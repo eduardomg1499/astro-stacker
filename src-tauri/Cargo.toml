@@ -1,0 +1,62 @@
+[package]
+name = "astro-stacker"
+version = "0.2.4"
+description = "ZenithAstroCode"
+authors = ["ZenithAstroCode-by-EduardoMG"]
+edition = "2021"
+default-run = "astro-stacker"
+
+[lib]
+name = "astro_stacker_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2.0.0", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2.9.0"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1.10"
+libc = "0.2"
+memmap2 = "0.9"
+byteorder = "1.5"
+image = "0.23.14"
+base64 = "0.22"
+bincode = "1.3.3"
+sysinfo = "0.30"
+lru = "0.12"
+dunce = "1.0"
+imageproc = "0.22.0"
+rusttype = "0.9.3"
+reqwest = { version = "0.11", features = ["json", "blocking"] }
+machine-uid = "0.5"
+aes-gcm = "0.10"
+hex = "0.4"
+chrono = "0.4"
+sha2 = "0.10"
+rand = "0.8"
+akaze = { git = "https://github.com/rust-cv/akaze" }
+num_cpus = "1.16.0"
+crossbeam-channel = "0.5"
+fitrs = "0.5.0"
+lz4_flex = "0.11.1"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+[patch.crates-io]
+bitarray = { path = "./vendor/bitarray" }
+
+# --- SEGURIDAD: CONFIGURACION DE PRODUCCION ---
+[profile.release]
+codegen-units = 1     # Mejor optimizacion, mas lento de compilar
+lto = true            # Link Time Optimization: Mezcla todo el codigo (dificil de separar)
+strip = true          # Elimina simbolos de depuracion (nombres de funciones, rutas)
+panic = "abort"       # Reduce el tamaño y elimina metadatos de panico
+opt-level = 3         # Maxima velocidad (o "z" para ofuscacion por tamaño minimo)

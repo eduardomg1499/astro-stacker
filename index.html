@@ -1,0 +1,3091 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zenith Astro Stacker</title>
+
+    <script type="importmap">
+        {
+          "imports": {
+            "@tauri-apps/api/": "https://esm.sh/@tauri-apps/api@^2.0.0/",
+            "@tauri-apps/plugin-dialog": "https://esm.sh/@tauri-apps/plugin-dialog@^2.6.0",
+            "@tauri-apps/plugin-fs": "https://esm.sh/@tauri-apps/plugin-fs@^2.4.5",
+            "@tauri-apps/plugin-updater": "https://esm.sh/@tauri-apps/plugin-updater@^2.9.0",
+            "@tauri-apps/plugin-process": "https://esm.sh/@tauri-apps/plugin-process@^2.3.1"
+          }
+        }
+    </script>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"
+        defer></script>
+
+    <link rel="stylesheet" href="./styles.css">
+    <link rel="stylesheet" href="./src/film_roll.css">
+
+    <style>
+        html,
+        body {
+            background-color: rgba(0, 0, 0, 0) !important;
+            background: transparent !important;
+            background-image: none !important;
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            transition: background-color 1s ease-in-out;
+        }
+
+        /* Ocultar interfaz principal hasta que el banner termine */
+        .custom-titlebar,
+        header,
+        .main-layout,
+        .status-bar,
+        #console-panel {
+            opacity: 0;
+            pointer-events: none;
+            transform: scale(0.985);
+            transition: opacity 1.2s cubic-bezier(0.4, 0, 0.2, 1), transform 1.2s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        body.ready {
+            background-color: #020617 !important; /* El color base de styles.css */
+            /* Permitimos que las imágenes de fondo se vean */
+            background-image:
+                radial-gradient(circle at 15% 25%, rgba(56, 189, 248, 0.12), transparent 45%),
+                radial-gradient(circle at 85% 65%, rgba(139, 92, 246, 0.12), transparent 50%),
+                radial-gradient(circle at 50% 50%, rgba(2, 6, 23, 0.8), transparent 100%) !important;
+        }
+
+        body.ready .custom-titlebar,
+        body.ready header,
+        body.ready .main-layout,
+        body.ready .status-bar {
+            opacity: 1;
+            pointer-events: auto;
+            transform: scale(1);
+        }
+
+        #splash-screen {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: transparent;
+            z-index: 10000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            transition: opacity 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+            pointer-events: none;
+        }
+
+        .splash-banner {
+            width: 650px;
+            height: 400px;
+            background: linear-gradient(145deg, #1e293b, #0f172a);
+            border: 1px solid rgba(56, 189, 248, 0.2);
+            border-radius: 20px;
+            box-shadow:
+                0 25px 50px -12px rgba(0, 0, 0, 0.8),
+                0 0 40px rgba(56, 189, 248, 0.1);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            position: relative;
+            overflow: hidden;
+            pointer-events: auto;
+            backdrop-filter: blur(10px);
+        }
+
+        .splash-banner::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(circle, rgba(56, 189, 248, 0.05) 0%, transparent 60%);
+            animation: rotateGlow 15s linear infinite;
+        }
+
+        @keyframes rotateGlow {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        #processing-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(15, 23, 42, 0.95);
+            backdrop-filter: blur(5px);
+            z-index: 9998;
+            display: none;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+
+        /* --- ASTRO LOADER (Orbital System - Liquid) --- */
+        .astro-loader {
+            position: relative;
+            width: 100px;
+            height: 100px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin-bottom: 25px;
+        }
+
+        .astro-star {
+            width: 22px;
+            height: 22px;
+            background: #fcd34d;
+            border-radius: 50%;
+            box-shadow: 0 0 30px #fcd34d, 0 0 60px #d97706;
+            animation: starPulse 2.5s ease-in-out infinite;
+            z-index: 10;
+        }
+
+        .orbit-sys {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            pointer-events: none;
+        }
+
+        .orbit-sys.outer {
+            animation: orbitSpin 8s linear infinite;
+        }
+
+        .orbit-sys.inner {
+            width: 60%;
+            height: 60%;
+            top: 20%;
+            left: 20%;
+            animation: orbitSpin 5s linear infinite reverse;
+        }
+
+        .orbit-ring {
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            border: 1px dashed rgba(251, 191, 36, 0.3);
+            box-sizing: border-box;
+            box-shadow: 0 0 15px rgba(251, 191, 36, 0.1);
+        }
+
+        .orbit-sys.inner .orbit-ring {
+            border: 1px dotted rgba(56, 189, 248, 0.4);
+            box-shadow: 0 0 15px rgba(56, 189, 248, 0.1);
+        }
+
+        .astro-planet {
+            position: absolute;
+            border-radius: 50%;
+            z-index: 5;
+        }
+
+        .planet-1 {
+            /* MARTE - Red */
+            top: -6px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 10px;
+            height: 10px;
+            background: #f87171;
+            box-shadow: 0 0 15px #f87171;
+        }
+
+        .planet-2 {
+            /* TIERRA - Blue */
+            bottom: -5px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 12px;
+            height: 12px;
+            background: #38bdf8;
+            box-shadow: 0 0 15px #38bdf8;
+        }
+
+        .planet-3 {
+            /* JUPITER - Orange (Outer) */
+            right: -6px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 14px;
+            height: 14px;
+            background: #fbbf24;
+            box-shadow: 0 0 15px #f59e0b;
+        }
+
+        .astro-loader.mini {
+            transform: scale(0.4);
+            transform-origin: center;
+            margin-bottom: -30px;
+        }
+
+        @media (max-height: 700px) {
+            .astro-loader.mini {
+                transform: scale(0.35);
+                margin-bottom: -40px;
+            }
+        }
+
+        @keyframes starPulse {
+
+            0%,
+            100% {
+                transform: scale(1);
+                opacity: 1;
+                box-shadow: 0 0 25px #fcd34d;
+            }
+
+            50% {
+                transform: scale(1.15);
+                opacity: 0.8;
+                box-shadow: 0 0 45px #fcd34d, 0 0 80px #fcd34d;
+            }
+        }
+
+        @keyframes orbitSpin {
+            from {
+                transform: rotate(0deg);
+            }
+
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .loader-text {
+            color: #94a3b8;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            letter-spacing: 2px;
+            margin-top: 10px;
+            text-transform: uppercase;
+            animation: pulse 2s infinite ease-in-out;
+        }
+
+        .splash-version {
+            position: absolute;
+            bottom: 20px;
+            right: 25px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.65rem;
+            color: #475569;
+            letter-spacing: 1px;
+        }
+
+        .splash-branding {
+            margin-top: 15px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .splash-title {
+            color: #ffffff;
+            font-size: 1.5rem;
+            font-weight: 800;
+            letter-spacing: -0.5px;
+            text-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        }
+
+        .splash-subtitle {
+            color: #a78bfa;
+            font-size: 0.7rem;
+            font-weight: 600;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            opacity: 1; /* Increased opacity for clarity */
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 0.6;
+            }
+
+            50% {
+                opacity: 1;
+            }
+        }
+
+        #overlay-progress-container {
+            width: 300px;
+            height: 4px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+            margin-top: 15px;
+            overflow: hidden;
+        }
+
+        #overlay-progress-fill {
+            height: 100%;
+            background: var(--accent);
+            width: 0%;
+            transition: width 0.3s ease;
+            box-shadow: 0 0 10px var(--accent);
+        }
+
+        #crop-box,
+        #anim-crop-box,
+        #stacking-roi-box {
+            position: absolute;
+            border: 1px solid rgba(252, 211, 77, 0.6);
+            /* Dark overlay outside crop */
+            box-shadow:
+                0 0 15px rgba(251, 191, 36, 0.3),
+                0 0 0 9999px rgba(0, 0, 0, 0.85);
+            display: none;
+            pointer-events: auto;
+            z-index: 100;
+            box-sizing: border-box;
+            backdrop-filter: brightness(1.1);
+        }
+
+        .crop-active {
+            cursor: crosshair !important;
+        }
+
+        .crop-active .zoom-content img,
+        .crop-active img {
+            pointer-events: none;
+        }
+
+        .license-badge {
+            background: rgba(255, 255, 255, 0.08);
+            color: #94a3b8;
+            padding: 3px 10px;
+            border-radius: 6px;
+            font-size: 0.6rem;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            cursor: default;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(5px);
+        }
+
+        .license-badge:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+            box-shadow: 0 0 10px var(--accent-glow);
+        }
+
+        .license-badge.pro {
+            background: linear-gradient(135deg, #f59e0b, #d97706);
+            color: white;
+            border: none;
+            box-shadow: 0 0 15px rgba(245, 158, 11, 0.4);
+            font-weight: bold;
+        }
+
+        /* --- SWITCH DE GRAFICA (Liquid) --- */
+        .chart-controls {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+            background: rgba(255, 255, 255, 0.03);
+            padding: 8px 12px;
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .switch-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .switch-label {
+            font-size: 0.75rem;
+            color: #ccc;
+            font-weight: bold;
+        }
+
+        /* The switch - the box around the slider */
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 44px;
+            height: 24px;
+        }
+
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        /* The slider */
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: rgba(0, 0, 0, 0.4);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: .4s;
+            border-radius: 34px;
+            box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.5);
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 18px;
+            width: 18px;
+            left: 2px;
+            bottom: 2px;
+            background-color: white;
+            transition: .4s cubic-bezier(0.34, 1.56, 0.64, 1);
+            border-radius: 50%;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.4);
+        }
+
+        input:checked+.slider {
+            background-color: var(--green);
+            border-color: var(--green);
+            box-shadow: 0 0 15px rgba(16, 185, 129, 0.4);
+        }
+
+        input:checked+.slider:before {
+            transform: translateX(20px);
+            background-color: #fff;
+        }
+
+        .chart-warning {
+            font-size: 0.65rem;
+            color: #94a3b8;
+            font-style: italic;
+        }
+
+        /* --- MODE GLOW EFFECTS (Atmospheric UI) --- */
+        .mode-glow-container {
+            transition: all 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+            position: relative;
+        }
+
+        .glow-luminance {
+            box-shadow: 0 0 30px rgba(255, 255, 255, 0.08), 0 0 50px rgba(255, 255, 255, 0.03) !important;
+            border-color: rgba(255, 255, 255, 0.15) !important;
+        }
+
+        .glow-rgb {
+            animation: razer-pulse 4s infinite linear;
+            border-color: rgba(56, 189, 248, 0.2) !important;
+        }
+
+        @keyframes razer-pulse {
+            0% {
+                box-shadow: 0 0 25px rgba(255, 0, 0, 0.12), 0 0 45px rgba(255, 0, 0, 0.05);
+            }
+
+            16% {
+                box-shadow: 0 0 25px rgba(255, 255, 0, 0.12), 0 0 45px rgba(255, 255, 0, 0.05);
+            }
+
+            33% {
+                box-shadow: 0 0 25px rgba(0, 255, 0, 0.12), 0 0 45px rgba(0, 255, 0, 0.05);
+            }
+
+            50% {
+                box-shadow: 0 0 25px rgba(0, 255, 255, 0.12), 0 0 45px rgba(0, 255, 255, 0.05);
+            }
+
+            66% {
+                box-shadow: 0 0 25px rgba(0, 0, 255, 0.12), 0 0 45px rgba(0, 0, 255, 0.05);
+            }
+
+            83% {
+                box-shadow: 0 0 25px rgba(255, 0, 255, 0.12), 0 0 45px rgba(255, 0, 255, 0.05);
+            }
+
+            100% {
+                box-shadow: 0 0 25px rgba(255, 0, 0, 0.12), 0 0 45px rgba(255, 0, 0, 0.05);
+            }
+        }
+    </style>
+
+    <!-- Tutorial Styles -->
+    <style>
+        #tutorial-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 999999;
+            pointer-events: none;
+            display: none;
+        }
+
+        #tutorial-overlay.active {
+            display: block;
+        }
+
+        body.tutorial-active {
+            overflow: hidden !important;
+            /* Prevent scrolling during tutorials */
+        }
+
+        #tutorial-highlight-box {
+            position: absolute;
+            border: 2px solid #fcd34d;
+            box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.75), 0 0 15px rgba(251, 191, 36, 0.5);
+            border-radius: 6px;
+            pointer-events: none;
+            transition: all 0.4s ease-in-out;
+            display: none;
+            z-index: 1000;
+        }
+
+        #tutorial-tooltip {
+            position: absolute;
+            width: 360px;
+            background: rgba(30, 41, 59, 0.98);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            backdrop-filter: blur(12px);
+            border-radius: 12px;
+            padding: 24px;
+            color: #e2e8f0;
+            box-shadow: 0 15px 45px rgba(0, 0, 0, 0.6);
+            z-index: 1001;
+            pointer-events: auto;
+            transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+            opacity: 0;
+            animation: fadeIn 0.4s forwards;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        #tut-title {
+            margin: 0 0 10px 0;
+            color: #fcd34d;
+            font-size: 1.1rem;
+            font-weight: bold;
+        }
+
+        #tut-content {
+            font-size: 0.9rem;
+            line-height: 1.5;
+            color: #cbd5e1;
+            margin-bottom: 20px;
+        }
+
+        .tut-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            padding-top: 15px;
+        }
+
+        #tut-step-count {
+            font-size: 0.8rem;
+            color: #64748b;
+        }
+
+        .tut-actions {
+            display: flex;
+            gap: 10px;
+        }
+
+        #tut-btn-skip {
+            background: transparent;
+            border: none;
+            color: #94a3b8;
+            cursor: pointer;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            padding: 4px 8px;
+            transition: color 0.2s;
+        }
+
+        #tut-btn-skip:hover {
+            color: #fca311;
+        }
+
+        #tut-btn-back {
+            background: rgba(255, 255, 255, 0.05);
+            color: #cbd5e1;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            padding: 6px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+
+        #tut-btn-back:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        #tut-btn-next {
+            background: #2563eb;
+            color: white;
+            border: none;
+            padding: 8px 18px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: bold;
+            transition: all 0.2s;
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
+        }
+
+        #tut-btn-next:hover {
+            background: #1d4ed8;
+            transform: translateY(-1px);
+            box-shadow: 0 6px 16px rgba(37, 99, 235, 0.4);
+        }
+    </style>
+</head>
+
+
+
+<body>
+    <!-- Custom Glassmorphism Titlebar -->
+    <div data-tauri-drag-region class="custom-titlebar">
+        <div class="titlebar-label" data-tauri-drag-region>
+            <img src="./logo_ZAS.svg" alt="ZAS" class="titlebar-logo" data-tauri-drag-region>
+            <span class="brand-zenith">ZENITH</span>&nbsp;<span class="brand-stacker">ASTRO STACKER</span>
+        </div>
+        <div class="titlebar-controls" aria-label="Controles de ventana">
+            <div class="titlebar-btn" id="titlebar-minimize" role="button" aria-label="Minimizar" title="Minimizar">
+                <svg viewBox="0 0 10 1" stroke="currentColor" stroke-width="1.5"><line x1="0" y1="0.5" x2="10" y2="0.5"/></svg>
+            </div>
+            <div class="titlebar-btn" id="titlebar-maximize" role="button" aria-label="Maximizar" title="Maximizar">
+                <svg viewBox="0 0 10 10" stroke="currentColor" fill="none" stroke-width="1.5"><rect x="0.5" y="0.5" width="9" height="9"/></svg>
+            </div>
+            <div class="titlebar-btn titlebar-close" id="titlebar-close" role="button" aria-label="Cerrar" title="Cerrar">
+                <svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1.5"><line x1="1" y1="1" x2="9" y2="9"/><line x1="9" y1="1" x2="1" y2="9"/></svg>
+            </div>
+        </div>
+    </div>
+
+    <!-- SVG Filter for Manual Color Tinting -->
+    <svg style="display: none;">
+        <defs>
+            <filter id="anim-advanced-filter">
+                <!-- Color Tint Matrix (Manual or Preset) -->
+                <feColorMatrix type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0" result="tinted" />
+
+                <!-- Levels Component Transfer -->
+                <feComponentTransfer in="tinted" result="levels">
+                    <feFuncR id="lvl-r" type="linear" slope="1" intercept="0" />
+                    <feFuncG id="lvl-g" type="linear" slope="1" intercept="0" />
+                    <feFuncB id="lvl-b" type="linear" slope="1" intercept="0" />
+                </feComponentTransfer>
+            </filter>
+        </defs>
+
+        <!-- ZAS SVG Glassmorphism Icons -->
+        <symbol id="icon-star" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <polygon
+                points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2">
+            </polygon>
+        </symbol>
+        <symbol id="icon-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path
+                d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z">
+            </path>
+        </symbol>
+        <symbol id="icon-lightning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+        </symbol>
+        <symbol id="icon-pro" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="12 2 2 7 12 22 22 7 12 2"></polygon>
+            <polyline points="2 7 12 7 22 7"></polyline>
+            <polyline points="12 22 12 7"></polyline>
+        </symbol>
+        <symbol id="icon-rocket" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"></path>
+            <path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z">
+            </path>
+            <path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"></path>
+            <path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"></path>
+        </symbol>
+        <symbol id="icon-timer" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"></circle>
+            <polyline points="12 6 12 12 16 14"></polyline>
+        </symbol>
+        <symbol id="icon-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+        </symbol>
+        <symbol id="icon-galaxy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2v20"></path>
+            <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
+        </symbol>
+        <symbol id="icon-sequence" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="5" width="14" height="14" rx="2" ry="2"></rect>
+            <path d="M7 3h14v14" fill="none"></path>
+            <circle cx="10" cy="12" r="2"></circle>
+            <polyline points="15 17 12 14 7 19"></polyline>
+        </symbol>
+        <symbol id="icon-magic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path
+                d="m21.64 3.64-1.28-1.28a1.21 1.21 0 0 0-1.72 0L2.36 18.64a1.21 1.21 0 0 0 0 1.72l1.28 1.28a1.2 1.2 0 0 0 1.72 0L21.64 5.36a1.2 1.2 0 0 0 0-1.72Z" />
+            <path d="m14 7 3 3" />
+            <path d="M5 6v4" />
+            <path d="M19 14v4" />
+            <path d="M10 2v2" />
+            <path d="M7 8H3" />
+            <path d="M21 16h-4" />
+            <path d="M11 3H9" />
+        </symbol>
+        <symbol id="icon-lightbulb" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <line x1="9" y1="18" x2="15" y2="18"></line>
+            <line x1="10" y1="22" x2="14" y2="22"></line>
+            <path d="M15.09 14c.18-.98.65-1.74 1.41-2.5A6 6 0 1 0 7.5 11.5c.76.76 1.23 1.52 1.41 2.5z"></path>
+        </symbol>
+        <symbol id="icon-batch" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <rect x="4" y="2" width="16" height="20" rx="2" ry="2"></rect>
+            <line x1="8" y1="6" x2="16" y2="6"></line>
+            <line x1="8" y1="10" x2="16" y2="10"></line>
+            <line x1="8" y1="14" x2="16" y2="14"></line>
+        </symbol>
+        <symbol id="icon-mosaic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="7" height="7"></rect>
+            <rect x="14" y="3" width="7" height="7"></rect>
+            <rect x="14" y="14" width="7" height="7"></rect>
+            <rect x="3" y="14" width="7" height="7"></rect>
+        </symbol>
+        <symbol id="icon-film" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"></rect>
+            <line x1="7" y1="2" x2="7" y2="22"></line>
+            <line x1="17" y1="2" x2="17" y2="22"></line>
+            <line x1="2" y1="12" x2="22" y2="12"></line>
+            <line x1="2" y1="7" x2="7" y2="7"></line>
+            <line x1="2" y1="17" x2="7" y2="17"></line>
+            <line x1="17" y1="17" x2="22" y2="17"></line>
+            <line x1="17" y1="7" x2="22" y2="7"></line>
+        </symbol>
+        <symbol id="icon-tools" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path
+                d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z">
+            </path>
+        </symbol>
+        <symbol id="icon-planet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="8"></circle>
+            <ellipse cx="12" cy="12" rx="14" ry="4" transform="rotate(30 12 12)"></ellipse>
+        </symbol>
+        <symbol id="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+        </symbol>
+        <symbol id="icon-anchor" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
+            <circle cx="12" cy="10" r="3"></circle>
+        </symbol>
+        <symbol id="icon-ruler" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path
+                d="M21.3 15.3l-7.6-7.6a2 2 0 0 0-2.8 0l-8.6 8.6a2 2 0 0 0 0 2.8l7.6 7.6a2 2 0 0 0 2.8 0l8.6-8.6a2 2 0 0 0 0-2.8z">
+            </path>
+            <path d="M14.5 12.5l-2-2"></path>
+            <path d="M11.5 15.5l-2-2"></path>
+            <path d="M8.5 18.5l-2-2"></path>
+        </symbol>
+        <symbol id="icon-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="7 10 12 15 17 10"></polyline>
+            <line x1="12" y1="15" x2="12" y2="3"></line>
+        </symbol>
+        <symbol id="icon-clipboard" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
+            <rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect>
+        </symbol>
+        <symbol id="icon-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </symbol>
+        <symbol id="icon-chart" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="20" x2="18" y2="10"></line>
+            <line x1="12" y1="20" x2="12" y2="4"></line>
+            <line x1="6" y1="20" x2="6" y2="14"></line>
+        </symbol>
+        <symbol id="icon-save" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
+            <polyline points="17 21 17 13 7 13 7 21"></polyline>
+            <polyline points="7 3 7 8 15 8"></polyline>
+        </symbol>
+        <symbol id="icon-undo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="9 14 4 9 9 4"></polyline>
+            <path d="M20 20v-7a4 4 0 0 0-4-4H4"></path>
+        </symbol>
+        <symbol id="icon-palette" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="13.5" cy="6.5" r=".5"></circle>
+            <circle cx="17.5" cy="10.5" r=".5"></circle>
+            <circle cx="8.5" cy="7.5" r=".5"></circle>
+            <circle cx="6.5" cy="12.5" r=".5"></circle>
+            <path
+                d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.836-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z">
+            </path>
+        </symbol>
+        <symbol id="icon-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <polyline points="19 12 12 19 5 12"></polyline>
+        </symbol>
+        <symbol id="icon-trophy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6"></path>
+            <path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18"></path>
+            <path d="M4 22h16"></path>
+            <path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22"></path>
+            <path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22"></path>
+            <path d="M18 2H6v7a6 6 0 0 0 12 0V2z"></path>
+        </symbol>
+        <symbol id="icon-scissors" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="6" cy="6" r="3"></circle>
+            <circle cx="6" cy="18" r="3"></circle>
+            <line x1="20" y1="4" x2="8.12" y2="15.88"></line>
+            <line x1="14.47" y1="14.48" x2="20" y2="20"></line>
+            <line x1="8.12" y1="8.12" x2="12" y2="12"></line>
+        </symbol>
+        <symbol id="icon-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+            <line x1="12" y1="9" x2="12" y2="13"></line>
+            <line x1="12" y1="17" x2="12.01" y2="17"></line>
+        </symbol>
+        <symbol id="icon-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="23 4 23 10 17 10"></polyline>
+            <polyline points="1 20 1 14 7 14"></polyline>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+        </symbol>
+        stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="6" cy="6" r="3"></circle>
+        <circle cx="6" cy="18" r="3"></circle>
+        <line x1="20" y1="4" x2="8.12" y2="15.88"></line>
+        <line x1="14.47" y1="14.48" x2="20" y2="20"></line>
+        <line x1="8.12" y1="8.12" x2="12" y2="12"></line>
+        </symbol>
+        <symbol id="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="20 6 9 17 4 12"></polyline>
+        </symbol>
+        <symbol id="icon-cross" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+        </symbol>
+        <symbol id="icon-magic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22.5 2.5l-2.5 7.5L12 12.5l2.5-7.5L22.5 2.5z"></path>
+            <path d="M8 12l-4 4"></path>
+            <path d="M4 16l4 4"></path>
+            <path d="M8 20l4-4"></path>
+            <path d="M12 16l-4-4"></path>
+            <path d="M2.5 2.5L5 5"></path>
+            <path d="M19 19l2.5 2.5"></path>
+        </symbol>
+        <symbol id="icon-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"></polyline>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            <line x1="10" y1="11" x2="10" y2="17"></line>
+            <line x1="14" y1="11" x2="14" y2="17"></line>
+        </symbol>
+        <symbol id="icon-hourglass" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 2v20l8-8 8 8V2L12 10 4 2z"></path>
+        </symbol>
+    </svg>
+
+    <div id="splash-screen">
+        <div class="splash-banner">
+            <div class="astro-loader">
+                <div class="astro-star"></div>
+                <div class="orbit-sys outer">
+                    <div class="orbit-ring"></div>
+                    <div class="astro-planet planet-1"></div>
+                    <div class="astro-planet planet-3"></div>
+                </div>
+                <div class="orbit-sys inner">
+                    <div class="orbit-ring"></div>
+                    <div class="astro-planet planet-2"></div>
+                </div>
+            </div>
+
+            <div class="splash-branding">
+                <div class="splash-title">ZENITH</div>
+                <div class="splash-subtitle">ASTRO STACKER</div>
+            </div>
+
+            <div class="loader-text" data-i18n="general.loading_system">INICIALIZANDO SISTEMA...</div>
+
+            <div id="splash-progress-bar" style="width: 200px; height: 2px; background: rgba(56,189,248,0.1); margin-top: 20px; border-radius: 1px; overflow: hidden;">
+                <div id="splash-progress-fill" style="width: 30%; height: 100%; background: #38bdf8; box-shadow: 0 0 10px #38bdf8;"></div>
+            </div>
+
+            <div class="splash-version">v0.2.3 Beta | Astro Stacker Edition</div>
+        </div>
+    </div>
+
+    <div id="processing-overlay">
+        <div class="astro-loader">
+            <div class="astro-star"></div>
+            <div class="orbit-sys outer">
+                <div class="orbit-ring"></div>
+                <div class="astro-planet planet-1"></div>
+            </div>
+            <div class="orbit-sys inner">
+                <div class="orbit-ring"></div>
+                <div class="astro-planet planet-2"></div>
+            </div>
+        </div>
+        <div class="loader-text" id="processing-msg" data-i18n="general.processing">PROCESANDO...</div>
+        <div id="processing-details"
+            style="margin-top: 8px; color: #94a3b8; font-family: 'Courier New', monospace; font-size: 0.85rem;"></div>
+        <div id="overlay-progress-container">
+            <div id="overlay-progress-fill"></div>
+        </div>
+
+        <button id="btn-cancel-process"
+            style="margin-top: 15px; width: auto; display: inline-block; background: none; border: none; color: #ef4444; cursor: pointer; font-family: sans-serif; font-size: 0.75rem; letter-spacing: 0.5px; opacity: 0.7; transition: all 0.2s; padding: 4px 8px; border-radius: 4px;"
+            onmouseover="this.style.opacity='1'; this.style.background='rgba(239, 68, 68, 0.1)';"
+            onmouseout="this.style.opacity='0.7'; this.style.background='none';">
+            <span data-i18n="general.cancel">Cancelar</span>
+        </button>
+    </div>
+
+    <header>
+        <div class="logo">
+            <img src="./logo_ZAS.svg" alt="ZAS" class="app-logo-img">
+            <span><span class="brand-zenith">ZENITH</span><span class="brand-stacker">ASTRO STACKER</span></span>
+            <div id="license-indicator" class="license-badge" data-i18n="general.license_indicator">FREE VERSION</div>
+        </div>
+        <div style="display:flex; align-items:center; gap:15px;">
+
+            <div id="btn-report-bug" class="updater-badge" style="cursor: pointer; display: flex; align-items: center;" title="Enviar comentarios e informe de errores">
+                <svg class="pulse-glow-yellow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+            </div>
+
+            <div id="btn-settings" class="updater-badge" style="cursor: pointer; display: flex; align-items: center;" data-i18n-title="updater.settings"
+                title="Configuración">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            </div>
+
+            <div id="updater-badge" class="updater-badge" data-i18n-title="updater.search_updates"
+                title="Buscar actualizaciones">
+                <span id="updater-icon">⚡</span>
+                <span id="updater-text" data-i18n="updater.checking">Verificando...</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- License Modal (UNCLOSEABLE) -->
+    <div id="license-modal" class="modal-overlay"
+        style="display:none; z-index:99999; backdrop-filter:blur(15px); background:rgba(0,0,0,0.9);">
+        <div class="modal-box" style="position:relative;">
+            <button id="license-modal-close" class="close-btn"
+                style="display:none; position:absolute; top:10px; right:15px; font-size:1.5rem;">×</button>
+
+            <div class="license-logo-container">
+                <img src="./logo_ZAS.svg" class="license-logo" alt="Logo">
+            </div>
+
+            <h3 class="license-title" data-i18n="activation.title">Activación Requerida</h3>
+            <p class="license-desc" data-i18n="activation.description">
+                Desbloquea todo el potencial de <b>Zenith Astro Stacker</b>.<br>
+                Ingresa tu licencia Pro o inicia una prueba gratuita.
+            </p>
+
+            <div class="license-input-wrapper">
+                <label for="license-key-input" class="license-input-label" data-i18n="activation.license_key_label">Clave de licencia</label>
+                <input type="text" id="license-key-input" class="license-input" placeholder="XXXX-XXXX-XXXX-XXXX"
+                    data-i18n="activation.placeholder">
+            </div>
+
+            <div id="license-loading" style="display:none; margin-bottom:15px; text-align:center;">
+                <div class="astro-loader mini" style="transform:scale(0.3); height:40px; margin:0 auto;">
+                    <div class="astro-star"></div>
+                    <div class="orbit-sys outer">
+                        <div class="orbit-ring"></div>
+                        <div class="astro-planet planet-1"></div>
+                    </div>
+                </div>
+                <span style="color:#38bdf8; font-size:0.8rem;" data-i18n="activation.verify">Verificando...</span>
+            </div>
+
+            <button id="btn-activate-license" class="btn-activate" data-i18n="activation.activate_btn">🚀 Activar
+                Licencia</button>
+
+            <div class="license-divider">O</div>
+
+            <div class="license-actions-grid">
+                <button id="btn-trial-checkout" class="btn-trial"
+                    onclick="window.openBrowser('https://zenith-astro-stacker.lemonsqueezy.com/checkout/buy/ed185d7d-7e1a-4f3d-a6dd-c23ea2a128d3?discount=0')">
+                    <span style="font-size:1.2rem;">⏱</span>
+                    <span data-i18n="activation.trial_btn">Probar (15 Días)</span>
+                </button>
+
+                <button class="btn-premium"
+                    onclick="window.openBrowser('https://zenith-astro-stacker.lemonsqueezy.com/checkout/buy/106d0e17-92c2-4a23-8782-8f780f06ec74')">
+                    <span style="font-size:1.2rem;">💎</span>
+                    <span data-i18n="activation.buy_btn">COMPRAR PRO</span>
+                </button>
+            </div>
+
+            <div class="license-language-switcher" aria-label="Cambiar idioma / Change language">
+                <span class="license-language-label" data-i18n="activation.language_label">Ver en</span>
+                <div class="license-language-options" role="group" aria-label="Language">
+                    <button type="button" class="license-lang-btn active" data-lang="es" aria-pressed="true"
+                        onclick="document.dispatchEvent(new CustomEvent('changeLang', {detail: 'es'}))">
+                        <span class="license-lang-code">🇲🇽</span>
+                        <span class="license-lang-name">Español</span>
+                    </button>
+                    <button type="button" class="license-lang-btn" data-lang="en" aria-pressed="false"
+                        onclick="document.dispatchEvent(new CustomEvent('changeLang', {detail: 'en'}))">
+                        <span class="license-lang-code">🇺🇸</span>
+                        <span class="license-lang-name">English</span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="license-qa-reset">
+                <span class="license-qa-label" data-i18n="activation.qa_reset_label">QA TEMPORAL</span>
+                <button type="button" id="btn-reset-license-qa" class="license-reset-btn"
+                    data-i18n="activation.qa_reset_btn">Permitir otra prueba</button>
+            </div>
+            <div class="license-modal-footer" data-i18n="activation.footer">ZENITH ASTRO STACKER • EDICIÓN PRO</div>
+        </div>
+
+
+
+    </div>
+    </div>
+    </div>
+    </div>
+    </div>
+    </div>
+
+    <!-- Activation Modal (INDEPENDENT - MANUAL UPGRADE) -->
+    <div id="activation-modal" class="modal-overlay"
+        style="display:none; z-index:200000; backdrop-filter:blur(20px); background:rgba(0,0,0,0.9);">
+
+        <!-- Main Card Container using .card for animations/style -->
+        <div class="card"
+            style="position:relative; max-width: 500px; width:100%; border-left: 4px solid #f59e0b; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);">
+
+            <!-- Boton Cerrar: Correctly positioned INSIDE the card (Clean/Embedded) -->
+            <button id="activation-modal-close" class="close-btn"
+                style="display:block; position:absolute; top:15px; right:15px; font-size:1.5rem; background:none; border:none; color:#94a3b8; cursor:pointer; transition:all 0.2s; opacity:0.6; padding:0;"
+                onmouseover="this.style.opacity='1'; this.style.color='white';"
+                onmouseout="this.style.opacity='0.6'; this.style.color='#94a3b8';">×</button>
+
+            <div class="license-logo-container" style="margin-bottom:20px; margin-top:10px;">
+                <img src="./logo_ZAS.svg" class="license-logo" alt="Logo" style="height:60px;">
+            </div>
+
+            <h2 style="color:#f59e0b; margin-bottom:10px; font-size:1.4rem; text-transform:uppercase; letter-spacing:1px; border:none; padding:0; text-align:center;"
+                data-i18n="activation.manual_title">
+                Actualizar a licencia anual</h2>
+            <p style="color:#94a3b8; margin-bottom:25px; font-size:0.95em; line-height:1.5;"
+                data-i18n="activation.manual_desc">
+                Desbloquea todo el potencial de Zenith Astro Stacker. Herramientas de análisis avanzado, soporte
+                prioritario y actualizaciones durante la vigencia anual.
+            </p>
+
+            <!-- BUY BUTTON (MARKETING) -->
+            <button id="btn-buy-pro-manual" class="btn-premium"
+                style="width:100%; padding:15px; font-size:1.1rem; margin-bottom:20px; cursor:pointer; background: linear-gradient(135deg, #f59e0b, #d97706); border:none; border-radius:8px; color:white; font-weight:bold; box-shadow: 0 4px 15px rgba(245, 158, 11, 0.4); transition: transform 0.2s;"
+                onmouseover="this.style.transform='translateY(-2px)'" onmouseout="this.style.transform='translateY(0)'"
+                onclick="window.openBrowser('https://zenith-astro-stacker.lemonsqueezy.com/checkout/buy/106d0e17-92c2-4a23-8782-8f780f06ec74')"
+                data-i18n="activation.buy_btn_manual">
+                💎 OBTENER LICENCIA ANUAL
+            </button>
+
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom:15px;">
+                <div style="flex:1; height:1px; background:#475569;"></div>
+                <span style="color:#64748b; font-size:0.8em; font-weight:bold;" data-i18n="activation.have_code">TENGO
+                    UN CODIGO</span>
+                <div style="flex:1; height:1px; background:#475569;"></div>
+            </div>
+
+            <!-- ACTIVATION INPUT -->
+            <div class="license-input-group">
+                <input type="text" id="activation-key-input" placeholder="XXXXX-XXXXX-XXXXX-XXXXX"
+                    style="width:100%; padding:12px; background:rgba(0,0,0,0.5); border:1px solid #475569; color:white; border-radius:6px; font-family:monospace; text-align:center; letter-spacing:1px; font-size:1rem;">
+            </div>
+
+            <div style="margin-top:15px;">
+                <button id="btn-manual-activate" class="primary"
+                    style="width:100%; padding:10px; background: rgba(59, 130, 246, 0.2); border: 1px solid #3b82f6; color:#60a5fa; font-weight:bold; font-size:0.9rem; transition:all 0.3s; cursor:pointer;"
+                    data-i18n="activation.activate_code_btn">
+                    ACTIVAR CODIGO ->
+                </button>
+            </div>
+
+            <div id="activation-loading" style="display:none; margin-top:15px;">
+                <div class="astro-loader mini" style="margin:0 auto;">
+                    <div class="astro-star"></div>
+                    <div class="orbit-sys outer">
+                        <div class="orbit-ring"></div>
+                        <div class="astro-planet planet-1"></div>
+                    </div>
+                </div>
+                <p style="font-size:0.8em; color:#94a3b8; margin-top:5px;" data-i18n="activation.verifying_license">
+                    Verificando licencia...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="modal-overlay"
+        style="display:none; z-index:99999; backdrop-filter:blur(15px); background:rgba(0,0,0,0.8);">
+        <div class="settings-box">
+            <div class="settings-sidebar">
+                <button class="settings-tab active" data-tab="general"
+                    data-i18n="settings.tabs.general">General</button>
+                <button class="settings-tab" data-tab="license" data-i18n="settings.tabs.license">Licencia</button>
+            </div>
+            <div class="settings-content">
+                <button id="btn-close-settings" class="close-btn">×</button>
+
+                <div id="tab-general" class="tab-content active">
+                    <div class="control-group">
+                        <div class="group-header">
+                            <h3 data-i18n="settings.general.title">Configuración General</h3>
+                        </div>
+
+                        <div style="margin-top:15px; margin-bottom:15px;">
+                            <label
+                                style="color:#cbd5e1; font-weight:bold; font-size:0.9rem; display:block; margin-bottom:8px;"
+                                data-i18n="settings.general.language">Idioma / Language</label>
+
+                            <!-- Custom Select Wrapper for Language -->
+                            <div class="custom-select-container" id="language-select-container">
+                                <select id="settings-lang-select" style="display: none;">
+                                    <option value="es">Español (ES)</option>
+                                    <option value="en">English (EN)</option>
+                                </select>
+
+                                <div class="custom-select-trigger" id="custom-language-trigger">
+                                    <div class="custom-select-selected-icon">
+                                        <svg viewBox="0 0 24 24" class="cs-icon cs-es" style="font-family: Arial, sans-serif; font-weight: 800; font-size: 14px;"><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="currentColor">ES</text></svg>
+                                    </div>
+                                    <span class="custom-select-text" id="custom-language-text">Español (ES)</span>
+                                    <div class="custom-select-arrow">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+                                    </div>
+                                </div>
+
+                                <div class="custom-select-options" id="custom-language-options">
+                                    <div class="custom-option selected" data-value="es">
+                                        <svg viewBox="0 0 24 24" class="cs-icon cs-es" style="font-family: Arial, sans-serif; font-weight: 800; font-size: 14px;"><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="currentColor">ES</text></svg>
+                                        <span>Español (ES)</span>
+                                    </div>
+                                    <div class="custom-option" data-value="en">
+                                        <svg viewBox="0 0 24 24" class="cs-icon cs-en" style="font-family: Arial, sans-serif; font-weight: 800; font-size: 14px;"><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="currentColor">EN</text></svg>
+                                        <span>English (EN)</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Tutorial Settings -->
+                        <div
+                            style="margin-top:15px; margin-bottom:15px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px;">
+                            <label
+                                style="color:#cbd5e1; font-weight:bold; font-size:0.9rem; display:block; margin-bottom:8px;"
+                                data-i18n="settings.general.tutorials">Tutoriales
+                                Interactivos</label>
+                            <p style="color:#64748b; font-size:0.72rem; line-height:1.35; margin:0 0 10px 0;"
+                                data-i18n="settings.general.tutorials_hint">
+                                Se muestran una sola vez por flujo. Puedes verlos de nuevo cuando quieras.
+                            </p>
+
+                            <div
+                                style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+                                <span style="color:#94a3b8; font-size:0.8rem;"
+                                    data-i18n="settings.general.show_visual_aids">Mostrar ayudas visuales</span>
+                                <label class="switch-container">
+                                    <span class="switch" style="transform:scale(0.8);">
+                                        <input type="checkbox" id="settings-tutorial-toggle" checked
+                                            style="display:none;">
+                                        <span class="slider round"></span>
+                                    </span>
+                                </label>
+                            </div>
+
+                            <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:10px;">
+                                <button class="secondary" data-tutorial-start="intro"
+                                    style="font-size:0.72rem; padding:7px;"
+                                    data-i18n="settings.general.start_tutorial_intro">Ver guía general</button>
+                                <button class="secondary" data-tutorial-start="individual"
+                                    style="font-size:0.72rem; padding:7px;"
+                                    data-i18n="settings.general.start_tutorial_individual">Ver guía individual</button>
+                                <button class="secondary" data-tutorial-start="batch"
+                                    style="font-size:0.72rem; padding:7px;"
+                                    data-i18n="settings.general.start_tutorial_batch">Ver guía de lotes</button>
+                                <button class="secondary" data-tutorial-start="mosaic"
+                                    style="font-size:0.72rem; padding:7px;"
+                                    data-i18n="settings.general.start_tutorial_mosaic">Ver guía de mosaico</button>
+                            </div>
+
+                            <button id="btn-reset-tutorial" class="secondary"
+                                style="width:100%; font-size:0.8rem; padding:6px;"
+                                data-i18n="settings.general.reset_tutorials">
+                                ↺ Reiniciar Todos los Tutoriales
+                            </button>
+                        </div>
+
+                        <p style="color:#94a3b8; font-style:italic; margin-top: 10px;"
+                            data-i18n="settings.general.more_options">Próximamente más opciones de
+                            personalización.</p>
+                    </div>
+                </div>
+
+                <div id="tab-license" class="tab-content" style="display:none;">
+                    <div class="control-group">
+                        <div class="group-header">
+                            <h3 data-i18n="settings.license.status_title">Estado de Licencia</h3>
+                        </div>
+                        <div id="settings-license-info" class="license-info-box">
+                            <!-- Dynamic Content -->
+                        </div>
+
+                        <div class="settings-actions" style="margin-top:20px; display:flex; gap:10px;">
+                            <button id="btn-settings-activate" class="success" style="display:none;"
+                                data-i18n="license.actions.activate">Activar
+                                Licencia</button>
+                            <button id="btn-settings-deactivate" class="primary"
+                                style="background:#ef4444; border:none; display:none;"
+                                data-i18n="license.actions.deactivate">Desactivar en este PC</button>
+                        </div>
+                        <div class="license-qa-reset settings-license-qa-reset">
+                            <span class="license-qa-label" data-i18n="activation.qa_reset_label">QA TEMPORAL</span>
+                            <button type="button" id="btn-settings-reset-license-qa" class="license-reset-btn"
+                                data-i18n="activation.qa_reset_btn">Permitir otra prueba</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <div class="main-layout" style="flex:1; overflow:hidden;">
+
+        <div class="sidebar">
+
+            <div class="card">
+                <h2 data-i18n="acquisition.title">Adquisicion de Datos</h2>
+
+                <!-- NEW: Analysis Mode Selector (PRE-IMPORT) -->
+                <div
+                    style="margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.05);">
+                    <label
+                        style="font-size: 0.7rem; color: #94a3b8; display: block; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px;"
+                        data-i18n="analysis.mode_label">Tipo de Calidad / Análisis</label>
+                    <!-- Custom Select Wrapper -->
+                    <div class="custom-select-container" id="quality-method-container">
+                        <select id="sel-quality-method" style="display: none;">
+                            <option value="zenith_ultimate" selected data-i18n="analysis.modes.zenith_ultimate">Zenith Presicion Ultimate</option>
+                        </select>
+
+                        <div class="custom-select-trigger" id="custom-quality-trigger">
+                            <div class="custom-select-selected-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="cs-icon cs-global"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+                            </div>
+                            <span class="custom-select-text" id="custom-quality-text" data-i18n="analysis.modes.zenith_ultimate">Zenith Presicion Ultimate</span>
+                            <div class="custom-select-arrow">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+                            </div>
+                        </div>
+
+                        <div class="custom-select-options" id="custom-quality-options">
+                            <div class="custom-option selected" data-value="zenith_ultimate">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="cs-icon cs-global"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+                                <span data-i18n="analysis.modes.zenith_ultimate">Zenith Presicion Ultimate</span>
+                            </div>
+                        </div>
+                    </div>
+                    <p style="font-size: 0.65rem; color: #64748b; margin-top: 5px; font-style: italic;"
+                        data-i18n="analysis.mode_hint">Determina cómo se evalúan y seleccionan los frames.</p>
+                </div>
+
+                <!-- NEW: Target Category Custom Selector -->
+                <div style="margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.05);" id="container-target-category">
+                    <label style="font-size: 0.7rem; color: #94a3b8; display: block; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px;" data-i18n="analysis.targets.title">Categoría del Objetivo</label>
+                    <div class="custom-select-container">
+                        <select id="sel-target-category" style="display:none;">
+                            <option value="surface" selected>surface</option>
+                            <option value="planet_small">planet_small</option>
+                        </select>
+                        <div id="trigger-target-category" class="custom-select-trigger" style="display:flex; justify-content:space-between; align-items:center; background:#0f172a; border:1px solid #334155; padding:8px 12px; border-radius:6px; cursor:pointer; color:#e2e8f0; transition:all 0.3s ease;">
+                            <div style="display:flex; align-items:center; gap:8px;">
+                                <div class="custom-select-selected-icon"><svg class='zas-icon' style="color:#38bdf8;"><use href='#icon-moon'></use></svg></div>
+                                <span id="text-target-category" style="font-weight:600; font-size:0.8rem;" data-i18n="analysis.targets.surface">Superficie (Luna / Sol)</span>
+                            </div>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="cs-arrow" style="width:14px; height:14px; transition:transform 0.3s;"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                        </div>
+                        <div id="options-target-category" class="custom-select-options">
+                            <div class="custom-option selected" data-value="surface">
+                                <svg class='zas-icon cs-icon cs-global'><use href='#icon-moon'></use></svg>
+                                <div>
+                                    <span data-i18n="analysis.targets.surface" style="font-weight:600;">Superficie (Luna / Sol)</span>
+                                    <span data-i18n="analysis.targets.surface_desc" style="display:block; font-size:0.65rem; color:#94a3b8; font-weight:normal; margin-top:2px;">Estabilización ancha y sólida.</span>
+                                </div>
+                            </div>
+                            <div class="custom-option" data-value="planet_small">
+                                <svg class='zas-icon cs-icon cs-v3' style="transform: scale(0.75);"><use href='#icon-planet'></use></svg>
+                                <div>
+                                    <span data-i18n="analysis.targets.planet_small" style="font-weight:600;">Planeta / Fase Lunar</span>
+                                    <span data-i18n="analysis.targets.planet_small_desc" style="display:block; font-size:0.65rem; color:#94a3b8; font-weight:normal; margin-top:2px;">AP local para planetas, lunas y detalles debiles.</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="display: flex; flex-direction: column; gap: 10px;">
+                    <button id="btn-analyze" class="primary" data-i18n="general.import_video">📂 Importar Video (SER /
+                        AVI)</button>
+                    <button id="btn-analyze-fits" class="primary"
+                        style="background: linear-gradient(135deg, #0ea5e9, #2563eb); margin-top: 5px; opacity: 0.5; cursor: not-allowed;"
+                        disabled><svg class="zas-icon">
+                            <use href="#icon-sequence"></use>
+                        </svg> Añadir Secuencia FITS/TIF</button>
+                    <button id="btn-batch-mode" class="primary"
+                        style="background: linear-gradient(135deg, #a855f7, #6366f1);" data-i18n="general.batch_mode">📚
+                        Apilado por Lotes</button>
+                    <button id="btn-mosaic-mode" class="primary"
+                        style="background: linear-gradient(135deg, #06b6d4, #3b82f6);"
+                        data-i18n="general.mosaic_mode">🧩 Crear Mosaico</button>
+                    <!-- NEW: Direct Animation Load -->
+                    <button id="btn-load-animation" class="primary"
+                        style="background: linear-gradient(135deg, #10b981, #059669);"
+                        data-i18n="general.load_animation">🎞 Cargar Animación (Imágenes)</button>
+                    <!-- NEW: Video Converter Tool -->
+                    <button id="btn-tools-convert" class="primary"
+                        style="background: linear-gradient(135deg, #f59e0b, #d97706); margin-top: 5px;"
+                        data-i18n="general.tools_convert">🛠 Convertir Video a SER</button>
+                    <!-- PLANETARY DEROTATION -->
+                    <button id="btn-derotate-mode" class="primary"
+                        style="background: linear-gradient(135deg, #8b5cf6, #6366f1); margin-top: 5px; opacity: 0.5; cursor: not-allowed;"
+                        disabled><svg class="zas-icon">
+                            <use href="#icon-planet"></use>
+                        </svg> Derotación Planetaria</button>
+                </div>
+
+                <div id="analysis-actions"
+                    style="display:none; margin-top:15px; padding-top:15px; border-top:1px dashed rgba(255,255,255,0.1);">
+                    <div style="font-size:0.75rem; color:#94a3b8; margin-bottom:8px;" data-i18n="general.file_selected">
+                        Archivo seleccionado:</div>
+                    <div id="selected-filename"
+                        style="font-size:0.8rem; color:#fff; font-weight:bold; margin-bottom:15px; word-break:break-all;">
+                        -</div>
+
+                    <!--
+                    LEGACY INDIVIDUAL INPUT SETTINGS
+                    Hidden because Zenith Ultimate now derives analysis/batch mode from the target
+                    category and Bayer/color defaults stay automatic internally. The selected filename
+                    above remains visible.
+                    <div id="video-input-settings"
+                        style="margin-bottom: 20px; background: rgba(255,255,255,0.03); padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
+                        <h4 style="font-size: 0.75rem; color: #fcd34d; margin-top: 0; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px;"
+                            data-i18n="video_settings.title">Configuración de Entrada</h4>
+
+                        <div style="margin-bottom: 12px;">
+                            <label style="display: block; font-size: 0.7rem; color: #94a3b8; margin-bottom: 5px;"
+                                data-i18n="video_settings.bayer_pattern">Patrón Bayer (Override)</label>
+                            <select id="sel-bayer-override"
+                                style="width: 100%; background: #0f172a; border: 1px solid #334155; color: #e2e8f0; font-size: 0.8rem; padding: 4px; border-radius: 4px;">
+                                <option value="auto" data-i18n="video_settings.auto">Automático (Detectar)</option>
+                                <option value="0">Grayscale (Mono)</option>
+                                <option value="8">RGGB</option>
+                                <option value="9">GRBG</option>
+                                <option value="10">GBRG</option>
+                                <option value="11">BGGR</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label style="display: block; font-size: 0.7rem; color: #94a3b8; margin-bottom: 5px;"
+                                data-i18n="video_settings.color_space">Espacio de Color</label>
+                            <select id="sel-color-space-override"
+                                style="width: 100%; background: #0f172a; border: 1px solid #334155; color: #e2e8f0; font-size: 0.8rem; padding: 4px; border-radius: 4px;">
+                                <option value="linear" data-i18n="video_settings.linear">Lineal / RAW</option>
+                                <option value="srgb" data-i18n="video_settings.srgb">sRGB / Procesado</option>
+                            </select>
+                        </div>
+
+                        <div style="margin-top: 10px;">
+                            <label style="display: block; font-size: 0.7rem; color: #94a3b8; margin-bottom: 5px;"
+                                data-i18n="video_settings.analysis_mode">Modo de Analisis</label>
+                            <select id="sel-analysis-mode"
+                                style="width: 100%; background: #0f172a; border: 1px solid #334155; color: #e2e8f0; font-size: 0.8rem; padding: 4px; border-radius: 4px;">
+                                <option value="planet_v3" data-i18n="video_settings.planet_v3">Zenith Presicion Ultimate - Planetario</option>
+                                <option value="surface_v3" data-i18n="video_settings.surface_v3">Zenith Presicion Ultimate - Superficie</option>
+                                <option value="planet_v2" selected>Planetaria v2 (PPA)</option>
+                                <option value="surface_v2">Superficie v2 (Features)</option>
+                                <option value="planet_v1">Planetaria v1 (Legacy)</option>
+                                <option value="surface_v1">Superficie v1 (Legacy)</option>
+                            </select>
+                        </div>
+                    </div>
+                    -->
+
+                    <!--
+                    LEGACY INDIVIDUAL MANUAL ANCHOR
+                    Hidden because automatic alignment/centering is now the default flow.
+                    <div style="display:flex; gap:5px; margin-top:5px; margin-bottom:5px;">
+                        <button id="btn-manual-anchor" class="secondary"
+                            style="flex:1; font-size:0.8em; padding: 6px; background: rgba(59, 130, 246, 0.15); border: 1px solid rgba(59, 130, 246, 0.3); color: #93c5fd; display:flex; align-items:center; justify-content:center; gap:6px;"
+                            data-i18n="analysis.set_manual_anchor"><svg class="zas-icon"
+                                style="width:14px; height:14px; fill:none; stroke:currentColor;">
+                                <use href="#icon-anchor"></use>
+                            </svg><span>Definir Anclaje Manual</span></button>
+                        <button id="btn-clear-anchor" title="Quitar Anclaje Manual" style="display:none; flex-shrink:0; width:34px; height:34px; padding:0; align-items:center; justify-content:center;
+                                   background: linear-gradient(135deg, rgba(239,68,68,0.18), rgba(180,30,30,0.10));
+                                   border: 1px solid rgba(239,68,68,0.40); border-top: 1px solid rgba(255,160,160,0.15);
+                                   border-radius:8px; color:#fca5a5; cursor:pointer;
+                                   backdrop-filter: blur(8px);
+                                   box-shadow: 0 2px 8px rgba(239,68,68,0.18), inset 0 1px 0 rgba(255,180,180,0.08);
+                                   transition: all 0.2s ease;">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                <polyline points="3 6 5 6 21 6" />
+                                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                                <path d="M10 11v6M14 11v6" />
+                                <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                            </svg>
+                        </button>
+                    </div>
+                    -->
+
+                    <!--
+                    LEGACY INDIVIDUAL STACKING ROI
+                    Hidden because the current individual stack uses full-frame automatic alignment.
+                    <div style="display:flex; gap:5px; margin-bottom:6px;">
+                        <button id="btn-stacking-roi" class="secondary"
+                            style="flex:1; font-size:0.8em; padding: 6px; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); color: #6ee7b7; display:flex; align-items:center; justify-content:center; gap:6px;"
+                            data-i18n="analysis.set_stacking_roi"><svg class="zas-icon"
+                                style="width:14px; height:14px; fill:none; stroke:currentColor;">
+                                <use href="#icon-ruler"></use>
+                            </svg><span>Definir Área de Apilado</span></button>
+                        <button id="btn-clear-roi" title="Quitar Área de Apilado" style="display:none; flex-shrink:0; width:34px; height:34px; padding:0; align-items:center; justify-content:center;
+                                   background: linear-gradient(135deg, rgba(239,68,68,0.18), rgba(180,30,30,0.10));
+                                   border: 1px solid rgba(239,68,68,0.40); border-top: 1px solid rgba(255,160,160,0.15);
+                                   border-radius:8px; color:#fca5a5; cursor:pointer;
+                                   backdrop-filter: blur(8px);
+                                   box-shadow: 0 2px 8px rgba(239,68,68,0.18), inset 0 1px 0 rgba(255,180,180,0.08);
+                                   transition: all 0.2s ease;">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                <polyline points="3 6 5 6 21 6" />
+                                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                                <path d="M10 11v6M14 11v6" />
+                                <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                            </svg>
+                        </button>
+                    </div>
+                    -->
+
+                    <!--
+                    LEGACY ANCHOR/ROI WARNING
+                    Hidden together with the manual anchor and ROI controls above.
+                    <div
+                        style="background: rgba(245,158,11,0.1); border:1px solid rgba(245,158,11,0.3); border-radius:6px; padding:7px 9px; margin-bottom:10px; display:flex; gap:7px; align-items:flex-start;">
+                        <span style="flex-shrink:0; color:#f59e0b; display:flex; align-items:center;"><svg
+                                class="zas-icon" style="width:16px; height:16px; fill:none; stroke:currentColor;">
+                                <use href="#icon-warning"></use>
+                            </svg></span>
+                        <p style="margin:0; font-size:0.72rem; color:#fcd34d; line-height:1.4;">
+                            <strong>Aviso:</strong> El Anclaje Manual y el Área de Apilado pueden generar resultados
+                            <strong>borrosos</strong> en modo Planetario. Úsalos solo si el apilado automático falla. Si
+                            el resultado sale borroso, usa el botón <em><svg class="zas-icon"
+                                    style="width:10px; height:10px; fill:none; stroke:currentColor; display:inline-block; vertical-align:middle; margin-right:2px;">
+                                    <use href="#icon-refresh"></use>
+                                </svg>Volver a Analizar</em> que aparece al
+                            finalizar el apilado.
+                        </p>
+                    </div>
+                    -->
+                    <button id="btn-run-analysis" class="success"
+                        style="background: linear-gradient(135deg, #7c3aed, #db2777);"
+                        data-i18n="general.start_analysis">⚡ Iniciar Analisis
+                        Completo</button>
+                </div>
+            </div>
+
+            <!-- BATCH PANEL (Refactored Flow) -->
+            <div id="panel-batch" class="card" style="display:none; border-left: 2px solid #a855f7;">
+                <h2
+                    style="color:#a855f7; border-bottom:1px solid rgba(168,85,247,0.3); padding-bottom:5px; margin-bottom:10px;">
+                    <span data-i18n="batch.title">Control de Lotes</span>
+                </h2>
+
+                <!-- 1. ORIGEN & TIPO -->
+                <div class="batch-step">
+                    <div class="step-label" data-i18n="batch.steps.source">1. Fuente</div>
+                    <div style="font-size:0.75rem; color:#cbd5e1; margin-bottom:5px;">
+                        <div style="display:flex; justify-content:space-between;">
+                            <span><span data-i18n="batch.source_videos">Videos:</span> <strong id="batch-count" style="color:#fff;">0</strong></span>
+                            <span id="batch-recursive-indicator"
+                                style="font-size:0.7rem; color:#94a3b8; display:none;" data-i18n="batch.recursive">(Recursivo)</span>
+                        </div>
+                        <div id="batch-source-path"
+                            style="font-style:italic; color:#64748b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:200px;">
+                            ...</div>
+                    </div>
+
+                    <!--
+                    LEGACY BATCH ENGINE SELECTOR
+                    Batch no longer branches through v1/v2/v3 UI values. The category selector below
+                    drives the same Zenith Ultimate flow as individual stacking, including batchMode,
+                    AP grid defaults and surface/planet behavior.
+                    <label style="font-size:0.7rem; color:#aaa;">Tipo de Objeto (Aplica a todo el lote)</label>
+                    <select id="sel-batch-type"
+                        style="background:#1e293b; color:white; border:1px solid #475569; padding:4px; border-radius:4px; width:100%; margin-top:2px;">
+                        <option value="planet_v3" data-i18n="video_settings.planet_v3">🌟 Planetario v3 (Precision High-SNR)</option>
+                        <option value="surface_v3" data-i18n="video_settings.surface_v3">✨ Superficie v3 (Precision-Edge)</option>
+                        <option value="planet_v2">🪐 Planetario v2 (PPA)</option>
+                        <option value="surface_v2">🌑 Superficie v2 (Features)</option>
+                        <option value="planet_v1" style="color:#64748b;">Planetario v1 (Legacy)</option>
+                        <option value="surface_v1" style="color:#64748b;">Superficie v1 (Legacy)</option>
+                    </select>
+                    -->
+
+                    <label style="font-size:0.7rem; color:#aaa; margin-top:10px; display:block;" data-i18n="batch.target_category">Categoría del Objetivo (Motor Zenith)</label>
+                    <select id="sel-batch-target-category"
+                        style="background:#0f172a; color:white; border:1px solid #334155; padding:4px; border-radius:4px; width:100%; margin-top:2px; font-size:0.75rem;">
+                        <option value="surface" data-i18n="analysis.targets.surface">🌕 Luna / Sol / Superficie (Extenso)</option>
+                        <option value="planet_small" data-i18n="analysis.targets.planet_small">🔴 Planeta / Fase Lunar</option>
+                    </select>
+                </div>
+
+                <!-- 2. REFERENCIA -->
+                <div class="batch-step">
+                    <div class="step-label" data-i18n="batch.steps.reference">2. Referencia</div>
+                    <button id="btn-batch-tune" class="primary" style="width:100%; font-size:0.8rem;" data-i18n="batch.reference.load_first_btn">
+                        📥 Cargar Video #1
+                    </button>
+                    <p style="font-size:0.65rem; color:#64748b; margin-top:4px;" data-i18n="batch.reference.description">Carga el primer video para calibrar.
+                    </p>
+                </div>
+
+                <!-- 3. ANALISIS -->
+                <div class="batch-step" id="batch-step-analysis" style="display:none;">
+                    <div class="step-label" data-i18n="batch.steps.analysis">3. Análisis</div>
+                    <p style="font-size:0.7rem; color:#94a3b8; margin:5px 0;" data-i18n="batch.analysis.description">Configura y ejecuta el análisis en el
+                        panel superior.</p>
+                    <!-- Telemetry Placeholder (Moved via JS) -->
+                    <div id="batch-telemetry-container" style="margin-top:5px;"></div>
+                </div>
+
+                <!-- 4. INTEGRACION (Apilado) -->
+                <div class="batch-step" id="batch-step-stacking" style="display:none;">
+                    <div class="step-label" data-i18n="batch.steps.stacking">4. Integración y Apilado</div>
+                    <!-- Stacking Slider & Controls (Moved via JS) -->
+                    <!-- Stacking Slider & Controls (Moved via JS) -->
+                    <div id="batch-stacking-container"
+                        style="background:rgba(0,0,0,0.2); padding:5px; border-radius:4px;">
+                        <!-- JS moves #panel-stacking here -->
+                    </div>
+
+                </div>
+
+                <!-- 5. POST-PROCESADO & EJECUCION -->
+                <div class="batch-step" id="batch-step-execution" style="display:none;">
+                    <button id="btn-batch-toggle-stacking" class="secondary"
+                        style="width:100%; font-size:0.75rem; padding:6px; margin-bottom:8px; opacity:0.7; background:rgba(168,85,247,0.1); border:1px dashed rgba(168,85,247,0.4); color:#c084fc; cursor:pointer; border-radius:4px; transition: all 0.2s;"
+                        onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.7'" data-i18n="batch.stacking.toggle">
+                        📋 Mostrar Integración y Apilado (Volver a apilar)
+                    </button>
+                    <div class="step-label" data-i18n="batch.steps.post">5. Post-Procesamiento (Wavelets)</div>
+                    <!-- Wavelets (Moved via JS) -->
+                    <div id="batch-wavelets-container">
+                        <!-- JS moves #panel-wavelets here if needed, or we rely on main view -->
+                        <p style="font-size:0.7rem; color:#94a3b8;" data-i18n="batch.post.description">Ajusta los Wavelets en el panel principal antes de
+                            continuar.</p>
+                    </div>
+
+                    <div style="margin-top:15px; border-top:1px dashed #475569; padding-top:10px;">
+                        <h3 style="color:#a855f7; font-size:0.9rem; margin-bottom:5px;" data-i18n="batch.execution.title">🚀 Ejecución Final</h3>
+                        <div class="progress-box" style="margin-bottom:8px;">
+                            <div
+                                style="display:flex; justify-content:space-between; font-size:0.7rem; margin-bottom:2px;">
+                                <span data-i18n="batch.execution.progress">Progreso:</span><span
+                                    id="batch-progress-text">0 / 0</span>
+                            </div>
+                            <div
+                                style="width:100%; height:6px; background:#1e293b; border-radius:3px; overflow:hidden;">
+                                <div id="batch-progress-bar"
+                                    style="width:0%; height:100%; background:#a855f7; transition:width 0.3s; box-shadow: 0 0 10px #a855f7;">
+                                </div>
+                            </div>
+                        </div>
+                        <button id="btn-batch-run" class="success" style="width:100%; font-size:1rem; padding:10px;" data-i18n="batch.execution.start_btn">
+                            Iniciar Lote Completo
+                        </button>
+
+                        <!-- BATCH: POST-STACK FRESH ANALYSIS HELP -->
+                        <div id="panel-batch-reanalyze"
+                            style="display:none; margin-top:10px; background: rgba(56,189,248,0.07); border:1px solid rgba(56,189,248,0.35); border-radius:7px; padding:9px 11px;">
+                            <div style="display:flex; align-items:center; gap:7px; margin-bottom:7px;">
+                                <span style="flex-shrink:0; color:#38bdf8; display:flex; align-items:center;"><svg
+                                        class="zas-icon"
+                                        style="width:16px; height:16px; fill:none; stroke:currentColor;">
+                                        <use href="#icon-refresh"></use>
+                                    </svg></span>
+                                <p style="color:#bfdbfe; font-size:0.78rem; font-weight:bold; margin:0;"
+                                    data-i18n="batch.reanalyze.title">¿Quieres recalcular el lote?</p>
+                            </div>
+                            <button id="btn-batch-reanalyze" class="btn-reanalyze-glass"
+                                style="width:100%; padding:7px; border-radius:5px; cursor:pointer; font-size:0.8rem; font-weight:bold; display:flex; align-items:center; justify-content:center; gap:6px;">
+                                <svg class="zas-icon" style="width:14px; height:14px; fill:none; stroke:currentColor;">
+                                    <use href="#icon-refresh"></use>
+                                </svg><span data-i18n="batch.reanalyze.button">Reanalizar datos del lote</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+
+            <!-- MOSAIC PANEL (Refactored) -->
+            <div id="panel-mosaic" class="card" style="display:none; height:auto; max-height:100%; overflow-y: auto;">
+                <div class="card-header">
+                    <h2 data-i18n="mosaic.title">Mosaico Magnetico</h2>
+                </div>
+
+                <!-- 1. Sources (Smart Import) -->
+                <div class="control-group" style="flex:0 0 auto;">
+                    <label data-i18n="mosaic.sources.title">1. Fuentes (Smart Import)</label>
+                    <div id="mosaic-dropzone"
+                        style="border: 2px dashed #334155; border-radius: 8px; padding: 15px; text-align: center; cursor: pointer; transition: all 0.2s; background: rgba(15, 23, 42, 0.4);">
+                        <div style="pointer-events: none;">
+                            <div style="font-size: 2rem; margin-bottom: 5px;">📂</div>
+                            <div style="font-weight: bold; color: #94a3b8;" data-i18n="mosaic.sources.select_files">
+                                Seleccionar Archivos</div>
+                            <div style="font-size: 0.8rem; color: #64748b;"
+                                data-i18n="mosaic.sources.supported_formats">Soporta .SER, .AVI, .PNG, .TIF</div>
+                        </div>
+                    </div>
+                    <div id="mosaic-sources-list" style="margin-top: 10px; max-height: 120px; overflow-y: auto;">
+                        <!-- JS populated -->
+                    </div>
+                    <div style="display:flex; justify-content:space-between; margin-top:5px;">
+                        <button id="btn-mosaic-auto" class="secondary" style="padding: 4px 8px; font-size: 0.8rem;"
+                            data-i18n="mosaic.sources.auto_organize">🪄
+                            Auto-Organizar</button>
+                        <button id="btn-mosaic-clear" class="secondary" style="padding: 4px 8px; font-size: 0.8rem;"
+                            data-i18n="mosaic.sources.clear">🗑
+                            Limpiar</button>
+                    </div>
+                </div>
+
+                <!-- 2. Workflow Controls -->
+                <div id="mosaic-workflow-controls" class="control-group"
+                    style="flex:0 0 auto; margin-top: 10px; border-top: 1px solid #334155; padding-top: 10px;">
+                    <label data-i18n="mosaic.workflow.title">2. Proceso de Apilado</label>
+
+                    <!-- Step A: Analysis -->
+                    <div id="mosaic-step-analyze">
+                        <p style="font-size: 0.8rem; color: #94a3b8; margin-bottom: 5px;"
+                            data-i18n="mosaic.workflow.analyze_description">Analiza los videos para
+                            determinar calidad.</p>
+                        <button id="btn-mosaic-analyze-all" class="primary" style="width:100%;"
+                            data-i18n="mosaic.workflow.analyze_btn">🔍 Analizar
+                            Todo</button>
+                    </div>
+
+                    <!-- Step B: Stacking Config (Hidden initially) -->
+                    <div id="mosaic-step-stack" style="display:none;">
+                        <div
+                            style="background: rgba(15, 23, 42, 0.6); padding: 10px; border-radius: 6px; margin-bottom: 5px;">
+                            <div style="font-size: 0.85rem; color: #bae6fd; margin-bottom: 5px;"><span
+                                    data-i18n="mosaic.workflow.quality_summary">📊 Resumen de Calidad:</span>
+                                <span id="mosaic-quality-summary" data-i18n="mosaic.workflow.pending">Pendiente</span>
+                            </div>
+
+                            <label style="font-size: 0.8rem;" data-i18n="mosaic.workflow.stack_percentage">Porcentaje a
+                                Apilar:</label>
+                            <div style="display:flex; align-items:center; gap:10px;">
+                                <input type="range" id="mosaic-stack-pct" min="1" max="100" value="20" style="flex:1;">
+                                <span id="mosaic-stack-pct-val" style="width: 30px; text-align:right;">20%</span>
+                            </div>
+                        </div>
+                        <button id="btn-mosaic-stack-all" class="primary" style="width:100%; background: #0ea5e9;"
+                            data-i18n="mosaic.workflow.stack_btn">📚
+                            Apilar por Lotes</button>
+                    </div>
+                </div>
+
+                <!-- 3. Generation -->
+                <div id="mosaic-step-generate" class="control-group"
+                    style="flex:0 0 auto; padding-top: 10px; border-top: 1px solid #334155; display:none;">
+
+                    <div style="font-style:italic; color:#64748b; font-size:0.75rem; margin-bottom:10px;"
+                        data-i18n="mosaic.generation.mode">
+                        Modo: <strong>Alineación Inteligente & Fundido Suave</strong>
+                    </div>
+
+                    <!-- GUIDED MODE TOGGLE -->
+                    <div
+                        style="margin-bottom: 10px; background: rgba(16, 185, 129, 0.1); padding: 8px; border-radius: 6px; border: 1px solid rgba(16, 185, 129, 0.3);">
+                        <label class="switch-container"
+                            style="display:flex; align-items:center; gap:10px; cursor:pointer;">
+                            <input type="checkbox" id="chk-mosaic-guided">
+                            <span style="font-size:0.9rem; font-weight:bold; color:#d1fae5;"
+                                data-i18n="mosaic.generation.guided_mode">Modo Guiado</span>
+                        </label>
+                        <div style="font-size:0.7rem; color:#94a3b8; margin-top:4px; line-height:1.2;"
+                            data-i18n="mosaic.generation.guided_description">
+                            Si está activo, respeta tu colocación manual como prioridad si no encuentra coincidencias
+                            claras.
+                        </div>
+                    </div>
+
+                    <button id="btn-mosaic-gen" class="success" style="width:100%; font-size: 1.1rem; padding: 12px;"
+                        data-i18n="mosaic.generation.create_btn">
+                        🧩 Crear Mosaico
+                    </button>
+                </div>
+
+                <!-- 4. Result Actions (Hidden initially) -->
+                <div id="mosaic-result-actions" class="control-group"
+                    style="display:none; padding-top: 10px; border-top: 1px solid #334155;">
+                    <label style="color:#10b981;" data-i18n="mosaic.results.title">Resultados Listos</label>
+                    <div style="display:flex; gap:10px; margin-bottom:10px;">
+                        <button id="btn-mosaic-save-png" class="success" style="flex:1;"
+                            data-i18n="mosaic.results.save_png">💾 PNG</button>
+                        <button id="btn-mosaic-save-tiff" class="primary" style="flex:1;"
+                            data-i18n="mosaic.results.save_tiff">💾 TIFF Pro</button>
+                    </div>
+                    <div style="display:flex; gap:10px; margin-bottom:10px;">
+                        <button id="btn-mosaic-redo" class="secondary" style="flex:1;" data-i18n="mosaic.results.redo">↩
+                            Rehacer</button>
+                        <button id="btn-mosaic-edit" class="secondary" style="flex:2;"
+                            data-i18n="mosaic.results.send_wavelets">🎨 Enviar a Wavelets</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- INFO / TELEMETRY PANEL (Restored) -->
+            <div id="panel-info" class="card" style="display:none;">
+                <h2 data-i18n="telemetry.title">Telemetria del Archivo</h2>
+                <div class="info-grid">
+                    <div class="info-item"><span class="info-label"
+                            data-i18n="telemetry.resolution">Resolucion</span><span class="info-val"
+                            id="info-res">-</span></div>
+                    <div class="info-item"><span class="info-label" data-i18n="telemetry.frames">Fotogramas</span><span
+                            class="info-val" id="info-frames">-</span></div>
+                    <div class="info-item"><span class="info-label" data-i18n="telemetry.bayer_matrix">Matriz
+                            Bayer</span><span class="info-val" id="info-pat" style="color:var(--accent);">-</span></div>
+                </div>
+
+                <div style="margin-top:10px; border-top:1px solid rgba(255,255,255,0.1); padding-top:10px;">
+                    <h3 style="font-size:0.7rem; color:#94a3b8; margin:0 0 8px 0; text-transform:uppercase;"
+                        data-i18n="telemetry.statistical_analysis">Analisis
+                        Estadistico</h3>
+                    <div class="info-grid">
+                        <div class="info-item"><span class="info-label" data-i18n="telemetry.avg_quality">✨ Calidad
+                                Media</span><span class="info-val" id="stat-avg-qual">-</span></div>
+                        <div class="info-item"><span class="info-label" data-i18n="telemetry.stability">📊
+                                Estabilidad</span><span class="info-val" id="stat-stability">-</span></div>
+                        <div class="info-item"><span class="info-label" data-i18n="telemetry.worst_score">🔻 Peor
+                                Nota</span><span class="info-val" id="stat-worst-score" style="color:#f87171;">-</span>
+                        </div>
+                        <div class="info-item"><span class="info-label" data-i18n="telemetry.best_score">🏆 Mejor
+                                Nota</span><span class="info-val" id="stat-best-score" style="color:#34d399;">-</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="panel-analysis" class="card" style="display:none;">
+                <h2 data-i18n="analysis.title">Integracion y Apilado</h2>
+
+                <div class="chart-controls">
+                    <div class="switch-container">
+                        <span class="switch-label" data-i18n="analysis.chart.time">Tiempo</span>
+                        <label class="switch">
+                            <input type="checkbox" id="chart-mode-switch" checked>
+                            <span class="slider"></span>
+                        </label>
+                        <span class="switch-label" style="color:#10b981;"
+                            data-i18n="analysis.chart.quality">Calidad</span>
+                    </div>
+                    <div class="chart-warning" data-i18n="analysis.chart.warning">Solo visual, no afecta apilado</div>
+                </div>
+
+                <div id="chart-wrapper"><canvas id="qualityChart"></canvas></div>
+
+                <div class="slider-container" style="margin-top:15px;">
+                    <div class="slider-labels"><span data-i18n="analysis.selection">Seleccion (Mejores %):</span><span
+                            id="pct-display" style="color:var(--accent);">20%</span></div>
+                    <input type="range" id="stack-slider" min="1" max="100" value="20">
+                </div>
+
+                <div style="margin-top:15px; border-top:1px solid #334155; padding-top:10px;">
+                    <div id="row-align-mode"
+                        style="display:none; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                        <span style="color:#aaa; font-size:0.8rem;" data-i18n="analysis.algorithm">Algoritmo</span>
+                        <select id="align-mode"
+                            style="background:#0f172a; color:#38bdf8; border:1px solid #334155; padding:2px; border-radius:4px; font-size:0.8rem;">
+                            <option value="zenith_map" data-i18n="analysis.algorithms.zenith_map">Zenith Estabilizado
+                                (Global)</option>
+                            <option value="zenith_v3" data-i18n="analysis.algorithms.zenith_v3">Zenith Precision v3
+                                (Global)</option>
+                            <option value="liquid_warping" data-i18n="analysis.algorithms.liquid_v2">Liquid Warping v2
+                                (Multi-Point)</option>
+                            <option value="liquid_v3" data-i18n="analysis.algorithms.liquid_v3">Zenith Precision v3
+                                (Multi-Point)</option>
+                            <option value="elite_v4" style="color:#f472b6; font-weight:bold;">Zenith Elite v4 (Neural-Restoration)</option>
+                        </select>
+                        <div id="liquid-warning"
+                            style="display:none; font-size:0.7rem; color:#f59e0b; margin-top:4px; font-style:italic; border-left:2px solid #f59e0b; padding-left:4px;"
+                            data-i18n="analysis.liquid_warning">
+                            ⚠ Experimental: Puede causar artefactos de malla.
+                        </div>
+                    </div>
+
+                    <!-- ZENITH ELITE V4 SETTINGS PANEL -->
+                    <div id="panel-elite-settings" style="display:none; background: rgba(244, 114, 182, 0.05); border: 1px solid rgba(244, 114, 182, 0.2); border-radius: 8px; padding: 10px; margin-top: 10px; margin-bottom: 10px;">
+                        <h3 style="color:#f472b6; font-size:0.85rem; margin-top:0; margin-bottom:10px; display:flex; align-items:center; gap:6px;">
+                            <span style="font-size:1.2rem;">🧬</span> Zenith Elite V4 Config
+                        </h3>
+
+                        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+                            <div class="elite-ctrl">
+                                <label style="font-size:0.7rem; color:#aaa; display:block;">PSF Radius</label>
+                                <input type="number" id="elite-psf-radius" value="15" min="5" max="50" style="width:100%; background:#1e293b; color:white; border:1px solid #334155; padding:3px; border-radius:4px;">
+                            </div>
+                            <div class="elite-ctrl">
+                                <label style="font-size:0.7rem; color:#aaa; display:block;">FWHM Pixels</label>
+                                <input type="number" id="elite-fwhm" value="2.5" step="0.1" style="width:100%; background:#1e293b; color:white; border:1px solid #334155; padding:3px; border-radius:4px;">
+                            </div>
+                            <div class="elite-ctrl">
+                                <label style="font-size:0.7rem; color:#aaa; display:block;">Airy Weight</label>
+                                <input type="number" id="elite-airy" value="0.3" step="0.1" style="width:100%; background:#1e293b; color:white; border:1px solid #334155; padding:3px; border-radius:4px;">
+                            </div>
+                            <div class="elite-ctrl" style="display:flex; align-items:center; gap:5px;">
+                                <input type="checkbox" id="elite-auto-psf" checked>
+                                <label style="font-size:0.7rem; color:#aaa;">Auto PSF (Limb)</label>
+                            </div>
+                            <div class="elite-ctrl">
+                                <label style="font-size:0.7rem; color:#aaa; display:block;">Iterations</label>
+                                <input type="number" id="elite-iter" value="15" min="1" max="50" style="width:100%; background:#1e293b; color:white; border:1px solid #334155; padding:3px; border-radius:4px;">
+                            </div>
+                            <div class="elite-ctrl">
+                                <label style="font-size:0.7rem; color:#aaa; display:block;">TV Lambda</label>
+                                <input type="number" id="elite-lambda" value="0.01" step="0.001" style="width:100%; background:#1e293b; color:white; border:1px solid #334155; padding:3px; border-radius:4px;">
+                            </div>
+                            <div class="elite-ctrl">
+                                <label style="font-size:0.7rem; color:#aaa; display:block;">SNR Floor</label>
+                                <input type="number" id="elite-snr" value="5.0" step="0.5" style="width:100%; background:#1e293b; color:white; border:1px solid #334155; padding:3px; border-radius:4px;">
+                            </div>
+                            <div class="elite-ctrl">
+                                <label style="font-size:0.7rem; color:#aaa; display:block;">Post-Sharpen</label>
+                                <input type="number" id="elite-sharpen" value="0.5" step="0.1" style="width:100%; background:#1e293b; color:white; border:1px solid #334155; padding:3px; border-radius:4px;">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="stacking-quality-options">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                        <span style="color:#aaa; font-size:0.8rem;" data-i18n="analysis.drizzle">Drizzle (Super-Res)
+                            <small class="pro-tag" style="color:#f59e0b; display:none;">PRO</small></span>
+                        <select id="drizzle-scale"
+                            style="background:#0f172a; color:#10b981; border:1px solid #334155; padding:2px; border-radius:4px; font-size:0.8rem;">
+                            <option value="1.0" selected data-i18n="analysis.drizzle_options.off">Off (1x)</option>
+                            <option value="1.5" data-i18n="analysis.drizzle_options.detail">1.5x (Detalle PRO)</option>
+                            <option value="2.0" data-i18n="analysis.drizzle_options.hd">2.0x (HD PRO)</option>
+                            <option value="3.0" data-i18n="analysis.drizzle_options.ultra">3.0x (Ultra PRO)</option>
+                            <option value="4.0" data-i18n="analysis.drizzle_options.extreme">4.0x (Extremo PRO)</option>
+                        </select>
+                    </div>
+                    <!-- DOUBLE PASS TOGGLE (default ON: en Superficie ejecuta la
+                         doble pasada real estilo AS!4 — re-alinea contra el apilado) -->
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                        <span style="color:#aaa; font-size:0.8rem;" data-i18n="analysis.double_pass">Alineación Doble
+                            Pasada</span>
+                        <label class="switch-container">
+                            <span class="switch" style="transform:scale(0.8);">
+                                <input type="checkbox" id="chk-double-pass" checked>
+                                <span class="slider round"></span>
+                            </span>
+                        </label>
+                    </div>
+                    <!-- NORMALIZE COLORS TOGGLE -->
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                        <span style="color:#aaa; font-size:0.8rem;" data-i18n="analysis.normalize_colors">Normalizar
+                            Colores (Auto-Balance)</span>
+                        <label class="switch-container">
+                            <span class="switch" style="transform:scale(0.8);">
+                                <input type="checkbox" id="chk-normalize-colors" checked>
+                                <span class="slider round"></span>
+                            </span>
+                        </label>
+                    </div>
+                    <!-- PHASE 12: AS! SHARPENED REPLICA -->
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                        <span style="color:#aaa; font-size:0.8rem;" data-i18n="analysis.sharpened_stack">Versión
+                            Sharpening (Detalles Extra)</span>
+                        <label class="switch-container">
+                            <span class="switch" style="transform:scale(0.8);">
+                                <input type="checkbox" id="chk-sharpened">
+                                <span class="slider round"></span>
+                            </span>
+                        </label>
+                    </div>
+
+                    <!-- NEW: Guided Sharpening Intensity Selector -->
+                    <div id="sharpen-intensity-container"
+                        style="display:none; margin-top:5px; margin-bottom:10px; background:rgba(16, 185, 129, 0.05); border:1px dashed rgba(16, 185, 129, 0.3); padding:8px; border-radius:6px;">
+                        <div
+                            style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                            <label style="font-size:0.75rem; color:#bae6fd;"
+                                data-i18n="analysis.sharpen_intensity">Intensidad de Detalle</label>
+                            <span style="font-size:0.6rem; color:#64748b; font-style:italic;"
+                                data-i18n="analysis.sharpen_multi_band">3-Band Engine</span>
+                        </div>
+                        <select id="sel-sharpen-intensity"
+                            style="width:100%; background:#0f172a; color:#10b981; border:1px solid #334155; padding:6px; border-radius:4px; font-size:0.8rem; cursor:pointer;">
+                            <option value="0.25" data-i18n="analysis.intensity_options.low">25% (Sutil / Conservador)
+                            </option>
+                            <option value="0.50" selected data-i18n="analysis.intensity_options.suggested">50%
+                                (Equilibrado / Sugerido)</option>
+                            <option value="0.75" data-i18n="analysis.intensity_options.high">75% (Agresivo / Detallado)
+                            </option>
+                            <option value="1.00" data-i18n="analysis.intensity_options.extreme">100% (Extremo /
+                                Procesado)</option>
+                        </select>
+                        <p style="font-size: 0.6rem; color: #64748b; margin-top: 5px;"
+                            data-i18n="analysis.sharpen_hint">Controla el peso de las bandas fina, media y estructura.
+                        </p>
+                    </div>
+                    </div>
+
+
+
+                    <div id="multipoint-wrapper" style="display:block;">
+                        <div id="multipoint-controls"
+                            style="background:rgba(0,0,0,0.2); padding:8px; border-radius:6px; margin-top:5px;">
+                            <div style="display:flex; gap:5px; margin-bottom:8px; align-items: center;">
+                                <span style="font-size:0.7em; color:#aaa;" data-i18n="analysis.ap_size">AP Size:</span>
+                                <select id="ap-size"
+                                    style="flex:1; background:#1e293b; color:white; border:none; padding:4px; border-radius:3px;">
+                                    <option value="8" data-i18n="analysis.ap_sizes.micro">Micro (8px)</option>
+                                    <option value="16" data-i18n="analysis.ap_sizes.ultra_fine">Ultra Fino (16px)
+                                    </option>
+                                    <option value="24" data-i18n="analysis.ap_sizes.small">Pequeño (24px)</option>
+                                    <option value="32" selected data-i18n="analysis.ap_sizes.fine">Fino (32px)</option>
+                                    <option value="48" data-i18n="analysis.ap_sizes.medium">Medio (48px)
+                                    </option>
+                                    <option value="104" data-i18n="analysis.ap_sizes.large">Grande (104px)</option>
+                                </select>
+                                <span style="font-size:0.7em; color:#aaa;" data-i18n="analysis.threshold">Umbral
+                                    (%):</span>
+                                <input type="number" id="ap-bright" value="15" min="0" max="100"
+                                    style="width:70px; background:#1e293b; color:white; border:none; text-align:center; border-radius:3px;">
+                            </div>
+                            <button id="btn-smart-grid" class="success"
+                                style="width:100%; font-size:0.8em; padding: 6px; margin-top:5px; background: linear-gradient(135deg, #a855f7, #ec4899); display:flex; align-items:center; justify-content:center; gap:6px;"
+                                data-i18n="analysis.generate_smart_points"><svg class="zas-icon"
+                                    style="width:14px; height:14px; fill:none; stroke:currentColor;">
+                                    <use href="#icon-magic"></use>
+                                </svg><span>Smart AP Generator (Auto)</span></button>
+                            <div style="margin-top:4px; font-size:0.7em; color:#aaa; text-align:right;"><span
+                                    data-i18n="analysis.active_points">Puntos
+                                    Activos:</span>
+                                <span id="ap-count" style="color:#38bdf8; font-weight:bold;">0</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div style="margin-top:15px;"><button id="btn-stack" class="success" disabled
+                        data-i18n="analysis.start_stacking">🚀 Iniciar
+                        Apilado</button></div>
+            </div>
+
+            <!-- POST-STACK FRESH ANALYSIS HELP -->
+            <div id="panel-reanalyze" class="card"
+                style="display:none; border-left: 3px solid #38bdf8; background: rgba(56,189,248,0.07); padding: 10px 12px;">
+                <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+                    <span style="flex-shrink:0; color:#38bdf8; display:flex; align-items:center;"><svg class="zas-icon"
+                            style="width:18px; height:18px; fill:none; stroke:currentColor;">
+                            <use href="#icon-refresh"></use>
+                        </svg></span>
+                    <p style="color:#bfdbfe; font-size:0.8rem; font-weight:bold; margin:0;"
+                        data-i18n="analysis.reanalyze.title">¿Quieres probar un análisis nuevo?
+                    </p>
+                </div>
+                <button id="btn-reanalyze" class="btn-reanalyze-glass"
+                    style="width:100%; padding:8px; border-radius:6px; cursor:pointer; font-size:0.82rem; font-weight:bold; letter-spacing:0.3px; display:flex; align-items:center; justify-content:center; gap:6px;">
+                    <svg class="zas-icon" style="width:14px; height:14px; fill:none; stroke:currentColor;">
+                        <use href="#icon-refresh"></use>
+                    </svg><span data-i18n="analysis.reanalyze.button">Reanalizar desde cero</span>
+                </button>
+            </div>
+
+            <div id="panel-tools" class="card" style="display:none; border-left: 1px solid #f59e0b;">
+                <h2 style="color:#f59e0b; border-bottom-color: rgba(245, 158, 11, 0.2);" data-i18n="tools.title">
+                    Herramientas de Edicion
+                </h2>
+                <div id="tools-main-view"><button id="btn-start-crop" class="primary"
+                        style="background: linear-gradient(135deg, #f59e0b, #d97706);" data-i18n="tools.crop_image">✂
+                        Recortar
+                        Imagen</button></div>
+                <div id="crop-controls" style="display:none; gap:10px; margin-top:10px;">
+                    <button id="btn-confirm-crop" class="success" data-i18n="tools.confirm">✔ Confirmar</button>
+                    <button id="btn-cancel-crop" class="primary" style="background: #ef4444; border:none;"
+                        data-i18n="tools.cancel">✖
+                        Cancelar</button>
+                </div>
+
+                <div id="crop-instr"
+                    style="display:none; margin-top:8px; font-size:0.7rem; color:#fcd34d; text-align:center;"
+                    data-i18n="tools.crop_instructions">
+                    Dibuja,
+                    arrastra o redimensiona</div>
+            </div>
+
+            <!-- Mosaic Viewport Overlay (Hidden by default) -->
+
+
+            <div id="panel-wavelets" class="card mode-glow-container" style="display:none;">
+                <div id="wavelets-signal-anchor"
+                    style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; border-bottom:1px solid rgba(255,255,255,0.05); padding-bottom:10px;">
+                    <h2 style="font-size:0.9rem; margin:0; color:#e2e8f0; display:flex; align-items:center; gap:8px;"
+                        data-i18n="wavelets.title">
+                        <span style="color:#60a5fa;">⚡</span> Procesamiento de Señal
+                    </h2>
+                    <span
+                        style="font-size:0.6rem; color:#64748b; border:1px solid #334155; padding:2px 4px; border-radius:4px; letter-spacing:0.05em; background:rgba(0,0,0,0.2);">
+                        32-BIT FLOAT
+                    </span>
+                </div>
+
+                <!-- Global Mode Switcher Row -->
+                <div class="glass-control-row pulse-glow-blue"
+                    style="display:flex; align-items:center; gap:12px; margin-bottom:15px; background:rgba(56, 189, 248, 0.03); border:1px solid rgba(56, 189, 248, 0.1); padding:8px 12px; border-radius:8px; transition:all 0.3s ease;">
+                    <div style="display:flex; flex-direction:column; gap:2px;">
+                        <span
+                            style="font-size:0.65rem; color:#38bdf8; font-weight:600; text-transform:uppercase; letter-spacing:0.02em;"
+                            data-i18n="wavelets.mode_label">Modo Nitidez:</span>
+                        <span style="font-size:0.55rem; color:#64748b; font-style:italic;"
+                            data-i18n="wavelets.engine_hint">Hybrid Processing
+                            Engine</span>
+                    </div>
+                    <select id="sel-sharpen-mode"
+                        style="flex:1; background:#0f172a; color:#f8fafc; border:1px solid #334155; border-radius:6px; font-size:0.75rem; padding:5px 10px; cursor:pointer; outline:none; transition:all 0.2s; box-shadow: 0 0 10px rgba(56, 189, 248, 0.05);">
+                        <option value="luminance" selected data-i18n="wavelets.modes.luminance">🔆 Luminancia (Y)
+                        </option>
+                        <option value="rgb" data-i18n="wavelets.modes.rgb">🌈 Canales (RGB)</option>
+                    </select>
+                </div>
+
+                <div class="control-group" style="border-left: 3px solid #60a5fa;">
+                    <div class="group-header">
+                        <h3 data-i18n="wavelets.deconvolution.title">Deconvolucion Zenith</h3>
+                        <span class="badge blue">DZ</span>
+                    </div>
+                    <div style="margin-bottom: 10px; display:flex; gap:5px; align-items: center;">
+                        <button id="btn-auto-psf" class="primary"
+                            style="flex: 1; font-size:0.75rem; padding: 6px; background: #6366f1;"
+                            data-i18n="wavelets.deconvolution.auto_analyze">🔮
+                            Auto-Analizar</button>
+                        <select id="sel-auto-mode"
+                            style="background:#0f172a; color:white; border:1px solid #334155; border-radius:4px; font-size:0.75rem; padding: 4px;">
+                            <option value="both" data-i18n="wavelets.deconvolution.modes.both">Ambos Motores</option>
+                            <option value="rl" data-i18n="wavelets.deconvolution.modes.adaptive">Solo Adaptativa
+                            </option>
+                            <option value="vc" data-i18n="wavelets.deconvolution.modes.projection">Solo Proyecc.
+                            </option>
+                        </select>
+                    </div>
+                    <div style="margin-bottom:8px;">
+                        <span style="font-size:0.7em; color:#aaa; font-weight:bold;"
+                            data-i18n="wavelets.deconvolution.adaptive_restoration">RESTAURACION
+                            ADAPTATIVA</span>
+                        <div class="control-row">
+                            <label data-i18n="wavelets.deconvolution.radius">Radio (σ)</label>
+                            <input type="range" id="sl-deconv-sigma" min="0" max="40" value="0" step="0.1"
+                                class="slider-blue">
+                            <input type="number" id="num-deconv-sigma" value="0.0" step="0.1" class="input-val">
+                        </div>
+                        <div class="control-row">
+                            <label data-i18n="wavelets.deconvolution.iterations">Iteraciones</label>
+                            <input type="range" id="sl-deconv-iter" min="0" max="10" value="0" step="1"
+                                class="slider-blue">
+                            <input type="number" id="num-deconv-iter" value="0" class="input-val">
+                        </div>
+                    </div>
+                    <div style="border-top:1px dashed #334155; padding-top:6px;">
+                        <span style="font-size:0.7em; color:#aaa; font-weight:bold;"
+                            data-i18n="wavelets.deconvolution.structural_projection">PROYECCION
+                            ESTRUCTURAL</span>
+                        <div class="control-row">
+                            <label data-i18n="wavelets.deconvolution.radius">Radio (σ)</label>
+                            <input type="range" id="sl-vc-sigma" min="0" max="40" value="0" step="0.1"
+                                class="slider-purple">
+                            <input type="number" id="num-vc-sigma" value="0.0" step="0.1" class="input-val">
+                        </div>
+                        <div class="control-row">
+                            <label data-i18n="wavelets.deconvolution.iterations">Iteraciones</label>
+                            <input type="range" id="sl-vc-iter" min="0" max="10" value="0" step="1"
+                                class="slider-purple">
+                            <input type="number" id="num-vc-iter" value="0" class="input-val">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="control-group" style="border-left: 3px solid #f472b6;">
+                    <div class="group-header">
+                        <h3 data-i18n="wavelets.high_frequency.title">Detalles Alta Frecuencia</h3><span
+                            class="badge pink">SUB-PIXEL</span>
+                    </div>
+                    <div class="ultra-grid">
+                        <div class="v-slider"><span>U1</span><input type="range" id="u1" min="0" max="50" step="0.1"
+                                value="0" class="slider-pink"><input type="number" id="num-u1" class="input-tiny"
+                                step="0.1" value="0">
+                        </div>
+                        <div class="v-slider"><span>U2</span><input type="range" id="u2" min="0" max="50" step="0.1"
+                                value="0" class="slider-pink"><input type="number" id="num-u2" class="input-tiny"
+                                step="0.1" value="0">
+                        </div>
+                        <div class="v-slider"><span>U3</span><input type="range" id="u3" min="0" max="50" step="0.1"
+                                value="0" class="slider-pink"><input type="number" id="num-u3" class="input-tiny"
+                                step="0.1" value="0">
+                        </div>
+                        <div class="v-slider"><span>U4</span><input type="range" id="u4" min="0" max="50" step="0.1"
+                                value="0" class="slider-pink"><input type="number" id="num-u4" class="input-tiny"
+                                step="0.1" value="0">
+                        </div>
+                        <div class="v-slider"><span>U5</span><input type="range" id="u5" min="0" max="50" step="0.1"
+                                value="0" class="slider-pink"><input type="number" id="num-u5" class="input-tiny"
+                                step="0.1" value="0">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="control-group" style="border-left: 3px solid #38bdf8;">
+                    <div class="group-header">
+                        <h3 data-i18n="wavelets.multiscale.title">Wavelets Multiescala</h3>
+                    </div>
+                    <div class="wavelet-row header-row"><span>#</span> <span
+                            data-i18n="wavelets.multiscale.intensity">Intensidad</span> <span>Val</span>
+                        <span data-i18n="wavelets.multiscale.noise_reduction">Red. Ruido</span> <span>Val</span>
+                    </div>
+                    <div class="wavelet-container">
+                        <div class="wavelet-row"><span class="layer-idx">1</span><input type="range" id="w1" min="0"
+                                max="50" step="0.1" value="0" class="slider-cyan"><input type="number" id="num-w1"
+                                step="0.1" value="0" class="input-val-w"><input type="range" id="d1" min="0" max="50"
+                                step="0.1" value="0" class="slider-green"><input type="number" id="num-d1" step="0.1"
+                                value="0" class="input-val-w">
+                        </div>
+                        <div class="wavelet-row"><span class="layer-idx">2</span><input type="range" id="w2" min="0"
+                                max="50" step="0.1" value="0" class="slider-cyan"><input type="number" id="num-w2"
+                                step="0.1" value="0" class="input-val-w"><input type="range" id="d2" min="0" max="50"
+                                step="0.1" value="0" class="slider-green"><input type="number" id="num-d2" step="0.1"
+                                value="0" class="input-val-w">
+                        </div>
+                        <div class="wavelet-row"><span class="layer-idx">3</span><input type="range" id="w3" min="0"
+                                max="50" step="0.1" value="0" class="slider-cyan"><input type="number" id="num-w3"
+                                step="0.1" value="0" class="input-val-w"><input type="range" id="d3" min="0" max="50"
+                                step="0.1" value="0" class="slider-green"><input type="number" id="num-d3" step="0.1"
+                                value="0" class="input-val-w">
+                        </div>
+                        <div class="wavelet-row"><span class="layer-idx">4</span><input type="range" id="w4" min="0"
+                                max="50" step="0.1" value="0" class="slider-cyan"><input type="number" id="num-w4"
+                                step="0.1" value="0" class="input-val-w"><input type="range" id="d4" min="0" max="50"
+                                step="0.1" value="0" class="slider-green"><input type="number" id="num-d4" step="0.1"
+                                value="0" class="input-val-w">
+                        </div>
+                        <div class="wavelet-row"><span class="layer-idx">5</span><input type="range" id="w5" min="0"
+                                max="50" step="0.1" value="0" class="slider-cyan"><input type="number" id="num-w5"
+                                step="0.1" value="0" class="input-val-w"><input type="range" id="d5" min="0" max="50"
+                                step="0.1" value="0" class="slider-green"><input type="number" id="num-d5" step="0.1"
+                                value="0" class="input-val-w">
+                        </div>
+                        <div class="wavelet-row"><span class="layer-idx">6</span><input type="range" id="w6" min="0"
+                                max="50" step="0.1" value="0" class="slider-cyan"><input type="number" id="num-w6"
+                                step="0.1" value="0" class="input-val-w"><input type="range" id="d6" min="0" max="50"
+                                step="0.1" value="0" class="slider-green"><input type="number" id="num-d6" step="0.1"
+                                value="0" class="input-val-w">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="control-group" style="border-left: 3px solid #fbbf24;">
+                    <div class="group-header">
+                        <h3 data-i18n="wavelets.post_processing_fine">Post-Procesado Fino</h3>
+                    </div>
+                    <div class="control-row"
+                        style="margin-bottom: 8px; background: rgba(56, 189, 248, 0.05); padding: 8px; border-radius: 6px; border: 1px dashed rgba(56, 189, 248, 0.3);">
+                        <label style="color:#38bdf8; font-weight:bold; width:100px;"
+                            data-i18n="wavelets.master_denoise">Master Denoise</label>
+                        <input type="range" id="sl-master-denoise" min="0" max="100" step="0.5" value="0"
+                            class="slider-cyan">
+                        <input type="number" id="num-master-denoise" value="0.0" step="0.5" class="input-val">
+                    </div>
+                    <div class="control-row"
+                        style="margin-top:-4px; margin-bottom:8px; padding:0 8px; gap:8px;">
+                        <label style="color:#94a3b8; font-size:0.72rem; width:100px;"
+                            data-i18n="wavelets.post.denoise_detail">Preservar detalle</label>
+                        <input type="range" id="sl-denoise-detail" min="0" max="100" step="1" value="70"
+                            class="slider-cyan">
+                        <input type="number" id="num-denoise-detail" value="70" step="1" class="input-val">
+                    </div>
+                    <div class="control-row"
+                        style="margin-top:-4px; margin-bottom:8px; padding:0 8px; gap:8px;">
+                        <label style="color:#94a3b8; font-size:0.72rem; width:100px;"
+                            data-i18n="wavelets.post.denoise_chroma">Ruido de color</label>
+                        <input type="range" id="sl-denoise-chroma" min="0" max="100" step="1" value="55"
+                            class="slider-cyan">
+                        <input type="number" id="num-denoise-chroma" value="55" step="1" class="input-val">
+                    </div>
+                    <div class="control-row">
+                            <label style="color:#22d3ee; font-weight:bold; width:100px;"
+                                data-i18n="wavelets.post.high_pass">High Pass</label>
+                        <input type="range" id="sl-crisp" min="0" max="50" step="0.1" value="0" class="slider-crisp">
+                        <input type="number" id="num-crisp" value="0.0" step="0.1" class="input-val">
+                    </div>
+                    <div
+                        style="background: rgba(255,255,255,0.03); border: 1px solid #475569; border-radius: 6px; padding: 6px; margin-top: 8px;">
+                        <div class="control-row">
+                            <label style="color:#fbbf24;" data-i18n="wavelets.post.smart_sharpen">Smart Sharpen</label>
+                            <input type="range" id="sl-usm-amt" min="0" max="50" step="0.1" value="0"
+                                class="slider-yellow">
+                            <input type="number" id="num-usm-amt" value="0.0" step="0.1" class="input-val">
+                        </div>
+                        <div class="control-row" style="margin-top:4px;">
+                            <label style="font-size:0.75em; color:#94a3b8;"
+                                data-i18n="wavelets.post.radius_auto">Radio (0 = Auto)</label>
+                            <input type="range" id="sl-usm-rad" min="0" max="10" step="0.1" value="0"
+                                class="slider-yellow">
+                            <input type="number" id="num-usm-rad" value="0.0" step="0.1" class="input-val">
+                        </div>
+                    </div>
+                    <div class="control-row" style="margin-top:8px;">
+                        <label style="color:#c084fc;">LCE / CLAHE</label>
+                        <input type="range" id="sl-lce-amt" min="0" max="100" step="0.1" value="0"
+                            class="slider-purple">
+                        <input type="number" id="num-lce-amt" value="0.0" step="0.1" class="input-val">
+                    </div>
+                    <div style="border-top:1px solid #334155; margin-top:10px; padding-top:10px;">
+                        <div class="control-row">
+                            <label data-i18n="wavelets.post.gamma">Gamma</label>
+                            <input type="range" id="sl-gamma" min="100" max="5000" value="1000" class="slider-yellow">
+                            <input type="number" id="num-gamma" value="1" step="0.01" min="0.10" max="5.00"
+                                class="input-val">
+                        </div>
+                        <div class="control-row">
+                            <label data-i18n="wavelets.post.saturation">Saturacion</label>
+                            <input type="range" id="sl-sat" min="0" max="5000" value="1000" class="slider-yellow">
+                            <input type="number" id="num-sat" value="1" step="0.01" min="0.00" max="5.00"
+                                class="input-val">
+                        </div>
+                        <div class="control-row">
+                            <label data-i18n="wavelets.post.contrast">Contraste</label>
+                            <input type="range" id="sl-contrast" min="100" max="3000" value="1000"
+                                class="slider-yellow">
+                            <input type="number" id="num-contrast" value="1" step="0.01" min="0.10" max="3.00"
+                                class="input-val">
+                        </div>
+                        <div class="control-row">
+                            <label data-i18n="wavelets.post.brightness">Brillo</label>
+                            <input type="range" id="sl-brightness" min="-1000" max="1000" value="0"
+                                class="slider-yellow">
+                            <input type="number" id="num-brightness" value="0" step="0.01" min="-1.00" max="1.00"
+                                class="input-val">
+                        </div>
+
+                        <div style="margin-top:8px; border-top:1px solid #334155; padding-top:8px;">
+                            <div class="control-row">
+                                <label data-i18n="wavelets.post.white_balance_r">White Balance (R)</label>
+                                <input type="range" id="sl-r-bal" min="-1000" max="1000" value="0"
+                                    class="slider-yellow">
+                                <input type="number" id="num-r-bal" value="0" step="0.01" min="-1.00" max="1.00"
+                                    class="input-val">
+                            </div>
+                            <div class="control-row">
+                                <label data-i18n="wavelets.post.white_balance_b">White Balance (B)</label>
+                                <input type="range" id="sl-b-bal" min="-1000" max="1000" value="0"
+                                    class="slider-yellow">
+                                <input type="number" id="num-b-bal" value="0" step="0.01" min="-1.00" max="1.00"
+                                    class="input-val">
+                            </div>
+                        </div>
+                        <div style="margin-top:10px;">
+                            <label data-i18n="wavelets.post.atmospheric_correction">Correccion Atmosferica (Alineacion RGB)</label>
+                            <div
+                                style="font-size:0.7em; color:#64748b; margin-bottom:4px; display:flex; justify-content:space-between;">
+                                <span data-i18n="wavelets.post.channel">Canal</span>
+                                <span data-i18n="wavelets.post.horizontal">Horizontal (X)</span>
+                                <span data-i18n="wavelets.post.vertical">Vertical (Y)</span>
+                            </div>
+                            <div class="rgb-grid">
+                                <span class="lbl-r">R</span> <input type="number" id="rx" placeholder="X" step="0.1"
+                                    value="0">
+                                <input type="number" id="ry" placeholder="Y" step="0.1" value="0">
+                                <span class="lbl-b">B</span> <input type="number" id="bx" placeholder="X" step="0.1"
+                                    value="0">
+                                <input type="number" id="by" placeholder="Y" step="0.1" value="0">
+                            </div>
+                        </div>
+                        <div class="control-row" style="margin-top:15px;">
+                            <label data-i18n="wavelets.post.blend">Mezcla (Blend)</label>
+                            <input type="range" id="blend-slider" min="0" max="100" value="100">
+                            <span id="blend-display"
+                                style="font-size:0.8em; width:35px; text-align:right; color:#aaa;">100%</span>
+                        </div>
+                        <div style="margin-top:10px; border-top:1px solid #334155; padding-top:8px;">
+                            <label style="font-size:0.85rem; color:#94a3b8; font-weight:bold;"
+                                data-i18n="wavelets.post.deringing">Reduccion de Artefactos
+                                (Deringing)</label>
+                            <div style="margin-top:5px;">
+                                <select id="sel-deringing-mode" class="input-val"
+                                    style="width:100%; margin-bottom:8px;">
+                                    <option value="0" selected data-i18n="wavelets.post.deringing_modes.off">Desactivado</option>
+                                    <option value="1" data-i18n="wavelets.post.deringing_modes.auto">Auto (Recomendado)</option>
+                                    <option value="2" data-i18n="wavelets.post.deringing_modes.manual">Manual</option>
+                                </select>
+                            </div>
+                            <div id="panel-deringing-manual"
+                                style="display:none; padding-left:5px; border-left:2px solid #334155;">
+                                <div class="control-row">
+                                    <label data-i18n="wavelets.post.threshold_sensitivity">Umbral (Sensibilidad)</label>
+                                    <input type="range" id="sl-dr-rad" min="0" max="500" value="100"
+                                        class="slider-yellow">
+                                    <input type="number" id="num-dr-rad" value="10" step="1" min="0" max="50"
+                                        class="input-val">
+                                </div>
+                                <div class="control-row">
+                                    <label data-i18n="wavelets.post.dark_rings">Oscuros (Dark Rings)</label>
+                                    <input type="range" id="sl-dr-dark" min="0" max="1000" value="500"
+                                        class="slider-yellow">
+                                    <input type="number" id="num-dr-dark" value="0.5" step="0.01" min="0" max="1"
+                                        class="input-val">
+                                </div>
+                                <div class="control-row">
+                                    <label data-i18n="wavelets.post.light_rings">Claros (Light Rings)</label>
+                                    <input type="range" id="sl-dr-light" min="0" max="1000" value="0"
+                                        class="slider-yellow">
+                                    <input type="number" id="num-dr-light" value="0" step="0.01" min="0" max="1"
+                                        class="input-val">
+                                </div>
+                                <div style="margin-top:8px; display:flex; align-items:center;">
+                                    <input type="checkbox" id="chk-dr-mask">
+                                    <label for="chk-dr-mask"
+                                        style="font-size:0.75rem; margin-left:6px; color:#fbbf24; cursor:pointer;"
+                                        data-i18n="wavelets.post.show_mask">Ver
+                                        Máscara (Show Mask)</label>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin-top:10px; display:flex; gap:10px;">
+                    <button id="btn-gen-mosaic" class="success" style="flex:2;">🧩 Generar Mosaico</button>
+                    <button id="btn-arrange-mosaic" class="primary" style="flex:1;">🖐 Organizar</button>
+                </div>
+                <div id="chk-mosaic-guided-wrapper" style="margin-top:8px; display:flex; align-items:center; gap:5px;">
+                    <input type="checkbox" id="chk-mosaic-guided" checked>
+                    <label for="chk-mosaic-guided" style="font-size:0.8rem; color:#cbd5e1; cursor:pointer;"
+                        title="Usa la posicion manual como ayuda si falla el automatico">Alineacion Asistida
+                        (Guiado)</label>
+                </div>
+
+                <div id="save-actions" style="margin-top:20px; display:flex; gap:10px;">
+                    <button id="btn-save-png" class="success" style="flex:1;"><span
+                            data-i18n="export.save_png">💾 Guardar PNG</span></button>
+                    <button id="btn-save-tiff" class="primary" style="flex:1;"><span
+                            data-i18n="export.save_tiff">💾 Guardar TIFF</span> <small class="pro-tag"
+                            style="color:#f59e0b; display:none; margin-left:5px;">PRO</small></button>
+                </div>
+            </div>
+        </div>
+
+        <div class="viewport" id="main-viewport" style="position: relative;">
+            <!-- Mosaic Viewport Overlay -->
+            <div id="mosaic-viewport-overlay"
+                style="display:none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 50;">
+                <div id="mosaic-canvas"
+                    style="width: 100%; height: 100%; pointer-events: auto; position: relative; overflow: hidden;">
+                    <div id="mosaic-grid-bg"
+                        style="position: absolute; width: 100%; height: 100%; opacity: 0.1; background-image: linear-gradient(#333 1px, transparent 1px), linear-gradient(90deg, #333 1px, transparent 1px); background-size: 50px 50px;">
+                    </div>
+                </div>
+            </div>
+            <div id="view-source" class="view-box">
+                <div class="view-label" data-i18n="viewer.source_mesh">Fuente / Malla</div>
+                <div class="zoom-target-container">
+                    <div class="zoom-content">
+                        <img id="img-source" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=" alt="">
+                        <canvas id="grid-overlay"></canvas>
+
+                        <!-- NEW: Stacking ROI Box -->
+                        <div id="stacking-roi-box"
+                            style="display:none; position:absolute; border-color: rgba(16, 185, 129, 0.8); box-shadow: 0 0 15px rgba(16, 185, 129, 0.4), 0 0 0 9999px rgba(0, 0, 0, 0.65); z-index:100; cursor:move;">
+                            <div class="crop-handle nw" data-dir="nw"></div>
+                            <div class="crop-handle n" data-dir="n"></div>
+                            <div class="crop-handle ne" data-dir="ne"></div>
+                            <div class="crop-handle w" data-dir="w"></div>
+                            <div class="crop-handle e" data-dir="e"></div>
+                            <div class="crop-handle sw" data-dir="sw"></div>
+                            <div class="crop-handle s" data-dir="s"></div>
+                            <div class="crop-handle se" data-dir="se"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div id="view-result" class="view-box" style="display:none; border-left:1px solid #334155;">
+                <div class="view-label"
+                    style="color:var(--success); display:flex; align-items:center; gap:12px; pointer-events:auto !important; width:auto; max-width:none;">
+                    <span data-i18n="viewer.processed_result">Resultado Procesado</span>
+                    <button id="btn-toggle-source"
+                        style="display:none; width:auto; flex-shrink:0; background:rgba(0,0,0,0.4); border:1px solid #334155; color:#cbd5e1; cursor:pointer; font-size:0.7rem; padding:2px 10px; border-radius:12px; backdrop-filter:blur(4px); white-space:nowrap; line-height:1.2; box-shadow:0 1px 2px rgba(0,0,0,0.2); pointer-events:auto;" data-i18n="viewer.hide_source">Ocultar
+                        Fuente</button>
+                </div>
+                <div id="local-processing-overlay" class="local-overlay">
+                    <div class="local-loader-box">
+                        <div class="astro-loader mini">
+                            <div class="astro-star"></div>
+                            <div class="orbit-sys outer">
+                                <div class="orbit-ring"></div>
+                                <div class="astro-planet planet-1"></div>
+                            </div>
+                            <div class="orbit-sys inner">
+                                <div class="orbit-ring"></div>
+                                <div class="astro-planet planet-2"></div>
+                            </div>
+                        </div>
+                        <div class="local-text" id="local-msg">Aplicando...</div>
+                        <div class="local-pct" id="local-pct">0%</div>
+                    </div>
+                </div>
+                <div class="zoom-target-container">
+                    <div class="zoom-content">
+                        <img id="img-result" alt="">
+                        <div id="crop-box">
+                            <div class="crop-grid-v v1"></div>
+                            <div class="crop-grid-v v2"></div>
+                            <div class="crop-grid-h h1"></div>
+                            <div class="crop-grid-h h2"></div>
+                            <div class="crop-handle nw" data-dir="nw"></div>
+                            <div class="crop-handle n" data-dir="n"></div>
+                            <div class="crop-handle ne" data-dir="ne"></div>
+                            <div class="crop-handle w" data-dir="w"></div>
+                            <div class="crop-handle e" data-dir="e"></div>
+                            <div class="crop-handle sw" data-dir="sw"></div>
+                            <div class="crop-handle s" data-dir="s"></div>
+                            <div class="crop-handle se" data-dir="se"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="console-panel">
+        <div class="console-header"><span>REGISTRO DEL SISTEMA</span><span style="cursor:pointer;"
+                onclick="document.getElementById('console-panel').classList.remove('open')">▼</span></div>
+        <div id="log-container"></div>
+    </div>
+
+    <div class="status-bar">
+        <div style="display:flex; gap:10px; align-items:center;">
+            <button id="btn-toggle-log">📋 LOGS</button>
+            <span id="status-text" style="color:var(--text-muted);">Listo.</span>
+        </div>
+        <div id="progress-container">
+            <div id="progress-fill"></div>
+        </div>
+    </div>
+
+    <div id="custom-modal-overlay" class="modal-overlay" style="z-index: 200000;">
+        <div class="modal-box">
+            <h3 id="modal-title">Atencion</h3>
+            <p id="modal-msg">Mensaje del sistema</p>
+            <div class="modal-buttons">
+                <button id="btn-modal-cancel" class="primary"
+                    style="background: rgba(255,255,255,0.1); white-space: normal; height: auto; min-height: 40px; padding: 10px; font-size: 0.9em;">Cancelar</button>
+                <button id="btn-modal-ok" class="success"
+                    style="background: linear-gradient(135deg, #f59e0b, #d97706); white-space: normal; height: auto; min-height: 40px; padding: 10px; font-size: 0.9em;">Confirmar</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="animation-modal" class="anim-modal" style="display:none;">
+        <div class="anim-content">
+            <div class="anim-viewport glow-border" id="anim-viewport"
+                style="display:flex; justify-content:center; align-items:center; overflow:hidden;">
+                <!-- Wrapper to constrain footer to image width -->
+                <div id="anim-img-wrapper"
+                    style="position:relative; display:flex; flex-direction:column; width:fit-content; max-width:100%; max-height:100%;">
+                    <div id="anim-image-container" style="position:relative;">
+                        <img id="anim-preview-img" src="" alt="Anim Preview"
+                            style="display:block; max-width:100%; max-height:80vh; object-fit:contain;">
+
+                        <!-- Watermark Overlay (On top of image) -->
+                        <div id="anim-watermark"
+                            style="position:absolute; bottom:10px; right:10px; color:rgba(255,255,255,0.5); font-weight:bold; font-size:14px; text-shadow:1px 1px 2px black; display:none; pointer-events:none;">
+                        </div>
+
+                        <!-- Crop Box (On top of image) -->
+                        <div id="anim-crop-box"
+                            style="display:none; position:absolute; top:0; left:0; border:1px solid #fcd34d; box-shadow:0 0 0 9999px rgba(0,0,0,0.75); z-index:50;">
+                            <div class="crop-handle nw" data-dir="nw"></div>
+                            <div class="crop-handle n" data-dir="n"></div>
+                            <div class="crop-handle ne" data-dir="ne"></div>
+                            <div class="crop-handle w" data-dir="w"></div>
+                            <div class="crop-handle e" data-dir="e"></div>
+                            <div class="crop-handle sw" data-dir="sw"></div>
+                            <div class="crop-handle s" data-dir="s"></div>
+                            <div class="crop-handle se" data-dir="se"></div>
+                        </div>
+
+                        <!--
+                        LEGACY ANIMATION REALIGN ROI
+                        Batch output is now auto-centered by category: surface uses the batch anchor stabilizer,
+                        and planetary stacks are recentered by CoG. Kept commented in case manual rescue
+                        realignment is needed later.
+                        <div id="anim-align-roi"
+                            style="display:none; position:absolute; top:33%; left:33%; width:33%; height:33%; border:2px solid #10b981; background:rgba(16, 185, 129, 0.2); box-shadow:0 0 0 9999px rgba(0,0,0,0.75); z-index:60; cursor:move;">
+                            <div
+                                style="position:absolute; top:-25px; left:0; background:#10b981; color:white; font-size:12px; padding:2px 6px; font-weight:bold;">
+                                TARGET (Drag Me)
+                            </div>
+                        </div>
+                        -->
+                    </div>
+
+                    <!-- Footer (Below image, taking full width of wrapper) -->
+                    <div id="anim-frame-bottom"
+                        style="background:white; color:black; padding:10px; display:flex; flex-direction:column; justify-content:center; align-items:flex-start; font-family:sans-serif; display:none; width:100%; box-sizing:border-box;">
+                    </div>
+                </div>
+            </div>
+
+            <!-- Frame Manager View (Hidden by default) -->
+            <!-- Frame Manager Window (Modal) -->
+            <div id="anim-frame-manager" class="glow-border"
+                style="display:none; flex-direction:column; background:#020617; position:absolute; top:50%; left:50%; transform:translate(-50%, -50%); width:90%; height:80%; z-index:50; box-shadow: 0 0 50px rgba(0,0,0,0.8); border-radius:12px;">
+                <div
+                    style="padding:10px; border-bottom:1px solid rgba(255,255,255,0.1); display:flex; justify-content:space-between; align-items:center;">
+                    <div>
+                        <h3 style="margin:0; font-size:1rem; color:#fff;" data-i18n="animation.frame_manager.title">Gestor de Frames</h3>
+                        <div id="anim-frame-manager-summary" style="margin-top:3px; font-size:0.7rem; color:#94a3b8;">0 / 0</div>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <span style="font-size:0.75rem; color:#94a3b8;" data-i18n="animation.frame_manager.zoom">Zoom</span>
+                        <button id="btn-anim-frame-zoom-out" class="secondary" style="width:32px; height:32px; padding:0;" data-i18n-title="animation.frame_manager.zoom_out" title="Alejar">−</button>
+                        <span id="anim-frame-zoom-value" style="min-width:48px; text-align:center; font-size:0.75rem; color:#e2e8f0;">160px</span>
+                        <button id="btn-anim-frame-zoom-in" class="secondary" style="width:32px; height:32px; padding:0;" data-i18n-title="animation.frame_manager.zoom_in" title="Acercar">+</button>
+                    </div>
+                </div>
+                <div id="anim-frame-grid">
+                    <!-- Thumbnails injected here -->
+                </div>
+                <div style="padding:10px; border-top:1px solid rgba(255,255,255,0.1); display:flex; gap:10px;">
+                    <button id="btn-anim-apply-frames" class="primary" style="font-size:0.8rem; padding:8px;" data-i18n="animation.frame_manager.apply">Aplicar
+                        Cambios</button>
+                    <button id="btn-anim-cancel-frames" class="secondary"
+                        style="font-size:0.8rem; padding:8px; background:#ef4444;" data-i18n="general.cancel">Cancelar</button>
+                </div>
+            </div>
+
+            <div class="anim-sidebar">
+                <h3 data-i18n="animation.editor_title">Editor de Animacion</h3>
+
+                <div class="control-group" style="margin-bottom: 10px;">
+                    <div style="display:flex; flex-direction: column; gap:10px;">
+                        <!--
+                        LEGACY ANIMATION REALIGN BUTTONS
+                        Hidden because batch now emits centered animation frames automatically.
+                        Keep these commented controls as a manual fallback for old exports.
+                        <button id="btn-anim-realign" class="secondary" style="font-size:0.8rem; padding: 8px 12px;">
+                            🪐 Realinear Planetas
+                        </button>
+                        <button id="btn-anim-realign-surface" class="secondary"
+                            style="font-size:0.8rem; padding: 8px 12px;">
+                            🌑 Alinear Superficie
+                        </button>
+                        -->
+                        <button id="btn-anim-manage-frames" class="secondary"
+                            style="font-size:0.8rem; padding: 8px 12px; background:linear-gradient(135deg, #6366f1, #8b5cf6);"
+                            data-i18n="animation.manage_frames">
+                            🎞 Frames
+                        </button>
+                    </div>
+                    <p style="font-size:0.65rem; color:#94a3b8; margin:2px 0 0 0; text-align:center;" data-i18n="animation.manage_frames_hint">Elimina
+                        frames defectuosos.</p>
+                </div>
+
+                <!-- PLANETARY DEROTATION SECTION -->
+                <div class="control-group" style="margin-bottom:10px;">
+                    <div style="display:flex; align-items:center; gap:6px; padding:8px;
+                        background:rgba(139,92,246,0.1); border:1px solid rgba(139,92,246,0.3); border-radius:8px; cursor:pointer;"
+                        onclick="document.getElementById('chk-anim-derotate').click()">
+                        <input type="checkbox" id="chk-anim-derotate" onclick="event.stopPropagation()">
+                        <label for="chk-anim-derotate"
+                            style="font-size:0.8rem; color:#c4b5fd; cursor:pointer; font-weight:bold;"
+                            data-i18n="animation.derotation.title">
+                            🪐 Derotación Planetaria
+                        </label>
+                    </div>
+                    <div id="anim-derot-options" style="display:none; margin-top:6px; padding:8px;
+                        background:rgba(0,0,0,0.3); border-radius:8px; border:1px solid rgba(139,92,246,0.15);">
+                        <label
+                            data-i18n="animation.derotation.planet"
+                            style="color:#94a3b8; font-size:0.7rem; display:block; margin-bottom:4px;">Planeta</label>
+                        <div id="anim-derot-planet-selector" style="display:flex; gap:6px; margin-bottom:8px;">
+                            <button class="planet-icon active" data-planet="jupiter" title="Jupiter"
+                                style="width:36px; height:36px; border-radius:50%; background:rgba(139,92,246,0.2); border:2px solid #8b5cf6; color:#c4b5fd; font-size:1.2rem; cursor:pointer; transition:all 0.3s;">♃</button>
+                            <button class="planet-icon" data-planet="saturn" title="Saturn"
+                                style="width:36px; height:36px; border-radius:50%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); color:#94a3b8; font-size:1.2rem; cursor:pointer; transition:all 0.3s;">♄</button>
+                            <button class="planet-icon" data-planet="mars" title="Mars"
+                                style="width:36px; height:36px; border-radius:50%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); color:#94a3b8; font-size:1.2rem; cursor:pointer; transition:all 0.3s;">♂</button>
+                        </div>
+                        <label style="color:#94a3b8; font-size:0.7rem; display:block; margin-bottom:4px;" data-i18n="animation.derotation.cm_system">Sistema
+                            CM</label>
+                        <select id="anim-derot-cm-system"
+                            style="width:100%; background:#0f172a; border:1px solid #334155; color:#e2e8f0; font-size:0.75rem; padding:4px; border-radius:4px; margin-bottom:8px;">
+                            <option value="1" selected>CM2 (870.27°/d — Tormentas)</option>
+                            <option value="0">CM1 (877.90°/d — Ecuatorial)</option>
+                            <option value="2">CM3 (870.54°/d — Radio/Magnético)</option>
+                        </select>
+                        <label style="color:#94a3b8; font-size:0.7rem; display:block; margin-bottom:4px;" data-i18n="animation.derotation.limb_correction">Corrección
+                            de
+                            Limbo</label>
+                        <input type="range" id="sl-anim-derot-limb" min="0" max="2" step="0.1" value="0.5"
+                            style="width:100%;">
+                        <p style="font-size:0.6rem; color:#64748b; margin:4px 0 0 0;" data-i18n="animation.derotation.limb_hint">Compensa el oscurecimiento del
+                            borde del planeta para un apilado uniforme.</p>
+                    </div>
+                </div>
+
+                <div class="control-group">
+                    <label data-i18n="animation.speed_label">Velocidad (ms)</label>
+                    <div style="display:flex; gap:10px; align-items:center;">
+                        <input type="range" id="anim-speed" min="20" max="500" value="100" step="10" style="flex:1;">
+                        <span id="anim-speed-val" style="width:50px; text-align:right;">100ms</span>
+                    </div>
+                </div>
+
+                <!-- Playback Controls: Play/Pause + Prev/Next + Frame Counter -->
+                <div style="display:flex; gap:6px; align-items:center; margin-top:5px;">
+                    <button id="btn-anim-prev" class="secondary"
+                        style="padding:6px 10px; font-size:0.9rem; flex:0; min-width:36px;"
+                        data-i18n-title="animation.previous_frame" title="Frame Anterior">⏮</button>
+                    <button id="btn-anim-playpause" class="primary"
+                        style="padding:6px 14px; font-size:0.9rem; flex:1; background:linear-gradient(135deg, #10b981, #059669);"
+                        data-i18n-title="animation.play_pause" title="Play / Pause">⏸</button>
+                    <button id="btn-anim-next" class="secondary"
+                        style="padding:6px 10px; font-size:0.9rem; flex:0; min-width:36px;"
+                        data-i18n-title="animation.next_frame" title="Frame Siguiente">⏭</button>
+                </div>
+                <div id="anim-frame-counter"
+                    style="text-align:center; font-size:0.75rem; color:#94a3b8; margin-top:4px; font-variant-numeric: tabular-nums;">
+                    Frame 1 / 1</div>
+
+                <div class="checkbox-row">
+                    <input type="checkbox" id="anim-boomerang">
+                    <label for="anim-boomerang" data-i18n="animation.boomerang">Efecto Boomerang</label>
+                </div>
+
+                <div class="control-group">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <label data-i18n="animation.visual_filters">Filtros de Visualizacion</label>
+                        <button id="btn-anim-reset-filters" class="secondary"
+                            style="font-size:0.65rem; padding:3px 8px; opacity:0.7; border-radius:4px;"
+                            data-i18n-title="animation.reset_filters_title"
+                            title="Restaurar todos los filtros a valores por defecto" data-i18n="animation.reset_filters">🔄 Reset</button>
+                    </div>
+                    <div class="slider-mini-row">
+                        <span data-i18n="animation.brightness">Brillo</span>
+                        <input type="range" id="sl-anim-bright" min="-1" max="1" step="0.1" value="0" style="flex:1;">
+                        <input type="number" id="num-anim-bright" value="0.0" step="0.1" class="input-tiny"
+                            style="width:60px;">
+                    </div>
+                    <div class="slider-mini-row" style="margin-top:5px;">
+                        <span data-i18n="animation.contrast_short">Contr.</span>
+                        <input type="range" id="sl-anim-contrast" min="0.5" max="2" step="0.1" value="1"
+                            style="flex:1;">
+                        <input type="number" id="num-anim-contrast" value="1.0" step="0.1" class="input-tiny"
+                            style="width:60px;">
+                    </div>
+                    <div class="slider-mini-row" style="margin-top:5px;">
+                        <span data-i18n="animation.saturation_short">Satur.</span>
+                        <input type="range" id="sl-anim-sat" min="0" max="3" step="0.1" value="1" style="flex:1;">
+                        <input type="number" id="num-anim-sat" value="1.0" step="0.1" class="input-tiny"
+                            style="width:60px;">
+                    </div>
+                    <!-- New Filters -->
+                    <div class="slider-mini-row" style="margin-top:5px;">
+                        <span data-i18n="animation.gamma">Gamma</span>
+                        <input type="range" id="sl-anim-gamma" min="0.1" max="3.0" step="0.1" value="1.0"
+                            style="flex:1;">
+                        <input type="number" id="num-anim-gamma" value="1.0" step="0.1" class="input-tiny"
+                            style="width:60px;">
+                    </div>
+                    <div class="slider-mini-row" style="margin-top:5px;">
+                        <span data-i18n="animation.hue">Hue</span>
+                        <input type="range" id="sl-anim-hue" min="-180" max="180" step="1" value="0" style="flex:1;">
+                        <input type="number" id="num-anim-hue" value="0" step="1" class="input-tiny"
+                            style="width:60px;">
+                    </div>
+                    <div style="margin-top:5px; padding-top:5px; border-top:1px dashed #334155;">
+                        <div style="display:flex; justify-content:space-between; font-size:0.8rem; margin-bottom:5px;">
+                            <span data-i18n="animation.levels">Niveles (Negro/Blanco)</span>
+                        </div>
+                        <div class="slider-mini-row">
+                            <span style="color:#94a3b8;">Bk</span>
+                            <input type="range" id="sl-anim-lvl-black" min="0" max="1" step="0.01" value="0"
+                                style="flex:1;">
+                            <input type="number" id="num-anim-lvl-black" value="0.0" step="0.01" min="0" max="1"
+                                class="input-tiny" style="width:60px;">
+                        </div>
+                        <div class="slider-mini-row" style="margin-top:2px;">
+                            <span style="color:#f1f5f9;">Wh</span>
+                            <input type="range" id="sl-anim-lvl-white" min="0" max="1" step="0.01" value="1"
+                                style="flex:1;">
+                            <input type="number" id="num-anim-lvl-white" value="1.0" step="0.01" min="0" max="1"
+                                class="input-tiny" style="width:60px;">
+                        </div>
+                    </div>
+                    <div style="margin-top:8px;">
+                        <label style="font-size:0.8rem;" data-i18n="animation.color_filter">Filtro de Color (Mono)</label>
+                        <select id="sel-anim-color-filter"
+                            style="width:100%; background:#0f172a; color:white; border:1px solid #334155; padding:4px; border-radius:4px; font-size:0.8rem;">
+                            <option value="none" data-i18n="animation.color_filters.none">Sin Filtro</option>
+                            <option value="solar-ha-gold" data-i18n="animation.color_filters.solar_ha_gold">Solar H-alpha Dorado</option>
+                            <option value="solar-orange" data-i18n="animation.color_filters.solar_orange">Solar Naranja</option>
+                            <option value="solar-yellow" data-i18n="animation.color_filters.solar_yellow">Solar Amarillo</option>
+                            <option value="h-alpha" data-i18n="animation.color_filters.h_alpha">H-Alpha (Rojo)</option>
+                            <option value="calcium-k" data-i18n="animation.color_filters.calcium_k">Calcio-K (Azul/Violeta)</option>
+                        </select>
+                        <div id="anim-color-tuning" style="margin-top:8px; padding-top:8px; border-top:1px dashed #334155;">
+                            <div class="slider-mini-row">
+                                <span data-i18n="animation.color_strength_short">Color</span>
+                                <input type="range" id="sl-anim-color-strength" min="0" max="1" step="0.05" value="1" style="flex:1;">
+                                <input type="number" id="num-anim-color-strength" value="1.00" min="0" max="1" step="0.05"
+                                    class="input-tiny" style="width:60px;">
+                            </div>
+                            <div class="slider-mini-row" style="margin-top:5px;">
+                                <span data-i18n="animation.highlight_protect_short">Altas</span>
+                                <input type="range" id="sl-anim-highlight-protect" min="0" max="1" step="0.05" value="0.35" style="flex:1;">
+                                <input type="number" id="num-anim-highlight-protect" value="0.35" min="0" max="1" step="0.05"
+                                    class="input-tiny" style="width:60px;">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin-top:10px;">
+                    <label style="font-size:0.8rem;" data-i18n="animation.manual_color">Color Manual (Tint)</label>
+                    <div class="slider-mini-row">
+                        <span style="color:#f87171;">R</span>
+                        <input type="range" id="sl-anim-tint-r" min="0" max="255" value="255" style="flex:1;">
+                        <input type="number" id="num-anim-tint-r" value="255"
+                            style="width:65px; text-align:center; font-size:0.85rem; padding:2px 4px; background:#0f172a; border:1px solid #334155; color:#fff;">
+                    </div>
+                    <div class="slider-mini-row" style="margin-top:2px;">
+                        <span style="color:#4ade80;">G</span>
+                        <input type="range" id="sl-anim-tint-g" min="0" max="255" value="255" style="flex:1;">
+                        <input type="number" id="num-anim-tint-g" value="255"
+                            style="width:65px; text-align:center; font-size:0.85rem; padding:2px 4px; background:#0f172a; border:1px solid #334155; color:#fff;">
+                    </div>
+                    <div class="slider-mini-row" style="margin-top:2px;">
+                        <span style="color:#60a5fa;">B</span>
+                        <input type="range" id="sl-anim-tint-b" min="0" max="255" value="255" style="flex:1;">
+                        <input type="number" id="num-anim-tint-b" value="255"
+                            style="width:65px; text-align:center; font-size:0.85rem; padding:2px 4px; background:#0f172a; border:1px solid #334155; color:#fff;">
+                    </div>
+                </div>
+
+                <div style="margin-top:10px; display:flex; gap:10px;">
+                    <button id="btn-anim-rotate" class="secondary" style="flex:1; font-size:0.8rem;"
+                        data-i18n="animation.rotate_90">🔄 Rotar
+                        90°</button>
+                    <button id="btn-anim-normalize" class="secondary" style="flex:1; font-size:0.8rem;"
+                        data-i18n="animation.normalize_brightness">💡
+                        Normalizar
+                        Brillo</button>
+                </div>
+
+                <div style="margin-top:15px; border-top:1px solid rgba(255,255,255,0.1); padding-top:10px;">
+                    <label data-i18n="animation.overlays_text">Overlays / Texto</label>
+                    <select id="sel-anim-overlay-mode"
+                        style="width:100%; margin-bottom:10px; background:#0f172a; color:white; border:1px solid #334155; padding:5px; border-radius:4px;">
+                        <option value="none" data-i18n="animation.overlay_modes.none">Sin Overlay</option>
+                        <option value="watermark" data-i18n="animation.overlay_modes.watermark">Marca de Agua</option>
+                        <option value="frame" data-i18n="animation.overlay_modes.frame">Marco de Datos</option>
+                    </select>
+
+                    <div id="panel-overlay-watermark" class="overlay-panel">
+                        <input type="text" id="input-anim-watermark-text" class="mini-input-text"
+                            placeholder="Texto marca de agua..." data-i18n="animation.placeholders.watermark">
+                        <div class="slider-mini-row">
+                            <span data-i18n="animation.opacity_short">Opac.</span>
+                            <input type="range" id="sl-anim-watermark-op" min="0" max="100" value="50" style="flex:1;">
+                            <input type="number" id="num-anim-watermark-op" value="0.5" step="0.1"
+                                style="width:40px; background:#0f172a; border:1px solid #334155; color:#fff;">
+                        </div>
+                    </div>
+
+                    <div id="panel-overlay-frame" class="overlay-panel">
+                        <input type="text" id="input-anim-frame-title" class="mini-input-text"
+                            placeholder="Titulo (Ej. Jupiter)" data-i18n="animation.placeholders.title">
+                        <div style="display:flex; gap:5px;">
+                            <input type="text" id="input-anim-frame-tele" class="mini-input-text"
+                                placeholder="Telescopio" data-i18n="animation.placeholders.telescope">
+                            <input type="text" id="input-anim-frame-cam" class="mini-input-text" placeholder="Camara" data-i18n="animation.placeholders.camera">
+                        </div>
+                        <input type="text" id="input-anim-frame-other" class="mini-input-text"
+                            placeholder="Otros datos..." data-i18n="animation.placeholders.other">
+                    </div>
+
+                    <div style="margin-top:5px;">
+                        <label style="font-size:0.8rem;" data-i18n="animation.font">Fuente</label>
+                        <select id="sel-anim-font"
+                            style="width:100%; background:#0f172a; color:white; border:1px solid #334155; padding:5px; border-radius:4px;">
+                            <option value="Arial">Arial</option>
+                            <option value="Verdana">Verdana</option>
+                            <option value="Times New Roman">Times New Roman</option>
+                            <option value="Courier New">Courier New</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="anim-actions">
+                    <div id="anim-crop-controls" style="display:none; gap:5px; margin-bottom:5px;">
+                        <button id="btn-anim-crop-confirm" class="success" style="flex:1; font-size:0.8rem;" data-i18n="animation.crop.confirm">✂
+                            Recortar</button>
+                        <button id="btn-anim-crop-cancel" class="destructive" style="flex:1; font-size:0.8rem;" data-i18n="general.cancel">✖
+                            Cancelar</button>
+                    </div>
+                    <button id="btn-anim-crop-start" class="secondary"
+                        style="width:100%; border:1px dashed #fbbf24; color:#fbbf24;" data-i18n="animation.crop.start">✂ Recortar
+                        Animacion</button>
+
+                    <div style="margin-top:15px; border-top:1px solid rgba(255,255,255,0.1); padding-top:15px;">
+                        <label style="display:block; margin-bottom:5px; font-size:0.8rem;" data-i18n="animation.export.format_label">Formato de
+                            Exportacion</label>
+                        <select id="anim-format"
+                            style="width:100%; background:#0f172a; color:#fff; border:1px solid #334155; padding:10px; border-radius:6px; margin-bottom:10px;">
+                            <option value="mp4" data-i18n="animation.export.formats.mp4">Video MP4 (H.264)</option>
+                            <option value="avi" data-i18n="animation.export.formats.avi">Video AVI (MPEG-4)</option>
+                            <option value="gif" data-i18n="animation.export.formats.gif">Animacion GIF</option>
+                        </select>
+
+                        <label style="display:block; margin-bottom:5px; font-size:0.8rem;" data-i18n="animation.export.rescale_label">Reescalar Salida</label>
+                        <select id="anim-rescale"
+                            style="width:100%; background:#0f172a; color:#fff; border:1px solid #334155; padding:10px; border-radius:6px; margin-bottom:10px;">
+                            <option value="0.5">50% (Mini / Web)</option>
+                            <option value="1.0" selected>100% (Original)</option>
+                            <option value="1.5">150% (HD Up)</option>
+                            <option value="2.0">200% (Retina / Desktop)</option>
+                            <option value="4.0">400% (Ultra / Poster)</option>
+                            <option value="5.0">500% (Extreme)</option>
+                            <option value="6.0">600% (Super Zoom)</option>
+                            <option value="7.0">700% (Maximum)</option>
+                        </select>
+
+                        <label style="display:block; margin-bottom:5px; font-size:0.8rem;" data-i18n="animation.export.quality_label">Calidad de
+                            Exportación</label>
+                        <select id="anim-export-quality"
+                            style="width:100%; background:#0f172a; color:#fff; border:1px solid #334155; padding:10px; border-radius:6px; margin-bottom:10px;">
+                            <option value="faster" data-i18n="animation.export.qualities.faster">Rapido (Mucha Compresión)</option>
+                            <option value="balanced" selected data-i18n="animation.export.qualities.balanced">Equilibrado (Velocidad/Calidad)</option>
+                            <option value="quality" data-i18n="animation.export.qualities.quality">Calidad (Lento pero Mejor)</option>
+                        </select>
+
+                        <button id="btn-anim-export" class="primary"
+                            style="width:100%; padding:15px; font-size:1rem; font-weight:bold; text-transform:uppercase; letter-spacing:1px; box-shadow:0 4px 6px rgba(0,0,0,0.3);"
+                            data-i18n="animation.export.file_button">
+                            💾 Exportar Archivo
+                        </button>
+                    </div>
+                    <button id="btn-anim-cancel" class="destructive" style="width:100%;" data-i18n="animation.close_editor">Cerrar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- PLANETARY DEROTATION MODAL (Standalone Mode) -->
+    <div id="derotation-modal" class="modal-overlay"
+        style="display:none; z-index:9990; backdrop-filter:blur(20px); background:rgba(0,0,0,0.85);">
+        <div
+            style="width:90%; max-width:900px; background:rgba(15,23,42,0.95); border:1px solid rgba(139,92,246,0.3); border-radius:16px; padding:30px; box-shadow:0 0 60px rgba(139,92,246,0.15), 0 20px 40px rgba(0,0,0,0.5); backdrop-filter:blur(20px); max-height:90vh; overflow-y:auto;">
+
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+                <h2 style="margin:0; color:#c4b5fd; font-size:1.3rem;">🪐 Derotación Planetaria</h2>
+                <button id="btn-derot-close"
+                    style="background:none; border:none; color:#64748b; font-size:1.5rem; cursor:pointer;"
+                    title="Cerrar">×</button>
+            </div>
+
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
+                <!-- LEFT: Image Preview + Wireframe -->
+                <div>
+                    <div id="derot-preview-container"
+                        style="background:#020617; border-radius:10px; border:1px solid rgba(255,255,255,0.1); aspect-ratio:1; display:flex; justify-content:center; align-items:center; position:relative; overflow:hidden;">
+                        <img id="derot-preview-img" src=""
+                            style="max-width:100%; max-height:100%; object-fit:contain; display:none;">
+                        <canvas id="derot-wireframe-canvas"
+                            style="position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none;"></canvas>
+                        <span id="derot-placeholder" style="color:#475569; font-size:0.9rem;">Arrastra una
+                            imagen o haz clic en Cargar</span>
+                    </div>
+                    <div id="derot-quality-indicator"
+                        style="display:flex; align-items:center; gap:8px; margin-top:8px; padding:6px 10px; background:rgba(0,0,0,0.3); border-radius:6px;">
+                        <div id="derot-quality-dot"
+                            style="width:8px; height:8px; border-radius:50%; background:#22c55e;"></div>
+                        <span id="derot-quality-text" style="font-size:0.75rem; color:#94a3b8;">Listo</span>
+                    </div>
+                </div>
+
+                <!-- RIGHT: Controls -->
+                <div style="display:flex; flex-direction:column; gap:12px;">
+                    <!-- Image Input -->
+                    <div
+                        style="background:rgba(255,255,255,0.03); padding:12px; border-radius:8px; border:1px solid rgba(255,255,255,0.06);">
+                        <button id="btn-derot-load-image" class="primary"
+                            style="width:100%; font-size:0.85rem; padding:10px; background:linear-gradient(135deg, #3b82f6, #1d4ed8);">📂
+                            Cargar Imagen</button>
+                    </div>
+
+                    <!-- Planet Selector -->
+                    <div
+                        style="background:rgba(255,255,255,0.03); padding:12px; border-radius:8px; border:1px solid rgba(255,255,255,0.06);">
+                        <label style="color:#94a3b8; font-size:0.75rem; display:block; margin-bottom:6px;">Seleccionar
+                            Planeta</label>
+                        <div id="derot-planet-selector" style="display:flex; gap:8px;">
+                            <button class="planet-icon active" data-planet="jupiter" title="Jupiter"
+                                style="flex:1; height:42px; border-radius:8px; background:rgba(139,92,246,0.2); border:2px solid #8b5cf6; color:#c4b5fd; font-size:1.3rem; cursor:pointer; transition:all 0.3s;">♃</button>
+                            <button class="planet-icon" data-planet="saturn" title="Saturn"
+                                style="flex:1; height:42px; border-radius:8px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); color:#94a3b8; font-size:1.3rem; cursor:pointer; transition:all 0.3s;">♄</button>
+                            <button class="planet-icon" data-planet="mars" title="Mars"
+                                style="flex:1; height:42px; border-radius:8px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); color:#94a3b8; font-size:1.3rem; cursor:pointer; transition:all 0.3s;">♂</button>
+                        </div>
+                    </div>
+
+                    <!-- CM System -->
+                    <div
+                        style="background:rgba(255,255,255,0.03); padding:12px; border-radius:8px; border:1px solid rgba(255,255,255,0.06);">
+                        <label style="color:#94a3b8; font-size:0.75rem; display:block; margin-bottom:4px;">Sistema
+                            de Meridiano Central</label>
+                        <select id="derot-cm-system"
+                            style="width:100%; background:#0f172a; border:1px solid #334155; color:#e2e8f0; font-size:0.8rem; padding:6px; border-radius:6px;">
+                            <option value="1" selected>CM2 (870.27°/d — Tormentas / Temperate)</option>
+                            <option value="0">CM1 (877.90°/d — Ecuatorial)</option>
+                            <option value="2">CM3 (870.54°/d — Radio / Magnético)</option>
+                        </select>
+                    </div>
+
+                    <!-- Time Inputs -->
+                    <div
+                        style="background:rgba(255,255,255,0.03); padding:12px; border-radius:8px; border:1px solid rgba(255,255,255,0.06);">
+                        <div
+                            style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                            <label style="color:#94a3b8; font-size:0.75rem;">Tiempo de Captura (UTC)</label>
+                            <button id="btn-derot-parse-log"
+                                style="background:rgba(139,92,246,0.2); border:1px solid rgba(139,92,246,0.4); color:#c4b5fd; font-size:0.7rem; padding:3px 8px; border-radius:4px; cursor:pointer;">📋
+                                Leer Log</button>
+                        </div>
+                        <input type="datetime-local" id="derot-capture-time" step="1"
+                            style="width:100%; background:#0f172a; border:1px solid #334155; color:#e2e8f0; padding:6px; border-radius:6px; font-size:0.8rem; margin-bottom:8px; box-sizing:border-box;">
+                        <label style="color:#94a3b8; font-size:0.75rem; display:block; margin-bottom:4px;">Tiempo
+                            de Referencia (UTC)</label>
+                        <input type="datetime-local" id="derot-reference-time" step="1"
+                            style="width:100%; background:#0f172a; border:1px solid #334155; color:#e2e8f0; padding:6px; border-radius:6px; font-size:0.8rem; box-sizing:border-box;">
+                    </div>
+
+                    <!-- Limb Correction -->
+                    <div
+                        style="background:rgba(255,255,255,0.03); padding:12px; border-radius:8px; border:1px solid rgba(255,255,255,0.06);">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <label style="color:#94a3b8; font-size:0.75rem;">Corrección de Limbo</label>
+                            <span id="derot-limb-value"
+                                style="color:#c4b5fd; font-size:0.75rem; font-weight:bold;">0.5</span>
+                        </div>
+                        <input type="range" id="sl-derot-limb" min="0" max="2" step="0.1" value="0.5"
+                            style="width:100%; margin-top:4px;">
+                    </div>
+
+                    <!-- Actions -->
+                    <div style="display:flex; gap:10px; margin-top:auto;">
+                        <button id="btn-derot-detect" class="secondary"
+                            style="flex:1; font-size:0.8rem; padding:10px; border:1px solid rgba(139,92,246,0.4); color:#c4b5fd;">🔍
+                            Auto-Detectar</button>
+                        <button id="btn-derot-apply" class="primary"
+                            style="flex:1; font-size:0.8rem; padding:10px; background:linear-gradient(135deg, #8b5cf6, #6366f1); font-weight:bold;">🪐
+                            Aplicar Derotación</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+</body>
+
+</html>

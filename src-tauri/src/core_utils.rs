@@ -1,0 +1,1174 @@
+// ==========================================
+// 2. UTILIDADES BASE
+// ==========================================
+
+fn clean_windows_path(path: PathBuf) -> String {
+    let s = path.to_string_lossy().to_string();
+    if cfg!(windows) && s.starts_with("\\\\?\\") {
+        s[4..].to_string()
+    } else {
+        s
+    }
+}
+
+fn log_to_front(app: &tauri::AppHandle, level: &str, msg: &str) {
+    let _ = app.emit(
+        "log_event",
+        LogMessage {
+            level: level.to_string(),
+            msg: msg.to_string(),
+        },
+    );
+}
+
+fn emit_progress(app: &tauri::AppHandle, step: &str, pct: f32, details: Option<String>) {
+    let _ = app.emit(
+        "progress",
+        Progress {
+            step: step.to_string(),
+            pct,
+            details,
+        },
+    );
+}
+
+fn load_font_from_path(path: &str) -> Option<Font<'static>> {
+    if let Ok(data) = fs::read(path) {
+        if let Some(font) = Font::try_from_vec(data) {
+            return Some(font);
+        }
+    }
+    None
+}
+
+fn get_fallback_font() -> Option<Font<'static>> {
+    let paths = [
+        "assets/font.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+    ];
+    for p in paths {
+        if let Some(f) = load_font_from_path(p) {
+            return Some(f);
+        }
+    }
+    None
+}
+
+fn get_font_map() -> Vec<(String, String)> {
+    let candidates = [
+        ("Arial", "C:\\Windows\\Fonts\\arial.ttf"),
+        ("Segoe UI", "C:\\Windows\\Fonts\\segoeui.ttf"),
+        ("Arial", "/Library/Fonts/Arial.ttf"),
+        ("Arial", "/System/Library/Fonts/Supplemental/Arial.ttf"),
+        (
+            "Helvetica",
+            "/System/Library/Fonts/Supplemental/Helvetica.ttf",
+        ),
+        ("DejaVu Sans", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        (
+            "Liberation Sans",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ),
+    ];
+
+    let mut available: Vec<(String, String)> = candidates
+        .iter()
+        .filter(|(_, path)| Path::new(path).exists())
+        .map(|(name, path)| ((*name).to_string(), (*path).to_string()))
+        .collect();
+
+    if available.is_empty() {
+        available.push(("Default".to_string(), "assets/font.ttf".to_string()));
+    }
+
+    available
+}
+
+fn resource_binary_names(stem: &str) -> Vec<String> {
+    let mut names = Vec::new();
+
+    if cfg!(target_os = "windows") {
+        names.push(format!("{}.exe", stem));
+        names.push(format!("{}-x86_64-pc-windows-msvc.exe", stem));
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            names.push(format!("{}-aarch64-apple-darwin", stem));
+        } else if cfg!(target_arch = "x86_64") {
+            names.push(format!("{}-x86_64-apple-darwin", stem));
+        }
+        names.push(stem.to_string());
+    } else {
+        names.push(stem.to_string());
+    }
+
+    names
+}
+
+fn resolve_bundled_binary(app: &tauri::AppHandle, stem: &str) -> Option<String> {
+    for name in resource_binary_names(stem) {
+        let rel_path = format!("bin/{}", name);
+        if let Ok(path) = app
+            .path()
+            .resolve(&rel_path, tauri::path::BaseDirectory::Resource)
+        {
+            if path.exists() {
+                return Some(clean_windows_path(path));
+            }
+        }
+    }
+
+    None
+}
+
+fn resolve_ffmpeg_tool(app: &tauri::AppHandle, stem: &str, env_var: &str) -> String {
+    if let Ok(path) = std::env::var(env_var) {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    resolve_bundled_binary(app, stem).unwrap_or_else(|| stem.to_string())
+}
+
+fn ffmpeg_install_hint() -> String {
+    let ffmpeg_names = resource_binary_names("ffmpeg").join("' o '");
+    let ffprobe_names = resource_binary_names("ffprobe").join("' o '");
+
+    format!(
+        "Instala FFmpeg en el sistema o coloca '{}' y '{}' en src-tauri/bin para empaquetar.",
+        ffmpeg_names, ffprobe_names
+    )
+}
+
+fn get_ffmpeg_command(app: &tauri::AppHandle) -> String {
+    resolve_ffmpeg_tool(app, "ffmpeg", "ZENITH_FFMPEG_PATH")
+}
+
+fn get_ffprobe_command(app: &tauri::AppHandle) -> String {
+    resolve_ffmpeg_tool(app, "ffprobe", "ZENITH_FFPROBE_PATH")
+}
+
+fn apply_saturation_inplace(img: &mut image::DynamicImage, saturation: f32) {
+    if let Some(rgb) = img.as_mut_rgb16() {
+        for px in rgb.pixels_mut() {
+            let r = px[0] as f32;
+            let g = px[1] as f32;
+            let b = px[2] as f32;
+            let l = 0.299 * r + 0.587 * g + 0.114 * b;
+            px[0] = (l + (r - l) * saturation).clamp(0.0, 65535.0) as u16;
+            px[1] = (l + (g - l) * saturation).clamp(0.0, 65535.0) as u16;
+            px[2] = (l + (b - l) * saturation).clamp(0.0, 65535.0) as u16;
+        }
+    } else if let Some(rgba) = img.as_mut_rgba16() {
+        for px in rgba.pixels_mut() {
+            let r = px[0] as f32;
+            let g = px[1] as f32;
+            let b = px[2] as f32;
+            let l = 0.299 * r + 0.587 * g + 0.114 * b;
+            px[0] = (l + (r - l) * saturation).clamp(0.0, 65535.0) as u16;
+            px[1] = (l + (g - l) * saturation).clamp(0.0, 65535.0) as u16;
+            px[2] = (l + (b - l) * saturation).clamp(0.0, 65535.0) as u16;
+        }
+    } else {
+        let mut rgba = img.to_rgba8();
+        for px in rgba.pixels_mut() {
+            let r = px[0] as f32;
+            let g = px[1] as f32;
+            let b = px[2] as f32;
+            let l = 0.299 * r + 0.587 * g + 0.114 * b;
+            px[0] = (l + (r - l) * saturation).clamp(0.0, 255.0) as u8;
+            px[1] = (l + (g - l) * saturation).clamp(0.0, 255.0) as u8;
+            px[2] = (l + (b - l) * saturation).clamp(0.0, 255.0) as u8;
+        }
+        *img = image::DynamicImage::ImageRgba8(rgba);
+    }
+}
+
+#[inline(always)]
+fn get_pixel_value(data: &[u8], idx: usize, bpp: usize) -> u16 {
+    if idx >= data.len() {
+        return 0;
+    }
+    if bpp == 1 {
+        unsafe { (*data.get_unchecked(idx) as u16) * 257 }
+    } else if bpp == 2 {
+        unsafe {
+            if idx * 2 + 1 >= data.len() {
+                return 0;
+            }
+            let start = idx * 2;
+            let b1 = *data.get_unchecked(start) as u16;
+            let b2 = *data.get_unchecked(start + 1) as u16;
+            (b2 << 8) | b1
+        }
+    } else if bpp == 6 {
+        unsafe {
+            if idx * 6 + 5 >= data.len() {
+                return 0;
+            }
+            let s = idx * 6;
+            let r =
+                ((*data.get_unchecked(s + 1) as u64) << 8 | *data.get_unchecked(s) as u64) as f32;
+            let g = ((*data.get_unchecked(s + 3) as u64) << 8 | *data.get_unchecked(s + 2) as u64)
+                as f32;
+            let b = ((*data.get_unchecked(s + 5) as u64) << 8 | *data.get_unchecked(s + 4) as u64)
+                as f32;
+            (0.299 * r + 0.587 * g + 0.114 * b) as u16
+        }
+    } else {
+        unsafe {
+            if idx * 3 + 2 >= data.len() {
+                return 0;
+            }
+            let start = idx * 3;
+            let r = *data.get_unchecked(start) as u32;
+            let g = *data.get_unchecked(start + 1) as u32;
+            let b = *data.get_unchecked(start + 2) as u32;
+            // Si bpp es 3, asumimos RGB 8-bit -> Escalar a u16
+            ((r + g + b) / 3 * 257) as u16
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn raw_to_u16_buffer_avx2(data: &[u8], out_buf: &mut Vec<u16>, bpp: usize, size: usize) {
+    use std::arch::x86_64::*;
+
+    // Ensure capacity and set length
+    out_buf.clear();
+    if out_buf.capacity() < size {
+        out_buf.reserve(size);
+    }
+    out_buf.set_len(size);
+
+    let out_ptr = out_buf.as_mut_ptr();
+    let in_ptr = data.as_ptr();
+
+    if bpp == 1 || bpp == 3 {
+        // Expansion 8-bit -> 16-bit (x257)
+        // 16 pixels per iteration
+        let mut i = 0;
+        while i + 16 <= size {
+            // Load 16 bytes (128-bit)
+            let v_u8 = _mm_loadu_si128(in_ptr.add(i) as *const _);
+            // Expand to 16 u16s (256-bit)
+            let v_u16 = _mm256_cvtepu8_epi16(v_u8);
+            // Multiply by 257: (x << 8) | x
+            let v_hi = _mm256_slli_epi16(v_u16, 8);
+            let v_res = _mm256_or_si256(v_hi, v_u16);
+            // Store
+            _mm256_storeu_si256(out_ptr.add(i) as *mut _, v_res);
+            i += 16;
+        }
+        // Scalar Tail
+        while i < size {
+            *out_ptr.add(i) = (*in_ptr.add(i) as u16) * 257;
+            i += 1;
+        }
+    } else if bpp == 2 || bpp == 6 {
+        // 16-bit Direct Copy (Little Endian)
+        // 16 pixels per iteration (32 bytes)
+        let mut i = 0;
+        while i + 16 <= size {
+            let offset_bytes = i * 2;
+            let v = _mm256_loadu_si256(in_ptr.add(offset_bytes) as *const _);
+            _mm256_storeu_si256(out_ptr.add(i) as *mut _, v);
+            i += 16;
+        }
+        // Scalar Tail
+        while i < size {
+            let offset = i * 2;
+            let low = *in_ptr.add(offset) as u16;
+            let high = *in_ptr.add(offset + 1) as u16;
+            *out_ptr.add(i) = (high << 8) | low;
+            i += 1;
+        }
+    } else {
+        // Fallback for weird bpp (unlikely)
+        for i in 0..size {
+            *out_ptr.add(i) = get_pixel_value(data, i, bpp);
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn raw_to_u16_buffer_neon(data: &[u8], out_buf: &mut Vec<u16>, bpp: usize, size: usize) {
+    use std::arch::aarch64::*;
+
+    // Ensure capacity and set length
+    out_buf.clear();
+    if out_buf.capacity() < size {
+        out_buf.reserve(size);
+    }
+    out_buf.set_len(size);
+
+    let out_ptr = out_buf.as_mut_ptr();
+    let in_ptr = data.as_ptr();
+
+    if bpp == 1 || bpp == 3 {
+        // Expansion 8-bit -> 16-bit (x257)
+        // 16 pixels per iteration
+        let mut i = 0;
+        while i + 16 <= size {
+            // Load 16 bytes (128-bit)
+            let v_u8 = vld1q_u8(in_ptr.add(i));
+            // Expand to 16 u16s (2 x 128-bit = 256-bit total)
+            let v_u16_low = vmovl_u8(vget_low_u8(v_u8));
+            let v_u16_high = vmovl_u8(vget_high_u8(v_u8));
+
+            // Multiply by 257: (x << 8) | x
+            let v_hi_low = vshlq_n_u16(v_u16_low, 8);
+            let v_res_low = vorrq_u16(v_hi_low, v_u16_low);
+
+            let v_hi_high = vshlq_n_u16(v_u16_high, 8);
+            let v_res_high = vorrq_u16(v_hi_high, v_u16_high);
+
+            // Store
+            vst1q_u16(out_ptr.add(i), v_res_low);
+            vst1q_u16(out_ptr.add(i + 8), v_res_high);
+            i += 16;
+        }
+        // Scalar Tail
+        while i < size {
+            *out_ptr.add(i) = (*in_ptr.add(i) as u16) * 257;
+            i += 1;
+        }
+    } else if bpp == 2 || bpp == 6 {
+        // 16-bit Direct Copy (Little Endian)
+        // 16 pixels per iteration (32 bytes)
+        let mut i = 0;
+        while i + 16 <= size {
+            let offset_bytes = i * 2;
+            let v1 = vld1q_u8(in_ptr.add(offset_bytes));
+            let v2 = vld1q_u8(in_ptr.add(offset_bytes + 16));
+            vst1q_u8(out_ptr.add(i) as *mut u8, v1);
+            vst1q_u8(out_ptr.add(i + 8) as *mut u8, v2);
+            i += 16;
+        }
+        // Scalar Tail
+        while i < size {
+            let offset = i * 2;
+            let low = *in_ptr.add(offset) as u16;
+            let high = *in_ptr.add(offset + 1) as u16;
+            *out_ptr.add(i) = (high << 8) | low;
+            i += 1;
+        }
+    } else {
+        // Fallback for weird bpp (unlikely)
+        for i in 0..size {
+            *out_ptr.add(i) = get_pixel_value(data, i, bpp);
+        }
+    }
+}
+
+
+fn raw_to_u16_buffer_into(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    bpp: usize,
+    out_buf: &mut Vec<u16>,
+) {
+    let is_rgb = bpp == 3 || bpp == 6;
+    let size = if is_rgb {
+        width * height * 3
+    } else {
+        width * height
+    };
+
+    // AVX2 OPTIMIZATION CHECK
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe {
+                raw_to_u16_buffer_avx2(data, out_buf, bpp, size);
+            }
+            return;
+        }
+    }
+
+    // NEON OPTIMIZATION CHECK
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            raw_to_u16_buffer_neon(data, out_buf, bpp, size);
+        }
+        return;
+    }
+
+    // SCALAR FALLBACK
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        out_buf.clear();
+        if out_buf.capacity() < size {
+            out_buf.reserve(size);
+        }
+
+        if bpp == 6 {
+            // Optimización para RGB 16-bit
+            unsafe {
+                for i in 0..size {
+                    let s = i * 2;
+                    if s + 1 < data.len() {
+                        out_buf.push(
+                            (*data.get_unchecked(s + 1) as u16) << 8 | *data.get_unchecked(s) as u16,
+                        );
+                    } else {
+                        out_buf.push(0);
+                    }
+                }
+            }
+        } else if bpp == 3 {
+            // RGB 8-bit: Direct mapping [0-255] -> [0-65535]
+            for v in data.iter().take(size) {
+                out_buf.push((*v as u16) * 257);
+            }
+        } else if bpp == 2 {
+            // Mono/Bayer 16-bit (Little Endian)
+            // size = width * height (pixels) -> input bytes = size * 2
+            unsafe {
+                // AVX2 O(1) Optimization zero-cost mapping
+                let expected_bytes = size * 2;
+                let copy_bytes = expected_bytes.min(data.len());
+
+                // Fast resize the uninitialized buffer directly
+                // Rust will optimize vec.set_len if capacity is sufficient
+                let new_len = copy_bytes / 2;
+                out_buf.set_len(new_len);
+
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    out_buf.as_mut_ptr() as *mut u8,
+                    copy_bytes,
+                );
+
+                // Pad if data was slightly short (rare but possible with truncation)
+                while out_buf.len() < size {
+                    out_buf.push(0);
+                }
+            }
+        } else {
+            // MONO 8-BIT -> U16
+            // AVX2/Neon Optimization here is huge.
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") {
+                    unsafe {
+                        raw_to_u16_buffer_avx2_mono8(data, out_buf);
+                    }
+                    return;
+                }
+            }
+
+            // fallback scalar
+            for i in 0..size {
+                out_buf.push(get_pixel_value(data, i, bpp));
+            }
+        }
+    }
+}
+
+// OPTIMIZATION: AVX2 for 8-bit Mono -> 16-bit Mono (Scaling * 257)
+#[cfg(target_arch = "x86_64")]
+unsafe fn raw_to_u16_buffer_avx2_mono8(data: &[u8], out_buf: &mut Vec<u16>) {
+    use std::arch::x86_64::*;
+
+    let len = data.len();
+    out_buf.clear();
+    if out_buf.capacity() < len {
+        out_buf.reserve(len);
+    }
+    out_buf.set_len(len);
+
+    let mut i = 0;
+
+    // Process 32 pixels at once (load 256-bit YMM = 32 x u8)
+    // Expand to 2 x YMM of u16.
+    // Multiply by 257.
+    // Store.
+
+    // Note: _mm256_cvtepu8_epi16 expands low 16 u8 to 16 u16.
+
+    while i + 32 <= len {
+        let chunk = _mm256_loadu_si256(data.as_ptr().add(i) as *const __m256i);
+
+        // Split into low and high 128-bit lanes extended to 256-bit u16
+        let lower_16 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(chunk));
+        let upper_16 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256::<1>(chunk));
+
+        // Multiplier 257 = (x << 8) | x
+        // Or just multiply.
+        // _mm256_mullo_epi16 keeps low 16 bits. 255 * 257 = 65535 (fits in u16).
+        // So mullo is sufficient.
+        let multiplier = _mm256_set1_epi16(257);
+
+        let res_low = _mm256_mullo_epi16(lower_16, multiplier);
+        let res_high = _mm256_mullo_epi16(upper_16, multiplier);
+
+        // Store to out_buf (ptr is u16)
+        _mm256_storeu_si256(out_buf.as_mut_ptr().add(i) as *mut __m256i, res_low);
+        _mm256_storeu_si256(out_buf.as_mut_ptr().add(i + 16) as *mut __m256i, res_high);
+
+        i += 32;
+    }
+
+    // Scalar tail
+    for j in i..len {
+        unsafe { *out_buf.as_mut_ptr().add(j) = (*data.get_unchecked(j) as u16) * 257 };
+    }
+}
+// [calculate_noise_floor moved to smart_grid.rs]
+
+fn raw_to_u16_buffer(data: &[u8], width: usize, height: usize, bpp: usize) -> Vec<u16> {
+    let is_rgb = bpp == 3 || bpp == 6;
+    let size = if is_rgb {
+        width * height * 3
+    } else {
+        width * height
+    };
+    let mut buf = Vec::with_capacity(size);
+    raw_to_u16_buffer_into(data, width, height, bpp, &mut buf);
+    buf
+}
+
+fn estimate_raw_frame_signal(data: &[u8], width: usize, height: usize, bpp: usize) -> (u16, f32) {
+    if data.is_empty() || width == 0 || height == 0 {
+        return (0, 0.0);
+    }
+
+    let pixel_count = width.saturating_mul(height);
+    if pixel_count == 0 {
+        return (0, 0.0);
+    }
+
+    let max_samples = 65_536usize;
+    let step = (pixel_count / max_samples).max(1);
+    let mut max_v = 0u16;
+    let mut sum = 0.0f32;
+    let mut samples = 0usize;
+
+    for idx in (0..pixel_count).step_by(step) {
+        let v = get_pixel_value(data, idx, bpp);
+        max_v = max_v.max(v);
+        sum += v as f32;
+        samples += 1;
+    }
+
+    let avg = if samples > 0 {
+        sum / samples as f32
+    } else {
+        0.0
+    };
+    (max_v, avg)
+}
+
+fn select_signal_frame_index(
+    reader: &VideoInput,
+    width: usize,
+    height: usize,
+    bpp: usize,
+    cid: i32,
+    preferred_idx: usize,
+) -> usize {
+    let total = reader.frame_count();
+    if total <= 1 {
+        return 0;
+    }
+
+    // Native readers are cheap random access. FFmpeg random seeks are expensive,
+    // so keep their existing behavior.
+    if reader.is_ffmpeg() {
+        return preferred_idx.min(total - 1);
+    }
+
+    let mut candidates = vec![
+        preferred_idx.min(total - 1),
+        0,
+        1.min(total - 1),
+        2.min(total - 1),
+        (total / 20).min(total - 1),
+        (total / 10).min(total - 1),
+        (total / 4).min(total - 1),
+        (total / 2).min(total - 1),
+        ((total * 3) / 4).min(total - 1),
+    ];
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    let mut best_idx = preferred_idx.min(total - 1);
+    let mut best_score = 0.0f32;
+    let mut preferred_score = None;
+
+    for idx in candidates {
+        let raw = reader.get_frame(idx, cid);
+        let (max_v, avg) = estimate_raw_frame_signal(&raw, width, height, bpp);
+        let score = max_v as f32 + avg * 8.0;
+        if idx == preferred_idx.min(total - 1) {
+            preferred_score = Some(score);
+        }
+        if score > best_score {
+            best_score = score;
+            best_idx = idx;
+        }
+    }
+
+    // Preserve the requested frame when it has comparable signal; otherwise
+    // recover from black/dark startup frames.
+    if let Some(score) = preferred_score {
+        if score > 512.0 && score >= best_score * 0.75 {
+            return preferred_idx.min(total - 1);
+        }
+    }
+
+    best_idx
+}
+
+fn suggest_target_from_frame(input: &[u16]) -> String {
+    if input.is_empty() {
+        return "surface".to_string();
+    }
+
+    let max_v = input.iter().copied().max().unwrap_or(0);
+    if max_v == 0 {
+        return "surface".to_string();
+    }
+
+    let threshold = (max_v / 8).max(512);
+    let signal_pixels = input.iter().filter(|&&v| v > threshold).count();
+    let coverage = signal_pixels as f32 / input.len() as f32;
+
+    if coverage < 0.12 {
+        "planet_small".to_string()
+    } else {
+        "surface".to_string()
+    }
+}
+
+// NUEVO: Helper para extraer ROI de buffer RAW (para optimizaciÃ³n extrema V2)
+// Convierte siempre a MONO u16 (para alineaciÃ³n/calidad)
+fn raw_to_u16_buffer_into_roi(
+    data: &[u8],
+    width: usize,
+    _height: usize,
+    bpp: usize,
+    roi_x: usize,
+    roi_y: usize,
+    roi_w: usize,
+    roi_h: usize,
+    out_buf: &mut Vec<u16>,
+) {
+    let size = roi_w * roi_h; // Target MONO size
+
+    out_buf.clear();
+    if out_buf.capacity() < size {
+        out_buf.reserve(size);
+    }
+
+    // Validate ROI
+    if roi_x + roi_w > width {
+        // Graceful fallback or panic? Graceful.
+        out_buf.resize(size, 0);
+        return;
+    }
+
+    if bpp == 6 {
+        // RGB 16-bit Optimized -> MONO (Average)
+        // Access pattern: y from roi_y to roi_y + roi_h
+        unsafe {
+            let row_stride = width * 6; // 6 bytes per pixel
+            for y in 0..roi_h {
+                let row_start = (roi_y + y) * row_stride;
+
+                for x in 0..roi_w {
+                    // Simplified:
+                    let abs_offset = row_start + (roi_x + x) * 6;
+
+                    // R (Little Endian)
+                    let r = (*data.get_unchecked(abs_offset + 1) as u32) << 8
+                        | *data.get_unchecked(abs_offset) as u32;
+                    // G
+                    let g = (*data.get_unchecked(abs_offset + 3) as u32) << 8
+                        | *data.get_unchecked(abs_offset + 2) as u32;
+                    // B
+                    let b = (*data.get_unchecked(abs_offset + 5) as u32) << 8
+                        | *data.get_unchecked(abs_offset + 4) as u32;
+
+                    // Mono Average
+                    let mono = (r + g + b) / 3;
+                    out_buf.push(mono as u16);
+                }
+            }
+        }
+    } else {
+        // Generic Loop for Mono 8/16 or RGB 8
+        // Relies on get_pixel_value which handles layout
+        for y in 0..roi_h {
+            let abs_y = roi_y + y;
+            for x in 0..roi_w {
+                let abs_x = roi_x + x;
+                let pixel_idx = abs_y * width + abs_x;
+                out_buf.push(get_pixel_value(data, pixel_idx, bpp));
+            }
+        }
+    }
+}
+
+fn auto_color_balance(buffer: &mut [u16], width: usize, height: usize) {
+    let mut sum_r = 0.0;
+    let mut sum_g = 0.0;
+    let mut sum_b = 0.0;
+    let mut count = 0.0;
+    let mut max_val = 0;
+    for i in (0..buffer.len()).step_by(100) {
+        unsafe {
+            if i + 1 < buffer.len() {
+                let v = *buffer.get_unchecked(i + 1);
+                if v > max_val {
+                    max_val = v;
+                }
+            }
+        }
+    }
+    let threshold = (max_val as f32 * 0.15) as u16;
+    let start_y = height / 4;
+    let end_y = height * 3 / 4;
+    let start_x = width / 4;
+    let end_x = width * 3 / 4;
+    let step = 8;
+    for y in (start_y..end_y).step_by(step) {
+        for x in (start_x..end_x).step_by(step) {
+            let idx = (y * width + x) * 3;
+            if idx + 2 < buffer.len() {
+                unsafe {
+                    let r = *buffer.get_unchecked(idx);
+                    let g = *buffer.get_unchecked(idx + 1);
+                    let b = *buffer.get_unchecked(idx + 2);
+                    if g > threshold && g < 64000 {
+                        sum_r += r as f32;
+                        sum_g += g as f32;
+                        sum_b += b as f32;
+                        count += 1.0;
+                    }
+                }
+            }
+        }
+    }
+    if count < 50.0 {
+        return;
+    }
+    let avg_r = sum_r / count;
+    let avg_g = sum_g / count;
+    let avg_b = sum_b / count;
+    let gain_r = if avg_r > 1.0 { avg_g / avg_r } else { 1.0 };
+    let gain_b = if avg_b > 1.0 { avg_g / avg_b } else { 1.0 };
+
+    // HEADROOM FIX: never gain a channel above 1 (it clipped/burned bright
+    // areas in the RGB preview); renormalize all three to preserve the ratio.
+    let max_gain = gain_r.max(gain_b).max(1.0);
+    let gain_r = gain_r / max_gain;
+    let gain_g = 1.0 / max_gain;
+    let gain_b = gain_b / max_gain;
+
+    buffer.par_chunks_exact_mut(3).for_each(|pixel| {
+        pixel[0] = (pixel[0] as f32 * gain_r + 0.5).min(65535.0) as u16;
+        pixel[1] = (pixel[1] as f32 * gain_g + 0.5).min(65535.0) as u16;
+        pixel[2] = (pixel[2] as f32 * gain_b + 0.5).min(65535.0) as u16;
+    });
+}
+
+fn auto_detect_sigma(data: &[f32], width: usize, _height: usize) -> f32 {
+    let mut max_val = 0.0;
+    let mut max_idx = 0;
+    for (i, &v) in data.iter().enumerate().step_by(2) {
+        if v > max_val {
+            max_val = v;
+            max_idx = i;
+        }
+    }
+    if max_val < 5000.0 {
+        return 1.0;
+    }
+
+    let cx = max_idx % width;
+    let cy = max_idx / width;
+    let half_max = max_val / 2.0;
+    let mut radius = 1.0;
+
+    for x in cx..width {
+        let idx = cy * width + x;
+        if data[idx] < half_max {
+            radius = (x - cx) as f32;
+            break;
+        }
+    }
+    let sigma = radius / 1.177;
+    sigma.clamp(0.6, 2.5)
+}
+
+/// PHASE 8: Multi-Scale Local Contrast Enhancement (LCE)
+/// Targets both solar granulation (fine) and filaments (medium) scales.
+/// PHASE 10: Multi-Scale Detail Bank (Fine/Med/Deep)
+/// Evolution of LCE to give volumetric "3D" depth to filaments.
+fn apply_micro_contrast_boost(buffer: &mut [u16], width: usize, height: usize, amount: f32) {
+    if amount <= 1.0 {
+        return;
+    }
+    let read_buf = buffer.to_vec();
+
+    // We use a progressive multi-scale sharpen
+    // Fine: 3x3 for granulation
+    // Med: 7x7 for filament threads
+    // Structural: 15x15 for larger filament volume
+    buffer
+        .par_chunks_exact_mut(width * 3)
+        .enumerate()
+        .for_each(|(y, row)| {
+            if y < 8 || y >= height - 8 {
+                return;
+            }
+            for x in 8..width - 8 {
+                let idx = x * 3;
+
+                // Scale 1: Fine (3x3)
+                let mut sum3 = 0u32;
+                for ky in -1..=1 {
+                    let r_off = (y as isize + ky) as usize * width * 3;
+                    for kx in -1..=1 {
+                        let p_idx = r_off + (x as isize + kx) as usize * 3;
+                        // Use max of channels for robustness (H-alpha is Red, Mono is R=G=B)
+                        let v_p = read_buf[p_idx]
+                            .max(read_buf[p_idx + 1])
+                            .max(read_buf[p_idx + 2]);
+                        sum3 += v_p as u32;
+                    }
+                }
+                let avg3 = (sum3 / 9) as f32;
+
+                // Scale 2: Medium (7x7)
+                let mut sum7 = 0u32;
+                for ky in -3..=3 {
+                    let r_off = (y as isize + ky) as usize * width * 3;
+                    for kx in -3..=3 {
+                        let p_idx = r_off + (x as isize + kx) as usize * 3;
+                        let v_p = read_buf[p_idx]
+                            .max(read_buf[p_idx + 1])
+                            .max(read_buf[p_idx + 2]);
+                        sum7 += v_p as u32;
+                    }
+                }
+                let avg7 = (sum7 / 49) as f32;
+
+                // Scale 3: Structural (15x15) - Sampled for speed
+                let mut sum15 = 0u32;
+                for ky in [-7, -4, 0, 4, 7] {
+                    let r_off = (y as isize + ky) as usize * width * 3;
+                    for kx in [-7, -4, 0, 4, 7] {
+                        let p_idx = r_off + (x as isize + kx) as usize * 3;
+                        let v_p = read_buf[p_idx]
+                            .max(read_buf[p_idx + 1])
+                            .max(read_buf[p_idx + 2]);
+                        sum15 += v_p as u32;
+                    }
+                }
+                let avg15 = (sum15 / 25) as f32;
+
+                for c in 0..3 {
+                    let v = row[idx + c] as f32;
+
+                    // Multi-scale contribution
+                    let d_fine = (v - avg3) * 0.8;
+                    let d_med = (v - avg7) * 0.5;
+                    let d_struct = (v - avg15) * 0.3;
+
+                    let boost = (d_fine + d_med + d_struct) * (amount - 1.0);
+
+                    // Shadow Emphasis: Sharpen more in dark filament areas
+                    let shadow_factor = if v < avg15 { 1.25 } else { 1.0 };
+
+                    let final_v = v + boost * shadow_factor;
+                    row[idx + c] = final_v.clamp(0.0, 65535.0) as u16;
+                }
+            }
+        });
+}
+
+/// PHASE 10: Volumetric Solar Normalization (CLAHE-Lite)
+/// Eliminates global "flatness" by normalizing contrast locally.
+fn apply_volumetric_solar_boost(buffer: &mut [u16], width: usize, height: usize, strength: f32) {
+    if strength <= 0.0 {
+        return;
+    }
+    let read_buf = buffer.to_vec();
+
+    // Global mean for baseline (robust max sampling)
+    let mut _global_sum = 0f64;
+    for i in 0..width * height {
+        let p_idx = i * 3;
+        let v = read_buf[p_idx]
+            .max(read_buf[p_idx + 1])
+            .max(read_buf[p_idx + 2]);
+        _global_sum += v as f64;
+    }
+    // let global_avg = (global_sum / (width * height) as f64) as f32;
+
+    buffer
+        .par_chunks_exact_mut(width * 3)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let radius = 31; // Large scale for volume
+            if y < radius || y >= height - radius {
+                return;
+            }
+
+            for x in radius..width - radius {
+                let idx = x * 3;
+
+                // Sample regional average (Sparse 25pt grid for performance)
+                let mut local_sum = 0u32;
+                let r_i = radius as isize;
+                let s_i = radius as isize / 2;
+                for ky in [-r_i, -s_i, 0, s_i, r_i] {
+                    let r_off = (y as isize + ky) as usize * width * 3;
+                    for kx in [-r_i, -s_i, 0, s_i, r_i] {
+                        let p_idx = r_off + (x as isize + kx as isize) as usize * 3;
+                        let v = read_buf[p_idx]
+                            .max(read_buf[p_idx + 1])
+                            .max(read_buf[p_idx + 2]);
+                        local_sum += v as u32;
+                    }
+                }
+                let local_avg = (local_sum / 25) as f32;
+
+                // CLAHE-style local stretch
+                // We normalize the pixel based on local mean vs global mean
+                for c in 0..3 {
+                    let v = row[idx + c] as f32;
+                    let diff = v - local_avg;
+
+                    // Push local contrast: pixels farther from local mean get boosted
+                    let contrast_push = 1.0 + (strength * 0.5);
+                    let mut final_v = local_avg + (diff * contrast_push);
+
+                    // Shadow Curve: Make deep filaments deeper
+                    if final_v < local_avg * 0.8 {
+                        final_v *= 0.95; // Darken shadows
+                    }
+
+                    row[idx + c] = final_v.clamp(0.0, 65535.0) as u16;
+                }
+            }
+        });
+}
+
+/// POST-STACK CHROMA NOISE REDUCTION (Mejora 5)
+/// Smooths only the Cb/Cr chroma channels in YCbCr space while preserving
+/// all luminance (Y) detail. This eliminates frame-to-frame chromatic
+/// fluctuation noise that causes the "gummy/chicloso" look in bright areas.
+///
+/// `radius` controls the blur kernel size (1=3x3, 2=5x5). Use 1 for planets
+/// (minimal chroma smoothing to preserve color edges), 2 for surface/solar
+/// (more aggressive chroma denoising).
+fn smooth_chroma_inplace(data: &mut [u16], width: usize, height: usize, radius: usize) {
+    if width < 3 || height < 3 || radius == 0 {
+        return;
+    }
+
+    let n_pixels = width * height;
+    if data.len() < n_pixels * 3 {
+        return;
+    }
+
+    // 1. Convert RGB → YCbCr (f32 for precision)
+    let mut y_chan = vec![0.0f32; n_pixels];
+    let mut cb_chan = vec![0.0f32; n_pixels];
+    let mut cr_chan = vec![0.0f32; n_pixels];
+
+    for i in 0..n_pixels {
+        let r = data[i * 3] as f32;
+        let g = data[i * 3 + 1] as f32;
+        let b = data[i * 3 + 2] as f32;
+        // ITU-R BT.601 conversion (standard for astro imaging)
+        y_chan[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+        cb_chan[i] = -0.169 * r - 0.331 * g + 0.500 * b;
+        cr_chan[i] = 0.500 * r - 0.419 * g - 0.081 * b;
+    }
+
+    // 2. Box blur Cb and Cr channels only (Y stays untouched = detail preserved)
+    let mut cb_smooth = vec![0.0f32; n_pixels];
+    let mut cr_smooth = vec![0.0f32; n_pixels];
+    let r = radius as isize;
+
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum_cb = 0.0f32;
+            let mut sum_cr = 0.0f32;
+            let mut count = 0.0f32;
+
+            for ky in -r..=r {
+                let py = y as isize + ky;
+                if py < 0 || py >= height as isize { continue; }
+                let row = py as usize * width;
+                for kx in -r..=r {
+                    let px = x as isize + kx;
+                    if px < 0 || px >= width as isize { continue; }
+                    let idx = row + px as usize;
+                    sum_cb += cb_chan[idx];
+                    sum_cr += cr_chan[idx];
+                    count += 1.0;
+                }
+            }
+
+            let out_idx = y * width + x;
+            if count > 0.0 {
+                cb_smooth[out_idx] = sum_cb / count;
+                cr_smooth[out_idx] = sum_cr / count;
+            } else {
+                cb_smooth[out_idx] = cb_chan[out_idx];
+                cr_smooth[out_idx] = cr_chan[out_idx];
+            }
+        }
+    }
+
+    // 3. Convert YCbCr -> RGB (using original Y + smoothed Cb/Cr)
+    for i in 0..n_pixels {
+        let y = y_chan[i];
+        let cb = cb_smooth[i];
+        let cr = cr_smooth[i];
+        let r = y + 1.402 * cr;
+        let g = y - 0.344 * cb - 0.714 * cr;
+        let b = y + 1.772 * cb;
+        data[i * 3] = r.clamp(0.0, 65535.0) as u16;
+        data[i * 3 + 1] = g.clamp(0.0, 65535.0) as u16;
+        data[i * 3 + 2] = b.clamp(0.0, 65535.0) as u16;
+    }
+}
+
+fn surface_luma_percentile_rgb(data: &[u16], percentile: usize) -> f32 {
+    if data.len() < 3 {
+        return 0.0;
+    }
+
+    let pixels = data.len() / 3;
+    let step = (pixels / 250_000).max(1);
+    let mut sample = Vec::with_capacity((pixels / step).max(1));
+
+    for i in (0..pixels).step_by(step) {
+        let off = i * 3;
+        let luma = 0.299 * data[off] as f32
+            + 0.587 * data[off + 1] as f32
+            + 0.114 * data[off + 2] as f32;
+        sample.push(luma);
+    }
+
+    if sample.is_empty() {
+        return 0.0;
+    }
+    sample.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = (sample.len() * percentile / 100).min(sample.len() - 1);
+    sample[idx]
+}
+
+/// Percentile over a single-channel u16 buffer (sampled).
+fn surface_percentile_mono(data: &[u16], percentile: usize) -> f32 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let step = (data.len() / 250_000).max(1);
+    let mut sample: Vec<u16> = data.iter().step_by(step).copied().collect();
+    if sample.is_empty() {
+        return 0.0;
+    }
+    sample.sort_unstable();
+    let idx = (sample.len() * percentile / 100).min(sample.len() - 1);
+    sample[idx] as f32
+}
+
+/// Mono counterpart of `normalize_surface_frame_exposure_inplace`: works on a
+/// single-channel buffer (the mono stacking branch never builds RGB frames).
+fn normalize_surface_frame_exposure_mono_inplace(data: &mut [u16], target_p90: f32) {
+    if target_p90 < 1.0 || data.is_empty() {
+        return;
+    }
+    let current_p90 = surface_percentile_mono(data, 90);
+    if current_p90 < 1.0 {
+        return;
+    }
+    let gain = (target_p90 / current_p90).clamp(0.70, 1.45);
+    if (gain - 1.0).abs() < 0.003 {
+        return;
+    }
+    for v in data.iter_mut() {
+        *v = (*v as f32 * gain + 0.5).clamp(0.0, 65535.0) as u16;
+    }
+}
+
+fn normalize_surface_frame_exposure_inplace(data: &mut [u16], target_p90: f32, is_mono: bool) {
+    if target_p90 < 1.0 || data.len() < 3 {
+        return;
+    }
+
+    let current_p90 = surface_luma_percentile_rgb(data, 90);
+    if current_p90 < 1.0 {
+        return;
+    }
+
+    let (lo, hi) = if is_mono { (0.70, 1.45) } else { (0.78, 1.30) };
+    let gain = (target_p90 / current_p90).clamp(lo, hi);
+    if (gain - 1.0).abs() < 0.003 {
+        return;
+    }
+
+    for v in data.iter_mut() {
+        *v = (*v as f32 * gain + 0.5).clamp(0.0, 65535.0) as u16;
+    }
+}
+
+// FUNCION AnADIDA: Relleno de agujeros para Drizzle > 1.0
+fn fill_black_holes(data: &mut [u16], width: usize, height: usize) {
+    let mut buffer = data.to_vec();
+    for _ in 0..2 {
+        let original = buffer.clone();
+        for y in 1..height - 1 {
+            let r_off = y * width;
+            for x in 1..width - 1 {
+                let idx = (r_off + x) * 3;
+                if original[idx] == 0 && original[idx + 1] == 0 && original[idx + 2] == 0 {
+                    let mut s_r = 0u32;
+                    let mut s_g = 0u32;
+                    let mut s_b = 0u32;
+                    let mut c = 0;
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            if dx == 0 && dy == 0 {
+                                continue;
+                            }
+                            let n_idx = ((y as isize + dy) as usize * width
+                                + (x as isize + dx) as usize)
+                                * 3;
+                            if original[n_idx] > 0 || original[n_idx + 1] > 0 {
+                                s_r += original[n_idx] as u32;
+                                s_g += original[n_idx + 1] as u32;
+                                s_b += original[n_idx + 2] as u32;
+                                c += 1;
+                            }
+                        }
+                    }
+                    if c > 0 {
+                        buffer[idx] = (s_r / c) as u16;
+                        buffer[idx + 1] = (s_g / c) as u16;
+                        buffer[idx + 2] = (s_b / c) as u16;
+                    }
+                }
+            }
+        }
+    }
+    data.copy_from_slice(&buffer);
+}

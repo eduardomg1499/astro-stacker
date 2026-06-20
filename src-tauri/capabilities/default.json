@@ -1,0 +1,51 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-is-maximized",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-decorations",
+    "core:window:allow-set-title-bar-style",
+    "core:window:allow-set-title",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-size",
+    "core:window:allow-center",
+    "dialog:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "fs:default",
+    "fs:allow-read-file",
+    "fs:allow-write-file",
+    "fs:allow-exists",
+    "fs:allow-read-dir",
+    "process:default",
+    "updater:default",
+    "shell:allow-open",
+    {
+      "identifier": "fs:scope",
+      "allow": [
+        "$HOME/**/*",
+        "G:\\**",
+        "C:\\**",
+        "D:\\**",
+        "E:\\**",
+        "F:\\**",
+        "H:\\**",
+        "**"
+      ],
+      "deny": []
+    }
+  ]
+}
