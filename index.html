@@ -1015,11 +1015,56 @@
             <span><span class="brand-zenith">ZENITH</span><span class="brand-stacker">ASTRO STACKER</span></span>
             <div id="license-indicator" class="license-badge" data-i18n="general.license_indicator">FREE VERSION</div>
         </div>
-        <div style="display:flex; align-items:center; gap:15px;">
-
-            <div id="btn-report-bug" class="updater-badge" style="cursor: pointer; display: flex; align-items: center;" title="Enviar comentarios e informe de errores">
-                <svg class="pulse-glow-yellow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+        <div class="header-actions">
+            <div id="social-links-wrapper" class="social-links-wrapper">
+                <button id="btn-social-links" class="updater-badge header-icon-btn" type="button"
+                    data-i18n-title="settings.general.social"
+                    title="Redes Sociales / Social Media" aria-label="Redes Sociales / Social Media">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="18" cy="5" r="3"></circle>
+                        <circle cx="6" cy="12" r="3"></circle>
+                        <circle cx="18" cy="19" r="3"></circle>
+                        <path d="M8.59 13.51l6.83 3.98"></path>
+                        <path d="M15.41 6.51l-6.82 3.98"></path>
+                    </svg>
+                </button>
+                <div id="social-links-menu" class="social-links-menu" aria-hidden="true">
+                    <button type="button" class="social-link-btn" data-social-url="https://www.facebook.com/profile.php?id=61586689886900">
+                        <svg class="social-icon facebook" viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
+                            <path d="M22 12.06C22 6.48 17.52 2 11.94 2S2 6.48 2 12.06c0 5.02 3.66 9.19 8.44 9.94v-7.03H7.9v-2.91h2.54V9.84c0-2.51 1.49-3.9 3.77-3.9 1.09 0 2.23.2 2.23.2v2.45h-1.25c-1.24 0-1.63.77-1.63 1.56v1.87h2.77l-.44 2.91h-2.33V22C18.34 21.25 22 17.08 22 12.06z"></path>
+                        </svg>
+                        <span>Facebook</span>
+                    </button>
+                    <button type="button" class="social-link-btn" data-social-url="https://www.instagram.com/zenith.astro.code?igsh=ajA2ZWVnOHJwb2t5&utm_source=qr">
+                        <svg class="social-icon instagram" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"
+                            stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect>
+                            <path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"></path>
+                            <path d="M17.5 6.5h.01"></path>
+                        </svg>
+                        <span>Instagram</span>
+                    </button>
+                    <button type="button" class="social-link-btn social-link-web" data-social-url="https://www.zenith-astro.com">
+                        <svg class="social-icon web" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"
+                            stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="10"></circle>
+                            <path d="M2 12h20"></path>
+                            <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+                        </svg>
+                        <span data-i18n="settings.general.official_web">Web Oficial</span>
+                    </button>
+                </div>
             </div>
+
+            <button id="btn-donation" class="updater-badge header-icon-btn donation-heart-btn" type="button"
+                data-i18n-title="settings.general.support"
+                title="Apoyar Proyecto / Support Project" aria-label="Apoyar Proyecto / Support Project">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78L12 21.23l8.84-8.84a5.5 5.5 0 0 0 0-7.78z"></path>
+                </svg>
+            </button>
 
             <div id="btn-settings" class="updater-badge" style="cursor: pointer; display: flex; align-items: center;" data-i18n-title="updater.settings"
                 title="Configuración">
@@ -1033,6 +1078,73 @@
             </div>
         </div>
     </header>
+
+    <div id="donation-modal" class="modal-overlay donation-modal" style="display:none;">
+        <div class="donation-modal-box">
+            <div class="donation-glow donation-glow-red"></div>
+            <div class="donation-glow donation-glow-pink"></div>
+            <button id="donation-modal-close" class="donation-close-btn" type="button" aria-label="Cerrar">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M18 6 6 18"></path>
+                    <path d="m6 6 12 12"></path>
+                </svg>
+            </button>
+            <div class="donation-content">
+                <div class="donation-heart-mark">
+                    <svg viewBox="0 0 24 24" fill="currentColor" width="32" height="32">
+                        <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78L12 21.23l8.84-8.84a5.5 5.5 0 0 0 0-7.78z"></path>
+                    </svg>
+                </div>
+                <h2 data-i18n="donation.title">¡Impulsa el Proyecto!</h2>
+                <p data-i18n="donation.subtitle">Si Zenith Astro Stacker te está gustando y quieres contribuir al desarrollo de esta y otras herramientas, considera un impulso más al creador de esta herramienta.</p>
+                <div class="donation-options">
+                    <button type="button" class="donation-option donation-coffee" data-donation-url="https://buymeacoffee.com/zenithastrocode">
+                        <span class="donation-option-icon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"
+                                stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M17 8h1a4 4 0 1 1 0 8h-1"></path>
+                                <path d="M3 8h14v7a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4Z"></path>
+                                <path d="M6 2v2"></path>
+                                <path d="M10 2v2"></path>
+                                <path d="M14 2v2"></path>
+                            </svg>
+                        </span>
+                        <span class="donation-option-copy">
+                            <strong data-i18n="donation.bmc_title">Invitame un café</strong>
+                            <small data-i18n="donation.bmc_desc">Apoyo rápido y sencillo</small>
+                        </span>
+                        <svg class="donation-option-external" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"
+                            stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+                            <path d="M15 3h6v6"></path>
+                            <path d="M10 14 21 3"></path>
+                        </svg>
+                    </button>
+                    <button type="button" class="donation-option donation-paypal" data-donation-url="https://www.paypal.com/paypalme/edmotion">
+                        <span class="donation-option-icon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"
+                                stroke-linecap="round" stroke-linejoin="round">
+                                <rect x="2" y="5" width="20" height="14" rx="2"></rect>
+                                <path d="M2 10h20"></path>
+                            </svg>
+                        </span>
+                        <span class="donation-option-copy">
+                            <strong data-i18n="donation.paypal_title">PayPal</strong>
+                            <small data-i18n="donation.paypal_desc">Donación personalizada</small>
+                        </span>
+                        <svg class="donation-option-external" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"
+                            stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+                            <path d="M15 3h6v6"></path>
+                            <path d="M10 14 21 3"></path>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+            <div class="donation-footer" data-i18n="donation.thanks">GRACIAS POR TU APOYO</div>
+        </div>
+    </div>
 
     <!-- License Modal (UNCLOSEABLE) -->
     <div id="license-modal" class="modal-overlay"

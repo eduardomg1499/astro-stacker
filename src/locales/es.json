@@ -132,6 +132,15 @@
         "qa_reset_ready_title": "QA listo",
         "qa_reset_ready_message": "Estado local reiniciado. Ya puedes intentar activar otra prueba o licencia."
     },
+    "donation": {
+        "title": "¡Impulsa el Proyecto!",
+        "subtitle": "Si Zenith Astro Stacker te está gustando y quieres contribuir al desarrollo de esta y otras herramientas, considera un impulso más al creador de esta herramienta. Esto es un proyecto personal que disfruto haciendo para mis compañeros astrofotógrafos.",
+        "bmc_title": "Invítame un café",
+        "bmc_desc": "Apoyo rápido y sencillo",
+        "paypal_title": "PayPal",
+        "paypal_desc": "Donación personalizada",
+        "thanks": "GRACIAS POR TU APOYO"
+    },
     "settings": {
         "tabs": {
             "general": "General",
@@ -150,7 +159,10 @@
             "reset_tutorials": "↺ Reiniciar Todos los Tutoriales",
             "tutorials_reset_title": "Tutoriales reiniciados",
             "tutorials_reset_message": "Los tutoriales volverán a aparecer una vez cuando entres a cada flujo.",
-            "more_options": "Próximamente más opciones de personalización."
+            "more_options": "Próximamente más opciones de personalización.",
+            "social": "Redes Sociales / Social Media",
+            "official_web": "Web Oficial",
+            "support": "Apoyar Proyecto / Support Project"
         },
         "license": {
             "status_title": "Estado de Licencia"

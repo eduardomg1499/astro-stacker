@@ -267,45 +267,100 @@ function syncActivationLanguageButtons(lang) {
     });
 }
 
-function initBugReportButton() {
-    const btnBug = document.getElementById('btn-report-bug');
-    if (btnBug) {
-        btnBug.addEventListener('click', () => {
-            const email = "zenith-astro-code@outlook.com";
-            
-            // Translations matching user configuration
-            const subjectText = i18n ? i18n.t('general.report_bug_subject') : "Reporte de Error / Comentarios - Zenith Astro Stacker";
-            let bodyText = i18n ? i18n.t('general.report_bug_body') : "Versión: {{version}}\n\nHola,\n\nEscribo para enviar el siguiente reporte:\n\n";
-            
-            bodyText = bodyText.replace("{{version}}", window.__ZAS_VERSION__ || "PRO");
+function initHeaderSupportButtons() {
+    const socialWrapper = $("#social-links-wrapper");
+    const btnSocial = $("#btn-social-links");
+    const socialMenu = $("#social-links-menu");
+    const btnDonation = $("#btn-donation");
+    const donationModal = $("#donation-modal");
+    const btnDonationClose = $("#donation-modal-close");
 
-            const subject = encodeURIComponent(subjectText);
-            const body = encodeURIComponent(bodyText);
-            const mailtoLink = `mailto:${email}?subject=${subject}&body=${body}`;
-            
-            try {
-                // `open` is exported at the top from @tauri-apps/plugin-shell
-                open(mailtoLink).catch(err => {
-                    console.error("Shell plugin failed to open mailto:", err);
-                    window.location.href = mailtoLink; // Fallback
-                });
-            } catch (e) {
-                window.location.href = mailtoLink;
-            }
+    const setSocialOpen = (openMenu) => {
+        if (!socialMenu || !btnSocial) return;
+        socialMenu.classList.toggle("open", openMenu);
+        socialMenu.setAttribute("aria-hidden", String(!openMenu));
+        btnSocial.classList.toggle("active", openMenu);
+    };
+
+    const openDonationModal = () => {
+        if (!donationModal) return;
+        donationModal.style.display = "flex";
+        setSocialOpen(false);
+    };
+
+    const closeDonationModal = () => {
+        if (donationModal) donationModal.style.display = "none";
+    };
+
+    const openSupportUrl = async (url) => {
+        if (!url) return;
+        setSocialOpen(false);
+        closeDonationModal();
+        if (typeof window.openBrowser === "function") {
+            await window.openBrowser(url);
+            return;
+        }
+        try {
+            await open(url);
+        } catch (e) {
+            console.warn("Tauri Shell Open fallo, intentando window.open:", e);
+            window.open(url, "_blank");
+        }
+    };
+
+    if (btnSocial && socialMenu) {
+        btnSocial.addEventListener("click", (event) => {
+            event.stopPropagation();
+            setSocialOpen(!socialMenu.classList.contains("open"));
         });
     }
+
+    document.querySelectorAll("[data-social-url]").forEach((btn) => {
+        btn.addEventListener("click", () => openSupportUrl(btn.dataset.socialUrl));
+    });
+
+    if (btnDonation) {
+        btnDonation.addEventListener("click", openDonationModal);
+    }
+
+    if (btnDonationClose) {
+        btnDonationClose.addEventListener("click", closeDonationModal);
+    }
+
+    if (donationModal) {
+        donationModal.addEventListener("click", (event) => {
+            if (event.target === donationModal) closeDonationModal();
+        });
+    }
+
+    document.querySelectorAll("[data-donation-url]").forEach((btn) => {
+        btn.addEventListener("click", () => openSupportUrl(btn.dataset.donationUrl));
+    });
+
+    document.addEventListener("click", (event) => {
+        if (socialWrapper && !socialWrapper.contains(event.target)) {
+            setSocialOpen(false);
+        }
+    });
+
+    document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+            setSocialOpen(false);
+            closeDonationModal();
+        }
+    });
 }
 
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
         initTitlebar();
         initCustomSelect();
-        initBugReportButton();
+        initHeaderSupportButtons();
     });
 } else {
     initTitlebar();
     initCustomSelect();
-    initBugReportButton();
+    initHeaderSupportButtons();
 }
 
 
