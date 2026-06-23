@@ -251,6 +251,12 @@ pub fn accumulate_frame_liquid(
 
                 for k in 0..effective_k {
                     let ap_idx = warp_indices[p_idx + k] as usize;
+                    // El warp map puede referenciar un AP fuera de rango (mismatch
+                    // de conteo de APs en ciertos SER). Sin este guard, local_shifts[ap_idx]
+                    // hace panic y, con panic=abort, cerraba la app en seco.
+                    if ap_idx >= local_shifts.len() {
+                        continue;
+                    }
                     let w_idw = warp_weights[p_idx + k];
 
                     if ap_idx < ap_acceptance.len() && !ap_acceptance[ap_idx] {
@@ -440,11 +446,13 @@ pub fn accumulate_frame_liquid(
 
             if let Some((pr, pg, pb)) = sample_pixel(sx_in, sy_in) {
                 let tidx = row_off + x_out;
-                unsafe {
-                    *acc_r.get_unchecked_mut(tidx) += pr * pixel_weight;
-                    *acc_g.get_unchecked_mut(tidx) += pg * pixel_weight;
-                    *acc_b.get_unchecked_mut(tidx) += pb * pixel_weight;
-                    *acc_w.get_unchecked_mut(tidx) += pixel_weight;
+                if tidx < acc_r.len() {
+                    unsafe {
+                        *acc_r.get_unchecked_mut(tidx) += pr * pixel_weight;
+                        *acc_g.get_unchecked_mut(tidx) += pg * pixel_weight;
+                        *acc_b.get_unchecked_mut(tidx) += pb * pixel_weight;
+                        *acc_w.get_unchecked_mut(tidx) += pixel_weight;
+                    }
                 }
             }
         }
@@ -504,6 +512,12 @@ pub fn accumulate_frame_liquid_mono(
 
                 for k in 0..effective_k {
                     let ap_idx = warp_indices[p_idx + k] as usize;
+                    // El warp map puede referenciar un AP fuera de rango (mismatch
+                    // de conteo de APs en ciertos SER). Sin este guard, local_shifts[ap_idx]
+                    // hace panic y, con panic=abort, cerraba la app en seco.
+                    if ap_idx >= local_shifts.len() {
+                        continue;
+                    }
                     let w_idw = warp_weights[p_idx + k];
 
                     if ap_idx < ap_acceptance.len() && !ap_acceptance[ap_idx] {
@@ -630,9 +644,11 @@ pub fn accumulate_frame_liquid_mono(
                 let val =
                     (sum_v / sum_w).clamp((min_v - band).max(0.0), (max_v + band).min(65535.0));
                 let tidx = row_off + x_out;
-                unsafe {
-                    *acc.get_unchecked_mut(tidx) += val * pixel_weight;
-                    *acc_w.get_unchecked_mut(tidx) += pixel_weight;
+                if tidx < acc.len() {
+                    unsafe {
+                        *acc.get_unchecked_mut(tidx) += val * pixel_weight;
+                        *acc_w.get_unchecked_mut(tidx) += pixel_weight;
+                    }
                 }
             }
         }
