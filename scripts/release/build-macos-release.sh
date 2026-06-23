@@ -31,6 +31,28 @@ MACOS_BUILD_TARGET="${MACOS_BUILD_TARGET:-aarch64-apple-darwin}"
 ARCH_LABEL="${ARCH_LABEL:-aarch64}"
 TARGET_DIR="src-tauri/target/$MACOS_BUILD_TARGET/release"
 
+# --- Verificación de binarios FFmpeg (deben empaquetarse en el .app) ---
+# Están ignorados por Git; si faltan, el bundle queda sin FFmpeg y la app
+# dará "No se encontró FFprobe". Abortamos antes de compilar.
+case "$ARCH_LABEL" in
+  aarch64) need_bins=("ffmpeg-aarch64-apple-darwin" "ffprobe-aarch64-apple-darwin") ;;
+  x86_64)  need_bins=("ffmpeg-x86_64-apple-darwin" "ffprobe-x86_64-apple-darwin") ;;
+  *)       need_bins=() ;;
+esac
+missing_bins=()
+for b in "${need_bins[@]}"; do
+  f="src-tauri/bin/$b"
+  if [[ ! -f "$f" ]] || [[ "$(stat -f%z "$f" 2>/dev/null || echo 0)" -lt 1000000 ]]; then
+    missing_bins+=("$b")
+  fi
+done
+if [[ ${#missing_bins[@]} -gt 0 ]]; then
+  echo "ERROR: faltan binarios FFmpeg en src-tauri/bin para $ARCH_LABEL: ${missing_bins[*]}" >&2
+  echo "Están ignorados por Git. Colócalos en src-tauri/bin antes de compilar para que el .app los empaquete." >&2
+  exit 1
+fi
+echo "-> Binarios FFmpeg ($ARCH_LABEL) presentes; se empaquetarán en el .app."
+
 scripts/apple/build-macos-updater-artifact.sh
 scripts/apple/create-custom-macos-dmg.sh
 npm run release:latest-json

@@ -33,6 +33,37 @@ if ([string]::IsNullOrWhiteSpace($cleanKey)) {
 $env:TAURI_SIGNING_PRIVATE_KEY = $cleanKey
 $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $SavedPassword
 
+# --- VERIFICACION DE BINARIOS FFMPEG (deben empaquetarse en el instalador) ---
+# ffmpeg.exe / ffprobe.exe estan ignorados por Git (.gitignore), asi que NO
+# llegan al clonar/actualizar el repo. Sin ellos el instalador queda SIN FFmpeg
+# y la app dara "No se encontro FFprobe". Abortamos antes de compilar.
+$binDir = "src-tauri/bin"
+$requiredBins = @("ffmpeg.exe", "ffprobe.exe")
+$missingBins = @()
+foreach ($b in $requiredBins) {
+    $p = Join-Path $binDir $b
+    if ((-not (Test-Path $p)) -or ((Get-Item $p).Length -lt 1MB)) {
+        $missingBins += $b
+    }
+}
+if ($missingBins.Count -gt 0) {
+    Write-Host ""
+    Write-Host '=============================================' -ForegroundColor Red
+    Write-Host '   ERROR: FALTAN BINARIOS DE FFMPEG          ' -ForegroundColor Red
+    Write-Host '=============================================' -ForegroundColor Red
+    Write-Host "Faltan en '$binDir': $($missingBins -join ', ')" -ForegroundColor Yellow
+    Write-Host "Estan ignorados por Git, por eso no llegan al clonar/actualizar." -ForegroundColor Yellow
+    Write-Host "Sin ellos el instalador NO incluira FFmpeg." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Solucion (una sola vez en esta maquina):" -ForegroundColor Cyan
+    Write-Host "  Opcion A (descargar):  powershell -ExecutionPolicy Bypass -File .\scripts\fetch-ffmpeg-windows.ps1" -ForegroundColor White
+    Write-Host "  Opcion B (manual):     copia ffmpeg.exe y ffprobe.exe (x64) a '$binDir'" -ForegroundColor White
+    Write-Host ""
+    pause
+    exit 1
+}
+Write-Host "-> Binarios FFmpeg presentes; se empaquetaran en el instalador." -ForegroundColor Green
+
 # --- LIMPIEZA PREVIA ---
 $targetDir = "src-tauri/target/release/bundle/nsis"
 if (Test-Path $targetDir) {
