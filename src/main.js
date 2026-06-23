@@ -7181,6 +7181,18 @@ function drawChart(data, cutVal, isSorted) {
 }
 
 listen("log_event", (e) => log(e.payload.level, e.payload.msg));
+listen("backend_panic", (e) => {
+    const msg = (e && e.payload != null) ? String(e.payload) : "Error interno";
+    log("ERROR", "Backend panic: " + msg);
+    try {
+        showCustomAlert(
+            tr("general.backend_panic_title", "Error inesperado"),
+            tr("general.backend_panic_body", "La operación falló y se detuvo de forma segura.") + "\n\n" + msg
+        );
+    } catch (_) {
+        showCustomAlert("Error", "Error inesperado: " + msg);
+    }
+});
 listen("progress", (e) => {
     const step = translateBackendProgressText(e.payload.step);
     const details = translateBackendProgressText(e.payload.details);

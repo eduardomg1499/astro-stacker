@@ -17,6 +17,8 @@
         "acknowledge": "Entendido",
         "error": "Error",
         "warning": "Aviso",
+        "backend_panic_title": "Error inesperado",
+        "backend_panic_body": "La operación falló y se detuvo de forma segura para no cerrar la app. En equipos con poca memoria, prueba con un video más corto, baja el porcentaje de frames a apilar o cierra otras aplicaciones.",
         "saving": "GUARDANDO...",
         "saved": "Guardado",
         "unavailable": "No disponible",

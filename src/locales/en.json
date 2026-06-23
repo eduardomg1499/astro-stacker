@@ -17,6 +17,8 @@
         "acknowledge": "Got it",
         "error": "Error",
         "warning": "Notice",
+        "backend_panic_title": "Unexpected error",
+        "backend_panic_body": "The operation failed and stopped safely so the app would not close. On low-memory machines, try a shorter video, lower the percentage of frames to stack, or close other applications.",
         "saving": "SAVING...",
         "saved": "Saved",
         "unavailable": "Unavailable",

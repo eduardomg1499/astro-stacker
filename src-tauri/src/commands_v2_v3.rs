@@ -1357,18 +1357,32 @@ pub async fn stack_video_liquid_warping_impl(
     sys.refresh_memory();
     let available_ram = sys.available_memory(); // Bytes
                                                 // Safe limit: 30% of FREE RAM to maximize NVMe offloading
-    let ram_limit_batch = (available_ram as f64 * 0.30) as u64;
-    let bytes_per_frame = (w_in * h_in * bpp * 2) as u64; // *2 because frames are stored as Vec<u16>
+    // Reservamos RAM para el SO/otros procesos y usamos la mitad del resto.
+    // Esto evita agotar la memoria en equipos de bajos recursos (antes el proceso
+    // se cerraba en seco: la asignacion fallaba y con panic=abort abortaba todo).
+    let os_reserve: u64 = 768 * 1024 * 1024; // 768 MB reservados para el sistema
+    let usable_ram = available_ram.saturating_sub(os_reserve);
+    let ram_limit_batch = (usable_ram as f64 * 0.50) as u64;
+
+    // Memoria REAL por frame mantenido en RAM: en color se expande a RGB u16
+    // (w*h*3*2) y en mono es w*h*2, mas un factor de seguridad por acumuladores
+    // y temporales por hilo. La estimacion previa (w*h*bpp*2) subestimaba color.
+    let channels: u64 = if is_color_video { 3 } else { 1 };
+    let per_frame_real = (w_in as u64) * (h_in as u64) * channels * 2;
+    let bytes_per_frame = ((per_frame_real as f64) * 1.6_f64).ceil() as u64;
+
     let mut frames_per_batch = (ram_limit_batch / bytes_per_frame.max(1)).max(1) as usize;
 
-    // ELITE BATCHING CAP: Never exceed 3000 to keep the progress bar responsive, but allow massive ram usage
-    if w_in >= 3000 {
-        frames_per_batch = frames_per_batch.clamp(30, 1000);
+    // Tope alto para NO penalizar gama alta; PISO bajo (2) para que los equipos
+    // de bajos recursos usen lotes pequenos en vez de quedarse sin memoria.
+    let batch_cap = if w_in >= 3000 {
+        1000
     } else if w_in >= 1920 {
-        frames_per_batch = frames_per_batch.clamp(60, 2000);
+        2000
     } else {
-        frames_per_batch = frames_per_batch.clamp(100, 3000);
-    }
+        3000
+    };
+    frames_per_batch = frames_per_batch.clamp(2, batch_cap);
 
     let total_active = active_frames_data.len();
     let total_batches = (total_active + frames_per_batch - 1) / frames_per_batch;

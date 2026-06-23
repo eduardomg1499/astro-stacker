@@ -58,5 +58,5 @@ bitarray = { path = "./vendor/bitarray" }
 codegen-units = 1     # Mejor optimizacion, mas lento de compilar
 lto = true            # Link Time Optimization: Mezcla todo el codigo (dificil de separar)
 strip = true          # Elimina simbolos de depuracion (nombres de funciones, rutas)
-panic = "abort"       # Reduce el tamaño y elimina metadatos de panico
+panic = "unwind"      # Permite capturar panics y mostrar error en vez de cerrar la app en seco
 opt-level = 3         # Maxima velocidad (o "z" para ofuscacion por tamaño minimo)

@@ -7135,6 +7135,33 @@ fn main() {
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| PathBuf::from("."));
+
+            // --- MANEJO DE PANICS ---
+            // Con panic=unwind el proceso ya no se cierra en seco. Ademas
+            // registramos el fallo en un log y avisamos al frontend para mostrar
+            // un mensaje (evento "backend_panic") en lugar de desaparecer.
+            {
+                let handle = app.handle().clone();
+                let crash_log = app_data_dir.join("crash_log.txt");
+                let default_hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| {
+                    let msg = info.to_string();
+                    if let Some(parent) = crash_log.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&crash_log)
+                    {
+                        use std::io::Write;
+                        let _ = writeln!(f, "[{}] {}", chrono::Utc::now().to_rfc3339(), msg);
+                    }
+                    let _ = handle.emit("backend_panic", msg.clone());
+                    default_hook(info);
+                }));
+            }
+
             let license_manager = Arc::new(LicenseManager::new(app_data_dir));
             app.manage(AppState {
                 stacked_image: Mutex::new(None),
