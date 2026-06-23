@@ -4185,6 +4185,1472 @@ async fn load_image_thumbnail(path: String) -> Result<AnalysisResult, String> {
     })
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct DerotationDiscDto {
+    cx: f64,
+    cy: f64,
+    radius_x: f64,
+    radius_y: f64,
+    angle_deg: f64,
+    phase: f64,
+}
+
+impl From<crate::derotation::PlanetDisc> for DerotationDiscDto {
+    fn from(disc: crate::derotation::PlanetDisc) -> Self {
+        Self {
+            cx: disc.cx,
+            cy: disc.cy,
+            radius_x: disc.radius_x,
+            radius_y: disc.radius_y,
+            angle_deg: disc.angle_deg,
+            phase: disc.phase,
+        }
+    }
+}
+
+impl From<&DerotationDiscDto> for crate::derotation::PlanetDisc {
+    fn from(disc: &DerotationDiscDto) -> Self {
+        Self {
+            cx: disc.cx,
+            cy: disc.cy,
+            radius_x: disc.radius_x,
+            radius_y: disc.radius_y,
+            angle_deg: disc.angle_deg,
+            phase: disc.phase,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PlanetaryDerotationPreflight {
+    width: usize,
+    height: usize,
+    file_name: String,
+    source_size_bytes: u64,
+    preview_base64: String,
+    detected_disc: DerotationDiscDto,
+    diagnostics: DerotationDiagnostics,
+    suggested_planet: String,
+    capture_time: String,
+    reference_time: String,
+    cm1: f64,
+    cm2: f64,
+    cm3: f64,
+    b0_deg: f64,
+    north_angle_deg: f64,
+    phase_angle_deg: f64,
+    apparent_diameter_arcsec: f64,
+    distance_au: f64,
+    source_kind: String,
+}
+
+#[derive(serde::Serialize)]
+struct PlanetaryDerotationResult {
+    output_path: String,
+    preview_base64: String,
+    width: usize,
+    height: usize,
+    file_name: String,
+    planet: String,
+    cm_system: usize,
+    delta_deg: f64,
+    detected_disc: DerotationDiscDto,
+    diagnostics: DerotationDiagnostics,
+    b0_deg: f64,
+    north_angle_deg: f64,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct DerotationDiagnostics {
+    confidence: f64,
+    classification: String,
+    can_apply: bool,
+    coverage: f64,
+    contrast_ratio: f64,
+    edge_margin_px: f64,
+    radius_px: f64,
+    aspect_ratio: f64,
+    expected_aspect_ratio: f64,
+    delta_deg: f64,
+    time_source: String,
+    duration_sec: f64,
+    fps: f64,
+    b0_deg: f64,
+    north_angle_deg: f64,
+    phase_angle_deg: f64,
+    apparent_diameter_arcsec: f64,
+    distance_au: f64,
+    warnings: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct PlanetaryDiscDetectionResult {
+    detected_disc: DerotationDiscDto,
+    diagnostics: DerotationDiagnostics,
+}
+
+#[derive(serde::Serialize)]
+struct PlanetaryDerotationSequenceResult {
+    output_paths: Vec<String>,
+    reference_frame: usize,
+    reference_time_jd: f64,
+    time_span_sec: f64,
+    warnings: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct PlanetaryDerotationFusionResult {
+    output_path: String,
+    preview_base64: String,
+    width: usize,
+    height: usize,
+    planet: String,
+    cm_system: usize,
+    frame_count: usize,
+    reference_frame: usize,
+    reference_time_jd: f64,
+    time_span_sec: f64,
+    detected_disc: DerotationDiscDto,
+    diagnostics: DerotationDiagnostics,
+    b0_deg: f64,
+    north_angle_deg: f64,
+    weights: Vec<f64>,
+    normalization_gains: Vec<[f64; 3]>,
+    rejected_pixel_fraction: f64,
+    warnings: Vec<String>,
+}
+
+fn derot_load_rgb16_image(path: &str) -> Result<(Vec<u16>, usize, usize), String> {
+    let img = image::open(path).map_err(|e| format!("No se pudo abrir la imagen: {}", e))?;
+    let rgb = img.to_rgb16();
+    let (w, h) = rgb.dimensions();
+    Ok((rgb.into_raw(), w as usize, h as usize))
+}
+
+fn derot_rgb_to_mono(rgb: &[u16]) -> Vec<u16> {
+    rgb.chunks_exact(3)
+        .map(|px| {
+            let r = px[0] as u32;
+            let g = px[1] as u32;
+            let b = px[2] as u32;
+            ((r * 299 + g * 587 + b * 114) / 1000) as u16
+        })
+        .collect()
+}
+
+fn derot_channel_means_inside_disc(
+    rgb: &[u16],
+    width: usize,
+    height: usize,
+    disc: &crate::derotation::PlanetDisc,
+    radius_limit: f64,
+) -> [f64; 3] {
+    let rx = disc.radius_x.abs().max(1.0);
+    let ry = disc.radius_y.abs().max(1.0);
+    let r2_limit = radius_limit * radius_limit;
+    let mut sums = [0.0_f64; 3];
+    let mut count = 0.0_f64;
+    let y_start = (disc.cy - ry * radius_limit).max(0.0) as usize;
+    let y_end = ((disc.cy + ry * radius_limit + 1.0) as usize).min(height);
+    let x_start = (disc.cx - rx * radius_limit).max(0.0) as usize;
+    let x_end = ((disc.cx + rx * radius_limit + 1.0) as usize).min(width);
+
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            let nx = (x as f64 - disc.cx) / rx;
+            let ny = (y as f64 - disc.cy) / ry;
+            if nx * nx + ny * ny > r2_limit {
+                continue;
+            }
+            let idx = (y * width + x) * 3;
+            if idx + 2 >= rgb.len() {
+                continue;
+            }
+            sums[0] += rgb[idx] as f64;
+            sums[1] += rgb[idx + 1] as f64;
+            sums[2] += rgb[idx + 2] as f64;
+            count += 1.0;
+        }
+    }
+
+    if count > 0.0 {
+        [sums[0] / count, sums[1] / count, sums[2] / count]
+    } else {
+        [1.0, 1.0, 1.0]
+    }
+}
+
+fn derot_photometric_gains(reference_means: [f64; 3], frame_means: [f64; 3]) -> [f64; 3] {
+    let mut gains = [1.0_f64; 3];
+    for c in 0..3 {
+        if frame_means[c].is_finite() && frame_means[c] > 64.0 {
+            gains[c] = (reference_means[c] / frame_means[c]).clamp(0.55, 1.85);
+        }
+    }
+    gains
+}
+
+fn derot_disc_mask(
+    width: usize,
+    height: usize,
+    disc: &crate::derotation::PlanetDisc,
+    radius_limit: f64,
+) -> Vec<u8> {
+    let rx = disc.radius_x.abs().max(1.0);
+    let ry = disc.radius_y.abs().max(1.0);
+    let r2_limit = radius_limit * radius_limit;
+    let mut mask = vec![0u8; width.saturating_mul(height)];
+    let y_start = (disc.cy - ry * radius_limit).max(0.0) as usize;
+    let y_end = ((disc.cy + ry * radius_limit + 1.0) as usize).min(height);
+    let x_start = (disc.cx - rx * radius_limit).max(0.0) as usize;
+    let x_end = ((disc.cx + rx * radius_limit + 1.0) as usize).min(width);
+
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            let nx = (x as f64 - disc.cx) / rx;
+            let ny = (y as f64 - disc.cy) / ry;
+            if nx * nx + ny * ny <= r2_limit {
+                mask[y * width + x] = 1;
+            }
+        }
+    }
+    mask
+}
+
+fn derot_stack_to_rgb16(stack: &StackResult) -> Vec<u16> {
+    let pixels = stack.width.saturating_mul(stack.height);
+    if stack.data.len() == pixels.saturating_mul(3) {
+        stack.data.clone()
+    } else {
+        let mut rgb = Vec::with_capacity(pixels.saturating_mul(3));
+        for v in stack.data.iter().take(pixels) {
+            rgb.extend_from_slice(&[*v, *v, *v]);
+        }
+        rgb
+    }
+}
+
+fn derot_encode_preview(rgb: &[u16], width: usize, height: usize) -> Result<String, String> {
+    if rgb.len() != width.saturating_mul(height).saturating_mul(3) {
+        return Err("Buffer RGB16 invalido para preview de derotacion".to_string());
+    }
+    let vis = to_8bit_preview_visual(rgb);
+    let mut png = Vec::new();
+    image::png::PngEncoder::new(&mut Cursor::new(&mut png))
+        .encode(&vis, width as u32, height as u32, image::ColorType::Rgb8)
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "data:image/png;base64,{}",
+        general_purpose::STANDARD.encode(&png)
+    ))
+}
+
+fn derot_save_rgb16_tiff(path: &Path, rgb: &[u16], width: usize, height: usize) -> Result<(), String> {
+    let mut raw_bytes = Vec::with_capacity(rgb.len() * 2);
+    for v in rgb {
+        raw_bytes.extend_from_slice(&v.to_ne_bytes());
+    }
+
+    let file = File::create(path).map_err(|e| e.to_string())?;
+    let writer = BufWriter::new(file);
+    image::codecs::tiff::TiffEncoder::new(writer)
+        .encode(&raw_bytes, width as u32, height as u32, image::ColorType::Rgb16)
+        .map_err(|e| e.to_string())
+}
+
+fn derot_default_output_path(source_path: &str) -> PathBuf {
+    let source = Path::new(source_path);
+    let parent = source.parent().unwrap_or_else(|| Path::new("."));
+    let stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Planetary_Derotation");
+    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    parent.join(format!("{}_Derotated_{}.tiff", stem, stamp))
+}
+
+fn derot_output_path_from_optional_source(source_path: Option<&str>, fallback_name: &str) -> PathBuf {
+    if let Some(path) = source_path.filter(|p| !p.trim().is_empty()) {
+        derot_default_output_path(path)
+    } else {
+        let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(format!("{}_Derotated_{}.tiff", fallback_name, stamp))
+    }
+}
+
+fn derot_iso_for_datetime_input(value: &str) -> String {
+    let cleaned = value.trim().replace(' ', "T");
+    if cleaned.len() >= 19 {
+        cleaned[..19].to_string()
+    } else if cleaned.len() >= 16 {
+        format!("{}:00", &cleaned[..16])
+    } else {
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string()
+    }
+}
+
+fn derot_metadata_with_source(
+    path: &str,
+    manual_log_path: Option<&str>,
+) -> (crate::derotation::CaptureMetadata, String) {
+    if let Some(log_path) = manual_log_path.filter(|p| !p.trim().is_empty()) {
+        if let Ok(meta) = crate::derotation::parse_capture_log(log_path) {
+            return (meta, "manual_log".to_string());
+        }
+    }
+    if let Some(meta) = crate::derotation::auto_parse_log(path) {
+        return (meta, "log".to_string());
+    }
+    if let Ok(meta) = crate::derotation::infer_time_from_file(path) {
+        return (meta, "file_modified".to_string());
+    }
+
+    (
+        {
+            let now = chrono::Utc::now();
+            let jd = crate::derotation::datetime_to_jd(
+                now.format("%Y").to_string().parse().unwrap_or(2026),
+                now.format("%m").to_string().parse().unwrap_or(1),
+                now.format("%d").to_string().parse().unwrap_or(1),
+                now.format("%H").to_string().parse().unwrap_or(0),
+                now.format("%M").to_string().parse().unwrap_or(0),
+                now.format("%S").to_string().parse::<f64>().unwrap_or(0.0),
+            );
+            crate::derotation::CaptureMetadata {
+                mid_time_jd: jd,
+                planet: None,
+                duration_sec: 0.0,
+                fps: 0.0,
+                start_time_iso: now.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            }
+        },
+        "system_clock".to_string(),
+    )
+}
+
+fn derot_disc_diagnostics(
+    mono: &[u16],
+    width: usize,
+    height: usize,
+    disc: &crate::derotation::PlanetDisc,
+    planet: &crate::derotation::PlanetaryBody,
+    time_source: &str,
+    duration_sec: f64,
+    fps: f64,
+    capture_jd: f64,
+    reference_jd: f64,
+    cm_system: usize,
+    geometry: crate::derotation::ObserverGeometry,
+) -> DerotationDiagnostics {
+    let rx = disc.radius_x.abs().max(1.0);
+    let ry = disc.radius_y.abs().max(1.0);
+    let radius_px = rx.min(ry);
+    let coverage = (std::f64::consts::PI * rx * ry) / (width.max(1) * height.max(1)) as f64;
+    let edge_margin_px = (disc.cx - rx)
+        .min(disc.cy - ry)
+        .min(width as f64 - (disc.cx + rx))
+        .min(height as f64 - (disc.cy + ry));
+    let aspect_ratio = ry / rx;
+    let expected_aspect_ratio = planet.polar_radius_km / planet.equatorial_radius_km;
+    let aspect_error = if expected_aspect_ratio > 0.0 {
+        (aspect_ratio / expected_aspect_ratio - 1.0).abs()
+    } else {
+        1.0
+    };
+
+    let step = ((width.max(height) / 900).max(1)).min(8);
+    let mut in_sum = 0.0;
+    let mut in_count = 0.0;
+    let mut out_sum = 0.0;
+    let mut out_count = 0.0;
+    for y in (0..height).step_by(step) {
+        for x in (0..width).step_by(step) {
+            let idx = y * width + x;
+            if idx >= mono.len() {
+                continue;
+            }
+            let nx = (x as f64 - disc.cx) / rx;
+            let ny = (y as f64 - disc.cy) / ry;
+            let r2 = nx * nx + ny * ny;
+            if r2 <= 0.92 {
+                in_sum += mono[idx] as f64;
+                in_count += 1.0;
+            } else if r2 >= 1.18 {
+                out_sum += mono[idx] as f64;
+                out_count += 1.0;
+            }
+        }
+    }
+    let in_mean = if in_count > 0.0 { in_sum / in_count } else { 0.0 };
+    let out_mean = if out_count > 0.0 { out_sum / out_count } else { 0.0 };
+    let contrast_ratio = (in_mean + 64.0) / (out_mean + 64.0);
+
+    let radius_score = ((radius_px - 12.0) / 80.0).clamp(0.0, 1.0);
+    let coverage_score = if coverage < 0.002 {
+        0.0
+    } else if coverage < 0.012 {
+        (coverage / 0.012).clamp(0.0, 1.0)
+    } else if coverage <= 0.65 {
+        1.0
+    } else {
+        ((0.92 - coverage) / 0.27).clamp(0.0, 1.0)
+    };
+    let contrast_score = ((contrast_ratio - 1.08) / 1.25).clamp(0.0, 1.0);
+    let margin_score = ((edge_margin_px + radius_px * 0.20) / (radius_px * 0.20)).clamp(0.0, 1.0);
+    let aspect_score = (1.0 - (aspect_error / 0.45)).clamp(0.0, 1.0);
+    let confidence = (0.25 * radius_score
+        + 0.25 * coverage_score
+        + 0.22 * contrast_score
+        + 0.16 * margin_score
+        + 0.12 * aspect_score)
+        .clamp(0.0, 1.0);
+
+    let delta_deg = crate::derotation::rotation_delta_deg(
+        planet,
+        reference_jd,
+        capture_jd,
+        cm_system.min(2),
+    );
+    let mut warnings = Vec::new();
+    if time_source != "log" && time_source != "manual_log" {
+        warnings.push("No se encontro log de captura; revisa manualmente la hora UTC antes de aplicar.".to_string());
+    }
+    if confidence < 0.45 {
+        warnings.push("La deteccion del disco es moderada o baja; ajusta centro/radio antes de derotar.".to_string());
+    }
+    if contrast_ratio < 1.18 {
+        warnings.push("Contraste bajo entre planeta y fondo; la malla puede estar imprecisa.".to_string());
+    }
+    if edge_margin_px < 2.0 {
+        warnings.push("El disco parece recortado o muy cerca del borde; revisa la geometria manual.".to_string());
+    }
+    if coverage > 0.72 {
+        warnings.push("La imagen cubre gran parte del frame; puede ser superficie lunar/solar, no disco planetario compacto.".to_string());
+    }
+    if aspect_error > 0.28 {
+        warnings.push("La relacion de aspecto detectada no coincide bien con el planeta seleccionado.".to_string());
+    }
+    if disc.phase < 0.35 {
+        warnings.push("Fase iluminada baja: el borde oscuro puede desplazar la deteccion.".to_string());
+    }
+    if delta_deg.abs() < 0.03 {
+        warnings.push("El delta temporal es casi cero; la imagen cambiara muy poco.".to_string());
+    } else if delta_deg.abs() > 75.0 {
+        warnings.push("Delta de rotacion alto; valida tiempos porque puede generar estiramientos visibles.".to_string());
+    }
+    if geometry.phase_angle_deg > 25.0 {
+        warnings.push("Fase planetaria alta: revisa que el limbo oscuro no desplace la malla.".to_string());
+    }
+
+    let can_apply = confidence >= 0.18 && radius_px >= 10.0 && coverage > 0.001;
+    let classification = if confidence >= 0.78 {
+        "excellent"
+    } else if confidence >= 0.58 {
+        "good"
+    } else if confidence >= 0.35 {
+        "review"
+    } else {
+        "poor"
+    }
+    .to_string();
+
+    DerotationDiagnostics {
+        confidence,
+        classification,
+        can_apply,
+        coverage,
+        contrast_ratio,
+        edge_margin_px,
+        radius_px,
+        aspect_ratio,
+        expected_aspect_ratio,
+        delta_deg,
+        time_source: time_source.to_string(),
+        duration_sec,
+        fps,
+        b0_deg: geometry.sub_earth_lat_deg,
+        north_angle_deg: geometry.north_pole_angle_deg,
+        phase_angle_deg: geometry.phase_angle_deg,
+        apparent_diameter_arcsec: geometry.apparent_diameter_arcsec,
+        distance_au: geometry.distance_au,
+        warnings,
+    }
+}
+
+fn derot_build_preflight(
+    rgb: &[u16],
+    width: usize,
+    height: usize,
+    file_name: String,
+    source_size_bytes: u64,
+    source_kind: String,
+    meta: crate::derotation::CaptureMetadata,
+    time_source: String,
+) -> Result<PlanetaryDerotationPreflight, String> {
+    let mono = derot_rgb_to_mono(rgb);
+    let raw_disc = crate::derotation::detect_planet_disc(&mono, width, height);
+    let suggested_planet = meta.planet.clone().unwrap_or_else(|| "jupiter".to_string());
+    let planet = crate::derotation::get_planet(&suggested_planet)
+        .unwrap_or(&crate::derotation::JUPITER);
+    let mut disc = crate::derotation::validate_disc_aspect(&raw_disc, planet);
+    let (cm1, cm2, cm3) = crate::derotation::calculate_central_meridian(planet, meta.mid_time_jd);
+    let geometry = crate::derotation::calculate_observer_geometry(planet, meta.mid_time_jd);
+    disc.angle_deg = geometry.north_pole_angle_deg;
+    let diagnostics = derot_disc_diagnostics(
+        &mono,
+        width,
+        height,
+        &disc,
+        planet,
+        &time_source,
+        meta.duration_sec,
+        meta.fps,
+        meta.mid_time_jd,
+        meta.mid_time_jd,
+        1,
+        geometry,
+    );
+    let preview_base64 = derot_encode_preview(rgb, width, height)?;
+
+    Ok(PlanetaryDerotationPreflight {
+        width,
+        height,
+        file_name,
+        source_size_bytes,
+        preview_base64,
+        detected_disc: disc.into(),
+        diagnostics,
+        suggested_planet,
+        capture_time: derot_iso_for_datetime_input(&meta.start_time_iso),
+        reference_time: derot_iso_for_datetime_input(&meta.start_time_iso),
+        cm1,
+        cm2,
+        cm3,
+        b0_deg: geometry.sub_earth_lat_deg,
+        north_angle_deg: geometry.north_pole_angle_deg,
+        phase_angle_deg: geometry.phase_angle_deg,
+        apparent_diameter_arcsec: geometry.apparent_diameter_arcsec,
+        distance_au: geometry.distance_au,
+        source_kind,
+    })
+}
+
+#[tauri::command]
+async fn get_planetary_derotation_preflight(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    image_path: String,
+    log_path: Option<String>,
+) -> Result<PlanetaryDerotationPreflight, String> {
+    state.license_manager.check_access()?;
+    let path = Path::new(&image_path);
+    if !path.exists() {
+        return Err("Imagen no encontrada".to_string());
+    }
+
+    emit_progress(&app, "Analizando derotacion planetaria...", 8.0, None);
+    let (rgb, width, height) = derot_load_rgb16_image(&image_path)?;
+    let (meta, time_source) = derot_metadata_with_source(&image_path, log_path.as_deref());
+    let preflight = derot_build_preflight(
+        &rgb,
+        width,
+        height,
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("imagen")
+            .to_string(),
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        "file".to_string(),
+        meta,
+        time_source,
+    )?;
+    emit_progress(&app, "Derotacion lista para ajustar", 100.0, None);
+    Ok(preflight)
+}
+
+#[tauri::command]
+async fn get_current_stacked_derotation_preflight(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    source_path: Option<String>,
+    log_path: Option<String>,
+) -> Result<PlanetaryDerotationPreflight, String> {
+    state.license_manager.check_access()?;
+    let stack = {
+        let guard = state.stacked_image.lock().unwrap();
+        guard
+            .clone()
+            .ok_or_else(|| "No hay una imagen apilada activa para derotar.".to_string())?
+    };
+    let rgb = derot_stack_to_rgb16(&stack);
+    if rgb.len() != stack.width.saturating_mul(stack.height).saturating_mul(3) {
+        return Err("La imagen apilada activa no tiene un buffer valido.".to_string());
+    }
+    let (meta, time_source) = if let Some(path) = source_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        derot_metadata_with_source(path, log_path.as_deref())
+    } else if let Some(path) = log_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        crate::derotation::parse_capture_log(path)
+            .map(|meta| (meta, "manual_log".to_string()))
+            .unwrap_or_else(|_| {
+                let now = chrono::Utc::now();
+                let jd = crate::derotation::datetime_to_jd(
+                    now.format("%Y").to_string().parse().unwrap_or(2026),
+                    now.format("%m").to_string().parse().unwrap_or(1),
+                    now.format("%d").to_string().parse().unwrap_or(1),
+                    now.format("%H").to_string().parse().unwrap_or(0),
+                    now.format("%M").to_string().parse().unwrap_or(0),
+                    now.format("%S").to_string().parse::<f64>().unwrap_or(0.0),
+                );
+                (
+                    crate::derotation::CaptureMetadata {
+                        mid_time_jd: jd,
+                        planet: None,
+                        duration_sec: 0.0,
+                        fps: 0.0,
+                        start_time_iso: now.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    },
+                    "system_clock".to_string(),
+                )
+            })
+    } else {
+            let now = chrono::Utc::now();
+            let jd = crate::derotation::datetime_to_jd(
+                now.format("%Y").to_string().parse().unwrap_or(2026),
+                now.format("%m").to_string().parse().unwrap_or(1),
+                now.format("%d").to_string().parse().unwrap_or(1),
+                now.format("%H").to_string().parse().unwrap_or(0),
+                now.format("%M").to_string().parse().unwrap_or(0),
+                now.format("%S").to_string().parse::<f64>().unwrap_or(0.0),
+            );
+            (
+                crate::derotation::CaptureMetadata {
+                    mid_time_jd: jd,
+                    planet: None,
+                    duration_sec: 0.0,
+                    fps: 0.0,
+                    start_time_iso: now.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                },
+                "system_clock".to_string(),
+            )
+    };
+
+    emit_progress(&app, "Analizando resultado actual para derotacion...", 8.0, None);
+    let preflight = derot_build_preflight(
+        &rgb,
+        stack.width,
+        stack.height,
+        "Resultado apilado actual".to_string(),
+        0,
+        "current_stack".to_string(),
+        meta,
+        time_source,
+    )?;
+    emit_progress(&app, "Derotacion lista para ajustar", 100.0, None);
+    Ok(preflight)
+}
+
+#[tauri::command]
+async fn detect_planetary_derotation_disc(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    image_path: String,
+    planet: String,
+    log_path: Option<String>,
+) -> Result<PlanetaryDiscDetectionResult, String> {
+    state.license_manager.check_access()?;
+    emit_progress(&app, "Detectando disco planetario...", 35.0, None);
+    let planet_body = crate::derotation::get_planet(&planet).unwrap_or(&crate::derotation::JUPITER);
+    let (rgb, width, height) = derot_load_rgb16_image(&image_path)?;
+    let mono = derot_rgb_to_mono(&rgb);
+    let disc = crate::derotation::detect_planet_disc(&mono, width, height);
+    let mut disc = crate::derotation::validate_disc_aspect(&disc, planet_body);
+    let (meta, time_source) = derot_metadata_with_source(&image_path, log_path.as_deref());
+    let geometry = crate::derotation::calculate_observer_geometry(planet_body, meta.mid_time_jd);
+    disc.angle_deg = geometry.north_pole_angle_deg;
+    let diagnostics = derot_disc_diagnostics(
+        &mono,
+        width,
+        height,
+        &disc,
+        planet_body,
+        &time_source,
+        meta.duration_sec,
+        meta.fps,
+        meta.mid_time_jd,
+        meta.mid_time_jd,
+        1,
+        geometry,
+    );
+    emit_progress(&app, "Disco detectado", 100.0, None);
+    Ok(PlanetaryDiscDetectionResult {
+        detected_disc: disc.into(),
+        diagnostics,
+    })
+}
+
+#[tauri::command]
+async fn apply_planetary_derotation(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    image_path: String,
+    planet: String,
+    capture_time: String,
+    reference_time: String,
+    cm_system: usize,
+    limb_strength: f64,
+    sub_earth_lat_deg: f64,
+    disc_override: Option<DerotationDiscDto>,
+) -> Result<PlanetaryDerotationResult, String> {
+    state.license_manager.check_access()?;
+    let planet_body = crate::derotation::get_planet(&planet)
+        .ok_or_else(|| "Planeta no soportado para derotacion".to_string())?;
+    let capture_jd = crate::derotation::parse_iso_to_jd(&capture_time)
+        .map_err(|e| format!("Tiempo de captura invalido: {}", e))?;
+    let reference_jd = crate::derotation::parse_iso_to_jd(&reference_time)
+        .map_err(|e| format!("Tiempo de referencia invalido: {}", e))?;
+
+    emit_progress(&app, "Cargando imagen para derotacion...", 5.0, None);
+    let (rgb, width, height) = derot_load_rgb16_image(&image_path)?;
+    let mono = derot_rgb_to_mono(&rgb);
+    let raw_disc = match disc_override.as_ref() {
+        Some(disc) => crate::derotation::PlanetDisc::from(disc),
+        None => crate::derotation::detect_planet_disc(&mono, width, height),
+    };
+    let disc = crate::derotation::validate_disc_aspect(&raw_disc, planet_body);
+    let mut geometry = crate::derotation::calculate_observer_geometry(planet_body, capture_jd);
+    geometry.sub_earth_lat_deg = sub_earth_lat_deg.clamp(-35.0, 35.0);
+    geometry.north_pole_angle_deg = disc.angle_deg;
+    let delta_deg = crate::derotation::rotation_delta_deg(
+        planet_body,
+        reference_jd,
+        capture_jd,
+        cm_system.min(2),
+    );
+    let diagnostics = derot_disc_diagnostics(
+        &mono,
+        width,
+        height,
+        &disc,
+        planet_body,
+        "manual",
+        0.0,
+        0.0,
+        capture_jd,
+        reference_jd,
+        cm_system.min(2),
+        geometry,
+    );
+    if !diagnostics.can_apply {
+        return Err("La geometria del disco no es suficientemente confiable. Ajusta centro/radio o carga una imagen planetaria con el disco completo visible.".to_string());
+    }
+
+    emit_progress(
+        &app,
+        "Aplicando proyeccion cilindrica y derotacion...",
+        35.0,
+        Some(format!("Delta {:.3} grados", delta_deg)),
+    );
+
+    let planet_for_block = planet.clone();
+    let disc_for_block = disc.clone();
+    let derotated = tauri::async_runtime::spawn_blocking(move || {
+        let planet_body = crate::derotation::get_planet(&planet_for_block)
+            .ok_or_else(|| "Planeta no soportado para derotacion".to_string())?;
+        Ok::<Vec<u16>, String>(crate::derotation::derotate_single_advanced(
+            &rgb,
+            width,
+            height,
+            3,
+            planet_body,
+            capture_jd,
+            reference_jd,
+            limb_strength.clamp(0.0, 2.0),
+            cm_system.min(2),
+            sub_earth_lat_deg.clamp(-35.0, 35.0),
+            Some(&disc_for_block),
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let out_path = derot_default_output_path(&image_path);
+    emit_progress(&app, "Guardando TIFF derotado 16-bit...", 82.0, None);
+    derot_save_rgb16_tiff(&out_path, &derotated, width, height)?;
+
+    {
+        let mut stacked = state.stacked_image.lock().unwrap();
+        *stacked = Some(StackResult {
+            data: derotated.clone(),
+            width,
+            height,
+            is_mono: false,
+            is_surface: false,
+        });
+    }
+    state.deconv_cache.lock().unwrap().clear();
+    state.wavelet_cache.lock().unwrap().clear();
+    state.filter_cache.lock().unwrap().clear();
+
+    let preview_base64 = derot_encode_preview(&derotated, width, height)?;
+    emit_progress(&app, "Derotacion completada", 100.0, None);
+    log_to_front(
+        &app,
+        "SUCCESS",
+        &format!(
+            "Derotacion planetaria completada: {} | delta {:.3}°",
+            clean_windows_path(out_path.clone()),
+            delta_deg
+        ),
+    );
+
+    Ok(PlanetaryDerotationResult {
+        output_path: clean_windows_path(out_path),
+        preview_base64,
+        width,
+        height,
+        file_name: Path::new(&image_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("imagen")
+            .to_string(),
+        planet,
+        cm_system: cm_system.min(2),
+        delta_deg,
+        detected_disc: disc.into(),
+        diagnostics,
+        b0_deg: sub_earth_lat_deg.clamp(-35.0, 35.0),
+        north_angle_deg: raw_disc.angle_deg,
+    })
+}
+
+#[tauri::command]
+async fn apply_current_stacked_planetary_derotation(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    source_path: Option<String>,
+    planet: String,
+    capture_time: String,
+    reference_time: String,
+    cm_system: usize,
+    limb_strength: f64,
+    sub_earth_lat_deg: f64,
+    disc_override: Option<DerotationDiscDto>,
+) -> Result<PlanetaryDerotationResult, String> {
+    state.license_manager.check_access()?;
+    let planet_body = crate::derotation::get_planet(&planet)
+        .ok_or_else(|| "Planeta no soportado para derotacion".to_string())?;
+    let capture_jd = crate::derotation::parse_iso_to_jd(&capture_time)
+        .map_err(|e| format!("Tiempo de captura invalido: {}", e))?;
+    let reference_jd = crate::derotation::parse_iso_to_jd(&reference_time)
+        .map_err(|e| format!("Tiempo de referencia invalido: {}", e))?;
+
+    let stack = {
+        let guard = state.stacked_image.lock().unwrap();
+        guard
+            .clone()
+            .ok_or_else(|| "No hay una imagen apilada activa para derotar.".to_string())?
+    };
+    let width = stack.width;
+    let height = stack.height;
+    let rgb = derot_stack_to_rgb16(&stack);
+    let mono = derot_rgb_to_mono(&rgb);
+    let raw_disc = match disc_override.as_ref() {
+        Some(disc) => crate::derotation::PlanetDisc::from(disc),
+        None => crate::derotation::detect_planet_disc(&mono, width, height),
+    };
+    let disc = crate::derotation::validate_disc_aspect(&raw_disc, planet_body);
+    let mut geometry = crate::derotation::calculate_observer_geometry(planet_body, capture_jd);
+    geometry.sub_earth_lat_deg = sub_earth_lat_deg.clamp(-35.0, 35.0);
+    geometry.north_pole_angle_deg = disc.angle_deg;
+    let delta_deg = crate::derotation::rotation_delta_deg(
+        planet_body,
+        reference_jd,
+        capture_jd,
+        cm_system.min(2),
+    );
+    let diagnostics = derot_disc_diagnostics(
+        &mono,
+        width,
+        height,
+        &disc,
+        planet_body,
+        "manual",
+        0.0,
+        0.0,
+        capture_jd,
+        reference_jd,
+        cm_system.min(2),
+        geometry,
+    );
+    if !diagnostics.can_apply {
+        return Err("La geometria del disco no es suficientemente confiable. Ajusta centro/radio o carga una imagen planetaria con el disco completo visible.".to_string());
+    }
+
+    emit_progress(
+        &app,
+        "Derotando resultado actual...",
+        35.0,
+        Some(format!("Delta {:.3} grados", delta_deg)),
+    );
+    let planet_for_block = planet.clone();
+    let disc_for_block = disc.clone();
+    let derotated = tauri::async_runtime::spawn_blocking(move || {
+        let planet_body = crate::derotation::get_planet(&planet_for_block)
+            .ok_or_else(|| "Planeta no soportado para derotacion".to_string())?;
+        Ok::<Vec<u16>, String>(crate::derotation::derotate_single_advanced(
+            &rgb,
+            width,
+            height,
+            3,
+            planet_body,
+            capture_jd,
+            reference_jd,
+            limb_strength.clamp(0.0, 2.0),
+            cm_system.min(2),
+            sub_earth_lat_deg.clamp(-35.0, 35.0),
+            Some(&disc_for_block),
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let out_path = derot_output_path_from_optional_source(source_path.as_deref(), "Current_Stack");
+    emit_progress(&app, "Guardando TIFF derotado 16-bit...", 82.0, None);
+    derot_save_rgb16_tiff(&out_path, &derotated, width, height)?;
+
+    {
+        let mut stacked = state.stacked_image.lock().unwrap();
+        *stacked = Some(StackResult {
+            data: derotated.clone(),
+            width,
+            height,
+            is_mono: false,
+            is_surface: false,
+        });
+    }
+    state.deconv_cache.lock().unwrap().clear();
+    state.wavelet_cache.lock().unwrap().clear();
+    state.filter_cache.lock().unwrap().clear();
+
+    let preview_base64 = derot_encode_preview(&derotated, width, height)?;
+    emit_progress(&app, "Derotacion completada", 100.0, None);
+    log_to_front(
+        &app,
+        "SUCCESS",
+        &format!(
+            "Derotacion planetaria del resultado actual completada: {} | delta {:.3}°",
+            clean_windows_path(out_path.clone()),
+            delta_deg
+        ),
+    );
+
+    Ok(PlanetaryDerotationResult {
+        output_path: clean_windows_path(out_path),
+        preview_base64,
+        width,
+        height,
+        file_name: "Resultado apilado actual".to_string(),
+        planet,
+        cm_system: cm_system.min(2),
+        delta_deg,
+        detected_disc: disc.into(),
+        diagnostics,
+        b0_deg: sub_earth_lat_deg.clamp(-35.0, 35.0),
+        north_angle_deg: raw_disc.angle_deg,
+    })
+}
+
+#[tauri::command]
+async fn derotate_animation_frames(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+    planet: String,
+    cm_system: usize,
+    limb_strength: f64,
+    fallback_interval_sec: Option<f64>,
+    sub_earth_lat_deg: Option<f64>,
+    north_angle_deg: Option<f64>,
+) -> Result<PlanetaryDerotationSequenceResult, String> {
+    state.license_manager.check_access()?;
+    if paths.is_empty() {
+        return Err("No hay frames para derotar".to_string());
+    }
+    state.active_req_id.store(1, Ordering::Relaxed);
+    let planet_body = crate::derotation::get_planet(&planet)
+        .ok_or_else(|| "Planeta no soportado para derotacion".to_string())?;
+
+    emit_progress(&app, "Preparando derotacion de secuencia...", 5.0, None);
+    let mut frames: Vec<(String, Vec<u16>, usize, usize, f64, String)> = Vec::with_capacity(paths.len());
+    for (idx, path) in paths.iter().enumerate() {
+        if state.active_req_id.load(Ordering::Relaxed) == 0 {
+            return Err("Operacion cancelada por el usuario".to_string());
+        }
+        let (rgb, width, height) = derot_load_rgb16_image(path)?;
+        let (meta, time_source) = derot_metadata_with_source(path, None);
+        let pct = 5.0 + ((idx as f32 / paths.len() as f32) * 20.0);
+        emit_progress(
+            &app,
+            "Leyendo timestamps de secuencia...",
+            pct,
+            Some(format!("{} / {}", idx + 1, paths.len())),
+        );
+        frames.push((path.clone(), rgb, width, height, meta.mid_time_jd, time_source));
+    }
+
+    let (width, height) = (frames[0].2, frames[0].3);
+    if frames.iter().any(|(_, _, w, h, _, _)| *w != width || *h != height) {
+        return Err("Todos los frames deben tener la misma resolucion para derotacion planetaria".to_string());
+    }
+
+    let mut warnings = Vec::new();
+    let log_count = frames.iter().filter(|(_, _, _, _, _, source)| source == "log").count();
+    if log_count < frames.len() {
+        warnings.push(format!(
+            "{} de {} frames no tienen log de captura; valida el intervalo temporal.",
+            frames.len() - log_count,
+            frames.len()
+        ));
+    }
+    let min_jd = frames
+        .iter()
+        .map(|(_, _, _, _, jd, _)| *jd)
+        .fold(f64::INFINITY, f64::min);
+    let max_jd = frames
+        .iter()
+        .map(|(_, _, _, _, jd, _)| *jd)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut time_span_sec = (max_jd - min_jd).abs() * 86400.0;
+    let fallback_interval = fallback_interval_sec.unwrap_or(0.0).clamp(0.0, 86400.0);
+    if time_span_sec < 1.0 && fallback_interval > 0.0 && frames.len() > 1 {
+        let mid = frames.len() / 2;
+        let base_jd = frames[mid].4;
+        for (idx, frame) in frames.iter_mut().enumerate() {
+            let offset = idx as isize - mid as isize;
+            frame.4 = base_jd + (offset as f64 * fallback_interval) / 86400.0;
+        }
+        time_span_sec = fallback_interval * (frames.len().saturating_sub(1)) as f64;
+        warnings.push(format!(
+            "Se uso intervalo manual de {:.1}s entre frames porque los timestamps no eran utiles.",
+            fallback_interval
+        ));
+    } else if time_span_sec < 1.0 && frames.len() > 1 {
+        warnings.push("Los timestamps de la secuencia son casi iguales; la derotacion tendra poco o ningun efecto.".to_string());
+    }
+
+    let reference_frame = frames.len() / 2;
+    let reference_jd = frames[reference_frame].4;
+    let geometry = crate::derotation::calculate_observer_geometry(planet_body, reference_jd);
+    let b0 = sub_earth_lat_deg
+        .unwrap_or(geometry.sub_earth_lat_deg)
+        .clamp(-35.0, 35.0);
+    let mono = derot_rgb_to_mono(&frames[0].1);
+    let mut disc = crate::derotation::validate_disc_aspect(
+        &crate::derotation::detect_planet_disc(&mono, width, height),
+        planet_body,
+    );
+    disc.angle_deg = north_angle_deg.unwrap_or(geometry.north_pole_angle_deg);
+    let first_parent = Path::new(&frames[0].0)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("Derotated_Planetary");
+    std::fs::create_dir_all(&first_parent).map_err(|e| e.to_string())?;
+
+    let mut output_paths = Vec::with_capacity(frames.len());
+    for (idx, (path, rgb, _, _, jd, _)) in frames.into_iter().enumerate() {
+        if state.active_req_id.load(Ordering::Relaxed) == 0 {
+            return Err("Operacion cancelada por el usuario".to_string());
+        }
+        let pct = 28.0 + ((idx as f32 / paths.len() as f32) * 66.0);
+        emit_progress(
+            &app,
+            "Derotando frames planetarios...",
+            pct,
+            Some(format!("{} / {}", idx + 1, paths.len())),
+        );
+
+        let derotated = crate::derotation::derotate_single_advanced(
+            &rgb,
+            width,
+            height,
+            3,
+            planet_body,
+            jd,
+            reference_jd,
+            limb_strength.clamp(0.0, 2.0),
+            cm_system.min(2),
+            b0,
+            Some(&disc),
+        );
+        let stem = Path::new(&path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("frame");
+        let out_path = first_parent.join(format!("{:04}_{}_derotated.tiff", idx + 1, stem));
+        derot_save_rgb16_tiff(&out_path, &derotated, width, height)?;
+        output_paths.push(clean_windows_path(out_path));
+    }
+
+    emit_progress(&app, "Secuencia derotada", 100.0, None);
+    log_to_front(
+        &app,
+        "SUCCESS",
+        &format!("Derotacion de secuencia completada: {} frames", output_paths.len()),
+    );
+    Ok(PlanetaryDerotationSequenceResult {
+        output_paths,
+        reference_frame: reference_frame + 1,
+        reference_time_jd: reference_jd,
+        time_span_sec,
+        warnings,
+    })
+}
+
+#[tauri::command]
+async fn fuse_planetary_derotation_stacks(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    image_paths: Vec<String>,
+    planet: String,
+    cm_system: usize,
+    limb_strength: f64,
+    fallback_interval_sec: Option<f64>,
+    sub_earth_lat_deg: Option<f64>,
+    north_angle_deg: Option<f64>,
+    disc_override: Option<DerotationDiscDto>,
+) -> Result<PlanetaryDerotationFusionResult, String> {
+    state.license_manager.check_access()?;
+    if image_paths.len() < 2 {
+        return Err("Selecciona al menos 2 stacks planetarios para fusionar.".to_string());
+    }
+    state.active_req_id.store(1, Ordering::Relaxed);
+    let planet_body = crate::derotation::get_planet(&planet)
+        .ok_or_else(|| "Planeta no soportado para derotacion".to_string())?;
+
+    emit_progress(&app, "Preparando fusion multi-stack...", 4.0, None);
+    let mut frames: Vec<(String, usize, usize, f64, String, DerotationDiagnostics)> =
+        Vec::with_capacity(image_paths.len());
+    let mut warnings = Vec::new();
+
+    for (idx, path) in image_paths.iter().enumerate() {
+        if state.active_req_id.load(Ordering::Relaxed) == 0 {
+            return Err("Operacion cancelada por el usuario".to_string());
+        }
+        let (rgb, width, height) = derot_load_rgb16_image(path)?;
+        let mono = derot_rgb_to_mono(&rgb);
+        let (meta, time_source) = derot_metadata_with_source(path, None);
+        let mut geometry = crate::derotation::calculate_observer_geometry(planet_body, meta.mid_time_jd);
+        if let Some(b0) = sub_earth_lat_deg {
+            geometry.sub_earth_lat_deg = b0.clamp(-35.0, 35.0);
+        }
+        let mut disc = match disc_override.as_ref() {
+            Some(disc) => crate::derotation::PlanetDisc::from(disc),
+            None => crate::derotation::detect_planet_disc(&mono, width, height),
+        };
+        disc = crate::derotation::validate_disc_aspect(&disc, planet_body);
+        disc.angle_deg = north_angle_deg.unwrap_or(geometry.north_pole_angle_deg);
+        let diagnostics = derot_disc_diagnostics(
+            &mono,
+            width,
+            height,
+            &disc,
+            planet_body,
+            &time_source,
+            meta.duration_sec,
+            meta.fps,
+            meta.mid_time_jd,
+            meta.mid_time_jd,
+            cm_system.min(2),
+            geometry,
+        );
+        let pct = 4.0 + ((idx as f32 / image_paths.len() as f32) * 18.0);
+        emit_progress(
+            &app,
+            "Leyendo stacks y logs planetarios...",
+            pct,
+            Some(format!("{} / {}", idx + 1, image_paths.len())),
+        );
+        frames.push((
+            path.clone(),
+            width,
+            height,
+            meta.mid_time_jd,
+            time_source,
+            diagnostics,
+        ));
+    }
+
+    let (width, height) = (frames[0].1, frames[0].2);
+    if frames.iter().any(|(_, w, h, _, _, _)| *w != width || *h != height) {
+        return Err("Todos los stacks deben tener la misma resolucion para fusion por derotacion.".to_string());
+    }
+
+    let log_count = frames
+        .iter()
+        .filter(|(_, _, _, _, source, _)| source == "log" || source == "manual_log")
+        .count();
+    if log_count < frames.len() {
+        warnings.push(format!(
+            "{} de {} stacks no tienen TXT/log de captura; se usara timestamp de archivo o intervalo de respaldo.",
+            frames.len() - log_count,
+            frames.len()
+        ));
+    }
+
+    frames.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+    let mut min_jd = frames
+        .iter()
+        .map(|(_, _, _, jd, _, _)| *jd)
+        .fold(f64::INFINITY, f64::min);
+    let mut max_jd = frames
+        .iter()
+        .map(|(_, _, _, jd, _, _)| *jd)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let fallback_interval = fallback_interval_sec.unwrap_or(0.0).clamp(0.0, 86400.0);
+    if (max_jd - min_jd).abs() * 86400.0 < 1.0 && fallback_interval > 0.0 {
+        let mid = frames.len() / 2;
+        let base_jd = frames[mid].3;
+        for (idx, frame) in frames.iter_mut().enumerate() {
+            let offset = idx as isize - mid as isize;
+            frame.3 = base_jd + (offset as f64 * fallback_interval) / 86400.0;
+        }
+        min_jd = frames
+            .iter()
+            .map(|(_, _, _, jd, _, _)| *jd)
+            .fold(f64::INFINITY, f64::min);
+        max_jd = frames
+            .iter()
+            .map(|(_, _, _, jd, _, _)| *jd)
+            .fold(f64::NEG_INFINITY, f64::max);
+        warnings.push(format!(
+            "Se uso intervalo manual de {:.1}s entre stacks porque los timestamps no eran utiles.",
+            fallback_interval
+        ));
+    }
+
+    let reference_frame = frames.len() / 2;
+    let reference_jd = frames[reference_frame].3;
+    let (reference_rgb, reference_width, reference_height) =
+        derot_load_rgb16_image(&frames[reference_frame].0)?;
+    if reference_width != width || reference_height != height {
+        return Err("El stack de referencia no coincide con la resolucion esperada.".to_string());
+    }
+    let reference_mono = derot_rgb_to_mono(&reference_rgb);
+    let mut reference_disc = match disc_override.as_ref() {
+        Some(disc) => crate::derotation::PlanetDisc::from(disc),
+        None => crate::derotation::detect_planet_disc(&reference_mono, width, height),
+    };
+    reference_disc = crate::derotation::validate_disc_aspect(&reference_disc, planet_body);
+    let reference_geometry = crate::derotation::calculate_observer_geometry(planet_body, reference_jd);
+    let b0 = sub_earth_lat_deg
+        .unwrap_or(reference_geometry.sub_earth_lat_deg)
+        .clamp(-35.0, 35.0);
+    reference_disc.angle_deg = north_angle_deg.unwrap_or(reference_geometry.north_pole_angle_deg);
+
+    let pixel_count = width.saturating_mul(height);
+    let reference_derotated = crate::derotation::derotate_single_advanced(
+        &reference_rgb,
+        width,
+        height,
+        3,
+        planet_body,
+        reference_jd,
+        reference_jd,
+        limb_strength.clamp(0.0, 2.0),
+        cm_system.min(2),
+        b0,
+        Some(&reference_disc),
+    );
+    let reference_means =
+        derot_channel_means_inside_disc(&reference_derotated, width, height, &reference_disc, 0.72);
+    let fusion_mask = derot_disc_mask(width, height, &reference_disc, 1.02);
+    let mut accum = vec![0.0f32; pixel_count.saturating_mul(3)];
+    let mut accum_weight = vec![0.0f32; pixel_count];
+    let mut weights = Vec::with_capacity(frames.len());
+    let mut normalization_gains = Vec::with_capacity(frames.len());
+    let mut rejected_samples: u64 = 0;
+    let mut inspected_samples: u64 = 0;
+    let mut final_diag = frames[reference_frame].5.clone();
+
+    for (idx, (path, _, _, jd, source, diagnostics)) in frames.into_iter().enumerate() {
+        if state.active_req_id.load(Ordering::Relaxed) == 0 {
+            return Err("Operacion cancelada por el usuario".to_string());
+        }
+        let (rgb, frame_width, frame_height) = derot_load_rgb16_image(&path)?;
+        if frame_width != width || frame_height != height {
+            return Err(format!(
+                "El stack '{}' no coincide con la resolucion de la fusion.",
+                Path::new(&path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("stack")
+            ));
+        }
+        let pct = 26.0 + ((idx as f32 / image_paths.len() as f32) * 62.0);
+        emit_progress(
+            &app,
+            "Derotando y fusionando stacks...",
+            pct,
+            Some(format!("{} / {}", idx + 1, image_paths.len())),
+        );
+
+        let quality_weight = (diagnostics.confidence.max(0.15)
+            * diagnostics.contrast_ratio.clamp(0.35, 3.0).sqrt()
+            * if source == "log" || source == "manual_log" { 1.0 } else { 0.78 })
+            .clamp(0.08, 3.0);
+        let derotated = if idx == reference_frame {
+            reference_derotated.clone()
+        } else {
+            crate::derotation::derotate_single_advanced(
+                &rgb,
+                width,
+                height,
+                3,
+                planet_body,
+                jd,
+                reference_jd,
+                limb_strength.clamp(0.0, 2.0),
+                cm_system.min(2),
+                b0,
+                Some(&reference_disc),
+            )
+        };
+        let frame_means =
+            derot_channel_means_inside_disc(&derotated, width, height, &reference_disc, 0.72);
+        let gains = derot_photometric_gains(reference_means, frame_means);
+
+        for pix in 0..pixel_count {
+            let base = pix * 3;
+            let mut pixel_weight = quality_weight as f32;
+            if fusion_mask.get(pix).copied().unwrap_or(0) != 0 {
+                let mut rejected_channels = 0_u64;
+                for c in 0..3 {
+                    inspected_samples = inspected_samples.saturating_add(1);
+                    let ref_v = reference_derotated[base + c] as f64;
+                    let norm_v = derotated[base + c] as f64 * gains[c];
+                    let tolerance = (900.0 + ref_v.abs() * 0.18).clamp(900.0, 14000.0);
+                    if (norm_v - ref_v).abs() > tolerance {
+                        rejected_channels = rejected_channels.saturating_add(1);
+                    }
+                }
+                if rejected_channels > 0 {
+                    rejected_samples = rejected_samples.saturating_add(rejected_channels);
+                    pixel_weight *= if rejected_channels >= 2 { 0.28 } else { 0.55 };
+                }
+            }
+
+            accum_weight[pix] += pixel_weight;
+            for c in 0..3 {
+                let value = (derotated[base + c] as f64 * gains[c]).clamp(0.0, 65535.0) as f32;
+                accum[base + c] += value * pixel_weight;
+            }
+        }
+        weights.push(quality_weight);
+        normalization_gains.push(gains);
+        if idx == reference_frame {
+            final_diag = diagnostics;
+        }
+        log_to_front(
+            &app,
+            "INFO",
+            &format!(
+                "Fusion derotacion: {} | peso {:.2} | {}",
+                Path::new(&path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("stack"),
+                quality_weight,
+                source
+            ),
+        );
+    }
+
+    if accum_weight.iter().all(|w| *w <= 0.0) {
+        return Err("No se pudo calcular peso valido para fusionar los stacks.".to_string());
+    }
+    let mut fused = Vec::with_capacity(pixel_count.saturating_mul(3));
+    for pix in 0..pixel_count {
+        let denom = accum_weight[pix].max(0.0001);
+        let base = pix * 3;
+        fused.push((accum[base] / denom).round().clamp(0.0, 65535.0) as u16);
+        fused.push((accum[base + 1] / denom).round().clamp(0.0, 65535.0) as u16);
+        fused.push((accum[base + 2] / denom).round().clamp(0.0, 65535.0) as u16);
+    }
+
+    let rejected_pixel_fraction = if inspected_samples > 0 {
+        rejected_samples as f64 / inspected_samples as f64
+    } else {
+        0.0
+    };
+    if rejected_pixel_fraction > 0.08 {
+        warnings.push(format!(
+            "La fusion redujo peso en {:.1}% de muestras por variacion local; revisa seeing, enfoque o diferencias de procesado entre stacks.",
+            rejected_pixel_fraction * 100.0
+        ));
+    }
+
+    let parent = Path::new(&image_paths[0])
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let out_path = parent.join(format!("Zenith_Derotated_Fusion_{}.tiff", stamp));
+    emit_progress(&app, "Guardando fusion derotada 16-bit...", 92.0, None);
+    derot_save_rgb16_tiff(&out_path, &fused, width, height)?;
+
+    {
+        let mut stacked = state.stacked_image.lock().unwrap();
+        *stacked = Some(StackResult {
+            data: fused.clone(),
+            width,
+            height,
+            is_mono: false,
+            is_surface: false,
+        });
+    }
+    state.deconv_cache.lock().unwrap().clear();
+    state.wavelet_cache.lock().unwrap().clear();
+    state.filter_cache.lock().unwrap().clear();
+
+    let preview_base64 = derot_encode_preview(&fused, width, height)?;
+    let time_span_sec = (max_jd - min_jd).abs() * 86400.0;
+    emit_progress(&app, "Fusion derotada completada", 100.0, None);
+    log_to_front(
+        &app,
+        "SUCCESS",
+        &format!(
+            "Fusion multi-stack derotada: {} stacks | {:.1}s | {}",
+            image_paths.len(),
+            time_span_sec,
+            clean_windows_path(out_path.clone())
+        ),
+    );
+
+    Ok(PlanetaryDerotationFusionResult {
+        output_path: clean_windows_path(out_path),
+        preview_base64,
+        width,
+        height,
+        planet,
+        cm_system: cm_system.min(2),
+        frame_count: image_paths.len(),
+        reference_frame: reference_frame + 1,
+        reference_time_jd: reference_jd,
+        time_span_sec,
+        detected_disc: reference_disc.into(),
+        diagnostics: final_diag,
+        b0_deg: b0,
+        north_angle_deg: north_angle_deg.unwrap_or(reference_geometry.north_pole_angle_deg),
+        weights,
+        normalization_gains,
+        rejected_pixel_fraction,
+        warnings,
+    })
+}
+
 // Helper: Auto-Stretch 16-bit/8-bit range to 0..255 for feature detection
 // This is critical for linear Astro data which often appears "black" in raw 8-bit conversion
 fn auto_stretch_gray(img: &image::GrayImage) -> image::GrayImage {
@@ -5701,6 +7167,13 @@ fn main() {
             normalize_batch_brightness,
             crop_animation_frames,
             realign_animation_frames,
+            get_planetary_derotation_preflight,
+            get_current_stacked_derotation_preflight,
+            detect_planetary_derotation_disc,
+            apply_planetary_derotation,
+            apply_current_stacked_planetary_derotation,
+            derotate_animation_frames,
+            fuse_planetary_derotation_stacks,
             get_available_fonts,
             check_ffmpeg_status,
             check_license_status,

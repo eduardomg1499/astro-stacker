@@ -396,9 +396,13 @@ impl LicenseManager {
                 Err(p) => p.into_inner(),
             };
 
+            // Revalidamos siempre que exista una clave, incluso si la licencia local
+            // figura como expirada o no verificada. Así, si el usuario renueva o se
+            // le extiende la licencia en LemonSqueezy, el cliente lo detecta en el
+            // siguiente arranque o al vencer el intervalo de re-chequeo.
             let key = match guard.license_key.clone() {
-                Some(key) if guard.is_pro_verified => key,
-                _ => return,
+                Some(key) => key,
+                None => return,
             };
 
             let license_type = Self::normalized_type(guard.license_type.as_deref());
@@ -411,9 +415,12 @@ impl LicenseManager {
             let stale = guard.last_check_date <= 0
                 || now_ts.saturating_sub(guard.last_check_date) >= REMOTE_RECHECK_INTERVAL_SEC;
 
+            // Si la licencia no está verificada (p. ej. expirada), reintentamos contra
+            // el servidor respetando `stale` para no saturarlo. Si está verificada,
+            // mantenemos el chequeo agresivo cerca del vencimiento y para las anuales.
             (
                 key,
-                force || stale || expiry_near || license_type == "ANNUAL",
+                force || stale || (guard.is_pro_verified && (expiry_near || license_type == "ANNUAL")),
             )
         };
 
@@ -768,7 +775,10 @@ impl LicenseManager {
         };
         *state_guard = final_state.clone();
 
-        if state_guard.license_key.is_some() && state_guard.is_pro_verified {
+        if state_guard.license_key.is_some() {
+            // Verificamos contra el servidor aunque la licencia local figure como
+            // expirada/no verificada: así detectamos renovaciones o extensiones
+            // hechas en LemonSqueezy sin que el usuario tenga que reinstalar.
             drop(state_guard);
             self.verify_pro_license_silent();
         } else {

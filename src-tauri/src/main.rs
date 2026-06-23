@@ -6,6 +6,7 @@
 mod alignment;
 mod avi;
 mod converter;
+mod derotation;
 mod fits_sequence;
 mod integral_image;
 mod license;

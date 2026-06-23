@@ -120,8 +120,8 @@ pub fn convert_video_to_ser(
     let (out_width, out_height) = (width, height);
     let input_frame_size = out_width * out_height * input_bpp;
     let bytes_per_frame = input_frame_size as u64;
-    let estimated_size_bytes = (SER_HEADER_LEN as u64)
-        .saturating_add(bytes_per_frame.saturating_mul(frame_count as u64));
+    let estimated_size_bytes =
+        (SER_HEADER_LEN as u64).saturating_add(bytes_per_frame.saturating_mul(frame_count as u64));
 
     emit_conversion_progress(
         app_handle,

@@ -62,6 +62,49 @@
         "report_source": "Source",
         "report_output": "Output"
     },
+    "derotation": {
+        "status": {
+            "waiting": "Load a stacked planetary image.",
+            "inspecting": "Inspecting image...",
+            "ready": "Ready · {{resolution}}",
+            "disc_ready": "Disc detected.",
+            "geometry_ready": "Geometry ready.",
+            "geometry_review": "Review geometry."
+        },
+        "processing": {
+            "inspecting": "INSPECTING DEROTATION...",
+            "detecting": "DETECTING DISC...",
+            "applying": "APPLYING PLANETARY DEROTATION..."
+        },
+        "errors": {
+            "load_first": "Load a planetary image first.",
+            "time_required": "Set both capture time and reference time.",
+            "load_image_after_log": "TXT loaded. Now load an image or use the current result to apply those times."
+        },
+        "logs": {
+            "completed": "Planetary derotation completed (Δ {{delta}}°). {{path}}"
+        },
+        "time_source": {
+            "manual_log": "Manual TXT",
+            "log": "Log",
+            "file_modified": "File",
+            "manual": "Manual",
+            "unknown": "Unknown"
+        },
+        "log": {
+            "auto_hint": "No manual TXT. SharpCap/FireCapture will be read next to the image when available."
+        },
+        "diagnostics": {
+            "manual": "Manual",
+            "ready": "Geometry ready to apply."
+        },
+        "warnings": {
+            "manual_geometry": "Geometry adjusted manually; verify that the mesh follows the real limb."
+        },
+        "use_current": "Use Current Result",
+        "success_title": "Derotation Complete",
+        "success_message": "Derotated image saved at:\n{{path}}\n\nApplied delta: {{delta}}°"
+    },
     "updater": {
         "settings": "Settings",
         "search_updates": "Check for updates",
@@ -576,11 +619,19 @@
             "summary": "{{active}} accepted / {{total}} total"
         },
         "derotation": {
-            "title": "🪐 Planetary Derotation",
+            "title": "<svg class='zas-icon' style='width:15px; height:15px;'><use href='#icon-planet'></use></svg> Planetary Derotation",
             "planet": "Planet",
             "cm_system": "CM System",
             "limb_correction": "Limb Correction",
-            "limb_hint": "Compensates the planet edge darkening for a smoother stack."
+            "limb_hint": "Compensates the planet edge darkening for a smoother stack.",
+            "interval_label": "Interval without logs (sec)",
+            "interval_hint": "Used only when files do not provide distinct timestamps.",
+            "apply_sequence": "Apply to Sequence",
+            "applying": "Applying...",
+            "processing": "DEROTATING PLANETARY SEQUENCE...",
+            "sequence_title": "Sequence Derotated",
+            "sequence_done": "Sequence derotated: {{count}} frames.",
+            "sequence_message": "{{count}} derotated frames were generated and loaded into the editor."
         },
         "placeholders": {
             "watermark": "Watermark text...",

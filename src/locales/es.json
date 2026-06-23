@@ -62,6 +62,49 @@
         "report_source": "Fuente",
         "report_output": "Salida"
     },
+    "derotation": {
+        "status": {
+            "waiting": "Carga una imagen apilada planetaria.",
+            "inspecting": "Analizando imagen...",
+            "ready": "Listo · {{resolution}}",
+            "disc_ready": "Disco detectado.",
+            "geometry_ready": "Geometría lista.",
+            "geometry_review": "Revisa la geometría."
+        },
+        "processing": {
+            "inspecting": "ANALIZANDO DEROTACIÓN...",
+            "detecting": "DETECTANDO DISCO...",
+            "applying": "APLICANDO DEROTACIÓN PLANETARIA..."
+        },
+        "errors": {
+            "load_first": "Carga primero una imagen planetaria.",
+            "time_required": "Define tiempo de captura y tiempo de referencia.",
+            "load_image_after_log": "TXT cargado. Ahora carga una imagen o usa el resultado actual para aplicar esos tiempos."
+        },
+        "logs": {
+            "completed": "Derotación planetaria completada (Δ {{delta}}°). {{path}}"
+        },
+        "time_source": {
+            "manual_log": "TXT manual",
+            "log": "Log",
+            "file_modified": "Archivo",
+            "manual": "Manual",
+            "unknown": "Sin dato"
+        },
+        "log": {
+            "auto_hint": "Sin TXT manual. Se intentará leer SharpCap/FireCapture junto a la imagen."
+        },
+        "diagnostics": {
+            "manual": "Manual",
+            "ready": "Geometría lista para aplicar."
+        },
+        "warnings": {
+            "manual_geometry": "Geometría ajustada manualmente; verifica que la malla siga el limbo real."
+        },
+        "use_current": "Usar resultado actual",
+        "success_title": "Derotación completada",
+        "success_message": "Imagen derotada guardada:\n{{path}}\n\nDelta aplicado: {{delta}}°"
+    },
     "updater": {
         "settings": "Configuración",
         "search_updates": "Buscar actualizaciones",
@@ -576,11 +619,19 @@
             "summary": "{{active}} aceptados / {{total}} total"
         },
         "derotation": {
-            "title": "🪐 Derotación Planetaria",
+            "title": "<svg class='zas-icon' style='width:15px; height:15px;'><use href='#icon-planet'></use></svg> Derotación Planetaria",
             "planet": "Planeta",
             "cm_system": "Sistema CM",
             "limb_correction": "Corrección de limbo",
-            "limb_hint": "Compensa el oscurecimiento del borde del planeta para un apilado uniforme."
+            "limb_hint": "Compensa el oscurecimiento del borde del planeta para un apilado uniforme.",
+            "interval_label": "Intervalo si no hay logs (seg)",
+            "interval_hint": "Se usa solo cuando los archivos no traen tiempos distintos.",
+            "apply_sequence": "Aplicar a secuencia",
+            "applying": "Aplicando...",
+            "processing": "DEROTANDO SECUENCIA PLANETARIA...",
+            "sequence_title": "Secuencia derotada",
+            "sequence_done": "Secuencia derotada: {{count}} frames.",
+            "sequence_message": "Se generaron {{count}} frames derotados y se cargaron en el editor."
         },
         "placeholders": {
             "watermark": "Texto marca de agua...",

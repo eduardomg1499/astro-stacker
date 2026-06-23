@@ -4815,6 +4815,746 @@ if ($("#btn-mosaic-mode")) {
     });
 }
 
+// 1.6. Planetary Derotation Mode
+(function () {
+    const btnDerotateMode = document.getElementById("btn-derotate-mode");
+    const modal = document.getElementById("derotation-modal");
+    if (!btnDerotateMode || !modal) return;
+
+    const state = {
+        imagePath: "",
+        preflight: null,
+        diagnostics: null,
+        autoDisc: null,
+        disc: null,
+        planet: "jupiter",
+        logPath: "",
+        sourceKind: "",
+        usingCurrentStack: false
+    };
+
+    const img = document.getElementById("derot-preview-img");
+    const placeholder = document.getElementById("derot-placeholder");
+    const canvas = document.getElementById("derot-wireframe-canvas");
+    const qualityText = document.getElementById("derot-quality-text");
+    const qualityDot = document.getElementById("derot-quality-dot");
+    const inputCapture = document.getElementById("derot-capture-time");
+    const inputReference = document.getElementById("derot-reference-time");
+    const cmSelect = document.getElementById("derot-cm-system");
+    const limbSlider = document.getElementById("sl-derot-limb");
+    const limbValue = document.getElementById("derot-limb-value");
+    const fusionIntervalInput = document.getElementById("derot-fusion-interval-sec");
+    const diagConfidence = document.getElementById("derot-diag-confidence");
+    const diagDelta = document.getElementById("derot-diag-delta");
+    const diagTimeSource = document.getElementById("derot-diag-time-source");
+    const diagDisc = document.getElementById("derot-diag-disc");
+    const diagContrast = document.getElementById("derot-diag-contrast");
+    const diagWarnings = document.getElementById("derot-warning-list");
+    const logStatus = document.getElementById("derot-log-status");
+    const discInputs = {
+        cx: document.getElementById("derot-disc-cx"),
+        cy: document.getElementById("derot-disc-cy"),
+        rx: document.getElementById("derot-disc-rx"),
+        ry: document.getElementById("derot-disc-ry"),
+        angle: document.getElementById("derot-disc-angle")
+    };
+    const b0Input = document.getElementById("derot-b0-lat");
+    const discReadouts = {
+        center: document.getElementById("derot-readout-center"),
+        size: document.getElementById("derot-readout-size"),
+        angle: document.getElementById("derot-readout-angle"),
+        b0: document.getElementById("derot-readout-b0")
+    };
+    const planetRates = {
+        jupiter: [877.9, 870.27, 870.536],
+        saturn: [844.3, 812.0, 810.7938],
+        mars: [350.89198507, 350.89198507, 350.89198507]
+    };
+
+    function setDerotStatus(text, tone = "ready") {
+        if (qualityText) qualityText.textContent = text;
+        if (!qualityDot) return;
+        const colors = {
+            ready: "#22c55e",
+            busy: "#38bdf8",
+            warn: "#f59e0b",
+            error: "#ef4444"
+        };
+        qualityDot.style.background = colors[tone] || colors.ready;
+    }
+
+    function setActivePlanet(containerId, planet) {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        container.querySelectorAll(".planet-icon").forEach((button) => {
+            const isActive = button.dataset.planet === planet;
+            button.classList.toggle("active", isActive);
+            button.style.border = isActive ? "2px solid #8b5cf6" : "1px solid rgba(255,255,255,0.15)";
+            button.style.background = isActive ? "rgba(139,92,246,0.2)" : "rgba(255,255,255,0.05)";
+            button.style.color = isActive ? "#c4b5fd" : "#94a3b8";
+        });
+    }
+
+    function formatDerotTimeSource(source) {
+        if (source === "manual_log") return tr("derotation.time_source.manual_log", "TXT manual");
+        if (source === "log") return tr("derotation.time_source.log", "Log");
+        if (source === "file_modified") return tr("derotation.time_source.file_modified", "Archivo");
+        if (source === "manual") return tr("derotation.time_source.manual", "Manual");
+        return tr("derotation.time_source.unknown", "Sin dato");
+    }
+
+    function parseDerotUtcInput(value) {
+        if (!value) return null;
+        const [date, time = "00:00:00"] = value.split("T");
+        const [year, month, day] = date.split("-").map(Number);
+        const [hour = 0, minute = 0, second = 0] = time.split(":").map(Number);
+        if (![year, month, day].every(Number.isFinite)) return null;
+        return Date.UTC(year, (month || 1) - 1, day || 1, hour || 0, minute || 0, second || 0);
+    }
+
+    function estimateDerotDelta() {
+        const capture = parseDerotUtcInput(inputCapture?.value || "");
+        const reference = parseDerotUtcInput(inputReference?.value || "");
+        if (capture === null || reference === null) return null;
+        const system = parseInt(cmSelect?.value || "1", 10);
+        const rate = (planetRates[state.planet] || planetRates.jupiter)[Math.max(0, Math.min(2, system))];
+        return rate * ((capture - reference) / 86400000);
+    }
+
+    function syncDiscInputs(disc) {
+        if (!disc) return;
+        if (discInputs.cx) discInputs.cx.value = Number(disc.cx || 0).toFixed(1);
+        if (discInputs.cy) discInputs.cy.value = Number(disc.cy || 0).toFixed(1);
+        if (discInputs.rx) discInputs.rx.value = Number(disc.radius_x || 0).toFixed(1);
+        if (discInputs.ry) discInputs.ry.value = Number(disc.radius_y || 0).toFixed(1);
+        if (discInputs.angle) discInputs.angle.value = Number(disc.angle_deg || 0).toFixed(1);
+        updateDiscReadouts();
+    }
+
+    function readDiscInputs() {
+        if (!state.disc) return null;
+        const cx = parseFloat(discInputs.cx?.value || state.disc.cx);
+        const cy = parseFloat(discInputs.cy?.value || state.disc.cy);
+        const rx = parseFloat(discInputs.rx?.value || state.disc.radius_x);
+        const ry = parseFloat(discInputs.ry?.value || state.disc.radius_y);
+        const angle = parseFloat(discInputs.angle?.value || state.disc.angle_deg || 0);
+        if (![cx, cy, rx, ry, angle].every(Number.isFinite) || rx <= 0 || ry <= 0) return state.disc;
+        return {
+            ...state.disc,
+            cx,
+            cy,
+            radius_x: rx,
+            radius_y: ry,
+            angle_deg: angle
+        };
+    }
+
+    function getB0Value() {
+        const value = parseFloat(b0Input?.value || state.preflight?.b0_deg || state.diagnostics?.b0_deg || 0);
+        return Number.isFinite(value) ? Math.max(-35, Math.min(35, value)) : 0;
+    }
+
+    function updateDiscReadouts() {
+        const d = state.disc || readDiscInputs();
+        if (discReadouts.center) {
+            discReadouts.center.textContent = d ? `${Number(d.cx || 0).toFixed(0)}, ${Number(d.cy || 0).toFixed(0)}` : "--";
+        }
+        if (discReadouts.size) {
+            discReadouts.size.textContent = d ? `${Number(d.radius_x || 0).toFixed(0)} x ${Number(d.radius_y || 0).toFixed(0)}` : "--";
+        }
+        if (discReadouts.angle) {
+            discReadouts.angle.textContent = d ? `${Number(d.angle_deg || 0).toFixed(1)}°` : "--";
+        }
+        if (discReadouts.b0) {
+            discReadouts.b0.textContent = `${getB0Value().toFixed(1)}°`;
+        }
+    }
+
+    function setDerotLogStatus(path = state.logPath, source = state.diagnostics?.time_source || "") {
+        if (!logStatus) return;
+        if (path) {
+            const name = String(path).split(/[\\/]/).pop();
+            logStatus.textContent = `${formatDerotTimeSource(source || "manual_log")}: ${name}`;
+            logStatus.style.color = "#7dd3fc";
+        } else {
+            logStatus.textContent = tr(
+                "derotation.log.auto_hint",
+                "Sin TXT manual. Se intentará leer SharpCap/FireCapture junto a la imagen."
+            );
+            logStatus.style.color = "#64748b";
+        }
+    }
+
+    function renderDerotDiagnostics(diagnostics = state.diagnostics, manual = false) {
+        const delta = estimateDerotDelta();
+        const confidence = Number(diagnostics?.confidence ?? 0);
+        const tone = confidence >= 0.58 ? "ready" : confidence >= 0.35 ? "warn" : "error";
+        if (diagConfidence) {
+            diagConfidence.textContent = manual
+                ? tr("derotation.diagnostics.manual", "Manual")
+                : diagnostics
+                    ? `${Math.round(confidence * 100)}% · ${diagnostics.classification || "review"}`
+                    : "--";
+            diagConfidence.style.color = tone === "ready" ? "#34d399" : tone === "warn" ? "#fbbf24" : "#fb7185";
+        }
+        if (diagDelta) {
+            const value = Number.isFinite(delta) ? delta : Number(diagnostics?.delta_deg ?? NaN);
+            diagDelta.textContent = Number.isFinite(value) ? `${value.toFixed(3)}°` : "--";
+            diagDelta.style.color = Math.abs(value || 0) > 75 ? "#fb7185" : "#e2e8f0";
+        }
+        if (diagTimeSource) diagTimeSource.textContent = formatDerotTimeSource(diagnostics?.time_source || "");
+        if (diagDisc) {
+            const d = state.disc;
+            diagDisc.textContent = d
+                ? `${Math.round(d.radius_x || 0)}x${Math.round(d.radius_y || 0)} px · ${Number(d.angle_deg || 0).toFixed(1)}°`
+                : "--";
+        }
+        if (diagContrast) {
+            const ratio = Number(diagnostics?.contrast_ratio ?? NaN);
+            diagContrast.textContent = Number.isFinite(ratio) ? `${ratio.toFixed(2)}x` : "--";
+        }
+        if (diagWarnings) {
+            const warnings = [...(diagnostics?.warnings || [])];
+            if (manual) warnings.unshift(tr("derotation.warnings.manual_geometry", "Geometría ajustada manualmente; verifica que la malla siga el limbo real."));
+            diagWarnings.innerHTML = warnings.length
+                ? warnings.slice(0, 4).map((w) => `<div>• ${String(w)}</div>`).join("")
+                : `<span style="color:#34d399;">${tr("derotation.diagnostics.ready", "Geometría lista para aplicar.")}</span>`;
+        }
+        if (diagnostics) {
+            setDerotStatus(
+                diagnostics.can_apply
+                    ? tr("derotation.status.geometry_ready", "Geometría lista.")
+                    : tr("derotation.status.geometry_review", "Revisa la geometría."),
+                tone
+            );
+        }
+    }
+
+    function drawDerotationWireframe() {
+        if (!canvas || !img || !state.disc || !img.naturalWidth || !img.naturalHeight) return;
+        const container = canvas.parentElement;
+        if (!container) return;
+
+        const width = container.clientWidth;
+        const height = container.clientHeight;
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, width, height);
+
+        const scale = Math.min(width / img.naturalWidth, height / img.naturalHeight);
+        const offsetX = (width - img.naturalWidth * scale) / 2;
+        const offsetY = (height - img.naturalHeight * scale) / 2;
+        const d = state.disc;
+        const cx = offsetX + d.cx * scale;
+        const cy = offsetY + d.cy * scale;
+        const rx = d.radius_x * scale;
+        const ry = d.radius_y * scale;
+
+        ctx.save();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "rgba(196,181,253,0.95)";
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+        ctx.stroke();
+
+        ctx.strokeStyle = "rgba(56,189,248,0.65)";
+        ctx.lineWidth = 1;
+        for (let i = -2; i <= 2; i++) {
+            ctx.beginPath();
+            ctx.ellipse(cx + (rx * i / 5), cy, Math.max(1, rx * 0.22), ry, 0, -Math.PI / 2, Math.PI / 2);
+            ctx.stroke();
+        }
+        for (let i = -2; i <= 2; i++) {
+            ctx.beginPath();
+            ctx.ellipse(cx, cy + (ry * i / 5), rx, Math.max(1, ry * 0.18), 0, 0, Math.PI * 2);
+            ctx.stroke();
+        }
+        ctx.fillStyle = "#fbbf24";
+        ctx.beginPath();
+        ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+    }
+
+    async function loadDerotationResultIntoWorkspace(result, sourceLabel = "Derotation") {
+        modal.style.display = "none";
+        window.setCurrentFilePath?.(result.output_path || state.imagePath || "");
+        currentFilePath = result.output_path || currentFilePath;
+        currentFileMetadata = {
+            width: result.width,
+            height: result.height,
+            frame_count: result.frame_count || 1,
+            bpp: 3,
+            color_id: 0,
+            pattern_name: sourceLabel,
+            file_size_mb: 0,
+            is_color: true
+        };
+        currentVideoStats = {
+            avg_quality: 100,
+            quality_stability: 100,
+            worst_score: 100,
+            best_score: 100
+        };
+
+        if (ui.iRes) ui.iRes.textContent = `${result.width}x${result.height}`;
+        if (ui.iFrames) ui.iFrames.textContent = String(result.frame_count || 1);
+        if (ui.iPat) ui.iPat.textContent = sourceLabel;
+        if (ui.statAvgQual) ui.statAvgQual.textContent = "100.00%";
+        if (ui.statStability) ui.statStability.textContent = "100.00%";
+        if (ui.statWorst) ui.statWorst.textContent = "-";
+        if (ui.statBest) ui.statBest.textContent = "-";
+
+        if (ui.panelInfo) ui.panelInfo.style.display = "block";
+        if (ui.panelAnalysis) ui.panelAnalysis.style.display = "none";
+        if (ui.panelTools) ui.panelTools.style.display = "block";
+        if (ui.panelWavelets) ui.panelWavelets.style.display = "block";
+        if (ui.viewResult) ui.viewResult.style.display = "flex";
+        if (ui.imgSource && state.preflight?.preview_base64) {
+            await setImageAndWait(ui.imgSource, state.preflight.preview_base64, true);
+        }
+        if (ui.imgResult) {
+            await setImageAndWait(ui.imgResult, result.preview_base64, false);
+            fitToScreen();
+            triggerStackSuccessEffect();
+        }
+
+        resetProcessingParams();
+        lastProcessedParams = null;
+    }
+
+    async function loadDerotationPreflight(path, logPath = state.logPath || "") {
+        state.imagePath = path;
+        state.logPath = logPath || "";
+        state.usingCurrentStack = false;
+        setDerotStatus(tr("derotation.status.inspecting", "Analizando imagen..."), "busy");
+        showProcessing(tr("derotation.processing.inspecting", "ANALIZANDO DEROTACIÓN..."));
+        try {
+            const preflight = await invoke("get_planetary_derotation_preflight", {
+                imagePath: path,
+                logPath: state.logPath || null
+            });
+            state.preflight = preflight;
+            state.diagnostics = preflight.diagnostics || null;
+            state.disc = preflight.detected_disc;
+            state.autoDisc = preflight.detected_disc ? { ...preflight.detected_disc } : null;
+            state.planet = preflight.suggested_planet || "jupiter";
+            state.sourceKind = preflight.source_kind || "file";
+            syncDiscInputs(state.disc);
+            if (b0Input) b0Input.value = Number(preflight.b0_deg || 0).toFixed(1);
+            updateDiscReadouts();
+
+            if (inputCapture) inputCapture.value = preflight.capture_time || "";
+            if (inputReference) inputReference.value = preflight.reference_time || preflight.capture_time || "";
+            if (img) {
+                img.style.display = "block";
+                img.onload = drawDerotationWireframe;
+                img.src = preflight.preview_base64;
+            }
+            if (placeholder) placeholder.style.display = "none";
+            setActivePlanet("derot-planet-selector", state.planet);
+            setDerotLogStatus(state.logPath, state.diagnostics?.time_source);
+            setDerotStatus(
+                trFormat(
+                    "derotation.status.ready",
+                    { resolution: `${preflight.width}x${preflight.height}` },
+                    `Listo · ${preflight.width}x${preflight.height}`
+                ),
+                "ready"
+            );
+            renderDerotDiagnostics(state.diagnostics);
+            requestAnimationFrame(drawDerotationWireframe);
+        } finally {
+            hideProcessing();
+        }
+    }
+
+    async function loadCurrentStackPreflight(showErrors = true, logPath = state.logPath || "") {
+        state.imagePath = window.getCurrentFilePath?.() || currentFilePath || "";
+        state.logPath = logPath || "";
+        state.usingCurrentStack = true;
+        setDerotStatus(tr("derotation.status.inspecting", "Analizando imagen..."), "busy");
+        showProcessing(tr("derotation.processing.inspecting", "ANALIZANDO DEROTACIÓN..."));
+        try {
+            const preflight = await invoke("get_current_stacked_derotation_preflight", {
+                sourcePath: state.imagePath || null,
+                logPath: state.logPath || null
+            });
+            state.preflight = preflight;
+            state.diagnostics = preflight.diagnostics || null;
+            state.disc = preflight.detected_disc;
+            state.autoDisc = preflight.detected_disc ? { ...preflight.detected_disc } : null;
+            state.planet = preflight.suggested_planet || "jupiter";
+            state.sourceKind = preflight.source_kind || "current_stack";
+            syncDiscInputs(state.disc);
+            if (b0Input) b0Input.value = Number(preflight.b0_deg || 0).toFixed(1);
+            updateDiscReadouts();
+            if (inputCapture) inputCapture.value = preflight.capture_time || "";
+            if (inputReference) inputReference.value = preflight.reference_time || preflight.capture_time || "";
+            if (img) {
+                img.style.display = "block";
+                img.onload = drawDerotationWireframe;
+                img.src = preflight.preview_base64;
+            }
+            if (placeholder) placeholder.style.display = "none";
+            setActivePlanet("derot-planet-selector", state.planet);
+            setDerotLogStatus(state.logPath, state.diagnostics?.time_source);
+            setDerotStatus(
+                trFormat(
+                    "derotation.status.ready",
+                    { resolution: `${preflight.width}x${preflight.height}` },
+                    `Listo · ${preflight.width}x${preflight.height}`
+                ),
+                "ready"
+            );
+            renderDerotDiagnostics(state.diagnostics);
+            requestAnimationFrame(drawDerotationWireframe);
+            return true;
+        } catch (e) {
+            if (showErrors) showCustomAlert(tr("general.info", "Info"), normalizeBackendText(e));
+            setDerotStatus(tr("derotation.status.waiting", "Carga una imagen apilada planetaria."), "warn");
+            return false;
+        } finally {
+            hideProcessing();
+        }
+    }
+
+    btnDerotateMode.addEventListener("click", async () => {
+        modal.style.display = "flex";
+        setDerotStatus(tr("derotation.status.waiting", "Carga una imagen apilada planetaria."), "warn");
+        setActivePlanet("derot-planet-selector", state.planet);
+        setDerotLogStatus();
+        updateDiscReadouts();
+        requestAnimationFrame(drawDerotationWireframe);
+        if (ui.imgResult?.src && ui.imgResult.naturalWidth > 0) {
+            await loadCurrentStackPreflight(false);
+        }
+    });
+
+    document.getElementById("btn-derot-close")?.addEventListener("click", () => {
+        modal.style.display = "none";
+    });
+
+    document.getElementById("btn-derot-load-image")?.addEventListener("click", async () => {
+        const result = await openDialog({
+            multiple: false,
+            filters: [{ name: "Planetary image", extensions: ["png", "tif", "tiff", "jpg", "jpeg"] }]
+        });
+        if (!result) return;
+        const path = (typeof result === "object" && result !== null && result.path) ? result.path : result;
+        if (!path) return;
+        try {
+            await loadDerotationPreflight(path, "");
+        } catch (e) {
+            setDerotStatus(tr("general.error", "Error"), "error");
+            showCustomAlert(tr("general.error", "Error"), normalizeBackendText(e));
+        }
+    });
+
+    document.getElementById("btn-derot-use-current")?.addEventListener("click", async () => {
+        await loadCurrentStackPreflight(true);
+    });
+
+    document.getElementById("derot-planet-selector")?.querySelectorAll(".planet-icon").forEach((button) => {
+        button.addEventListener("click", () => {
+            state.planet = button.dataset.planet || "jupiter";
+            setActivePlanet("derot-planet-selector", state.planet);
+            renderDerotDiagnostics(state.diagnostics);
+        });
+    });
+
+    Object.values(discInputs).forEach((input) => {
+        input?.addEventListener("input", () => {
+            state.disc = readDiscInputs();
+            updateDiscReadouts();
+            renderDerotDiagnostics(state.diagnostics, true);
+            drawDerotationWireframe();
+        });
+    });
+    b0Input?.addEventListener("input", () => {
+        updateDiscReadouts();
+        renderDerotDiagnostics(state.diagnostics, true);
+    });
+
+    document.querySelectorAll("[data-derot-adjust]").forEach((button) => {
+        button.addEventListener("click", (event) => {
+            const field = button.dataset.derotAdjust;
+            const rawDelta = parseFloat(button.dataset.delta || "0");
+            if (!field || !Number.isFinite(rawDelta)) return;
+            state.disc = readDiscInputs() || state.disc;
+            if (!state.disc) return;
+            const multiplier = event.shiftKey ? 5 : (event.altKey || event.metaKey ? 0.2 : 1);
+            const delta = rawDelta * multiplier;
+            if (field === "cx") state.disc.cx += delta;
+            if (field === "cy") state.disc.cy += delta;
+            if (field === "center" && state.autoDisc) {
+                state.disc.cx = state.autoDisc.cx;
+                state.disc.cy = state.autoDisc.cy;
+            }
+            if (field === "rx") state.disc.radius_x = Math.max(1, state.disc.radius_x + delta);
+            if (field === "ry") state.disc.radius_y = Math.max(1, state.disc.radius_y + delta);
+            if (field === "size") {
+                state.disc.radius_x = Math.max(1, state.disc.radius_x + delta);
+                state.disc.radius_y = Math.max(1, state.disc.radius_y + delta);
+            }
+            if (field === "angle") state.disc.angle_deg += delta;
+            if (field === "b0" && b0Input) {
+                const next = Math.max(-35, Math.min(35, getB0Value() + delta));
+                b0Input.value = next.toFixed(1);
+            }
+            syncDiscInputs(state.disc);
+            renderDerotDiagnostics(state.diagnostics, true);
+            drawDerotationWireframe();
+        });
+    });
+
+    document.getElementById("btn-derot-reset-disc")?.addEventListener("click", () => {
+        if (!state.autoDisc) return;
+        state.disc = { ...state.autoDisc };
+        syncDiscInputs(state.disc);
+        if (b0Input && state.preflight) b0Input.value = Number(state.preflight.b0_deg || 0).toFixed(1);
+        updateDiscReadouts();
+        renderDerotDiagnostics(state.diagnostics);
+        drawDerotationWireframe();
+    });
+
+    [inputCapture, inputReference, cmSelect].forEach((el) => {
+        el?.addEventListener("input", () => renderDerotDiagnostics(state.diagnostics));
+        el?.addEventListener("change", () => renderDerotDiagnostics(state.diagnostics));
+    });
+
+    if (limbSlider && limbValue) {
+        limbSlider.addEventListener("input", () => {
+            limbValue.textContent = Number(limbSlider.value || 0).toFixed(1);
+        });
+    }
+
+    document.getElementById("btn-derot-parse-log")?.addEventListener("click", async () => {
+        try {
+            const result = await openDialog({
+                multiple: false,
+                filters: [{ name: "SharpCap / FireCapture TXT", extensions: ["txt", "log"] }]
+            });
+            if (!result) return;
+            const path = (typeof result === "object" && result !== null && result.path) ? result.path : result;
+            if (!path) return;
+            state.logPath = path;
+            setDerotLogStatus(path, "manual_log");
+            if (state.usingCurrentStack || (!state.imagePath && ui.imgResult?.src && ui.imgResult.naturalWidth > 0)) {
+                await loadCurrentStackPreflight(true, path);
+            } else if (state.imagePath) {
+                await loadDerotationPreflight(state.imagePath, path);
+            } else {
+                showCustomAlert(
+                    tr("general.info", "Info"),
+                    tr("derotation.errors.load_image_after_log", "TXT cargado. Ahora carga una imagen o usa el resultado actual para aplicar esos tiempos.")
+                );
+            }
+        } catch (e) {
+            showCustomAlert(tr("general.error", "Error"), normalizeBackendText(e));
+        }
+    });
+
+    document.getElementById("btn-derot-detect")?.addEventListener("click", async () => {
+        if (!state.imagePath) {
+            showCustomAlert(tr("general.info", "Info"), tr("derotation.errors.load_first", "Carga primero una imagen planetaria."));
+            return;
+        }
+        showProcessing(tr("derotation.processing.detecting", "DETECTANDO DISCO..."));
+        try {
+            if (state.usingCurrentStack) {
+                await loadCurrentStackPreflight(true, state.logPath);
+                return;
+            }
+            const detection = await invoke("detect_planetary_derotation_disc", {
+                imagePath: state.imagePath,
+                planet: state.planet,
+                logPath: state.logPath || null
+            });
+            state.disc = detection.detected_disc;
+            state.autoDisc = detection.detected_disc ? { ...detection.detected_disc } : null;
+            state.diagnostics = detection.diagnostics || state.diagnostics;
+            syncDiscInputs(state.disc);
+            setDerotStatus(tr("derotation.status.disc_ready", "Disco detectado."), "ready");
+            renderDerotDiagnostics(state.diagnostics);
+            drawDerotationWireframe();
+        } catch (e) {
+            setDerotStatus(tr("general.error", "Error"), "error");
+            showCustomAlert(tr("general.error", "Error"), normalizeBackendText(e));
+        } finally {
+            hideProcessing();
+        }
+    });
+
+    document.getElementById("btn-derot-fusion")?.addEventListener("click", async () => {
+        try {
+            const result = await openDialog({
+                multiple: true,
+                filters: [{ name: "Planetary stacks", extensions: ["png", "tif", "tiff", "jpg", "jpeg"] }]
+            });
+            if (!result) return;
+            const paths = (Array.isArray(result) ? result : [result])
+                .map((entry) => (typeof entry === "object" && entry !== null && entry.path) ? entry.path : entry)
+                .filter(Boolean);
+            if (paths.length < 2) {
+                showCustomAlert(tr("general.info", "Info"), "Selecciona al menos 2 stacks planetarios para fusionar.");
+                return;
+            }
+
+            state.disc = readDiscInputs() || state.disc;
+            const fallbackIntervalSec = parseFloat(fusionIntervalInput?.value || "0");
+            showProcessing("FUSIONANDO STACKS DEROTADOS...");
+            const fusion = await invoke("fuse_planetary_derotation_stacks", {
+                imagePaths: paths,
+                planet: state.planet,
+                cmSystem: parseInt(cmSelect?.value || "1", 10),
+                limbStrength: parseFloat(limbSlider?.value || "0.5"),
+                fallbackIntervalSec: Number.isFinite(fallbackIntervalSec) ? fallbackIntervalSec : 0,
+                subEarthLatDeg: getB0Value(),
+                northAngleDeg: state.disc ? Number(state.disc.angle_deg || 0) : null,
+                discOverride: state.disc || null
+            });
+
+            state.diagnostics = fusion.diagnostics || state.diagnostics;
+            state.disc = fusion.detected_disc || state.disc;
+            syncDiscInputs(state.disc);
+            await loadDerotationResultIntoWorkspace(fusion, `Derotation Fusion ${fusion.frame_count || paths.length}x`);
+            const warningText = (fusion.warnings || []).length ? `\n\nAvisos:\n${fusion.warnings.join("\n")}` : "";
+            const rejectPct = Number(fusion.rejected_pixel_fraction || 0) * 100;
+            const gainRows = Array.isArray(fusion.normalization_gains)
+                ? fusion.normalization_gains
+                    .map((g, idx) => Array.isArray(g) ? `${idx + 1}: ${g.map((v) => Number(v || 1).toFixed(2)).join("/")}` : "")
+                    .filter(Boolean)
+                    .slice(0, 5)
+                : [];
+            const gainText = gainRows.length
+                ? `\nNormalización RGB: ${gainRows.join("  ")}${fusion.normalization_gains.length > gainRows.length ? " ..." : ""}`
+                : "";
+            const rejectionText = `\nRechazo robusto: ${rejectPct.toFixed(2)}%`;
+            log(
+                "SUCCESS",
+                `Fusión multi-stack derotada: ${fusion.frame_count || paths.length} stacks · ${Number(fusion.time_span_sec || 0).toFixed(1)}s · rechazo ${rejectPct.toFixed(2)}% · ${fusion.output_path}`
+            );
+            showCustomAlert(
+                "Fusión derotada completada",
+                `Resultado guardado:\n${fusion.output_path}\n\nStacks: ${fusion.frame_count || paths.length}\nVentana temporal: ${Number(fusion.time_span_sec || 0).toFixed(1)}s${gainText}${rejectionText}${warningText}`
+            );
+        } catch (e) {
+            showCustomAlert(tr("general.error", "Error"), normalizeBackendText(e));
+        } finally {
+            hideProcessing();
+        }
+    });
+
+    document.getElementById("btn-derot-apply")?.addEventListener("click", async () => {
+        if (!state.imagePath) {
+            showCustomAlert(tr("general.info", "Info"), tr("derotation.errors.load_first", "Carga primero una imagen planetaria."));
+            return;
+        }
+        const captureTime = inputCapture?.value || "";
+        const referenceTime = inputReference?.value || captureTime;
+        if (!captureTime || !referenceTime) {
+            showCustomAlert(tr("general.error", "Error"), tr("derotation.errors.time_required", "Define tiempo de captura y tiempo de referencia."));
+            return;
+        }
+
+        showProcessing(tr("derotation.processing.applying", "APLICANDO DEROTACIÓN PLANETARIA..."));
+        try {
+            state.disc = readDiscInputs();
+            const commonPayload = {
+                planet: state.planet,
+                captureTime,
+                referenceTime,
+                cmSystem: parseInt(cmSelect?.value || "1", 10),
+                limbStrength: parseFloat(limbSlider?.value || "0.5"),
+                subEarthLatDeg: getB0Value(),
+                discOverride: state.disc
+            };
+            const result = state.usingCurrentStack
+                ? await invoke("apply_current_stacked_planetary_derotation", {
+                    ...commonPayload,
+                    sourcePath: state.imagePath || null
+                })
+                : await invoke("apply_planetary_derotation", {
+                    ...commonPayload,
+                    imagePath: state.imagePath
+                });
+            state.diagnostics = result.diagnostics || state.diagnostics;
+
+            modal.style.display = "none";
+            window.setCurrentFilePath?.(state.imagePath || result.output_path);
+            currentFileMetadata = {
+                width: result.width,
+                height: result.height,
+                frame_count: 1,
+                bpp: 3,
+                color_id: 0,
+                pattern_name: `Derotation ${result.planet}`,
+                file_size_mb: (state.preflight?.source_size_bytes || 0) / (1024 * 1024),
+                is_color: true
+            };
+            currentVideoStats = {
+                avg_quality: 100,
+                quality_stability: 100,
+                worst_score: 100,
+                best_score: 100
+            };
+
+            if (ui.iRes) ui.iRes.textContent = `${result.width}x${result.height}`;
+            if (ui.iFrames) ui.iFrames.textContent = "1";
+            if (ui.iPat) ui.iPat.textContent = `Derotation ${result.planet}`;
+            if (ui.statAvgQual) ui.statAvgQual.textContent = "100.00%";
+            if (ui.statStability) ui.statStability.textContent = "100.00%";
+            if (ui.statWorst) ui.statWorst.textContent = "-";
+            if (ui.statBest) ui.statBest.textContent = "-";
+
+            if (ui.panelInfo) ui.panelInfo.style.display = "block";
+            if (ui.panelAnalysis) ui.panelAnalysis.style.display = "none";
+            if (ui.panelTools) ui.panelTools.style.display = "block";
+            if (ui.panelWavelets) ui.panelWavelets.style.display = "block";
+            if (ui.viewResult) ui.viewResult.style.display = "flex";
+
+            if (ui.imgSource && state.preflight?.preview_base64) {
+                await setImageAndWait(ui.imgSource, state.preflight.preview_base64, true);
+            }
+            if (ui.imgResult) {
+                await setImageAndWait(ui.imgResult, result.preview_base64, false);
+                fitToScreen();
+                triggerStackSuccessEffect();
+            }
+
+            resetProcessingParams();
+            lastProcessedParams = null;
+            log(
+                "SUCCESS",
+                trFormat(
+                    "derotation.logs.completed",
+                    { delta: Number(result.delta_deg || 0).toFixed(3), path: result.output_path },
+                    `Derotación planetaria completada (Δ ${Number(result.delta_deg || 0).toFixed(3)}°). ${result.output_path}`
+                )
+            );
+            showCustomAlert(
+                tr("derotation.success_title", "Derotación completada"),
+                trFormat(
+                    "derotation.success_message",
+                    { path: result.output_path, delta: Number(result.delta_deg || 0).toFixed(3) },
+                    `Imagen derotada guardada:\n${result.output_path}\n\nDelta aplicado: ${Number(result.delta_deg || 0).toFixed(3)}°`
+                )
+            );
+        } catch (e) {
+            showCustomAlert(tr("general.error", "Error"), normalizeBackendText(e));
+        } finally {
+            hideProcessing();
+        }
+    });
+
+    window.addEventListener("resize", () => {
+        if (modal.style.display !== "none") requestAnimationFrame(drawDerotationWireframe);
+    });
+})();
+
 // 2. Sintonizar con el Primer Video
 if (ui.btnBatchTune) {
     ui.btnBatchTune.addEventListener("click", async () => {
@@ -7375,6 +8115,102 @@ is commented out in index.html and this handler remains commented for reference.
             }
         });
     }
+})();
+
+// =========================================================================
+// ANIMATION PLANETARY DEROTATION
+// =========================================================================
+(function () {
+    const chk = document.getElementById("chk-anim-derotate");
+    const options = document.getElementById("anim-derot-options");
+    const btnApply = document.getElementById("btn-anim-apply-derotation");
+    if (!chk || !options) return;
+
+    let animDerotPlanet = "jupiter";
+
+    function setActivePlanet(containerId, planet) {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        container.querySelectorAll(".planet-icon").forEach((button) => {
+            const isActive = button.dataset.planet === planet;
+            button.classList.toggle("active", isActive);
+            button.style.border = isActive ? "2px solid #8b5cf6" : "1px solid rgba(255,255,255,0.15)";
+            button.style.background = isActive ? "rgba(139,92,246,0.2)" : "rgba(255,255,255,0.05)";
+            button.style.color = isActive ? "#c4b5fd" : "#94a3b8";
+        });
+    }
+
+    chk.addEventListener("change", () => {
+        options.style.display = chk.checked ? "block" : "none";
+        setActivePlanet("anim-derot-planet-selector", animDerotPlanet);
+    });
+
+    document.getElementById("anim-derot-planet-selector")?.querySelectorAll(".planet-icon").forEach((button) => {
+        button.addEventListener("click", (event) => {
+            event.preventDefault();
+            animDerotPlanet = button.dataset.planet || "jupiter";
+            setActivePlanet("anim-derot-planet-selector", animDerotPlanet);
+        });
+    });
+
+    btnApply?.addEventListener("click", async () => {
+        if (!batchResultPaths || batchResultPaths.length === 0) {
+            showCustomAlert(tr("general.error", "Error"), tr("animation.errors.no_frames_to_export", "No hay fotogramas para exportar."));
+            return;
+        }
+
+        const cmSystem = parseInt(document.getElementById("anim-derot-cm-system")?.value || "1", 10);
+        const limbStrength = parseFloat(document.getElementById("sl-anim-derot-limb")?.value || "0.5");
+        const fallbackIntervalSec = parseFloat(document.getElementById("anim-derot-interval-sec")?.value || "0");
+        const oldText = btnApply.innerHTML;
+        btnApply.disabled = true;
+        btnApply.innerHTML = tr("animation.derotation.applying", "Aplicando...");
+        showProcessing(tr("animation.derotation.processing", "DEROTANDO SECUENCIA PLANETARIA..."));
+
+        try {
+            const sequenceResult = await invoke("derotate_animation_frames", {
+                paths: batchResultPaths,
+                planet: animDerotPlanet,
+                cmSystem,
+                limbStrength,
+                fallbackIntervalSec: Number.isFinite(fallbackIntervalSec) ? fallbackIntervalSec : 0,
+                subEarthLatDeg: null,
+                northAngleDeg: null
+            });
+            const resultPaths = Array.isArray(sequenceResult) ? sequenceResult : (sequenceResult.output_paths || []);
+            const warnings = Array.isArray(sequenceResult) ? [] : (sequenceResult.warnings || []);
+
+            if (!resultPaths || resultPaths.length === 0) {
+                showCustomAlert(tr("general.error", "Error"), tr("animation.errors.no_valid_images", "No se generaron imagenes validas para reproducir."));
+                return;
+            }
+
+            batchResultPaths = resultPaths;
+            batchGeneratedImages = resultPaths;
+            refreshAnimationFromFullFrames(resultPaths, true);
+            chk.checked = true;
+            options.style.display = "block";
+            log("SUCCESS", trFormat(
+                "animation.derotation.sequence_done",
+                { count: resultPaths.length },
+                `Secuencia derotada: ${resultPaths.length} frames.`
+            ));
+            showCustomAlert(
+                tr("animation.derotation.sequence_title", "Secuencia derotada"),
+                trFormat(
+                    "animation.derotation.sequence_message",
+                    { count: resultPaths.length },
+                    `Se generaron ${resultPaths.length} frames derotados y se cargaron en el editor.`
+                ) + (warnings.length ? `<br><br>${warnings.slice(0, 3).join("<br>")}` : "")
+            );
+        } catch (e) {
+            showCustomAlert(tr("general.error", "Error"), normalizeBackendText(e));
+        } finally {
+            hideProcessing();
+            btnApply.disabled = false;
+            btnApply.innerHTML = oldText;
+        }
+    });
 })();
 
 // =========================================================================
