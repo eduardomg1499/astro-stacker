@@ -28,7 +28,20 @@ $tmpZip = Join-Path $env:TEMP "zas-ffmpeg-win64.zip"
 $tmpDir = Join-Path $env:TEMP "zas-ffmpeg-win64"
 
 Write-Host "Descargando FFmpeg (Windows x64) desde BtbN..." -ForegroundColor Cyan
-Invoke-WebRequest -Uri $zipUrl -OutFile $tmpZip
+# La barra de progreso de Invoke-WebRequest hace la descarga ~50x mas lenta en
+# PowerShell 5.1 (parece colgada). La suprimimos y preferimos curl.exe (incluido
+# en Win10/11): rapido, sigue redirecciones y muestra progreso real.
+$ProgressPreference = 'SilentlyContinue'
+$curlExe = Get-Command curl.exe -ErrorAction SilentlyContinue
+if ($curlExe) {
+    & curl.exe -L --fail --retry 3 -o $tmpZip $zipUrl
+    if ($LASTEXITCODE -ne 0) { throw "Fallo la descarga con curl (codigo $LASTEXITCODE)." }
+} else {
+    Invoke-WebRequest -Uri $zipUrl -OutFile $tmpZip -UseBasicParsing
+}
+if ((-not (Test-Path $tmpZip)) -or ((Get-Item $tmpZip).Length -lt 1MB)) {
+    throw "El zip descargado esta vacio o incompleto."
+}
 
 Write-Host "Extrayendo..." -ForegroundColor Cyan
 if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force }
