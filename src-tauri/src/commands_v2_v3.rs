@@ -347,6 +347,33 @@ fn process_analysis_frame(
     }
 }
 
+// Calcula cuántos hilos puede usar el análisis sin agotar la RAM. El pico de
+// memoria escala con el número de hilos (cada uno reserva su AnalysisBufferSet
+// + temporales por frame). Devolvemos todos los hilos por hardware, salvo que
+// no quepan en la RAM libre; ahí bajamos lo justo para no abortar (0xc0000409).
+// En equipos con RAM de sobra NO se reduce nada (sin pérdida de rendimiento).
+fn ram_aware_analysis_threads(rw: usize, rh: usize, is_color: bool) -> usize {
+    let hw = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .saturating_sub(2)
+        .max(2);
+    let mut sys = System::new_all();
+    sys.refresh_memory();
+    let available = sys.available_memory(); // bytes
+    let os_reserve: u64 = 2 * 1024 * 1024 * 1024; // 2 GB para el SO/otros procesos
+    let usable = available.saturating_sub(os_reserve);
+    // Memoria estimada por hilo: AnalysisBufferSet (~9 bytes/px) + temporales por
+    // frame (raw + u16 + debayer en color) con un margen de seguridad.
+    let per_px: u64 = if is_color { 28 } else { 16 };
+    let per_thread = (rw as u64)
+        .saturating_mul(rh as u64)
+        .saturating_mul(per_px)
+        .max(1);
+    let by_ram = (usable / per_thread).max(1) as usize;
+    by_ram.min(hw)
+}
+
 #[tauri::command]
 async fn perform_standardized_analysis(
     app: &tauri::AppHandle,
@@ -674,7 +701,11 @@ async fn perform_standardized_analysis(
                 });
 
                 // Consumer Side (Lock-Free SIMD with Recycler)
-                let local_stats: Vec<FrameAlignmentData> = rx_full
+                let analysis_pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(ram_aware_analysis_threads(rw, rh, is_color))
+                    .build()
+                    .unwrap();
+                let local_stats: Vec<FrameAlignmentData> = analysis_pool.install(|| rx_full
                     .into_iter()
                     .par_bridge()
                     .map_init(
@@ -698,7 +729,7 @@ async fn perform_standardized_analysis(
                             result
                         },
                     )
-                    .collect();
+                    .collect());
 
                 if !local_stats.is_empty() {
                     stats = local_stats;
@@ -708,11 +739,7 @@ async fn perform_standardized_analysis(
         }
     }
     if stats.is_empty() {
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .saturating_sub(2)
-            .max(2);
+        let threads = ram_aware_analysis_threads(rw, rh, is_color);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
