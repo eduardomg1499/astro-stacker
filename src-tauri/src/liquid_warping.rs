@@ -199,6 +199,169 @@ impl LanczosLUT {
 
 static LANCZOS_LUT: OnceLock<LanczosLUT> = OnceLock::new();
 
+// ===========================================================================
+// Fase 1b — SIMD para el fast-path del muestreo Lanczos RGB. El frame está
+// interleaved (R,G,B por píxel), así que las columnas de un canal NO son
+// contiguas. Para no añadir buffers (riesgo de OOM) ni shuffles delicados,
+// hacemos el de-interleave con lecturas escalares ACOTADAS (los índices están
+// garantizados por el guard del fast-path) y vectorizamos la ARITMÉTICA de los
+// 3 canales (productos, sumas, min/max) reutilizando los reductores del mono.
+// min/max son exactos; la suma se reordena <1 ULP. La ruta escalar queda como
+// fallback y referencia de validación (ver test rgb_fast_sample_avx2_*).
+// ===========================================================================
+
+#[allow(clippy::type_complexity)]
+#[inline(always)]
+fn fast_sample_rgb_scalar(
+    rgb_buf: &[u16],
+    w_in: usize,
+    sx0: isize,
+    sy0: isize,
+    w_xs: &[f32; 6],
+    fy: f32,
+    lut: &LanczosLUT,
+    drop_size: f32,
+) -> (f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) {
+    // (sum_r, sum_g, sum_b, sum_w, min_r, min_g, min_b, max_r, max_g, max_b)
+    let mut min_r = 65535.0f32;
+    let mut min_g = 65535.0f32;
+    let mut min_b = 65535.0f32;
+    let mut max_r = 0.0f32;
+    let mut max_g = 0.0f32;
+    let mut max_b = 0.0f32;
+    let mut sum_r = 0.0f32;
+    let mut sum_g = 0.0f32;
+    let mut sum_b = 0.0f32;
+    let mut sum_w = 0.0f32;
+    for ky in -2..=3 {
+        let wy = lut.get(fy - ky as f32, drop_size);
+        if wy.abs() < 0.001 {
+            continue;
+        }
+        let src_row = (sy0 + ky) as usize * w_in;
+        for (i, kx) in (-2..=3).enumerate() {
+            let w_final = w_xs[i] * wy;
+            let off = (src_row + (sx0 + kx) as usize) * 3;
+            let pr = rgb_buf[off] as f32;
+            let pg = rgb_buf[off + 1] as f32;
+            let pb = rgb_buf[off + 2] as f32;
+            if pr < min_r {
+                min_r = pr;
+            }
+            if pg < min_g {
+                min_g = pg;
+            }
+            if pb < min_b {
+                min_b = pb;
+            }
+            if pr > max_r {
+                max_r = pr;
+            }
+            if pg > max_g {
+                max_g = pg;
+            }
+            if pb > max_b {
+                max_b = pb;
+            }
+            sum_r += pr * w_final;
+            sum_g += pg * w_final;
+            sum_b += pb * w_final;
+            sum_w += w_final;
+        }
+    }
+    (
+        sum_r, sum_g, sum_b, sum_w, min_r, min_g, min_b, max_r, max_g, max_b,
+    )
+}
+
+#[allow(clippy::type_complexity)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fast_sample_rgb_avx2(
+    rgb_buf: &[u16],
+    w_in: usize,
+    sx0: isize,
+    sy0: isize,
+    w_xs: &[f32; 6],
+    fy: f32,
+    lut: &LanczosLUT,
+    drop_size: f32,
+) -> (f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) {
+    use std::arch::x86_64::*;
+    let wxs = _mm256_setr_ps(w_xs[0], w_xs[1], w_xs[2], w_xs[3], w_xs[4], w_xs[5], 0.0, 0.0);
+    let pad_hi = _mm256_set1_ps(65535.0);
+    let mut sum_r = _mm256_setzero_ps();
+    let mut sum_g = _mm256_setzero_ps();
+    let mut sum_b = _mm256_setzero_ps();
+    let mut sum_w = _mm256_setzero_ps();
+    let mut vmin_r = pad_hi;
+    let mut vmin_g = pad_hi;
+    let mut vmin_b = pad_hi;
+    let mut vmax_r = _mm256_setzero_ps();
+    let mut vmax_g = _mm256_setzero_ps();
+    let mut vmax_b = _mm256_setzero_ps();
+    for ky in -2..=3isize {
+        let wy = lut.get(fy - ky as f32, drop_size);
+        if wy.abs() < 0.001 {
+            continue;
+        }
+        let src_row = (sy0 + ky) as usize * w_in;
+        // base..base+18 son las 6 columnas RGB; índices garantizados en rango
+        // por el guard del fast-path (sx0>=2, sx0+3<w_in, sy0>=2, sy0+3<h_in).
+        let base = (src_row + (sx0 - 2) as usize) * 3;
+        let g = |o: usize| *rgb_buf.get_unchecked(base + o) as f32;
+        let rv = _mm256_setr_ps(g(0), g(3), g(6), g(9), g(12), g(15), 0.0, 0.0);
+        let gv = _mm256_setr_ps(g(1), g(4), g(7), g(10), g(13), g(16), 0.0, 0.0);
+        let bv = _mm256_setr_ps(g(2), g(5), g(8), g(11), g(14), g(17), 0.0, 0.0);
+        let wf = _mm256_mul_ps(wxs, _mm256_set1_ps(wy));
+        sum_r = _mm256_add_ps(sum_r, _mm256_mul_ps(rv, wf));
+        sum_g = _mm256_add_ps(sum_g, _mm256_mul_ps(gv, wf));
+        sum_b = _mm256_add_ps(sum_b, _mm256_mul_ps(bv, wf));
+        sum_w = _mm256_add_ps(sum_w, wf);
+        vmin_r = _mm256_min_ps(vmin_r, _mm256_blend_ps::<0b1100_0000>(rv, pad_hi));
+        vmin_g = _mm256_min_ps(vmin_g, _mm256_blend_ps::<0b1100_0000>(gv, pad_hi));
+        vmin_b = _mm256_min_ps(vmin_b, _mm256_blend_ps::<0b1100_0000>(bv, pad_hi));
+        vmax_r = _mm256_max_ps(vmax_r, rv);
+        vmax_g = _mm256_max_ps(vmax_g, gv);
+        vmax_b = _mm256_max_ps(vmax_b, bv);
+    }
+    (
+        hsum256_ps(sum_r),
+        hsum256_ps(sum_g),
+        hsum256_ps(sum_b),
+        hsum256_ps(sum_w),
+        hmin256_ps(vmin_r),
+        hmin256_ps(vmin_g),
+        hmin256_ps(vmin_b),
+        hmax256_ps(vmax_r),
+        hmax256_ps(vmax_g),
+        hmax256_ps(vmax_b),
+    )
+}
+
+#[allow(clippy::type_complexity)]
+#[inline(always)]
+fn fast_sample_rgb(
+    rgb_buf: &[u16],
+    w_in: usize,
+    sx0: isize,
+    sy0: isize,
+    w_xs: &[f32; 6],
+    fy: f32,
+    lut: &LanczosLUT,
+    drop_size: f32,
+) -> (f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe {
+                fast_sample_rgb_avx2(rgb_buf, w_in, sx0, sy0, w_xs, fy, lut, drop_size)
+            };
+        }
+    }
+    fast_sample_rgb_scalar(rgb_buf, w_in, sx0, sy0, w_xs, fy, lut, drop_size)
+}
+
 pub fn accumulate_frame_liquid(
     acc_r: &mut [f32],
     acc_g: &mut [f32],
@@ -324,102 +487,70 @@ pub fn accumulate_frame_liquid(
                     w_xs[i] = lut.get(fx - kx as f32, drop_size);
                 }
 
-                let mut min_r = 65535.0f32;
-                let mut min_g = 65535.0f32;
-                let mut min_b = 65535.0f32;
-                let mut max_r = 0.0f32;
-                let mut max_g = 0.0f32;
-                let mut max_b = 0.0f32;
-                let mut sum_r = 0.0f32;
-                let mut sum_g = 0.0f32;
-                let mut sum_b = 0.0f32;
-                let mut sum_w = 0.0f32;
-
-                if sx0 >= 2 && sx0 + 3 < w_in as isize && sy0 >= 2 && sy0 + 3 < h_in as isize {
-                    // FAST PATH (Interior Pixels)
-                    for ky in -2..=3 {
-                        let wy = lut.get(fy - ky as f32, drop_size);
-                        if wy.abs() < 0.001 {
-                            continue;
-                        }
-                        let src_row = (sy0 + ky) as usize * w_in;
-                        for (i, kx) in (-2..=3).enumerate() {
-                            let w_final = w_xs[i] * wy;
-                            let off = (src_row + (sx0 + kx) as usize) * 3;
-                            let pr = rgb_buf[off] as f32;
-                            let pg = rgb_buf[off + 1] as f32;
-                            let pb = rgb_buf[off + 2] as f32;
-                            if pr < min_r {
-                                min_r = pr;
-                            }
-                            if pg < min_g {
-                                min_g = pg;
-                            }
-                            if pb < min_b {
-                                min_b = pb;
-                            }
-                            if pr > max_r {
-                                max_r = pr;
-                            }
-                            if pg > max_g {
-                                max_g = pg;
-                            }
-                            if pb > max_b {
-                                max_b = pb;
-                            }
-                            sum_r += pr * w_final;
-                            sum_g += pg * w_final;
-                            sum_b += pb * w_final;
-                            sum_w += w_final;
-                        }
-                    }
-                } else {
-                    // SLOW PATH (Boundary clipping)
-                    for ky in -2..=3 {
-                        let py = sy0 + ky;
-                        if py < 0 || py >= h_in as isize {
-                            continue;
-                        }
-                        let wy = lut.get(fy - ky as f32, drop_size);
-                        if wy.abs() < 0.001 {
-                            continue;
-                        }
-                        let src_row = py as usize * w_in;
-                        for (i, kx) in (-2..=3).enumerate() {
-                            let px = sx0 + kx;
-                            if px < 0 || px >= w_in as isize {
+                let (sum_r, sum_g, sum_b, sum_w, min_r, min_g, min_b, max_r, max_g, max_b) =
+                    if sx0 >= 2 && sx0 + 3 < w_in as isize && sy0 >= 2 && sy0 + 3 < h_in as isize {
+                        // FAST PATH (Interior Pixels) — SIMD (AVX2) con fallback escalar
+                        fast_sample_rgb(rgb_buf, w_in, sx0, sy0, &w_xs, fy, lut, drop_size)
+                    } else {
+                        // SLOW PATH (Boundary clipping) — escalar
+                        let mut min_r = 65535.0f32;
+                        let mut min_g = 65535.0f32;
+                        let mut min_b = 65535.0f32;
+                        let mut max_r = 0.0f32;
+                        let mut max_g = 0.0f32;
+                        let mut max_b = 0.0f32;
+                        let mut sum_r = 0.0f32;
+                        let mut sum_g = 0.0f32;
+                        let mut sum_b = 0.0f32;
+                        let mut sum_w = 0.0f32;
+                        for ky in -2..=3 {
+                            let py = sy0 + ky;
+                            if py < 0 || py >= h_in as isize {
                                 continue;
                             }
-                            let w_final = w_xs[i] * wy;
-                            let off = (src_row + px as usize) * 3;
-                            let pr = rgb_buf[off] as f32;
-                            let pg = rgb_buf[off + 1] as f32;
-                            let pb = rgb_buf[off + 2] as f32;
-                            if pr < min_r {
-                                min_r = pr;
+                            let wy = lut.get(fy - ky as f32, drop_size);
+                            if wy.abs() < 0.001 {
+                                continue;
                             }
-                            if pg < min_g {
-                                min_g = pg;
+                            let src_row = py as usize * w_in;
+                            for (i, kx) in (-2..=3).enumerate() {
+                                let px = sx0 + kx;
+                                if px < 0 || px >= w_in as isize {
+                                    continue;
+                                }
+                                let w_final = w_xs[i] * wy;
+                                let off = (src_row + px as usize) * 3;
+                                let pr = rgb_buf[off] as f32;
+                                let pg = rgb_buf[off + 1] as f32;
+                                let pb = rgb_buf[off + 2] as f32;
+                                if pr < min_r {
+                                    min_r = pr;
+                                }
+                                if pg < min_g {
+                                    min_g = pg;
+                                }
+                                if pb < min_b {
+                                    min_b = pb;
+                                }
+                                if pr > max_r {
+                                    max_r = pr;
+                                }
+                                if pg > max_g {
+                                    max_g = pg;
+                                }
+                                if pb > max_b {
+                                    max_b = pb;
+                                }
+                                sum_r += pr * w_final;
+                                sum_g += pg * w_final;
+                                sum_b += pb * w_final;
+                                sum_w += w_final;
                             }
-                            if pb < min_b {
-                                min_b = pb;
-                            }
-                            if pr > max_r {
-                                max_r = pr;
-                            }
-                            if pg > max_g {
-                                max_g = pg;
-                            }
-                            if pb > max_b {
-                                max_b = pb;
-                            }
-                            sum_r += pr * w_final;
-                            sum_g += pg * w_final;
-                            sum_b += pb * w_final;
-                            sum_w += w_final;
                         }
-                    }
-                }
+                        (
+                            sum_r, sum_g, sum_b, sum_w, min_r, min_g, min_b, max_r, max_g, max_b,
+                        )
+                    };
 
                 // SYMMETRIC RANGE-BASED ANTI-RINGING CLAMP:
                 // The old lower-only clamp (min·factor) brightened dark
@@ -1221,5 +1352,55 @@ mod simd_validation {
         // Umbral holgado pero estricto frente a un bug real (que daría diffs grandes).
         assert!(max_diff_v < 0.5, "sum_v difiere demasiado: {max_diff_v}");
         assert!(max_diff_w < 1e-3, "sum_w difiere demasiado: {max_diff_w}");
+    }
+
+    #[test]
+    fn rgb_fast_sample_avx2_matches_scalar() {
+        let w_in = 80usize;
+        let h_in = 80usize;
+        // Buffer RGB interleaved pseudo-aleatorio determinista.
+        let mut buf = vec![0u16; w_in * h_in * 3];
+        let mut s = 0x9E37_79B9u32;
+        for v in buf.iter_mut() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = (s >> 16) as u16;
+        }
+        let lut = LanczosLUT::new(30000, 3.0);
+        let drop_size = 1.0f32;
+
+        let mut max_diff_sum = 0.0f32;
+        let mut checked = 0u64;
+        for sy0 in 2..(h_in as isize - 3) {
+            for sx0 in 2..(w_in as isize - 3) {
+                for &fx in &[0.0f32, 0.2, 0.5, 0.51, 0.77, 0.999] {
+                    for &fy in &[0.0f32, 0.13, 0.49, 0.5, 0.86, 0.999] {
+                        let mut w_xs = [0.0f32; 6];
+                        for (i, kx) in (-2..=3).enumerate() {
+                            w_xs[i] = lut.get(fx - kx as f32, drop_size);
+                        }
+                        let sc =
+                            fast_sample_rgb_scalar(&buf, w_in, sx0, sy0, &w_xs, fy, &lut, drop_size);
+                        let si = unsafe {
+                            fast_sample_rgb_avx2(&buf, w_in, sx0, sy0, &w_xs, fy, &lut, drop_size)
+                        };
+                        // min/max (índices 4..10) deben ser EXACTOS.
+                        for j in 4..10 {
+                            let a = [sc.4, sc.5, sc.6, sc.7, sc.8, sc.9][j - 4];
+                            let b = [si.4, si.5, si.6, si.7, si.8, si.9][j - 4];
+                            assert_eq!(a, b, "min/max idx {j} difiere en sx0={sx0} sy0={sy0}");
+                        }
+                        // sumas (0..4): <1 ULP.
+                        for j in 0..4 {
+                            let a = [sc.0, sc.1, sc.2, sc.3][j];
+                            let b = [si.0, si.1, si.2, si.3][j];
+                            max_diff_sum = max_diff_sum.max((a - b).abs());
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("RGB SIMD validado en {checked} casos. max_diff suma={max_diff_sum}");
+        assert!(max_diff_sum < 0.5, "suma RGB difiere demasiado: {max_diff_sum}");
     }
 }
