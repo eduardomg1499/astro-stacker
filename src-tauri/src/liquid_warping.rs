@@ -459,6 +459,161 @@ pub fn accumulate_frame_liquid(
     }
 }
 
+// ===========================================================================
+// Fase 1a — SIMD para el fast-path del muestreo Lanczos MONO (el loop más
+// caliente del apilado). Por cada una de las 6 filas del kernel 6×6, los 6
+// píxeles de columna son CONTIGUOS en memoria, así que se vectoriza la fila y
+// se reduce una sola vez por píxel. min/max son exactos (sin reordenamiento);
+// solo la SUMA se reordena → diferencias <1 ULP, del mismo orden que la
+// no-determinación que ya introduce la reducción en paralelo de rayon.
+// La ruta escalar queda como fallback y referencia de validación (ver test).
+// ===========================================================================
+
+#[inline(always)]
+fn fast_sample_mono_scalar(
+    mono_buf: &[u16],
+    w_in: usize,
+    sx0: isize,
+    sy0: isize,
+    w_xs: &[f32; 6],
+    fy: f32,
+    lut: &LanczosLUT,
+    drop_size: f32,
+) -> (f32, f32, f32, f32) {
+    let mut min_v = 65535.0f32;
+    let mut max_v = 0.0f32;
+    let mut sum_v = 0.0f32;
+    let mut sum_w = 0.0f32;
+    for ky in -2..=3 {
+        let wy = lut.get(fy - ky as f32, drop_size);
+        if wy.abs() < 0.001 {
+            continue;
+        }
+        let src_row = (sy0 + ky) as usize * w_in;
+        for (i, kx) in (-2..=3).enumerate() {
+            let w_final = w_xs[i] * wy;
+            let pv = mono_buf[src_row + (sx0 + kx) as usize] as f32;
+            if pv < min_v {
+                min_v = pv;
+            }
+            if pv > max_v {
+                max_v = pv;
+            }
+            sum_v += pv * w_final;
+            sum_w += w_final;
+        }
+    }
+    (sum_v, sum_w, min_v, max_v)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum256_ps(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castps256_ps128(v);
+    let hi = _mm256_extractf128_ps::<1>(v);
+    let s = _mm_add_ps(lo, hi);
+    let s = _mm_hadd_ps(s, s);
+    let s = _mm_hadd_ps(s, s);
+    _mm_cvtss_f32(s)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hmin256_ps(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castps256_ps128(v);
+    let hi = _mm256_extractf128_ps::<1>(v);
+    let m = _mm_min_ps(lo, hi);
+    let m = _mm_min_ps(m, _mm_movehl_ps(m, m));
+    let m = _mm_min_ss(m, _mm_shuffle_ps::<1>(m, m));
+    _mm_cvtss_f32(m)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hmax256_ps(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castps256_ps128(v);
+    let hi = _mm256_extractf128_ps::<1>(v);
+    let m = _mm_max_ps(lo, hi);
+    let m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+    let m = _mm_max_ss(m, _mm_shuffle_ps::<1>(m, m));
+    _mm_cvtss_f32(m)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fast_sample_mono_avx2(
+    mono_buf: &[u16],
+    w_in: usize,
+    sx0: isize,
+    sy0: isize,
+    w_xs: &[f32; 6],
+    fy: f32,
+    lut: &LanczosLUT,
+    drop_size: f32,
+) -> (f32, f32, f32, f32) {
+    use std::arch::x86_64::*;
+    // Pesos en X con los 2 lanes de relleno a 0 (no contribuyen a las sumas).
+    let wxs = _mm256_setr_ps(w_xs[0], w_xs[1], w_xs[2], w_xs[3], w_xs[4], w_xs[5], 0.0, 0.0);
+    let mut sum_v = _mm256_setzero_ps();
+    let mut sum_w = _mm256_setzero_ps();
+    let mut vmin = _mm256_set1_ps(65535.0);
+    let mut vmax = _mm256_setzero_ps();
+    let base = (sx0 - 2) as usize;
+    for ky in -2..=3isize {
+        let wy = lut.get(fy - ky as f32, drop_size);
+        if wy.abs() < 0.001 {
+            continue;
+        }
+        let p = mono_buf.as_ptr().add((sy0 + ky) as usize * w_in + base);
+        // Carga de EXACTAMENTE 6 u16 (4 + 2) para no leer fuera de rango: el
+        // guard del fast-path solo garantiza índices [sx0-2 .. sx0+3].
+        let lo = _mm_loadl_epi64(p as *const __m128i); // u16[0..4]
+        let hi = _mm_cvtsi32_si128(core::ptr::read_unaligned(p.add(4) as *const i32)); // u16[4..6]
+        let combined = _mm_or_si128(lo, _mm_bslli_si128::<8>(hi));
+        let pv = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(combined)); // lanes 6,7 = 0
+        let wf = _mm256_mul_ps(wxs, _mm256_set1_ps(wy)); // lanes 6,7 = 0
+        sum_v = _mm256_add_ps(sum_v, _mm256_mul_ps(pv, wf));
+        sum_w = _mm256_add_ps(sum_w, wf);
+        // Para el mínimo, fijar los lanes de relleno a 65535 (neutros).
+        let pv_min = _mm256_blend_ps::<0b1100_0000>(pv, _mm256_set1_ps(65535.0));
+        vmin = _mm256_min_ps(vmin, pv_min);
+        vmax = _mm256_max_ps(vmax, pv); // lanes 6,7 = 0, neutros para max (datos >= 0)
+    }
+    (
+        hsum256_ps(sum_v),
+        hsum256_ps(sum_w),
+        hmin256_ps(vmin),
+        hmax256_ps(vmax),
+    )
+}
+
+/// Despacho: usa AVX2 si está disponible; si no, el escalar (mismo resultado
+/// salvo <1 ULP en la suma). En aarch64/otros usa el escalar.
+#[inline(always)]
+fn fast_sample_mono(
+    mono_buf: &[u16],
+    w_in: usize,
+    sx0: isize,
+    sy0: isize,
+    w_xs: &[f32; 6],
+    fy: f32,
+    lut: &LanczosLUT,
+    drop_size: f32,
+) -> (f32, f32, f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe {
+                fast_sample_mono_avx2(mono_buf, w_in, sx0, sy0, w_xs, fy, lut, drop_size)
+            };
+        }
+    }
+    fast_sample_mono_scalar(mono_buf, w_in, sx0, sy0, w_xs, fy, lut, drop_size)
+}
+
 /// Mono variant of `accumulate_frame_liquid`: identical warp/IDW logic but
 /// samples a single channel. Avoids the historical mono→RGB triplication
 /// (3× RAM and 3× sampling cost for grayscale cameras).
@@ -580,34 +735,19 @@ pub fn accumulate_frame_liquid_mono(
                 w_xs[i] = lut.get(fx - kx as f32, drop_size);
             }
 
-            let mut min_v = 65535.0f32;
-            let mut max_v = 0.0f32;
-            let mut sum_v = 0.0f32;
-            let mut sum_w = 0.0f32;
-
-            if sx0 >= 2 && sx0 + 3 < w_in as isize && sy0 >= 2 && sy0 + 3 < h_in as isize {
-                // FAST PATH (Interior Pixels)
-                for ky in -2..=3 {
-                    let wy = lut.get(fy - ky as f32, drop_size);
-                    if wy.abs() < 0.001 {
-                        continue;
-                    }
-                    let src_row = (sy0 + ky) as usize * w_in;
-                    for (i, kx) in (-2..=3).enumerate() {
-                        let w_final = w_xs[i] * wy;
-                        let pv = mono_buf[src_row + (sx0 + kx) as usize] as f32;
-                        if pv < min_v {
-                            min_v = pv;
-                        }
-                        if pv > max_v {
-                            max_v = pv;
-                        }
-                        sum_v += pv * w_final;
-                        sum_w += w_final;
-                    }
-                }
+            let (sum_v, sum_w, min_v, max_v) = if sx0 >= 2
+                && sx0 + 3 < w_in as isize
+                && sy0 >= 2
+                && sy0 + 3 < h_in as isize
+            {
+                // FAST PATH (Interior Pixels) — SIMD (AVX2) con fallback escalar
+                fast_sample_mono(mono_buf, w_in, sx0, sy0, &w_xs, fy, lut, drop_size)
             } else {
-                // SLOW PATH (Boundary clipping)
+                // SLOW PATH (Boundary clipping) — escalar
+                let mut min_v = 65535.0f32;
+                let mut max_v = 0.0f32;
+                let mut sum_v = 0.0f32;
+                let mut sum_w = 0.0f32;
                 for ky in -2..=3 {
                     let py = sy0 + ky;
                     if py < 0 || py >= h_in as isize {
@@ -635,7 +775,8 @@ pub fn accumulate_frame_liquid_mono(
                         sum_w += w_final;
                     }
                 }
-            }
+                (sum_v, sum_w, min_v, max_v)
+            };
 
             if sum_w.abs() > 0.00001 {
                 // Symmetric range-based anti-ringing clamp (same policy as RGB):
@@ -1012,5 +1153,73 @@ pub fn accumulate_frame_rigid_lanczos(
                 }
             }
         }
+    }
+}
+
+// ===========================================================================
+// Validación Fase 1a: el fast-path AVX2 debe coincidir con el escalar.
+// Solo se compila/ejecuta en x86_64 (donde corre la ruta AVX2). min/max deben
+// ser EXACTOS; la suma puede diferir <1 ULP por el reordenamiento.
+// ===========================================================================
+#[cfg(all(test, target_arch = "x86_64"))]
+mod simd_validation {
+    use super::*;
+
+    #[test]
+    fn mono_fast_sample_avx2_matches_scalar() {
+        // Nota: bajo Rosetta, is_x86_feature_detected!("avx2") puede devolver
+        // false aunque las instrucciones AVX2 SÍ se ejecuten. Forzamos la llamada
+        // directa a la versión AVX2 para validarla aquí. En hardware sin AVX2
+        // real esto daría SIGILL (y entonces la validación debe hacerse en x86).
+        eprintln!(
+            "avx2 reportado por cpuid = {}",
+            is_x86_feature_detected!("avx2")
+        );
+        let w_in = 96usize;
+        let h_in = 96usize;
+        // Buffer mono pseudo-aleatorio determinista (LCG).
+        let mut buf = vec![0u16; w_in * h_in];
+        let mut s = 0x1234_5678u32;
+        for v in buf.iter_mut() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = (s >> 16) as u16;
+        }
+        let lut = LanczosLUT::new(30000, 3.0);
+        let drop_size = 1.0f32;
+
+        let mut max_diff_v = 0.0f32;
+        let mut max_diff_w = 0.0f32;
+        let mut checked = 0u64;
+
+        for sy0 in 2..(h_in as isize - 3) {
+            for sx0 in 2..(w_in as isize - 3) {
+                for &fx in &[0.0f32, 0.2, 0.5, 0.51, 0.77, 0.999] {
+                    for &fy in &[0.0f32, 0.13, 0.49, 0.5, 0.86, 0.999] {
+                        let mut w_xs = [0.0f32; 6];
+                        for (i, kx) in (-2..=3).enumerate() {
+                            w_xs[i] = lut.get(fx - kx as f32, drop_size);
+                        }
+                        let sc =
+                            fast_sample_mono_scalar(&buf, w_in, sx0, sy0, &w_xs, fy, &lut, drop_size);
+                        let si = unsafe {
+                            fast_sample_mono_avx2(&buf, w_in, sx0, sy0, &w_xs, fy, &lut, drop_size)
+                        };
+                        // min/max: exactos (min/max de los mismos f32, sin aritmética).
+                        assert_eq!(sc.2, si.2, "min difiere en sx0={sx0} sy0={sy0}");
+                        assert_eq!(sc.3, si.3, "max difiere en sx0={sx0} sy0={sy0}");
+                        max_diff_v = max_diff_v.max((sc.0 - si.0).abs());
+                        max_diff_w = max_diff_w.max((sc.1 - si.1).abs());
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "SIMD validado en {checked} casos. max_diff sum_v={max_diff_v}, sum_w={max_diff_w}"
+        );
+        // sum_v ~ hasta ~65535×(Σpesos); el reordenamiento da error relativo ~1e-6.
+        // Umbral holgado pero estricto frente a un bug real (que daría diffs grandes).
+        assert!(max_diff_v < 0.5, "sum_v difiere demasiado: {max_diff_v}");
+        assert!(max_diff_w < 1e-3, "sum_w difiere demasiado: {max_diff_w}");
     }
 }
