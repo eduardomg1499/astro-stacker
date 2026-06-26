@@ -556,9 +556,13 @@ async fn perform_standardized_analysis(
     emit_progress(app, &get_msg("Preparando referencia..."), 4.0, None);
 
     let a_mono = {
+        // Fase 4: decodificar el frame de referencia UNA sola vez y reusarlo.
+        // En small-planet se re-extraía con otro get_frame -> doble decode (caro
+        // en FFmpeg; en SER mmap es barato). Mismos píxeles -> resultado idéntico.
+        let ref_raw = r.get_frame(analysis_ref_idx, cid);
         let mut tmp = Vec::with_capacity(rw * rh);
         raw_to_u16_buffer_into_roi(
-            &r.get_frame(analysis_ref_idx, cid),
+            &ref_raw,
             tw,
             th,
             tbp,
@@ -584,10 +588,10 @@ async fn perform_standardized_analysis(
                 rw = planet_roi.w;
                 rh = planet_roi.h;
                 
-                // Re-extract tighter reference mono
+                // Re-extract tighter reference mono (reusa el frame ya decodificado)
                 tmp.clear();
                 raw_to_u16_buffer_into_roi(
-                    &r.get_frame(analysis_ref_idx, cid),
+                    &ref_raw,
                     tw, th, tbp,
                     rx, ry, rw, rh,
                     &mut tmp,
