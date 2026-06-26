@@ -906,7 +906,12 @@ fn refine_center_radial(
     let search_r = (radius / 10).max(2).min(20);
     let mut best_cx = cx;
     let mut best_cy = cy;
-    let mut best_symmetry = f64::MAX;
+    // Inicializar con la simetría del CENTROIDE de entrada (no f64::MAX): si la
+    // métrica es plana o hay empate en el mínimo (p. ej. disco uniforme o planeta
+    // de bajo gradiente), gana el centroide en vez del primer candidato probado
+    // (la esquina cx-search_r, que sesgaba el centro). Con un mínimo único (datos
+    // reales con gradiente) el comportamiento es idéntico.
+    let mut best_symmetry = measure_radial_symmetry(data, w, h, cx, cy, radius);
     let step = 0.5_f64;
 
     let mut test_cx = cx - search_r as f64;
