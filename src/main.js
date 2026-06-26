@@ -6576,6 +6576,7 @@ if (ui.btnStack) {
                         stackingRoi: getStackingRoiOverrideValue(),
                         normalizeColors: document.getElementById("chk-normalize-colors") ? document.getElementById("chk-normalize-colors").checked : true,
                         isV3: flow.isV3 || (alignModeStr === "liquid_v3") || (alignModeStr === "zenith_v3"), // V3 flag for all these modes
+                        keepFullFrame: document.getElementById("chk-keep-full-frame") ? document.getElementById("chk-keep-full-frame").checked : false,
                         targetType: flow.category
                     });
                 } else {
@@ -6597,6 +6598,7 @@ if (ui.btnStack) {
                         stackingRoi: getStackingRoiOverrideValue(),
                         normalizeColors: document.getElementById("chk-normalize-colors") ? document.getElementById("chk-normalize-colors").checked : true,
                         isV3: flow.isV3 || (alignModeStr === "zenith_v3"), // NEW FLAG
+                        keepFullFrame: document.getElementById("chk-keep-full-frame") ? document.getElementById("chk-keep-full-frame").checked : false,
                         targetType: flow.category
                     });
                 }

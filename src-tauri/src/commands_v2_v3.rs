@@ -1072,6 +1072,7 @@ async fn stack_video_liquid_warping(
     normalize_colors: bool,
     is_v3: bool,
     target_type: String, // NEW
+    keep_full_frame: Option<bool>, // NEW: no recortar bordes (mantener encuadre completo)
 ) -> Result<String, String> {
     stack_video_liquid_warping_impl(
         &app,
@@ -1093,6 +1094,7 @@ async fn stack_video_liquid_warping(
         is_v3,
         target_type,
         None,
+        keep_full_frame,
     )
     .await
 }
@@ -1121,6 +1123,7 @@ pub async fn stack_video_liquid_warping_impl(
     is_v3: bool,
     target_type: String,
     progress_prefix: Option<String>,
+    keep_full_frame: Option<bool>,
 ) -> Result<String, String> {
     let app = app.clone();
     let is_surface = is_surface || is_surface_target(&target_type);
@@ -2360,9 +2363,15 @@ pub async fn stack_video_liquid_warping_impl(
         // EDGE ARTIFACT MITIGATION (AS!4-style cropped output): output borders
         // covered by only a few shifted frames show seams, exposure steps and
         // noise. Trim border rows/cols whose coverage is far below the median.
-        if let Some((cx0, cy0, cx1, cy1)) =
+        // Recorte AS!4 de bordes de baja cobertura. Se OMITE si el usuario pidió
+        // mantener el encuadre completo (keep_full_frame) o si hay un ROI de
+        // apilado manual (que ya define el frame de salida).
+        let crop_box = if !keep_full_frame.unwrap_or(false) && stacking_roi.is_none() {
             compute_low_coverage_crop(&acc_grad_g.direct_w, w_out, h_out, 0.06)
-        {
+        } else {
+            None
+        };
+        if let Some((cx0, cy0, cx1, cy1)) = crop_box {
             let nw = cx1 - cx0;
             let nh = cy1 - cy0;
             let mut cropped = vec![0.0f32; nw * nh * 3];

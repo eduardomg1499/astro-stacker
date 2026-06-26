@@ -493,6 +493,7 @@
         "sharpen_hint": "Controls the weight of fine, mid, and structural bands.",
         "double_pass": "Double-Pass Alignment",
         "normalize_colors": "Normalize Colors (Auto-Balance)",
+        "keep_full_frame": "Keep full frame (no crop)",
         "ap_size": "AP Size:",
         "ap_sizes": {
             "micro": "Micro (8px)",

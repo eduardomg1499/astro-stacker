@@ -1664,6 +1664,7 @@ async fn process_batch_entry(
         is_v3,
         target_type.clone(),
         Some(get_msg("")),
+        None, // keep_full_frame: el lote usa el recorte por defecto
     )
     .await?;
 
@@ -3523,6 +3524,7 @@ async fn stack_video(
     normalize_colors: bool,
     is_v3: bool,                       // NEW
     target_type: String,               // NEW
+    keep_full_frame: Option<bool>,     // NEW: mantener encuadre completo (no recortar)
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
  
@@ -3557,6 +3559,7 @@ async fn stack_video(
         normalize_colors,
         is_v3,
         target_type, // NEW
+        keep_full_frame,
     )
     .await;
 }

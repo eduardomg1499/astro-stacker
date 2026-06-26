@@ -2229,6 +2229,17 @@
                             </span>
                         </label>
                     </div>
+                    <!-- KEEP FULL FRAME (no recortar bordes de baja cobertura: evita el
+                         "corte" estilo AS! cuando la zona util no llega al borde) -->
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                        <span style="color:#aaa; font-size:0.8rem;" data-i18n="analysis.keep_full_frame">Mantener encuadre completo (no recortar)</span>
+                        <label class="switch-container">
+                            <span class="switch" style="transform:scale(0.8);">
+                                <input type="checkbox" id="chk-keep-full-frame">
+                                <span class="slider round"></span>
+                            </span>
+                        </label>
+                    </div>
                     <!-- NORMALIZE COLORS TOGGLE -->
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
                         <span style="color:#aaa; font-size:0.8rem;" data-i18n="analysis.normalize_colors">Normalizar

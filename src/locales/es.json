@@ -493,6 +493,7 @@
         "sharpen_hint": "Controla el peso de las bandas fina, media y estructura.",
         "double_pass": "Alineación Doble Pasada",
         "normalize_colors": "Normalizar Colores (Auto-Balance)",
+        "keep_full_frame": "Mantener encuadre completo (no recortar)",
         "ap_size": "AP Size:",
         "ap_sizes": {
             "micro": "Micro (8px)",
