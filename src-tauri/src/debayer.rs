@@ -116,6 +116,12 @@ fn debayer_into_buffer(
         }
     };
 
+    // OPTIMIZACION (bit-identica): aritmetica ENTERA en vez de f32.
+    // `((a+b+c+d) as f32 * 0.25) as u16` == `(a+b+c+d) >> 2`, y `((a+b) as f32
+    // * 0.5) as u16` == `(a+b) >> 1` para sumas de u16 no negativas (el truncado
+    // a u16 es el floor de la division exacta). Mismo flujo de control que la
+    // version f32 previa -> resultado IDENTICO, pero sin conversiones f32 y con
+    // mejor auto-vectorizacion. Validado en el test `debayer_integer_matches_f32`.
     let ptr_in = input.as_ptr();
     let ptr_out = out.as_mut_ptr();
     for y in 1..height - 1 {
@@ -126,37 +132,112 @@ fn debayer_into_buffer(
             let idx = row_offset + x;
             let o = idx * 3;
             unsafe {
-                let v = *ptr_in.add(idx) as f32;
+                let v = *ptr_in.add(idx) as u32;
                 let red_pixel = (x % 2 == rx) && (y % 2 == ry);
                 let blue_pixel = (x % 2 != rx) && (y % 2 != ry);
-                let u = *ptr_in.add(prev_row + x) as f32;
-                let d = *ptr_in.add(next_row + x) as f32;
-                let l = *ptr_in.add(row_offset + x - 1) as f32;
-                let r = *ptr_in.add(row_offset + x + 1) as f32;
+                let u = *ptr_in.add(prev_row + x) as u32;
+                let d = *ptr_in.add(next_row + x) as u32;
+                let l = *ptr_in.add(row_offset + x - 1) as u32;
+                let r = *ptr_in.add(row_offset + x + 1) as u32;
 
                 let (cr, cg, cb) = if red_pixel {
-                    let c1 = *ptr_in.add(prev_row + x - 1) as f32;
-                    let c2 = *ptr_in.add(prev_row + x + 1) as f32;
-                    let c3 = *ptr_in.add(next_row + x - 1) as f32;
-                    let c4 = *ptr_in.add(next_row + x + 1) as f32;
-                    (v, (u + d + l + r) * 0.25, (c1 + c2 + c3 + c4) * 0.25)
+                    let c1 = *ptr_in.add(prev_row + x - 1) as u32;
+                    let c2 = *ptr_in.add(prev_row + x + 1) as u32;
+                    let c3 = *ptr_in.add(next_row + x - 1) as u32;
+                    let c4 = *ptr_in.add(next_row + x + 1) as u32;
+                    (v, (u + d + l + r) >> 2, (c1 + c2 + c3 + c4) >> 2)
                 } else if blue_pixel {
-                    let c1 = *ptr_in.add(prev_row + x - 1) as f32;
-                    let c2 = *ptr_in.add(prev_row + x + 1) as f32;
-                    let c3 = *ptr_in.add(next_row + x - 1) as f32;
-                    let c4 = *ptr_in.add(next_row + x + 1) as f32;
-                    ((c1 + c2 + c3 + c4) * 0.25, (u + d + l + r) * 0.25, v)
+                    let c1 = *ptr_in.add(prev_row + x - 1) as u32;
+                    let c2 = *ptr_in.add(prev_row + x + 1) as u32;
+                    let c3 = *ptr_in.add(next_row + x - 1) as u32;
+                    let c4 = *ptr_in.add(next_row + x + 1) as u32;
+                    ((c1 + c2 + c3 + c4) >> 2, (u + d + l + r) >> 2, v)
+                } else if y % 2 == ry {
+                    ((l + r) >> 1, v, (u + d) >> 1)
                 } else {
-                    if y % 2 == ry {
-                        ((l + r) * 0.5, v, (u + d) * 0.5)
-                    } else {
-                        ((u + d) * 0.5, v, (l + r) * 0.5)
-                    }
+                    ((u + d) >> 1, v, (l + r) >> 1)
                 };
                 *ptr_out.add(o) = cr as u16;
                 *ptr_out.add(o + 1) = cg as u16;
                 *ptr_out.add(o + 2) = cb as u16;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod debayer_validation {
+    use super::*;
+
+    /// Referencia f32 (logica original) para validar que la version entera es
+    /// bit-identica.
+    fn debayer_bilinear_f32_reference(
+        input: &[u16],
+        width: usize,
+        height: usize,
+        rx: usize,
+        ry: usize,
+    ) -> Vec<u16> {
+        let mut out = vec![0u16; width * height * 3];
+        for y in 1..height - 1 {
+            let row_offset = y * width;
+            let prev_row = (y - 1) * width;
+            let next_row = (y + 1) * width;
+            for x in 1..width - 1 {
+                let idx = row_offset + x;
+                let o = idx * 3;
+                let v = input[idx] as f32;
+                let red_pixel = (x % 2 == rx) && (y % 2 == ry);
+                let blue_pixel = (x % 2 != rx) && (y % 2 != ry);
+                let u = input[prev_row + x] as f32;
+                let d = input[next_row + x] as f32;
+                let l = input[row_offset + x - 1] as f32;
+                let r = input[row_offset + x + 1] as f32;
+                let (cr, cg, cb) = if red_pixel {
+                    let c1 = input[prev_row + x - 1] as f32;
+                    let c2 = input[prev_row + x + 1] as f32;
+                    let c3 = input[next_row + x - 1] as f32;
+                    let c4 = input[next_row + x + 1] as f32;
+                    (v, (u + d + l + r) * 0.25, (c1 + c2 + c3 + c4) * 0.25)
+                } else if blue_pixel {
+                    let c1 = input[prev_row + x - 1] as f32;
+                    let c2 = input[prev_row + x + 1] as f32;
+                    let c3 = input[next_row + x - 1] as f32;
+                    let c4 = input[next_row + x + 1] as f32;
+                    ((c1 + c2 + c3 + c4) * 0.25, (u + d + l + r) * 0.25, v)
+                } else if y % 2 == ry {
+                    ((l + r) * 0.5, v, (u + d) * 0.5)
+                } else {
+                    ((u + d) * 0.5, v, (l + r) * 0.5)
+                };
+                out[o] = cr as u16;
+                out[o + 1] = cg as u16;
+                out[o + 2] = cb as u16;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn debayer_integer_matches_f32() {
+        let width = 64usize;
+        let height = 48usize;
+        // Imagen Bayer sintetica determinista (cubre todo el rango u16).
+        let mut input = vec![0u16; width * height];
+        let mut s = 0xC0FF_EE12u32;
+        for v in input.iter_mut() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = (s >> 16) as u16;
+        }
+        // Probar los 4 patrones Bayer (color_id 8..11 -> (rx,ry)).
+        for &(color_id, rx, ry) in &[(8, 0, 0), (9, 1, 0), (10, 0, 1), (11, 1, 1)] {
+            let mut out = Vec::new();
+            debayer_into_buffer(&input, width, height, color_id, &mut out);
+            let reference = debayer_bilinear_f32_reference(&input, width, height, rx, ry);
+            assert_eq!(
+                out, reference,
+                "debayer entero difiere del f32 para color_id={color_id}"
+            );
         }
     }
 }
