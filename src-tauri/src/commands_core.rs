@@ -1683,9 +1683,23 @@ async fn process_batch_entry(
     // del batch compara contra 0 — re-sincronizar para no auto-cancelarse.
     state.active_req_id.store(0, Ordering::Relaxed);
 
+    // CONSISTENCIA CON EL FIX DE DISCO GRANDE (single-file): una Luna / fase
+    // lunar grande se estabiliza por TEXTURA (SAD contra anchor), igual que
+    // Superficie. El re-centrado CoG planetario haria que el disco "baile" entre
+    // frames del timelapse al moverse el centroide con la fase. Los planetas
+    // pequenos (blob diminuto) conservan intacto su re-centrado CoG.
+    let large_disc_batch = if is_surface_batch {
+        false
+    } else {
+        let mono: Vec<u16> = stacked_data
+            .chunks_exact(3)
+            .map(|p| ((p[0] as u32 + p[1] as u32 + p[2] as u32) / 3) as u16)
+            .collect();
+        is_large_lunar_disc(&mono, out_w, out_h)
+    };
 
     // --- RECORTE Y ESTABILIZACION SOLAR (Logica Mantenida) ---
-    let (centered_data, cw, ch) = if is_surface_batch {
+    let (centered_data, cw, ch) = if is_surface_batch || large_disc_batch {
         // En modo solar/surface, maximizamos el area.
         // Recortamos un margen minimo de seguridad (Protection Frame) para estabilizacion
         // Reducimos el recorte a algo minimo (ej. 8-10px) para maximizar FOV
@@ -1805,7 +1819,7 @@ async fn process_batch_entry(
                     }
                 }
 
-                if is_surface_batch {
+                if is_surface_batch || large_disc_batch {
                     let anchor_mut = anchor_guard.as_mut().unwrap();
                     // FIX: Reducir factor de actualizacion (Drift) del 5% al 0.5% para super-estabilidad
                     // Esto evita que el ancla "persiga" la turbulencia
@@ -6701,6 +6715,33 @@ fn correct_white_balance(data: &mut [u16], w: usize, h: usize) {
     });
 }
 
+/// Smooth highlight rolloff in normalised [0,1] space. Identity below the knee,
+/// asymptotically compresses everything above it toward 1.0 (no hard clipping).
+#[inline]
+fn soft_highlight_norm(x: f32) -> f32 {
+    let knee = 0.82;
+    if x <= knee {
+        x
+    } else {
+        let over = x - knee;
+        let head = 1.0 - knee;
+        knee + head * (over / (over + head))
+    }
+}
+
+/// Professional contrast as a smooth S-curve anchored at 0, `pivot` and 1.
+/// `k` > 1 increases contrast (steepens around the pivot); `k` < 1 reduces it.
+/// The endpoints are preserved exactly, so it never clips shadows or highlights.
+#[inline]
+fn s_curve_contrast(x: f32, pivot: f32, k: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    if x < pivot {
+        pivot * (x / pivot).powf(k)
+    } else {
+        1.0 - (1.0 - pivot) * ((1.0 - x) / (1.0 - pivot)).powf(k)
+    }
+}
+
 fn apply_advanced_color_magic(
     r: &mut f32,
     g: &mut f32,
@@ -6714,60 +6755,75 @@ fn apply_advanced_color_magic(
     contrast_pivot: f32,
     tone_white: f32,
 ) {
-    // 1. White Balance (Simple Gain)
-    // Sliders: -0.5 to 0.5 (Neutral 0.0)
-    let r_gain = 1.0 + r_bal;
-    let b_gain = 1.0 + b_bal;
-    // Green gain is usually fixed, adjust R/B relative to G.
-    *r *= r_gain;
-    *b *= b_gain;
+    // Professional tone / colour engine working in NORMALISED 16-bit float space.
+    // Every adjustment is computed in [0,1] (value / 65535) using smooth, clip-free
+    // curves (Lightroom-style) and only converted back to 16-bit at the very end.
+    // This is the key difference vs. the old engine, which crushed highlights
+    // (gamma normalised against the white point) and clipped hard (linear contrast
+    // + additive brightness).
+    const N: f32 = 65535.0;
+    const INV_N: f32 = 1.0 / 65535.0;
 
-    // 2. Contrast & Brightness
-    let pivot = contrast_pivot.clamp(256.0, 49152.0);
-    let white = tone_white.clamp(1024.0, 65535.0);
+    // --- 1. White Balance (per-channel gain, linear) ------------------------
+    // Sliders: -0.5..0.5 (neutral 0.0). Green is the anchor; R/B move relative.
+    *r *= 1.0 + r_bal;
+    *b *= 1.0 + b_bal;
 
-    // Contrast (Neutral 1.0)
+    let mut rn = (*r * INV_N).max(0.0);
+    let mut gn = (*g * INV_N).max(0.0);
+    let mut bn = (*b * INV_N).max(0.0);
+
+    // --- 2. Brightness as exposure (multiplicative, hue-preserving) ---------
+    // Slider -1..1 -> roughly -1.5..+1.5 stops. Highlights roll off smoothly
+    // instead of clipping, exactly how an exposure control behaves in Lightroom.
+    if brightness.abs() > 0.0005 {
+        let exposure = (brightness * 1.5).exp2();
+        rn *= exposure;
+        gn *= exposure;
+        bn *= exposure;
+        if exposure > 1.0 {
+            rn = soft_highlight_norm(rn);
+            gn = soft_highlight_norm(gn);
+            bn = soft_highlight_norm(bn);
+        }
+    }
+
+    // --- 3. Contrast as an S-curve anchored at the image midtone ------------
+    // Neutral 1.0. Pivots on the actual signal midtone (great for astro frames
+    // that are mostly dark) and preserves both endpoints -> no hard clipping.
     if (contrast - 1.0).abs() > 0.001 {
-        *r = ((*r - pivot) * contrast + pivot).clamp(0.0, 655350.0);
-        *g = ((*g - pivot) * contrast + pivot).clamp(0.0, 655350.0);
-        *b = ((*b - pivot) * contrast + pivot).clamp(0.0, 655350.0);
+        let pivot = (contrast_pivot * INV_N).clamp(0.05, 0.95);
+        let k = contrast.clamp(0.1, 3.0);
+        rn = s_curve_contrast(rn, pivot, k);
+        gn = s_curve_contrast(gn, pivot, k);
+        bn = s_curve_contrast(bn, pivot, k);
     }
 
-    // Brightness (Offset). Neutral is 0.0 (Range -1.0 to 1.0 roughly)
-    if brightness.abs() > 0.001 {
-        let b_offset = brightness * white;
-        *r += b_offset;
-        *g += b_offset;
-        *b += b_offset;
-    }
-
-    // 3. Gamma & Saturation
-    // Intermediate Clamping to avoid extreme overflows before Gamma
-    *r = r.clamp(0.0, 655350.0);
-    *g = g.clamp(0.0, 655350.0);
-    *b = b.clamp(0.0, 655350.0);
-
-    // Gamma
-    if gamma != 1.0 && gamma > 0.0 {
+    // --- 4. Gamma (midtone power curve over the FULL range) -----------------
+    // Normalised against full scale (NOT the white point) so highlights above
+    // the estimated white are never crushed. 0->0 and 1->1 stay fixed.
+    if (gamma - 1.0).abs() > 0.001 && gamma > 0.0 {
         let inv_gamma = 1.0 / gamma;
-        // Normalize against the image's useful signal range, not always full 16-bit.
-        *r = (*r / white).clamp(0.0, 1.0).powf(inv_gamma) * white;
-        *g = (*g / white).clamp(0.0, 1.0).powf(inv_gamma) * white;
-        *b = (*b / white).clamp(0.0, 1.0).powf(inv_gamma) * white;
+        rn = rn.clamp(0.0, 1.0).powf(inv_gamma);
+        gn = gn.clamp(0.0, 1.0).powf(inv_gamma);
+        bn = bn.clamp(0.0, 1.0).powf(inv_gamma);
     }
 
-    // Saturation (Neutral 1.0)
+    // --- 5. Saturation (luminance-preserving) -------------------------------
+    // Neutral 1.0. On mono data r==g==b so lum==r and this is a no-op.
     if (saturation - 1.0).abs() > 0.001 {
-        let lum = 0.299 * *r + 0.587 * *g + 0.114 * *b;
-        *r = lum + (*r - lum) * saturation;
-        *g = lum + (*g - lum) * saturation;
-        *b = lum + (*b - lum) * saturation;
+        let lum = 0.299 * rn + 0.587 * gn + 0.114 * bn;
+        rn = (lum + (rn - lum) * saturation).max(0.0);
+        gn = (lum + (gn - lum) * saturation).max(0.0);
+        bn = (lum + (bn - lum) * saturation).max(0.0);
     }
 
-    // FINAL BLINDAJE: Clamp all to valid u16 range before returning
-    *r = r.clamp(0.0, 65535.0);
-    *g = g.clamp(0.0, 65535.0);
-    *b = b.clamp(0.0, 65535.0);
+    // --- De-normalise. The top end is left to the pipeline soft-clip so any
+    // oversaturated channel compresses gracefully instead of hard-clipping.
+    let _ = tone_white; // retained in signature; full-range normalisation is used now
+    *r = (rn * N).max(0.0);
+    *g = (gn * N).max(0.0);
+    *b = (bn * N).max(0.0);
 }
 
 fn apply_high_pass(
@@ -6898,30 +6954,95 @@ fn apply_luma_preserving_denoise(
     amount: f32,
     detail_protect: f32,
 ) -> Vec<f32> {
+    // Edge-preserving luminance denoise: a true bilateral filter. It smooths
+    // flat/noisy regions hard while leaving edges and fine structure intact.
+    // The range kernel auto-scales to the measured noise floor and `detail`
+    // tightens it to protect detail; a precomputed LUT keeps the hot loop fast.
     let amount_n = (amount / 100.0).clamp(0.0, 1.0);
     if amount_n <= 0.001 || width < 3 || height < 3 {
         return chan.to_vec();
     }
-
     let detail_n = (detail_protect / 100.0).clamp(0.0, 1.0);
-    let radius = if amount_n < 0.34 { 1 } else if amount_n < 0.72 { 2 } else { 3 };
-    let mut smooth = box_blur_parallel(chan, width, height, radius);
-    if amount_n > 0.82 {
-        smooth = box_blur_parallel(&smooth, width, height, 1);
+
+    // Measured noise sigma drives the range (intensity) kernel automatically.
+    let noise = estimate_channel_noise(chan, width, height);
+
+    // Spatial support grows with strength (bilateral radius 1..3).
+    let radius: i32 = if amount_n < 0.4 {
+        1
+    } else if amount_n < 0.78 {
+        2
+    } else {
+        3
+    };
+    let kdim = (2 * radius + 1) as usize;
+    let spatial_sigma = radius as f32 * 0.6 + 0.35;
+    let inv_2ss = 1.0 / (2.0 * spatial_sigma * spatial_sigma);
+
+    // Range sigma: how far apart in intensity two pixels can be and still be
+    // averaged. Larger -> stronger smoothing; detail_protect shrinks it.
+    let range_sigma = (noise * (2.0 + amount_n * 5.0) * (1.3 - detail_n))
+        .clamp(noise * 0.6, noise * 14.0)
+        .max(10.0);
+    let inv_2sr = 1.0 / (2.0 * range_sigma * range_sigma);
+
+    // Precompute the spatial Gaussian weights for the window.
+    let mut spatial = vec![0.0f32; kdim * kdim];
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            let d2 = (dx * dx + dy * dy) as f32;
+            spatial[((dy + radius) * (2 * radius + 1) + (dx + radius)) as usize] =
+                (-d2 * inv_2ss).exp();
+        }
     }
 
-    let noise = estimate_channel_noise(chan, width, height);
-    let edge_start = (noise * (3.2 - detail_n * 2.1)).max(16.0);
-    let edge_end = edge_start * (2.2 + amount_n);
-    let max_blend = 0.18 + amount_n * 0.72;
+    // Range-weight LUT keyed by |intensity difference| (no exp() in the hot loop).
+    let lut_n = 2048usize;
+    let lut_max = (range_sigma * 4.0).max(1.0);
+    let mut range_lut = vec![0.0f32; lut_n + 1];
+    for i in 0..=lut_n {
+        let d = lut_max * i as f32 / lut_n as f32;
+        range_lut[i] = (-d * d * inv_2sr).exp();
+    }
+    let inv_step = lut_n as f32 / lut_max;
 
-    chan.par_iter()
-        .zip(smooth.par_iter())
-        .map(|(v, s)| {
-            let detail = (*v - *s).abs();
-            let flat_weight = 1.0 - smoothstep(edge_start, edge_end, detail);
-            let blend = (amount_n * max_blend * flat_weight).clamp(0.0, 0.92);
-            v + (s - v) * blend
+    // Global blend so the slider scales the visible strength smoothly.
+    let blend = (0.30 + amount_n * 0.70).clamp(0.0, 1.0);
+
+    let w = width as i32;
+    let h = height as i32;
+
+    (0..(width * height))
+        .into_par_iter()
+        .map(|idx| {
+            let x = (idx % width) as i32;
+            let y = (idx / width) as i32;
+            let center = chan[idx];
+
+            let mut wsum = 0.0f32;
+            let mut vsum = 0.0f32;
+            for dy in -radius..=radius {
+                let yy = (y + dy).clamp(0, h - 1);
+                let srow = yy * w;
+                let sprow = (dy + radius) * (2 * radius + 1);
+                for dx in -radius..=radius {
+                    let xx = (x + dx).clamp(0, w - 1);
+                    let s = chan[(srow + xx) as usize];
+                    let sw = spatial[(sprow + (dx + radius)) as usize];
+                    let ad = (s - center).abs();
+                    let rw = if ad >= lut_max {
+                        0.0
+                    } else {
+                        range_lut[(ad * inv_step) as usize]
+                    };
+                    let weight = sw * rw;
+                    wsum += weight;
+                    vsum += weight * s;
+                }
+            }
+
+            let filtered = if wsum > 1e-6 { vsum / wsum } else { center };
+            center + (filtered - center) * blend
         })
         .collect()
 }

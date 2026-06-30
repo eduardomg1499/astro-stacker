@@ -36,10 +36,11 @@ fn zenith_analysis_cache_suffix(
     has_anchor: bool,
 ) -> String {
     let flow = if warping_analysis { "warp" } else { "global" };
-    // "_a2" = analysis v2 (half-res scoring, R13). Versioning the suffix
-    // invalidates pre-R13 caches cleanly (automatic re-analysis once).
+    // "_a3" = analysis v3: large lunar discs now align on surface texture instead
+    // of the brightness CoG. Bumping the version invalidates stale CoG-based
+    // planet caches cleanly (one automatic re-analysis). ("_a2" was half-res R13.)
     let mut suffix = format!(
-        "{}_zenith_ultimate_{}_a2",
+        "{}_zenith_ultimate_{}_a3",
         zenith_target_key(target_type, is_surface),
         flow
     );
@@ -171,6 +172,63 @@ fn compute_robust_geometric_center(
     (offset_x as f32 + avg_x, offset_y as f32 + avg_y)
 }
 
+/// **Large lunar-disc detector.**
+/// Brightness CoG centering (`compute_robust_geometric_center`) is rock-solid for
+/// a small, compact planet on a black sky, but it WOBBLES frame-to-frame on a big
+/// lunar disc: the phase terminator and bright rayed craters (Tycho/Copernicus)
+/// shift the brightness centroid as seeing/transparency vary, so the frames never
+/// register consistently and the stack comes out soft. Such targets must instead
+/// be aligned on SURFACE TEXTURE (the Superficie path). This returns `true` when
+/// the lit disc fills a large fraction of the frame (Moon / large lunar phase),
+/// and `false` for the tiny bright blob of a real planet — keeping small planets
+/// on the proven CoG path.
+fn is_large_lunar_disc(data: &[u16], w: usize, h: usize) -> bool {
+    if data.len() < w * h || w < 24 || h < 24 {
+        return false;
+    }
+
+    // Noise floor from the four corners (a single corner is biased when the disk
+    // drifts into it — same rationale as the CoG estimator).
+    let block = 12usize.min(w).min(h);
+    let mut corner = Vec::with_capacity(block * block * 4);
+    for &by in &[0usize, h - block] {
+        for &bx in &[0usize, w - block] {
+            for y in by..(by + block).min(h) {
+                for x in bx..(bx + block).min(w) {
+                    corner.push(data[y * w + x]);
+                }
+            }
+        }
+    }
+    corner.sort_unstable();
+    let noise = corner.get(corner.len() / 2).cloned().unwrap_or(0) as f32;
+
+    let mut max_val = 0u16;
+    for &v in data.iter().step_by(4) {
+        if v > max_val {
+            max_val = v;
+        }
+    }
+    let span = (max_val as f32 - noise).max(1.0);
+    // ~10% above background reliably captures the lit lunar surface (incl. maria)
+    // without counting background noise.
+    let threshold = noise + span * 0.10;
+
+    let step = (data.len() / 400_000).max(1);
+    let mut lit = 0usize;
+    let mut total = 0usize;
+    for v in data.iter().step_by(step) {
+        total += 1;
+        if *v as f32 > threshold {
+            lit += 1;
+        }
+    }
+    let fill = lit as f32 / total.max(1) as f32;
+
+    // Moon / large lunar phase fills a big chunk of the frame; a planet a tiny one.
+    fill > 0.22
+}
+
 /// **Dual-Frequency Planet Scorer (V3 Elite)**
 /// Focuses on both microscopic detail (High-pass) and structural contrast (Mid-pass).
 /// Robust to noise because it only counts signal that persists across both bands.
@@ -236,6 +294,9 @@ fn process_analysis_frame(
     _cog_cx: f32,
     _cog_cy: f32,
     _target_type: &str,
+    // When true (large lunar disc), align on surface texture instead of the
+    // brightness CoG — the disk is too big/asymmetric for stable centroiding.
+    large_disc: bool,
 ) -> FrameAlignmentData {
     if raw.is_empty() {
         return FrameAlignmentData::empty(i);
@@ -266,8 +327,12 @@ fn process_analysis_frame(
         &mut buffers.lap_out,
     );
 
-    // DEDICATED PLANET SCORER: Focus only on the disk
-    if !is_surface {
+    // A large lunar disc is treated like a surface for alignment, scoring and
+    // grid quality — the same proven path that makes Superficie sharp on the Moon.
+    let texture_align = is_surface || large_disc;
+
+    // DEDICATED PLANET SCORER: Focus only on the disk (true small planets only).
+    if !texture_align {
         score_val = score_planetary_frequency(
             &buffers.half_u16,
             hw,
@@ -304,8 +369,10 @@ fn process_analysis_frame(
         (0.0, 0.0)
     };
 
-    if is_surface {
-        // half-res shift → full-res coordinates
+    if texture_align {
+        // TEXTURE ALIGNMENT (surface + large lunar disc): half-res SAD shift →
+        // full-res coordinates. Locks onto real surface features regardless of
+        // the lunar phase, so the frames register consistently → sharp stack.
         dx = sdx * 2.0;
         dy = sdy * 2.0;
     } else {
@@ -320,7 +387,7 @@ fn process_analysis_frame(
 
     let mut grid_scores = None;
     if warping_analysis {
-        let input_buffer = if is_surface {
+        let input_buffer = if texture_align {
             &buffers.blur_out
         } else {
             &buffers.half_u16
@@ -330,7 +397,7 @@ fn process_analysis_frame(
             hw,
             hh,
             40,
-            is_surface,
+            texture_align,
         ));
     }
 
@@ -551,6 +618,8 @@ async fn perform_standardized_analysis(
     // Planetary CoG of the reference frame (Calculated while the object is a solid disk)
     let mut ref_cog_cx = tw as f32 / 2.0;
     let mut ref_cog_cy = th as f32 / 2.0;
+    // Decided once from the reference frame; threaded into every per-frame call.
+    let mut large_disc = false;
 
     let analysis_ref_idx = select_signal_frame_index(&r, tw, th, tbp, cid, tf / 2);
     emit_progress(app, &get_msg("Preparando referencia..."), 4.0, None);
@@ -579,8 +648,13 @@ async fn perform_standardized_analysis(
             ref_cog_cx = cx;
             ref_cog_cy = cy;
 
+            // A large lunar disc (Moon / big phase) switches to texture alignment
+            // and must stay full-frame like Superficie — NOT tightened to a planet
+            // ROI. Genuine small planets keep the tight ROI + rock-solid CoG.
+            large_disc = is_large_lunar_disc(&tmp, rw, rh);
+
             // OPTIMIZATION: For small planets, redefine ROI to be a tight box around the disk
-            if is_small_planet(&target_type) {
+            if is_small_planet(&target_type) && !large_disc {
                 let planet_roi = find_planet_roi_from_u16(&tmp, rw, rh);
                 // Shift planet ROI to absolute coordinates
                 rx = rx + planet_roi.x;
@@ -645,6 +719,7 @@ async fn perform_standardized_analysis(
             ref_cog_cx,
             ref_cog_cy,
             &target_type, // NEW
+            large_disc,
         )
     };
     let mut stats = Vec::new();
@@ -1722,6 +1797,17 @@ pub async fn stack_video_liquid_warping_impl(
     // alignment (washed filaments). True sky is connected to the frame
     // border: compute_surface_signal_mask_f32 isolates exactly that
     // (1.0 = disk/feature, 0.0 = border-connected background).
+    // LARGE LUNAR DISC: a Moon stacked in the Disco category is a bright disc on
+    // black sky, so it needs the LIMB-DOT protections (edge-normal projection +
+    // limb AP damping) that are otherwise surface-only. Without them the sharp,
+    // texture-aligned Moon shows periodic limb scallops/dots (aperture problem of
+    // APs straddling the sky/disk boundary). Detected once from the master; small
+    // planets (tiny disc) stay false and keep their existing behaviour untouched.
+    let large_disc = !is_surface_logic && use_liquid && is_large_lunar_disc(&master_mono, w_in, h_in);
+    // Drives ONLY the limb-dot mitigations (NOT normalization, cutoffs, the
+    // outlier filter, etc.) so the planetary look/behaviour is preserved.
+    let limb_protect = is_surface_logic || large_disc;
+
     let surface_sky_mask: Option<Vec<f32>> = if use_liquid && is_surface_logic {
         let luma: Vec<f32> = master_mono.iter().map(|&v| v as f32).collect();
         let m = compute_border_connected_sky_mask(&luma, w_in, h_in, 10);
@@ -1811,7 +1897,7 @@ pub async fn stack_video_liquid_warping_impl(
     // around their centers. Pixels they covered now blend smoothly from the
     // nearest valid disk APs (or the global shift via spatial filtering).
     let (custom_points, frame_acceptance_masks, ap_signal_valid, ap_dark_ratio) =
-        if use_liquid && is_surface_logic && ap_signal_valid.iter().any(|&v| !v) {
+        if use_liquid && limb_protect && ap_signal_valid.iter().any(|&v| !v) {
             let keep: Vec<usize> = (0..custom_points.len())
                 .filter(|&i| ap_signal_valid[i])
                 .collect();
@@ -1837,7 +1923,7 @@ pub async fn stack_video_liquid_warping_impl(
         };
 
     // Limb APs (partially over sky) keep reduced influence on the warp field.
-    let ap_quality_weights: Vec<f32> = if is_surface_logic {
+    let ap_quality_weights: Vec<f32> = if limb_protect {
         ap_dark_ratio
             .iter()
             .zip(ap_signal_valid.iter())
@@ -1856,7 +1942,7 @@ pub async fn stack_video_liquid_warping_impl(
     // sky/disk boundary. We precompute each limb AP's edge-normal direction
     // (gradient of the smoothed master) and later keep only the radial
     // component of its measured shift.
-    let ap_limb_normal: Vec<Option<(f32, f32)>> = if use_liquid && is_surface_logic {
+    let ap_limb_normal: Vec<Option<(f32, f32)>> = if use_liquid && limb_protect {
         custom_points
             .iter()
             .zip(ap_dark_ratio.iter())
@@ -2260,6 +2346,7 @@ pub async fn stack_video_liquid_warping_impl(
                             box_size,
                             search_r,
                             is_surface_logic,
+                            limb_protect,
                         );
 
                         let ap_mask = acceptance_ref.get(&frame_data.idx).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -2579,6 +2666,9 @@ fn compute_frame_local_shifts(
     box_size: usize,
     search_r: i32,
     is_surface: bool,
+    // Enables the limb-AP damping for surface AND large lunar discs, without
+    // changing the (planetary) spatial outlier filter selected by `is_surface`.
+    limb_protect: bool,
 ) -> Vec<(f32, f32, f32)> {
     let mut local_shifts = Vec::with_capacity(custom_points.len());
 
@@ -2631,7 +2721,7 @@ fn compute_frame_local_shifts(
                 (dx, dy)
             };
             // Limb APs also keep a damped vote in the warp field.
-            let limb_damp = if is_surface {
+            let limb_damp = if limb_protect {
                 let d = ap_dark_ratio.get(ap_i).copied().unwrap_or(0.0);
                 (1.0 - d * 0.8).clamp(0.2, 1.0)
             } else {
@@ -4985,6 +5075,46 @@ mod zas_v3_tests {
     use super::*;
 
     #[test]
+    fn test_large_lunar_disc_vs_small_planet() {
+        let w = 256usize;
+        let h = 256usize;
+
+        // A big disc filling most of the frame (Moon-like) -> texture alignment.
+        let mut moon = vec![300u16; w * h]; // background noise floor
+        let (cx, cy, rad) = (w as f32 / 2.0, h as f32 / 2.0, 110.0f32);
+        for y in 0..h {
+            for x in 0..w {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                if dx * dx + dy * dy <= rad * rad {
+                    moon[y * w + x] = 45000;
+                }
+            }
+        }
+        assert!(
+            is_large_lunar_disc(&moon, w, h),
+            "a disc filling most of the frame must use texture alignment"
+        );
+
+        // A tiny bright planet on a black sky -> keep CoG centering.
+        let mut planet = vec![300u16; w * h];
+        let prad = 16.0f32;
+        for y in 0..h {
+            for x in 0..w {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                if dx * dx + dy * dy <= prad * prad {
+                    planet[y * w + x] = 60000;
+                }
+            }
+        }
+        assert!(
+            !is_large_lunar_disc(&planet, w, h),
+            "a small planetary disc must keep brightness CoG centering"
+        );
+    }
+
+    #[test]
     fn test_low_coverage_crop_trims_dead_border() {
         let w = 200;
         let h = 200;
@@ -5183,7 +5313,7 @@ mod zas_v3_tests {
                 &master_edges, &ap_mc, &ap_ml, &master_ds, mds_w,
                 &f_edges, &frame, &f_ds, w, h,
                 &points, &all_valid, &no_dark, &no_normals,
-                gx, gy, ap_size, 12, true,
+                gx, gy, ap_size, 12, true, true,
             );
 
             // Milimetric per-AP accuracy vs the injected warp field
