@@ -40,6 +40,25 @@ npm ci
 npm run tauri:dev
 ```
 
+### Asistente de release para Windows
+
+El script `scripts/windows-release-assistant.ps1` automatiza la configuracion o
+actualizacion del repositorio, FFmpeg, el build NSIS firmado, la conservacion de
+las entradas macOS de `latest.json`, la subida al Release y su validacion final.
+
+En un repositorio ya descargado, colocalo en `scripts\` y ejecuta desde la raiz:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\windows-release-assistant.ps1
+```
+
+Para una configuracion desde cero, ejecuta una copia del script desde fuera de
+la carpeta destino y elige la opcion 1. La ruta predeterminada es:
+
+```text
+C:\Users\picis\Desktop\Proyecto-Zenith-Astro-Stacker
+```
+
 ## FFmpeg por plataforma
 
 Durante desarrollo, la app usa `ffmpeg` y `ffprobe` desde el `PATH`.

@@ -1466,21 +1466,54 @@ pub async fn stack_video_liquid_warping_impl(
     sys.refresh_memory();
     let available_ram = sys.available_memory(); // Bytes
                                                 // Safe limit: 30% of FREE RAM to maximize NVMe offloading
-    // Reservamos RAM para el SO/otros procesos y usamos la mitad del resto.
-    // Esto evita agotar la memoria en equipos de bajos recursos (antes el proceso
-    // se cerraba en seco: la asignacion fallaba y con panic=abort abortaba todo).
+    // RAM que se ADAPTA al equipo y nunca desborda: el pipeline mantiene ~2
+    // lotes de frames a la vez (uno apilandose mientras el prefetcher carga el
+    // siguiente) MAS el scratch por hilo del stacker y los acumuladores de
+    // salida. Presupuestar TODO evita que un equipo con mucha RAM asigne por
+    // encima de la memoria fisica (crash/OOM del cliente) y a la vez le da a los
+    // equipos modestos un lote sano en lugar de matarlos de hambre.
     let os_reserve: u64 = 768 * 1024 * 1024; // 768 MB reservados para el sistema
     let usable_ram = available_ram.saturating_sub(os_reserve);
-    let ram_limit_batch = (usable_ram as f64 * 0.50) as u64;
 
     // Memoria REAL por frame mantenido en RAM: en color se expande a RGB u16
-    // (w*h*3*2) y en mono es w*h*2, mas un factor de seguridad por acumuladores
-    // y temporales por hilo. La estimacion previa (w*h*bpp*2) subestimaba color.
+    // (w*h*3*2) y en mono es w*h*2. La estimacion previa (w*h*bpp*2) subestimaba color.
     let channels: u64 = if is_color_video { 3 } else { 1 };
     let per_frame_real = (w_in as u64) * (h_in as u64) * channels * 2;
     let bytes_per_frame = ((per_frame_real as f64) * 1.6_f64).ceil() as u64;
 
-    let mut frames_per_batch = (ram_limit_batch / bytes_per_frame.max(1)).max(1) as usize;
+    // El stacker mantiene un LiquidScratch POR HILO (buffers de trabajo u16 +
+    // acumuladores f64/f32 del lienzo): ~78 bytes/px en color, ~32 en mono. En un
+    // equipo de muchos nucleos eso son DECENAS de GB, INDEPENDIENTE del tamano de
+    // lote — la causa real del cuelgue/thrashing (parece congelado, no consume
+    // recursos) y del OOM. Estimamos su tamano real y LIMITAMOS los hilos del
+    // apilado para que todo el scratch quepa en ~35% de la RAM usable.
+    let drz = (drizzle as f64).max(1.0);
+    let n_in_px = (w_in as u64) * (h_in as u64);
+    let n_out_px = ((w_in as f64 * drz) as u64) * ((h_in as f64 * drz) as u64);
+    let per_scratch = if is_color_video {
+        n_out_px * 64 + n_in_px * 14 // 3×grad(f64) + 4×w(f32) + buffers u16
+    } else {
+        n_out_px * 24 + n_in_px * 8 // 1×grad(f64) + 2×w(f32) + buffers u16
+    };
+
+    let hw_threads = rayon::current_num_threads().max(1) as u64;
+    let max_threads_ram = (((usable_ram as f64) * 0.35) as u64 / per_scratch.max(1)).max(1);
+    let stack_threads = hw_threads.min(max_threads_ram).max(1) as usize;
+
+    let scratch_total = per_scratch * (stack_threads as u64);
+    let global_accum = n_out_px * 16 * channels; // acc_grad_* (direct + direct_w, f64)
+
+    // Con sync_channel(1) el pico real son 3 lotes de frames a la vez (el que
+    // apila main + el que espera en el canal + el que el prefetcher construye).
+    // Presupuestar los 3 lotes + el scratch + los acumuladores dentro del 85% de
+    // la RAM usable garantiza que ni en el pico se desborde (evita el crash/OOM y
+    // el thrashing del paginado que congelaba el equipo).
+    const IN_FLIGHT_BATCHES: u64 = 3;
+    let ram_for_frames =
+        ((usable_ram as f64 * 0.85) as u64).saturating_sub(scratch_total + global_accum);
+    let per_batch_budget = (ram_for_frames / IN_FLIGHT_BATCHES).max(bytes_per_frame);
+
+    let mut frames_per_batch = (per_batch_budget / bytes_per_frame.max(1)).max(1) as usize;
 
     // Tope alto para NO penalizar gama alta; PISO bajo (2) para que los equipos
     // de bajos recursos usen lotes pequenos en vez de quedarse sin memoria.
@@ -1506,7 +1539,12 @@ pub async fn stack_video_liquid_warping_impl(
             total_active
         ),
         10.0,
-        None,
+        Some(format!(
+            "Aceleracion: {} · {} hilos ({} disponibles)",
+            get_accel_label(),
+            stack_threads,
+            hw_threads
+        )),
     );
 
     // --- STEP 3: MASTER REFERENCE GENERATION ---
@@ -2064,15 +2102,43 @@ pub async fn stack_video_liquid_warping_impl(
                     )
                     .unwrap_or_default()
                 } else {
-                    // Direct Load (SER/AVI)
-                    let mut map = std::collections::HashMap::with_capacity(indices_to_load.len());
-                    if let Ok(r_batch) = VideoInput::open(&pre_path, &pre_app) {
-                        for &idx in &indices_to_load {
-                            let raw = r_batch.get_frame(idx, pre_color_id);
-                            map.insert(idx, raw_to_u16_buffer(&raw, pre_w, pre_h, pre_bpp));
-                        }
+                    // Direct Load (SER/AVI/FITS) — PARALLEL.
+                    // Was a single-threaded for-loop: on a multicore box the whole
+                    // selection loaded serially at ~1% CPU BEFORE any stacking ran
+                    // (the parallel stacker then sat idle waiting on rx.recv()).
+                    // mmap-backed readers scale across cores; each worker opens its
+                    // own cheap reader (the OS shares the underlying mmap pages) so
+                    // there is no cross-thread aliasing on reader state. IO fan-out
+                    // is capped so it overlaps with — instead of starving — the
+                    // stacking pass that runs on the same rayon pool.
+                    let n_io = rayon::current_num_threads().clamp(1, 8);
+                    let mut groups: Vec<Vec<usize>> = (0..n_io).map(|_| Vec::new()).collect();
+                    for (k, &idx) in indices_to_load.iter().enumerate() {
+                        groups[k % n_io].push(idx);
                     }
-                    map
+                    groups
+                        .par_iter()
+                        .map(|group| {
+                            let mut m =
+                                std::collections::HashMap::with_capacity(group.len());
+                            if let Ok(r_local) = VideoInput::open(&pre_path, &pre_app) {
+                                for &idx in group {
+                                    let raw = r_local.get_frame(idx, pre_color_id);
+                                    m.insert(
+                                        idx,
+                                        raw_to_u16_buffer(&raw, pre_w, pre_h, pre_bpp),
+                                    );
+                                }
+                            }
+                            m
+                        })
+                        .reduce(
+                            std::collections::HashMap::new,
+                            |mut a, b| {
+                                a.extend(b);
+                                a
+                            },
+                        )
                 };
                 if tx.send(frame_map).is_err() {
                     break;
@@ -2161,6 +2227,14 @@ pub async fn stack_video_liquid_warping_impl(
     let mut acc_grad_g = GradientDomainStacker::new_empty();
     let mut acc_grad_b = GradientDomainStacker::new_empty();
 
+    // Pool ACOTADO para el apilado: fija el numero de workers a `stack_threads`
+    // (calculado por la RAM), asi el scratch por-hilo NO desborda la memoria en
+    // equipos de muchos nucleos. Si la creacion falla, cae al pool global.
+    let stack_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(stack_threads)
+        .build()
+        .ok();
+
     for pass in 0..total_passes {
     let pass_label = if total_passes > 1 {
         format!("[Pasada {}/{}] ", pass + 1, total_passes)
@@ -2201,7 +2275,7 @@ pub async fn stack_video_liquid_warping_impl(
         let ap_mc_ref = &ap_master_contrast;
         let ap_ml_ref = &ap_master_lap;
 
-        let batch_results = chunk.par_iter().fold(
+        let run_batch = || chunk.par_iter().fold(
             || LiquidScratch::new(w_in, h_in, w_out, h_out, is_mono_stack),
             |mut sc, frame_data| {
                 let completed = counter_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2401,6 +2475,12 @@ pub async fn stack_video_liquid_warping_impl(
                 sc
             }
         ).reduce_with(|mut a, b| { a.grad_r.merge(&b.grad_r); a.grad_g.merge(&b.grad_g); a.grad_b.merge(&b.grad_b); a });
+        // Run the batch on the RAM-bounded stacking pool (falls back to the
+        // global pool only if the dedicated pool could not be created).
+        let batch_results = match &stack_pool {
+            Some(p) => p.install(run_batch),
+            None => run_batch(),
+        };
 
         if let Some(br) = batch_results {
             acc_grad_r.merge(&br.grad_r); acc_grad_g.merge(&br.grad_g); acc_grad_b.merge(&br.grad_b);

@@ -7327,6 +7327,8 @@ fn main() {
             fuse_planetary_derotation_stacks,
             get_available_fonts,
             check_ffmpeg_status,
+            check_avx2_support,
+            get_accel_label,
             check_license_status,
             activate_pro_license,
             deactivate_license,

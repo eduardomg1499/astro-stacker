@@ -1785,23 +1785,32 @@ async function checkForAppUpdates(silent = true) {
 
 async function checkAvx2Status() {
     try {
-        const isAvx2 = await invoke("check_avx2_support");
-        const appInfoDiv = document.querySelector(".app-info"); // Adjust selector if needed
-        if (appInfoDiv) {
+        // Cross-platform backend label: "AVX2 · Windows", "NEON · macOS", etc.
+        // (The old check only knew x86 AVX2, so Apple Silicon wrongly showed
+        // "SIMD OFF" even though NEON is always active there.)
+        const label = await invoke("get_accel_label");
+        const isAccel = !/escalar/i.test(label);
+
+        // 1. Persistent label on the processing overlay (the progress screen).
+        const accelEl = document.getElementById("accel-label");
+        if (accelEl) {
+            accelEl.innerHTML = `<svg class='zas-icon' style='width:1em;height:1em;'><use href='#icon-rocket'></use></svg> Aceleración: ${label}`;
+            accelEl.style.color = isAccel ? "#10b981" : "#f59e0b";
+        }
+
+        // 2. Header badge (created once).
+        const appInfoDiv = document.querySelector(".app-info");
+        if (appInfoDiv && !appInfoDiv.querySelector(".accel-badge")) {
             const badge = document.createElement("span");
-            if (isAvx2) {
-                badge.innerHTML = "<svg class='zas-icon' style='width:1em;height:1em;margin-right:2px;'><use href='#icon-rocket'></use></svg> AVX2 ACTIVE";
-                badge.style.cssText = "background:#10b981; color:white; padding:2px 6px; border-radius:4px; font-size:0.75rem; margin-left:8px; font-weight:bold; display:inline-flex; align-items:center;";
-                console.log("SIMD: AVX2 Enabled");
-            } else {
-                badge.innerHTML = "<svg class='zas-icon' style='width:1em;height:1em;margin-right:2px;'><use href='#icon-cross'></use></svg> SIMD OFF";
-                badge.style.cssText = "background:#f59e0b; color:black; padding:2px 6px; border-radius:4px; font-size:0.75rem; margin-left:8px; font-weight:bold;";
-                console.warn("SIMD: AVX2 not detected");
-            }
+            badge.className = "accel-badge";
+            const icon = isAccel ? "icon-rocket" : "icon-cross";
+            badge.innerHTML = `<svg class='zas-icon' style='width:1em;height:1em;margin-right:2px;'><use href='#${icon}'></use></svg> ${label}`;
+            badge.style.cssText = `background:${isAccel ? "#10b981" : "#f59e0b"}; color:${isAccel ? "white" : "black"}; padding:2px 6px; border-radius:4px; font-size:0.75rem; margin-left:8px; font-weight:bold; display:inline-flex; align-items:center;`;
             appInfoDiv.appendChild(badge);
         }
+        console.log("SIMD backend:", label);
     } catch (e) {
-        console.error("Failed to check AVX2:", e);
+        console.error("Failed to get accel label:", e);
     }
 }
 
@@ -1896,7 +1905,10 @@ function clearSourcePreviewSurface(width = null, height = null, clearImage = tru
 
 window.addEventListener("load", () => {
     console.log("Zenith: Startup content loaded.");
-    
+
+    // Populate the hardware-acceleration label (progress overlay + header badge).
+    checkAvx2Status();
+
     // Double-check show if it somehow missed the module init
     if (appWindow && typeof appWindow.show === 'function') {
         appWindow.show().catch(e => {}); 

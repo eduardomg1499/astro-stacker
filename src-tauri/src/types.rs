@@ -31,6 +31,52 @@ fn check_avx2_support() -> bool {
     false
 }
 
+/// Best SIMD backend actually enabled at RUNTIME for the hot loops (SAD match,
+/// Lanczos accumulation, alignment enhance). x86 is probed per-CPU; aarch64
+/// (Apple Silicon) always has NEON as a baseline. This is what powers the
+/// acceleration label — so a Mac shows "NEON" instead of a bogus "SIMD OFF".
+fn simd_backend_label() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            "AVX2"
+        } else if is_x86_feature_detected!("avx") {
+            "AVX"
+        } else if is_x86_feature_detected!("sse4.1") {
+            "SSE4.1"
+        } else {
+            "Escalar"
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        "NEON"
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        "Escalar"
+    }
+}
+
+fn os_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macOS"
+    } else if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "linux") {
+        "Linux"
+    } else {
+        "SO"
+    }
+}
+
+/// e.g. "AVX2 · Windows" or "NEON · macOS". Shown on the progress screen so the
+/// user can confirm hardware acceleration is engaged on whatever OS/CPU they run.
+#[tauri::command]
+fn get_accel_label() -> String {
+    format!("{} · {}", simd_backend_label(), os_label())
+}
+
 // NUEVO: FunciÃ³n unificada para generar ruta de cachÃ© de anÃ¡lisis
 fn get_analysis_cache_path(video_path: &str, mode_suffix: &str) -> String {
     // Normalizar path para evitar mismatches por ", /, o mayÃºsculas
