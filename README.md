@@ -24,6 +24,27 @@ Para verificar sin abrir la app:
 npm run check
 ```
 
+### Asistente de version, compilacion y publicacion para macOS
+
+El asistente `scripts/mac-release-assistant.sh` permite conservar o cambiar la
+version, compilar Apple Silicon e Intel con los scripts existentes, publicar u
+omitir el Release y subir por separado el proyecto al repositorio privado.
+Tambien protege una entrada Windows ya existente en `latest.json`.
+
+```bash
+./scripts/mac-release-assistant.sh
+```
+
+Para comprobar el script y la coherencia de versiones sin modificar nada:
+
+```bash
+./scripts/mac-release-assistant.sh --check
+```
+
+El instalador Windows se genera nativamente con
+`scripts/windows-release-assistant.ps1`; el asistente de Mac muestra su comando
+al finalizar.
+
 ## Desarrollo en Windows
 
 Requisitos recomendados:
