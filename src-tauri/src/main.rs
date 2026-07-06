@@ -55,5 +55,6 @@ include!("advanced_wavelets.rs");
 
 include!("commands_v2_v3.rs");
 include!("commands_core.rs");
+include!("deepsky.rs");
 
 include!("smart_ap_generator.rs");

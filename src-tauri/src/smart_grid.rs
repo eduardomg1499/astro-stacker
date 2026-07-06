@@ -185,7 +185,15 @@ pub fn generate_smart_grid_internal(
     let step = if surface_like {
         // Surface stacks need overlapping APs so the local warp can follow seeing
         // cells instead of interpolating between a sparse checkerboard of anchors.
-        ((ap_size as f32 * 0.67).round() as usize).clamp(8, ap_size)
+        let base = ((ap_size as f32 * 0.67).round() as usize).clamp(8, ap_size);
+        // FRAME-AREA CAP: at the base overlap step a 20-Mpx lunar disc spawns
+        // 40k+ candidate APs (~3x the density validated on solar surfaces) and
+        // multiplies the stacking cost with no quality gain. Scale the step so
+        // the candidate count stays near the proven density (~14k for the
+        // frame). A 2792x2174 solar capture yields cap==21 == base: the tuned
+        // solar behaviour is preserved exactly.
+        let cap = (((width * height) as f32 / 14_000.0).sqrt().ceil() as usize).min(ap_size * 3);
+        base.max(cap)
     } else {
         ap_size
     };

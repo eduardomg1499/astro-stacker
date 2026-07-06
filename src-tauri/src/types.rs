@@ -1402,6 +1402,11 @@ struct AppState {
     batch_anchor: Mutex<Option<Vec<u16>>>,
     batch_anchor_dims: Mutex<(usize, usize)>,
     active_req_id: AtomicUsize,
+    // Cancelacion cooperativa de analisis/apilado. Arc para poder clonarlo a
+    // los hilos productores (decoder FFmpeg, prefetcher) que sobreviven al
+    // scope del comando. Se resetea al INICIAR una operacion de usuario, y lo
+    // consultan los bucles pesados para abortar limpio con Err("Cancelado").
+    cancel_requested: Arc<std::sync::atomic::AtomicBool>,
     license_manager: Arc<LicenseManager>,
 }
 

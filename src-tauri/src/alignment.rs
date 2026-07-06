@@ -394,6 +394,66 @@ pub fn find_best_match_sad_pyramid(
     (final_dx, final_dy)
 }
 
+/// Pyramid SAD with an INITIAL COARSE OFFSET (`init_dx/init_dy`, full-res px).
+/// The coarse search is centered at the offset instead of zero, so the
+/// effective motion range becomes unbounded when a prior estimate exists —
+/// e.g. the brightness-centroid delta of a disc on black sky (handheld phone
+/// videos, whose frame-to-frame motion far exceeds any fixed search window).
+/// With (0, 0) it behaves exactly like `find_best_match_sad_pyramid`.
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_match_sad_pyramid_offset(
+    ref_full: &[u16],
+    tgt_full: &[u16],
+    ref_small: &[u16],
+    width: usize,
+    height: usize,
+    small_w: usize,
+    small_h: usize,
+    roi_x: usize,
+    roi_y: usize,
+    roi_w: usize,
+    roi_h: usize,
+    search_range: isize,
+    scale_factor: usize,
+    fine_search_range: isize,
+    init_dx: isize,
+    init_dy: isize,
+) -> (f32, f32) {
+    let tgt_small = downscale_integer(tgt_full, width, height, scale_factor);
+    let factor = scale_factor.max(1) as isize;
+    let coarse_range = (search_range / factor).max(2);
+
+    let (_best_sad, best_dx, best_dy) = find_best_match_sad_rect(
+        ref_small,
+        &tgt_small,
+        small_w,
+        small_h,
+        roi_x / scale_factor,
+        roi_y / scale_factor,
+        roi_w / scale_factor,
+        roi_h / scale_factor,
+        init_dx / factor,
+        init_dy / factor,
+        coarse_range,
+    );
+
+    let (final_dx, final_dy) = find_best_match_sad_subpixel(
+        ref_full,
+        tgt_full,
+        width,
+        height,
+        roi_x,
+        roi_y,
+        roi_w,
+        roi_h,
+        best_dx * factor,
+        best_dy * factor,
+        fine_search_range,
+    );
+
+    (final_dx, final_dy)
+}
+
 fn find_best_match_sad_rect(
     ref_data: &[u16],
     tgt_data: &[u16],

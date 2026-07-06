@@ -1,935 +1,1035 @@
 {
+  "general": {
+    "loading_system": "INITIALIZING SYSTEM...",
+    "processing": "PROCESSING...",
+    "license_indicator": "FREE VERSION",
+    "import_video": "<svg class='zas-icon'><use href='#icon-folder'></use></svg> Import Video <span style='font-size:0.7em; opacity:0.8'>(SER, AVI, MP4, MOV)</span>",
+    "batch_mode": "<svg class='zas-icon'><use href='#icon-batch'></use></svg> Batch Stacking",
+    "mosaic_mode": "<svg class='zas-icon'><use href='#icon-mosaic'></use></svg> Create Mosaic",
+    "start_analysis": "<svg class='zas-icon'><use href='#icon-lightning'></use></svg> Start Full Analysis",
+    "file_selected": "File selected:",
+    "change_reference": "📂 Change Reference",
+    "load_another_video": "📂 Load Another Video",
+    "confirm_yes": "Yes",
+    "no": "No",
+    "cancel": "Cancel",
+    "ready": "Done",
+    "acknowledge": "Got it",
+    "error": "Error",
+    "warning": "Notice",
+    "backend_panic_title": "Unexpected error",
+    "backend_panic_body": "The operation failed and stopped safely so the app would not close. On low-memory machines, try a shorter video, lower the percentage of frames to stack, or close other applications.",
+    "saving": "SAVING...",
+    "saved": "Saved",
+    "unavailable": "Unavailable",
+    "not_applicable": "Not applicable",
+    "load_animation": "<svg class='zas-icon'><use href='#icon-film'></use></svg> Load Animation (Images)",
+    "tools_convert": "<svg class='zas-icon'><use href='#icon-tools'></use></svg> Convert Video to SER",
+    "derotate_mode": "<svg class='zas-icon'><use href='#icon-planet'></use></svg> Planetary Derotation",
+    "report_bug_subject": "Bug Report / Feedback - Zenith Astro Stacker",
+    "report_bug_body": "Version: {{version}}\n\nHello Zenith Astro Code team,\n\nI am writing to send the following report/feedback:\n\n[WRITE YOUR MESSAGE HERE]\n",
+    "deepsky_mode": "Deep-Sky Stacking",
+    "cancelling": "Cancelling..."
+  },
+  "converter": {
+    "profile_title": "SER Conversion Format",
+    "profile_intro": "Choose how to create the working SER. For MP4/MOV, the video is decoded into stacking-ready frames; no sharpening or destructive filters are applied.",
+    "profile_mono8_title": "Recommended lightweight",
+    "profile_mono8_desc": "Smallest file size. Ideal for Moon, H-alpha/mono Sun, and planetary luminance.",
+    "profile_color8_title": "Preserve color",
+    "profile_color8_desc": "Keeps color when the source has it. Uses about 3x more space than mono.",
+    "profile_auto_title": "High depth",
+    "profile_auto_desc": "Preserves 10/12/16-bit when the source allows it. Potentially better quality, larger file.",
+    "recommended_badge": "Recommended",
+    "estimate_label": "Estimated SER",
+    "source_file": "Source video",
+    "source_size": "Current size",
+    "source_resolution": "Resolution",
+    "source_frames": "Frames",
+    "source_depth": "Source",
+    "size_note": "SER is uncompressed, so the final size can be much larger than the original video.",
+    "inspecting": "READING VIDEO DATA...",
+    "processing": "CONVERTING VIDEO TO SER...",
+    "processing_detail": "Converting frames...",
+    "success_title": "SER conversion completed",
+    "error_title": "Conversion error",
+    "open_folder": "Open folder",
+    "report_profile": "SER profile",
+    "report_time": "Time",
+    "report_resolution": "Resolution",
+    "report_frames": "Frames",
+    "report_depth": "Bit depth",
+    "report_frame_size": "Size/frame",
+    "report_estimated": "Estimated",
+    "report_final_size": "Final size",
+    "report_throughput": "Throughput",
+    "report_source": "Source",
+    "report_output": "Output"
+  },
+  "derotation": {
+    "status": {
+      "waiting": "Load a stacked planetary image.",
+      "inspecting": "Inspecting image...",
+      "ready": "Ready · {{resolution}}",
+      "disc_ready": "Disc detected.",
+      "geometry_ready": "Geometry ready.",
+      "geometry_review": "Review geometry."
+    },
+    "processing": {
+      "inspecting": "INSPECTING DEROTATION...",
+      "detecting": "DETECTING DISC...",
+      "applying": "APPLYING PLANETARY DEROTATION..."
+    },
+    "errors": {
+      "load_first": "Load a planetary image first.",
+      "time_required": "Set both capture time and reference time.",
+      "load_image_after_log": "TXT loaded. Now load an image or use the current result to apply those times."
+    },
+    "logs": {
+      "completed": "Planetary derotation completed (Δ {{delta}}°). {{path}}"
+    },
+    "time_source": {
+      "manual_log": "Manual TXT",
+      "log": "Log",
+      "file_modified": "File",
+      "manual": "Manual",
+      "unknown": "Unknown"
+    },
+    "log": {
+      "auto_hint": "No manual TXT. SharpCap/FireCapture will be read next to the image when available."
+    },
+    "diagnostics": {
+      "manual": "Manual",
+      "ready": "Geometry ready to apply."
+    },
+    "warnings": {
+      "manual_geometry": "Geometry adjusted manually; verify that the mesh follows the real limb."
+    },
+    "use_current": "Use Current Result",
+    "success_title": "Derotation Complete",
+    "success_message": "Derotated image saved at:\n{{path}}\n\nApplied delta: {{delta}}°"
+  },
+  "updater": {
+    "settings": "Settings",
+    "search_updates": "Check for updates",
+    "checking": "Checking...",
+    "searching": "Searching...",
+    "available_badge": "v{{version}} Available",
+    "default_notes": "Performance improvements and fixes.",
+    "manual_notes": "A new version is available.",
+    "available_title": "New version available",
+    "current_version": "Current version",
+    "new_version": "New version",
+    "manual_note": "Note: this version requires manual installation.",
+    "install_question": "Do you want to download and install it now?",
+    "manual_action": "Download manually",
+    "install_action": "Update now",
+    "later": "Later",
+    "downloading": "DOWNLOADING UPDATE...",
+    "downloading_pct": "DOWNLOADING: {{pct}}%",
+    "restarting": "RESTARTING...",
+    "install_error_title": "Installation error",
+    "install_error_message": "Installation failed: {{error}}\nTry downloading it manually from GitHub.",
+    "latest_message": "You are using the latest version (v{{version}}).",
+    "same_version_message": "The server reports the same version (v{{version}}).",
+    "connection_error_title": "Connection Error",
+    "connection_error_message": "Could not check for updates. Please check your internet connection."
+  },
+  "activation": {
+    "title": "Activation Required",
+    "description": "Unlock the full potential of <b>Zenith Astro Stacker</b>.<br>Enter your Pro license or start a free trial.",
+    "license_key_label": "License key",
+    "placeholder": "XXXX-XXXX-XXXX-XXXX",
+    "verify": "Verifying...",
+    "activate_btn": "<svg class='zas-icon'><use href='#icon-rocket'></use></svg> Activate License",
+    "trial_btn": "Try (15 Days)",
+    "buy_btn": "BUY ANNUAL LICENSE",
+    "language_label": "View in",
+    "qa_reset_label": "TEMP QA",
+    "qa_reset_btn": "Allow another trial",
+    "footer": "ZENITH ASTRO STACKER • PRO EDITION",
+    "manual_title": "Upgrade to annual license",
+    "manual_desc": "Unlock the full potential of Zenith Astro Stacker. Advanced analysis tools, priority support, and updates during the annual term.",
+    "buy_btn_manual": "<svg class='zas-icon'><use href='#icon-pro'></use></svg> GET ANNUAL LICENSE",
+    "have_code": "I HAVE A CODE",
+    "activate_code_btn": "ACTIVATE CODE ->",
+    "verifying_license": "Verifying license...",
+    "marketing_title": "<svg class='zas-icon'><use href='#icon-rocket'></use></svg> <span style='color:#f59e0b'>Upgrade</span>",
+    "marketing_desc": "Enjoy full power with an active annual license.",
+    "already_have_key": "Already have your key?",
+    "enter_license_code": "Enter License Code",
+    "enter_license_title": "Enter Your License",
+    "enter_license_desc": "Enter your license code.",
+    "update_title": "Update License",
+    "update_desc": "Enter your new license key.",
+    "required_desc": "Unlock the full potential of <b>Zenith Astro Stacker</b>.",
+    "invalid_key": "Enter a valid key.",
+    "activated_title": "License activated!",
+    "activated_message": "Your license has been activated successfully.\n\nWelcome to the full Zenith Astro Stacker experience.",
+    "activation_error_title": "Activation Error",
+    "deactivate_title": "Deactivate License",
+    "deactivate_message": "Do you want to deactivate the license on this computer? You will return to an inactive state, or expired if the trial has already ended.",
+    "deactivate_confirm": "Yes, deactivate",
+    "deactivated_title": "Deactivated",
+    "deactivated_message": "License removed from this computer.",
+    "qa_reset_title": "Trial reset",
+    "qa_reset_message": "This clears the local license state and marks the trial as unused on this computer.\n\nUse it only to validate activations.",
+    "qa_reset_confirm": "Reset",
+    "qa_reset_loading": "Resetting...",
+    "qa_reset_ready_title": "QA ready",
+    "qa_reset_ready_message": "Local state has been reset. You can try activating another trial or license."
+  },
+  "donation": {
+    "title": "Boost the Project!",
+    "subtitle": "If you are enjoying Zenith Astro Stacker and want to contribute to the development of this and other tools, consider an extra boost for the creator of this tool. This is a personal project that I enjoy building for fellow astrophotographers.",
+    "bmc_title": "Buy Me a Coffee",
+    "bmc_desc": "Quick and simple support",
+    "paypal_title": "PayPal",
+    "paypal_desc": "Custom donation",
+    "thanks": "THANK YOU FOR YOUR SUPPORT"
+  },
+  "settings": {
+    "tabs": {
+      "general": "General",
+      "license": "License"
+    },
     "general": {
-        "loading_system": "INITIALIZING SYSTEM...",
-        "processing": "PROCESSING...",
-        "license_indicator": "FREE VERSION",
-        "import_video": "<svg class='zas-icon'><use href='#icon-folder'></use></svg> Import Video <span style='font-size:0.7em; opacity:0.8'>(SER, AVI, MP4, MOV)</span>",
-        "batch_mode": "<svg class='zas-icon'><use href='#icon-batch'></use></svg> Batch Stacking",
-        "mosaic_mode": "<svg class='zas-icon'><use href='#icon-mosaic'></use></svg> Create Mosaic",
-        "start_analysis": "<svg class='zas-icon'><use href='#icon-lightning'></use></svg> Start Full Analysis",
-        "file_selected": "File selected:",
-        "change_reference": "📂 Change Reference",
-        "load_another_video": "📂 Load Another Video",
-        "confirm_yes": "Yes",
-        "no": "No",
-        "cancel": "Cancel",
-        "ready": "Done",
-        "acknowledge": "Got it",
-        "error": "Error",
-        "warning": "Notice",
-        "backend_panic_title": "Unexpected error",
-        "backend_panic_body": "The operation failed and stopped safely so the app would not close. On low-memory machines, try a shorter video, lower the percentage of frames to stack, or close other applications.",
-        "saving": "SAVING...",
-        "saved": "Saved",
-        "unavailable": "Unavailable",
-        "not_applicable": "Not applicable",
-        "load_animation": "<svg class='zas-icon'><use href='#icon-film'></use></svg> Load Animation (Images)",
-        "tools_convert": "<svg class='zas-icon'><use href='#icon-tools'></use></svg> Convert Video to SER",
-        "derotate_mode": "<svg class='zas-icon'><use href='#icon-planet'></use></svg> Planetary Derotation",
-        "report_bug_subject": "Bug Report / Feedback - Zenith Astro Stacker",
-        "report_bug_body": "Version: {{version}}\n\nHello Zenith Astro Code team,\n\nI am writing to send the following report/feedback:\n\n[WRITE YOUR MESSAGE HERE]\n"
-    },
-    "converter": {
-        "profile_title": "SER Conversion Format",
-        "profile_intro": "Choose how to create the working SER. For MP4/MOV, the video is decoded into stacking-ready frames; no sharpening or destructive filters are applied.",
-        "profile_mono8_title": "Recommended lightweight",
-        "profile_mono8_desc": "Smallest file size. Ideal for Moon, H-alpha/mono Sun, and planetary luminance.",
-        "profile_color8_title": "Preserve color",
-        "profile_color8_desc": "Keeps color when the source has it. Uses about 3x more space than mono.",
-        "profile_auto_title": "High depth",
-        "profile_auto_desc": "Preserves 10/12/16-bit when the source allows it. Potentially better quality, larger file.",
-        "recommended_badge": "Recommended",
-        "estimate_label": "Estimated SER",
-        "source_file": "Source video",
-        "source_size": "Current size",
-        "source_resolution": "Resolution",
-        "source_frames": "Frames",
-        "source_depth": "Source",
-        "size_note": "SER is uncompressed, so the final size can be much larger than the original video.",
-        "inspecting": "READING VIDEO DATA...",
-        "processing": "CONVERTING VIDEO TO SER...",
-        "processing_detail": "Converting frames...",
-        "success_title": "SER conversion completed",
-        "error_title": "Conversion error",
-        "open_folder": "Open folder",
-        "report_profile": "SER profile",
-        "report_time": "Time",
-        "report_resolution": "Resolution",
-        "report_frames": "Frames",
-        "report_depth": "Bit depth",
-        "report_frame_size": "Size/frame",
-        "report_estimated": "Estimated",
-        "report_final_size": "Final size",
-        "report_throughput": "Throughput",
-        "report_source": "Source",
-        "report_output": "Output"
-    },
-    "derotation": {
-        "status": {
-            "waiting": "Load a stacked planetary image.",
-            "inspecting": "Inspecting image...",
-            "ready": "Ready · {{resolution}}",
-            "disc_ready": "Disc detected.",
-            "geometry_ready": "Geometry ready.",
-            "geometry_review": "Review geometry."
-        },
-        "processing": {
-            "inspecting": "INSPECTING DEROTATION...",
-            "detecting": "DETECTING DISC...",
-            "applying": "APPLYING PLANETARY DEROTATION..."
-        },
-        "errors": {
-            "load_first": "Load a planetary image first.",
-            "time_required": "Set both capture time and reference time.",
-            "load_image_after_log": "TXT loaded. Now load an image or use the current result to apply those times."
-        },
-        "logs": {
-            "completed": "Planetary derotation completed (Δ {{delta}}°). {{path}}"
-        },
-        "time_source": {
-            "manual_log": "Manual TXT",
-            "log": "Log",
-            "file_modified": "File",
-            "manual": "Manual",
-            "unknown": "Unknown"
-        },
-        "log": {
-            "auto_hint": "No manual TXT. SharpCap/FireCapture will be read next to the image when available."
-        },
-        "diagnostics": {
-            "manual": "Manual",
-            "ready": "Geometry ready to apply."
-        },
-        "warnings": {
-            "manual_geometry": "Geometry adjusted manually; verify that the mesh follows the real limb."
-        },
-        "use_current": "Use Current Result",
-        "success_title": "Derotation Complete",
-        "success_message": "Derotated image saved at:\n{{path}}\n\nApplied delta: {{delta}}°"
-    },
-    "updater": {
-        "settings": "Settings",
-        "search_updates": "Check for updates",
-        "checking": "Checking...",
-        "searching": "Searching...",
-        "available_badge": "v{{version}} Available",
-        "default_notes": "Performance improvements and fixes.",
-        "manual_notes": "A new version is available.",
-        "available_title": "New version available",
-        "current_version": "Current version",
-        "new_version": "New version",
-        "manual_note": "Note: this version requires manual installation.",
-        "install_question": "Do you want to download and install it now?",
-        "manual_action": "Download manually",
-        "install_action": "Update now",
-        "later": "Later",
-        "downloading": "DOWNLOADING UPDATE...",
-        "downloading_pct": "DOWNLOADING: {{pct}}%",
-        "restarting": "RESTARTING...",
-        "install_error_title": "Installation error",
-        "install_error_message": "Installation failed: {{error}}\nTry downloading it manually from GitHub.",
-        "latest_message": "You are using the latest version (v{{version}}).",
-        "same_version_message": "The server reports the same version (v{{version}}).",
-        "connection_error_title": "Connection Error",
-        "connection_error_message": "Could not check for updates. Please check your internet connection."
-    },
-    "activation": {
-        "title": "Activation Required",
-        "description": "Unlock the full potential of <b>Zenith Astro Stacker</b>.<br>Enter your Pro license or start a free trial.",
-        "license_key_label": "License key",
-        "placeholder": "XXXX-XXXX-XXXX-XXXX",
-        "verify": "Verifying...",
-        "activate_btn": "<svg class='zas-icon'><use href='#icon-rocket'></use></svg> Activate License",
-        "trial_btn": "Try (15 Days)",
-        "buy_btn": "BUY ANNUAL LICENSE",
-        "language_label": "View in",
-        "qa_reset_label": "TEMP QA",
-        "qa_reset_btn": "Allow another trial",
-        "footer": "ZENITH ASTRO STACKER • PRO EDITION",
-        "manual_title": "Upgrade to annual license",
-        "manual_desc": "Unlock the full potential of Zenith Astro Stacker. Advanced analysis tools, priority support, and updates during the annual term.",
-        "buy_btn_manual": "<svg class='zas-icon'><use href='#icon-pro'></use></svg> GET ANNUAL LICENSE",
-        "have_code": "I HAVE A CODE",
-        "activate_code_btn": "ACTIVATE CODE ->",
-        "verifying_license": "Verifying license...",
-        "marketing_title": "<svg class='zas-icon'><use href='#icon-rocket'></use></svg> <span style='color:#f59e0b'>Upgrade</span>",
-        "marketing_desc": "Enjoy full power with an active annual license.",
-        "already_have_key": "Already have your key?",
-        "enter_license_code": "Enter License Code",
-        "enter_license_title": "Enter Your License",
-        "enter_license_desc": "Enter your license code.",
-        "update_title": "Update License",
-        "update_desc": "Enter your new license key.",
-        "required_desc": "Unlock the full potential of <b>Zenith Astro Stacker</b>.",
-        "invalid_key": "Enter a valid key.",
-        "activated_title": "License activated!",
-        "activated_message": "Your license has been activated successfully.\n\nWelcome to the full Zenith Astro Stacker experience.",
-        "activation_error_title": "Activation Error",
-        "deactivate_title": "Deactivate License",
-        "deactivate_message": "Do you want to deactivate the license on this computer? You will return to an inactive state, or expired if the trial has already ended.",
-        "deactivate_confirm": "Yes, deactivate",
-        "deactivated_title": "Deactivated",
-        "deactivated_message": "License removed from this computer.",
-        "qa_reset_title": "Trial reset",
-        "qa_reset_message": "This clears the local license state and marks the trial as unused on this computer.\n\nUse it only to validate activations.",
-        "qa_reset_confirm": "Reset",
-        "qa_reset_loading": "Resetting...",
-        "qa_reset_ready_title": "QA ready",
-        "qa_reset_ready_message": "Local state has been reset. You can try activating another trial or license."
-    },
-    "donation": {
-        "title": "Boost the Project!",
-        "subtitle": "If you are enjoying Zenith Astro Stacker and want to contribute to the development of this and other tools, consider an extra boost for the creator of this tool. This is a personal project that I enjoy building for fellow astrophotographers.",
-        "bmc_title": "Buy Me a Coffee",
-        "bmc_desc": "Quick and simple support",
-        "paypal_title": "PayPal",
-        "paypal_desc": "Custom donation",
-        "thanks": "THANK YOU FOR YOUR SUPPORT"
-    },
-    "settings": {
-        "tabs": {
-            "general": "General",
-            "license": "License"
-        },
-        "general": {
-            "title": "General Settings",
-            "language": "Language / Idioma",
-            "tutorials": "Interactive Tutorials",
-            "tutorials_hint": "Shown only once per workflow. You can replay them whenever you need.",
-            "show_visual_aids": "Show visual aids",
-            "start_tutorial_intro": "View overview guide",
-            "start_tutorial_individual": "View single-stack guide",
-            "start_tutorial_batch": "View batch guide",
-            "start_tutorial_mosaic": "View mosaic guide",
-            "reset_tutorials": "↺ Reset All Tutorials",
-            "tutorials_reset_title": "Tutorials reset",
-            "tutorials_reset_message": "Tutorials will appear once again when you enter each workflow.",
-            "more_options": "More customization options coming soon.",
-            "social": "Social Media",
-            "official_web": "Official Website",
-            "support": "Support Project"
-        },
-        "license": {
-            "status_title": "License Status"
-        }
+      "title": "General Settings",
+      "language": "Language / Idioma",
+      "tutorials": "Interactive Tutorials",
+      "tutorials_hint": "Shown only once per workflow. You can replay them whenever you need.",
+      "show_visual_aids": "Show visual aids",
+      "start_tutorial_intro": "View overview guide",
+      "start_tutorial_individual": "View single-stack guide",
+      "start_tutorial_batch": "View batch guide",
+      "start_tutorial_mosaic": "View mosaic guide",
+      "reset_tutorials": "↺ Reset All Tutorials",
+      "tutorials_reset_title": "Tutorials reset",
+      "tutorials_reset_message": "Tutorials will appear once again when you enter each workflow.",
+      "more_options": "More customization options coming soon.",
+      "social": "Social Media",
+      "official_web": "Official Website",
+      "support": "Support Project"
     },
     "license": {
-        "statuses": {
-            "pro": "PRO",
-            "annual": "ANNUAL",
-            "trial": "TRIAL",
-            "free": "FREE",
-            "expired": "EXPIRED",
-            "locked": "NOT ACTIVATED",
-            "unknown": "UNKNOWN"
-        },
-        "types": {
-            "annual": "Annual license",
-            "trial": "Free trial",
-            "free": "Free license",
-            "pro": "PRO license",
-            "license": "License"
-        },
-        "rows": {
-            "status": "Status",
-            "license_type": "License type",
-            "license_key": "Registered license",
-            "registered_at": "Registered",
-            "expires_at": "Expires",
-            "days_remaining": "Days remaining",
-            "last_checked_at": "Last checked",
-            "renewal": "Renewal",
-            "message": "Message"
-        },
-        "fallbacks": {
-            "no_registered_license": "No registered license",
-            "no_message": "No message"
-        },
-        "messages": {
-            "activation_required": "Activation is required.",
-            "trial_active": "Free trial active. {{days}} days remaining.",
-            "free_active": "Free license active. {{days}} days remaining with limited features.",
-            "annual_active": "Annual license active.",
-            "annual_active_until": "Annual license active until {{date}}.",
-            "pro_active": "PRO license active.",
-            "trial_not_current": "The free trial is not active.",
-            "free_not_current": "The free license is not active.",
-            "annual_not_current": "The annual license is not active or was not renewed.",
-            "trial_finished": "The free trial has ended.",
-            "free_expired": "The free license has expired.",
-            "annual_expired": "The annual license has expired or was not renewed."
-        },
-        "renewal": {
-            "verified": "Payment and renewal verified.",
-            "verified_on": "Payment and renewal verified on {{date}}.",
-            "not_current": "Payment was not renewed or the annual license is not active.",
-            "expired": "Payment was not renewed or the annual license expired."
-        },
-        "badge": {
-            "pro": "PRO VERSION",
-            "annual": "ANNUAL LICENSE",
-            "annual_days": "ANNUAL ({{days}} DAYS)",
-            "free": "FREE LICENSE",
-            "trial_days": "TRIAL ({{days}} DAYS)",
-            "required": "LICENSE REQUIRED",
-            "expired": "EXPIRED"
-        },
-        "actions": {
-            "activate": "Activate License",
-            "deactivate": "Deactivate on this PC",
-            "change": "Change License",
-            "upgrade_annual": "UPGRADE TO ANNUAL LICENSE"
-        },
-        "settings": {
-            "loading": "Loading information...",
-            "load_error": "Error loading license information."
-        }
+      "status_title": "License Status"
+    }
+  },
+  "license": {
+    "statuses": {
+      "pro": "PRO",
+      "annual": "ANNUAL",
+      "trial": "TRIAL",
+      "free": "FREE",
+      "expired": "EXPIRED",
+      "locked": "NOT ACTIVATED",
+      "unknown": "UNKNOWN"
     },
-    "acquisition": {
-        "title": "Data Acquisition"
+    "types": {
+      "annual": "Annual license",
+      "trial": "Free trial",
+      "free": "Free license",
+      "pro": "PRO license",
+      "license": "License"
     },
-    "viewer": {
-        "source_mesh": "Source / Mesh",
-        "processed_result": "Processed Result",
-        "hide_source": "Hide Source",
-        "show_source": "Show Source"
+    "rows": {
+      "status": "Status",
+      "license_type": "License type",
+      "license_key": "Registered license",
+      "registered_at": "Registered",
+      "expires_at": "Expires",
+      "days_remaining": "Days remaining",
+      "last_checked_at": "Last checked",
+      "renewal": "Renewal",
+      "message": "Message"
     },
-    "batch": {
-        "title": "Batch Control",
-        "source": "Source:",
-        "videos_detected": "Videos Detected:",
-        "source_videos": "Videos:",
-        "recursive": "(Recursive)",
-        "target_category": "Target Category (Zenith Engine)",
-        "steps": {
-            "source": "1. Source",
-            "reference": "2. Reference",
-            "analysis": "3. Analysis",
-            "stacking": "4. Integration & Stacking",
-            "post": "5. Post-Processing (Wavelets)"
-        },
-        "reference": {
-            "load_first_btn": "<svg class='zas-icon'><use href='#icon-folder'></use></svg> Load Video #1",
-            "description": "Load the first video to calibrate the batch.",
-            "error_loading": "Reference load failed: {{error}}"
-        },
-        "analysis": {
-            "description": "Configure and run the analysis in the upper panel."
-        },
-        "stacking": {
-            "toggle": "<svg class='zas-icon'><use href='#icon-batch'></use></svg> Show Integration & Stacking"
-        },
-        "post": {
-            "description": "Adjust Wavelets in the main panel before continuing."
-        },
-        "scan": {
-            "title": "Scan Settings",
-            "question": "Do you want to include videos inside subfolders?",
-            "recursive": "Include subfolders",
-            "root_only": "This folder only",
-            "scanning": "SCANNING...",
-            "empty_title": "No Videos Found",
-            "empty_message": "No .SER or .AVI videos were found in this folder.",
-            "error_message": "Scan failed: {{error}}"
-        },
-        "calibration": {
-            "title": "1. Calibration",
-            "description": "Stack and adjust wavelets for the first video. These settings will be copied to all.",
-            "process_btn": "<svg class='zas-icon'><use href='#icon-tools'></use></svg> Process First (Reference)"
-        },
-        "execution": {
-            "title": "<svg class='zas-icon'><use href='#icon-rocket'></use></svg> Final Run",
-            "progress": "Batch Progress:",
-            "start_btn": "<svg class='zas-icon'><use href='#icon-rocket'></use></svg> Start Full Batch",
-            "ready_tooltip": "Run batch",
-            "load_files_tooltip": "Load files first",
-            "no_outputs": "The batch finished, but no valid frames were generated. Check Logs for the files that failed."
-        },
-        "reanalyze": {
-            "title": "Want to refresh the batch analysis?",
-            "button": "Reanalyze batch data"
-        },
-        "logs": {
-            "activated": "Batch mode activated. {{count}} files.",
-            "reference_loading": "LOADING REFERENCE...",
-            "reference_ready": "Reference loaded. Press Start Full Analysis to continue.",
-            "processing_file": "[Batch {{current}}/{{total}}] Processing: {{name}}...",
-            "file_failed": "Failed on {{name}}: {{error}}",
-            "completed": "Batch complete: PNGs saved. Opening animation editor."
-        }
+    "fallbacks": {
+      "no_registered_license": "No registered license",
+      "no_message": "No message"
     },
-    "mosaic": {
-        "title": "Magnetic Mosaic",
-        "sources": {
-            "title": "1. Sources (Smart Import)",
-            "select_files": "Select Files",
-            "supported_formats": "Supports .SER, .AVI, .PNG, .TIF",
-            "auto_organize": "<svg class='zas-icon'><use href='#icon-magic'></use></svg> Auto-Organize",
-            "clear": "<svg class='zas-icon'><use href='#icon-trash'></use></svg> Clear"
-        },
-        "workflow": {
-            "title": "2. Stacking Process",
-            "analyze_description": "Analyze videos to determine quality.",
-            "analyze_btn": "<svg class='zas-icon'><use href='#icon-search'></use></svg> Analyze All",
-            "quality_summary": "<svg class='zas-icon'><use href='#icon-chart'></use></svg> Quality Summary:",
-            "pending": "Pending",
-            "stack_percentage": "Stack Percentage:",
-            "stack_btn": "<svg class='zas-icon'><use href='#icon-batch'></use></svg> Batch Stacking"
-        },
-        "generation": {
-            "mode": "Mode: <strong>Smart Alignment & Smooth Blending</strong>",
-            "guided_mode": "Guided Mode",
-            "guided_description": "If active, respects your manual placement as priority if no clear matches are found.",
-            "create_btn": "<svg class='zas-icon'><use href='#icon-mosaic'></use></svg> Create Mosaic",
-            "processing": "CREATING MOSAIC...",
-            "stitching": "<svg class='zas-icon icon-spin'><use href='#icon-settings'></use></svg> Stitching...",
-            "error_button": "<svg class='zas-icon'><use href='#icon-cross'></use></svg> Error",
-            "failed_message": "The mosaic could not be stitched. Review the details.\n{{error}}"
-        },
-        "results": {
-            "title": "Results Ready",
-            "save_png": "<svg class='zas-icon'><use href='#icon-save'></use></svg> PNG",
-            "save_tiff": "<svg class='zas-icon'><use href='#icon-save'></use></svg> TIFF Pro",
-            "redo": "<svg class='zas-icon'><use href='#icon-undo'></use></svg> Redo",
-            "send_wavelets": "<svg class='zas-icon'><use href='#icon-palette'></use></svg> Send to Wavelets",
-            "no_result": "No mosaic has been generated yet.",
-            "save_success": "Saved successfully as .{{ext}}",
-            "save_error": "Error saving: {{error}}"
-        },
-        "info": {
-            "title": "Mosaic",
-            "show": "Info",
-            "resolution": "Resolution",
-            "megapixels": "Megapixels",
-            "tiles": "Tiles",
-            "mode": "Mode",
-            "mode_guided": "Guided",
-            "mode_blind": "Automatic",
-            "preview": "Preview",
-            "preview_native": "Native RGB8",
-            "preview_embedded": "Embedded",
-            "export": "Export",
-            "master": "Master"
-        }
+    "messages": {
+      "activation_required": "Activation is required.",
+      "trial_active": "Free trial active. {{days}} days remaining.",
+      "free_active": "Free license active. {{days}} days remaining with limited features.",
+      "annual_active": "Annual license active.",
+      "annual_active_until": "Annual license active until {{date}}.",
+      "pro_active": "PRO license active.",
+      "trial_not_current": "The free trial is not active.",
+      "free_not_current": "The free license is not active.",
+      "annual_not_current": "The annual license is not active or was not renewed.",
+      "trial_finished": "The free trial has ended.",
+      "free_expired": "The free license has expired.",
+      "annual_expired": "The annual license has expired or was not renewed."
     },
-    "video_settings": {
-        "title": "Input Configuration",
-        "bayer_pattern": "Bayer Pattern (Override)",
-        "color_space": "Color Space",
-        "analysis_mode": "Analysis Mode",
-        "auto": "Automatic (Detect)",
-        "linear": "Linear / RAW",
-        "srgb": "sRGB / Processed",
-        "force_mono": "Force Monochrome",
-        "planet_v3": "Zenith Presicion Ultimate - Planetary",
-        "surface_v3": "Zenith Presicion Ultimate - Surface"
+    "renewal": {
+      "verified": "Payment and renewal verified.",
+      "verified_on": "Payment and renewal verified on {{date}}.",
+      "not_current": "Payment was not renewed or the annual license is not active.",
+      "expired": "Payment was not renewed or the annual license expired."
     },
-    "telemetry": {
-        "title": "File Telemetry",
-        "resolution": "Resolution",
-        "frames": "Frames",
-        "bayer_matrix": "Bayer Matrix",
-        "statistical_analysis": "Statistical Analysis",
-        "avg_quality": "<svg class='zas-icon'><use href='#icon-star'></use></svg> Avg Quality",
-        "stability": "<svg class='zas-icon'><use href='#icon-chart'></use></svg> Stability",
-        "worst_score": "<svg class='zas-icon'><use href='#icon-down'></use></svg> Worst Score",
-        "best_score": "<svg class='zas-icon'><use href='#icon-trophy'></use></svg> Best Score"
+    "badge": {
+      "pro": "PRO VERSION",
+      "annual": "ANNUAL LICENSE",
+      "annual_days": "ANNUAL ({{days}} DAYS)",
+      "free": "FREE LICENSE",
+      "trial_days": "TRIAL ({{days}} DAYS)",
+      "required": "LICENSE REQUIRED",
+      "expired": "EXPIRED"
+    },
+    "actions": {
+      "activate": "Activate License",
+      "deactivate": "Deactivate on this PC",
+      "change": "Change License",
+      "upgrade_annual": "UPGRADE TO ANNUAL LICENSE"
+    },
+    "settings": {
+      "loading": "Loading information...",
+      "load_error": "Error loading license information."
+    }
+  },
+  "acquisition": {
+    "title": "Data Acquisition"
+  },
+  "viewer": {
+    "source_mesh": "Source / Mesh",
+    "processed_result": "Processed Result",
+    "hide_source": "Hide Source",
+    "show_source": "Show Source"
+  },
+  "batch": {
+    "title": "Batch Control",
+    "source": "Source:",
+    "videos_detected": "Videos Detected:",
+    "source_videos": "Videos:",
+    "recursive": "(Recursive)",
+    "target_category": "Target Category (Zenith Engine)",
+    "steps": {
+      "source": "1. Source",
+      "reference": "2. Reference",
+      "analysis": "3. Analysis",
+      "stacking": "4. Integration & Stacking",
+      "post": "5. Post-Processing (Wavelets)"
+    },
+    "reference": {
+      "load_first_btn": "<svg class='zas-icon'><use href='#icon-folder'></use></svg> Load Video #1",
+      "description": "Load the first video to calibrate the batch.",
+      "error_loading": "Reference load failed: {{error}}"
     },
     "analysis": {
-        "title": "Integration & Stacking",
-        "chart": {
-            "time": "Time",
-            "quality": "Quality",
-            "warning": "Visual only, does not affect stacking"
-        },
-        "mode_label": "Quality / Analysis Type",
-        "targets": {
-            "title": "Target Category",
-            "surface": "Surface (Moon / Sun)",
-            "surface_desc": "Wide-feature stabilization.",
-            "planet_large": "Planet / Lunar Phase",
-            "planet_large_desc": "Legacy alias for the universal planetary flow.",
-            "planet_small": "Planet / Lunar Phase",
-            "planet_small_desc": "Jupiter, Saturn, Mars, Venus, moons, and transits with local APs."
-        },
-        "modes": {
-            "zenith_ultimate": "Zenith Presicion Ultimate",
-            "global": "Zenith Global v2 (Rigid Center)",
-            "multipoint": "Zenith Multipoint Patch v2 (Rigid Blocks)",
-            "precision_v3": "Zenith Precision v3 (High Precision Stacking)",
-            "elite_v4": "Zenith Elite v4 (Neural Restoration)"
-        },
-        "mode_hint": "Single workflow: adapts by category for surface, large planet, or small planet.",
-        "selection": "Selection (Best %):",
-        "algorithm": "Algorithm",
-        "algorithms": {
-            "liquid": "Liquid Warping (Clarity Engine)",
-            "global": "Global (Fast)",
-            "zenith_map": "Zenith Presicion Ultimate (Global)",
-            "zenith_v3": "Zenith Presicion Ultimate (Global)",
-            "liquid_v2": "Zenith Presicion Ultimate (Multi-Point)",
-            "liquid_v3": "Zenith Presicion Ultimate (Multi-Point)",
-            "elite_v4": "Zenith Elite v4 (Neural-Restoration)",
-            "classic": "Classic Stacking"
-        },
-        "liquid_warning": "⚠ Experimental: May cause mesh artifacts.",
-        "drizzle": "Drizzle (Super-Res)",
-        "drizzle_options": {
-            "off": "Off (1x)",
-            "detail": "1.5x (PRO Detail)",
-            "hd": "2.0x (PRO HD)",
-            "ultra": "3.0x (PRO Ultra)",
-            "extreme": "4.0x (PRO Extreme)"
-        },
-        "sharpened_stack": "Sharpening (Extra Details)",
-        "sharpen_intensity": "Sharpen Intensity",
-        "sharpen_multi_band": "5-Band Wavelet Engine",
-        "intensity_options": {
-            "low": "25% (Subtle / Conservative)",
-            "suggested": "50% (Balanced / Suggested)",
-            "high": "75% (Aggressive / Detailed)",
-            "extreme": "100% (Extreme / Processed)"
-        },
-        "sharpen_hint": "Controls the weight of fine, mid, and structural bands.",
-        "double_pass": "Double-Pass Alignment",
-        "normalize_colors": "Normalize Colors (Auto-Balance)",
-        "keep_full_frame": "Keep full frame (no crop)",
-        "ap_size": "AP Size:",
-        "ap_sizes": {
-            "micro": "Micro (8px)",
-            "ultra_fine": "Ultra Fine (16px)",
-            "small": "Small (24px)",
-            "fine": "Fine (32px)",
-            "medium": "Medium (48px)",
-            "large": "Large (104px)"
-        },
-        "threshold": "Threshold (%):",
-        "set_manual_anchor": "<svg class='zas-icon'><use href='#icon-anchor'></use></svg> Set Manual Anchor",
-        "set_stacking_roi": "<svg class='zas-icon'><use href='#icon-ruler'></use></svg> Set Stacking Area",
-        "generate_points": "<svg class='zas-icon'><use href='#icon-star'></use></svg> Generate Alignment Points",
-        "generate_smart_points": "<svg class='zas-icon'><use href='#icon-magic'></use></svg> Smart AP Generator (Auto)",
-        "active_points": "Active Points:",
-        "start_stacking": "<svg class='zas-icon'><use href='#icon-rocket'></use></svg> Start Stacking",
-        "reanalyze": {
-            "title": "Want to try a fresh analysis?",
-            "button": "Reanalyze from scratch",
-            "log": "Fresh analysis requested. Anchor and stacking area were cleared. Run the analysis again."
-        }
+      "description": "Configure and run the analysis in the upper panel."
     },
-    "tools": {
-        "title": "Editing Tools",
-        "crop_image": "<svg class='zas-icon'><use href='#icon-scissors'></use></svg> Crop Image",
-        "confirm": "<svg class='zas-icon'><use href='#icon-check'></use></svg> Confirm",
-        "cancel": "<svg class='zas-icon'><use href='#icon-cross'></use></svg> Cancel",
-        "crop_instructions": "Draw, drag or resize"
+    "stacking": {
+      "toggle": "<svg class='zas-icon'><use href='#icon-batch'></use></svg> Show Integration & Stacking"
+    },
+    "post": {
+      "description": "Adjust Wavelets in the main panel before continuing."
+    },
+    "scan": {
+      "title": "Scan Settings",
+      "question": "Do you want to include videos inside subfolders?",
+      "recursive": "Include subfolders",
+      "root_only": "This folder only",
+      "scanning": "SCANNING...",
+      "empty_title": "No Videos Found",
+      "empty_message": "No .SER or .AVI videos were found in this folder.",
+      "error_message": "Scan failed: {{error}}"
+    },
+    "calibration": {
+      "title": "1. Calibration",
+      "description": "Stack and adjust wavelets for the first video. These settings will be copied to all.",
+      "process_btn": "<svg class='zas-icon'><use href='#icon-tools'></use></svg> Process First (Reference)"
+    },
+    "execution": {
+      "title": "<svg class='zas-icon'><use href='#icon-rocket'></use></svg> Final Run",
+      "progress": "Batch Progress:",
+      "start_btn": "<svg class='zas-icon'><use href='#icon-rocket'></use></svg> Start Full Batch",
+      "ready_tooltip": "Run batch",
+      "load_files_tooltip": "Load files first",
+      "no_outputs": "The batch finished, but no valid frames were generated. Check Logs for the files that failed."
+    },
+    "reanalyze": {
+      "title": "Want to refresh the batch analysis?",
+      "button": "Reanalyze batch data"
+    },
+    "logs": {
+      "activated": "Batch mode activated. {{count}} files.",
+      "reference_loading": "LOADING REFERENCE...",
+      "reference_ready": "Reference loaded. Press Start Full Analysis to continue.",
+      "processing_file": "[Batch {{current}}/{{total}}] Processing: {{name}}...",
+      "file_failed": "Failed on {{name}}: {{error}}",
+      "completed": "Batch complete: PNGs saved. Opening animation editor."
+    }
+  },
+  "mosaic": {
+    "title": "Magnetic Mosaic",
+    "sources": {
+      "title": "1. Sources (Smart Import)",
+      "select_files": "Select Files",
+      "supported_formats": "Supports .SER, .AVI, .PNG, .TIF",
+      "auto_organize": "<svg class='zas-icon'><use href='#icon-magic'></use></svg> Auto-Organize",
+      "clear": "<svg class='zas-icon'><use href='#icon-trash'></use></svg> Clear"
+    },
+    "workflow": {
+      "title": "2. Stacking Process",
+      "analyze_description": "Analyze videos to determine quality.",
+      "analyze_btn": "<svg class='zas-icon'><use href='#icon-search'></use></svg> Analyze All",
+      "quality_summary": "<svg class='zas-icon'><use href='#icon-chart'></use></svg> Quality Summary:",
+      "pending": "Pending",
+      "stack_percentage": "Stack Percentage:",
+      "stack_btn": "<svg class='zas-icon'><use href='#icon-batch'></use></svg> Batch Stacking"
+    },
+    "generation": {
+      "mode": "Mode: <strong>Smart Alignment & Smooth Blending</strong>",
+      "guided_mode": "Guided Mode",
+      "guided_description": "If active, respects your manual placement as priority if no clear matches are found.",
+      "create_btn": "<svg class='zas-icon'><use href='#icon-mosaic'></use></svg> Create Mosaic",
+      "processing": "CREATING MOSAIC...",
+      "stitching": "<svg class='zas-icon icon-spin'><use href='#icon-settings'></use></svg> Stitching...",
+      "error_button": "<svg class='zas-icon'><use href='#icon-cross'></use></svg> Error",
+      "failed_message": "The mosaic could not be stitched. Review the details.\n{{error}}"
+    },
+    "results": {
+      "title": "Results Ready",
+      "save_png": "<svg class='zas-icon'><use href='#icon-save'></use></svg> PNG",
+      "save_tiff": "<svg class='zas-icon'><use href='#icon-save'></use></svg> TIFF Pro",
+      "redo": "<svg class='zas-icon'><use href='#icon-undo'></use></svg> Redo",
+      "send_wavelets": "<svg class='zas-icon'><use href='#icon-palette'></use></svg> Send to Wavelets",
+      "no_result": "No mosaic has been generated yet.",
+      "save_success": "Saved successfully as .{{ext}}",
+      "save_error": "Error saving: {{error}}"
+    },
+    "info": {
+      "title": "Mosaic",
+      "show": "Info",
+      "resolution": "Resolution",
+      "megapixels": "Megapixels",
+      "tiles": "Tiles",
+      "mode": "Mode",
+      "mode_guided": "Guided",
+      "mode_blind": "Automatic",
+      "preview": "Preview",
+      "preview_native": "Native RGB8",
+      "preview_embedded": "Embedded",
+      "export": "Export",
+      "master": "Master"
+    }
+  },
+  "video_settings": {
+    "title": "Input Configuration",
+    "bayer_pattern": "Bayer Pattern (Override)",
+    "color_space": "Color Space",
+    "analysis_mode": "Analysis Mode",
+    "auto": "Automatic (Detect)",
+    "linear": "Linear / RAW",
+    "srgb": "sRGB / Processed",
+    "force_mono": "Force Monochrome",
+    "planet_v3": "Zenith Presicion Ultimate - Planetary",
+    "surface_v3": "Zenith Presicion Ultimate - Surface"
+  },
+  "telemetry": {
+    "title": "File Telemetry",
+    "resolution": "Resolution",
+    "frames": "Frames",
+    "bayer_matrix": "Bayer Matrix",
+    "statistical_analysis": "Statistical Analysis",
+    "avg_quality": "<svg class='zas-icon'><use href='#icon-star'></use></svg> Avg Quality",
+    "stability": "<svg class='zas-icon'><use href='#icon-chart'></use></svg> Stability",
+    "worst_score": "<svg class='zas-icon'><use href='#icon-down'></use></svg> Worst Score",
+    "best_score": "<svg class='zas-icon'><use href='#icon-trophy'></use></svg> Best Score"
+  },
+  "analysis": {
+    "title": "Integration & Stacking",
+    "chart": {
+      "time": "Time",
+      "quality": "Quality",
+      "warning": "Visual only, does not affect stacking"
+    },
+    "mode_label": "Quality / Analysis Type",
+    "targets": {
+      "title": "Target Category",
+      "surface": "General (Planets / Surfaces)",
+      "surface_desc": "Planets, Moon, Sun and surfaces — universal stacking engine.",
+      "planet_large": "Planet / Lunar Phase",
+      "planet_large_desc": "Legacy alias for the universal planetary flow.",
+      "planet_small": "Planet / Lunar Phase",
+      "planet_small_desc": "Jupiter, Saturn, Mars, Venus, moons, and transits with local APs."
+    },
+    "modes": {
+      "zenith_ultimate": "Zenith Presicion Ultimate",
+      "global": "Zenith Global v2 (Rigid Center)",
+      "multipoint": "Zenith Multipoint Patch v2 (Rigid Blocks)",
+      "precision_v3": "Zenith Precision v3 (High Precision Stacking)",
+      "elite_v4": "Zenith Elite v4 (Neural Restoration)"
+    },
+    "mode_hint": "Single workflow: adapts by category for surface, large planet, or small planet.",
+    "selection": "Selection (Best %):",
+    "algorithm": "Algorithm",
+    "algorithms": {
+      "liquid": "Liquid Warping (Clarity Engine)",
+      "global": "Global (Fast)",
+      "zenith_map": "Zenith Presicion Ultimate (Global)",
+      "zenith_v3": "Zenith Presicion Ultimate (Global)",
+      "liquid_v2": "Zenith Presicion Ultimate (Multi-Point)",
+      "liquid_v3": "Zenith Presicion Ultimate (Multi-Point)",
+      "elite_v4": "Zenith Elite v4 (Neural-Restoration)",
+      "classic": "Classic Stacking"
+    },
+    "liquid_warning": "⚠ Experimental: May cause mesh artifacts.",
+    "drizzle": "Drizzle (Super-Res)",
+    "drizzle_options": {
+      "off": "Off (1x)",
+      "detail": "1.5x (PRO Detail)",
+      "hd": "2.0x (PRO HD)",
+      "ultra": "3.0x (PRO Ultra)",
+      "extreme": "4.0x (PRO Extreme)"
+    },
+    "sharpened_stack": "Sharpening (Extra Details)",
+    "sharpen_intensity": "Sharpen Intensity",
+    "sharpen_multi_band": "5-Band Wavelet Engine",
+    "intensity_options": {
+      "low": "25% (Subtle / Conservative)",
+      "suggested": "50% (Balanced / Suggested)",
+      "high": "75% (Aggressive / Detailed)",
+      "extreme": "100% (Extreme / Processed)"
+    },
+    "sharpen_hint": "Controls the weight of fine, mid, and structural bands.",
+    "double_pass": "Double-Pass Alignment",
+    "normalize_colors": "Normalize Colors (Auto-Balance)",
+    "keep_full_frame": "Keep full frame (no crop)",
+    "ap_size": "AP Size:",
+    "ap_sizes": {
+      "micro": "Micro (8px)",
+      "ultra_fine": "Ultra Fine (16px)",
+      "small": "Small (24px)",
+      "fine": "Fine (32px)",
+      "medium": "Medium (48px)",
+      "large": "Large (104px)"
+    },
+    "threshold": "Threshold (%):",
+    "set_manual_anchor": "<svg class='zas-icon'><use href='#icon-anchor'></use></svg> Set Manual Anchor",
+    "set_stacking_roi": "<svg class='zas-icon'><use href='#icon-ruler'></use></svg> Set Stacking Area",
+    "generate_points": "<svg class='zas-icon'><use href='#icon-star'></use></svg> Generate Alignment Points",
+    "generate_smart_points": "<svg class='zas-icon'><use href='#icon-magic'></use></svg> Smart AP Generator (Auto)",
+    "active_points": "Active Points:",
+    "start_stacking": "<svg class='zas-icon'><use href='#icon-rocket'></use></svg> Start Stacking",
+    "reanalyze": {
+      "title": "Want to try a fresh analysis?",
+      "button": "Reanalyze from scratch",
+      "log": "Fresh analysis requested. Anchor and stacking area were cleared. Run the analysis again."
+    },
+    "rgb_align": "RGB Align (Auto)",
+    "suggested": "Suggested"
+  },
+  "tools": {
+    "title": "Editing Tools",
+    "crop_image": "<svg class='zas-icon'><use href='#icon-scissors'></use></svg> Crop Image",
+    "confirm": "<svg class='zas-icon'><use href='#icon-check'></use></svg> Confirm",
+    "cancel": "<svg class='zas-icon'><use href='#icon-cross'></use></svg> Cancel",
+    "crop_instructions": "Draw, drag or resize"
+  },
+  "export": {
+    "save_png": "💾 Save PNG",
+    "save_tiff": "💾 Save TIFF",
+    "pro_title": "PRO Feature",
+    "tiff_requires_pro": "Saving 16-bit TIFF requires an annual license or an active trial.\n\nPlease activate your license."
+  },
+  "wavelets": {
+    "title": "Signal Processing",
+    "mode_label": "Sharpen Mode:",
+    "engine_hint": "Hybrid Processing Engine",
+    "modes": {
+      "luminance": "🔆 Luminance (Y)",
+      "rgb": "🌈 Channels (RGB)"
+    },
+    "deconvolution": {
+      "title": "Zenith Deconvolution",
+      "auto_analyze": "<svg class='zas-icon'><use href='#icon-magic'></use></svg> Auto-Analyze",
+      "analyzing": "Analyzing...",
+      "modes": {
+        "both": "Both Engines",
+        "adaptive": "Adaptive Only",
+        "projection": "Projection Only"
+      },
+      "adaptive_restoration": "ADAPTIVE RESTORATION",
+      "radius": "Radius (σ)",
+      "iterations": "Iterations",
+      "structural_projection": "STRUCTURAL PROJECTION"
+    },
+    "high_frequency": {
+      "title": "High Frequency Details"
+    },
+    "multiscale": {
+      "title": "Multiscale Wavelets",
+      "intensity": "Intensity",
+      "noise_reduction": "Noise Red."
+    },
+    "post_processing_fine": "Fine Post-Processing",
+    "master_denoise": "Master Denoise",
+    "post": {
+      "denoise_detail": "Preserve Detail",
+      "denoise_chroma": "Color Noise",
+      "high_pass": "High Pass",
+      "smart_sharpen": "Smart Sharpen",
+      "radius_auto": "Radius (0 = Auto)",
+      "gamma": "Gamma",
+      "saturation": "Saturation",
+      "contrast": "Contrast",
+      "brightness": "Brightness",
+      "white_balance_r": "White Balance (R)",
+      "white_balance_b": "White Balance (B)",
+      "atmospheric_correction": "Atmospheric Correction (RGB Alignment)",
+      "channel": "Channel",
+      "horizontal": "Horizontal (X)",
+      "vertical": "Vertical (Y)",
+      "blend": "Blend",
+      "deringing": "Artifact Reduction (Deringing)",
+      "deringing_modes": {
+        "off": "Off",
+        "auto": "Auto (Recommended)",
+        "manual": "Manual"
+      },
+      "threshold_sensitivity": "Threshold (Sensitivity)",
+      "dark_rings": "Dark Rings",
+      "light_rings": "Light Rings",
+      "show_mask": "Show Mask"
+    },
+    "presets": {
+      "placeholder": "— Saved schemes —",
+      "name": "Name...",
+      "saved": "Scheme saved: ",
+      "deleted": "Scheme deleted: ",
+      "applied": "Scheme applied: ",
+      "need_name": "Type a name to save the scheme."
+    },
+    "reapplying": "Re-applying post-processing to the new stack..."
+  },
+  "animation": {
+    "errors": {
+      "no_valid_images": "No valid images were generated for playback.",
+      "no_source_files": "No source files are available to process.",
+      "no_valid_paths": "No valid file paths were found.",
+      "no_frames_to_export": "There are no frames to export.",
+      "no_active_frames": "There are no accepted frames to export.",
+      "missing_output_folder": "Could not determine the output folder.",
+      "export_failed": "Export failed: {{error}}"
+    },
+    "editor_title": "Animation Editor",
+    "manage_frames": "<svg class='zas-icon'><use href='#icon-film'></use></svg> Frames",
+    "manage_frames_hint": "Discard defective frames.",
+    "speed_label": "Speed (ms)",
+    "speed_value": "{{ms}}ms",
+    "previous_frame": "Previous frame",
+    "play_pause": "Play / Pause",
+    "next_frame": "Next frame",
+    "frame_counter": "Frame {{current}} / {{total}}",
+    "reset_filters": "<svg class='zas-icon'><use href='#icon-refresh'></use></svg> Reset",
+    "opacity_short": "Opac.",
+    "font": "Font",
+    "close_editor": "Close",
+    "frame_manager": {
+      "title": "Frame Manager",
+      "zoom": "Zoom",
+      "zoom_in": "Zoom in",
+      "zoom_out": "Zoom out",
+      "apply": "Apply Changes",
+      "summary": "{{active}} accepted / {{total}} total"
+    },
+    "derotation": {
+      "title": "<svg class='zas-icon' style='width:15px; height:15px;'><use href='#icon-planet'></use></svg> Planetary Derotation",
+      "planet": "Planet",
+      "cm_system": "CM System",
+      "limb_correction": "Limb Correction",
+      "limb_hint": "Compensates the planet edge darkening for a smoother stack.",
+      "interval_label": "Interval without logs (sec)",
+      "interval_hint": "Used only when files do not provide distinct timestamps.",
+      "apply_sequence": "Apply to Sequence",
+      "applying": "Applying...",
+      "processing": "DEROTATING PLANETARY SEQUENCE...",
+      "sequence_title": "Sequence Derotated",
+      "sequence_done": "Sequence derotated: {{count}} frames.",
+      "sequence_message": "{{count}} derotated frames were generated and loaded into the editor."
+    },
+    "placeholders": {
+      "watermark": "Watermark text...",
+      "title": "Title (e.g. Jupiter)",
+      "telescope": "Telescope",
+      "camera": "Camera",
+      "other": "Other details..."
+    },
+    "crop": {
+      "start": "<svg class='zas-icon'><use href='#icon-scissors'></use></svg> Crop Animation",
+      "confirm": "<svg class='zas-icon'><use href='#icon-scissors'></use></svg> Crop",
+      "missing_image_size": "The image's real size could not be read.",
+      "invalid_selection": "Invalid selection or outside the image.",
+      "export_crop_log": "Export crop set: {{width}}x{{height}}"
     },
     "export": {
-        "save_png": "💾 Save PNG",
-        "save_tiff": "💾 Save TIFF",
-        "pro_title": "PRO Feature",
-        "tiff_requires_pro": "Saving 16-bit TIFF requires an annual license or an active trial.\n\nPlease activate your license."
+      "format_label": "Export Format",
+      "rescale_label": "Output Scale",
+      "quality_label": "Export Quality",
+      "file_button": "<svg class='zas-icon'><use href='#icon-save'></use></svg> Export File",
+      "exporting": "<svg class='zas-icon icon-spin'><use href='#icon-settings'></use></svg> Exporting {{format}}...",
+      "processing": "EXPORTING {{format}}...",
+      "saved_title": "Export Complete",
+      "saved_message": "File saved at:\n{{path}}\n\nOpen the folder?",
+      "open_folder": "Yes, open",
+      "formats": {
+        "mp4": "MP4 Video (H.264)",
+        "avi": "AVI Video (MPEG-4)",
+        "gif": "GIF Animation"
+      },
+      "qualities": {
+        "faster": "Fast (More Compression)",
+        "balanced": "Balanced (Speed/Quality)",
+        "quality": "Quality (Slower but Better)"
+      }
     },
-    "wavelets": {
-        "title": "Signal Processing",
-        "mode_label": "Sharpen Mode:",
-        "engine_hint": "Hybrid Processing Engine",
-        "modes": {
-            "luminance": "🔆 Luminance (Y)",
-            "rgb": "🌈 Channels (RGB)"
-        },
-        "deconvolution": {
-            "title": "Zenith Deconvolution",
-            "auto_analyze": "<svg class='zas-icon'><use href='#icon-magic'></use></svg> Auto-Analyze",
-            "analyzing": "Analyzing...",
-            "modes": {
-                "both": "Both Engines",
-                "adaptive": "Adaptive Only",
-                "projection": "Projection Only"
-            },
-            "adaptive_restoration": "ADAPTIVE RESTORATION",
-            "radius": "Radius (σ)",
-            "iterations": "Iterations",
-            "structural_projection": "STRUCTURAL PROJECTION"
-        },
-        "high_frequency": {
-            "title": "High Frequency Details"
-        },
-        "multiscale": {
-            "title": "Multiscale Wavelets",
-            "intensity": "Intensity",
-            "noise_reduction": "Noise Red."
-        },
-        "post_processing_fine": "Fine Post-Processing",
-        "master_denoise": "Master Denoise",
-        "post": {
-            "denoise_detail": "Preserve Detail",
-            "denoise_chroma": "Color Noise",
-            "high_pass": "High Pass",
-            "smart_sharpen": "Smart Sharpen",
-            "radius_auto": "Radius (0 = Auto)",
-            "gamma": "Gamma",
-            "saturation": "Saturation",
-            "contrast": "Contrast",
-            "brightness": "Brightness",
-            "white_balance_r": "White Balance (R)",
-            "white_balance_b": "White Balance (B)",
-            "atmospheric_correction": "Atmospheric Correction (RGB Alignment)",
-            "channel": "Channel",
-            "horizontal": "Horizontal (X)",
-            "vertical": "Vertical (Y)",
-            "blend": "Blend",
-            "deringing": "Artifact Reduction (Deringing)",
-            "deringing_modes": {
-                "off": "Off",
-                "auto": "Auto (Recommended)",
-                "manual": "Manual"
-            },
-            "threshold_sensitivity": "Threshold (Sensitivity)",
-            "dark_rings": "Dark Rings",
-            "light_rings": "Light Rings",
-            "show_mask": "Show Mask"
-        }
+    "boomerang": "Boomerang Effect",
+    "visual_filters": "Preview Filters",
+    "reset_filters_title": "Reset all filters to default values",
+    "brightness": "Brightness",
+    "contrast_short": "Contr.",
+    "saturation_short": "Satur.",
+    "gamma": "Gamma",
+    "hue": "Hue",
+    "levels": "Levels (Black/White)",
+    "color_filter": "Color Filter (Mono)",
+    "color_strength_short": "Color",
+    "highlight_protect_short": "Highs",
+    "color_filters": {
+      "none": "No Filter",
+      "solar_ha_gold": "Golden H-alpha Solar",
+      "solar_orange": "Solar Orange",
+      "solar_yellow": "Solar Yellow",
+      "h_alpha": "H-Alpha (Red)",
+      "calcium_k": "Calcium-K (Blue/Violet)"
     },
-    "animation": {
-        "errors": {
-            "no_valid_images": "No valid images were generated for playback.",
-            "no_source_files": "No source files are available to process.",
-            "no_valid_paths": "No valid file paths were found.",
-            "no_frames_to_export": "There are no frames to export.",
-            "no_active_frames": "There are no accepted frames to export.",
-            "missing_output_folder": "Could not determine the output folder.",
-            "export_failed": "Export failed: {{error}}"
-        },
-        "editor_title": "Animation Editor",
-        "manage_frames": "<svg class='zas-icon'><use href='#icon-film'></use></svg> Frames",
-        "manage_frames_hint": "Discard defective frames.",
-        "speed_label": "Speed (ms)",
-        "speed_value": "{{ms}}ms",
-        "previous_frame": "Previous frame",
-        "play_pause": "Play / Pause",
-        "next_frame": "Next frame",
-        "frame_counter": "Frame {{current}} / {{total}}",
-        "reset_filters": "<svg class='zas-icon'><use href='#icon-refresh'></use></svg> Reset",
-        "opacity_short": "Opac.",
-        "font": "Font",
-        "close_editor": "Close",
-        "frame_manager": {
-            "title": "Frame Manager",
-            "zoom": "Zoom",
-            "zoom_in": "Zoom in",
-            "zoom_out": "Zoom out",
-            "apply": "Apply Changes",
-            "summary": "{{active}} accepted / {{total}} total"
-        },
-        "derotation": {
-            "title": "<svg class='zas-icon' style='width:15px; height:15px;'><use href='#icon-planet'></use></svg> Planetary Derotation",
-            "planet": "Planet",
-            "cm_system": "CM System",
-            "limb_correction": "Limb Correction",
-            "limb_hint": "Compensates the planet edge darkening for a smoother stack.",
-            "interval_label": "Interval without logs (sec)",
-            "interval_hint": "Used only when files do not provide distinct timestamps.",
-            "apply_sequence": "Apply to Sequence",
-            "applying": "Applying...",
-            "processing": "DEROTATING PLANETARY SEQUENCE...",
-            "sequence_title": "Sequence Derotated",
-            "sequence_done": "Sequence derotated: {{count}} frames.",
-            "sequence_message": "{{count}} derotated frames were generated and loaded into the editor."
-        },
-        "placeholders": {
-            "watermark": "Watermark text...",
-            "title": "Title (e.g. Jupiter)",
-            "telescope": "Telescope",
-            "camera": "Camera",
-            "other": "Other details..."
-        },
-        "crop": {
-            "start": "<svg class='zas-icon'><use href='#icon-scissors'></use></svg> Crop Animation",
-            "confirm": "<svg class='zas-icon'><use href='#icon-scissors'></use></svg> Crop",
-            "missing_image_size": "The image's real size could not be read.",
-            "invalid_selection": "Invalid selection or outside the image.",
-            "export_crop_log": "Export crop set: {{width}}x{{height}}"
-        },
-        "export": {
-            "format_label": "Export Format",
-            "rescale_label": "Output Scale",
-            "quality_label": "Export Quality",
-            "file_button": "<svg class='zas-icon'><use href='#icon-save'></use></svg> Export File",
-            "exporting": "<svg class='zas-icon icon-spin'><use href='#icon-settings'></use></svg> Exporting {{format}}...",
-            "processing": "EXPORTING {{format}}...",
-            "saved_title": "Export Complete",
-            "saved_message": "File saved at:\n{{path}}\n\nOpen the folder?",
-            "open_folder": "Yes, open",
-            "formats": {
-                "mp4": "MP4 Video (H.264)",
-                "avi": "AVI Video (MPEG-4)",
-                "gif": "GIF Animation"
-            },
-            "qualities": {
-                "faster": "Fast (More Compression)",
-                "balanced": "Balanced (Speed/Quality)",
-                "quality": "Quality (Slower but Better)"
-            }
-        },
-        "boomerang": "Boomerang Effect",
-        "visual_filters": "Preview Filters",
-        "reset_filters_title": "Reset all filters to default values",
-        "brightness": "Brightness",
-        "contrast_short": "Contr.",
-        "saturation_short": "Satur.",
-        "gamma": "Gamma",
-        "hue": "Hue",
-        "levels": "Levels (Black/White)",
-        "color_filter": "Color Filter (Mono)",
-        "color_strength_short": "Color",
-        "highlight_protect_short": "Highs",
-        "color_filters": {
-            "none": "No Filter",
-            "solar_ha_gold": "Golden H-alpha Solar",
-            "solar_orange": "Solar Orange",
-            "solar_yellow": "Solar Yellow",
-            "h_alpha": "H-Alpha (Red)",
-            "calcium_k": "Calcium-K (Blue/Violet)"
-        },
-        "manual_color": "Manual Color (Tint)",
-        "rotate_90": "🔄 Rotate 90°",
-        "normalize_brightness": "💡 Normalize Brightness",
-        "normalize_confirm_title": "Normalize Brightness",
-        "normalize_confirm_message": "This will modify the original files. Continue?",
-        "normalize_processing": "NORMALIZING BRIGHTNESS...",
-        "normalize_success_log": "Brightness normalized successfully.",
-        "normalize_success_message": "Brightness correction has been applied.",
-        "normalize_error": "Brightness normalization failed: {{error}}",
-        "overlays_text": "Overlays / Text",
-        "overlay_modes": {
-            "none": "No Overlay",
-            "watermark": "Watermark",
-            "frame": "Data Frame"
-        }
-    },
-    "tutorial": {
-        "common": {
-            "skip": "Skip All",
-            "back": "Back",
-            "next": "Next",
-            "finish": "Finish",
-            "interactive_hint": "Interactive tutorial: use the highlighted control when it applies, or press Next and move at your own pace."
-        },
-        "intro": {
-            "step0": {
-                "title": "Welcome to Zenith Astro Stacker!",
-                "content": "<b>This is a general overview</b> of how the software works. You can move with <b>Next</b>, and in guided workflows use highlighted controls when the tutorial asks for them."
-            },
-            "step1": {
-                "title": "Import Video",
-                "content": "Start here by importing your SER or AVI files to process them individually."
-            },
-            "step2": {
-                "title": "Batch Mode",
-                "content": "Process multiple videos automatically with the same configuration."
-            },
-            "step3": {
-                "title": "Create Mosaic",
-                "content": "Join multiple lunar or solar panels into a single high-resolution image."
-            },
-            "step4": {
-                "title": "Settings",
-                "content": "Adjust language and tutorial preferences here."
-            },
-            "step5": {
-                "title": "Check for Updates",
-                "content": "Click here to search for new versions of the software and keep it up to date."
-            }
-        },
-        "individual": {
-            "step0": {
-                "title": "Step 1: Import Video",
-                "content": "Start by selecting a .SER or .AVI video to process."
-            },
-            "step1": {
-                "title": "Target Type",
-                "content": "Choose the workflow language that best describes your capture.<br><b>Surface:</b> Moon, Sun, or wide-detail scenes.<br><b>Planet / Lunar Phase:</b> compact objects with a cleaner background."
-            },
-            "step2": {
-                "title": "Step 2: Start Analysis",
-                "content": "<b>Press this button now!</b> to begin analyzing all frames. The system will evaluate the quality of each frame automatically."
-            },
-            "step3": {
-                "title": "Preparing Analysis",
-                "content": "The system is starting the frame analysis. Please wait a moment while the data is processed."
-            },
-            "step4": {
-                "title": "Step 3: Frame Selection",
-                "content": "Adjust the percentage of the best frames to stack. More frames = less noise, but includes lower quality frames."
-            },
-            "step5": {
-                "title": "Step 4: Stacking Options",
-                "content": "Here you adjust <b>Drizzle</b>, <b>Double-Pass Alignment</b>, and <b>Sharpening</b>. Keep them conservative when you want a clean reference before fine post-processing."
-            },
-            "step6": {
-                "title": "Step 5: Smart AP",
-                "content": "The <b>Smart AP Generator</b> creates the alignment mesh. Adjust <b>AP Size</b> and <b>Threshold</b> if you need finer points or more selective detection."
-            },
-            "step7": {
-                "title": "Viewer: Source",
-                "content": "Before stacking, review the reference frame and alignment-point mesh here. This helps confirm that the system is tracking the right areas."
-            },
-            "step8": {
-                "title": "Step 6: Start Stacking",
-                "content": "Once parameters are set and the source view looks right, press this button to begin stacking."
-            },
-            "step9": {
-                "title": "Processing Details",
-                "content": "This card summarizes the stack: time, frames used, engine, AP points, throughput, and system details. Use it to validate that the process behaved as expected."
-            },
-            "step10": {
-                "title": "Viewer: Result",
-                "content": "This is your stacked image. You can zoom and pan to inspect the details."
-            },
-            "step11": {
-                "title": "Wavelets and Processing",
-                "content": "Adjust wavelets, deconvolution, color, and denoise from this card. Keep the <b>Processed Result</b> visible on the right so you can judge each change before continuing."
-            },
-            "step12": {
-                "title": "Export Result",
-                "content": "Finally, save your processed image. You have options to export in <b>PNG (8-bit)</b> for general use or <b>TIFF (16-bit)</b> to preserve maximum quality."
-            }
-        },
-        "batch": {
-            "step0": {
-                "title": "Batch Mode",
-                "content": "Use this workflow when you want to process several videos with the same calibration. First, select the folder that contains your captures."
-            },
-            "step1": {
-                "title": "Batch Panel",
-                "content": "Here you will see the folder, the number of videos found, and the batch stages. This panel guides the workflow through final execution."
-            },
-            "step2": {
-                "title": "Batch Target Type",
-                "content": "Choose whether the whole batch is <b>Surface</b> or <b>Planet / Lunar Phase</b>. This sets the analysis and alignment engine for every file."
-            },
-            "step3": {
-                "title": "Batch Reference",
-                "content": "Load the first video to calibrate analysis, stacking, and post-processing. That setup becomes the template for the rest of the batch."
-            },
-            "step4": {
-                "title": "Analyze Reference",
-                "content": "Run analysis on the reference video. The system measures quality, stability, and the data needed to repeat the workflow."
-            },
-            "step5": {
-                "title": "Frame Selection",
-                "content": "Adjust the percentage of best frames. This value is used as the base for every video in the batch."
-            },
-            "step6": {
-                "title": "Stacking Options",
-                "content": "Review <b>Drizzle</b>, <b>Double-Pass Alignment</b>, <b>Normalize Colors</b>, and <b>Sharpening</b>. These settings become the base recipe for the batch."
-            },
-            "step7": {
-                "title": "Batch Smart AP",
-                "content": "Set <b>AP Size</b> and <b>Threshold</b>, then generate the Smart AP mesh. This helps the reference track the right detail before the recipe is repeated."
-            },
-            "step8": {
-                "title": "Viewer: Source",
-                "content": "Review the reference and generated mesh here. Confirm that points cover useful areas before stacking."
-            },
-            "step9": {
-                "title": "Stack Reference",
-                "content": "Stack the reference to validate the result before applying the same recipe to the full batch."
-            },
-            "step10": {
-                "title": "Processing Details",
-                "content": "This card summarizes the reference stack: time, frames used, engine, AP points, throughput, and technical details."
-            },
-            "step11": {
-                "title": "Post-Processing",
-                "content": "Adjust wavelets, deconvolution, color, and denoise on the reference while checking the <b>Processed Result</b>. These values will be replicated across every video."
-            },
-            "step12": {
-                "title": "Batch Control",
-                "content": "Return to the batch panel to review completed stages and confirm the reference is ready as the template."
-            },
-            "step13": {
-                "title": "Start Full Batch",
-                "content": "When the reference looks right, start the full batch. The system applies the validated configuration to the remaining files."
-            },
-            "step14": {
-                "title": "Animation Editor",
-                "content": "When processing finishes, results move to the animation editor so you can review frames, reject bad ones, and export the final video."
-            }
-        },
-        "mosaic": {
-            "step0": {
-                "title": "Mosaic Mode",
-                "content": "Use this workflow to join lunar or solar panels. You can work with videos that will be stacked first or with already processed images."
-            },
-            "step1": {
-                "title": "Mosaic Sources",
-                "content": "Select the videos or images that will form the mosaic. Keep panels from the same session together to make stitching easier."
-            },
-            "step2": {
-                "title": "Auto-Organize",
-                "content": "Press <b>Auto-Organize</b> so the system can place panels in the source viewer and you can review the initial layout."
-            },
-            "step3": {
-                "title": "Source View",
-                "content": "Here you can inspect how the tiles were arranged before analysis, stacking, or final stitching."
-            },
-            "step4": {
-                "title": "Global Analysis",
-                "content": "Analyze all panels to measure quality and prepare a consistent result. Wait for this to finish before continuing."
-            },
-            "step5": {
-                "title": "Mosaic Process",
-                "content": "If you are working with videos, set the stacking percentage here and stack every tile before stitching."
-            },
-            "step6": {
-                "title": "Guided Mode and Creation",
-                "content": "Create the final mosaic here. You can enable <b>Guided Mode</b> when you want your manual placement to have priority, but the recommended path is leaving it off so automatic stitching can find matches on its own. Press <b>Create Mosaic</b> and wait for it to finish."
-            },
-            "step7": {
-                "title": "Step 6: Save or Process",
-                "content": "Mosaic completed! You can <b>save as PNG/TIFF</b> or send it to <b>Wavelets</b> for additional processing."
-            }
-        }
-    },
-    "report": {
-        "title": "PROCESSING DETAILS",
-        "execution_time": "TOTAL EXECUTION TIME",
-        "snr_gain": "SNR GAIN",
-        "stacked_frames": "STACKED FRAMES",
-        "avg_quality": "AVG QUALITY",
-        "core_engine": "CORE ENGINE",
-        "alignment_points": "AP POINTS",
-        "cpu_threads": "CPU THREADS",
-        "threads_active": "{{count}} threads active",
-        "precision": "PRECISION",
-        "precision_subpixel": "Sub-pixel 0.1px",
-        "engine": "STACKING ENGINE",
-        "resolution": "OUTPUT RESOLUTION",
-        "frames": "FRAMES INTEGRATED",
-        "ap_points": "ALIGNMENT POINTS",
-        "ref_frame": "REFERENCE FRAME",
-        "bayer": "BAYER PATTERN",
-        "format": "SOURCE FORMAT",
-        "throughput": "THROUGHPUT",
-        "bandwidth": "BANDWIDTH",
-        "stability": "STABILITY",
-        "nominal": "NOMINAL",
-        "operating_system": "OS",
-        "system_integrity": "SYSTEM INTEGRITY",
-        "mp_processed": "{{mp}} MP PROCESSED",
-        "ap_count": "{{count}} points",
-        "global_alignment": "Global alignment",
-        "global_fallback": "Automatic global",
-        "engines": {
-            "zenith_ultimate_surface": "Zenith Ultimate - Surface",
-            "zenith_ultimate_planetary": "Zenith Ultimate - Planetary",
-            "liquid_v3": "Zenith Precision v3 - Multipoint",
-            "liquid_warping": "Multipoint Patch v2",
-            "zenith_v3": "Zenith Precision v3 - Global",
-            "zenith_map": "Zenith Global v2",
-            "elite_v4": "Zenith Elite v4",
-            "global": "Zenith Global v2"
-        }
+    "manual_color": "Manual Color (Tint)",
+    "rotate_90": "🔄 Rotate 90°",
+    "normalize_brightness": "💡 Normalize Brightness",
+    "normalize_confirm_title": "Normalize Brightness",
+    "normalize_confirm_message": "This will modify the original files. Continue?",
+    "normalize_processing": "NORMALIZING BRIGHTNESS...",
+    "normalize_success_log": "Brightness normalized successfully.",
+    "normalize_success_message": "Brightness correction has been applied.",
+    "normalize_error": "Brightness normalization failed: {{error}}",
+    "overlays_text": "Overlays / Text",
+    "overlay_modes": {
+      "none": "No Overlay",
+      "watermark": "Watermark",
+      "frame": "Data Frame"
     }
+  },
+  "tutorial": {
+    "common": {
+      "skip": "Skip All",
+      "back": "Back",
+      "next": "Next",
+      "finish": "Finish",
+      "interactive_hint": "Interactive tutorial: use the highlighted control when it applies, or press Next and move at your own pace."
+    },
+    "intro": {
+      "step0": {
+        "title": "Welcome to Zenith Astro Stacker!",
+        "content": "<b>This is a general overview</b> of how the software works. You can move with <b>Next</b>, and in guided workflows use highlighted controls when the tutorial asks for them."
+      },
+      "step1": {
+        "title": "Import Video",
+        "content": "Start here by importing your SER or AVI files to process them individually."
+      },
+      "step2": {
+        "title": "Batch Mode",
+        "content": "Process multiple videos automatically with the same configuration."
+      },
+      "step3": {
+        "title": "Create Mosaic",
+        "content": "Join multiple lunar or solar panels into a single high-resolution image."
+      },
+      "step4": {
+        "title": "Settings",
+        "content": "Adjust language and tutorial preferences here."
+      },
+      "step5": {
+        "title": "Check for Updates",
+        "content": "Click here to search for new versions of the software and keep it up to date."
+      }
+    },
+    "individual": {
+      "step0": {
+        "title": "Step 1: Import Video",
+        "content": "Start by selecting a .SER or .AVI video to process."
+      },
+      "step1": {
+        "title": "Target Type",
+        "content": "Choose the workflow language that best describes your capture.<br><b>Surface:</b> Moon, Sun, or wide-detail scenes.<br><b>Planet / Lunar Phase:</b> compact objects with a cleaner background."
+      },
+      "step2": {
+        "title": "Step 2: Start Analysis",
+        "content": "<b>Press this button now!</b> to begin analyzing all frames. The system will evaluate the quality of each frame automatically."
+      },
+      "step3": {
+        "title": "Preparing Analysis",
+        "content": "The system is starting the frame analysis. Please wait a moment while the data is processed."
+      },
+      "step4": {
+        "title": "Step 3: Frame Selection",
+        "content": "Adjust the percentage of the best frames to stack. More frames = less noise, but includes lower quality frames."
+      },
+      "step5": {
+        "title": "Step 4: Stacking Options",
+        "content": "Here you adjust <b>Drizzle</b>, <b>Double-Pass Alignment</b>, and <b>Sharpening</b>. Keep them conservative when you want a clean reference before fine post-processing."
+      },
+      "step6": {
+        "title": "Step 5: Smart AP",
+        "content": "The <b>Smart AP Generator</b> creates the alignment mesh. Adjust <b>AP Size</b> and <b>Threshold</b> if you need finer points or more selective detection."
+      },
+      "step7": {
+        "title": "Viewer: Source",
+        "content": "Before stacking, review the reference frame and alignment-point mesh here. This helps confirm that the system is tracking the right areas."
+      },
+      "step8": {
+        "title": "Step 6: Start Stacking",
+        "content": "Once parameters are set and the source view looks right, press this button to begin stacking."
+      },
+      "step9": {
+        "title": "Processing Details",
+        "content": "This card summarizes the stack: time, frames used, engine, AP points, throughput, and system details. Use it to validate that the process behaved as expected."
+      },
+      "step10": {
+        "title": "Viewer: Result",
+        "content": "This is your stacked image. You can zoom and pan to inspect the details."
+      },
+      "step11": {
+        "title": "Wavelets and Processing",
+        "content": "Adjust wavelets, deconvolution, color, and denoise from this card. Keep the <b>Processed Result</b> visible on the right so you can judge each change before continuing."
+      },
+      "step12": {
+        "title": "Export Result",
+        "content": "Finally, save your processed image. You have options to export in <b>PNG (8-bit)</b> for general use or <b>TIFF (16-bit)</b> to preserve maximum quality."
+      }
+    },
+    "batch": {
+      "step0": {
+        "title": "Batch Mode",
+        "content": "Use this workflow when you want to process several videos with the same calibration. First, select the folder that contains your captures."
+      },
+      "step1": {
+        "title": "Batch Panel",
+        "content": "Here you will see the folder, the number of videos found, and the batch stages. This panel guides the workflow through final execution."
+      },
+      "step2": {
+        "title": "Batch Target Type",
+        "content": "Choose whether the whole batch is <b>Surface</b> or <b>Planet / Lunar Phase</b>. This sets the analysis and alignment engine for every file."
+      },
+      "step3": {
+        "title": "Batch Reference",
+        "content": "Load the first video to calibrate analysis, stacking, and post-processing. That setup becomes the template for the rest of the batch."
+      },
+      "step4": {
+        "title": "Analyze Reference",
+        "content": "Run analysis on the reference video. The system measures quality, stability, and the data needed to repeat the workflow."
+      },
+      "step5": {
+        "title": "Frame Selection",
+        "content": "Adjust the percentage of best frames. This value is used as the base for every video in the batch."
+      },
+      "step6": {
+        "title": "Stacking Options",
+        "content": "Review <b>Drizzle</b>, <b>Double-Pass Alignment</b>, <b>Normalize Colors</b>, and <b>Sharpening</b>. These settings become the base recipe for the batch."
+      },
+      "step7": {
+        "title": "Batch Smart AP",
+        "content": "Set <b>AP Size</b> and <b>Threshold</b>, then generate the Smart AP mesh. This helps the reference track the right detail before the recipe is repeated."
+      },
+      "step8": {
+        "title": "Viewer: Source",
+        "content": "Review the reference and generated mesh here. Confirm that points cover useful areas before stacking."
+      },
+      "step9": {
+        "title": "Stack Reference",
+        "content": "Stack the reference to validate the result before applying the same recipe to the full batch."
+      },
+      "step10": {
+        "title": "Processing Details",
+        "content": "This card summarizes the reference stack: time, frames used, engine, AP points, throughput, and technical details."
+      },
+      "step11": {
+        "title": "Post-Processing",
+        "content": "Adjust wavelets, deconvolution, color, and denoise on the reference while checking the <b>Processed Result</b>. These values will be replicated across every video."
+      },
+      "step12": {
+        "title": "Batch Control",
+        "content": "Return to the batch panel to review completed stages and confirm the reference is ready as the template."
+      },
+      "step13": {
+        "title": "Start Full Batch",
+        "content": "When the reference looks right, start the full batch. The system applies the validated configuration to the remaining files."
+      },
+      "step14": {
+        "title": "Animation Editor",
+        "content": "When processing finishes, results move to the animation editor so you can review frames, reject bad ones, and export the final video."
+      }
+    },
+    "mosaic": {
+      "step0": {
+        "title": "Mosaic Mode",
+        "content": "Use this workflow to join lunar or solar panels. You can work with videos that will be stacked first or with already processed images."
+      },
+      "step1": {
+        "title": "Mosaic Sources",
+        "content": "Select the videos or images that will form the mosaic. Keep panels from the same session together to make stitching easier."
+      },
+      "step2": {
+        "title": "Auto-Organize",
+        "content": "Press <b>Auto-Organize</b> so the system can place panels in the source viewer and you can review the initial layout."
+      },
+      "step3": {
+        "title": "Source View",
+        "content": "Here you can inspect how the tiles were arranged before analysis, stacking, or final stitching."
+      },
+      "step4": {
+        "title": "Global Analysis",
+        "content": "Analyze all panels to measure quality and prepare a consistent result. Wait for this to finish before continuing."
+      },
+      "step5": {
+        "title": "Mosaic Process",
+        "content": "If you are working with videos, set the stacking percentage here and stack every tile before stitching."
+      },
+      "step6": {
+        "title": "Guided Mode and Creation",
+        "content": "Create the final mosaic here. You can enable <b>Guided Mode</b> when you want your manual placement to have priority, but the recommended path is leaving it off so automatic stitching can find matches on its own. Press <b>Create Mosaic</b> and wait for it to finish."
+      },
+      "step7": {
+        "title": "Step 6: Save or Process",
+        "content": "Mosaic completed! You can <b>save as PNG/TIFF</b> or send it to <b>Wavelets</b> for additional processing."
+      }
+    }
+  },
+  "report": {
+    "title": "PROCESSING DETAILS",
+    "execution_time": "TOTAL EXECUTION TIME",
+    "snr_gain": "SNR GAIN",
+    "stacked_frames": "STACKED FRAMES",
+    "avg_quality": "AVG QUALITY",
+    "core_engine": "CORE ENGINE",
+    "alignment_points": "AP POINTS",
+    "cpu_threads": "CPU THREADS",
+    "threads_active": "{{count}} threads active",
+    "precision": "PRECISION",
+    "precision_subpixel": "Sub-pixel 0.1px",
+    "engine": "STACKING ENGINE",
+    "resolution": "OUTPUT RESOLUTION",
+    "frames": "FRAMES INTEGRATED",
+    "ap_points": "ALIGNMENT POINTS",
+    "ref_frame": "REFERENCE FRAME",
+    "bayer": "BAYER PATTERN",
+    "format": "SOURCE FORMAT",
+    "throughput": "THROUGHPUT",
+    "bandwidth": "BANDWIDTH",
+    "stability": "STABILITY",
+    "nominal": "NOMINAL",
+    "operating_system": "OS",
+    "system_integrity": "SYSTEM INTEGRITY",
+    "mp_processed": "{{mp}} MP PROCESSED",
+    "ap_count": "{{count}} points",
+    "global_alignment": "Global alignment",
+    "global_fallback": "Automatic global",
+    "engines": {
+      "zenith_ultimate_surface": "Zenith Ultimate - Surface",
+      "zenith_ultimate_planetary": "Zenith Ultimate - Planetary",
+      "liquid_v3": "Zenith Precision v3 - Multipoint",
+      "liquid_warping": "Multipoint Patch v2",
+      "zenith_v3": "Zenith Precision v3 - Global",
+      "zenith_map": "Zenith Global v2",
+      "elite_v4": "Zenith Elite v4",
+      "global": "Zenith Global v2"
+    }
+  },
+  "deepsky": {
+    "title": "Deep-Sky Stacking",
+    "hint": "Pick your lights and (optional) calibration. Reference, star alignment, satellite rejection and stretch: automatic.",
+    "pick_lights": "Lights (object frames)",
+    "pick_darks": "Darks (optional)",
+    "pick_flats": "Flats (optional)",
+    "pick_bias": "Bias (optional)",
+    "sigma_clip": "σ-clip rejection",
+    "kappa_hint": "lower κ = more aggressive rejection",
+    "run": "Stack Deep-Sky",
+    "post_hint": "The result stays linear, ready for wavelets, deconvolution and color in the post-processing panel.",
+    "need_lights": "Pick at least 1 light.",
+    "processing": "STACKING DEEP-SKY...",
+    "done": "Deep-sky stacked. View is auto-stretched; data stays linear for post-processing.",
+    "keywords_label": "Keywords (optional, comma separated)",
+    "clear": "Clear",
+    "group_all": "All",
+    "summary_used": "used",
+    "warn_dims": "different dimensions",
+    "cosmetic": "Cosmetic correction",
+    "gradient": "Background & color cleanup (ABE+SCNR)",
+    "dark_opt": "Optimize darks (thermal scaling)",
+    "pixfrac": "Drop (pixfrac)",
+    "local_norm": "Local normalization",
+    "auto_crop": "Crop borders (partial coverage)",
+    "report": "Frames",
+    "report_title": "Frame quality",
+    "report_used": "used",
+    "report_file": "File",
+    "report_stars": "Stars",
+    "report_weight": "Weight",
+    "report_rejected": "rejected",
+    "report_ref": "reference",
+    "no_files": "No files",
+    "files": "files",
+    "scan_folder": "Scan folder (auto-classify)",
+    "scan_folder_hint": "Detects lights/darks/flats/bias in subfolders by name",
+    "scanning": "SCANNING AND CLASSIFYING...",
+    "pick_folder": "Load folder (recursive)",
+    "plan_title": "CALIBRATION PLAN",
+    "step_bias": "− Master Bias",
+    "step_dark": "− Master Dark",
+    "step_flat": "÷ Master Flat",
+    "step_cosmetic": "Cosmetic",
+    "step_cosmetic_d": "hot pixels",
+    "step_integrate": "κ-σ Integration",
+    "step_integrate_d": "registration + FWHM weight",
+    "stf_auto": "Auto (color)",
+    "stf_balanced": "Balanced",
+    "stf_linear": "Linear",
+    "stf_intensity": "Intensity",
+    "stf_note": "View only · data stays linear",
+    "drizzle": "Drizzle",
+    "remove_file": "Remove this file",
+    "drag_hint": "Drag a file to another category to reclassify it · ✕ to remove",
+    "prog_title": "Deep-Sky Stacking",
+    "export": "Export",
+    "export_title": "Export result",
+    "export_stretched": "Stretched (what you see)",
+    "export_linear": "Linear 16-bit (PixInsight/PS)",
+    "export_hint": "Saved next to your lights. The stretch uses the current mode/intensity.",
+    "export_do": "Save",
+    "exporting": "Exporting…",
+    "export_pick": "Pick at least one output.",
+    "export_no_result": "No deep-sky result to export.",
+    "hist_title": "Histogram",
+    "hist_bg": "Bkg",
+    "hist_clip": "clip",
+    "combine_open": "Combine channels (LRGB / SHO)",
+    "combine_title": "Combine channels (LRGB / SHO)",
+    "combine_desc": "Assign one MONO stack per channel. They are star-registered to each other and combined. Luminance (L) is optional and adds detail/SNR while preserving color.",
+    "combine_preset": "Palette / preset",
+    "combine_rgb": "RGB / LRGB (true color · background neutralize + SCNR)",
+    "combine_sho": "SHO — Hubble (SII→R · Ha→G · OIII→B · no SCNR)",
+    "combine_hoo": "HOO (Ha→R · OIII→G · OIII→B · no SCNR)",
+    "combine_register": "Register channels by stars",
+    "combine_run": "Combine and stretch",
+    "combine_need": "Assign at least channels R, G and B (or Ha/OIII).",
+    "combining": "COMBINING CHANNELS...",
+    "combine_done": "Channels combined. Adjust the stretch in the bottom bar.",
+    "slot_r": "R — red",
+    "slot_g": "G — green",
+    "slot_b": "B — blue",
+    "slot_l": "L — luminance (optional)",
+    "slot_empty": "unassigned",
+    "slot_pick": "Choose"
+  }
 }

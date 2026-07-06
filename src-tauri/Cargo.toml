@@ -1,6 +1,6 @@
 [package]
 name = "astro-stacker"
-version = "0.2.7"
+version = "0.2.8"
 description = "ZenithAstroCode"
 authors = ["ZenithAstroCode-by-EduardoMG"]
 edition = "2021"
@@ -60,3 +60,13 @@ lto = true            # Link Time Optimization: Mezcla todo el codigo (dificil d
 strip = true          # Elimina simbolos de depuracion (nombres de funciones, rutas)
 panic = "unwind"      # Permite capturar panics y mostrar error en vez de cerrar la app en seco
 opt-level = 3         # Maxima velocidad (o "z" para ofuscacion por tamaño minimo)
+
+# --- DEV UTILIZABLE: sin esto, `tauri dev` compila a opt-level 0 (código 10-40x
+# más lento: análisis/apilado tardan una eternidad y parecen "colgados" aunque
+# AVX2/NEON se detecten). Con opt-level 2 el dev rinde cerca del release para
+# probar flujos; el benchmark real sigue siendo el build release.
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3         # dependencias (ffmpeg-io, lz4, rayon, image...) siempre a fondo

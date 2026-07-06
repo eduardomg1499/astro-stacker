@@ -36,11 +36,12 @@ fn zenith_analysis_cache_suffix(
     has_anchor: bool,
 ) -> String {
     let flow = if warping_analysis { "warp" } else { "global" };
-    // "_a3" = analysis v3: large lunar discs now align on surface texture instead
-    // of the brightness CoG. Bumping the version invalidates stale CoG-based
-    // planet caches cleanly (one automatic re-analysis). ("_a2" was half-res R13.)
+    // "_a5" = analysis v5: CoG pre-centering for compact objects on black sky
+    // (handheld videos) — caches from the bounded-window alignment hold garbage
+    // shifts for large-motion videos. ("_a4" was the true-color mono collapse,
+    // "_a3" the large-disc texture alignment, "_a2" the half-res R13 scoring.)
     let mut suffix = format!(
-        "{}_zenith_ultimate_{}_a3",
+        "{}_zenith_ultimate_{}_a5",
         zenith_target_key(target_type, is_surface),
         flow
     );
@@ -58,18 +59,49 @@ fn zenith_recommended_pct(target_type: &str, is_surface: bool) -> f32 {
     }
 }
 
-/// SMART STACK PERCENTAGE: instead of a fixed per-category number, suggest the
-/// fraction of frames that actually hold ≥62% of the best frame's quality —
-/// a steady-seeing video earns a higher percentage, a turbulent one a lower
-/// one. Clamped to a sane lucky-imaging range; falls back to the static
-/// default for degenerate graphs.
+/// SMART STACK PERCENTAGE: suggest the fraction of frames that yields the best
+/// sharpness/SNR tradeoff. Two independent estimators, take the stricter:
+///  (a) ABSOLUTE QUALITY: fraction of frames holding ≥62% of the best score —
+///      steady seeing earns more, turbulence earns less.
+///  (b) KNEE OF THE SORTED CURVE: sort scores best→worst and find the point of
+///      maximum sag below the straight line between the endpoints — that is
+///      where quality starts falling faster than frames are being added (the
+///      classic "elbow"). Past the knee, extra frames blur more than they
+///      denoise. Skipped when the curve is nearly linear (no clear knee).
+/// Clamped to a sane lucky-imaging range; static default for tiny graphs.
 fn compute_smart_stack_pct(quality_graph: &[f32], target_type: &str, is_surface: bool) -> f32 {
     if quality_graph.len() < 8 {
         return zenith_recommended_pct(target_type, is_surface);
     }
+    let n = quality_graph.len();
+
+    // (a) absolute-quality fraction
     let good = quality_graph.iter().filter(|&&v| v >= 62.0).count() as f32;
-    let pct = good / quality_graph.len() as f32 * 100.0;
-    pct.clamp(8.0, 40.0)
+    let pct_quality = good / n as f32 * 100.0;
+
+    // (b) knee of the sorted (descending) quality curve
+    let mut sorted: Vec<f32> = quality_graph.to_vec();
+    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let v0 = sorted[0];
+    let vn = sorted[n - 1];
+    let mut knee_idx = n - 1;
+    let mut max_sag = 0.0f32;
+    for (i, &v) in sorted.iter().enumerate() {
+        let chord = v0 + (vn - v0) * i as f32 / (n - 1) as f32;
+        let sag = chord - v; // curve below the chord = accelerating quality loss
+        if sag > max_sag {
+            max_sag = sag;
+            knee_idx = i;
+        }
+    }
+    // A sag under ~3 quality points means the curve is basically linear.
+    let pct_knee = if max_sag >= 3.0 {
+        (knee_idx + 1) as f32 / n as f32 * 100.0
+    } else {
+        100.0
+    };
+
+    pct_quality.min(pct_knee).clamp(8.0, 50.0)
 }
 
 fn compute_robust_geometric_center(
@@ -187,46 +219,142 @@ fn is_large_lunar_disc(data: &[u16], w: usize, h: usize) -> bool {
         return false;
     }
 
-    // Noise floor from the four corners (a single corner is biased when the disk
-    // drifts into it — same rationale as the CoG estimator).
-    let block = 12usize.min(w).min(h);
-    let mut corner = Vec::with_capacity(block * block * 4);
-    for &by in &[0usize, h - block] {
-        for &bx in &[0usize, w - block] {
-            for y in by..(by + block).min(h) {
-                for x in bx..(bx + block).min(w) {
-                    corner.push(data[y * w + x]);
-                }
-            }
-        }
+    // FRAMING-INDEPENDENT detection via sampled percentiles. The first version
+    // estimated the sky level from the four CORNER blocks — but a Moon close-up
+    // that overflows the frame puts 3 of 4 corners ON the lit disc, so the
+    // "noise floor" landed at lunar brightness, the threshold went sky-high and
+    // the fill fraction came out tiny → large_disc=false → planetary CoG on a
+    // partial disc (garbage centering) AND no normalization (dark result).
+    // P5 lands on the sky when any sky exists, or on dark maria when the disc
+    // fills everything — either way the lit fraction is measured correctly.
+    let step = (data.len() / 200_000).max(1);
+    let mut sample: Vec<u16> = data.iter().step_by(step).copied().collect();
+    if sample.len() < 64 {
+        return false;
     }
-    corner.sort_unstable();
-    let noise = corner.get(corner.len() / 2).cloned().unwrap_or(0) as f32;
+    sample.sort_unstable();
+    let p05 = sample[sample.len() * 5 / 100] as f32;
+    let p999 = sample[(sample.len() * 999 / 1000).min(sample.len() - 1)] as f32;
+    let span = (p999 - p05).max(1.0);
 
-    let mut max_val = 0u16;
-    for &v in data.iter().step_by(4) {
-        if v > max_val {
-            max_val = v;
-        }
+    // Degenerate but real close-up case: the lit disc fills (nearly) the WHOLE
+    // frame, so even P5 lands on the disc and the span collapses. A bright,
+    // near-uniform frame with no sky IS a large disc — a planet on black sky
+    // always keeps a huge span (sky P5 vs disc P99.9), and an empty/noise frame
+    // fails the brightness bar.
+    if span < p999 * 0.15 && p999 > 2000.0 {
+        return true;
     }
-    let span = (max_val as f32 - noise).max(1.0);
-    // ~10% above background reliably captures the lit lunar surface (incl. maria)
+
+    // ~10% above the dark level captures the lit lunar surface (incl. maria)
     // without counting background noise.
-    let threshold = noise + span * 0.10;
+    let threshold = p05 + span * 0.10;
 
-    let step = (data.len() / 400_000).max(1);
-    let mut lit = 0usize;
-    let mut total = 0usize;
-    for v in data.iter().step_by(step) {
-        total += 1;
-        if *v as f32 > threshold {
-            lit += 1;
-        }
-    }
-    let fill = lit as f32 / total.max(1) as f32;
+    let lit = sample.iter().filter(|&&v| (v as f32) > threshold).count();
+    let fill = lit as f32 / sample.len() as f32;
 
     // Moon / large lunar phase fills a big chunk of the frame; a planet a tiny one.
     fill > 0.22
+}
+
+/// COMPACT OBJECT ON BLACK SKY (handheld/phone-video scene): a bright disc
+/// occupying a SMALL fraction of a dominantly black frame. In that scene the
+/// brightness centroid is a rock-solid, range-unlimited motion prior — used to
+/// PRE-CENTER the SAD search so violent handheld motion (hundreds of px, far
+/// beyond any fixed search window) still aligns. Distinct from
+/// `is_large_lunar_disc`: a big disc has texture everywhere and small relative
+/// motion, so it neither needs nor wants centroid assistance.
+fn is_compact_object_on_black(data: &[u16], w: usize, h: usize) -> bool {
+    if data.len() < w * h || w < 16 || h < 16 {
+        return false;
+    }
+    let step = (data.len() / 200_000).max(1);
+    let mut s: Vec<u16> = data.iter().step_by(step).copied().collect();
+    if s.len() < 64 {
+        return false;
+    }
+    s.sort_unstable();
+    let p05 = s[s.len() * 5 / 100] as f32;
+    let p999 = s[(s.len() * 999 / 1000).min(s.len() - 1)] as f32;
+    if p999 < 2000.0 {
+        return false; // no bright object at all
+    }
+    if p05 > p999 * 0.10 {
+        return false; // no dominant black sky
+    }
+    let thr = p05 + (p999 - p05) * 0.10;
+    let lit = s.iter().filter(|&&v| (v as f32) > thr).count() as f32 / s.len() as f32;
+    // Compact: present but far from filling the frame.
+    lit > 0.0002 && lit < 0.45
+}
+
+/// AP-SCORE INFORMATIVENESS (0..1): Pearson correlation between an AP's local
+/// per-frame scores and the GLOBAL frame scores, remapped to a gate weight.
+/// Seeing modulates the whole frame at once, so a real local quality signal
+/// CORRELATES with the global one; an uncorrelated local score is noise
+/// (faint/low-contrast AP: limb, dark maria, planet terminator). Informative
+/// APs earn a strict local cutoff; noisy APs are ranked by the global score
+/// and accept more frames (pure SNR — local selection can't help there).
+fn pearson_informativeness(ap_scores: &[f32], global_scores: &[f32]) -> f32 {
+    let n = ap_scores.len().min(global_scores.len());
+    if n < 8 {
+        return 1.0; // too few frames to judge — keep the strict local behaviour
+    }
+    let nf = n as f64;
+    let (mut sa, mut sb, mut saa, mut sbb, mut sab) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let x = ap_scores[i] as f64;
+        let y = global_scores[i] as f64;
+        sa += x;
+        sb += y;
+        saa += x * x;
+        sbb += y * y;
+        sab += x * y;
+    }
+    let ma = sa / nf;
+    let mb = sb / nf;
+    let va = saa / nf - ma * ma;
+    let vb = sbb / nf - mb * mb;
+    if va <= 1e-9 || vb <= 1e-9 {
+        return 0.0; // flat scores carry no information
+    }
+    let r = ((sab / nf - ma * mb) / (va.sqrt() * vb.sqrt())) as f32;
+    ((r - 0.15) / 0.40).clamp(0.0, 1.0)
+}
+
+/// Residual chroma noise of the stacked RGB result (ADU16 sigma), from the
+/// horizontal second difference of the U plane sampled at ±2 px (skips the
+/// debayer-correlated immediate neighbours). Drives the ADAPTIVE chroma
+/// smoothing: a clean stack keeps its real color detail (lunar mineral
+/// tinting) instead of being blurred by a fixed-radius pass.
+fn estimate_stack_chroma_noise(rgb: &[u16], w: usize, h: usize) -> f32 {
+    let n = w * h;
+    if rgb.len() < n * 3 || w < 16 || h < 8 {
+        return 0.0;
+    }
+    let u_at = |x: usize, y: usize| -> f32 {
+        let i = (y * w + x) * 3;
+        -0.14713 * rgb[i] as f32 - 0.28886 * rgb[i + 1] as f32 + 0.436 * rgb[i + 2] as f32
+    };
+    let mut res: Vec<f32> = Vec::with_capacity(200_000);
+    let step_y = (h / 400).max(1);
+    let mut y = 1;
+    while y < h - 1 && res.len() < 200_000 {
+        let mut x = 2;
+        while x < w - 2 {
+            let d = u_at(x, y) - 0.5 * (u_at(x - 2, y) + u_at(x + 2, y));
+            res.push(d.abs());
+            x += 7;
+        }
+        y += step_y;
+    }
+    if res.len() < 64 {
+        return 0.0;
+    }
+    res.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mad = res[res.len() / 2];
+    // The second difference of iid noise carries 1.5× the variance — undo it.
+    mad * 1.4826 / 1.2247
 }
 
 /// **Dual-Frequency Planet Scorer (V3 Elite)**
@@ -290,9 +418,13 @@ fn process_analysis_frame(
     warping_analysis: bool,
     anchor_pyramid_ref: Option<&Vec<u16>>,
     anchor_mono_ref: &Vec<u16>,
-    _use_sad: bool,
-    _cog_cx: f32,
-    _cog_cy: f32,
+    // COG-ASSIST (compact object on black sky, e.g. handheld phone videos):
+    // when true, `ref_cog_x/y` hold the reference frame's brightness centroid
+    // (ROI coords, full-res) and each frame's centroid delta PRE-CENTERS the
+    // SAD search — unbounded motion range, texture-refined precision.
+    cog_assist: bool,
+    ref_cog_x: f32,
+    ref_cog_y: f32,
     _target_type: &str,
     // When true (large lunar disc), align on surface texture instead of the
     // brightness CoG — the disk is too big/asymmetric for stable centroiding.
@@ -308,6 +440,27 @@ fn process_analysis_frame(
 
     // ALL MODES now use Phase Correlation (SAD) and Noise-Resistant scoring.
     raw_to_u16_buffer_into(raw, roi_img_w, roi_img_h, bpp, &mut buffers.raw_u16);
+
+    // TRUE-COLOR FIX: for RGB inputs (rgb48/rgb24 — converted SER CID=100 and
+    // FFmpeg color streams) raw_to_u16_buffer_into yields an INTERLEAVED RGB
+    // buffer (3·w·h), but everything below (downscale, scoring, SAD, 40×40
+    // grid, CoG) indexes it as MONO w·h — the analysis was effectively run on
+    // an interleaved-channel corruption of the top third of the frame, while
+    // the reference anchor (raw_to_u16_buffer_into_roi) IS proper mono. That
+    // asymmetry produced garbage shifts/scores for true-color videos ("FFmpeg
+    // no detecta bien las estructuras"); Bayer/mono inputs (bpp 1-2) were
+    // never affected. Collapse to the SAME (r+g+b)/3 mono as the reference.
+    let px = roi_img_w * roi_img_h;
+    if buffers.raw_u16.len() >= px * 3 {
+        for i in 0..px {
+            let off = i * 3;
+            let r = buffers.raw_u16[off] as u32;
+            let g = buffers.raw_u16[off + 1] as u32;
+            let b = buffers.raw_u16[off + 2] as u32;
+            buffers.raw_u16[i] = ((r + g + b) / 3) as u16;
+        }
+        buffers.raw_u16.truncate(px);
+    }
 
     // ANALYSIS @ HALF RESOLUTION (R13): scoring, global matching and the
     // 40×40 grid all run on a 2× reduced image — ~4× faster, with a noise-
@@ -349,7 +502,22 @@ fn process_analysis_frame(
     let search_y = (hh - search_h) / 2;
 
     let (sdx, sdy) = if let Some(pyr) = anchor_pyramid_ref {
-        find_best_match_sad_pyramid(
+        // COG PRE-CENTERING: the fixed search window covers ~±128 full-res px.
+        // Handheld phone videos move MUCH more — frames beyond the window got
+        // garbage shifts and stacked as displaced ghosts. For a compact object
+        // on black sky the centroid delta is an unbounded-range prior; the SAD
+        // then only refines around it (texture precision preserved).
+        let (init_dx, init_dy) = if cog_assist {
+            let (fcx, fcy) =
+                compute_robust_geometric_center(&buffers.half_u16, hw, hh, 0, 0);
+            (
+                (fcx - ref_cog_x / 2.0).round() as isize,
+                (fcy - ref_cog_y / 2.0).round() as isize,
+            )
+        } else {
+            (0, 0)
+        };
+        crate::alignment::find_best_match_sad_pyramid_offset(
             anchor_mono_ref,
             &buffers.lap_out,
             pyr,
@@ -364,6 +532,8 @@ fn process_analysis_frame(
             64,
             2,
             16,
+            init_dx,
+            init_dy,
         )
     } else {
         (0.0, 0.0)
@@ -620,6 +790,9 @@ async fn perform_standardized_analysis(
     let mut ref_cog_cy = th as f32 / 2.0;
     // Decided once from the reference frame; threaded into every per-frame call.
     let mut large_disc = false;
+    // COG-ASSIST for handheld/phone videos (compact disc on black sky): the
+    // centroid delta pre-centers each frame's SAD search → unbounded motion.
+    let mut cog_assist = false;
 
     let analysis_ref_idx = select_signal_frame_index(&r, tw, th, tbp, cid, tf / 2);
     emit_progress(app, &get_msg("Preparando referencia..."), 4.0, None);
@@ -676,6 +849,23 @@ async fn perform_standardized_analysis(
             }
         }
 
+        // COG-ASSIST DETECTION: for a compact bright object on black sky
+        // (typical handheld phone capture) the reference centroid becomes the
+        // motion prior for every frame's SAD search. Coordinates are ROI-local
+        // (0,0-based) to match the per-frame centroid computed on the half-res
+        // ROI buffer.
+        cog_assist = is_compact_object_on_black(&tmp, rw, rh);
+        if cog_assist {
+            let (acx, acy) = compute_robust_geometric_center(&tmp, rw, rh, 0, 0);
+            ref_cog_cx = acx;
+            ref_cog_cy = acy;
+            log_to_front(
+                app,
+                "INFO",
+                "Objeto compacto sobre cielo negro: pre-centrado CoG activado (movimiento amplio soportado).",
+            );
+        }
+
         // R13 HALF-RES: the anchor map must go through the SAME pipeline as
         // the per-frame maps (2× downscale → enhance) or the SAD would be
         // asymmetric. See process_analysis_frame.
@@ -715,13 +905,14 @@ async fn perform_standardized_analysis(
             warping_analysis,
             a_pyr_ref.as_ref(),
             a_mono_ref,
-            use_sad,
+            cog_assist,
             ref_cog_cx,
             ref_cog_cy,
             &target_type, // NEW
             large_disc,
         )
     };
+    let _ = use_sad;
     let mut stats = Vec::new();
     if r.is_ffmpeg() {
         let bin = match rt {
@@ -765,9 +956,13 @@ async fn perform_standardized_analysis(
                     tx_empty.send(vec![0u8; frame_size]).unwrap();
                 }
 
+                let prod_cancel = state.cancel_requested.clone();
                 std::thread::spawn(move || {
                     let mut frame_idx = 0;
                     while let Ok(mut buffer) = rx_empty.recv() {
+                        if prod_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            break; // cancelado: dejar de decodificar ya
+                        }
                         if it.read_frame_into(&mut buffer) {
                             if tx_full.send((frame_idx, buffer)).is_err() {
                                 break;
@@ -791,10 +986,14 @@ async fn perform_standardized_analysis(
                         || AnalysisBufferSet::new(rw * rh),
                         |bs, (i, raw): (usize, Vec<u8>)| {
                             let c = cs.fetch_add(1, Ordering::Relaxed);
+                            // Cancel check on EVERY frame (atomic load ≈ free).
+                            // The old per-50 check only skipped THAT one frame;
+                            // all others still ran the full analysis (minutes
+                            // of dead work after pressing Cancel).
+                            if check_cancel(&sc, req_id) {
+                                return FrameAlignmentData::empty(i);
+                            }
                             if c % 50 == 0 {
-                                if check_cancel(&sc, req_id) {
-                                    return FrameAlignmentData::empty(i);
-                                }
                                 emit_progress(
                                     &ac,
                                     &format!("Analizando: {}/{}", c, tf),
@@ -835,10 +1034,14 @@ async fn perform_standardized_analysis(
                     || (rt.clone(), AnalysisBufferSet::new(rw * rh)),
                     |(rl, bs), i| {
                         let c = cf.fetch_add(1, Ordering::Relaxed);
+                        // Cancel check on EVERY frame — this is the SER path:
+                        // the old per-10 check only skipped that single frame,
+                        // so cancelling a SER analysis still burned through the
+                        // whole remaining video.
+                        if check_cancel(&sc, req_id) {
+                            return FrameAlignmentData::empty(i);
+                        }
                         if c % 10 == 0 {
-                            if check_cancel(&sc, req_id) {
-                                return FrameAlignmentData::empty(i);
-                            }
                             emit_progress(
                                 &ac,
                                 &format!("Analizando: {}/{}", c, tf),
@@ -854,6 +1057,14 @@ async fn perform_standardized_analysis(
     }
     if stats.is_empty() {
         return Err("Error: Sin frames.".into());
+    }
+    // Cancelacion: los workers devolvieron frames vacios a partir del aviso —
+    // abortar AHORA, antes de escribir un cache de analisis corrupto.
+    if state
+        .cancel_requested
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err("Cancelado por el usuario".into());
     }
     let mut qg: Vec<f32> = stats.iter().map(|s| s.score as f32).collect();
     let mut si: Vec<usize> = (0..stats.len()).collect();
@@ -975,6 +1186,10 @@ async fn analyze_video_v2(
     anchor_override: Option<Vec<i32>>,
     progress_prefix: Option<String>,
 ) -> Result<AnalysisResult, String> {
+    // Nueva operacion de usuario: limpiar cualquier cancelacion previa.
+    state
+        .cancel_requested
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     perform_standardized_analysis(
         &app,
         &state,
@@ -1013,6 +1228,199 @@ fn ver_licencia(state: State<'_, AppState>) -> AppStatus {
 }
 
 // WRAPPER: PARALLEL LOAD
+/// Persistent-stream FFmpeg batch feeder: ONE sequential decode pass serves ALL
+/// RAM batches of a stacking pass. The previous per-batch loader opened a new
+/// ffmpeg process per batch and decoded from frame 0 every time — with N
+/// batches that is O(N²) redundant decoding (a 28-batch stack decoded ~14× the
+/// video). Batches arrive in ascending order (indices are sorted), so a single
+/// stream can feed them all; the per-batch LZ4 cache still makes pass 2 free.
+#[allow(clippy::too_many_arguments)]
+fn stream_frames_ffmpeg_chunked(
+    reader: &FfmpegReader,
+    path: &str,
+    app: &tauri::AppHandle,
+    chunks: &[Vec<usize>],
+    tx: &std::sync::mpsc::SyncSender<std::collections::HashMap<usize, Vec<u16>>>,
+    width: usize,
+    height: usize,
+    bpp: usize,
+    color_id: i32,
+    pass_label: &str,
+    total_batches: usize,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let cache_dir = std::env::temp_dir().join("astro_stacker_cache");
+    if !cache_dir.exists() {
+        let _ = std::fs::create_dir_all(&cache_dir);
+    }
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    let path_hash = hasher.finish();
+
+    let is_color_stream = color_id < 8 || color_id > 11;
+    let stream_bpp = if is_color_stream { 6usize } else { 2usize };
+    let mut raw_buf = vec![0u8; width * height * stream_bpp];
+
+    let mut it: Option<FfmpegStreamIterator> = None;
+    let mut pos: usize = 0; // next frame index the stream will yield
+    let mut use_gpu = true;
+    let t_start = std::time::Instant::now();
+
+    for (batch_idx, indices) in chunks.iter().enumerate() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let prefix = format!(
+            "{}Cargando Lote {}/{}",
+            pass_label,
+            batch_idx + 1,
+            total_batches
+        );
+
+        // 1. LZ4 cache first (pass 2 and re-stacks are pure disk reads).
+        let batch_hash = {
+            let mut bh = DefaultHasher::new();
+            indices.hash(&mut bh);
+            bh.finish()
+        };
+        let cache_file = cache_dir.join(format!("batch_{}_{}.bin.lz4", path_hash, batch_hash));
+        if cache_file.exists() {
+            if let Ok(compressed) = std::fs::read(&cache_file) {
+                if let Ok(raw) = lz4_flex::decompress_size_prepended(&compressed) {
+                    if let Ok(map) = bincode::deserialize::<
+                        std::collections::HashMap<usize, Vec<u16>>,
+                    >(&raw)
+                    {
+                        emit_progress(app, &format!("{}: Recuperado de NVMe", prefix), 100.0, None);
+                        if tx.send(map).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 2. Serve from the persistent sequential stream.
+        let wanted: std::collections::HashSet<usize> = indices.iter().copied().collect();
+        let last_wanted = indices.iter().copied().max().unwrap_or(0);
+        let mut map = std::collections::HashMap::with_capacity(indices.len());
+        let mut cancelled = false;
+
+        loop {
+            if it.is_none() {
+                match FfmpegStreamIterator::new(
+                    path,
+                    width,
+                    height,
+                    0,
+                    0,
+                    width,
+                    height,
+                    color_id,
+                    &reader.ffmpeg_path,
+                    None, // sequential from 0: exact indices
+                    use_gpu,
+                    &reader.codec_name,
+                    reader.rotation,
+                ) {
+                    Ok(v) => {
+                        it = Some(v);
+                        pos = 0;
+                        map.retain(|_, _| false); // restart: refill this batch
+                    }
+                    Err(_) if use_gpu => {
+                        use_gpu = false;
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            let s = it.as_mut().expect("stream just ensured");
+            let mut stream_ok = true;
+            while pos <= last_wanted {
+                if pos % 32 == 0 && cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    cancelled = true;
+                    break;
+                }
+                if !s.read_frame_into(&mut raw_buf) {
+                    stream_ok = false;
+                    break;
+                }
+                if wanted.contains(&pos) {
+                    map.insert(pos, raw_to_u16_buffer(&raw_buf, width, height, bpp));
+                    if map.len() % 25 == 0 || map.len() == indices.len() {
+                        let elapsed = t_start.elapsed().as_secs_f32().max(0.001);
+                        emit_progress(
+                            app,
+                            &format!(
+                                "{} - {}/{} frames (escaneo {:.0} FPS)",
+                                prefix,
+                                map.len(),
+                                indices.len(),
+                                pos as f32 / elapsed
+                            ),
+                            (map.len() as f32 / indices.len() as f32) * 100.0,
+                            None,
+                        );
+                    }
+                }
+                pos += 1;
+            }
+
+            if cancelled || map.len() == indices.len() {
+                break;
+            }
+            if !stream_ok {
+                // Decoder died mid-pass. One retry on CPU decoding from 0;
+                // afterwards fill any stragglers via single-frame fallback.
+                it = None;
+                if use_gpu {
+                    use_gpu = false;
+                    continue;
+                }
+                for &idx in indices {
+                    if !map.contains_key(&idx) {
+                        let raw = reader.get_frame(idx, color_id);
+                        if !raw.is_empty() {
+                            map.insert(idx, raw_to_u16_buffer(&raw, width, height, bpp));
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        if cancelled {
+            break;
+        }
+
+        // 3. Bounded LZ4 cache save (same limits as before).
+        const MAX_BATCH_CACHE_BYTES: usize = 768 * 1024 * 1024;
+        const MAX_CACHE_DIR_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+        if let Ok(serialized) = bincode::serialize(&map) {
+            if serialized.len() <= MAX_BATCH_CACHE_BYTES {
+                let compressed = lz4_flex::compress_prepend_size(&serialized);
+                let dir_size: u64 = std::fs::read_dir(&cache_dir)
+                    .map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum())
+                    .unwrap_or(0);
+                if dir_size + compressed.len() as u64 <= MAX_CACHE_DIR_BYTES {
+                    let _ = std::fs::write(&cache_file, compressed);
+                }
+            }
+        }
+
+        if tx.send(map).is_err() {
+            break;
+        }
+    }
+}
+
+#[allow(dead_code)] // superseded by stream_frames_ffmpeg_chunked (kept for reference)
 fn load_frames_ffmpeg_buffered(
     reader: &FfmpegReader,
     path: &str,
@@ -1074,26 +1482,93 @@ fn load_frames_ffmpeg_buffered(
 
     let t_start = std::time::Instant::now();
 
-    // --- 2. OPTIMIZED BATCH FRAME EXTRACTION ---
-    // Uses get_frames_batch() with a SINGLE FFmpeg process per sub-batch of 200 frames
-    // instead of sequential get_frame() which requires mutex lock per frame.
+    // --- 2. FRAME-ACCURATE SEQUENTIAL EXTRACTION (single pass, exact indices) ---
+    // The old path (get_frames_batch) used FAST INPUT SEEKING (-ss before -i)
+    // plus select by RELATIVE frame number, assuming the first decoded frame
+    // after each seek was exactly `first_idx`. With inter-frame codecs
+    // (H.264/HEVC in MOV/MP4) and fractional fps that assumption breaks: the
+    // stack received THE WRONG FRAMES, so the analysis shifts were applied to
+    // different images → smeared/dim stacks, corner artifacts. It also applied
+    // an `unsharp` deblock filter the analysis pipeline does NOT apply
+    // (asymmetric preprocessing). We now stream the video SEQUENTIALLY through
+    // the SAME FfmpegStreamIterator the analysis uses: exact frame indices,
+    // identical preprocessing, and ONE ffmpeg process per batch instead of one
+    // per 200 frames. SER-style correctness for compressed videos.
     let mut final_map = std::collections::HashMap::with_capacity(total_frames);
-    let sub_batch_size = 200;
-    for (sub_idx, sub_chunk) in indices.chunks(sub_batch_size).enumerate() {
-        let sub_start = sub_idx * sub_batch_size;
-        let elapsed = t_start.elapsed().as_secs_f32().max(0.001);
-        let fps = if sub_start > 0 { sub_start as f32 / elapsed } else { 0.0 };
-        emit_progress(app, &format!("{} - Frames {}-{}/{} ({:.0} FPS)", message_prefix, sub_start + 1, (sub_start + sub_chunk.len()).min(total_frames), total_frames, fps), (sub_start as f32 / total_frames as f32) * 100.0, None);
-        match reader.get_frames_batch(sub_chunk, color_id) {
-            Ok(raw_map) => {
-                let u16_entries: Vec<(usize, Vec<u16>)> = raw_map.into_par_iter().map(|(idx, raw_bytes)| {
-                    (idx, raw_to_u16_buffer(&raw_bytes, width, height, bpp))
-                }).collect();
-                for (idx, u16_buf) in u16_entries { final_map.insert(idx, u16_buf); }
+    let wanted: std::collections::HashSet<usize> = indices.iter().copied().collect();
+    let last_wanted = indices.iter().copied().max().unwrap_or(0);
+    let is_color_stream = color_id < 8 || color_id > 11;
+    let stream_bpp = if is_color_stream { 6usize } else { 2usize };
+    let mut raw_buf = vec![0u8; width * height * stream_bpp];
+    // Cancelacion cooperativa: sin esto, cancelar durante la decodificacion de
+    // un lote grande obligaria a esperar minutos a que FFmpeg lo termine.
+    let cancel_flag = app.state::<AppState>().cancel_requested.clone();
+
+    for use_gpu in [true, false] {
+        final_map.clear();
+        let it = FfmpegStreamIterator::new(
+            path,
+            width,
+            height,
+            0,
+            0,
+            width,
+            height,
+            color_id,
+            &reader.ffmpeg_path,
+            None, // NO seeking: sequential from frame 0 → indices are exact
+            use_gpu,
+            &reader.codec_name,
+            reader.rotation,
+        );
+        let mut it = match it {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let mut frame_idx: usize = 0;
+        while it.read_frame_into(&mut raw_buf) {
+            if frame_idx % 32 == 0 && cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(std::collections::HashMap::new()); // cancelado
             }
-            Err(_) => {
-                for &idx in sub_chunk {
-                    let raw = reader.get_frame(idx, color_id);
+            if wanted.contains(&frame_idx) {
+                final_map.insert(frame_idx, raw_to_u16_buffer(&raw_buf, width, height, bpp));
+                let got = final_map.len();
+                if got % 50 == 0 || got == total_frames {
+                    let elapsed = t_start.elapsed().as_secs_f32().max(0.001);
+                    let fps = frame_idx as f32 / elapsed;
+                    emit_progress(
+                        app,
+                        &format!(
+                            "{} - {}/{} frames (escaneo {:.0} FPS)",
+                            message_prefix, got, total_frames, fps
+                        ),
+                        (got as f32 / total_frames as f32) * 100.0,
+                        None,
+                    );
+                }
+                if got == total_frames {
+                    break; // all collected: stop decoding early
+                }
+            }
+            if frame_idx >= last_wanted {
+                break;
+            }
+            frame_idx += 1;
+        }
+
+        if final_map.len() == total_frames {
+            break; // complete set with this decoder mode
+        }
+        // GPU decode produced an incomplete stream → retry once on CPU.
+    }
+
+    // Last-resort fill for any frame still missing (corrupt tail, etc.).
+    if final_map.len() != total_frames {
+        for &idx in indices {
+            if !final_map.contains_key(&idx) {
+                let raw = reader.get_frame(idx, color_id);
+                if !raw.is_empty() {
                     final_map.insert(idx, raw_to_u16_buffer(&raw, width, height, bpp));
                 }
             }
@@ -1148,7 +1623,12 @@ async fn stack_video_liquid_warping(
     is_v3: bool,
     target_type: String, // NEW
     keep_full_frame: Option<bool>, // NEW: no recortar bordes (mantener encuadre completo)
+    align_rgb: Option<bool>,       // NEW: alineacion RGB automatica (switch de usuario)
 ) -> Result<String, String> {
+    // Nueva operacion de usuario: limpiar cualquier cancelacion previa.
+    state
+        .cancel_requested
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     stack_video_liquid_warping_impl(
         &app,
         &state,
@@ -1170,6 +1650,7 @@ async fn stack_video_liquid_warping(
         target_type,
         None,
         keep_full_frame,
+        align_rgb,
     )
     .await
 }
@@ -1199,6 +1680,7 @@ pub async fn stack_video_liquid_warping_impl(
     target_type: String,
     progress_prefix: Option<String>,
     keep_full_frame: Option<bool>,
+    align_rgb: Option<bool>,
 ) -> Result<String, String> {
     let app = app.clone();
     let is_surface = is_surface || is_surface_target(&target_type);
@@ -1278,40 +1760,92 @@ pub async fn stack_video_liquid_warping_impl(
     let t_low = target_type.to_lowercase();
     let is_surface_logic = t_low.contains("superficie") || t_low.contains("surface") || t_low.contains("luna") || t_low.contains("sol");
 
+    // LARGE-DISC EARLY DETECTION (BEFORE frame selection): a big lunar disc in
+    // Disco must use the PURE per-AP frame selection below — the AS!4 "stack by
+    // parts" that makes Superficie sharp. The planetary grid-voting path adds a
+    // global-popularity filter that dilutes each AP's local picks (softer
+    // stacks on big discs). Detected once from the best analysis frame; small
+    // planets keep grid-voting untouched.
+    let large_disc = if !is_surface_logic && !custom_points.is_empty() {
+        let det_idx = all_stats
+            .iter()
+            .max_by_key(|f| f.score)
+            .map(|f| f.idx)
+            .unwrap_or(0);
+        let det_raw = r.get_frame(det_idx, r.color_id());
+        let mut det = raw_to_u16_buffer(&det_raw, w_in, h_in, r.bpp());
+        let px = w_in * h_in;
+        if det.len() >= px * 3 {
+            // True-color: collapse interleaved RGB to green before measuring.
+            for i in 0..px {
+                det[i] = det[i * 3 + 1];
+            }
+            det.truncate(px);
+        }
+        is_large_lunar_disc(&det, w_in, h_in)
+    } else {
+        false
+    };
+
     if warping_analysis && !custom_points.is_empty() {
         // 1. Calculate Per-AP Acceptance (The Secret to Max Sharpness)
         // For surface, we skip regional grid-voting and give each AP its absolute top-tier frames.
 
-        if is_surface_logic {
-            // PURE PER-AP SELECTION (Ultra Selective)
+        if is_surface_logic || large_disc {
+            // PURE PER-AP SELECTION (Ultra Selective) — surface AND large lunar
+            // discs: every AP independently stacks its own locally-best frames.
+            //
+            // ADAPTIVE CUTOFF BY LOCAL SNR: a fixed 0.70 cutoff assumes the AP's
+            // scores measure seeing. In faint/low-contrast APs (limb, dark
+            // maria, planet terminator) the scores are NOISE — a strict cutoff
+            // there rejects frames at random: less SNR, zero sharpness gain.
+            // `pearson_informativeness` (local-vs-global score correlation)
+            // gates each AP: informative → strict local cutoff (0.70, current
+            // behaviour); noisy → rank by GLOBAL score with a relaxed cutoff
+            // (0.45) so the AP simply averages the globally best frames. A
+            // minimum per-AP count prevents starved, visibly noisier patches.
+            let g_scores: Vec<f32> = all_stats.iter().map(|f| f.score as f32).collect();
+            let g_best = g_scores.iter().cloned().fold(1.0f32, f32::max);
+            let min_keep = (num_to_stack / 6).clamp(4, 16).min(num_to_stack.max(1));
+
             for (ap_idx, ap) in custom_points.iter().enumerate() {
                 let gx = ((ap.x / w_in as f32) * 40.0).floor().clamp(0.0, 39.0) as usize;
                 let gy = ((ap.y / h_in as f32) * 40.0).floor().clamp(0.0, 39.0) as usize;
                 let grid_idx = gy * 40 + gx;
 
-                let mut ap_stats: Vec<(usize, u64)> = all_stats.iter().map(|f| {
-                    let s = if let Some(gs) = &f.grid_scores { gs[grid_idx] } else { f.score };
-                    (f.idx, s)
-                }).collect();
-                ap_stats.sort_by(|a, b| b.1.cmp(&a.1));
+                let ap_scores: Vec<f32> = all_stats
+                    .iter()
+                    .map(|f| {
+                        (if let Some(gs) = &f.grid_scores { gs[grid_idx] } else { f.score }) as f32
+                    })
+                    .collect();
+                let ap_best = ap_scores.iter().cloned().fold(1.0f32, f32::max);
+                let w_info = pearson_informativeness(&ap_scores, &g_scores);
+                let cutoff_frac = 0.45 + 0.25 * w_info;
 
-                // NEW: Adaptive Local Quality Cutoff
-                // If the quality drops significantly relative to the best frame for this AP,
-                // we stop accepting frames even if we haven't reached the N% limit.
-                // 0.70: locally mediocre frames wash out granulation/filaments.
-                let best_ap_score = if let Some(&(_, s)) = ap_stats.first() { s as f32 } else { 0.0 };
-                let ap_cutoff = best_ap_score * 0.70;
+                let mut ranked: Vec<(usize, f32)> = all_stats
+                    .iter()
+                    .enumerate()
+                    .map(|(k, f)| {
+                        let blended = w_info * (ap_scores[k] / ap_best)
+                            + (1.0 - w_info) * (g_scores[k] / g_best);
+                        (f.idx, blended)
+                    })
+                    .collect();
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let best_blend = ranked.first().map(|&(_, s)| s).unwrap_or(1.0);
+                let ap_cutoff = best_blend * cutoff_frac;
 
-                // Every AP takes its own top N% independently
-                for rank in 0..num_to_stack {
-                    if let Some(&(idx, s)) = ap_stats.get(rank) {
-                        if (s as f32) < ap_cutoff {
-                            break; // Quality cliff reached, stop blurring this cráter!
-                        }
-                        global_active_indices.insert(idx);
-                        let mask = frame_acceptance_masks.entry(idx).or_insert_with(|| vec![false; custom_points.len()]);
-                        mask[ap_idx] = true;
+                // Every AP takes its own top N% independently.
+                let mut accepted = 0usize;
+                for &(idx, s) in ranked.iter().take(num_to_stack) {
+                    if s < ap_cutoff && accepted >= min_keep {
+                        break; // quality cliff reached — but never starve the AP
                     }
+                    global_active_indices.insert(idx);
+                    let mask = frame_acceptance_masks.entry(idx).or_insert_with(|| vec![false; custom_points.len()]);
+                    mask[ap_idx] = true;
+                    accepted += 1;
                 }
             }
         } else {
@@ -1419,7 +1953,7 @@ pub async fn stack_video_liquid_warping_impl(
             })
             .collect();
         scored.sort_by(|a, b| b.1.cmp(&a.1));
-        let max_allowed = if is_surface_logic {
+        let max_allowed = if is_surface_logic || large_disc {
             (num_to_stack as f32 * 1.25).ceil() as usize
         } else {
             num_to_stack
@@ -1460,6 +1994,10 @@ pub async fn stack_video_liquid_warping_impl(
     // We load them sequentially to maximize disk speed.
     // This buffer is used BOTH for Master Generation AND Final Stacking (Liquid).
 
+    // Cancelacion cooperativa: clonado (Arc) para poder pasarlo al hilo del
+    // prefetcher y consultarlo en los bucles pesados sin tocar `state`.
+    let cancel_flag = state.cancel_requested.clone();
+
     // Identify needed indices
     // OPTIMIZATION: DYNAMIC RAM BATCHING (Unified Logic)
     let mut sys = System::new_all();
@@ -1481,27 +2019,30 @@ pub async fn stack_video_liquid_warping_impl(
     let per_frame_real = (w_in as u64) * (h_in as u64) * channels * 2;
     let bytes_per_frame = ((per_frame_real as f64) * 1.6_f64).ceil() as u64;
 
-    // El stacker mantiene un LiquidScratch POR HILO (buffers de trabajo u16 +
-    // acumuladores f64/f32 del lienzo): ~78 bytes/px en color, ~32 en mono. En un
-    // equipo de muchos nucleos eso son DECENAS de GB, INDEPENDIENTE del tamano de
-    // lote — la causa real del cuelgue/thrashing (parece congelado, no consume
-    // recursos) y del OOM. Estimamos su tamano real y LIMITAMOS los hilos del
-    // apilado para que todo el scratch quepa en ~35% de la RAM usable.
+    // Scratch POR HILO del stacker: solo buffers de trabajo (u16 de entrada +
+    // 2-4 planos f32 de salida). Los acumuladores f64 del lienzo ya NO son
+    // por-hilo — son COMPARTIDOS con un mutex por canal — asi que el costo por
+    // hilo bajo ~4x y (casi) todos los nucleos caben en RAM. Aun asi se limita
+    // por seguridad en equipos con poca memoria libre (evita el thrashing que
+    // congelaba el equipo).
     let drz = (drizzle as f64).max(1.0);
     let n_in_px = (w_in as u64) * (h_in as u64);
     let n_out_px = ((w_in as f64 * drz) as u64) * ((h_in as f64 * drz) as u64);
     let per_scratch = if is_color_video {
-        n_out_px * 64 + n_in_px * 14 // 3×grad(f64) + 4×w(f32) + buffers u16
+        n_out_px * 16 + n_in_px * 14 // 4×w(f32) + buffers u16 (rgb+mono+edges)
     } else {
-        n_out_px * 24 + n_in_px * 8 // 1×grad(f64) + 2×w(f32) + buffers u16
+        n_out_px * 8 + n_in_px * 8 // 2×w(f32) + buffers u16
     };
 
     let hw_threads = rayon::current_num_threads().max(1) as u64;
-    let max_threads_ram = (((usable_ram as f64) * 0.35) as u64 / per_scratch.max(1)).max(1);
+    let max_threads_ram = (((usable_ram as f64) * 0.40) as u64 / per_scratch.max(1)).max(1);
     let stack_threads = hw_threads.min(max_threads_ram).max(1) as usize;
 
     let scratch_total = per_scratch * (stack_threads as u64);
-    let global_accum = n_out_px * 16 * channels; // acc_grad_* (direct + direct_w, f64)
+    // acc_grad_* (direct + direct_w, f64) — with double pass, pass 1 also holds
+    // the sigma-clip m2 plane (f64) and the lo/hi winsorization bounds (2×f32)
+    // coexist briefly between passes: budget 32 B/px/canal in that mode.
+    let global_accum = n_out_px * if double_pass { 32 } else { 16 } * channels;
 
     // Con sync_channel(1) el pico real son 3 lotes de frames a la vez (el que
     // apila main + el que espera en el canal + el que el prefetcher construye).
@@ -1540,10 +2081,13 @@ pub async fn stack_video_liquid_warping_impl(
         ),
         10.0,
         Some(format!(
-            "Aceleracion: {} · {} hilos ({} disponibles)",
+            "Aceleracion: {} · apilado {} de {} hilos{}",
             get_accel_label(),
             stack_threads,
-            hw_threads
+            hw_threads,
+            // FFmpeg decodes in ITS OWN process with its own threads — Task
+            // Manager shows those cores busy on top of the stacking pool.
+            if r.is_ffmpeg() { " + decodificador FFmpeg" } else { "" }
         )),
     );
 
@@ -1599,9 +2143,26 @@ pub async fn stack_video_liquid_warping_impl(
         let anchor_enhanced = enhance_for_alignment(&anchor_mono, w_in, h_in);
         let anchor_pyramid = downscale_integer(&anchor_enhanced, w_in, h_in, 4);
 
+        // COG-ASSIST for the master itself: with handheld motion beyond the
+        // SAD window, the reference frames would stack displaced and SMEAR the
+        // master — poisoning every downstream alignment. Same centroid prior
+        // as the analysis.
+        let master_cog_assist = is_compact_object_on_black(&anchor_mono, w_in, h_in);
+        let anchor_cog = if master_cog_assist {
+            Some(compute_robust_geometric_center(&anchor_mono, w_in, h_in, 0, 0))
+        } else {
+            None
+        };
+
         let ref_data: Vec<(Vec<u16>, (f32, f32))> = ref_indices
             .iter()
             .map(|&idx| {
+                // Cancelacion durante la generacion del master (decodifica y
+                // alinea ~20 frames grandes): frame vacio → el guard de slices
+                // lo ignora y el check de fase posterior aborta con Err.
+                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return (Vec::new(), (0.0f32, 0.0f32));
+                }
                 let f = r_ref.get_frame(idx, color_id);
                 let px_u16 = raw_to_u16_buffer(&f, w_in, h_in, bpp);
 
@@ -1620,7 +2181,14 @@ pub async fn stack_video_liquid_warping_impl(
                 let px_mono = px_expanded.chunks(3).map(|p| p[1]).collect::<Vec<u16>>();
                 let px_enh = enhance_for_alignment(&px_mono, w_in, h_in);
 
-                let shift = find_best_match_sad_pyramid(
+                let (init_dx, init_dy) = if let Some((acx, acy)) = anchor_cog {
+                    let (fcx, fcy) =
+                        compute_robust_geometric_center(&px_mono, w_in, h_in, 0, 0);
+                    ((fcx - acx).round() as isize, (fcy - acy).round() as isize)
+                } else {
+                    (0, 0)
+                };
+                let shift = crate::alignment::find_best_match_sad_pyramid_offset(
                     &anchor_enhanced,
                     &px_enh,
                     &anchor_pyramid,
@@ -1635,59 +2203,72 @@ pub async fn stack_video_liquid_warping_impl(
                     32,
                     4,
                     4,
+                    init_dx,
+                    init_dy,
                 );
 
                 (px_expanded, shift)
             })
             .collect();
 
-        let mut ref_acc = vec![0u32; w_in * h_in * 3];
-        // FIX: per-PIXEL counts. Dividing by the global frame count darkened
-        // every border pixel that fewer shifted frames covered, corrupting the
-        // reference's exposure statistics and its border texture.
-        let mut ref_cnt_px = vec![0u16; w_in * h_in];
+        // SUBPIXEL MASTER ACCUMULATION: the old integer-rounded shifts
+        // (dx.round()) landed every reference frame with up to ±0.5 px of
+        // jitter — the master came out convolved with ~1 px of blur, and EVERY
+        // per-AP alignment then refined against that slightly soft reference.
+        // Bilinear sub-pixel placement keeps the reference crisp (AS!4-style),
+        // which sharpens the whole downstream chain for free.
+        let mut ref_acc = vec![0.0f32; w_in * h_in * 3];
+        // Per-PIXEL weights: dividing by the global frame count darkened every
+        // border pixel that fewer shifted frames covered.
+        let mut ref_cnt_px = vec![0.0f32; w_in * h_in];
 
-        for (px_rgb, (dx, dy)) in ref_data {
-            let off_x = dx.round() as isize;
-            let off_y = dy.round() as isize;
-
-            let start_y = if off_y > 0 { off_y as usize } else { 0 };
-            let end_y = if off_y < 0 { (h_in as isize + off_y) as usize } else { h_in };
-            let start_x = if off_x > 0 { off_x as usize } else { 0 };
-            let end_x = if off_x < 0 { (w_in as isize + off_x) as usize } else { w_in };
-
-            for y in start_y..end_y {
-                let sy = (y as isize - off_y) as usize;
-                let s_row = sy * w_in;
-                let t_row = y * w_in;
-
-                let sx = start_x as isize - off_x;
-                let t_start = (t_row + start_x) * 3;
-                let t_end = (t_row + end_x) * 3;
-                let s_start = (s_row + sx as usize) * 3;
-                let s_end = s_start + (end_x - start_x) * 3;
-
-                if t_end <= ref_acc.len() && s_end <= px_rgb.len() {
-                    let tgt_slice = &mut ref_acc[t_start..t_end];
-                    let src_slice = &px_rgb[s_start..s_end];
-
-                    for (tgt, &src) in tgt_slice.iter_mut().zip(src_slice.iter()) {
-                        *tgt += src as u32;
-                    }
-                    for c in ref_cnt_px[(t_row + start_x)..(t_row + end_x)].iter_mut() {
-                        *c += 1;
-                    }
-                }
+        for (px_rgb, (dx, dy)) in &ref_data {
+            if px_rgb.is_empty() {
+                continue; // cancelled placeholder
             }
+            let (dx, dy) = (*dx, *dy);
+            ref_acc
+                .par_chunks_mut(w_in * 3)
+                .zip(ref_cnt_px.par_chunks_mut(w_in))
+                .enumerate()
+                .for_each(|(y, (acc_row, cnt_row))| {
+                    let syf = y as f32 - dy;
+                    if syf < 0.0 || syf >= (h_in - 1) as f32 {
+                        return;
+                    }
+                    let y0 = syf as usize;
+                    let fy = syf - y0 as f32;
+                    for x in 0..w_in {
+                        let sxf = x as f32 - dx;
+                        if sxf < 0.0 || sxf >= (w_in - 1) as f32 {
+                            continue;
+                        }
+                        let x0 = sxf as usize;
+                        let fx = sxf - x0 as f32;
+                        let w00 = (1.0 - fx) * (1.0 - fy);
+                        let w10 = fx * (1.0 - fy);
+                        let w01 = (1.0 - fx) * fy;
+                        let w11 = fx * fy;
+                        let i00 = (y0 * w_in + x0) * 3;
+                        let i01 = i00 + w_in * 3;
+                        for c in 0..3 {
+                            acc_row[x * 3 + c] += px_rgb[i00 + c] as f32 * w00
+                                + px_rgb[i00 + 3 + c] as f32 * w10
+                                + px_rgb[i01 + c] as f32 * w01
+                                + px_rgb[i01 + 3 + c] as f32 * w11;
+                        }
+                        cnt_row[x] += 1.0;
+                    }
+                });
         }
 
         let mut final_ref_clean = vec![0u16; w_in * h_in * 3];
         for i in 0..w_in * h_in {
-            let c = ref_cnt_px[i] as u32;
-            if c > 0 {
-                final_ref_clean[i * 3] = (ref_acc[i * 3] / c) as u16;
-                final_ref_clean[i * 3 + 1] = (ref_acc[i * 3 + 1] / c) as u16;
-                final_ref_clean[i * 3 + 2] = (ref_acc[i * 3 + 2] / c) as u16;
+            let c = ref_cnt_px[i];
+            if c > 0.0 {
+                final_ref_clean[i * 3] = (ref_acc[i * 3] / c + 0.5).min(65535.0) as u16;
+                final_ref_clean[i * 3 + 1] = (ref_acc[i * 3 + 1] / c + 0.5).min(65535.0) as u16;
+                final_ref_clean[i * 3 + 2] = (ref_acc[i * 3 + 2] / c + 0.5).min(65535.0) as u16;
             }
         }
 
@@ -1776,7 +2357,9 @@ pub async fn stack_video_liquid_warping_impl(
     // the ground-truth harness proved for surface that ANY asymmetric
     // preprocessing shifts the SAD minimum and costs sub-pixel accuracy.
     // Master and frames now share the exact same pipeline in every category.
-    let align_amount: f32 = if is_surface_logic { 4.0 } else { 6.0 };
+    // Large lunar discs use the surface enhancement amount: 6× over-boosts a
+    // texture-rich disc (amplified noise → false SAD minima → soft warp).
+    let align_amount: f32 = if is_surface_logic || large_disc { 4.0 } else { 6.0 };
     let mut master_edges =
         enhance_for_alignment_with_amount(&master_mono, w_in, h_in, align_amount);
 
@@ -1839,9 +2422,17 @@ pub async fn stack_video_liquid_warping_impl(
     // black sky, so it needs the LIMB-DOT protections (edge-normal projection +
     // limb AP damping) that are otherwise surface-only. Without them the sharp,
     // texture-aligned Moon shows periodic limb scallops/dots (aperture problem of
-    // APs straddling the sky/disk boundary). Detected once from the master; small
-    // planets (tiny disc) stay false and keep their existing behaviour untouched.
-    let large_disc = !is_surface_logic && use_liquid && is_large_lunar_disc(&master_mono, w_in, h_in);
+    // APs straddling the sky/disk boundary). Primary source: the EARLY detection
+    // (best analysis frame, before frame selection). ROBUSTNESS: for FFmpeg
+    // inputs get_frame can return a black buffer on a failed seek/spawn — the
+    // early detection would silently come back false and shut down the whole
+    // large-disc path (dark + blurry stack). The master mono is built
+    // unconditionally from frames that demonstrably decoded, so OR-ing it in
+    // guarantees the flag even if the early probe failed. (Only the frame
+    // selection upstream depends on the early value alone.)
+    let large_disc = (large_disc
+        || (!is_surface_logic && is_large_lunar_disc(&master_mono, w_in, h_in)))
+        && use_liquid;
     // Drives ONLY the limb-dot mitigations (NOT normalization, cutoffs, the
     // outlier filter, etc.) so the planetary look/behaviour is preserved.
     let limb_protect = is_surface_logic || large_disc;
@@ -2020,8 +2611,11 @@ pub async fn stack_video_liquid_warping_impl(
     // the warp field follow individual seeing cells instead of low-passing
     // them across ~8 AP spans (sharper granulation/filaments). Planets keep
     // K=8 (sparser grids need the smoothing).
-    let idw_power_v3 = if is_surface_logic { 1.55 } else { 1.75 };
-    let idw_top_k = if is_surface_logic { 4 } else { 8 };
+    // Large lunar discs use the surface IDW tuning: with a dense grid over the
+    // disc, K=4 keeps the warp local (follows seeing cells → sharper texture);
+    // K=8 stays for sparse small-planet grids that need the smoothing.
+    let idw_power_v3 = if is_surface_logic || large_disc { 1.55 } else { 1.75 };
+    let idw_top_k = if is_surface_logic || large_disc { 4 } else { 8 };
     let (warp_indices, warp_weights) = compute_idw_map_for_output(
         w_out,
         h_out,
@@ -2032,6 +2626,12 @@ pub async fn stack_video_liquid_warping_impl(
         idw_power_v3,
         idw_top_k,
     );
+
+    // Phase-boundary cancel check: master generation and the IDW map are the
+    // two long pre-stacking stages — abort here instead of starting the passes.
+    if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("Cancelado por el usuario".into());
+    }
 
     // --- STEP 5: BATCH PROCESSING LOOP ---
     // GLOBAL PROGRESS COUNTER
@@ -2069,39 +2669,45 @@ pub async fn stack_video_liquid_warping_impl(
         let pre_color_id = color_id;
         let pre_ffmpeg_cmd = ffmpeg_cmd.clone();
         let pre_r_template = r.clone();
+        let pre_cancel = cancel_flag.clone();
 
         std::thread::spawn(move || {
-            let ffmpeg_reader_opt = match pre_r_template {
-                VideoInput::Ffmpeg(ref fr) => Some(fr.clone()),
-                _ => None,
-            };
+            let _ = &pre_ffmpeg_cmd;
+            if let VideoInput::Ffmpeg(ref fr) = pre_r_template {
+                // PERSISTENT STREAM: one sequential decode pass feeds every
+                // batch of this stacking pass (batches are ascending). The old
+                // per-batch loader re-decoded from frame 0 for each batch —
+                // O(N²) work that dominated wall time on compressed videos.
+                stream_frames_ffmpeg_chunked(
+                    fr,
+                    &pre_path,
+                    &pre_app,
+                    &pre_chunks,
+                    &tx,
+                    pre_w,
+                    pre_h,
+                    pre_bpp,
+                    pre_color_id,
+                    &pass_label,
+                    pre_total_batches,
+                    &pre_cancel,
+                );
+                return;
+            }
 
             for (batch_idx, indices_to_load) in pre_chunks.into_iter().enumerate() {
+                if pre_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break; // cancelado: no cargar mas lotes
+                }
                 let load_prefix = format!(
                     "{}Cargando Lote {}/{}",
                     pass_label,
                     batch_idx + 1,
                     pre_total_batches
                 );
+                let _ = &load_prefix;
 
-                let frame_map = if let Some(ref fr) = ffmpeg_reader_opt {
-                    // Use background FFmpeg-based loader
-                    load_frames_ffmpeg_buffered(
-                        fr,
-                        &pre_path,
-                        &pre_app,
-                        &indices_to_load,
-                        pre_w,
-                        pre_h,
-                        pre_bpp,
-                        pre_color_id,
-                        &pre_ffmpeg_cmd,
-                        fr.fps,
-                        &load_prefix,
-                        &fr.codec_name,
-                    )
-                    .unwrap_or_default()
-                } else {
+                let frame_map = {
                     // Direct Load (SER/AVI/FITS) — PARALLEL.
                     // Was a single-threaded for-loop: on a multicore box the whole
                     // selection loaded serially at ~1% CPU BEFORE any stacking ran
@@ -2123,6 +2729,11 @@ pub async fn stack_video_liquid_warping_impl(
                                 std::collections::HashMap::with_capacity(group.len());
                             if let Ok(r_local) = VideoInput::open(&pre_path, &pre_app) {
                                 for &idx in group {
+                                    // SER cancel: without this, cancelling mid-load
+                                    // waited for the whole batch to finish reading.
+                                    if pre_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                        break;
+                                    }
                                     let raw = r_local.get_frame(idx, pre_color_id);
                                     m.insert(
                                         idx,
@@ -2197,7 +2808,10 @@ pub async fn stack_video_liquid_warping_impl(
         0.0
     };
 
-    let surface_ref_p90 = if is_surface_logic {
+    // Per-frame exposure matching reference — also for large lunar discs:
+    // without it, transparency/exposure variations between frames average into
+    // a dimmer, lower-contrast (blurrier-looking) stack. Surface always had it.
+    let surface_ref_p90 = if is_surface_logic || large_disc {
         surface_luma_percentile_rgb(&master_clean_rgb, 90)
     } else {
         0.0
@@ -2227,6 +2841,21 @@ pub async fn stack_video_liquid_warping_impl(
     let mut acc_grad_g = GradientDomainStacker::new_empty();
     let mut acc_grad_b = GradientDomainStacker::new_empty();
 
+    // KAPPA-SIGMA REJECTION (AS!4-grade robustness at high stack %): pass 1
+    // additionally tracks the per-pixel second moment; between passes we build
+    // per-pixel winsorization bounds (mean ± k·σ) and pass 2 clamps every
+    // frame contribution to them. Transient artifacts (satellites, birds,
+    // dust, compression glitches) are statistical outliers at their pixels and
+    // get clamped to plausible values; real detail lives inside ±kσ of the
+    // seeing distribution and passes untouched. Only active with the double
+    // pass (same canvas guaranteed: drizzle 1×, no ROI).
+    let sigma_clip_enabled = total_passes == 2;
+    const SIGMA_CLIP_K: f32 = 4.0;
+    const SIGMA_CLIP_FLOOR: f32 = 6.0; // ADU16: guards zero-variance pixels
+    let mut clip_r: Option<(Vec<f32>, Vec<f32>)> = None;
+    let mut clip_g: Option<(Vec<f32>, Vec<f32>)> = None;
+    let mut clip_b: Option<(Vec<f32>, Vec<f32>)> = None;
+
     // Pool ACOTADO para el apilado: fija el numero de workers a `stack_threads`
     // (calculado por la RAM), asi el scratch por-hilo NO desborda la memoria en
     // equipos de muchos nucleos. Si la creacion falla, cae al pool global.
@@ -2245,9 +2874,27 @@ pub async fn stack_video_liquid_warping_impl(
     let rx = spawn_prefetcher(pass_label.clone());
     global_align_counter.store(0, std::sync::atomic::Ordering::Relaxed);
 
-    acc_grad_r = if is_mono_stack { GradientDomainStacker::new_empty() } else { GradientDomainStacker::new_direct_only(w_out, h_out) };
-    acc_grad_g = GradientDomainStacker::new_direct_only(w_out, h_out);
-    acc_grad_b = if is_mono_stack { GradientDomainStacker::new_empty() } else { GradientDomainStacker::new_direct_only(w_out, h_out) };
+    // SHARED per-channel accumulators: each frame merges under a short-lived
+    // lock (merge is ~5-10% of the per-frame alignment+warp cost, and the R/G/B
+    // locks overlap between workers). This replaces the per-thread f64 canvas
+    // trio that multiplied RAM by the thread count. Lock order is always
+    // R → G → B, so no deadlock is possible.
+    // Pass 1 of a double-pass run tracks the second moment (m2) for the
+    // sigma-clip statistics; pass 2 and single-pass runs use the lean variant.
+    let track_variance = sigma_clip_enabled && pass == 0;
+    let mk_acc = |active: bool| {
+        if !active {
+            GradientDomainStacker::new_empty()
+        } else if track_variance {
+            GradientDomainStacker::new_direct_tracked(w_out, h_out)
+        } else {
+            GradientDomainStacker::new_direct_only(w_out, h_out)
+        }
+    };
+    let acc_r_mx = std::sync::Mutex::new(mk_acc(!is_mono_stack));
+    let acc_g_mx = std::sync::Mutex::new(mk_acc(true));
+    let acc_b_mx = std::sync::Mutex::new(mk_acc(!is_mono_stack));
+    let scratch_pool_mx: std::sync::Mutex<Vec<LiquidScratch>> = std::sync::Mutex::new(Vec::new());
 
     // PERF: master-side AP statistics are constant within a pass — compute
     // once instead of per frame × AP (recomputed per pass: the double-pass
@@ -2262,6 +2909,9 @@ pub async fn stack_video_liquid_warping_impl(
     );
 
     for (_batch_idx, chunk) in active_frames_data.chunks(frames_per_batch).enumerate() {
+        if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            break; // cancelado por el usuario
+        }
         let frame_map = match rx.recv() { Ok(m) => m, Err(_) => break };
         if frame_map.is_empty() { continue; }
 
@@ -2274,10 +2924,19 @@ pub async fn stack_video_liquid_warping_impl(
         let limb_normal_ref = &ap_limb_normal;
         let ap_mc_ref = &ap_master_contrast;
         let ap_ml_ref = &ap_master_lap;
+        // Sigma-clip bounds: None in pass 1 (statistics being gathered),
+        // Some(...) in pass 2 (winsorized accumulation).
+        let clip_r_ref = clip_r.as_ref();
+        let clip_g_ref = clip_g.as_ref();
+        let clip_b_ref = clip_b.as_ref();
 
-        let run_batch = || chunk.par_iter().fold(
-            || LiquidScratch::new(w_in, h_in, w_out, h_out, is_mono_stack),
-            |mut sc, frame_data| {
+        let run_batch = || chunk.par_iter().for_each_init(
+            || ScratchLease::take(&scratch_pool_mx, w_in, h_in, w_out, h_out, is_mono_stack),
+            |lease, frame_data| {
+                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return; // cancelado: no procesar mas frames
+                }
+                let sc = lease.sc.as_mut().expect("scratch lease always holds a buffer");
                 let completed = counter_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if completed % 25 == 0 {
                     emit_progress(app_ref, &format!("Zenith Elite V4: Procesando Frame {}/{}...", completed, total_frames_all), (completed as f32 / total_frames_all as f32) * 40.0 + 50.0, None);
@@ -2289,37 +2948,15 @@ pub async fn stack_video_liquid_warping_impl(
                     let mut render_dx = frame_data.x_shift - ref_dx;
                     let mut render_dy = frame_data.y_shift - ref_dy;
 
-                    if !is_surface_logic {
-                        if let Some(m_cog) = master_cog {
-                            // FIX COG PER-FRAME: Use peak-based threshold (same as master)
-                            // to ensure consistent disk detection across all frames.
-                            let f_cog = if is_color_video {
-                                let temp_mono: Vec<u16> = debayer_to_rgb(u16_data, w_in, h_in, color_id).chunks(3).map(|p| p[1]).collect();
-                                let f_peak = temp_mono.iter().copied().max().unwrap_or(2000) as f32;
-                                let f_cog_thresh = (f_peak * 0.15).max(512.0) as u16;
-                                crate::alignment::calculate_center_of_gravity(&temp_mono, w_in, h_in, f_cog_thresh)
-                            } else {
-                                let f_peak = u16_data.iter().copied().max().unwrap_or(2000) as f32;
-                                let f_cog_thresh = (f_peak * 0.15).max(512.0) as u16;
-                                crate::alignment::calculate_center_of_gravity(u16_data, w_in, h_in, f_cog_thresh)
-                            };
-                            if let Some(f_cog) = f_cog {
-                                // Refined Shift: Source_CoG - Master_CoG
-                                render_dx = f_cog.0 - m_cog.0;
-                                render_dy = f_cog.1 - m_cog.1;
-                            }
-                        }
-                    }
-
                     if is_mono_stack {
                         // MONO BRANCH: single-channel working copy, no triplication.
                         sc.mono_buf.copy_from_slice(u16_data);
-                        if is_surface_logic {
+                        if is_surface_logic || large_disc {
                             normalize_surface_frame_exposure_mono_inplace(&mut sc.mono_buf, surface_ref_p90);
                         }
                     } else {
                         debayer_into_buffer(u16_data, w_in, h_in, color_id, &mut sc.rgb_buf);
-                        if is_surface_logic {
+                        if is_surface_logic || large_disc {
                             normalize_surface_frame_exposure_inplace(&mut sc.rgb_buf, surface_ref_p90, false);
                         }
                         for i in 0..w_in * h_in {
@@ -2327,11 +2964,32 @@ pub async fn stack_video_liquid_warping_impl(
                         }
                     }
 
+                    // PLANETARY per-frame CoG re-centering — SMALL discs only.
+                    // A large lunar disc SKIPS this: its brightness centroid
+                    // wobbles with the phase (round-14 lesson) and would
+                    // override the texture-based analysis shift; it gets the
+                    // surface-style 4× verification below instead. Computed
+                    // from sc.mono_buf (already-debayered green) — the old code
+                    // ran a SECOND full debayer per frame just for this.
+                    if !is_surface_logic && !large_disc {
+                        if let Some(m_cog) = master_cog {
+                            // FIX COG PER-FRAME: Use peak-based threshold (same as master)
+                            // to ensure consistent disk detection across all frames.
+                            let f_peak = sc.mono_buf.iter().copied().max().unwrap_or(2000) as f32;
+                            let f_cog_thresh = (f_peak * 0.15).max(512.0) as u16;
+                            if let Some(f_cog) = crate::alignment::calculate_center_of_gravity(&sc.mono_buf, w_in, h_in, f_cog_thresh) {
+                                // Refined Shift: Source_CoG - Master_CoG
+                                render_dx = f_cog.0 - m_cog.0;
+                                render_dy = f_cog.1 - m_cog.1;
+                            }
+                        }
+                    }
+
                     let frame_score = frame_data.score as f32;
                     let q_weight_opt = compute_frame_weight_sigmoidal(frame_score, global_min_score, global_max_score, cat_profile.rejection_percentile, cat_profile.sigmoid_steepness);
 
                     if let Some(q_weight_raw) = q_weight_opt {
-                        let q_weight = if is_surface_logic {
+                        let q_weight = if is_surface_logic || large_disc {
                             q_weight_raw.powf(1.35).max(0.03)
                         } else {
                             q_weight_raw
@@ -2348,7 +3006,10 @@ pub async fn stack_video_liquid_warping_impl(
                         // Pass 2 re-aligns against the pass-1 stack: residual shifts
                         // are tiny, so a tight search window suppresses false SAD
                         // minima on low-contrast detail (sharper convergence).
-                        let search_r: i32 = if !is_surface_logic {
+                        // Large lunar discs use the (cheaper) surface windows: they
+                        // align by texture with a verified global shift, so the wide
+                        // planetary window only adds cost and false minima.
+                        let search_r: i32 = if !is_surface_logic && !large_disc {
                             if pass == 0 { 32 } else { 12 }
                         } else if pass == 0 {
                             24
@@ -2365,7 +3026,9 @@ pub async fn stack_video_liquid_warping_impl(
                         // ±search_r AP window and stacks a displaced GHOST copy
                         // (doubled limb). A cheap 4×-downscaled re-match against the
                         // master confirms or corrects it before the AP pass.
-                        if is_surface_logic {
+                        // Large lunar discs get it too: they align by texture (no
+                        // per-frame CoG), so they need the same safety net.
+                        if is_surface_logic || large_disc {
                             let w_ds = w_in / 4;
                             let h_ds = h_in / 4;
                             let cx = w_ds / 2;
@@ -2419,7 +3082,11 @@ pub async fn stack_video_liquid_warping_impl(
                             render_dy,
                             box_size,
                             search_r,
-                            is_surface_logic,
+                            // Large discs use the surface spatial-outlier filter
+                            // (gentler fallback): the planetary variant's harsh
+                            // rejection pushed too many APs onto the global
+                            // fallback vector → locally smeared warp.
+                            is_surface_logic || large_disc,
                             limb_protect,
                         );
 
@@ -2450,7 +3117,13 @@ pub async fn stack_video_liquid_warping_impl(
                                     sc.wg[i] /= w_val;
                                 }
                             }
-                            sc.grad_g.accumulate(&sc.wg, &sc.ww, d_quality, dq_w, dq_h, q_off_x, q_off_y, q_weight);
+                            // Pass 2: kappa-sigma rejection against the pass-1
+                            // statistics (kills satellites/birds/glitches; the
+                            // clean frames keep full weight → no holes).
+                            if let Some((lo, hi)) = clip_g_ref {
+                                apply_sigma_rejection(&sc.wg, &mut sc.ww, lo, hi);
+                            }
+                            acc_g_mx.lock().unwrap().accumulate(&sc.wg, &sc.ww, d_quality, dq_w, dq_h, q_off_x, q_off_y, q_weight);
                         } else {
                             sc.wr.fill(0.0);
                             sc.wg.fill(0.0);
@@ -2466,30 +3139,70 @@ pub async fn stack_video_liquid_warping_impl(
                                     sc.wb[i] /= w_val;
                                 }
                             }
-                            sc.grad_r.accumulate(&sc.wr, &sc.ww, d_quality, dq_w, dq_h, q_off_x, q_off_y, q_weight);
-                            sc.grad_g.accumulate(&sc.wg, &sc.ww, d_quality, dq_w, dq_h, q_off_x, q_off_y, q_weight);
-                            sc.grad_b.accumulate(&sc.wb, &sc.ww, d_quality, dq_w, dq_h, q_off_x, q_off_y, q_weight);
+                            // Pass 2: kappa-sigma rejection against the pass-1
+                            // statistics. A transient (satellite/bird/glitch)
+                            // is achromatic: if ANY channel is an outlier the
+                            // whole pixel of this frame is dropped (shared
+                            // coverage plane) — the clean frames fill it in.
+                            if let Some((lo, hi)) = clip_r_ref {
+                                apply_sigma_rejection(&sc.wr, &mut sc.ww, lo, hi);
+                            }
+                            if let Some((lo, hi)) = clip_g_ref {
+                                apply_sigma_rejection(&sc.wg, &mut sc.ww, lo, hi);
+                            }
+                            if let Some((lo, hi)) = clip_b_ref {
+                                apply_sigma_rejection(&sc.wb, &mut sc.ww, lo, hi);
+                            }
+                            // Fixed R → G → B lock order (deadlock-free); each
+                            // lock is held only for one channel merge so workers
+                            // on different channels overlap.
+                            acc_r_mx.lock().unwrap().accumulate(&sc.wr, &sc.ww, d_quality, dq_w, dq_h, q_off_x, q_off_y, q_weight);
+                            acc_g_mx.lock().unwrap().accumulate(&sc.wg, &sc.ww, d_quality, dq_w, dq_h, q_off_x, q_off_y, q_weight);
+                            acc_b_mx.lock().unwrap().accumulate(&sc.wb, &sc.ww, d_quality, dq_w, dq_h, q_off_x, q_off_y, q_weight);
                         }
                     }
                 }
-                sc
             }
-        ).reduce_with(|mut a, b| { a.grad_r.merge(&b.grad_r); a.grad_g.merge(&b.grad_g); a.grad_b.merge(&b.grad_b); a });
+        );
         // Run the batch on the RAM-bounded stacking pool (falls back to the
         // global pool only if the dedicated pool could not be created).
-        let batch_results = match &stack_pool {
+        match &stack_pool {
             Some(p) => p.install(run_batch),
             None => run_batch(),
         };
-
-        if let Some(br) = batch_results {
-            acc_grad_r.merge(&br.grad_r); acc_grad_g.merge(&br.grad_g); acc_grad_b.merge(&br.grad_b);
-        }
     }
+
+    // Collect the shared accumulators for this pass.
+    acc_grad_r = acc_r_mx.into_inner().unwrap();
+    acc_grad_g = acc_g_mx.into_inner().unwrap();
+    acc_grad_b = acc_b_mx.into_inner().unwrap();
+    drop(scratch_pool_mx);
 
     // Between passes: rebuild the alignment reference from the fresh stack
     // (its geometry matches the master because drizzle/ROI are disabled here).
     if pass + 1 < total_passes {
+        // KAPPA-SIGMA: freeze the pass-1 per-pixel statistics into winsorization
+        // bounds for pass 2. Built BEFORE the accumulators are recreated; the
+        // m2 planes are released with the pass-1 stackers right after.
+        if sigma_clip_enabled {
+            emit_progress(
+                &app,
+                "Doble Pasada: construyendo mapa sigma-clip (anti-artefactos)...",
+                91.0,
+                None,
+            );
+            if !acc_grad_g.m2.is_empty() {
+                clip_g = Some(build_sigma_clip_bounds(&acc_grad_g, SIGMA_CLIP_K, SIGMA_CLIP_FLOOR));
+            }
+            if !is_mono_stack {
+                if !acc_grad_r.m2.is_empty() {
+                    clip_r = Some(build_sigma_clip_bounds(&acc_grad_r, SIGMA_CLIP_K, SIGMA_CLIP_FLOOR));
+                }
+                if !acc_grad_b.m2.is_empty() {
+                    clip_b = Some(build_sigma_clip_bounds(&acc_grad_b, SIGMA_CLIP_K, SIGMA_CLIP_FLOOR));
+                }
+            }
+        }
         emit_progress(&app, "Doble Pasada: regenerando referencia desde el apilado...", 92.0, None);
         for i in 0..w_in * h_in {
             let w_g = acc_grad_g.direct_w[i].max(1e-9);
@@ -2500,6 +3213,10 @@ pub async fn stack_video_liquid_warping_impl(
         master_ds_w = ds_w;
     }
     } // end multi-pass loop
+
+    if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("Cancelado por el usuario".into());
+    }
 
     // Elite V4: High-Fidelity Multi-Point Stack
     // (Poisson gradient stacking removed for this path: it smoothed surface
@@ -2553,6 +3270,32 @@ pub async fn stack_video_liquid_warping_impl(
         }
     }
 
+    // AUTO RGB ALIGN (AS!4 parity): correct atmospheric-dispersion channel
+    // shifts on the stacked result. Measured on the stack (huge SNR) so even
+    // sub-pixel dispersion is detected; a no-op when channels already match.
+    // User-switchable (chk-rgb-align, default ON); guarded by measurement-site
+    // selection and the improvement gate inside align_stack_rgb_channels.
+    if !is_mono_stack && align_rgb.unwrap_or(true) {
+        emit_progress(&app, "Alineacion RGB automatica (dispersion atmosferica)...", 94.0, None);
+        let (rdx, rdy, bdx, bdy) = align_stack_rgb_channels(&mut stacked_f32, w_out, h_out);
+        if rdx.abs().max(rdy.abs()).max(bdx.abs()).max(bdy.abs()) >= 0.05 {
+            log_to_front(
+                &app,
+                "INFO",
+                &format!(
+                    "RGB Align automatico: R({:+.2}, {:+.2}) px · B({:+.2}, {:+.2}) px",
+                    rdx, rdy, bdx, bdy
+                ),
+            );
+        } else {
+            log_to_front(
+                &app,
+                "INFO",
+                "RGB Align: sin correccion (canales ya alineados o medicion no concluyente).",
+            );
+        }
+    }
+
     // 8. POST-PROCESSING (Elite Phase)
     emit_progress(&app, "Zenith Elite V4: Estimacion de PSF y Deconvolucion TV-RL...", 95.0, None);
     
@@ -2591,17 +3334,44 @@ pub async fn stack_video_liquid_warping_impl(
     // (spicules, prominence fringes, rilles) and is statistically identical to
     // a hot pixel for this filter — it was ERASING genuine limb detail. With
     // dozens of warped frames stacked, sensor hot pixels are already diluted,
-    // so surface stacks skip this stage entirely.
-    if !is_surface_logic {
+    // so surface stacks skip this stage entirely. Large lunar discs skip it for
+    // the same reason (crater rims/rilles ARE 1-2 px detail) — and it saves a
+    // full pass over a potentially 20-Mpx canvas.
+    if !is_surface_logic && !large_disc {
         emit_progress(&app, "Eliminando pixeles calientes y ruido residual...", 92.0, None);
         reject_spatial_outliers_u16(&mut final_u16, w_out, h_out);
     }
 
-    // POST-STACK CHROMA NOISE REDUCTION (Mejora 5):
-    // Smooth Cb/Cr in YCbCr space while preserving luminance detail.
+    // POST-STACK CHROMA NOISE REDUCTION — ADAPTIVE (Mejora 5 revisada):
+    // the fixed radius (2 surface / 1 planet) blurred REAL color detail
+    // (lunar mineral tinting, planetary band hues) even when stacking had
+    // already averaged the chroma noise away. Measure the residual chroma
+    // noise and smooth only as much as the data actually needs.
     if is_color_video {
-        let chroma_r = if is_surface_logic { 2 } else { 1 };
-        smooth_chroma_inplace(&mut final_u16, w_out, h_out, chroma_r);
+        let chroma_sigma = estimate_stack_chroma_noise(&final_u16, w_out, h_out);
+        let chroma_r: usize = if chroma_sigma < 40.0 {
+            0
+        } else if chroma_sigma < 120.0 {
+            1
+        } else {
+            2
+        };
+        log_to_front(
+            &app,
+            "INFO",
+            &format!(
+                "Ruido croma del stack: {:.0} ADU → {}",
+                chroma_sigma,
+                if chroma_r == 0 {
+                    "suavizado omitido (croma limpio, color preservado)".to_string()
+                } else {
+                    format!("suavizado radio {}", chroma_r)
+                }
+            ),
+        );
+        if chroma_r > 0 {
+            smooth_chroma_inplace(&mut final_u16, w_out, h_out, chroma_r);
+        }
     }
 
     // Apply stack sharpening if enabled via UI toggle ("Sharpened" checkbox)
@@ -2612,7 +3382,12 @@ pub async fn stack_video_liquid_warping_impl(
 
     // Exposure / dynamic-range normalization
     {
-        if is_surface_logic {
+        // Large lunar discs use the SURFACE normalization: the planetary
+        // exposure-match leaves the stack at the (deliberately low) capture
+        // exposure, and with the LINEAR result preview the Moon looked
+        // "attenuated" next to the max-normalized source view. Real planets
+        // keep the gentle exposure match (no black-point lift on Jupiter etc.).
+        if is_surface_logic || large_disc {
             // AS!4-style "Normalize Stack": linear remap anchored at BOTH ends.
             //  - Black point: when a true dark background exists (P1 ≪ P99,
             //    i.e. sky/limb framing), anchor it near 0 — stacking lifts the
@@ -2834,6 +3609,282 @@ fn compute_frame_local_shifts(
     }
 
     local_shifts
+}
+
+/// AUTO RGB ALIGN (AS!4 "RGB Align"): atmospheric dispersion displaces the R
+/// and B channels relative to G — from fractions of a pixel to several px at
+/// low altitude — smearing color detail that the mono-luma alignment cannot
+/// see. Measures each channel's global sub-pixel shift against G on the
+/// STACKED result (huge SNR → precise measurement) and re-samples the channel
+/// bilinearly. Shifts beyond ±12 px are treated as a failed measurement and
+/// skipped; shifts below 0.05 px are a no-op. Returns (rdx, rdy, bdx, bdy).
+fn align_stack_rgb_channels(stacked: &mut [f32], w: usize, h: usize) -> (f32, f32, f32, f32) {
+    let n = w * h;
+    if stacked.len() < n * 3 || w < 64 || h < 64 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+
+    let mut r = vec![0u16; n];
+    let mut g = vec![0u16; n];
+    let mut b = vec![0u16; n];
+    for i in 0..n {
+        r[i] = stacked[i * 3].clamp(0.0, 65535.0) as u16;
+        g[i] = stacked[i * 3 + 1].clamp(0.0, 65535.0) as u16;
+        b[i] = stacked[i * 3 + 2].clamp(0.0, 65535.0) as u16;
+    }
+
+    // MEASUREMENT SITE BY GRADIENT ENERGY: measuring at the blind image center
+    // fails on a smooth disc interior (flat SAD minimum → noisy multi-px
+    // "shift") and mis-corrected stacks showed a huge blue limb fringe. The
+    // channel misalignment is only measurable where there is STRUCTURE — pick
+    // the candidate window with the highest gradient energy (usually the limb
+    // or a crater field).
+    let roi_half = (w.min(h) / 6).clamp(24, 256);
+    let box_size = (roi_half * 2).clamp(48, 1024);
+    let margin = box_size / 2 + 12;
+    let mut best_energy = -1.0f64;
+    let mut cx = w / 2;
+    let mut cy = h / 2;
+    let grid_n = 6usize;
+    for gy in 0..grid_n {
+        for gx in 0..grid_n {
+            let px = margin + (w - 2 * margin) * gx / (grid_n - 1).max(1);
+            let py = margin + (h - 2 * margin) * gy / (grid_n - 1).max(1);
+            let mut e = 0.0f64;
+            let mut yy = py.saturating_sub(roi_half).max(2);
+            while yy < (py + roi_half).min(h - 3) {
+                let mut xx = px.saturating_sub(roi_half).max(2);
+                while xx < (px + roi_half).min(w - 3) {
+                    let i = yy * w + xx;
+                    e += (g[i + 2] as i32 - g[i] as i32).unsigned_abs() as f64
+                        + (g[i + 2 * w] as i32 - g[i] as i32).unsigned_abs() as f64;
+                    xx += 4;
+                }
+                yy += 4;
+            }
+            if e > best_energy {
+                best_energy = e;
+                cx = px;
+                cy = py;
+            }
+        }
+    }
+
+    let measure = |plane: &[u16]| -> (f32, f32) {
+        let (dx, dy, _sad) =
+            crate::alignment::find_best_match_sad(&g, plane, w, cx, cy, cx, cy, box_size, 8);
+        // Dispersion is small; a large "measurement" is a failed match.
+        if dx.is_finite() && dy.is_finite() && dx.abs() <= 6.0 && dy.abs() <= 6.0 {
+            (dx, dy)
+        } else {
+            (0.0, 0.0)
+        }
+    };
+
+    // SUB-PIXEL REFINEMENT: find_best_match_sad resolves to integer pixels,
+    // but dispersion is typically a FRACTION of a pixel. Two-stage local grid
+    // search (0.25 px → 0.05 px) on a bilinear-resampled SAD over the SAME
+    // high-gradient ROI nails the fractional part.
+    let gf: Vec<f32> = stacked.iter().skip(1).step_by(3).copied().collect();
+    let (rx0, rx1) = (cx - roi_half, cx + roi_half);
+    let (ry0, ry1) = (cy - roi_half, cy + roi_half);
+    let sad_range = |plane: &[f32], dx: f32, dy: f32, y_from: usize, y_to: usize| -> f64 {
+        let mut s = 0.0f64;
+        let mut y = y_from;
+        while y < y_to {
+            let syf = y as f32 + dy;
+            if syf >= 1.0 && syf < (h - 2) as f32 {
+                let yy = syf as usize;
+                let fy = syf - yy as f32;
+                let mut x = rx0;
+                while x < rx1 {
+                    let sxf = x as f32 + dx;
+                    if sxf >= 1.0 && sxf < (w - 2) as f32 {
+                        let xx = sxf as usize;
+                        let fx = sxf - xx as f32;
+                        let i00 = yy * w + xx;
+                        let v = plane[i00] * (1.0 - fx) * (1.0 - fy)
+                            + plane[i00 + 1] * fx * (1.0 - fy)
+                            + plane[i00 + w] * (1.0 - fx) * fy
+                            + plane[i00 + w + 1] * fx * fy;
+                        s += ((v - gf[y * w + x]) as f64).abs();
+                    }
+                    x += 2;
+                }
+            }
+            y += 2;
+        }
+        s
+    };
+    let refine = |plane: &[f32], ix: f32, iy: f32| -> (f32, f32) {
+        let mut best = (ix, iy);
+        let mut best_s = f64::MAX;
+        for &(step, span) in &[(0.25f32, 1.0f32), (0.05, 0.25)] {
+            let (bx, by) = best;
+            let mut sx = -span;
+            while sx <= span + 1e-6 {
+                let mut sy = -span;
+                while sy <= span + 1e-6 {
+                    let s = sad_range(plane, bx + sx, by + sy, ry0, ry1);
+                    if s < best_s {
+                        best_s = s;
+                        best = (bx + sx, by + sy);
+                    }
+                    sy += step;
+                }
+                sx += step;
+            }
+        }
+        best
+    };
+
+    let rf: Vec<f32> = stacked.iter().skip(0).step_by(3).copied().collect();
+    let bfp: Vec<f32> = stacked.iter().skip(2).step_by(3).copied().collect();
+
+    // IMPROVEMENT GATE (split-half validated): the correction is applied only
+    // if it improves the channel match by ≥10% in BOTH independent halves of
+    // the ROI. A real dispersion shift improves everywhere; a noise-driven
+    // minimum (flat SAD on structure-less or lens-CA-dominated data — the case
+    // that once painted a huge blue limb fringe) does not survive both halves.
+    let validate = |plane: &[f32], dx: f32, dy: f32| -> (f32, f32) {
+        if dx.abs() < 0.05 && dy.abs() < 0.05 {
+            return (0.0, 0.0);
+        }
+        if dx.abs() > 6.0 || dy.abs() > 6.0 {
+            return (0.0, 0.0);
+        }
+        let mid = (ry0 + ry1) / 2;
+        let s0a = sad_range(plane, 0.0, 0.0, ry0, mid);
+        let s1a = sad_range(plane, dx, dy, ry0, mid);
+        let s0b = sad_range(plane, 0.0, 0.0, mid, ry1);
+        let s1b = sad_range(plane, dx, dy, mid, ry1);
+        // SMOOTHING-BIAS COMPENSATION: bilinear resampling of a FRACTIONAL
+        // shift averages 4 neighbours and shrinks the plane's noise, lowering
+        // the SAD by up to ~13% with NO real alignment gain. The expected
+        // noise-only shrink is √((1+Σw²)/2) for the bilinear weights — scale
+        // the acceptance threshold by it so fractional shifts must beat the
+        // smoothing, not ride on it.
+        let sw2 = {
+            let fx = (dx - dx.floor()) as f64;
+            let fy = (dy - dy.floor()) as f64;
+            let (w00, w10, w01, w11) = (
+                (1.0 - fx) * (1.0 - fy),
+                fx * (1.0 - fy),
+                (1.0 - fx) * fy,
+                fx * fy,
+            );
+            w00 * w00 + w10 * w10 + w01 * w01 + w11 * w11
+        };
+        let smoothing_comp = ((1.0 + sw2) / 2.0).sqrt();
+        let thresh = 0.90 * smoothing_comp;
+        if s1a < s0a * thresh && s1b < s0b * thresh {
+            (dx, dy)
+        } else {
+            (0.0, 0.0)
+        }
+    };
+    let (ri_x, ri_y) = measure(&r);
+    let (bi_x, bi_y) = measure(&b);
+    let (rdx, rdy) = {
+        let v = refine(&rf, ri_x, ri_y);
+        validate(&rf, v.0, v.1)
+    };
+    let (bdx, bdy) = {
+        let v = refine(&bfp, bi_x, bi_y);
+        validate(&bfp, v.0, v.1)
+    };
+
+    // find_best_match_sad follows the render convention (shift = channel_pos −
+    // ref_pos), so the correction samples aligned(p) = ch(p + shift) — the same
+    // way the stacking warp consumes render_dx. Verified by the synthetic
+    // regression test (known physical shift → aligned residual ≈ 0).
+    let shift_channel_inplace = |stacked: &mut [f32], ch: usize, dx: f32, dy: f32| {
+        if dx.abs() < 0.05 && dy.abs() < 0.05 {
+            return;
+        }
+        let plane: Vec<f32> = stacked.iter().skip(ch).step_by(3).copied().collect();
+        stacked
+            .par_chunks_mut(w * 3)
+            .enumerate()
+            .for_each(|(y, row)| {
+                let syf = y as f32 + dy;
+                if syf < 0.0 || syf >= (h - 1) as f32 {
+                    return; // keep original border rows
+                }
+                let y0 = syf as usize;
+                let fy = syf - y0 as f32;
+                for x in 0..w {
+                    let sxf = x as f32 + dx;
+                    if sxf < 0.0 || sxf >= (w - 1) as f32 {
+                        continue;
+                    }
+                    let x0 = sxf as usize;
+                    let fx = sxf - x0 as f32;
+                    let i00 = y0 * w + x0;
+                    row[x * 3 + ch] = plane[i00] * (1.0 - fx) * (1.0 - fy)
+                        + plane[i00 + 1] * fx * (1.0 - fy)
+                        + plane[i00 + w] * (1.0 - fx) * fy
+                        + plane[i00 + w + 1] * fx * fy;
+                }
+            });
+    };
+    shift_channel_inplace(stacked, 0, rdx, rdy);
+    shift_channel_inplace(stacked, 2, bdx, bdy);
+
+    (rdx, rdy, bdx, bdy)
+}
+
+/// KAPPA-SIGMA REJECTION BOUNDS (AS!4-grade robustness at high stack %):
+/// per-pixel [mean − k·σ, mean + k·σ] acceptance window from the PASS-1
+/// weighted statistics. σ is the real per-pixel spread of the frame
+/// distribution, so edges (which legitimately jitter with seeing) get WIDE
+/// windows while flat areas get tight ones — transient artifacts (satellites,
+/// birds, dust, compression glitches) fall outside and are REJECTED in pass 2
+/// without touching genuine detail. `sigma_floor` keeps degenerate
+/// zero-variance pixels from rejecting everything. Pixels with no pass-1
+/// coverage get (-∞, +∞) bounds (no-op).
+fn build_sigma_clip_bounds(
+    acc: &GradientDomainStacker,
+    k: f32,
+    sigma_floor: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let n = acc.direct.len();
+    let mut lo = vec![f32::MIN; n];
+    let mut hi = vec![f32::MAX; n];
+    if acc.m2.len() != n {
+        return (lo, hi);
+    }
+    for i in 0..n {
+        let w = acc.direct_w[i];
+        if w > 1e-9 {
+            let mean = acc.direct[i] / w;
+            let var = (acc.m2[i] / w - mean * mean).max(0.0);
+            let sigma = var.sqrt().max(sigma_floor as f64);
+            lo[i] = (mean - k as f64 * sigma) as f32;
+            hi[i] = (mean + k as f64 * sigma) as f32;
+        }
+    }
+    (lo, hi)
+}
+
+/// HARD REJECTION against the per-pixel bounds: an out-of-bounds pixel gets
+/// its coverage weight zeroed, so that frame contributes NOTHING there and the
+/// stacked pixel becomes the mean of the clean frames only. Rejection (not
+/// clamping) matters because an extreme outlier inflates the pass-1 σ of its
+/// own pixel — clamping to μ±kσ would still leave most of the artifact energy
+/// in; zero-weighting removes it completely. The remaining frames keep full
+/// weight → no holes, no seams (a pixel would need ALL frames rejected to go
+/// empty, which needs a real scene change, not a transient).
+fn apply_sigma_rejection(vals: &[f32], coverage: &mut [f32], lo: &[f32], hi: &[f32]) {
+    let n = vals.len().min(lo.len()).min(hi.len()).min(coverage.len());
+    for i in 0..n {
+        if coverage[i] > 1e-9 {
+            let v = vals[i];
+            if v < lo[i] || v > hi[i] {
+                coverage[i] = 0.0;
+            }
+        }
+    }
 }
 
 /// Detects low-coverage border rows/columns of the stacked output.
@@ -3569,10 +4620,13 @@ pub fn downscale_u16_to_f32_box(
 /// once per rayon worker instead of once per frame (the previous code
 /// allocated ~9 large vectors per frame, fragmenting RAM on long videos).
 /// In mono mode the RGB-only buffers stay empty (zero cost).
+// RAM: the per-thread scratch deliberately holds NO canvas accumulators. The
+// old per-thread GradientDomainStacker trio (f64 direct + direct_w × 3) was
+// ~48 bytes/px_out PER THREAD — gigabytes on many-core machines, the root
+// cause of the OOM/paging freeze. Frames now merge into SHARED per-channel
+// accumulators (one short-lived lock per frame; merge cost is small next to
+// the per-frame alignment+warp work), so threads scale without RAM blowup.
 struct LiquidScratch {
-    grad_r: GradientDomainStacker,
-    grad_g: GradientDomainStacker,
-    grad_b: GradientDomainStacker,
     rgb_buf: Vec<u16>,
     mono_buf: Vec<u16>,
     f_s1: Vec<u16>,
@@ -3590,9 +4644,6 @@ impl LiquidScratch {
         let n_in = w_in * h_in;
         let n_out = w_out * h_out;
         Self {
-            grad_r: if is_mono { GradientDomainStacker::new_empty() } else { GradientDomainStacker::new_direct_only(w_out, h_out) },
-            grad_g: GradientDomainStacker::new_direct_only(w_out, h_out),
-            grad_b: if is_mono { GradientDomainStacker::new_empty() } else { GradientDomainStacker::new_direct_only(w_out, h_out) },
             rgb_buf: if is_mono { Vec::new() } else { vec![0u16; n_in * 3] },
             mono_buf: vec![0u16; n_in],
             f_s1: vec![0u16; n_in],
@@ -3607,6 +4658,40 @@ impl LiquidScratch {
     }
 }
 
+/// Bounded lease pool: workers borrow a LiquidScratch and return it on drop,
+/// so live scratches never exceed the real thread concurrency (rayon's
+/// fold/for_each_init would otherwise allocate one per work-split).
+struct ScratchLease<'a> {
+    pool: &'a std::sync::Mutex<Vec<LiquidScratch>>,
+    sc: Option<LiquidScratch>,
+}
+
+impl<'a> ScratchLease<'a> {
+    fn take(
+        pool: &'a std::sync::Mutex<Vec<LiquidScratch>>,
+        w_in: usize,
+        h_in: usize,
+        w_out: usize,
+        h_out: usize,
+        is_mono: bool,
+    ) -> Self {
+        let sc = pool
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| LiquidScratch::new(w_in, h_in, w_out, h_out, is_mono));
+        Self { pool, sc: Some(sc) }
+    }
+}
+
+impl<'a> Drop for ScratchLease<'a> {
+    fn drop(&mut self) {
+        if let Some(sc) = self.sc.take() {
+            self.pool.lock().unwrap().push(sc);
+        }
+    }
+}
+
 // ==========================================
 // ELITE V4: GRADIENT DOMAIN STACKING (Poisson)
 // ==========================================
@@ -3617,6 +4702,11 @@ pub struct GradientDomainStacker {
     pub weight: Vec<f64>,
     pub direct: Vec<f64>,
     pub direct_w: Vec<f64>,
+    /// Weighted sum of squared values (Σ w·v²). Allocated only in sigma-clip
+    /// tracked mode: together with `direct`/`direct_w` it yields the per-pixel
+    /// weighted variance of the frame distribution — the statistical basis for
+    /// the kappa-sigma artifact rejection in pass 2.
+    pub m2: Vec<f64>,
     pub width: usize,
     pub height: usize,
 }
@@ -3630,6 +4720,7 @@ impl GradientDomainStacker {
             weight: vec![0.0; n],
             direct: vec![0.0; n],
             direct_w: vec![0.0; n],
+            m2: Vec::new(),
             width: w,
             height: h,
         }
@@ -3646,6 +4737,23 @@ impl GradientDomainStacker {
             weight: Vec::new(),
             direct: vec![0.0; n],
             direct_w: vec![0.0; n],
+            m2: Vec::new(),
+            width: w,
+            height: h,
+        }
+    }
+
+    /// Direct-mean variant that ALSO tracks the per-pixel second moment for
+    /// sigma-clip statistics (used by pass 1 of the double-pass stack).
+    pub fn new_direct_tracked(w: usize, h: usize) -> Self {
+        let n = w * h;
+        Self {
+            grad_x: Vec::new(),
+            grad_y: Vec::new(),
+            weight: Vec::new(),
+            direct: vec![0.0; n],
+            direct_w: vec![0.0; n],
+            m2: vec![0.0; n],
             width: w,
             height: h,
         }
@@ -3659,6 +4767,7 @@ impl GradientDomainStacker {
             weight: Vec::new(),
             direct: Vec::new(),
             direct_w: Vec::new(),
+            m2: Vec::new(),
             width: 0,
             height: 0,
         }
@@ -3715,6 +4824,10 @@ impl GradientDomainStacker {
                 }
                 self.direct[i] += frame[i] as f64 * combined_w;
                 self.direct_w[i] += combined_w;
+                if !self.m2.is_empty() {
+                    let v = frame[i] as f64;
+                    self.m2[i] += v * v * combined_w;
+                }
             }
         }
     }
@@ -3725,6 +4838,7 @@ impl GradientDomainStacker {
         for (a, b) in self.weight.iter_mut().zip(other.weight.iter()) { *a += b; }
         for (a, b) in self.direct.iter_mut().zip(other.direct.iter()) { *a += b; }
         for (a, b) in self.direct_w.iter_mut().zip(other.direct_w.iter()) { *a += b; }
+        for (a, b) in self.m2.iter_mut().zip(other.m2.iter()) { *a += b; }
     }
 
     pub fn reconstruct(&self, iterations: usize) -> Vec<f32> {
@@ -5192,6 +6306,370 @@ mod zas_v3_tests {
             !is_large_lunar_disc(&planet, w, h),
             "a small planetary disc must keep brightness CoG centering"
         );
+
+        // Moon OVERFLOWING the frame (close-up: disc touches 3 corners, sky only
+        // in the fourth). The old corner-based noise floor landed ON the disc and
+        // broke the detection — this is the exact framing from the user report.
+        let mut overflow = vec![300u16; w * h];
+        let (ox, oy, orad) = (w as f32 * 0.72, h as f32 * 0.72, w as f32 * 0.95);
+        for y in 0..h {
+            for x in 0..w {
+                let dx = x as f32 - ox;
+                let dy = y as f32 - oy;
+                if dx * dx + dy * dy <= orad * orad {
+                    overflow[y * w + x] = 42000;
+                }
+            }
+        }
+        assert!(
+            is_large_lunar_disc(&overflow, w, h),
+            "a lunar disc overflowing the frame must still use texture alignment"
+        );
+    }
+
+    #[test]
+    fn test_gaussian_blur_effective_sigma_matches_request() {
+        // Impulse response: blur a delta and measure the standard deviation of
+        // the resulting kernel. The old box formula (missing /n) produced an
+        // EFFECTIVE sigma ~1.73× the requested one — every wavelet band and the
+        // RL/VC deconvolution PSF were coarser than labeled. The old 5-tap
+        // "safe" variant ignored sigma entirely (always ~1.0).
+        let w = 129usize;
+        let h = 129usize;
+        let measure = |img: &[f32]| -> f32 {
+            let (mut sum, mut var) = (0.0f64, 0.0f64);
+            let c = 64.0f64;
+            for y in 0..h {
+                for x in 0..w {
+                    let v = img[y * w + x] as f64;
+                    sum += v;
+                    var += v * ((x as f64 - c).powi(2) + (y as f64 - c).powi(2));
+                }
+            }
+            ((var / sum / 2.0).sqrt()) as f32 // isotropic: σ² per axis = var/2
+        };
+        let mut delta = vec![0.0f32; w * h];
+        delta[64 * w + 64] = 10000.0;
+
+        for &(req, tol) in &[(1.0f32, 0.35f32), (4.0, 0.6), (8.0, 1.0)] {
+            let out = apply_gaussian_blur(&delta, w, h, req);
+            let eff = measure(&out);
+            assert!(
+                (eff - req).abs() <= tol,
+                "apply_gaussian_blur σ={} produced effective σ={}",
+                req,
+                eff
+            );
+        }
+
+        // The "safe" variant must honour sigma too (it used to ignore it).
+        let out = apply_gaussian_blur_safe(&delta, w, h, 6.0);
+        let eff = measure(&out);
+        assert!(
+            (eff - 6.0).abs() <= 1.0,
+            "apply_gaussian_blur_safe σ=6 produced effective σ={}",
+            eff
+        );
+    }
+
+    #[test]
+    fn test_pearson_informativeness_gates_ap_selection() {
+        // Correlated local scores (real seeing signal) → full weight (strict
+        // local cutoff). Uncorrelated noise or flat scores → zero weight
+        // (global ranking, relaxed cutoff).
+        let n = 200usize;
+        let global: Vec<f32> = (0..n).map(|i| 1000.0 + (i as f32) * 7.3).collect();
+
+        // Strongly correlated (scaled + offset copy of global).
+        let correlated: Vec<f32> = global.iter().map(|g| g * 0.6 + 300.0).collect();
+        assert!(
+            pearson_informativeness(&correlated, &global) > 0.95,
+            "correlated scores must be treated as informative"
+        );
+
+        // Deterministic pseudo-noise, uncorrelated with the global ramp.
+        let noise: Vec<f32> = (0..n)
+            .map(|i| ((i as u32).wrapping_mul(2654435761) >> 16) as f32 % 977.0)
+            .collect();
+        assert!(
+            pearson_informativeness(&noise, &global) < 0.25,
+            "noise scores must be treated as uninformative"
+        );
+
+        // Flat scores carry no information at all.
+        let flat = vec![500.0f32; n];
+        assert_eq!(pearson_informativeness(&flat, &global), 0.0);
+    }
+
+    #[test]
+    fn test_chroma_noise_estimator_gates_smoothing() {
+        // Clean color stack → near-zero chroma noise (smoothing skipped);
+        // noisy chroma → clearly above the radius-1 threshold.
+        let w = 320usize;
+        let h = 240usize;
+        let n = w * h;
+
+        // Clean: smooth luminance gradient, perfectly neutral color.
+        let mut clean = vec![0u16; n * 3];
+        for i in 0..n {
+            let v = 8000 + ((i % w) * 40) as u16;
+            clean[i * 3] = v;
+            clean[i * 3 + 1] = v;
+            clean[i * 3 + 2] = v;
+        }
+        let sigma_clean = estimate_stack_chroma_noise(&clean, w, h);
+        assert!(
+            sigma_clean < 20.0,
+            "neutral stack must measure ~0 chroma noise (got {})",
+            sigma_clean
+        );
+
+        // Noisy: independent per-channel noise ±600 → strong chroma noise.
+        let mut noisy = clean.clone();
+        for i in 0..n * 3 {
+            let h32 = (i as u32).wrapping_mul(2654435761) >> 14;
+            let d = (h32 % 1201) as i32 - 600;
+            noisy[i] = (noisy[i] as i32 + d).clamp(0, 65535) as u16;
+        }
+        let sigma_noisy = estimate_stack_chroma_noise(&noisy, w, h);
+        assert!(
+            sigma_noisy > 120.0,
+            "noisy chroma must trigger radius-2 smoothing (got {})",
+            sigma_noisy
+        );
+    }
+
+    #[test]
+    fn test_auto_rgb_align_corrects_dispersion() {
+        // Atmospheric dispersion: R and B physically displaced vs G by known
+        // sub-pixel/px shifts. After align_stack_rgb_channels the channels
+        // must coincide with G (interior), and the measured shifts must match
+        // the injected ones.
+        let w = 256usize;
+        let h = 256usize;
+        let pattern = |x: f32, y: f32| -> f32 {
+            5000.0 + 3000.0 * (x * 0.11).sin() * (y * 0.07).sin() + 1500.0 * (x * 0.031 + y * 0.023).sin()
+        };
+        // Physically shifted channel: content moved by +s ⇒ ch(p) = pattern(p − s).
+        let make = |sdx: f32, sdy: f32| -> Vec<f32> {
+            (0..w * h)
+                .map(|i| {
+                    let x = (i % w) as f32;
+                    let y = (i / w) as f32;
+                    pattern(x - sdx, y - sdy)
+                })
+                .collect()
+        };
+        let (r_s, b_s) = ((1.6f32, -0.8f32), (-1.2f32, 0.6f32));
+        let g_p = make(0.0, 0.0);
+        let r_p = make(r_s.0, r_s.1);
+        let b_p = make(b_s.0, b_s.1);
+
+        let mut stacked = vec![0.0f32; w * h * 3];
+        for i in 0..w * h {
+            stacked[i * 3] = r_p[i];
+            stacked[i * 3 + 1] = g_p[i];
+            stacked[i * 3 + 2] = b_p[i];
+        }
+
+        let (rdx, rdy, bdx, bdy) = align_stack_rgb_channels(&mut stacked, w, h);
+        assert!(
+            (rdx - r_s.0).abs() < 0.35 && (rdy - r_s.1).abs() < 0.35,
+            "R shift mismeasured: got ({}, {}) want ({}, {})",
+            rdx, rdy, r_s.0, r_s.1
+        );
+        assert!(
+            (bdx - b_s.0).abs() < 0.35 && (bdy - b_s.1).abs() < 0.35,
+            "B shift mismeasured: got ({}, {}) want ({}, {})",
+            bdx, bdy, b_s.0, b_s.1
+        );
+
+        // Interior residual after correction.
+        let mut sum_r = 0.0f64;
+        let mut sum_b = 0.0f64;
+        let mut cnt = 0.0f64;
+        for y in 8..h - 8 {
+            for x in 8..w - 8 {
+                let i = y * w + x;
+                sum_r += ((stacked[i * 3] - stacked[i * 3 + 1]) as f64).powi(2);
+                sum_b += ((stacked[i * 3 + 2] - stacked[i * 3 + 1]) as f64).powi(2);
+                cnt += 1.0;
+            }
+        }
+        let rms_r = (sum_r / cnt).sqrt();
+        let rms_b = (sum_b / cnt).sqrt();
+        assert!(rms_r < 80.0, "R residual too high after align: {}", rms_r);
+        assert!(rms_b < 80.0, "B residual too high after align: {}", rms_b);
+
+        // NO-FALSE-POSITIVE: already-aligned channels over smooth data with
+        // per-channel noise (the flat SAD case that once painted a blue limb
+        // fringe) must NOT be "corrected" — the improvement gate keeps it out.
+        let mut aligned = vec![0.0f32; w * h * 3];
+        // Non-linear hash (murmur3 finalizer): a plain multiplicative hash is
+        // LINEAR, so constant seed deltas give constant hash deltas — a shifted
+        // channel then genuinely matched the noise pattern and fooled the test.
+        let hash = |seed: u32| -> u32 {
+            let mut z = seed ^ 0x9E37_79B9;
+            z ^= z >> 16;
+            z = z.wrapping_mul(0x85EB_CA6B);
+            z ^= z >> 13;
+            z = z.wrapping_mul(0xC2B2_AE35);
+            z ^ (z >> 16)
+        };
+        for i in 0..w * h {
+            let x = (i % w) as f32;
+            let y = (i / w) as f32;
+            let base = 20000.0 + 500.0 * (x * 0.01).sin() * (y * 0.008).sin(); // very smooth
+            aligned[i * 3] = base + (hash((i * 3) as u32) % 400) as f32 - 200.0;
+            aligned[i * 3 + 1] = base + (hash((i * 3 + 1) as u32) % 400) as f32 - 200.0;
+            aligned[i * 3 + 2] = base + (hash((i * 3 + 2) as u32) % 400) as f32 - 200.0;
+        }
+        let (zr_x, zr_y, zb_x, zb_y) = align_stack_rgb_channels(&mut aligned, w, h);
+        assert!(
+            zr_x.abs() < 0.3 && zr_y.abs() < 0.3 && zb_x.abs() < 0.3 && zb_y.abs() < 0.3,
+            "aligned channels must not be corrected (got R({},{}) B({},{}))",
+            zr_x, zr_y, zb_x, zb_y
+        );
+    }
+
+    #[test]
+    fn test_cog_precentering_recovers_large_handheld_motion() {
+        // Handheld phone video of the Moon: a compact textured disc on black
+        // sky jumping ~280 px between frames — far beyond the fixed SAD window
+        // (~±128 px), which is exactly what produced displaced "ghost" stacks.
+        // The centroid delta must pre-center the search so SAD refines to the
+        // true shift.
+        let w = 512usize;
+        let h = 512usize;
+        let disc = |cx: f32, cy: f32| -> Vec<u16> {
+            let mut v = vec![300u16; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let dx = x as f32 - cx;
+                    let dy = y as f32 - cy;
+                    if dx * dx + dy * dy <= 40.0 * 40.0 {
+                        // Textured disc so the SAD has structure to refine on.
+                        v[y * w + x] = 30000 + ((x * 7 + y * 11) % 2000) as u16;
+                    }
+                }
+            }
+            v
+        };
+        let reference = disc(150.0, 150.0);
+        let (true_dx, true_dy) = (280.0f32, 170.0f32);
+        let target = disc(150.0 + true_dx, 150.0 + true_dy);
+
+        assert!(
+            is_compact_object_on_black(&reference, w, h),
+            "small disc on black sky must enable CoG assist"
+        );
+        assert!(
+            !is_compact_object_on_black(&vec![30000u16; w * h], w, h),
+            "a full-frame bright field must NOT enable CoG assist"
+        );
+
+        let (rcx, rcy) = compute_robust_geometric_center(&reference, w, h, 0, 0);
+        let (tcx, tcy) = compute_robust_geometric_center(&target, w, h, 0, 0);
+        let init_dx = (tcx - rcx).round() as isize;
+        let init_dy = (tcy - rcy).round() as isize;
+
+        let ref_small = crate::alignment::downscale_integer(&reference, w, h, 4);
+        let (dx, dy) = crate::alignment::find_best_match_sad_pyramid_offset(
+            &reference, &target, &ref_small, w, h,
+            w / 4, h / 4,          // small dims
+            w / 4, h / 4,          // ROI origin (central box)
+            w / 2, h / 2,          // ROI size
+            32, 4, 4,              // same params as the master mini-alignment
+            init_dx, init_dy,
+        );
+
+        assert!(
+            (dx - true_dx).abs() < 3.0 && (dy - true_dy).abs() < 3.0,
+            "CoG-assisted SAD must recover the large shift (got {}, {})",
+            dx,
+            dy
+        );
+    }
+
+    #[test]
+    fn test_sigma_clip_rejects_transient_artifact() {
+        // Realistic lucky-imaging regime: a satellite/bird streak crosses 2 of
+        // 60 frames. Pass 1 gathers per-pixel statistics, pass 2 rejects the
+        // outliers — the streak must vanish while clean pixels stay identical.
+        let w = 64usize;
+        let h = 64usize;
+        let n = w * h;
+        let frames_total = 60usize;
+        let streak_frames = [11usize, 37usize];
+        let streak_row = 32usize;
+        let streak_cols = 10usize..54;
+
+        let base: Vec<f32> = (0..n)
+            .map(|i| {
+                let x = i % w;
+                let y = i / w;
+                5000.0 + ((x * 13 + y * 7) % 800) as f32
+            })
+            .collect();
+        // Deterministic pseudo-noise in ±100 (σ ≈ 58).
+        let noise = |f: usize, i: usize| -> f32 {
+            let h32 = ((f * 31 + i) as u32).wrapping_mul(2654435761);
+            ((h32 >> 16) % 201) as f32 - 100.0
+        };
+        let make_frame = |f: usize| -> Vec<f32> {
+            let mut v: Vec<f32> = (0..n).map(|i| base[i] + noise(f, i)).collect();
+            if streak_frames.contains(&f) {
+                for x in streak_cols.clone() {
+                    v[streak_row * w + x] = 60000.0; // satellite
+                }
+            }
+            v
+        };
+        let cov = vec![1.0f32; n];
+
+        // PASS 1: tracked accumulation (mean + second moment).
+        let mut acc1 = GradientDomainStacker::new_direct_tracked(w, h);
+        for f in 0..frames_total {
+            acc1.accumulate(&make_frame(f), &cov, &[], 0, 0, 0.0, 0.0, 1.0);
+        }
+        let (lo, hi) = build_sigma_clip_bounds(&acc1, 4.0, 6.0);
+
+        // PASS 2: rejection against the pass-1 window.
+        let mut acc2 = GradientDomainStacker::new_direct_only(w, h);
+        for f in 0..frames_total {
+            let vals = make_frame(f);
+            let mut c = cov.clone();
+            apply_sigma_rejection(&vals, &mut c, &lo, &hi);
+            acc2.accumulate(&vals, &c, &[], 0, 0, 0.0, 0.0, 1.0);
+        }
+
+        let mean_of = |acc: &GradientDomainStacker, i: usize| -> f32 {
+            (acc.direct[i] / acc.direct_w[i].max(1e-9)) as f32
+        };
+
+        // Streak pixels (interior): pass 1 is visibly contaminated, pass 2 clean.
+        for x in [20usize, 32, 45] {
+            let i = streak_row * w + x;
+            let m1 = mean_of(&acc1, i);
+            let m2 = mean_of(&acc2, i);
+            assert!(
+                m1 - base[i] > 1000.0,
+                "pass 1 should be contaminated at streak pixel (got +{})",
+                m1 - base[i]
+            );
+            assert!(
+                (m2 - base[i]).abs() < 300.0,
+                "pass 2 must reject the streak (residual {})",
+                m2 - base[i]
+            );
+        }
+
+        // Clean pixels: rejection must not distort normal signal.
+        for &(x, y) in &[(20usize, 20usize), (45, 12), (8, 50)] {
+            let i = y * w + x;
+            let d = (mean_of(&acc2, i) - mean_of(&acc1, i)).abs();
+            assert!(d < 60.0, "clean pixel distorted by {}", d);
+        }
     }
 
     #[test]

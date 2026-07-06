@@ -1276,6 +1276,8 @@ let currentBestFrame = 0; // NEW: Store Ref Frame
 // "planetary" or "surface"
 let currentGraphData = [];
 let currentRecommendedPct = 20;
+// Sugerencia inteligente del ANÁLISIS (fija; no cambia al mover el slider).
+let analysisSuggestedPct = null;
 let currentFileMetadata = null; // NEW: Store metadata for report
 let currentVideoStats = null; // NEW: Store video stats during analysis
 let manualAnchorPoint = null; // NEW: Manual Anchor for Surface Mode
@@ -1338,7 +1340,17 @@ const ZENITH_ULTIMATE_VALUE = "zenith_ultimate";
 const ZENITH_ULTIMATE_NAME = "Zenith Presicion Ultimate";
 
 function normalizeZenithCategory(category) {
-    return category === "planet_large" ? "planet_small" : (category || "surface");
+    // PARKED (2026-06-28): la categoría "Planeta / Fase Lunar" queda oculta y
+    // TODO se enruta al motor de Superficie. Prueba empírica del usuario:
+    // Superficie apila perfecto planetas, Luna y superficies (mono y RGB),
+    // mientras el camino planetario seguía produciendo apilados oscuros y
+    // borrosos en discos grandes pese a múltiples correcciones. El código
+    // planetario del backend sigue intacto (dormido) para una futura fase de
+    // depuración; para reactivarlo, restaurar esta función a:
+    //   return category === "planet_large" ? "planet_small" : (category || "surface");
+    // y quitar el atributo hidden de las opciones planet_small en index.html.
+    const _ = category; // firma intacta para todos los call sites
+    return "surface";
 }
 
 function getSelectedTargetCategory() {
@@ -1458,7 +1470,7 @@ function applySuggestedTargetCategory(suggestedTarget) {
 
     const flow = getZenithUltimateFlow(category);
     currentAnalysisMode = flow.analysisMode;
-    log("INFO", `Objetivo detectado: ${category === "planet_small" ? "Planeta / Fase Lunar" : "Superficie"}.`);
+    log("INFO", `Objetivo detectado: ${category === "planet_small" ? "Planeta / Fase Lunar" : "General (Planetas / Superficies)"}.`);
 }
 
 // Estado del Reproductor de Animacion
@@ -1903,11 +1915,192 @@ function clearSourcePreviewSurface(width = null, height = null, clearImage = tru
     if (ui.apCount) ui.apCount.textContent = "0";
 }
 
+// ============================================================
+// KIT UX DE SLIDERS (global): ajuste fino y estandarización.
+//  - Rueda del ratón sobre un slider: ±1 paso (sin scroll de página).
+//  - Shift + rueda: paso FINO (paso/10) para ajustes milimétricos.
+//  - Doble clic en el slider: restablecer a su valor por defecto (el del
+//    HTML, capturado como data-default la primera vez).
+// Los number inputs emparejados siguen siendo la entrada exacta por teclado.
+// ============================================================
+function enhanceRangeInputs() {
+    document.querySelectorAll('input[type="range"]').forEach((sl) => {
+        if (sl.dataset.uxEnhanced) return;
+        sl.dataset.uxEnhanced = "1";
+        if (sl.dataset.default === undefined) sl.dataset.default = sl.value;
+
+        const stepOf = () => {
+            const s = parseFloat(sl.step);
+            return (isFinite(s) && s > 0) ? s : 1;
+        };
+        const decimalsOf = (step) => {
+            const s = String(step);
+            const i = s.indexOf(".");
+            return i < 0 ? 0 : s.length - i - 1;
+        };
+        const apply = (v, step) => {
+            const min = parseFloat(sl.min), max = parseFloat(sl.max);
+            if (isFinite(min)) v = Math.max(min, v);
+            if (isFinite(max)) v = Math.min(max, v);
+            sl.value = v.toFixed(Math.min(decimalsOf(step) + 1, 4));
+            sl.dispatchEvent(new Event("input", { bubbles: true }));
+            sl.dispatchEvent(new Event("change", { bubbles: true }));
+        };
+
+        sl.addEventListener("wheel", (e) => {
+            e.preventDefault();
+            const base = stepOf();
+            const step = e.shiftKey ? base / 10 : base;
+            const dir = e.deltaY < 0 ? 1 : -1;
+            apply(parseFloat(sl.value) + dir * step, step);
+        }, { passive: false });
+
+        sl.addEventListener("dblclick", () => {
+            apply(parseFloat(sl.dataset.default), stepOf());
+        });
+
+        const hint = "Rueda: ±paso · Shift+rueda: fino · Doble clic: restablecer (" + sl.dataset.default + ")";
+        sl.title = sl.title ? sl.title + " — " + hint : hint;
+    });
+}
+
+// ============================================================
+// ESQUEMAS DE WAVELETS (presets estilo RegiStax, en localStorage)
+// Guardan la configuración COMPLETA del panel de post-procesado y la
+// re-aplican con un clic (los listeners num→slider hacen el resto y el
+// pipeline se re-lanza con su debounce normal).
+// ============================================================
+const WAVELET_PRESETS_KEY = "zas_wavelet_presets_v1";
+
+function waveletPresetsLoad() {
+    try { return JSON.parse(localStorage.getItem(WAVELET_PRESETS_KEY)) || {}; }
+    catch (_) { return {}; }
+}
+function waveletPresetsSave(all) {
+    try { localStorage.setItem(WAVELET_PRESETS_KEY, JSON.stringify(all)); } catch (_) { }
+}
+
+function refreshWaveletPresetList(selectName) {
+    const sel = document.getElementById("wavelet-preset-select");
+    if (!sel) return;
+    const all = waveletPresetsLoad();
+    sel.innerHTML = "";
+    const ph = document.createElement("option");
+    ph.value = "";
+    ph.textContent = tr("wavelets.presets.placeholder", "— Esquemas guardados —");
+    sel.appendChild(ph);
+    Object.keys(all).sort().forEach((name) => {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        sel.appendChild(opt);
+    });
+    if (selectName) sel.value = selectName;
+}
+
+function applyWaveletPreset(p) {
+    const setNum = (id, val) => {
+        const el = document.getElementById("num-" + id);
+        if (!el || val === undefined || val === null || isNaN(val)) return;
+        el.value = val;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+    };
+    (p.u || []).forEach((v, i) => setNum("u" + (i + 1), v));
+    (p.w || []).forEach((v, i) => setNum("w" + (i + 1), v));
+    (p.d || []).forEach((v, i) => setNum("d" + (i + 1), v));
+    setNum("crisp", p.crisp);
+    if (p.deconv) {
+        setNum("deconv-sigma", p.deconv.s); setNum("deconv-iter", p.deconv.i);
+        setNum("vc-sigma", p.deconv.vs); setNum("vc-iter", p.deconv.vi);
+    }
+    if (p.usm) { setNum("usm-amt", p.usm.a); setNum("usm-rad", p.usm.r); }
+    setNum("lce-amt", p.lce);
+    setNum("master-denoise", p.masterDenoise);
+    setNum("denoise-detail", p.denoiseDetail);
+    setNum("denoise-chroma", p.denoiseChroma);
+    if (p.color) {
+        setNum("gamma", p.color.g); setNum("sat", p.color.s);
+        setNum("contrast", p.color.c); setNum("brightness", p.color.b);
+        setNum("r-bal", p.color.rb); setNum("b-bal", p.color.bb);
+    }
+    if (p.dr) {
+        setNum("dr-rad", p.dr.rad); setNum("dr-dark", p.dr.dark); setNum("dr-light", p.dr.light);
+        if (ui.selDrMode) { ui.selDrMode.value = String(p.dr.mode ?? 0); ui.selDrMode.dispatchEvent(new Event("change", { bubbles: true })); }
+        if (ui.chkDrMask) ui.chkDrMask.checked = !!p.dr.mask;
+    }
+    if (p.shift) {
+        [["rx", p.shift.rx], ["ry", p.shift.ry], ["bx", p.shift.bx], ["by", p.shift.by]].forEach(([k, v]) => {
+            if (ui[k] && v !== undefined) { ui[k].value = v; ui[k].dispatchEvent(new Event("input", { bubbles: true })); }
+        });
+    }
+    if (p.blend !== undefined && ui.blendSlider) {
+        ui.blendSlider.value = p.blend;
+        ui.blendSlider.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    const selSharp = document.getElementById("sel-sharpen-mode");
+    if (selSharp && p.useRgbSharpening !== undefined) {
+        selSharp.value = p.useRgbSharpening ? "rgb" : "luminance";
+        selSharp.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    triggerUpdate();
+}
+
+function initWaveletPresets() {
+    const sel = document.getElementById("wavelet-preset-select");
+    const nameInput = document.getElementById("wavelet-preset-name");
+    const btnSave = document.getElementById("btn-wavelet-preset-save");
+    const btnDel = document.getElementById("btn-wavelet-preset-del");
+    if (!sel || !btnSave) return;
+
+    refreshWaveletPresetList();
+
+    btnSave.addEventListener("click", () => {
+        const name = (nameInput?.value || sel.value || "").trim();
+        if (!name) {
+            log("WARN", tr("wavelets.presets.need_name", "Escribe un nombre para guardar el esquema."));
+            return;
+        }
+        const all = waveletPresetsLoad();
+        all[name] = getPipelineParams();
+        waveletPresetsSave(all);
+        refreshWaveletPresetList(name);
+        if (nameInput) nameInput.value = "";
+        log("SUCCESS", tr("wavelets.presets.saved", "Esquema guardado: ") + name);
+    });
+
+    btnDel?.addEventListener("click", () => {
+        const name = sel.value;
+        if (!name) return;
+        const all = waveletPresetsLoad();
+        delete all[name];
+        waveletPresetsSave(all);
+        refreshWaveletPresetList();
+        log("INFO", tr("wavelets.presets.deleted", "Esquema borrado: ") + name);
+    });
+
+    sel.addEventListener("change", () => {
+        const name = sel.value;
+        if (!name) return;
+        const all = waveletPresetsLoad();
+        if (all[name]) {
+            applyWaveletPreset(all[name]);
+            log("INFO", tr("wavelets.presets.applied", "Esquema aplicado: ") + name);
+        }
+    });
+}
+
 window.addEventListener("load", () => {
     console.log("Zenith: Startup content loaded.");
 
     // Populate the hardware-acceleration label (progress overlay + header badge).
     checkAvx2Status();
+
+    // Ajuste fino + doble-clic-reset en todos los sliders de la app.
+    enhanceRangeInputs();
+
+    // Esquemas de wavelets guardables (paridad de flujo con RegiStax).
+    initWaveletPresets();
 
     // Double-check show if it somehow missed the module init
     if (appWindow && typeof appWindow.show === 'function') {
@@ -2196,6 +2389,8 @@ if (btnCloseFfmpeg) {
 function showProcessing(msg = "PROCESANDO...") {
     isLocalOperation = false;
     isCancellationRequested = false;
+    if (typeof dsHideStretchBar === "function") dsHideStretchBar();
+    if (typeof dsExitResultMode === "function") dsExitResultMode();
     const overlay = $("#processing-overlay");
     const txt = $("#processing-msg");
     const det = $("#processing-details");
@@ -4475,6 +4670,25 @@ function getPipelineParams() {
 }
 window.getPipelineParams = getPipelineParams;
 
+// ¿La configuración de post-procesado está en estado NEUTRO (identidad)?
+// Se usa para decidir si vale la pena re-lanzar el pipeline tras un apilado
+// nuevo (con todo neutro el resultado sería idéntico al stack crudo, y la
+// descomposición wavelet a resolución completa no es gratis).
+function isPostConfigNeutral(p) {
+    const zero = (v) => Math.abs(v) < 0.001;
+    const one = (v) => Math.abs(v - 1) < 0.001;
+    return p.u.every(zero) && p.w.every(zero) && p.d.every(zero)
+        && zero(p.crisp)
+        && p.deconv.i === 0 && p.deconv.vi === 0
+        && zero(p.usm.a) && zero(p.lce)
+        && zero(p.masterDenoise)
+        && one(p.color.g) && one(p.color.s) && one(p.color.c)
+        && zero(p.color.b) && zero(p.color.rb) && zero(p.color.bb)
+        && zero(p.shift.rx) && zero(p.shift.ry) && zero(p.shift.bx) && zero(p.shift.by)
+        && Math.abs(p.blend - 100) < 0.001
+        && p.dr.mode === 0;
+}
+
 function triggerUpdate() {
     const currentParams = JSON.stringify(getPipelineParams());
     if (currentParams === lastProcessedParams) return;
@@ -5744,7 +5958,8 @@ if (ui.btnBatchRun) {
                         isV3: batchFlow.isV3,
                         apGridSize: batchFlow.apSize,
                         apThreshold: batchFlow.apThreshold,
-                        progressPrefix: `[${displayIdx}/${batchFiles.length}]`
+                        progressPrefix: `[${displayIdx}/${batchFiles.length}]`,
+                        alignRgb: document.getElementById("chk-rgb-align") ? document.getElementById("chk-rgb-align").checked : true
                     });
 
                     const preview = result?.preview_base64 || result?.path;
@@ -5763,6 +5978,10 @@ if (ui.btnBatchRun) {
 
                 } catch (e) {
                     log("ERROR", trFormat("batch.logs.file_failed", { name: fileName, error: e }, `Fallo en ${file}: ${e}`));
+                    if (isCancellationError(e)) {
+                        log("WARN", tr("batch.logs.cancelled", "Lote cancelado por el usuario."));
+                        break; // no seguir con los archivos restantes
+                    }
                 }
             }
 
@@ -6089,6 +6308,14 @@ if (ui.btnRunAnalysis) {
                 if (ui.statWorst) ui.statWorst.textContent = format(res.stats.worst_score);
                 if (ui.statBest) ui.statBest.textContent = format(res.stats.best_score);
                 ui.stackSlider.value = res.recommended_pct; ui.pctDisplay.textContent = res.recommended_pct.toFixed(0) + "%";
+                // Fijar y mostrar la sugerencia inteligente (clic para re-aplicarla).
+                analysisSuggestedPct = res.recommended_pct || null;
+                const sugBadge = document.getElementById("suggested-pct-badge");
+                const sugVal = document.getElementById("suggested-pct-value");
+                if (sugBadge && sugVal && analysisSuggestedPct) {
+                    sugVal.textContent = analysisSuggestedPct.toFixed(0) + "%";
+                    sugBadge.style.display = "block";
+                }
                 ui.panelInfo.style.display = "block"; ui.panelAnalysis.style.display = "block";
                 ui.analysisActions.style.display = "none";
                 if (isBatchMode) {
@@ -6169,6 +6396,14 @@ if (ui.btnRunAnalysis) {
         }, 100);
     });
 }
+
+// Click en la sugerencia → aplicarla al slider y refrescar la gráfica.
+const suggestedBadge = document.getElementById("suggested-pct-badge");
+if (suggestedBadge) suggestedBadge.addEventListener("click", () => {
+    if (!analysisSuggestedPct || !ui.stackSlider) return;
+    ui.stackSlider.value = analysisSuggestedPct;
+    ui.stackSlider.dispatchEvent(new Event("input"));
+});
 
 if (ui.stackSlider) ui.stackSlider.addEventListener("input", (e) => {
     ui.pctDisplay.textContent = `${e.target.value}%`;
@@ -6589,7 +6824,8 @@ if (ui.btnStack) {
                         normalizeColors: document.getElementById("chk-normalize-colors") ? document.getElementById("chk-normalize-colors").checked : true,
                         isV3: flow.isV3 || (alignModeStr === "liquid_v3") || (alignModeStr === "zenith_v3"), // V3 flag for all these modes
                         keepFullFrame: document.getElementById("chk-keep-full-frame") ? document.getElementById("chk-keep-full-frame").checked : false,
-                        targetType: flow.category
+                        targetType: flow.category,
+                        alignRgb: document.getElementById("chk-rgb-align") ? document.getElementById("chk-rgb-align").checked : true
                     });
                 } else {
                     // MODO GLOBAL / STANDARD
@@ -6634,6 +6870,18 @@ if (ui.btnStack) {
                 if (ui.imgResult) {
                     await setImageAndWait(ui.imgResult, b64, false);
                     fitToScreen(); // Recenter the viewport symmetrically to feature both images
+                }
+
+                // RE-APLICAR POST-PROCESADO AL NUEVO STACK: el resultado recién
+                // apilado llega CRUDO y lastProcessedParams aún guarda los del
+                // stack anterior — sin esto, la configuración en curso (wavelets,
+                // deconv, color...) no se re-aplicaba hasta tocar un slider (y si
+                // nada cambiaba, ni así). Se resetea el memo y, si hay config
+                // activa (no-neutra), se relanza el pipeline automáticamente.
+                lastProcessedParams = null;
+                if (!isPostConfigNeutral(getPipelineParams())) {
+                    log("INFO", tr("wavelets.reapplying", "Re-aplicando post-procesado al nuevo apilado..."));
+                    triggerUpdate();
                 }
 
                 // PERSISTENCE: Mantener paneles de análisis e info visibles para permitir re-apilado rápido
@@ -7063,6 +7311,29 @@ function drawChart(data, cutVal, isSorted) {
                 }
             }
         };
+
+        // Marca FIJA de la sugerencia inteligente del análisis (ámbar). Solo
+        // se dibuja si difiere del corte actual para no encimar etiquetas.
+        if (analysisSuggestedPct && Math.abs(analysisSuggestedPct - cutVal) > 0.5) {
+            const sugIndex = Math.floor(data.length * (analysisSuggestedPct / 100));
+            annotations.suggested = {
+                type: 'line',
+                xMin: sugIndex,
+                xMax: sugIndex,
+                borderColor: '#f59e0b',
+                borderWidth: 1.5,
+                borderDash: [3, 4],
+                label: {
+                    content: `⭐ ${analysisSuggestedPct.toFixed(0)}%`,
+                    display: true,
+                    position: 'end',
+                    backgroundColor: 'rgba(120, 53, 15, 0.85)',
+                    color: '#fbbf24',
+                    font: { size: 10, weight: 'bold' },
+                    yAdjust: -6
+                }
+            };
+        }
     }
 
     chartInstance = new Chart(ctx, {
@@ -7207,10 +7478,25 @@ listen("backend_panic", (e) => {
         showCustomAlert("Error", "Error inesperado: " + msg);
     }
 });
+// Reporte de calidad por-toma (WBPP-style) emitido por stack_deepsky.
+let dsFrameReport = null;
+listen("ds-report", (e) => {
+    dsFrameReport = Array.isArray(e.payload) ? e.payload : null;
+    const btn = document.getElementById("ds-report-btn");
+    if (btn) btn.style.display = dsFrameReport && dsFrameReport.length ? "inline-flex" : "none";
+});
+
 listen("progress", (e) => {
     const step = translateBackendProgressText(e.payload.step);
     const details = translateBackendProgressText(e.payload.details);
     const pct = Number(e.payload.pct ?? 0);
+
+    // Cielo Profundo: ventana WBPP dedicada (no la pantalla de carga genérica).
+    if (typeof dsStacking !== "undefined" && dsStacking) {
+        dsProgressUpdate(step, pct);
+        if (ui.statusText) ui.statusText.textContent = `${step}: ${pct.toFixed(0)}%`;
+        return;
+    }
 
     // 1. Update Status Bar (Log side)
     if (ui.statusText) ui.statusText.textContent = `${step}: ${pct.toFixed(0)}%`;
@@ -7833,6 +8119,965 @@ updateAlignModeUI();
 // =========================================================================
 // PROCESS CANCELLATION
 // =========================================================================
+
+// ============================================================
+// APILADO DE CIELO PROFUNDO — flujo tipo WBPP simplificado:
+// listado técnico por archivo (dims/exposición desde la cabecera FITS),
+// agrupación por palabras clave, emparejamiento darks/flats/bias↔lights
+// con diagnóstico, e integración σ-clip. El resultado LINEAL entra al
+// mismo pipeline de post-procesado que los apilados planetarios.
+// ============================================================
+const dsFiles = { lights: [], darks: [], flats: [], bias: [] }; // DsProbe[]
+let dsSelectedGroup = null; // keyword activa o null = todos
+
+const DS_SECTIONS = [
+    { kind: "lights", icon: "icon-sequence", labelKey: "deepsky.pick_lights", fallback: "Lights (imágenes del objeto)", iconBg: "rgba(99,102,241,0.18)", iconColor: "#a5b4fc" },
+    { kind: "darks", icon: "icon-moon", labelKey: "deepsky.pick_darks", fallback: "Darks (opcional)", iconBg: "rgba(100,116,139,0.18)", iconColor: "#94a3b8" },
+    { kind: "flats", icon: "icon-lightbulb", labelKey: "deepsky.pick_flats", fallback: "Flats (opcional)", iconBg: "rgba(245,158,11,0.15)", iconColor: "#fbbf24" },
+    { kind: "bias", icon: "icon-film", labelKey: "deepsky.pick_bias", fallback: "Bias (opcional)", iconBg: "rgba(6,182,212,0.15)", iconColor: "#67e8f9" }
+];
+
+function dsKeywords() {
+    const raw = document.getElementById("ds-keywords")?.value || "";
+    return raw.split(",").map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
+}
+
+function dsFileGroups(file) {
+    const n = file.name.toLowerCase();
+    return dsKeywords().filter(k => n.includes(k));
+}
+
+function dsActiveLights() {
+    if (!dsSelectedGroup) return dsFiles.lights.filter(f => f.ok);
+    return dsFiles.lights.filter(f => f.ok && f.name.toLowerCase().includes(dsSelectedGroup));
+}
+
+// Calibración emparejada: si hay grupo activo, se prefieren los archivos de
+// calibración que contengan la misma palabra clave; los que no llevan NINGUNA
+// keyword se consideran globales (sirven para todos los grupos).
+function dsMatchedCalib(kind) {
+    const all = dsFiles[kind].filter(f => f.ok);
+    if (!dsSelectedGroup) return all;
+    const tagged = all.filter(f => f.name.toLowerCase().includes(dsSelectedGroup));
+    if (tagged.length > 0) return tagged;
+    return all.filter(f => dsFileGroups(f).length === 0); // globales
+}
+
+function dsFmtExp(e) {
+    return (e === null || e === undefined) ? "—" : (e >= 10 ? e.toFixed(0) : e.toFixed(1)) + "s";
+}
+
+function dsRenderFileList(container, kind, files, lightsRef) {
+    container.innerHTML = "";
+    if (files.length === 0) { container.style.display = "none"; return; }
+    container.style.display = "block";
+    const shown = files.slice(0, 120);
+    shown.forEach(f => {
+        const idx = dsFiles[kind].indexOf(f);
+        const row = document.createElement("div");
+        row.draggable = true;
+        row.dataset.kind = kind;
+        row.dataset.path = f.path;
+        // Grid: drag · estado · nombre COMPLETO · dims · exp · tags · borrar.
+        row.style.cssText = "display:grid; grid-template-columns:12px 14px minmax(0,1fr) 76px 48px auto 18px; align-items:center; gap:7px; padding:3px 4px; font-size:0.64rem; color:#94a3b8; font-family:'Courier New',monospace; border-radius:6px; cursor:grab;";
+        row.addEventListener("mouseenter", () => { row.style.background = "rgba(124,58,237,0.10)"; });
+        row.addEventListener("mouseleave", () => { row.style.background = "transparent"; });
+        row.addEventListener("dragstart", (e) => {
+            e.dataTransfer.setData("text/plain", `${kind}|${f.path}`);
+            e.dataTransfer.effectAllowed = "move";
+            row.style.opacity = "0.4";
+        });
+        row.addEventListener("dragend", () => { row.style.opacity = "1"; });
+
+        const grip = document.createElement("span");
+        grip.textContent = "⠿";
+        grip.style.color = "#475569";
+        let warn = "";
+        if (!f.ok) { warn = f.error || "ilegible"; }
+        else if (lightsRef && (f.w !== lightsRef.w || f.h !== lightsRef.h)) { warn = tr("deepsky.warn_dims", "dims ≠"); }
+        const status = document.createElement("span");
+        status.textContent = f.ok && !warn ? "✓" : "⚠";
+        status.style.color = f.ok && !warn ? "#34d399" : "#f59e0b";
+        status.title = warn;
+        const name = document.createElement("span");
+        name.textContent = f.name;
+        name.style.cssText = "overflow:hidden; white-space:nowrap; text-overflow:ellipsis; color:#cbd5e1;";
+        name.title = f.path;
+        const dims = document.createElement("span");
+        dims.textContent = f.ok ? `${f.w}×${f.h}` : "—";
+        dims.style.cssText = "text-align:right;";
+        const exp = document.createElement("span");
+        exp.textContent = dsFmtExp(f.exptime);
+        exp.style.cssText = "text-align:right;";
+        const tags = document.createElement("span");
+        const parts = dsFileGroups(f);
+        if (f.bayer) parts.unshift(f.bayer);
+        tags.textContent = parts.join(" ");
+        tags.style.cssText = "color:#7dd3fc; text-align:right; white-space:nowrap;";
+        const del = document.createElement("span");
+        del.textContent = "✕";
+        del.title = tr("deepsky.remove_file", "Quitar este archivo");
+        del.style.cssText = "color:#64748b; cursor:pointer; text-align:center;";
+        del.addEventListener("click", (e) => { e.stopPropagation(); if (idx >= 0) { dsFiles[kind].splice(idx, 1); dsUpdateUI(); } });
+        del.addEventListener("mouseenter", () => { del.style.color = "#f87171"; });
+        del.addEventListener("mouseleave", () => { del.style.color = "#64748b"; });
+        row.append(grip, status, name, dims, exp, tags, del);
+        container.appendChild(row);
+    });
+    if (files.length > shown.length) {
+        const more = document.createElement("div");
+        more.style.cssText = "font-size:0.6rem; color:#64748b; padding:3px 2px; text-align:center;";
+        more.textContent = `… +${files.length - shown.length} ${tr("deepsky.files", "archivos")}`;
+        container.appendChild(more);
+    }
+}
+
+// Mover un archivo de una categoría a otra (arrastrar y soltar).
+function dsMoveFile(fromKind, path, toKind) {
+    if (fromKind === toKind) return;
+    const i = dsFiles[fromKind].findIndex(f => f.path === path);
+    if (i < 0) return;
+    const [f] = dsFiles[fromKind].splice(i, 1);
+    if (!dsFiles[toKind].some(x => x.path === path)) dsFiles[toKind].push(f);
+    log("INFO", `Movido a ${toKind.toUpperCase()}: ${f.name}`);
+    dsUpdateUI();
+}
+
+function dsRenderSections() {
+    const host = document.getElementById("ds-sections");
+    if (!host || host.dataset.built) return;
+    host.dataset.built = "1";
+
+    // Botón de auto-clasificación de carpeta (una sola carpeta raíz →
+    // lights/darks/flats/bias por palabras clave del nombre, recursivo).
+    const auto = document.createElement("button");
+    auto.type = "button";
+    auto.className = "donation-option";
+    auto.style.cssText = "width:100%; min-height:52px; margin:0 0 4px;";
+    auto.innerHTML = `
+        <span class="donation-option-icon" style="background:rgba(124,58,237,0.18); color:#c4b5fd; width:36px; height:36px;">
+            <svg class="zas-icon" style="width:18px; height:18px;"><use href="#icon-folder"></use></svg>
+        </span>
+        <span class="donation-option-copy" style="min-width:0;">
+            <strong data-i18n="deepsky.scan_folder" style="letter-spacing:0.05em;">Escanear carpeta (auto-clasificar)</strong>
+            <small data-i18n="deepsky.scan_folder_hint">Detecta lights/darks/flats/bias en subcarpetas por nombre</small>
+        </span>`;
+    auto.addEventListener("click", dsScanFolder);
+    host.appendChild(auto);
+
+    for (const s of DS_SECTIONS) {
+        const wrap = document.createElement("div");
+        wrap.dataset.kind = s.kind;
+        wrap.style.cssText = "display:flex; flex-direction:column; gap:4px; border-radius:12px; transition:background 0.15s, box-shadow 0.15s;";
+        // Zona de soltado: arrastrar un archivo aquí lo reclasifica.
+        wrap.addEventListener("dragover", (e) => { e.preventDefault(); wrap.style.boxShadow = "inset 0 0 0 2px #7c3aed"; wrap.style.background = "rgba(124,58,237,0.06)"; });
+        wrap.addEventListener("dragleave", () => { wrap.style.boxShadow = "none"; wrap.style.background = "transparent"; });
+        wrap.addEventListener("drop", (e) => {
+            e.preventDefault();
+            wrap.style.boxShadow = "none"; wrap.style.background = "transparent";
+            const data = e.dataTransfer.getData("text/plain");
+            const [fromKind, path] = data.split("|");
+            if (fromKind && path) dsMoveFile(fromKind, path, s.kind);
+        });
+        const rowTop = document.createElement("div");
+        rowTop.style.cssText = "display:flex; align-items:center; gap:8px;";
+
+        // Fila principal con el lenguaje visual de las donation-option.
+        const btn = document.createElement("button");
+        btn.id = `btn-ds-${s.kind}`;
+        btn.type = "button";
+        btn.className = "donation-option";
+        btn.style.cssText = "flex:1 1 auto; width:auto; min-width:0; margin:0;";
+        btn.innerHTML = `
+            <span class="donation-option-icon" style="background:${s.iconBg}; color:${s.iconColor};">
+                <svg class="zas-icon" style="width:18px; height:18px;"><use href="#${s.icon}"></use></svg>
+            </span>
+            <span class="donation-option-copy" style="min-width:0;">
+                <strong data-i18n="${s.labelKey}" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${s.fallback}</strong>
+                <small id="ds-${s.kind}-sub">${tr("deepsky.no_files", "Sin archivos")}</small>
+            </span>
+            <span id="ds-${s.kind}-count"
+                style="flex:0 0 auto; min-width:44px; text-align:center; font-size:0.7rem; color:#94a3b8; border:1px solid #334155; border-radius:999px; padding:3px 8px;">0</span>`;
+
+        // Botón de carpeta recursiva para ESTE tipo (todos los frames bajo la
+        // carpeta se asignan a esta categoría).
+        const folder = document.createElement("button");
+        folder.type = "button";
+        folder.title = tr("deepsky.pick_folder", "Cargar carpeta (recursivo)");
+        folder.innerHTML = `<svg class="zas-icon" style="width:14px;height:14px;"><use href="#icon-folder"></use></svg>`;
+        folder.style.cssText = "flex:0 0 auto; width:auto; background:none; border:1px solid #334155; color:#94a3b8; border-radius:8px; padding:6px 9px; cursor:pointer; display:flex; align-items:center;";
+        folder.addEventListener("click", () => dsPickFolder(s.kind));
+
+        const clear = document.createElement("button");
+        clear.type = "button";
+        clear.title = tr("deepsky.clear", "Limpiar");
+        clear.textContent = "✕";
+        clear.style.cssText = "flex:0 0 auto; width:auto; background:none; border:1px solid #334155; color:#64748b; border-radius:8px; padding:6px 10px; cursor:pointer; font-size:0.7rem;";
+        clear.addEventListener("click", () => { dsFiles[s.kind] = []; dsUpdateUI(); });
+
+        rowTop.append(btn, folder, clear);
+        const list = document.createElement("div");
+        list.id = `ds-list-${s.kind}`;
+        list.style.cssText = "display:none; max-height:190px; overflow-y:auto; margin:2px 4px 0; border-left:2px solid rgba(124,58,237,0.25); padding:2px 4px 2px 8px;";
+        wrap.append(rowTop, list);
+        host.appendChild(wrap);
+        btn.addEventListener("click", () => dsPick(s.kind));
+    }
+}
+
+function dsUpdateUI() {
+    const lights = dsActiveLights();
+    const lightsRef = lights[0] || null;
+
+    for (const s of DS_SECTIONS) {
+        const badge = document.getElementById(`ds-${s.kind}-count`);
+        const list = document.getElementById(`ds-list-${s.kind}`);
+        const sub = document.getElementById(`ds-${s.kind}-sub`);
+        const files = dsFiles[s.kind];
+        const usable = s.kind === "lights" ? lights.length : dsMatchedCalib(s.kind).length;
+        if (badge) {
+            badge.textContent = files.length === usable ? String(files.length) : `${usable}/${files.length}`;
+            badge.style.color = files.length > 0 ? "#34d399" : "#94a3b8";
+        }
+        if (sub) {
+            if (files.length === 0) {
+                sub.textContent = tr("deepsky.no_files", "Sin archivos");
+            } else {
+                const f0 = files.find(f => f.ok);
+                const bits = [`${usable} ${tr("deepsky.files", "archivos")}`];
+                if (f0) bits.push(`${f0.w}×${f0.h}`);
+                const exps = files.map(f => f.exptime).filter(e => e !== null && e !== undefined);
+                if (exps.length) bits.push(dsFmtExp(exps.reduce((a, b) => a + b, 0) / exps.length));
+                if (f0 && f0.bayer) bits.push(f0.bayer);
+                sub.textContent = bits.join(" · ");
+            }
+        }
+        if (list) dsRenderFileList(list, s.kind, files, s.kind === "lights" ? null : lightsRef);
+    }
+
+    // Cosmética inteligente: con darks el master ya elimina los píxeles
+    // calientes — se apaga sola salvo que el usuario la haya tocado.
+    const chkCos = document.getElementById("chk-ds-cosmetic");
+    if (chkCos && !chkCos.dataset.touched) {
+        chkCos.checked = dsFiles.darks.length === 0;
+    }
+
+    // Chips de grupo (keywords presentes en los lights)
+    const chips = document.getElementById("ds-group-chips");
+    if (chips) {
+        chips.innerHTML = "";
+        const kws = dsKeywords();
+        const groups = kws
+            .map(k => ({ k, n: dsFiles.lights.filter(f => f.name.toLowerCase().includes(k)).length }))
+            .filter(g => g.n > 0);
+        if (groups.length === 0) {
+            chips.style.display = "none";
+            dsSelectedGroup = null;
+        } else {
+            chips.style.display = "flex";
+            const mk = (label, value, count) => {
+                const c = document.createElement("button");
+                const active = dsSelectedGroup === value;
+                c.textContent = `${label} (${count})`;
+                c.style.cssText = `border-radius:999px; padding:3px 10px; font-size:0.68rem; cursor:pointer; border:1px solid ${active ? "#7c3aed" : "#334155"}; background:${active ? "rgba(124,58,237,0.25)" : "rgba(15,23,42,0.6)"}; color:${active ? "#ddd6fe" : "#94a3b8"};`;
+                c.addEventListener("click", () => { dsSelectedGroup = value; dsUpdateUI(); });
+                return c;
+            };
+            chips.appendChild(mk(tr("deepsky.group_all", "Todos"), null, dsFiles.lights.filter(f => f.ok).length));
+            groups.forEach(g => chips.appendChild(mk(g.k, g.k, g.n)));
+        }
+    }
+
+    // MAPA DE CALIBRACIÓN (pipeline visual estilo WBPP): pasos encadenados de
+    // cómo se calibrará cada light, con validación de dims y exposición.
+    const sum = document.getElementById("ds-match-summary");
+    if (sum) {
+        if (dsFiles.lights.length === 0) {
+            sum.style.display = "none";
+        } else {
+            sum.style.display = "block";
+            const expOf = (arr) => {
+                const es = arr.map(f => f.exptime).filter(e => e !== null && e !== undefined);
+                if (es.length === 0) return null;
+                return es.reduce((a, b) => a + b, 0) / es.length;
+            };
+            const lExp = expOf(lights);
+            const usedB = dsMatchedCalib("bias");
+            const usedD = dsMatchedCalib("darks");
+            const usedF = dsMatchedCalib("flats");
+            const dimsWarn = (arr) => lightsRef && arr.length > 0 && !arr.every(f => f.w === lightsRef.w && f.h === lightsRef.h);
+
+            const step = (icon, color, title, detail, warn) => `
+                <div style="display:flex; align-items:center; gap:7px; padding:4px 8px; border-radius:8px; background:rgba(15,23,42,0.55); border:1px solid ${warn ? 'rgba(245,158,11,0.4)' : 'rgba(255,255,255,0.06)'};">
+                    <svg class="zas-icon" style="width:14px;height:14px;color:${color};"><use href="#${icon}"></use></svg>
+                    <div style="min-width:0;">
+                        <div style="font-weight:600;color:#e2e8f0;font-size:0.66rem;">${title}</div>
+                        <div style="font-size:0.6rem;color:${warn ? '#fbbf24' : '#94a3b8'};">${detail}</div>
+                    </div>
+                </div>`;
+            const arrow = `<div style="color:#475569; align-self:center;">→</div>`;
+
+            const parts = [];
+            const grpTxt = dsSelectedGroup ? ` · «${dsSelectedGroup}»` : "";
+            parts.push(step("icon-sequence", "#a5b4fc", `${lights.length} Lights${grpTxt}`,
+                `${lightsRef ? lightsRef.w + "×" + lightsRef.h : "—"} · ${dsFmtExp(lExp)}${(lightsRef && lightsRef.bayer) ? " · " + lightsRef.bayer : ""}`, false));
+
+            if (usedB.length) {
+                parts.push(arrow);
+                parts.push(step("icon-film", "#67e8f9", tr("deepsky.step_bias", "− Master Bias"),
+                    `${usedB.length} bias`, dimsWarn(usedB)));
+            }
+            if (usedD.length) {
+                const dExp = expOf(usedD);
+                const expWarn = lExp !== null && dExp !== null && Math.abs(dExp - lExp) > lExp * 0.05;
+                parts.push(arrow);
+                parts.push(step("icon-moon", "#94a3b8", tr("deepsky.step_dark", "− Master Dark"),
+                    `${usedD.length} darks${dExp !== null ? " · " + dsFmtExp(dExp) : ""}`, dimsWarn(usedD) || expWarn));
+            }
+            if (usedF.length) {
+                parts.push(arrow);
+                parts.push(step("icon-lightbulb", "#fbbf24", tr("deepsky.step_flat", "÷ Master Flat"),
+                    `${usedF.length} flats`, dimsWarn(usedF)));
+            }
+            // Cosmética si aplica (sin darks) + integración
+            if (usedD.length === 0) {
+                parts.push(arrow);
+                parts.push(step("icon-magic", "#c4b5fd", tr("deepsky.step_cosmetic", "Cosmética"),
+                    tr("deepsky.step_cosmetic_d", "píxeles calientes"), false));
+            }
+            parts.push(arrow);
+            parts.push(step("icon-galaxy", "#f0abfc", tr("deepsky.step_integrate", "Integración κ-σ"),
+                tr("deepsky.step_integrate_d", "registro + peso FWHM"), false));
+
+            sum.innerHTML = `<div style="font-size:0.62rem;color:#64748b;margin-bottom:6px;font-weight:600;letter-spacing:0.05em;">${tr("deepsky.plan_title", "PLAN DE CALIBRACIÓN")}</div><div style="display:flex;flex-wrap:wrap;gap:6px;align-items:stretch;">${parts.join("")}</div>`;
+        }
+    }
+
+    const run = document.getElementById("btn-deepsky-run");
+    if (run) {
+        // 1 light = flujo valido (calibrar + estirar); ≥2 = integracion completa.
+        run.disabled = lights.length < 1;
+        run.style.opacity = lights.length < 1 ? "0.5" : "1";
+    }
+}
+
+async function dsPick(kind) {
+    try {
+        const sel = await openDialog({
+            multiple: true,
+            title: kind === "lights" ? "Selecciona tus LIGHTS" : `Selecciona ${kind.toUpperCase()} (opcional)`,
+            filters: [{ name: "Astro (FITS/TIF/PNG)", extensions: ["fits", "fit", "tif", "tiff", "png", "jpg", "jpeg"] }]
+        });
+        if (!sel) return;
+        const paths = Array.isArray(sel) ? sel : [sel];
+        const probes = await invoke("deepsky_probe", { paths });
+        dsFiles[kind] = probes;
+        const bad = probes.filter(p => !p.ok).length;
+        if (bad > 0) log("WARN", `${kind}: ${bad} archivo(s) ilegibles (marcados ⚠).`);
+        dsUpdateUI();
+    } catch (e) {
+        console.error("deepsky pick:", e);
+        log("ERROR", `Cielo Profundo (${kind}): ${e}`);
+    }
+}
+
+// Carpeta recursiva → TODOS los frames bajo ella se asignan a `kind`.
+async function dsPickFolder(kind) {
+    try {
+        const dir = await openDialog({ directory: true, multiple: false, title: `Carpeta de ${kind.toUpperCase()}` });
+        if (!dir) return;
+        const cl = await invoke("deepsky_scan_classify", { root: dir });
+        const all = [...cl.lights, ...cl.darks, ...cl.flats, ...cl.bias];
+        if (all.length === 0) { log("WARN", "No se encontraron imágenes en la carpeta."); return; }
+        dsFiles[kind] = all;
+        log("INFO", `${kind}: ${all.length} archivo(s) cargados de la carpeta (recursivo).`);
+        dsUpdateUI();
+    } catch (e) { log("ERROR", `Cielo Profundo carpeta (${kind}): ${e}`); }
+}
+
+// ============================================================
+// VENTANA DE PROGRESO CIELO PROFUNDO (estilo WBPP: fases + tiempos)
+// ============================================================
+let dsStacking = false;
+let dsProgTimer = null;
+let dsProgStart = 0;
+const DS_PHASES = [
+    { id: "calib", label: "Calibración y detección de estrellas", rx: /calibr|master|detect/i },
+    { id: "register", label: "Registro estelar (triángulos)", rx: /registr/i },
+    { id: "int1", label: "Integración · pasada 1", rx: /pasada 1/i },
+    { id: "int2", label: "Integración · pasada 2 (σ-clip)", rx: /pasada 2/i },
+    { id: "bg", label: "Fondo: ABE + SCNR + neutralización", rx: /abe|gradiente|scnr|neutraliz/i },
+    { id: "stretch", label: "Estiramiento automático (STF)", rx: /estir|stf/i }
+];
+let dsPhaseTimes = {};
+
+function dsFmtClock(ms) {
+    const s = Math.floor(ms / 1000);
+    return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function dsProgressStart() {
+    dsStacking = true;
+    dsProgStart = Date.now();
+    dsPhaseTimes = {};
+    const steps = document.getElementById("ds-prog-steps");
+    if (steps) {
+        steps.innerHTML = "";
+        DS_PHASES.forEach(ph => {
+            const row = document.createElement("div");
+            row.id = `ds-ph-${ph.id}`;
+            row.style.cssText = "display:flex; align-items:center; gap:9px; padding:4px 6px; border-radius:8px; font-size:0.72rem; color:#64748b;";
+            row.innerHTML = `<span class="ds-ph-mark" style="width:16px; text-align:center;">○</span><span class="ds-ph-label" style="flex:1;">${ph.label}</span><span class="ds-ph-time" style="font-family:'Courier New',monospace; font-size:0.66rem; color:#475569;"></span>`;
+            steps.appendChild(row);
+        });
+    }
+    const bar = document.getElementById("ds-prog-bar"); if (bar) bar.style.width = "0%";
+    const pct = document.getElementById("ds-prog-pct"); if (pct) pct.textContent = "0%";
+    const cur = document.getElementById("ds-prog-current"); if (cur) cur.textContent = "";
+    const ov = document.getElementById("ds-progress"); if (ov) ov.style.display = "flex";
+    clearInterval(dsProgTimer);
+    dsProgTimer = setInterval(() => {
+        const el = document.getElementById("ds-prog-elapsed");
+        if (el) el.textContent = dsFmtClock(Date.now() - dsProgStart);
+    }, 1000);
+}
+
+function dsProgressUpdate(step, pct) {
+    if (!dsStacking) return;
+    const bar = document.getElementById("ds-prog-bar"); if (bar) bar.style.width = `${Math.min(100, pct)}%`;
+    const pe = document.getElementById("ds-prog-pct"); if (pe) pe.textContent = `${Math.round(pct)}%`;
+    const cur = document.getElementById("ds-prog-current"); if (cur) cur.textContent = step || "";
+
+    let active = DS_PHASES.findIndex(ph => ph.rx.test(step || ""));
+    if (pct >= 99.5) active = DS_PHASES.length; // todo hecho
+    if (active < 0) return;
+    DS_PHASES.forEach((ph, i) => {
+        const row = document.getElementById(`ds-ph-${ph.id}`);
+        if (!row) return;
+        const mark = row.querySelector(".ds-ph-mark");
+        const time = row.querySelector(".ds-ph-time");
+        if (i < active) {
+            if (!dsPhaseTimes[ph.id]) dsPhaseTimes[ph.id] = Date.now();
+            mark.textContent = "✓"; mark.style.color = "#34d399";
+            row.style.color = "#94a3b8";
+            if (time && dsPhaseTimes[ph.id + "_start"]) time.textContent = dsFmtClock(dsPhaseTimes[ph.id] - dsPhaseTimes[ph.id + "_start"]);
+        } else if (i === active) {
+            if (!dsPhaseTimes[ph.id + "_start"]) dsPhaseTimes[ph.id + "_start"] = Date.now();
+            mark.textContent = "▸"; mark.style.color = "#c4b5fd";
+            row.style.color = "#e2e8f0"; row.style.background = "rgba(124,58,237,0.08)";
+        }
+    });
+}
+
+function dsProgressStop() {
+    dsStacking = false;
+    clearInterval(dsProgTimer);
+    const ov = document.getElementById("ds-progress"); if (ov) ov.style.display = "none";
+}
+
+// Flujo de resultado DEDICADO de cielo profundo: solo la imagen final, sin la
+// vista fuente ni los paneles de post-procesado planetario (wavelets/deconv).
+function dsEnterResultMode() {
+    const vs = document.getElementById("view-source");
+    const vr = document.getElementById("view-result");
+    if (vs) vs.style.display = "none";
+    if (vr) { vr.style.display = "flex"; vr.style.borderLeft = "none"; }
+    const tog = document.getElementById("btn-toggle-source"); if (tog) tog.style.display = "none";
+    // Ocultar el post-procesado planetario — cielo profundo tiene su barra STF.
+    if (ui.panelWavelets) ui.panelWavelets.style.display = "none";
+    if (ui.panelTools) ui.panelTools.style.display = "none";
+    document.body.dataset.dsResult = "1";
+}
+
+// Restaurar la vista normal (fuente + resultado) al volver a un flujo planetario.
+function dsExitResultMode() {
+    if (document.body.dataset.dsResult !== "1") return;
+    const vs = document.getElementById("view-source");
+    const vr = document.getElementById("view-result");
+    if (vs) vs.style.display = "";
+    if (vr) vr.style.borderLeft = "";
+    dsHideStretchBar();
+    delete document.body.dataset.dsResult;
+}
+
+// ---- Barra de estirado final (SIRIL-style screen transfer function) ----
+let dsStretchMode = "linked";
+let dsStretchStrength = 0.5;
+let dsResultBasePath = null; // primer light del apilado → carpeta de exportación
+
+// Exporta el resultado de cielo profundo (estirado 16-bit/PNG y/o lineal 16-bit).
+// NO usa showProcessing (eso saldría del modo resultado); estado ocupado inline.
+async function dsExportResult(opts, triggerBtn) {
+    if (!dsResultBasePath) {
+        showCustomAlert(tr("general.error", "Error"), tr("deepsky.export_no_result", "No hay resultado de cielo profundo para exportar."));
+        return;
+    }
+    const prevTxt = triggerBtn ? triggerBtn.textContent : null;
+    if (triggerBtn) { triggerBtn.disabled = true; triggerBtn.style.opacity = "0.6"; triggerBtn.textContent = tr("deepsky.exporting", "Exportando…"); }
+    try {
+        const msg = await invoke("deepsky_export", {
+            basePath: dsResultBasePath,
+            mode: dsStretchMode,
+            strength: dsStretchStrength,
+            saveStretched: !!opts.stretched,
+            saveLinear: !!opts.linear,
+            asPng: !!opts.png
+        });
+        log("SUCCESS", normalizeBackendText(msg));
+        showCustomAlert(tr("general.saved", "Guardado"), normalizeBackendText(msg));
+    } catch (e) {
+        log("ERROR", `Exportar cielo profundo: ${e}`);
+        showCustomAlert(tr("general.error", "Error"), String(e));
+    } finally {
+        if (triggerBtn) { triggerBtn.disabled = false; triggerBtn.style.opacity = "1"; triggerBtn.textContent = prevTxt; }
+    }
+}
+
+async function dsApplyStretch() {
+    try {
+        const b64 = await invoke("deepsky_restretch", { mode: dsStretchMode, strength: dsStretchStrength });
+        if (ui.imgResult) await setImageAndWait(ui.imgResult, b64, false);
+        dsUpdateHistogram();
+    } catch (e) { log("ERROR", `Re-estirado: ${e}`); }
+}
+
+// Histograma RGB + lectura de fondo/recorte de la vista final (estilo PixInsight).
+async function dsUpdateHistogram() {
+    const panel = document.getElementById("ds-histogram");
+    if (!panel || panel.style.display === "none") return;
+    try {
+        const hp = await invoke("deepsky_histogram", { mode: dsStretchMode, strength: dsStretchStrength });
+        const cv = panel.querySelector("canvas");
+        const ctx = cv.getContext("2d");
+        const W = cv.width, H = cv.height;
+        ctx.clearRect(0, 0, W, H);
+        const bins = hp.bins;
+        // Escala log para ver a la vez fondo y picos; máximo global.
+        const maxv = Math.max(1, ...hp.r, ...hp.g, ...hp.b);
+        const lmax = Math.log(1 + maxv);
+        const draw = (arr, color) => {
+            ctx.beginPath();
+            for (let i = 0; i < bins; i++) {
+                const x = (i / (bins - 1)) * W;
+                const y = H - (Math.log(1 + arr[i]) / lmax) * H;
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            }
+            ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.stroke();
+        };
+        if (hp.is_mono) {
+            draw(hp.r, "rgba(226,232,240,0.9)");
+        } else {
+            draw(hp.r, "rgba(239,68,68,0.85)");
+            draw(hp.g, "rgba(34,197,94,0.85)");
+            draw(hp.b, "rgba(96,165,250,0.85)");
+        }
+        const info = panel.querySelector(".ds-hist-info");
+        if (info) {
+            const bg = hp.bg.map(v => Math.round(v));
+            const bgTxt = hp.is_mono ? `${bg[0]}` : `${bg[0]}/${bg[1]}/${bg[2]}`;
+            info.innerHTML = `${tr("deepsky.hist_bg", "Fondo")}: <b>${bgTxt}</b> ADU · ` +
+                `${tr("deepsky.hist_clip", "recorte")} ▼${hp.clip_low.toFixed(2)}% ▲${hp.clip_high.toFixed(2)}%`;
+        }
+    } catch (e) { /* sin resultado o incompatible — silencioso */ }
+}
+
+function dsHideStretchBar() {
+    const bar = document.getElementById("ds-stretch-bar");
+    if (bar) bar.style.display = "none";
+    const hist = document.getElementById("ds-histogram");
+    if (hist) hist.style.display = "none";
+}
+
+// Panel flotante del histograma, encima de la barra STF.
+function dsBuildHistogramPanel() {
+    if (document.getElementById("ds-histogram")) return;
+    const panel = document.createElement("div");
+    panel.id = "ds-histogram";
+    panel.style.cssText = "position:fixed; bottom:78px; left:50%; transform:translateX(-50%); z-index:499; width:260px; padding:8px 10px 6px; background:rgba(15,23,42,0.94); border:1px solid rgba(124,58,237,0.35); border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(6px);";
+    const cv = document.createElement("canvas");
+    cv.width = 240; cv.height = 66;
+    cv.style.cssText = "width:100%; height:66px; display:block; background:rgba(2,6,23,0.6); border-radius:6px;";
+    const info = document.createElement("div");
+    info.className = "ds-hist-info";
+    info.style.cssText = "font-size:0.6rem; color:#94a3b8; margin-top:4px; text-align:center;";
+    info.textContent = tr("deepsky.hist_title", "Histograma");
+    panel.append(cv, info);
+    document.body.appendChild(panel);
+}
+
+// Tabla de calidad por-toma (WBPP-style): FWHM, excentricidad, ruido, peso.
+function dsShowReportPanel() {
+    if (!dsFrameReport || !dsFrameReport.length) return;
+    let ov = document.getElementById("ds-report-modal");
+    if (ov) ov.remove();
+    ov = document.createElement("div");
+    ov.id = "ds-report-modal";
+    ov.style.cssText = "position:fixed; inset:0; z-index:960; display:flex; align-items:center; justify-content:center; background:rgba(2,6,23,0.6);";
+    // Ordena por peso descendente; los no usados al final.
+    const rows = [...dsFrameReport].sort((a, b) => (b.weight ?? -1) - (a.weight ?? -1));
+    const used = rows.filter(r => r.used).length;
+    const bestW = Math.max(...rows.map(r => r.weight ?? 0), 0.0001);
+    const box = document.createElement("div");
+    box.style.cssText = "width:720px; max-width:94vw; max-height:86vh; overflow:auto; background:rgba(15,23,42,0.98); border:1px solid rgba(124,58,237,0.4); border-radius:14px; box-shadow:0 12px 40px rgba(0,0,0,0.6); padding:18px;";
+    const th = "text-align:left; padding:6px 8px; font-size:0.66rem; color:#94a3b8; border-bottom:1px solid #334155; position:sticky; top:0; background:rgba(15,23,42,0.98);";
+    const td = "padding:5px 8px; font-size:0.7rem; color:#e2e8f0; border-bottom:1px solid rgba(51,65,85,0.4);";
+    const bar = (w) => {
+        const pct = Math.round((w / bestW) * 100);
+        return `<div style="display:flex; align-items:center; gap:6px;"><div style="flex:1; height:6px; background:#1e293b; border-radius:4px; overflow:hidden;"><div style="height:100%; width:${pct}%; background:linear-gradient(90deg,#7c3aed,#db2777);"></div></div><span style="min-width:34px; text-align:right;">${w.toFixed(2)}</span></div>`;
+    };
+    box.innerHTML = `
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+            <span style="font-size:1rem; font-weight:700; color:#e2e8f0;">${tr("deepsky.report_title", "Calidad de tomas")}</span>
+            <span style="font-size:0.72rem; color:#94a3b8;">${used}/${rows.length} ${tr("deepsky.report_used", "usadas")}</span>
+            <button id="ds-report-x" type="button" style="margin-left:auto; width:auto; padding:5px 10px; border-radius:8px; border:none; background:rgba(51,65,85,0.6); color:#cbd5e1; cursor:pointer;">✕</button>
+        </div>
+        <table style="width:100%; border-collapse:collapse;">
+            <thead><tr>
+                <th style="${th}">#</th>
+                <th style="${th}">${tr("deepsky.report_file", "Archivo")}</th>
+                <th style="${th}">FWHM</th>
+                <th style="${th}">Ecc</th>
+                <th style="${th}">${tr("deepsky.report_stars", "Estrellas")}</th>
+                <th style="${th}">${tr("deepsky.hist_bg", "Ruido")}</th>
+                <th style="${th}">${tr("deepsky.report_weight", "Peso")}</th>
+            </tr></thead>
+            <tbody>
+                ${rows.map((r, i) => `<tr style="${r.used ? "" : "opacity:0.5;"}">
+                    <td style="${td}">${i + 1}${r.reference ? " ★" : ""}</td>
+                    <td style="${td}; max-width:230px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${r.name}">${r.name}</td>
+                    <td style="${td}">${r.fwhm.toFixed(2)}</td>
+                    <td style="${td}; color:${r.ecc > 0.55 ? "#f87171" : "#e2e8f0"};">${r.ecc.toFixed(3)}</td>
+                    <td style="${td}">${r.stars}</td>
+                    <td style="${td}">${Math.round(r.noise)}</td>
+                    <td style="${td}">${r.used ? bar(r.weight) : `<span style='color:#f87171;'>${tr("deepsky.report_rejected", "rechazada")}</span>`}</td>
+                </tr>`).join("")}
+            </tbody>
+        </table>
+        <div style="font-size:0.6rem; color:#64748b; margin-top:10px;">★ ${tr("deepsky.report_ref", "referencia")} · FWHM y Ecc menores = mejor · Ecc>0.55 en rojo (estrellas alargadas)</div>
+    `;
+    ov.appendChild(box);
+    document.body.appendChild(ov);
+    ov.addEventListener("click", (e) => { if (e.target === ov) ov.remove(); });
+    box.querySelector("#ds-report-x").addEventListener("click", () => ov.remove());
+}
+
+function dsShowStretchBar() {
+    let bar = document.getElementById("ds-stretch-bar");
+    if (!bar) {
+        bar = document.createElement("div");
+        bar.id = "ds-stretch-bar";
+        bar.style.cssText = "position:fixed; bottom:22px; left:50%; transform:translateX(-50%); z-index:500; display:flex; align-items:center; gap:10px; padding:8px 14px; background:rgba(15,23,42,0.94); border:1px solid rgba(124,58,237,0.35); border-radius:14px; box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(6px);";
+        const modes = [
+            { m: "linked", label: tr("deepsky.stf_auto", "Auto (color)") },
+            { m: "unlinked", label: tr("deepsky.stf_balanced", "Balanceado") },
+            { m: "linear", label: tr("deepsky.stf_linear", "Lineal") }
+        ];
+        const seg = document.createElement("div");
+        seg.style.cssText = "display:flex; gap:4px;";
+        modes.forEach(({ m, label }) => {
+            const b = document.createElement("button");
+            b.type = "button";
+            b.dataset.mode = m;
+            b.textContent = label;
+            b.style.cssText = "width:auto; padding:5px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1;";
+            b.addEventListener("click", () => { dsStretchMode = m; dsSyncStretchBar(); dsApplyStretch(); });
+            seg.appendChild(b);
+        });
+        const sldWrap = document.createElement("label");
+        sldWrap.style.cssText = "display:flex; align-items:center; gap:6px; font-size:0.68rem; color:#94a3b8;";
+        sldWrap.innerHTML = `<span>${tr("deepsky.stf_intensity", "Intensidad")}</span>`;
+        const sld = document.createElement("input");
+        sld.type = "range"; sld.min = "0"; sld.max = "1"; sld.step = "0.05"; sld.value = String(dsStretchStrength);
+        sld.style.width = "90px";
+        sld.addEventListener("input", () => { dsStretchStrength = parseFloat(sld.value); });
+        sld.addEventListener("change", () => dsApplyStretch());
+        sldWrap.appendChild(sld);
+        const note = document.createElement("span");
+        note.style.cssText = "font-size:0.6rem; color:#64748b; max-width:140px;";
+        note.textContent = tr("deepsky.stf_note", "Solo la vista · los datos siguen lineales");
+
+        // Divisor + botón Exportar con popover (estirado 16-bit/PNG · lineal 16-bit).
+        const divider = document.createElement("span");
+        divider.style.cssText = "width:1px; height:22px; background:#334155;";
+        const exportWrap = document.createElement("div");
+        exportWrap.style.cssText = "position:relative;";
+        const btnExport = document.createElement("button");
+        btnExport.type = "button";
+        btnExport.textContent = "⤓ " + tr("deepsky.export", "Exportar");
+        btnExport.style.cssText = "width:auto; padding:6px 13px; border-radius:9px; font-size:0.74rem; font-weight:600; cursor:pointer; border:1px solid #7c3aed; background:linear-gradient(135deg,#7c3aed,#db2777); color:#fff;";
+        const pop = document.createElement("div");
+        pop.style.cssText = "display:none; position:absolute; bottom:44px; right:0; width:250px; padding:12px; background:rgba(15,23,42,0.98); border:1px solid rgba(124,58,237,0.4); border-radius:12px; box-shadow:0 10px 34px rgba(0,0,0,0.6); flex-direction:column; gap:9px;";
+        pop.innerHTML = `
+            <div style="font-size:0.72rem; font-weight:700; color:#e2e8f0;">${tr("deepsky.export_title", "Exportar resultado")}</div>
+            <label style="display:flex; align-items:center; gap:7px; font-size:0.7rem; color:#cbd5e1; cursor:pointer;">
+                <input type="checkbox" id="ds-exp-stretched" checked style="width:auto;"> ${tr("deepsky.export_stretched", "Estirado (lo que ves)")}
+            </label>
+            <div style="display:flex; gap:6px; padding-left:22px;">
+                <label style="display:flex; align-items:center; gap:5px; font-size:0.66rem; color:#94a3b8; cursor:pointer;">
+                    <input type="radio" name="ds-exp-fmt" id="ds-exp-tiff" checked style="width:auto;"> TIFF 16-bit
+                </label>
+                <label style="display:flex; align-items:center; gap:5px; font-size:0.66rem; color:#94a3b8; cursor:pointer;">
+                    <input type="radio" name="ds-exp-fmt" id="ds-exp-png" style="width:auto;"> PNG
+                </label>
+            </div>
+            <label style="display:flex; align-items:center; gap:7px; font-size:0.7rem; color:#cbd5e1; cursor:pointer;">
+                <input type="checkbox" id="ds-exp-linear" style="width:auto;"> ${tr("deepsky.export_linear", "Lineal 16-bit (PixInsight/PS)")}
+            </label>
+            <div style="font-size:0.6rem; color:#64748b; line-height:1.3;">${tr("deepsky.export_hint", "Se guarda junto a tus lights. El estirado usa el modo/intensidad actual.")}</div>
+            <button type="button" id="ds-exp-go" style="width:100%; padding:8px; border-radius:8px; border:none; background:linear-gradient(135deg,#7c3aed,#db2777); color:#fff; font-weight:600; font-size:0.72rem; cursor:pointer;">${tr("deepsky.export_do", "Guardar")}</button>
+        `;
+        btnExport.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            pop.style.display = pop.style.display === "flex" ? "none" : "flex";
+        });
+        pop.addEventListener("click", (ev) => ev.stopPropagation());
+        document.addEventListener("click", () => { pop.style.display = "none"; });
+        pop.querySelector("#ds-exp-go").addEventListener("click", () => {
+            const stretched = pop.querySelector("#ds-exp-stretched").checked;
+            const linear = pop.querySelector("#ds-exp-linear").checked;
+            const png = pop.querySelector("#ds-exp-png").checked;
+            if (!stretched && !linear) {
+                showCustomAlert(tr("general.error", "Error"), tr("deepsky.export_pick", "Elige al menos una salida."));
+                return;
+            }
+            pop.style.display = "none";
+            dsExportResult({ stretched, linear, png }, pop.querySelector("#ds-exp-go"));
+        });
+        exportWrap.append(btnExport, pop);
+
+        const close = document.createElement("button");
+        close.type = "button"; close.textContent = "✕";
+        close.style.cssText = "width:auto; padding:4px 8px; border-radius:8px; border:none; background:none; color:#64748b; cursor:pointer;";
+        close.addEventListener("click", dsHideStretchBar);
+        const btnReport = document.createElement("button");
+        btnReport.id = "ds-report-btn";
+        btnReport.type = "button";
+        btnReport.textContent = "📋 " + tr("deepsky.report", "Tomas");
+        btnReport.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; display:" + (dsFrameReport && dsFrameReport.length ? "inline-flex" : "none") + ";";
+        btnReport.addEventListener("click", (ev) => { ev.stopPropagation(); dsShowReportPanel(); });
+        bar.append(seg, sldWrap, note, divider, btnReport, exportWrap, close);
+        document.body.appendChild(bar);
+    }
+    bar.style.display = "flex";
+    dsBuildHistogramPanel();
+    const hist = document.getElementById("ds-histogram");
+    if (hist) hist.style.display = "block";
+    dsSyncStretchBar();
+    dsUpdateHistogram();
+}
+
+function dsSyncStretchBar() {
+    const bar = document.getElementById("ds-stretch-bar");
+    if (!bar) return;
+    bar.querySelectorAll("button[data-mode]").forEach(b => {
+        const active = b.dataset.mode === dsStretchMode;
+        b.style.background = active ? "rgba(124,58,237,0.35)" : "rgba(30,41,59,0.7)";
+        b.style.borderColor = active ? "#7c3aed" : "#334155";
+        b.style.color = active ? "#ddd6fe" : "#cbd5e1";
+    });
+}
+
+// Carpeta raíz → auto-clasificación WBPP (por subcarpetas/nombres).
+async function dsScanFolder() {
+    try {
+        const dir = await openDialog({ directory: true, multiple: false, title: "Carpeta raíz de la sesión (auto-clasificar)" });
+        if (!dir) return;
+        showProcessing(tr("deepsky.scanning", "ESCANEANDO Y CLASIFICANDO..."));
+        const cl = await invoke("deepsky_scan_classify", { root: dir });
+        hideProcessing();
+        if (cl.lights.length) dsFiles.lights = cl.lights;
+        if (cl.darks.length) dsFiles.darks = cl.darks;
+        if (cl.flats.length) dsFiles.flats = cl.flats;
+        if (cl.bias.length) dsFiles.bias = cl.bias;
+        log("SUCCESS", `Auto-clasificación: ${cl.lights.length} lights · ${cl.darks.length} darks · ${cl.flats.length} flats · ${cl.bias.length} bias.`);
+        dsUpdateUI();
+    } catch (e) {
+        hideProcessing();
+        log("ERROR", `Cielo Profundo escaneo: ${e}`);
+    }
+}
+
+(function initDeepSky() {
+    const modal = document.getElementById("deepsky-modal");
+    const btnOpen = document.getElementById("btn-deepsky-mode");
+    if (!modal || !btnOpen) return;
+
+    btnOpen.addEventListener("click", () => {
+        dsRenderSections();
+        if (typeof applyTranslations === "function") { try { applyTranslations(); } catch (_) { } }
+        modal.style.display = "flex";
+        dsUpdateUI();
+    });
+    document.getElementById("btn-deepsky-close")?.addEventListener("click", () => { modal.style.display = "none"; });
+    modal.addEventListener("click", (e) => { if (e.target === modal) modal.style.display = "none"; });
+    document.getElementById("ds-prog-cancel")?.addEventListener("click", async () => {
+        try { await invoke("cancel_processing"); } catch (_) { }
+        const c = document.getElementById("ds-prog-current"); if (c) c.textContent = tr("general.cancelling", "Cancelando...");
+    });
+    document.getElementById("ds-keywords")?.addEventListener("input", () => { dsSelectedGroup = null; dsUpdateUI(); });
+    document.getElementById("chk-ds-cosmetic")?.addEventListener("change", (e) => { e.target.dataset.touched = "1"; });
+    // El control de gota (pixfrac) solo aplica con drizzle activo.
+    const dsDrizzleSel = document.getElementById("sel-ds-drizzle");
+    const dsSyncPixfrac = () => {
+        const lbl = document.getElementById("lbl-ds-pixfrac");
+        if (lbl) lbl.style.display = (parseFloat(dsDrizzleSel?.value) > 1) ? "flex" : "none";
+    };
+    dsDrizzleSel?.addEventListener("change", dsSyncPixfrac);
+    dsSyncPixfrac();
+
+    document.getElementById("btn-deepsky-run")?.addEventListener("click", async () => {
+        const lights = dsActiveLights();
+        if (lights.length < 1) {
+            log("WARN", tr("deepsky.need_lights", "Selecciona al menos 1 light."));
+            return;
+        }
+        modal.style.display = "none";
+        dsResultBasePath = lights[0]?.path || null; // carpeta destino de exportación
+        dsProgressStart(); // ventana WBPP dedicada (no la pantalla genérica)
+        try {
+            const b64 = await invoke("stack_deepsky", {
+                lights: lights.map(f => f.path),
+                darks: dsMatchedCalib("darks").map(f => f.path),
+                flats: dsMatchedCalib("flats").map(f => f.path),
+                bias: dsMatchedCalib("bias").map(f => f.path),
+                kappa: parseFloat(document.getElementById("num-ds-kappa")?.value) || 3.0,
+                sigmaClip: document.getElementById("chk-ds-sigma")?.checked ?? true,
+                cosmetic: document.getElementById("chk-ds-cosmetic")?.checked ?? null,
+                gradient: document.getElementById("chk-ds-gradient")?.checked ?? false,
+                drizzle: parseFloat(document.getElementById("sel-ds-drizzle")?.value) || 1.0,
+                optimizeDark: document.getElementById("chk-ds-darkopt")?.checked ?? null,
+                pixfrac: parseFloat(document.getElementById("sel-ds-pixfrac")?.value) || 0.8,
+                localNorm: document.getElementById("chk-ds-localnorm")?.checked ?? false,
+                autoCrop: document.getElementById("chk-ds-autocrop")?.checked ?? true
+            });
+            dsProgressStop();
+            // FLUJO DEDICADO DE CIELO PROFUNDO: solo la imagen final (sin vista
+            // fuente ni el post-procesado planetario de wavelets).
+            dsEnterResultMode();
+            if (ui.imgResult) {
+                await setImageAndWait(ui.imgResult, b64, false);
+                fitToScreen();
+            }
+            dsShowStretchBar();
+            log("SUCCESS", tr("deepsky.done", "Cielo Profundo apilado. Usa la barra inferior para ajustar el estirado (los datos quedan lineales)."));
+        } catch (e) {
+            dsProgressStop();
+            if (isCancellationError(e)) {
+                log("WARN", tr("general.cancelled", "Operación cancelada."));
+            } else {
+                log("ERROR", `Cielo Profundo: ${e}`);
+                showCustomAlert(tr("general.error", "Error"), String(e));
+            }
+        }
+    });
+})();
+
+// ============ COMBINAR CANALES (LRGB / SHO / HOO) ============
+const dsCombineFiles = { r: null, g: null, b: null, l: null };
+const DS_COMBINE_PRESETS = {
+    rgb: { neutralize: true, scnr: true, slots: [
+        { key: "r", label: () => tr("deepsky.slot_r", "R — rojo") },
+        { key: "g", label: () => tr("deepsky.slot_g", "G — verde") },
+        { key: "b", label: () => tr("deepsky.slot_b", "B — azul") },
+        { key: "l", label: () => tr("deepsky.slot_l", "L — luminancia (opcional)"), opt: true }
+    ] },
+    sho: { neutralize: false, scnr: false, slots: [
+        { key: "r", label: () => "SII → R" },
+        { key: "g", label: () => "Ha → G" },
+        { key: "b", label: () => "OIII → B" },
+        { key: "l", label: () => tr("deepsky.slot_l", "L — luminancia (opcional)"), opt: true }
+    ] },
+    hoo: { neutralize: false, scnr: false, slots: [
+        { key: "r", label: () => "Ha → R" },
+        { key: "g", label: () => "OIII → G y B" },
+        { key: "l", label: () => tr("deepsky.slot_l", "L — luminancia (opcional)"), opt: true }
+    ] }
+};
+
+function dsCombinePreset() {
+    return document.getElementById("ds-combine-preset")?.value || "rgb";
+}
+
+function dsRenderCombineSlots() {
+    const wrap = document.getElementById("ds-combine-slots");
+    if (!wrap) return;
+    const preset = DS_COMBINE_PRESETS[dsCombinePreset()] || DS_COMBINE_PRESETS.rgb;
+    wrap.innerHTML = "";
+    preset.slots.forEach(slot => {
+        const path = dsCombineFiles[slot.key];
+        const name = path ? path.split(/[\\/]/).pop() : tr("deepsky.slot_empty", "sin asignar");
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex; align-items:center; gap:10px; padding:9px 11px; background:rgba(30,41,59,0.55); border:1px solid " + (path ? "rgba(124,58,237,0.4)" : "#334155") + "; border-radius:10px;";
+        row.innerHTML = `
+            <span style="flex:0 0 148px; font-size:0.74rem; font-weight:600; color:#e2e8f0;">${slot.label()}</span>
+            <span style="flex:1 1 auto; min-width:0; font-size:0.7rem; color:${path ? "#c4b5fd" : "#64748b"}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${path || ""}">${name}</span>`;
+        const pick = document.createElement("button");
+        pick.type = "button";
+        pick.textContent = tr("deepsky.slot_pick", "Elegir");
+        pick.style.cssText = "flex:0 0 auto; width:auto; padding:6px 12px; border-radius:8px; font-size:0.7rem; cursor:pointer; border:1px solid #7c3aed; background:rgba(124,58,237,0.2); color:#ddd6fe;";
+        pick.addEventListener("click", async () => {
+            const f = await openDialog({ multiple: false, title: slot.label(), filters: [{ name: "Imagen", extensions: ["fit", "fits", "tif", "tiff", "png", "jpg", "jpeg"] }] });
+            if (f) { dsCombineFiles[slot.key] = f; dsRenderCombineSlots(); }
+        });
+        row.appendChild(pick);
+        if (path) {
+            const clr = document.createElement("button");
+            clr.type = "button"; clr.textContent = "✕";
+            clr.style.cssText = "flex:0 0 auto; width:auto; padding:6px 8px; border-radius:8px; border:none; background:none; color:#64748b; cursor:pointer;";
+            clr.addEventListener("click", () => { dsCombineFiles[slot.key] = null; dsRenderCombineSlots(); });
+            row.appendChild(clr);
+        }
+        wrap.appendChild(row);
+    });
+}
+
+(function initDeepSkyCombine() {
+    const modal = document.getElementById("ds-combine-modal");
+    const btnOpen = document.getElementById("btn-deepsky-combine-open");
+    if (!modal || !btnOpen) return;
+    btnOpen.addEventListener("click", () => {
+        document.getElementById("deepsky-modal").style.display = "none";
+        dsRenderCombineSlots();
+        if (typeof applyTranslations === "function") { try { applyTranslations(); } catch (_) { } }
+        modal.style.display = "flex";
+    });
+    document.getElementById("ds-combine-close")?.addEventListener("click", () => { modal.style.display = "none"; });
+    modal.addEventListener("click", (e) => { if (e.target === modal) modal.style.display = "none"; });
+    document.getElementById("ds-combine-preset")?.addEventListener("change", () => dsRenderCombineSlots());
+
+    document.getElementById("ds-combine-run")?.addEventListener("click", async () => {
+        const presetKey = dsCombinePreset();
+        const preset = DS_COMBINE_PRESETS[presetKey] || DS_COMBINE_PRESETS.rgb;
+        const r = dsCombineFiles.r, g = dsCombineFiles.g;
+        const b = presetKey === "hoo" ? dsCombineFiles.g : dsCombineFiles.b;
+        if (!r || !g || !b) {
+            showCustomAlert(tr("general.error", "Error"), tr("deepsky.combine_need", "Asigna al menos los canales R, G y B (o Ha/OIII)."));
+            return;
+        }
+        modal.style.display = "none";
+        dsResultBasePath = r;
+        showProcessing(tr("deepsky.combining", "COMBINANDO CANALES..."));
+        try {
+            const b64 = await invoke("deepsky_combine_channels", {
+                rPath: r, gPath: g, bPath: b,
+                lPath: dsCombineFiles.l || null,
+                register: document.getElementById("ds-combine-register")?.checked ?? true,
+                neutralize: preset.neutralize,
+                scnr: preset.scnr,
+                gradient: true
+            });
+            hideProcessing();
+            dsEnterResultMode();
+            if (ui.imgResult) { await setImageAndWait(ui.imgResult, b64, false); fitToScreen(); }
+            dsShowStretchBar();
+            log("SUCCESS", tr("deepsky.combine_done", "Canales combinados. Ajusta el estirado en la barra inferior."));
+        } catch (e) {
+            hideProcessing();
+            log("ERROR", `Combinar canales: ${e}`);
+            showCustomAlert(tr("general.error", "Error"), String(e));
+        }
+    });
+})();
 
 const btnCancelProcess = document.getElementById("btn-cancel-process");
 if (btnCancelProcess) {

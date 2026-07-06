@@ -3,14 +3,29 @@
 // ==========================================
 
 fn apply_gaussian_blur(input: &[f32], width: usize, height: usize, sigma: f32) -> Vec<f32> {
-    // OPTIMIZATION: Use 3-pass Box Blur to approximate Gaussian.
-    let w_ideal = (12.0 * sigma * sigma + 1.0).sqrt();
-    let wl = w_ideal.floor() as usize;
-    let wl = if wl % 2 == 0 { wl - 1 } else { wl }; // Force odd
+    // OPTIMIZATION: 3-pass box blur approximating a Gaussian — CANONICAL box
+    // sizing (Kuckir): w_ideal = sqrt(12σ²/n + 1) with n = 3 passes. The old
+    // formula omitted the /n, so the EFFECTIVE sigma was ~1.73× the requested
+    // one: every wavelet band sat ~73% coarser than labeled (finest band ≈1.7px
+    // instead of 1px — RegiStax level-1 territory was unreachable) and the
+    // RL/VC deconvolution PSF never matched its slider.
+    let n = 3.0f32;
+    let sigma = sigma.max(0.3);
+    let w_ideal = (12.0 * sigma * sigma / n + 1.0).sqrt();
+    let mut wl = w_ideal.floor() as isize;
+    if wl % 2 == 0 {
+        wl -= 1; // force odd
+    }
+    let wl = wl.max(1) as usize;
     let wu = wl + 2;
 
-    let m = (12.0 * sigma * sigma - (3 * wl * wl + 6 * wl + 3) as f32) / (4 * wl + 2) as f32;
-    let m = m.round() as usize;
+    // Ideal pass count with the smaller box (canonical formula).
+    let m_ideal = (12.0 * sigma * sigma
+        - (n * (wl * wl) as f32)
+        - (4.0 * n * wl as f32)
+        - (3.0 * n))
+        / (-4.0 * wl as f32 - 4.0);
+    let m = m_ideal.round().clamp(0.0, n) as usize;
 
     let sizes = [
         if 0 < m { wl } else { wu },
@@ -21,7 +36,10 @@ fn apply_gaussian_blur(input: &[f32], width: usize, height: usize, sigma: f32) -
     let mut current = input.to_vec();
 
     for &box_size in &sizes {
-        current = box_blur_parallel(&current, width, height, (box_size - 1) / 2);
+        let radius = (box_size - 1) / 2;
+        if radius > 0 {
+            current = box_blur_parallel(&current, width, height, radius);
+        }
     }
 
     current

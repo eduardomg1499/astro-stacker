@@ -20,7 +20,14 @@ fn check_ffmpeg_status(app: tauri::AppHandle) -> bool {
 #[tauri::command]
 fn cancel_processing(app: tauri::AppHandle, state: State<'_, AppState>) {
     log_to_front(&app, "WARNING", "CancelaciÃ³n solicitada por el usuario.");
+    // 1. Invalida el req_id activo → los workers del analisis y el pipeline de
+    //    wavelets que consultan check_cancel() dejan de trabajar de inmediato.
     state.active_req_id.store(0, Ordering::Relaxed);
+    // 2. Flag cooperativo → los bucles de apilado, el prefetcher y el decoder
+    //    FFmpeg abortan limpio y el comando devuelve Err("Cancelado...").
+    state
+        .cancel_requested
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -1520,8 +1527,15 @@ async fn process_batch_entry(
     target_type: Option<String>, // NEW
     ap_grid_size: Option<u32>,  // R13: AP size del flujo Zenith (32 por defecto)
     ap_threshold: Option<f32>,  // R13: umbral de malla del flujo Zenith
+    align_rgb: Option<bool>,    // switch de alineacion RGB automatica
 ) -> Result<BatchEntryResult, String> {
     state.license_manager.check_access()?;
+    // Nueva entrada del lote: limpiar cancelaciones previas. Si el usuario
+    // cancela a mitad de este archivo, el analisis/apilado devuelve
+    // Err("Cancelado") y el frontend corta el bucle del lote.
+    state
+        .cancel_requested
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     let target_type = target_type.unwrap_or_else(|| {
         if batch_mode.contains("surface") || batch_mode.contains("solar") {
             "surface".to_string()
@@ -1665,6 +1679,7 @@ async fn process_batch_entry(
         target_type.clone(),
         Some(get_msg("")),
         None, // keep_full_frame: el lote usa el recorte por defecto
+        align_rgb, // switch de usuario (mismo toggle que el flujo individual)
     )
     .await?;
 
@@ -2019,56 +2034,15 @@ async fn process_batch_entry(
     })
 }
 
-fn apply_gaussian_blur_safe(data: &[f32], w: usize, h: usize, _sigma: f32) -> Vec<f32> {
-    // 5-tap approximation (Sigma ~1.0-1.5, repeated passes yield 2.0+)
-    // Kernel: 1, 4, 6, 4, 1
-    let mut temp = vec![0.0; data.len()];
-    for y in 0..h {
-        let row_offset = y * w;
-        for x in 0..w {
-            let mut sum = 0.0;
-            let mut weight = 0.0;
-            for k in -2..=2 {
-                let px = x as isize + k;
-                if px >= 0 && px < w as isize {
-                    let val = data[row_offset + px as usize];
-                    let w_k = match k.abs() {
-                        0 => 6.0,
-                        1 => 4.0,
-                        2 => 1.0,
-                        _ => 0.0,
-                    };
-                    sum += val * w_k;
-                    weight += w_k;
-                }
-            }
-            temp[row_offset + x] = sum / weight;
-        }
-    }
-
-    let mut out = vec![0.0; data.len()];
-    for x in 0..w {
-        for y in 0..h {
-            let mut sum = 0.0;
-            let mut weight = 0.0;
-            for k in -2..=2 {
-                let py = y as isize + k;
-                if py >= 0 && py < h as isize {
-                    let val = temp[py as usize * w + x];
-                    let w_k = match k.abs() {
-                        0 => 6.0,
-                        1 => 4.0,
-                        2 => 1.0,
-                        _ => 0.0,
-                    };
-                    sum += val * w_k;
-                    weight += w_k;
-                }
-            }
-            out[y * w + x] = sum / weight;
-        }
-    }
-    out
+fn apply_gaussian_blur_safe(data: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
+    // FIX (sigma was IGNORED): this was a fixed 5-tap kernel (sigma ~1.0) no
+    // matter what the caller asked — the high-pass always used sigma 1 instead
+    // of 3, the Smart Sharpen RADIUS slider did nothing, and LCE/CLAHE
+    // (dynamic sigma up to 30) degenerated into a fine high-pass instead of
+    // true local contrast. Delegate to the corrected 3-pass box Gaussian:
+    // separable, parallel, O(n) regardless of sigma (no freeze risk), and it
+    // honours the requested sigma.
+    apply_gaussian_blur(data, w, h, sigma.clamp(0.5, 40.0))
 }
 
 // NUEVO: Optimized Surface Enhancement + Quality Scoring (AutoStakkert-like)
@@ -3574,6 +3548,7 @@ async fn stack_video(
         is_v3,
         target_type, // NEW
         keep_full_frame,
+        None, // align_rgb: el legacy usa el default (activado, con gates de seguridad)
     )
     .await;
 }
@@ -7295,6 +7270,7 @@ fn main() {
                 batch_anchor: Mutex::new(None),
                 batch_anchor_dims: Mutex::new((0, 0)),
                 active_req_id: AtomicUsize::new(0),
+                cancel_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 license_manager,
             });
             Ok(())
@@ -7329,6 +7305,13 @@ fn main() {
             check_ffmpeg_status,
             check_avx2_support,
             get_accel_label,
+            stack_deepsky,
+            deepsky_probe,
+            deepsky_scan_classify,
+            deepsky_restretch,
+            deepsky_export,
+            deepsky_histogram,
+            deepsky_combine_channels,
             check_license_status,
             activate_pro_license,
             deactivate_license,
