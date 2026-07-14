@@ -700,6 +700,21 @@ pub struct SessionMapEntry {
     pub darks: String,
 }
 
+/// Asesor de muestreo (F2): FWHM mediana medida en un light representativo y
+/// recomendación de escala de salida. Cubre submuestreo (candidato EIDR) y
+/// SOBREMUESTREO (super-binning), hueco del documento técnico original.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SamplingAdvisorReport {
+    pub fwhm_median_px: f32,
+    pub stars_measured: usize,
+    pub sampled_frame: String,
+    /// "undersampled" | "well_sampled" | "oversampled"
+    pub classification: String,
+    /// "0.5x" | "0.75x" | "1x" | "1.5x" | "2x"
+    pub recommended_scale: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreparedStackPlan {
@@ -728,6 +743,8 @@ pub struct PreparedStackPlan {
     /// con gamma/cuantización de display). El motor clásico los sigue
     /// aceptando; los motores científicos (NebulaFusion/EIDR) los bloquearán.
     pub scientific_eligible: bool,
+    /// Diagnóstico de muestreo (None si no se pudieron medir estrellas).
+    pub sampling_advisor: Option<SamplingAdvisorReport>,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -8996,6 +8996,7 @@ function dsFormatSessionPreflight(plan) {
                 <span>~${Math.max(1, Math.round(p.estimatedSeconds || 0))} s</span>
             </div>
             <div class="ds-component-flow"><span>Salidas:</span>${components || `<span class="ds-component-chip">Máster</span>`}</div>
+            ${dsFormatSamplingAdvisor(p.samplingAdvisor)}
             ${dsFormatSessionMap(p.sessionMap)}
         </article>`;
     }).join("");
@@ -9027,6 +9028,37 @@ function dsFormatSessionMap(map) {
                 <th style="padding:4px 8px;text-align:left;">Noche (lights)</th><th style="padding:4px 8px;text-align:right;">Lights</th><th style="padding:4px 8px;text-align:right;">Exposición</th><th style="padding:4px 8px;text-align:left;">Flats que aplicará</th><th style="padding:4px 8px;text-align:left;">Darks</th>
             </tr></thead><tbody>${rows}</tbody>
         </table></div></div>`;
+}
+
+// Tarjeta "Fondo y muestreo" (asesor F2): FWHM mediana medida, clasificación
+// del muestreo y escala recomendada. Solo se pinta si el backend pudo medir
+// estrellas (plan.samplingAdvisor puede ser null/ausente).
+function dsFormatSamplingAdvisor(advisor) {
+    if (!advisor) return "";
+    const classInfo = {
+        undersampled: { key: "deepsky.advisor_undersampled", fallback: "Submuestreado", color: "#fcd34d" },
+        well_sampled: { key: "deepsky.advisor_well_sampled", fallback: "Muestreo correcto", color: "#6ee7b7" },
+        oversampled: { key: "deepsky.advisor_oversampled", fallback: "Sobremuestreado", color: "#7dd3fc" },
+    }[advisor.classification];
+    const classLabel = classInfo ? tr(classInfo.key, classInfo.fallback) : (advisor.classification || "");
+    const classColor = classInfo?.color || "#cbd5e1";
+    const scale = advisor.recommendedScale || "1x";
+    const scaleValue = parseFloat(scale);
+    const recommendation = !isFinite(scaleValue) || scaleValue === 1
+        ? tr("deepsky.advisor_reco_native", "Escala recomendada: 1x (resolución nativa)")
+        : scaleValue < 1
+            ? trFormat("deepsky.advisor_reco_binning", { scale }, `Escala recomendada: ${scale} (super-binning)`)
+            : trFormat("deepsky.advisor_reco_superres", { scale }, `Escala recomendada: ${scale} — candidata a super-resolución cuando EIDR esté disponible`);
+    const fwhm = Number(advisor.fwhmMedianPx || 0).toFixed(1);
+    const frame = escapeHtml(pathBaseName(advisor.sampledFrame || ""));
+    const stars = trFormat("deepsky.advisor_stars", { stars: advisor.starsMeasured ?? 0, frame }, `${advisor.starsMeasured ?? 0} estrellas · toma ${frame}`);
+    return `<div style="margin:0 0 8px;padding:7px 9px;border:1px solid rgba(124,58,237,.25);border-radius:8px;background:rgba(124,58,237,.06);color:#c4b5fd;">
+        <b>${tr("deepsky.advisor_title", "Fondo y muestreo")}</b>
+        <div style="margin-top:3px;color:#94a3b8;line-height:1.45;">
+            <div>${tr("deepsky.advisor_fwhm", "FWHM mediana")} <b style="color:#e2e8f0;">${fwhm} px</b> · ${stars}</div>
+            <div><span style="color:${classColor};font-weight:700;">${escapeHtml(classLabel)}</span> · ${recommendation}</div>
+        </div>
+    </div>`;
 }
 
 function dsFormatPreflight(plan) {
@@ -9079,7 +9111,7 @@ function dsFormatPreflight(plan) {
     <div style="margin:0 0 8px;padding:7px 9px;border:1px solid rgba(34,211,238,.2);border-radius:8px;background:rgba(8,145,178,.06);color:#a5f3fc;">
         <b>Perfil recomendado: ${escapeHtml(recommendedLabel)}</b>
         ${recommendation ? `<div style="margin-top:3px;color:#94a3b8;line-height:1.45;">${recommendation}</div>` : ""}
-    </div>${alerts}${groupRows}${dsFormatSessionMap(plan.sessionMap)}<div style="margin-top:8px;">${stages}</div>
+    </div>${dsFormatSamplingAdvisor(plan.samplingAdvisor)}${alerts}${groupRows}${dsFormatSessionMap(plan.sessionMap)}<div style="margin-top:8px;">${stages}</div>
     ${normModel ? `<details style="margin-top:7px;"><summary style="cursor:pointer;color:#a5f3fc;">Modelo de normalización a inspeccionar</summary><div style="padding-top:5px;">${normModel}</div></details>` : ""}`;
 }
 
@@ -10123,7 +10155,8 @@ function dsShowStretchBar() {
             <option value="rejection_high">${tr("deepsky.view_rejection_high", "Rechazo alto")}</option>
             <option value="coverage">${tr("deepsky.view_coverage", "Cobertura")}</option>
             <option value="weight">${tr("deepsky.view_weight", "Peso")}</option>
-            <option value="registration_residuals">${tr("deepsky.view_residuals", "Residuales")}</option>`;
+            <option value="registration_residuals">${tr("deepsky.view_residuals", "Residuales")}</option>
+            <option value="background_model">${tr("deepsky.view_background_model", "Modelo de fondo (CL)")}</option>`;
         view.addEventListener("change", () => dsShowResultView(view.value));
         const modes = [
             { m: "linked", label: tr("deepsky.stf_auto", "Auto (color)") },

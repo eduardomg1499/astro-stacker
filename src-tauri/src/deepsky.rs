@@ -3531,12 +3531,39 @@ fn deepsky_frame_preview(path: String) -> Result<String, String> {
 fn deepsky_result_view(state: State<'_, AppState>, kind: String) -> Result<String, String> {
     let guard = state.deep_sky_result.lock().unwrap();
     let result = guard.as_ref().ok_or("No hay resultado lineal de cielo profundo")?;
+    let bg_owned: Vec<f32>;
     let plane: &[f32] = match kind.as_str() {
         "coverage" => &result.coverage,
         "weight" => &result.weight,
         "rejection_low" => &result.rejection_low,
         "rejection_high" => &result.rejection_high,
         "registration_residuals" => &result.registration_residuals,
+        // Modelo de fondo/contaminación lumínica (F2): se ajusta bajo demanda
+        // sobre el máster (grado 2 robusto, no destructivo) y se muestra como
+        // luma desplazada al rango positivo.
+        "background_model" => {
+            let (w, h, ch) = (result.width, result.height, result.channels);
+            let model = crate::deepsky_background::fit_background_model(&result.data, w, h, ch)
+                .ok_or("El máster es demasiado pequeño para modelar el fondo")?;
+            let corr = model.render_correction();
+            let npx = w * h;
+            let mut luma = vec![0.0f32; npx];
+            for p in 0..npx {
+                let mut s = 0.0f32;
+                for c in 0..ch {
+                    s += corr[p * ch + c];
+                }
+                luma[p] = s / ch as f32;
+            }
+            let minv = luma.iter().copied().fold(f32::INFINITY, f32::min);
+            if minv.is_finite() && minv < 0.0 {
+                for v in luma.iter_mut() {
+                    *v -= minv;
+                }
+            }
+            bg_owned = luma;
+            &bg_owned
+        }
         _ => return Err(format!("Vista diagnóstica desconocida: {kind}")),
     };
     let n = result.width * result.height;
@@ -3995,6 +4022,35 @@ fn deepsky_export_float32(
                 )?;
                 diagnostics.push(path.display().to_string());
             }
+        }
+        // Producto BG (F2): modelo de fondo/contaminación lumínica ajustado
+        // sobre el máster, REVERSIBLE (máster_sin_gradiente + BG = original si
+        // el toggle de gradiente estaba activo; con el toggle apagado es el
+        // diagnóstico del LP presente en el máster). Nunca se resta aquí.
+        cancellation_checkpoint(cancel.as_ref(), "exportación del modelo de fondo")?;
+        if let Some(model) = crate::deepsky_background::fit_background_model(
+            &result.data,
+            result.width,
+            result.height,
+            result.channels,
+        ) {
+            let corr = model.render_correction();
+            let path = parent.join(format!("{stem}_background_model.fits"));
+            ds_save_float32_fits_cancellable(
+                &path,
+                &corr,
+                result.width,
+                result.height,
+                result.channels,
+                &[
+                    ("EXTNAME", "'BG'".to_string()),
+                    ("ZASJOB", format!("'{}'", result.id)),
+                    ("ZASBGDEG", model.degree.to_string()),
+                    ("ZASBGREV", "T".to_string()),
+                ],
+                Some(cancel.as_ref()),
+            )?;
+            diagnostics.push(path.display().to_string());
         }
     }
     emit_deepsky_pipeline_telemetry(
@@ -4676,6 +4732,48 @@ fn ds_probe_nonfits_channels(path: &str) -> usize {
     3
 }
 
+/// Asesor de muestreo (F2): mide la FWHM mediana de un light representativo
+/// (con debayer si es CFA) y clasifica el muestreo. Devuelve None si el
+/// frame no se puede leer o no hay estrellas suficientes — el preflight
+/// simplemente omite la tarjeta, nunca bloquea.
+fn ds_measure_sampling_advisor(path: &str) -> Option<pipeline::SamplingAdvisorReport> {
+    let img = ds_read_image(path).ok()?;
+    let img = match img.bayer {
+        Some(cid) if img.ch == 1 => ds_debayer_image(img, cid),
+        _ => img,
+    };
+    let npx = img.w * img.h;
+    let luma: Vec<f32> = if img.ch == 1 {
+        img.data
+    } else {
+        (0..npx)
+            .map(|p| {
+                (img.data[p * img.ch] + img.data[p * img.ch + 1] + img.data[p * img.ch + 2]) / 3.0
+            })
+            .collect()
+    };
+    let stars = ds_detect_stars(&luma, img.w, img.h, 80);
+    let fwhms = ds_star_fwhms(&luma, img.w, img.h, &stars);
+    if fwhms.len() < 5 {
+        return None;
+    }
+    let mut vals: Vec<f32> = fwhms.iter().map(|s| s.2).collect();
+    vals.sort_by(|a, b| a.total_cmp(b));
+    let median = vals[vals.len() / 2];
+    let (class, scale) = crate::deepsky_background::advise_sampling(median as f64);
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    Some(pipeline::SamplingAdvisorReport {
+        fwhm_median_px: median,
+        stars_measured: fwhms.len(),
+        sampled_frame: name,
+        classification: class.as_str().into(),
+        recommended_scale: scale.into(),
+    })
+}
+
 #[tauri::command]
 fn deepsky_probe(paths: Vec<String>) -> Vec<DsProbe> {
     paths
@@ -5154,9 +5252,18 @@ fn ds_canonical_interpolation(value: &str) -> Option<&'static str> {
 }
 
 /// Preflight tipado del asistente: valida geometría/metadatos y estima el plan
-/// efectivo antes de reservar varios GB o iniciar un stack largo.
+/// efectivo antes de reservar varios GB o iniciar un stack largo. ASYNC para
+/// no congelar el hilo principal: desde F2 el asesor de muestreo decodifica
+/// un light completo y mide estrellas.
 #[tauri::command]
-fn prepare_deepsky_stack(request: DeepSkyStackRequest) -> PreparedStackPlan {
+async fn prepare_deepsky_stack(request: DeepSkyStackRequest) -> PreparedStackPlan {
+    prepare_deepsky_stack_impl(request, true)
+}
+
+/// `with_advisor=false` en las rutas de EJECUCIÓN (run_*): allí el plan solo
+/// se usa para validar y el asesor (lectura completa de un light + detección
+/// estelar) sería trabajo desechado — el stack relee todos los lights.
+fn prepare_deepsky_stack_impl(request: DeepSkyStackRequest, with_advisor: bool) -> PreparedStackPlan {
     use std::collections::{BTreeMap, BTreeSet};
 
     let request = request.resolved_profile();
@@ -5324,6 +5431,18 @@ fn prepare_deepsky_stack(request: DeepSkyStackRequest) -> PreparedStackPlan {
             suffix
         ));
     }
+
+    // Asesor de muestreo (F2): FWHM mediana de un light representativo (el
+    // central). Falla en silencio: sin estrellas medibles no hay tarjeta.
+    // Solo con plan válido — no se paga una decodificación completa para un
+    // plan que se va a rechazar.
+    let sampling_advisor = if with_advisor && errors.is_empty() {
+        valid_probes
+            .get(valid_probes.len() / 2)
+            .and_then(|probe| ds_measure_sampling_advisor(&probe.path))
+    } else {
+        None
+    };
 
     // Desglose de SESIONES (noches) de los lights, con EXPOSICIÓN TOTAL por
     // sesión. Si hay varias, cada una se calibrará con los flats de SU noche.
@@ -5723,6 +5842,7 @@ fn prepare_deepsky_stack(request: DeepSkyStackRequest) -> PreparedStackPlan {
         stages,
         normalization_model,
         scientific_eligible,
+        sampling_advisor,
     }
 }
 
@@ -5733,7 +5853,8 @@ async fn run_deepsky_stack(
     request: DeepSkyStackRequest,
 ) -> Result<DeepSkyResultHandle, String> {
     let request = request.resolved_profile();
-    let plan = prepare_deepsky_stack(request.clone());
+    // Solo validación: sin asesor de muestreo (el stack relee los lights).
+    let plan = prepare_deepsky_stack_impl(request.clone(), false);
     if !plan.valid {
         return Err(plan.errors.join("\n"));
     }
@@ -5794,7 +5915,16 @@ async fn run_deepsky_stack(
 }
 
 #[tauri::command]
-fn prepare_deepsky_session(request: DeepSkySessionStackRequest) -> PreparedDeepSkySessionPlan {
+async fn prepare_deepsky_session(
+    request: DeepSkySessionStackRequest,
+) -> PreparedDeepSkySessionPlan {
+    prepare_deepsky_session_impl(request, true)
+}
+
+fn prepare_deepsky_session_impl(
+    request: DeepSkySessionStackRequest,
+    with_advisor: bool,
+) -> PreparedDeepSkySessionPlan {
     use std::collections::BTreeSet;
 
     let session_id = new_job_id("ds-session-plan");
@@ -5834,7 +5964,7 @@ fn prepare_deepsky_session(request: DeepSkySessionStackRequest) -> PreparedDeepS
         let component_filters = ds_filter_components(&filter_profile);
         components.extend(component_filters.iter().cloned());
         total_frames += group.request.lights.len();
-        let plan = prepare_deepsky_stack(group.request);
+        let plan = prepare_deepsky_stack_impl(group.request, with_advisor);
         estimated_ram_mb = estimated_ram_mb.max(plan.estimated_ram_mb);
         estimated_vram_mb = estimated_vram_mb.max(plan.estimated_vram_mb);
         estimated_disk_mb = estimated_disk_mb.saturating_add(plan.estimated_disk_mb);
@@ -6178,7 +6308,8 @@ async fn run_deepsky_session(
     state: State<'_, AppState>,
     request: DeepSkySessionStackRequest,
 ) -> Result<DeepSkySessionResultHandle, String> {
-    let plan = prepare_deepsky_session(request.clone());
+    // Solo validación: sin asesor de muestreo (cada grupo relee sus lights).
+    let plan = prepare_deepsky_session_impl(request.clone(), false);
     if !plan.valid {
         return Err(plan.errors.join("\n"));
     }
@@ -9660,7 +9791,7 @@ mod ds_tests {
         nf_request.integration_method = Some(pipeline::DeepSkyIntegrationMethod::NebulaFusion(
             pipeline::NebulaFusionConfig::default(),
         ));
-        let nf_plan = prepare_deepsky_stack(nf_request);
+        let nf_plan = prepare_deepsky_stack_impl(nf_request, false);
         assert!(!nf_plan.valid);
         assert!(nf_plan.errors.iter().any(|e| e.contains("NebulaFusion")));
         // El tag serde del enum es estable (contrato de receta v3).
@@ -9672,7 +9803,7 @@ mod ds_tests {
         .unwrap();
         assert_eq!(parsed.label(), "nebula_fusion");
 
-        let plan = prepare_deepsky_stack(request.clone());
+        let plan = prepare_deepsky_stack_impl(request.clone(), false);
         assert!(plan.valid, "{:?}", plan.errors);
         assert_eq!(plan.requested_rejection, "winsorized");
         assert_eq!(plan.effective_rejection, "sigma");
@@ -9684,7 +9815,7 @@ mod ds_tests {
         let mut invalid = request;
         invalid.rejection = "magic-stack".into();
         invalid.drizzle = 1.0;
-        let invalid_plan = prepare_deepsky_stack(invalid);
+        let invalid_plan = prepare_deepsky_stack_impl(invalid, false);
         assert!(!invalid_plan.valid);
         assert!(invalid_plan
             .errors

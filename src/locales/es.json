@@ -1141,6 +1141,23 @@
     "local_weighting_note": "Cada zona del cielo se apila prefiriendo las tomas donde ESA zona salió más nítida (seeing local). Exclusivo de Zenith: los apiladores tradicionales solo ponderan la toma completa.",
     "work_dir": "Carpeta de trabajo y salida",
     "work_dir_hint": "Junto a los lights (clic para elegir otro disco: cachés de varios GB + masters + exportaciones)",
-    "work_dir_pick": "Carpeta de trabajo y salida (cachés, masters y exportaciones)"
+    "work_dir_pick": "Carpeta de trabajo y salida (cachés, masters y exportaciones)",
+    "result_view_hint": "Alternar máster y mapas científicos",
+    "view_master": "Máster",
+    "view_rejection_low": "Rechazo bajo",
+    "view_rejection_high": "Rechazo alto",
+    "view_coverage": "Cobertura",
+    "view_weight": "Peso",
+    "view_residuals": "Residuales",
+    "view_background_model": "Modelo de fondo (CL)",
+    "advisor_title": "Fondo y muestreo",
+    "advisor_fwhm": "FWHM mediana",
+    "advisor_stars": "{{stars}} estrellas · toma {{frame}}",
+    "advisor_undersampled": "Submuestreado",
+    "advisor_well_sampled": "Muestreo correcto",
+    "advisor_oversampled": "Sobremuestreado",
+    "advisor_reco_native": "Escala recomendada: 1x (resolución nativa)",
+    "advisor_reco_binning": "Escala recomendada: {{scale}} (super-binning)",
+    "advisor_reco_superres": "Escala recomendada: {{scale}} — candidata a super-resolución cuando EIDR esté disponible"
   }
 }

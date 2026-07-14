@@ -1141,6 +1141,23 @@
     "local_weighting_note": "Each sky region is stacked preferring the frames where THAT region came out sharpest (local seeing). Zenith exclusive: traditional stackers only weight whole frames.",
     "work_dir": "Working & output folder",
     "work_dir_hint": "Next to the lights (click to pick another disk: multi-GB caches + masters + exports)",
-    "work_dir_pick": "Working & output folder (caches, masters and exports)"
+    "work_dir_pick": "Working & output folder (caches, masters and exports)",
+    "result_view_hint": "Toggle master and scientific maps",
+    "view_master": "Master",
+    "view_rejection_low": "Low rejection",
+    "view_rejection_high": "High rejection",
+    "view_coverage": "Coverage",
+    "view_weight": "Weight",
+    "view_residuals": "Residuals",
+    "view_background_model": "Background model (LP)",
+    "advisor_title": "Background & sampling",
+    "advisor_fwhm": "Median FWHM",
+    "advisor_stars": "{{stars}} stars · frame {{frame}}",
+    "advisor_undersampled": "Undersampled",
+    "advisor_well_sampled": "Well sampled",
+    "advisor_oversampled": "Oversampled",
+    "advisor_reco_native": "Recommended scale: 1x (native resolution)",
+    "advisor_reco_binning": "Recommended scale: {{scale}} (super-binning)",
+    "advisor_reco_superres": "Recommended scale: {{scale}} — super-resolution candidate once EIDR is available"
   }
 }
