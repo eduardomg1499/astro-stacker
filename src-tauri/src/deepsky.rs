@@ -3836,8 +3836,11 @@ fn ds_save_float32_fits_cancellable(
 
 fn ds_write_recipe(path: &std::path::Path, result: &DeepSkyLinearResult) -> Result<(), String> {
     let env = benchmark::get_benchmark_environment();
+    // v3: el bloque `recipe` incorpora `integrationMethod` (solicitado/efectivo/
+    // fallbacks) y `variance.origin`. Las recetas v2 se interpretan como
+    // Classic con sus valores actuales (no hay reinterpretación silenciosa).
     let json = serde_json::json!({
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "algorithmVersion": "hybrid-v2-2026.07",
         "resultId": result.id,
         "width": result.width,
@@ -5201,6 +5204,21 @@ fn prepare_deepsky_stack(request: DeepSkyStackRequest) -> PreparedStackPlan {
     if request.pedestal.is_some_and(|pedestal| !pedestal.is_finite()) {
         errors.push("pedestal debe ser un número finito".into());
     }
+    // Métodos de integración versionados (receta v3). Sin fallback silencioso:
+    // pedir un motor que aún no existe es un error de plan, no una degradación.
+    match request.resolved_integration_method() {
+        pipeline::DeepSkyIntegrationMethod::Classic(_) => {}
+        pipeline::DeepSkyIntegrationMethod::NebulaFusion(_) => {
+            errors.push(
+                "NebulaFusion aún no está disponible en esta versión; usa el método clásico. El preflight no aplica fallbacks silenciosos".into(),
+            );
+        }
+        pipeline::DeepSkyIntegrationMethod::Eidr(_) => {
+            errors.push(
+                "EIDR aún no está disponible en esta versión; usa el método clásico. El preflight no aplica fallbacks silenciosos".into(),
+            );
+        }
+    }
     if probes.is_empty() {
         errors.push("Selecciona al menos un light".into());
     }
@@ -5720,6 +5738,7 @@ async fn run_deepsky_stack(
         return Err(plan.errors.join("\n"));
     }
     let started = std::time::Instant::now();
+    let effective_method = request.resolved_integration_method();
     let preview_path = stack_deepsky(
         app,
         state.clone(),
@@ -5746,6 +5765,7 @@ async fn run_deepsky_stack(
         Some(request.compute_policy),
         Some(request.local_weighting),
         request.work_dir.clone(),
+        Some(effective_method),
     ).await?;
     let result = state.deep_sky_result.lock().unwrap();
     let ds = result.as_ref().ok_or("El motor terminó sin publicar un resultado lineal")?;
@@ -6203,6 +6223,7 @@ async fn run_deepsky_session(
             ),
         );
         let resolved = group.request.resolved_profile();
+        let group_method = resolved.resolved_integration_method();
         let group_started = std::time::Instant::now();
         let preview_path = stack_deepsky(
             app.clone(),
@@ -6230,6 +6251,7 @@ async fn run_deepsky_session(
             Some(resolved.compute_policy),
             Some(resolved.local_weighting),
             resolved.work_dir.clone(),
+            Some(group_method),
         )
         .await?;
         let result = state
@@ -7128,6 +7150,7 @@ async fn stack_deepsky(
     compute_policy: Option<ComputePolicy>,
     local_weighting: Option<bool>,
     work_dir: Option<String>,
+    integration_method: Option<pipeline::DeepSkyIntegrationMethod>,
 ) -> Result<String, String> {
     let ds_run_started = std::time::Instant::now();
     let ds_result_id = new_job_id("ds-result");
@@ -9024,8 +9047,26 @@ async fn stack_deepsky(
             })
         })
         .collect();
+    // Método de integración efectivo (receta v3). En esta fase solo Classic
+    // llega hasta aquí (el preflight bloquea NebulaFusion/EIDR); el bloque ya
+    // registra solicitado/efectivo/fallbacks para que las recetas sean
+    // estables cuando lleguen los motores nuevos.
+    let effective_integration_method = integration_method.unwrap_or_else(|| {
+        pipeline::DeepSkyIntegrationMethod::Classic(pipeline::ClassicIntegrationConfig {
+            version: 1,
+            legacy_local_fwhm: local_weighting,
+        })
+    });
     let recipe = serde_json::json!({
         "sourceFingerprint": ds_source_fingerprint(&[&lights, &darks, &flats, &bias]),
+        "integrationMethod": {
+            "requested": effective_integration_method.label(),
+            "effective": &effective_integration_method,
+            "fallbacks": Vec::<String>::new(),
+        },
+        // El motor clásico no produce varianza por píxel; los motores
+        // científicos (F3+) fijarán aquí propagated/camera_model/empirical.
+        "variance": { "origin": serde_json::Value::Null },
         "inputs": {
             "lights": lights,
             "darks": darks,
@@ -9593,7 +9634,44 @@ mod ds_tests {
             pedestal: Some(0.0),
             local_weighting: false,
             work_dir: None,
+            integration_method: None,
+            scientific_products: false,
         };
+        // Receta v3: sin integration_method el método efectivo es Classic con
+        // la migración del localWeighting antiguo a legacy_local_fwhm.
+        let effective = request.resolved_integration_method();
+        assert_eq!(effective.label(), "classic");
+        match &effective {
+            pipeline::DeepSkyIntegrationMethod::Classic(cfg) => {
+                assert!(!cfg.legacy_local_fwhm);
+            }
+            other => panic!("método inesperado: {other:?}"),
+        }
+        let mut legacy = request.clone();
+        legacy.local_weighting = true;
+        match legacy.resolved_integration_method() {
+            pipeline::DeepSkyIntegrationMethod::Classic(cfg) => {
+                assert!(cfg.legacy_local_fwhm);
+            }
+            other => panic!("método inesperado: {other:?}"),
+        }
+        // Motores aún no disponibles: error explícito, jamás fallback.
+        let mut nf_request = request.clone();
+        nf_request.integration_method = Some(pipeline::DeepSkyIntegrationMethod::NebulaFusion(
+            pipeline::NebulaFusionConfig::default(),
+        ));
+        let nf_plan = prepare_deepsky_stack(nf_request);
+        assert!(!nf_plan.valid);
+        assert!(nf_plan.errors.iter().any(|e| e.contains("NebulaFusion")));
+        // El tag serde del enum es estable (contrato de receta v3).
+        let json = serde_json::to_value(&effective).unwrap();
+        assert_eq!(json["method"], "classic");
+        let parsed: pipeline::DeepSkyIntegrationMethod = serde_json::from_value(
+            serde_json::json!({"method": "nebula_fusion", "mode": "lite"}),
+        )
+        .unwrap();
+        assert_eq!(parsed.label(), "nebula_fusion");
+
         let plan = prepare_deepsky_stack(request.clone());
         assert!(plan.valid, "{:?}", plan.errors);
         assert_eq!(plan.requested_rejection, "winsorized");
@@ -10427,7 +10505,7 @@ mod ds_tests {
         ds_write_recipe(&path, &result).unwrap();
         let recipe: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(recipe["schemaVersion"], 2);
+        assert_eq!(recipe["schemaVersion"], 3);
         assert_eq!(recipe["resultId"], "deep-test-job");
         assert_eq!(recipe["linearFloat32"], true);
         assert_eq!(recipe["recipe"]["sourceFingerprint"], "fixture-v1");

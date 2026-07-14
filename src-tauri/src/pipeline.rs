@@ -324,6 +324,199 @@ pub fn clear_telemetry(job_id: Option<&str>) -> usize {
         .unwrap_or(0)
 }
 
+/// Método de integración versionado (F1 del plan NebulaFusion/EIDR).
+///
+/// `None` en el request ⇒ `Classic` derivado de los campos planos actuales
+/// (compatibilidad total con la UI/recetas existentes). Los motores nuevos
+/// se seleccionan EXPLÍCITAMENTE; jamás hay reinterpretación silenciosa.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum DeepSkyIntegrationMethod {
+    /// Motor actual (streaming/tiled/GPU + drizzle clásico). La config espeja
+    /// los campos planos del request; `legacy_local_fwhm` migra el antiguo
+    /// `localWeighting` con aviso.
+    Classic(ClassicIntegrationConfig),
+    /// NebulaFusion: coadición con varianza propagada (Lite) y PSF objetivo
+    /// por frecuencia (Full). Disponible a partir de F3.
+    NebulaFusion(NebulaFusionConfig),
+    /// EIDR: reconstrucción forward-model sucesora de Drizzle. Disponible a
+    /// partir de F9.
+    Eidr(EidrConfig),
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassicIntegrationConfig {
+    #[serde(default)]
+    pub version: u16,
+    /// Migración del antiguo `localWeighting` (rejilla FWHM 8×8 experimental).
+    /// Se conserva con nombre explícito para no reinterpretarlo como
+    /// NebulaFusion; la UI muestra aviso de característica legada.
+    #[serde(default)]
+    pub legacy_local_fwhm: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum NebulaFusionMode {
+    Lite,
+    Full,
+    FullWithStruct,
+}
+
+impl Default for NebulaFusionMode {
+    fn default() -> Self {
+        NebulaFusionMode::Lite
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum OutputBinning {
+    Native,
+    Bin0_75,
+    Bin0_5,
+}
+
+impl Default for OutputBinning {
+    fn default() -> Self {
+        OutputBinning::Native
+    }
+}
+
+fn default_nf_tile_size() -> u16 {
+    512
+}
+fn default_nf_psf_leakage() -> f32 {
+    1e-3
+}
+fn default_nf_noise_amplification() -> f32 {
+    1.5
+}
+fn default_nf_crossfit_folds() -> u8 {
+    4
+}
+fn default_nf_fdr_q() -> f32 {
+    0.01
+}
+fn default_nf_min_split_sigma() -> f32 {
+    2.5
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NebulaFusionConfig {
+    #[serde(default)]
+    pub version: u16,
+    #[serde(default)]
+    pub mode: NebulaFusionMode,
+    /// CFA directo (sin debayer, por fotodiodo) — F4. `false` = ruta
+    /// demosaiced float32 actual, rotulada `demosaiced_input=true`.
+    #[serde(default)]
+    pub cfa_direct: bool,
+    #[serde(default = "default_nf_tile_size")]
+    pub tile_size: u16,
+    #[serde(default = "default_nf_psf_leakage")]
+    pub max_psf_leakage: f32,
+    #[serde(default = "default_nf_noise_amplification")]
+    pub max_noise_amplification: f32,
+    #[serde(default)]
+    pub empirical_psd: bool,
+    #[serde(default = "default_nf_crossfit_folds")]
+    pub crossfit_folds: u8,
+    #[serde(default = "default_nf_fdr_q")]
+    pub fdr_q: f32,
+    #[serde(default = "default_nf_min_split_sigma")]
+    pub min_split_sigma: f32,
+    #[serde(default)]
+    pub output_bin: OutputBinning,
+}
+
+impl Default for NebulaFusionConfig {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            mode: NebulaFusionMode::default(),
+            cfa_direct: false,
+            tile_size: default_nf_tile_size(),
+            max_psf_leakage: default_nf_psf_leakage(),
+            max_noise_amplification: default_nf_noise_amplification(),
+            empirical_psd: false,
+            crossfit_folds: default_nf_crossfit_folds(),
+            fdr_q: default_nf_fdr_q(),
+            min_split_sigma: default_nf_min_split_sigma(),
+            output_bin: OutputBinning::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum EidrScalePolicy {
+    Auto,
+    X1,
+    X1_5,
+    X2,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum EidrSolveMode {
+    /// Máscaras/PSF/registro congelados, pérdida L2 y regularización
+    /// cuadrática: para parámetros fijos la solución es un operador lineal.
+    ScientificQuadratic,
+    /// Huber + TGV. Experimental hasta validar falsos positivos.
+    ExperimentalDetail,
+}
+
+fn default_eidr_max_iterations() -> u16 {
+    60
+}
+fn default_eidr_huber_delta() -> f32 {
+    2.5
+}
+fn default_eidr_holdout() -> f32 {
+    0.15
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EidrConfig {
+    #[serde(default)]
+    pub version: u16,
+    pub scale: EidrScalePolicy,
+    pub solve_mode: EidrSolveMode,
+    #[serde(default = "default_eidr_max_iterations")]
+    pub max_iterations: u16,
+    #[serde(default = "default_eidr_huber_delta")]
+    pub huber_delta: f32,
+    #[serde(default = "default_eidr_holdout")]
+    pub holdout_fraction: f32,
+    #[serde(default)]
+    pub refine_registration: bool,
+    #[serde(default)]
+    pub refine_psf: bool,
+    #[serde(default = "crate::pipeline::default_true_flag")]
+    pub warm_start: bool,
+    #[serde(default = "crate::pipeline::default_true_flag")]
+    pub multigrid: bool,
+}
+
+pub fn default_true_flag() -> bool {
+    true
+}
+
+impl DeepSkyIntegrationMethod {
+    /// Etiqueta corta para receta/telemetría/UI.
+    pub fn label(&self) -> &'static str {
+        match self {
+            DeepSkyIntegrationMethod::Classic(_) => "classic",
+            DeepSkyIntegrationMethod::NebulaFusion(_) => "nebula_fusion",
+            DeepSkyIntegrationMethod::Eidr(_) => "eidr",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepSkyStackRequest {
@@ -374,6 +567,27 @@ pub struct DeepSkyStackRequest {
     /// (temp) y a los lights, como siempre.
     #[serde(default)]
     pub work_dir: Option<String>,
+    /// Método de integración versionado. `None` ⇒ Classic derivado de los
+    /// campos planos de arriba (compatibilidad con UI/recetas existentes).
+    #[serde(default)]
+    pub integration_method: Option<DeepSkyIntegrationMethod>,
+    /// Exporta también los productos científicos (VAR/NEFF/DQ/…) cuando el
+    /// motor los produce. `false` = comportamiento clásico exacto.
+    #[serde(default)]
+    pub scientific_products: bool,
+}
+
+impl DeepSkyStackRequest {
+    /// Método efectivo: el solicitado, o Classic espejando los campos planos
+    /// (incluida la migración de `localWeighting` → `legacy_local_fwhm`).
+    pub fn resolved_integration_method(&self) -> DeepSkyIntegrationMethod {
+        self.integration_method.clone().unwrap_or_else(|| {
+            DeepSkyIntegrationMethod::Classic(ClassicIntegrationConfig {
+                version: 1,
+                legacy_local_fwhm: self.local_weighting,
+            })
+        })
+    }
 }
 
 fn default_rejection() -> String {

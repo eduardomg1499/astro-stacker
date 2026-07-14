@@ -10,6 +10,11 @@ default-run = "astro-stacker"
 name = "astro_stacker_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Compila el simulador de verdad conocida (deepsky_sim) fuera de los tests,
+# p.ej. para generar datasets sintéticos de benchmark desde un binario.
+deepsky-sim = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
