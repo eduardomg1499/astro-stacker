@@ -9,6 +9,7 @@ pub struct FfmpegReader {
     pub height: usize,
     pub frame_count: usize,
     pub bytes_per_pixel: usize,
+    pub sample_bits: usize,
     pub color_id: i32,
     pub ffmpeg_path: String,
     pub fps: f64,
@@ -70,11 +71,24 @@ fn os_label() -> &'static str {
     }
 }
 
-/// e.g. "AVX2 · Windows" or "NEON · macOS". Shown on the progress screen so the
-/// user can confirm hardware acceleration is engaged on whatever OS/CPU they run.
+/// e.g. "AVX2 · Windows · GPU DX12 (RTX 3060)" or "NEON · macOS · GPU Metal
+/// (Apple M2)". Shown on the progress screen so the user can confirm hardware
+/// acceleration (SIMD + GPU compute) is engaged on whatever OS/GPU they run.
 #[tauri::command]
 fn get_accel_label() -> String {
-    format!("{} · {}", simd_backend_label(), os_label())
+    format!(
+        "{} · {}{}",
+        simd_backend_label(),
+        os_label(),
+        crate::gpu_stack::accel_suffix()
+    )
+}
+
+/// Deteccion de GPU compute para la UI: nombre/backend/VRAM presupuestada y
+/// estado del self-test de paridad numerica GPU-vs-CPU.
+#[tauri::command]
+fn get_gpu_info() -> crate::gpu_stack::GpuInfo {
+    crate::gpu_stack::gpu_info()
 }
 
 // NUEVO: FunciÃ³n unificada para generar ruta de cachÃ© de anÃ¡lisis
@@ -84,6 +98,111 @@ fn get_analysis_cache_path(video_path: &str, mode_suffix: &str) -> String {
     // Usamos el path limpio, pero conservamos la integridad del nombre base
     let clean = clean_windows_path(p.to_path_buf());
     format!("{}_{}.analysis_v2", clean, mode_suffix)
+}
+
+/// Fingerprint estable del origen planetario. Incluye versión algorítmica,
+/// ruta canónica, tamaño/mtime y muestras de contenido; para una secuencia FITS
+/// en carpeta incluye cada entrada. Evita reutilizar desplazamientos cuando el
+/// usuario sobrescribe un SER/MP4 conservando nombre y geometría.
+fn planetary_source_fingerprint(path: &str) -> Result<u64, String> {
+    use std::hash::{Hash, Hasher};
+    use std::io::{Read, Seek, SeekFrom};
+
+    const ALGORITHM_VERSION: &str = "planetary-analysis-hybrid-v2-a6";
+    const SAMPLE_BYTES: usize = 64 * 1024;
+    let source = Path::new(path);
+    let metadata = std::fs::metadata(source)
+        .map_err(|error| format!("No se pudo identificar el origen '{path}': {error}"))?;
+    let canonical = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    ALGORITHM_VERSION.hash(&mut hasher);
+    clean_windows_path(canonical).hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .hash(&mut hasher);
+
+    if metadata.is_file() {
+        let mut file = File::open(source)
+            .map_err(|error| format!("No se pudo muestrear el origen '{path}': {error}"))?;
+        let mut sample = vec![0u8; SAMPLE_BYTES.min(metadata.len() as usize)];
+        let first = file
+            .read(&mut sample)
+            .map_err(|error| format!("No se pudo leer el origen '{path}': {error}"))?;
+        sample[..first].hash(&mut hasher);
+        if metadata.len() > SAMPLE_BYTES as u64 {
+            file.seek(SeekFrom::End(-(SAMPLE_BYTES as i64)))
+                .map_err(|error| format!("No se pudo muestrear el final de '{path}': {error}"))?;
+            sample.resize(SAMPLE_BYTES, 0);
+            let last = file
+                .read(&mut sample)
+                .map_err(|error| format!("No se pudo leer el final de '{path}': {error}"))?;
+            sample[..last].hash(&mut hasher);
+        }
+    } else if metadata.is_dir() {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(source)
+            .map_err(|error| format!("No se pudo enumerar la secuencia '{path}': {error}"))?
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        entries.sort();
+        entries.len().hash(&mut hasher);
+        for entry in entries {
+            entry.file_name().hash(&mut hasher);
+            if let Ok(meta) = std::fs::metadata(&entry) {
+                meta.len().hash(&mut hasher);
+                meta.modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .hash(&mut hasher);
+            }
+        }
+    }
+    Ok(hasher.finish())
+}
+
+// CACHE DE ANALISIS V2 EN BINCODE+LZ4. Antes era JSON: con grid_scores de
+// 40×40 u64 por frame (warping activo), un video de 10k frames producia un
+// .analysis_v2 de >100 MB que se re-parseaba con serde_json AL INICIO DE CADA
+// APILADO (segundos de espera + pico de RAM 2-3× el archivo) y se reescribia
+// completo en cada clic. bincode+LZ4 es 10-50× mas rapido y ~5× mas compacto.
+// COMPATIBILIDAD: parse intenta el formato nuevo y cae a JSON legado, asi los
+// caches ya escritos junto a los videos siguen siendo validos sin re-analizar.
+// NOTA bincode: sin nombres de campo — si CachedAnalysis cambia de forma,
+// bumpear el sufijo del cache (zenith_analysis_cache_suffix) para invalidar.
+fn parse_cached_analysis(raw: &[u8]) -> Option<CachedAnalysis> {
+    // SNIFF antes de intentar LZ4: decompress_size_prepended lee los primeros
+    // 4 bytes como TAMANO a asignar — en un JSON legado ('{"sc...') eso es una
+    // peticion de ~1.67 GB que se asigna y descarta en cada lectura (hipo en
+    // macOS; en un Windows justo de RAM puede abortar el proceso). Un cache
+    // JSON siempre empieza con '{': ir directo a serde_json en ese caso.
+    if raw.first() == Some(&b'{') {
+        return serde_json::from_slice::<CachedAnalysis>(raw).ok();
+    }
+    if let Ok(bin) = lz4_flex::decompress_size_prepended(raw) {
+        if let Ok(c) = bincode::deserialize::<CachedAnalysis>(&bin) {
+            return Some(c);
+        }
+    }
+    serde_json::from_slice::<CachedAnalysis>(raw).ok()
+}
+
+fn load_cached_analysis(cache_path: &str) -> Option<CachedAnalysis> {
+    parse_cached_analysis(&fs::read(cache_path).ok()?)
+}
+
+fn save_cached_analysis(cache_path: &str, cached: &CachedAnalysis) {
+    if let Ok(bin) = bincode::serialize(cached) {
+        // Escritura silenciosa a proposito: el cache vive junto al video y en
+        // medios de solo lectura (SD, red) el write falla — no es un error.
+        let _ = fs::write(cache_path, lz4_flex::compress_prepend_size(&bin));
+    }
 }
 
 // NUEVO: Helper para detectar ColorID en SER sin cargar todo el archivo
@@ -159,7 +278,10 @@ impl FfmpegReader {
                 .status()
                 .is_ok()
         {
-            return Err(format!("Error: No se encontro FFprobe. {}", ffmpeg_install_hint()));
+            return Err(format!(
+                "Error: No se encontro FFprobe. {}",
+                ffmpeg_install_hint()
+            ));
         }
 
         // Usar ffprobe para obtener metadatos precisos.
@@ -201,15 +323,10 @@ impl FfmpegReader {
         }
 
         let json_str = String::from_utf8_lossy(&output.stdout);
-        let probe: serde_json::Value = serde_json::from_str(&json_str)
-            .map_err(|e| {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                format!(
-                    "Error al parsear JSON de FFprobe: {}. {}",
-                    e,
-                    stderr.trim()
-                )
-            })?;
+        let probe: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            format!("Error al parsear JSON de FFprobe: {}. {}", e, stderr.trim())
+        })?;
 
         // Find the first VIDEO stream
         let mut stream_idx = 0;
@@ -263,6 +380,17 @@ impl FfmpegReader {
         let mut width = stream["width"].as_u64().unwrap_or(0) as usize;
         let mut height = stream["height"].as_u64().unwrap_or(0) as usize;
         let pix_fmt = stream["pix_fmt"].as_str().unwrap_or("unknown");
+        let sample_bits = stream["bits_per_raw_sample"]
+            .as_str()
+            .and_then(|v| v.parse::<usize>().ok())
+            .or_else(|| stream["bits_per_raw_sample"].as_u64().map(|v| v as usize))
+            .filter(|&v| v > 0)
+            .unwrap_or_else(|| {
+                [16usize, 14, 12, 10, 9]
+                    .into_iter()
+                    .find(|bits| pix_fmt.contains(&bits.to_string()))
+                    .unwrap_or(8)
+            });
         let codec_tag = stream["codec_tag_string"].as_str().unwrap_or("");
         let codec_name = stream["codec_name"]
             .as_str()
@@ -508,6 +636,53 @@ impl FfmpegReader {
         }
         frame_count = sc_frame_count.unwrap_or(frame_count);
 
+        // CONTEO EXACTO POR PAQUETES cuando el contenedor no declara nb_frames
+        // ni duración (fragmented MP4/MOV, dumps de stream) o es ASF/WMV con
+        // metadatos poco fiables. Un total inventado (antes quedaba en 1 por el
+        // max(1)) rompía el % de progreso y podía mandar el frame de referencia
+        // del análisis más allá del último frame real → referencia NEGRA y
+        // todas las puntuaciones en 0. Leer el índice del contenedor no
+        // decodifica nada y para MP4/MOV es casi instantáneo.
+        if sc_frame_count.is_none() && (frame_count == 0 || is_asf) {
+            let mut cmd = Command::new(&ffprobe_path);
+            #[cfg(target_os = "windows")]
+            cmd.creation_flags(0x08000000);
+            let counted = cmd
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-count_packets",
+                    "-show_entries",
+                    "stream=nb_read_packets",
+                    "-of",
+                    "csv=p=0",
+                    path,
+                ])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| {
+                    String::from_utf8_lossy(&out.stdout)
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                })
+                .filter(|&n| n > 0);
+            if let Some(n) = counted {
+                log_to_front(
+                    app,
+                    "INFO",
+                    &format!(
+                        "FFprobe: conteo exacto de frames por paquetes = {} (el contenedor no declaraba nb_frames fiable).",
+                        n
+                    ),
+                );
+                frame_count = n;
+            }
+        }
+
         // DETECCION DE COLOR vs MONO/BAYER
         let mut is_color = true;
         let mut color_id = 0; // Default Mono/Bayer
@@ -560,6 +735,7 @@ impl FfmpegReader {
             height,
             frame_count: frame_count.max(1),
             bytes_per_pixel: if is_color { 6 } else { 2 },
+            sample_bits,
             color_id,
             ffmpeg_path: ffmpeg_path.to_string(), // Ensure owned string
             fps,
@@ -642,10 +818,69 @@ impl FfmpegReader {
                 *current_idx = index + 1; // It consumed the frame, so next frame is index + 1
             } else {
                 eprintln!("DEBUG: Stream EOF or Read Failed at index {}", index);
-                // Fallback to empty
-                buffer.fill(0);
                 *cache_guard = None; // Kill dead stream
             }
+        }
+
+        if cache_guard.is_none() {
+            // ESCALERA DE REINTENTOS tras EOF/lectura fallida: el `-ss index/fps`
+            // usa un fps ESTIMADO — con VFR o metadatos imprecisos puede caer en
+            // (o tras) el final real y este método devolvía un frame NEGRO en
+            // silencio; el máster de apilado y los previews heredaban ese vacío.
+            //  A) buscar ~2 s antes y avanzar hasta el objetivo (frame exacto si
+            //     la estimación era razonable);
+            //  B) mismo seek sin avanzar (frame real ~2 s antes del objetivo);
+            //  C) frame 0 (siempre existe en un vídeo legible).
+            // Un frame cercano REAL siempre es mejor referencia/preview que
+            // oscuridad absoluta. Decode CPU: máxima compatibilidad.
+            let target_seconds = if self.fps > 0.0 && index > 0 {
+                index as f64 / self.fps
+            } else {
+                0.0
+            };
+            let near_seek = (target_seconds - 2.0).max(0.0);
+            let near_delta = if self.fps > 0.0 {
+                index.saturating_sub((near_seek * self.fps).round() as usize)
+            } else {
+                index
+            };
+            let attempts: [(f64, usize); 3] = [(near_seek, near_delta), (near_seek, 0), (0.0, 0)];
+            for (attempt, &(seek_s, skip)) in attempts.iter().enumerate() {
+                let stream = FfmpegStreamIterator::new(
+                    &self.path,
+                    self.width,
+                    self.height,
+                    0,
+                    0,
+                    self.width,
+                    self.height,
+                    current_color_id,
+                    &self.ffmpeg_path,
+                    (seek_s > 0.0).then(|| format!("{:.4}", seek_s)),
+                    false,
+                    &self.codec_name,
+                    self.rotation,
+                );
+                let Ok(mut retry_stream) = stream else {
+                    continue;
+                };
+                if skip > 0 {
+                    retry_stream.skip_frames(skip);
+                }
+                if retry_stream.read_frame_into(&mut buffer) {
+                    // El stream queda posicionado tras el frame entregado; sólo
+                    // el intento exacto conserva la numeración para reuso.
+                    if attempt == 0 {
+                        *cache_guard = Some((index + 1, retry_stream));
+                    }
+                    return buffer;
+                }
+            }
+            eprintln!(
+                "DEBUG: Retry EOF definitivo en frame {} (seek {:.2}s)",
+                index, near_seek
+            );
+            buffer.fill(0);
         }
 
         buffer
@@ -660,13 +895,16 @@ impl FfmpegReader {
             return Ok(std::collections::HashMap::new());
         }
 
-        let p_fmt = if self.is_color && (current_color_id < 8 || current_color_id > 11) {
+        let p_fmt = if ffmpeg_stream_is_color(current_color_id) {
             "rgb48le"
         } else {
             "gray16le"
         };
 
         let mut filters = Vec::new();
+        if let Some(rotation_filter) = ffmpeg_rotation_filter(self.rotation) {
+            filters.push(rotation_filter.to_string());
+        }
         let needs_deblock = matches!(
             self.codec_name.as_str(),
             "h264" | "hevc" | "h265" | "mpeg4" | "mpeg2video"
@@ -702,6 +940,7 @@ impl FfmpegReader {
             args.extend_from_slice(&["-ss", ss]);
         }
         args.extend_from_slice(&["-hwaccel", "auto"]);
+        args.push("-noautorotate");
         args.extend_from_slice(&["-i", &self.path]);
 
         let vframes = indices.len().to_string();
@@ -739,28 +978,24 @@ impl FfmpegReader {
             if let Some(ref ss) = seek_target {
                 fallback_args.extend_from_slice(&["-ss", ss]);
             }
-            let fallback_filter = if self.rotation != 0 {
-                let transpose_filter = match self.rotation {
-                    90 => "transpose=1",
-                    180 => "transpose=2,transpose=2",
-                    270 => "transpose=2",
-                    _ => "",
+            let fallback_filter =
+                if let Some(rotation_filter) = ffmpeg_rotation_filter(self.rotation) {
+                    format!(
+                        "{},{},{},select='{}'",
+                        rotation_filter,
+                        format!("scale={}:{}:flags=neighbor", self.width, self.height),
+                        format!("format={}", p_fmt),
+                        select_expr
+                    )
+                } else {
+                    format!(
+                        "scale={}:{}:flags=neighbor,format={},select='{}'",
+                        self.width, self.height, p_fmt, select_expr
+                    )
                 };
-                format!(
-                    "{},{},{},select='{}'",
-                    transpose_filter,
-                    format!("scale={}:{}:flags=neighbor", self.width, self.height),
-                    format!("format={}", p_fmt),
-                    select_expr
-                )
-            } else {
-                format!(
-                    "scale={}:{}:flags=neighbor,format={},select='{}'",
-                    self.width, self.height, p_fmt, select_expr
-                )
-            };
 
             fallback_args.extend_from_slice(&[
+                "-noautorotate",
                 "-i",
                 &self.path,
                 "-threads",
@@ -807,13 +1042,16 @@ impl FfmpegReader {
         roi_h: usize,
         current_color_id: i32,
     ) -> Vec<u8> {
-        let p_fmt = if self.is_color && (current_color_id < 8 || current_color_id > 11) {
+        let p_fmt = if ffmpeg_stream_is_color(current_color_id) {
             "rgb48le"
         } else {
             "gray16le"
         };
 
         let mut filters = Vec::new();
+        if let Some(rotation_filter) = ffmpeg_rotation_filter(self.rotation) {
+            filters.push(rotation_filter.to_string());
+        }
         filters.push(format!(
             "scale={}:{}:flags=spline+accurate_rnd+full_chroma_int+full_chroma_inp,setsar=1/1",
             self.width, self.height
@@ -840,6 +1078,7 @@ impl FfmpegReader {
         }
 
         args.extend_from_slice(&["-hwaccel", "auto"]);
+        args.push("-noautorotate");
         args.extend_from_slice(&["-i", &self.path]);
 
         args.extend_from_slice(&[
@@ -888,6 +1127,44 @@ pub struct FfmpegStreamIterator {
     frame_size_bytes: usize,
 }
 
+/// FFprobe puede devolver 90, -270 o incluso múltiplos de 360 para la misma
+/// orientación. Normalizamos y construimos un filtro explícito para que todas
+/// las rutas (stream, batch y ROI) decodifiquen la misma geometría. Los callers
+/// añaden `-noautorotate`; así FFmpeg no aplica además su autorrotación oculta.
+fn ffmpeg_rotation_filter(rotation: i32) -> Option<&'static str> {
+    match rotation.rem_euclid(360) {
+        // `side_data_list.rotation` follows FFmpeg's display-matrix
+        // convention: positive angles are counter-clockwise.
+        90 => Some("transpose=2"),
+        180 => Some("transpose=2,transpose=2"),
+        270 => Some("transpose=1"),
+        _ => None,
+    }
+}
+
+/// Formato que Zenith solicita al pipe FFmpeg. Mono (0) y todos los mosaicos
+/// CFA deben seguir siendo un plano `gray16le`; sólo RGB/BGR/YUV ya
+/// interpretados se convierten a `rgb48le`.
+fn ffmpeg_stream_is_color(color_id: i32) -> bool {
+    crate::ser::ser_color_is_direct_rgb(color_id)
+        || crate::ser::ser_color_is_direct_bgr(color_id)
+        || crate::ser::ser_color_is_yuv422(color_id)
+}
+
+fn read_exact_ffmpeg_frame<R: std::io::Read>(reader: &mut R, buffer: &mut [u8]) -> bool {
+    match reader.read_exact(buffer) {
+        Ok(_) => true,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                eprintln!("DEBUG: FfmpegStream Read Failed (Msg): {}", e);
+            }
+            // Un frame parcial nunca se entrega: el caller conserva el último
+            // índice completo y descarta limpiamente una cola FFmpeg truncada.
+            false
+        }
+    }
+}
+
 impl FfmpegStreamIterator {
     pub fn new(
         path: &str,
@@ -904,13 +1181,18 @@ impl FfmpegStreamIterator {
         _codec_name: &str,
         rotation: i32,
     ) -> Result<Self, String> {
-        let is_color = color_id < 8 || color_id > 11;
+        let is_color = ffmpeg_stream_is_color(color_id);
         let p_fmt = if is_color { "rgb48le" } else { "gray16le" };
         let bpp = if is_color { 6 } else { 2 };
         let frame_size_bytes = roi_w * roi_h * bpp;
 
-        // Construct Filter Chain
+        // Construct Filter Chain. Rotation must happen before resize/crop: the
+        // public FfmpegReader dimensions already describe the displayed
+        // orientation (width/height are swapped for 90/270 degrees).
         let mut filters = Vec::new();
+        if let Some(rotation_filter) = ffmpeg_rotation_filter(rotation) {
+            filters.push(rotation_filter.to_string());
+        }
         // (Removed unsharp deblocking as it destroys CPU performance during extraction)
         // 1. Scale with NEAREST NEIGHBOR (Fastest & Safest)
         filters.push(format!(
@@ -921,24 +1203,12 @@ impl FfmpegStreamIterator {
         filters.push(format!("crop={}:{}:{}:{}", roi_w, roi_h, roi_x, roi_y));
         // 3. Format
         filters.push(format!("format={}", p_fmt));
-        let filter_str = filters.join(",");
-
         let mut args = Vec::new();
         // Robust Probe Limits for MOV (MOOV at end)
         args.extend_from_slice(&["-analyzeduration", "100M", "-probesize", "100M"]);
         args.extend_from_slice(&["-hide_banner", "-nostdin", "-y"]);
 
-        // 4. Rotation (NEW: Added Rotation Parameter)
-        let transpose_filter = match rotation {
-            90 => "transpose=1",
-            180 => "transpose=2,transpose=2",
-            270 => "transpose=2",
-            _ => "",
-        };
-
-        if !transpose_filter.is_empty() {
-            filters.push(transpose_filter.to_string());
-        }
+        let filter_str = filters.join(",");
 
         // GPU Hardware Acceleration (Auto)
         if use_gpu {
@@ -950,6 +1220,10 @@ impl FfmpegStreamIterator {
             args.extend_from_slice(&["-ss", ss]);
         }
 
+        // La orientación se aplica mediante el filtro anterior. Desactivar la
+        // autorrotación implícita evita doble giro y mantiene CPU/GPU idénticos.
+        args.push("-noautorotate");
+
         // INTELLIGENT CPU MANAGEMENT (Modest PCs)
         // Detect logical cores and reserve 1-2 cores to prevent freezing.
         let num_cpus = num_cpus::get(); // Use the standard `num_cpus` crate already in use for rayon
@@ -960,6 +1234,10 @@ impl FfmpegStreamIterator {
         };
         let thread_str = ffmpeg_threads.to_string();
         args.extend_from_slice(&["-threads", &thread_str]);
+        // Los filtros (scale neighbor / crop / format) van por defecto en UN
+        // solo hilo — en 4K rgb48le la conversión era el cuello del productor.
+        // El troceado por slices es determinista: bytes idénticos.
+        args.extend_from_slice(&["-filter_threads", &thread_str]);
 
         args.extend_from_slice(&["-i", path]);
         args.extend_from_slice(&[
@@ -1034,15 +1312,7 @@ impl FfmpegStreamIterator {
             return false;
         }
 
-        match self.reader.read_exact(buffer) {
-            Ok(_) => true,
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                    eprintln!("DEBUG: FfmpegStream Read Failed (Msg): {}", e);
-                }
-                false
-            }
-        }
+        read_exact_ffmpeg_frame(&mut self.reader, buffer)
     }
 
     // OPT FFMPEG 3: FAST-FORWARD DRAIN (Sequential Skipping)
@@ -1057,6 +1327,19 @@ impl FfmpegStreamIterator {
         // Take exact amount and drain it directly
         let mut take = (&mut self.reader).take(bytes_to_dump);
         let _ = std::io::copy(&mut take, &mut sink);
+    }
+}
+
+impl Drop for FfmpegStreamIterator {
+    // Al reemplazar/descartar un stream (salto atras en get_frame, reintento
+    // GPU->CPU, fin de pasada) el hijo ffmpeg solo moria cuando su siguiente
+    // write chocaba con el pipe cerrado, y NUNCA se cosechaba (wait): en
+    // macOS quedaban entradas zombie acumulandose durante toda la sesion.
+    // kill lo termina de inmediato y wait libera la entrada del proceso.
+    // Si el proceso ya salio (EOF normal), kill falla y se ignora.
+    fn drop(&mut self) {
+        let _ = self._process.kill();
+        let _ = self._process.wait();
     }
 }
 
@@ -1180,6 +1463,14 @@ impl VideoInput {
             VideoInput::Avi(r) => r.info.bytes_per_pixel,
             VideoInput::Ffmpeg(r) => r.bytes_per_pixel,
             VideoInput::Fits(r) => r.bytes_per_pixel,
+        }
+    }
+    fn sample_bits(&self) -> usize {
+        match self {
+            VideoInput::Ser(r) => r.info.sample_bits,
+            VideoInput::Avi(r) => r.info.sample_bits,
+            VideoInput::Ffmpeg(r) => r.sample_bits,
+            VideoInput::Fits(r) => r.sample_bits,
         }
     }
     fn color_id(&self) -> i32 {
@@ -1326,6 +1617,15 @@ impl VideoInput {
     fn is_ffmpeg(&self) -> bool {
         matches!(self, VideoInput::Ffmpeg(_))
     }
+    /// Etiqueta corta del formato para la telemetria (visible en la UI).
+    fn reader_kind_label(&self) -> &'static str {
+        match self {
+            VideoInput::Ser(_) => "SER",
+            VideoInput::Avi(_) => "AVI",
+            VideoInput::Fits(_) => "FITS",
+            VideoInput::Ffmpeg(_) => "FFmpeg",
+        }
+    }
     fn codec_name(&self) -> &str {
         match self {
             VideoInput::Ffmpeg(r) => &r.codec_name,
@@ -1348,6 +1648,8 @@ struct DeconvParams {
     iter: usize,
     vc_sigma: f32,
     vc_iter: usize,
+    // A: PSF medida del limbo activa → invalida el cache de deconv al togglear.
+    psf_from_limb: bool,
 }
 
 #[derive(Clone)]
@@ -1364,6 +1666,11 @@ struct WaveletLayers {
     width: usize,
     height: usize,
     parent_deconv_params: DeconvParams,
+    // B: descomposicion edge-aware activa → invalida el cache de wavelets.
+    edge_aware: bool,
+    // B+: intensidad edge-aware (nº bandas bilaterales + estrechez del rango) →
+    // tambien cambia la descomposicion, invalida el cache cuando edge_aware=on.
+    edge_aware_strength: f32,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1384,6 +1691,13 @@ struct FilterParams {
     deringing_light: f32,
     deringing_mask: bool,
     deconv_params: DeconvParams,
+    // La descomposicion wavelet (edge-aware + intensidad) y la auto-mascara
+    // adaptativa cambian la recombinacion → deben formar parte de la clave del
+    // filter_cache o un toggle solo (sin mover otro slider) devolveria un
+    // resultado obsoleto de la cache.
+    edge_aware: bool,
+    edge_aware_strength: f32,
+    auto_mask: f32,
 }
 
 #[derive(Clone)]
@@ -1396,6 +1710,9 @@ struct FilterCache {
 
 struct AppState {
     stacked_image: Mutex<Option<StackResult>>,
+    /// Máster lineal float32 y mapas científicos de cielo profundo. Se mantiene
+    /// separado del resultado planetario u16 para no perder headroom.
+    deep_sky_result: Mutex<Option<DeepSkyLinearResult>>,
     deconv_cache: Mutex<Vec<DeconvCache>>,
     wavelet_cache: Mutex<Vec<WaveletLayers>>,
     filter_cache: Mutex<Vec<FilterCache>>,
@@ -1504,6 +1821,30 @@ struct LogMessage {
     level: String,
     msg: String,
 }
+/// Telemetria EN VIVO del apilado (evento "stack_telemetry", cada ~25
+/// frames): modo de acumulacion (GPU/CPU), rendimiento y recursos — la
+/// validacion visible que pide el usuario de que la GPU esta trabajando.
+#[derive(Clone, serde::Serialize)]
+struct StackTelemetry {
+    /// "analysis" | "stacking" — la UI ajusta las etiquetas de la rejilla.
+    phase: String,
+    mode: String,
+    /// Decodificación de video por hardware. `None` para SER/AVI/FITS nativo.
+    decode_gpu: Option<bool>,
+    /// Kernel wgpu efectivo para preprocesado/acumulación, no mera detección.
+    compute_gpu: bool,
+    frames_done: usize,
+    frames_total: usize,
+    fps: f32,
+    align_ms: f32,
+    accum_ms: f32,
+    upload_mbps: f32,
+    ram_mb: u64,
+    vram_mb: u64,
+    cache_hits: usize,
+    threads: usize,
+}
+
 #[derive(Clone, serde::Serialize)]
 struct Progress {
     step: String,
@@ -1552,4 +1893,56 @@ struct MosaicTileConfig {
     height: u32,
     #[allow(dead_code)]
     rotation: f32,
+}
+
+#[cfg(test)]
+mod frame_stream_tests {
+    #[test]
+    fn ffmpeg_rotation_is_normalized_and_explicit() {
+        assert_eq!(super::ffmpeg_rotation_filter(0), None);
+        assert_eq!(super::ffmpeg_rotation_filter(360), None);
+        assert_eq!(super::ffmpeg_rotation_filter(90), Some("transpose=2"));
+        assert_eq!(super::ffmpeg_rotation_filter(-270), Some("transpose=2"));
+        assert_eq!(
+            super::ffmpeg_rotation_filter(180),
+            Some("transpose=2,transpose=2")
+        );
+        assert_eq!(
+            super::ffmpeg_rotation_filter(-180),
+            Some("transpose=2,transpose=2")
+        );
+        assert_eq!(super::ffmpeg_rotation_filter(270), Some("transpose=1"));
+        assert_eq!(super::ffmpeg_rotation_filter(-90), Some("transpose=1"));
+    }
+
+    #[test]
+    fn ffmpeg_pipe_keeps_mono_and_cfa_single_channel() {
+        for color_id in [0, 8, 9, 10, 11, 16, 17, 18, 19] {
+            assert!(
+                !super::ffmpeg_stream_is_color(color_id),
+                "color_id={color_id}"
+            );
+        }
+        for color_id in [12, 14, 20, 100, 101, 102, 103] {
+            assert!(
+                super::ffmpeg_stream_is_color(color_id),
+                "color_id={color_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn ffmpeg_truncated_pipe_never_emits_a_partial_frame() {
+        let frame_size = 64usize;
+        let mut bytes = vec![7u8; frame_size + frame_size / 2];
+        for (i, v) in bytes.iter_mut().enumerate() {
+            *v = (i & 0xff) as u8;
+        }
+        let mut reader = std::io::Cursor::new(bytes);
+        let mut frame = vec![0u8; frame_size];
+        assert!(super::read_exact_ffmpeg_frame(&mut reader, &mut frame));
+        assert_eq!(frame[17], 17);
+        assert!(!super::read_exact_ffmpeg_frame(&mut reader, &mut frame));
+        assert_eq!(reader.position(), (frame_size + frame_size / 2) as u64);
+    }
 }

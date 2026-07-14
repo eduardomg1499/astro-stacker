@@ -1,0 +1,253 @@
+{
+  "suiteVersion": "2.0",
+  "environment": {
+    "appVersion": "0.2.8",
+    "os": "macos",
+    "arch": "aarch64",
+    "cpuThreads": 8,
+    "memoryMb": 16384,
+    "gpuAvailable": true,
+    "gpuName": "Apple M1",
+    "gpuBackend": "Metal",
+    "gpuBudgetMb": 4096,
+    "generatedAtUtc": "2026-07-10T12:00:00Z"
+  },
+  "datasets": [
+    {
+      "id": "planetary-ser-mono-surface",
+      "domain": "planetary",
+      "sources": ["/absolute/path/to/surface.ser"],
+      "zenithOutput": "/absolute/path/to/zenith-surface.tiff",
+      "baselineCpuSeconds": 120.0,
+      "baselineCpuOutput": "/absolute/path/to/zenith-cpu-v1-surface.tiff",
+      "baselineCpuLog": "/absolute/path/to/zenith-cpu-v1-surface.log",
+      "baselineCpuParameters": {
+        "engine": "zenith-cpu-v1",
+        "percent": 15,
+        "apSize": 48,
+        "drizzle": 1
+      },
+      "baselineCpuProcessing": {
+        "linear": true,
+        "stretched": false,
+        "width": 1920,
+        "height": 1080,
+        "channels": 1,
+        "sampleFormat": "uint16",
+        "drizzleScale": 1.0,
+        "crop": { "x": 0, "y": 0, "width": 1920, "height": 1080 },
+        "postProcessing": []
+      },
+      "zenithRuns": [
+        {
+          "mode": "hybrid-v2",
+          "coldCache": true,
+          "cachePreparation": "FrameStore Zenith eliminado antes de begin_benchmark_run; purga de caché del SO ejecutada y documentada por el operador",
+          "elapsedSeconds": 50.0,
+          "output": "/absolute/path/to/zenith-surface.tiff",
+          "telemetry": ["/absolute/path/to/benchmark-session/telemetry.json"],
+          "parameters": {
+            "computePolicy": "hybrid",
+            "profile": "balanced",
+            "percent": 15,
+            "apSize": 48,
+            "drizzle": 1
+          },
+          "processing": {
+            "linear": true,
+            "stretched": false,
+            "width": 1920,
+            "height": 1080,
+            "channels": 1,
+            "sampleFormat": "uint16",
+            "drizzleScale": 1.0,
+            "crop": { "x": 0, "y": 0, "width": 1920, "height": 1080 },
+            "postProcessing": []
+          }
+        },
+        {
+          "mode": "hybrid-v2",
+          "coldCache": false,
+          "cachePreparation": "misma receta inmediatamente después de la corrida fría; cachés conservadas",
+          "elapsedSeconds": 42.0,
+          "output": "/absolute/path/to/zenith-surface-warm.tiff",
+          "telemetry": ["/absolute/path/to/benchmark-session-warm/telemetry.json"],
+          "parameters": {
+            "computePolicy": "hybrid",
+            "profile": "balanced",
+            "percent": 15,
+            "apSize": 48,
+            "drizzle": 1
+          },
+          "processing": {
+            "linear": true,
+            "stretched": false,
+            "width": 1920,
+            "height": 1080,
+            "channels": 1,
+            "sampleFormat": "uint16",
+            "drizzleScale": 1.0,
+            "crop": { "x": 0, "y": 0, "width": 1920, "height": 1080 },
+            "postProcessing": []
+          }
+        }
+      ],
+      "comparators": [
+        {
+          "engine": "AutoStakkert",
+          "version": "user-supplied-exact-version",
+          "output": "/absolute/path/to/comparator-surface.tiff",
+          "elapsedSeconds": 70.0,
+          "log": "/absolute/path/to/comparator-surface.log",
+          "parameters": {
+            "qualityEstimator": "document exact setting",
+            "stackPercent": 15,
+            "alignmentPoints": "document exact setting"
+          },
+          "processing": {
+            "linear": true,
+            "stretched": false,
+            "width": 1920,
+            "height": 1080,
+            "channels": 1,
+            "sampleFormat": "uint16",
+            "drizzleScale": 1.0,
+            "crop": { "x": 0, "y": 0, "width": 1920, "height": 1080 },
+            "postProcessing": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "deep-sky-osc-calibrated-dithered",
+      "domain": "deep_sky",
+      "sources": ["/absolute/path/to/lights/light_001.fits"],
+      "zenithOutput": "/absolute/path/to/zenith-master.fits",
+      "baselineCpuSeconds": 600.0,
+      "baselineCpuOutput": "/absolute/path/to/zenith-cpu-v1-master.fits",
+      "baselineCpuLog": "/absolute/path/to/zenith-cpu-v1-master.log",
+      "baselineCpuParameters": {
+        "engine": "zenith-cpu-v1",
+        "rejection": "sigma",
+        "normalization": "local",
+        "drizzle": 1
+      },
+      "baselineCpuProcessing": {
+        "linear": true,
+        "stretched": false,
+        "width": 6248,
+        "height": 4176,
+        "channels": 3,
+        "sampleFormat": "float32",
+        "drizzleScale": 1.0,
+        "crop": { "x": 0, "y": 0, "width": 6248, "height": 4176 },
+        "postProcessing": []
+      },
+      "zenithRuns": [
+        {
+          "mode": "hybrid-v2",
+          "coldCache": true,
+          "cachePreparation": "caché algorítmica eliminada y condición de caché del SO documentada",
+          "elapsedSeconds": 240.0,
+          "output": "/absolute/path/to/zenith-master.fits",
+          "telemetry": "/absolute/path/to/benchmark-session-deepsky/telemetry.json",
+          "recipe": "/absolute/path/to/zenith-master-cold-recipe.json",
+          "parameters": {
+            "computePolicy": "hybrid",
+            "effectiveEngine": "Hybrid CPU + GPU wgpu",
+            "rejection": "sigma",
+            "kappaLow": 3.0,
+            "kappaHigh": 3.0,
+            "clipIterations": 2,
+            "normalization": "local",
+            "localNormalization": true,
+            "interpolation": "lanczos3",
+            "drizzle": 1.0,
+            "pixfrac": 0.8,
+            "cfaDrizzlePattern": null,
+            "cosmetic": true,
+            "darkOptimization": true,
+            "autoCrop": false,
+            "optionalAbeScnr": false,
+            "pedestal": 0.0
+          },
+          "processing": {
+            "linear": true,
+            "stretched": false,
+            "width": 6248,
+            "height": 4176,
+            "channels": 3,
+            "sampleFormat": "float32",
+            "drizzleScale": 1.0,
+            "crop": { "x": 0, "y": 0, "width": 6248, "height": 4176 },
+            "postProcessing": []
+          }
+        },
+        {
+          "mode": "hybrid-v2",
+          "coldCache": false,
+          "cachePreparation": "misma receta inmediatamente después de la corrida fría; caches conservadas",
+          "elapsedSeconds": 210.0,
+          "output": "/absolute/path/to/zenith-master-warm.fits",
+          "telemetry": "/absolute/path/to/benchmark-session-deepsky-warm/telemetry.json",
+          "recipe": "/absolute/path/to/zenith-master-warm-recipe.json",
+          "parameters": {
+            "computePolicy": "hybrid",
+            "effectiveEngine": "Hybrid CPU + GPU wgpu",
+            "rejection": "sigma",
+            "kappaLow": 3.0,
+            "kappaHigh": 3.0,
+            "clipIterations": 2,
+            "normalization": "local",
+            "localNormalization": true,
+            "interpolation": "lanczos3",
+            "drizzle": 1.0,
+            "pixfrac": 0.8,
+            "cfaDrizzlePattern": null,
+            "cosmetic": true,
+            "darkOptimization": true,
+            "autoCrop": false,
+            "optionalAbeScnr": false,
+            "pedestal": 0.0
+          },
+          "processing": {
+            "linear": true,
+            "stretched": false,
+            "width": 6248,
+            "height": 4176,
+            "channels": 3,
+            "sampleFormat": "float32",
+            "drizzleScale": 1.0,
+            "crop": { "x": 0, "y": 0, "width": 6248, "height": 4176 },
+            "postProcessing": []
+          }
+        }
+      ],
+      "comparators": [
+        {
+          "engine": "PixInsight",
+          "version": "user-supplied-exact-version",
+          "output": "/absolute/path/to/pixinsight-master.fits",
+          "elapsedSeconds": 300.0,
+          "log": "/absolute/path/to/pixinsight.log",
+          "parameters": {
+            "registration": "document exact StarAlignment model",
+            "normalization": "document exact model",
+            "rejection": "document exact ImageIntegration method"
+          },
+          "processing": {
+            "linear": true,
+            "stretched": false,
+            "width": 6248,
+            "height": 4176,
+            "channels": 3,
+            "sampleFormat": "float32",
+            "drizzleScale": 1.0,
+            "crop": { "x": 0, "y": 0, "width": 6248, "height": 4176 },
+            "postProcessing": []
+          }
+        }
+      ]
+    }
+  ]
+}

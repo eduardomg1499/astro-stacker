@@ -1130,8 +1130,236 @@
     </div>
 
     <!-- ============ DEEP-SKY MODAL (diseño de la familia donation) ============ -->
-    <div id="deepsky-modal" class="modal-overlay donation-modal" style="display:none;">
-        <div class="donation-modal-box" style="width:880px; max-width:96vw; max-height:94vh; overflow-y:auto;">
+    <style>
+        /* Opciones de cielo profundo: rejilla 2×2 de grupos etiquetados (estilo WBPP).
+           Cada fila es un grid [etiqueta | control] con la columna de control de ancho
+           FIJO (132px) para vencer al `select{width:100%}` global y evitar desbordes. */
+        #deepsky-modal .ds-opts {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            align-items: start;
+            gap: 12px;
+            margin-bottom: 16px;
+            text-align: left;
+        }
+        #deepsky-modal .ds-og {
+            background: rgba(124, 58, 237, 0.05);
+            border: 1px solid rgba(124, 58, 237, 0.18);
+            border-radius: 14px;
+            padding: 13px 16px 14px;
+        }
+        #deepsky-modal .ds-og-h {
+            font-size: 0.6rem;
+            font-weight: 700;
+            letter-spacing: 0.09em;
+            text-transform: uppercase;
+            color: #a78bfa;
+            margin: 0 0 4px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid rgba(124, 58, 237, 0.16);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        #deepsky-modal .ds-og-h svg { width: 13px; height: 13px; opacity: 0.9; margin: 0; }
+        #deepsky-modal .ds-row {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 132px;
+            align-items: center;
+            gap: 8px 12px;
+            min-height: 38px;
+            font-size: 0.74rem;
+            color: #cbd5e1;
+            line-height: 1.3;
+        }
+        #deepsky-modal .ds-row + .ds-row { border-top: 1px solid rgba(148, 163, 184, 0.08); }
+        #deepsky-modal .ds-row > :last-child { justify-self: end; }
+        /* Selects y number: ancho fijo, alto compacto, sin el sombreado global */
+        #deepsky-modal .ds-sel {
+            width: 132px;
+            height: 32px;
+            box-sizing: border-box;
+            background: #0f172a;
+            color: #e2e8f0;
+            border: 1px solid #3a4a63;
+            border-radius: 8px;
+            font-family: inherit;
+            font-size: 0.72rem;
+            font-weight: 500;
+            padding: 4px 26px 4px 10px;
+            box-shadow: none;
+            outline: none;
+        }
+        #deepsky-modal .ds-sel:focus { border-color: #7c3aed; background: #0f172a; }
+        #deepsky-modal .ds-kappa {
+            width: 72px;
+            height: 32px;
+            box-sizing: border-box;
+            text-align: center;
+        }
+        #deepsky-modal .ds-row .switch { transform: scale(0.82); transform-origin: center right; margin: 0; }
+        /* κ doble (bajo/alto) dentro de la columna de control de 132px */
+        #deepsky-modal .ds-kappa2 { display: flex; gap: 6px; align-items: center; }
+        #deepsky-modal .ds-kappa2 input { width: 58px; height: 32px; box-sizing: border-box; text-align: center; padding: 2px; }
+        /* Selector de presets (estilo WBPP) */
+        #deepsky-modal .ds-presets { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; text-align: left; flex-wrap: wrap; }
+        #deepsky-modal .ds-presets-label { font-size: 0.6rem; font-weight: 700; letter-spacing: 0.09em; text-transform: uppercase; color: #a78bfa; }
+        #deepsky-modal .ds-preset-btns { display: flex; gap: 6px; flex: 1; flex-wrap: wrap; }
+        #deepsky-modal .ds-preset {
+            width: auto; flex: 1 1 auto; min-width: 92px;
+            padding: 7px 10px; font-size: 0.72rem; font-weight: 600;
+            text-transform: none; letter-spacing: 0; border-radius: 9px;
+            border: 1px solid rgba(124, 58, 237, 0.25); background: rgba(124, 58, 237, 0.06);
+            color: #c4b5fd; cursor: pointer; box-shadow: none;
+        }
+        #deepsky-modal .ds-preset.active {
+            background: linear-gradient(135deg, #7c3aed, #6d28d9); border-color: #7c3aed;
+            color: #fff; box-shadow: 0 2px 10px rgba(124, 58, 237, 0.4);
+        }
+        #deepsky-modal .ds-preset.recommended:not(.active) {
+            border-color: rgba(34, 211, 238, 0.55);
+            box-shadow: inset 0 0 0 1px rgba(34, 211, 238, 0.12);
+        }
+        /* Panel diagrama de proceso */
+        #deepsky-modal .ds-diagram { margin: 0 0 14px; padding: 12px 14px; background: rgba(56, 189, 248, 0.04); border: 1px solid rgba(56, 189, 248, 0.14); border-radius: 14px; text-align: left; }
+        #deepsky-modal .ds-diagram-flow { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 4px; margin-bottom: 12px; }
+        #deepsky-modal .ds-stage { display: flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 9px; font-size: 0.68rem; font-weight: 600; border: 1px solid transparent; white-space: nowrap; }
+        #deepsky-modal .ds-stage.on { background: rgba(124, 58, 237, 0.14); border-color: rgba(124, 58, 237, 0.35); color: #ddd6fe; }
+        #deepsky-modal .ds-stage.off { background: rgba(30, 41, 59, 0.4); color: #475569; text-decoration: line-through; }
+        #deepsky-modal .ds-stage svg { width: 12px; height: 12px; }
+        #deepsky-modal .ds-arrow { color: #475569; font-size: 0.7rem; }
+        #deepsky-modal .ds-techrow { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.66rem; color: #94a3b8; }
+        #deepsky-modal .ds-techrow b { color: #e2e8f0; font-weight: 700; }
+        #deepsky-modal .ds-tech-time { color: #7dd3fc; }
+        #deepsky-modal .ds-wizard-box {
+            width: 1220px; max-width: 98vw; height: min(94vh, 860px); max-height: 96vh;
+            overflow: clip; padding: 0; display: flex; flex-direction: column; overscroll-behavior: none;
+        }
+        #deepsky-modal .ds-wizard-shell {
+            width: 100%; height: 100%; min-height: 0; box-sizing: border-box;
+            display: flex; flex-direction: column; padding: 22px 28px 18px; text-align: left;
+        }
+        #deepsky-modal .ds-wizard-head {
+            flex: 0 0 auto; display:grid; grid-template-columns:48px minmax(210px,260px) minmax(260px,1fr) minmax(430px,470px);
+            align-items:center; gap:12px; text-align:left; margin-bottom:12px;
+        }
+        #deepsky-modal .ds-wizard-head .donation-heart-mark { margin:0; }
+        #deepsky-modal .ds-wizard-head h2 { margin:0; font-size:1.28rem; line-height:1.15; max-width:245px; }
+        #deepsky-modal .ds-wizard-head p { margin:0; font-size:.75rem; line-height:1.5; overflow-wrap:anywhere; }
+        #deepsky-modal .ds-wizard-steps {
+            display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px;
+            padding: 5px; margin:0; border: 1px solid rgba(124,58,237,.2);
+            border-radius: 13px; background: rgba(15,23,42,.72);
+        }
+        #deepsky-modal .ds-wizard-step {
+            width: auto; min-height: 42px; padding: 7px 8px; display: flex; align-items: center;
+            justify-content: center; gap: 7px; border: 1px solid transparent; border-radius: 9px;
+            background: transparent; color: #94a3b8; font: 600 .72rem/1.25 inherit; cursor: pointer;
+            text-transform: none; letter-spacing: 0;
+        }
+        #deepsky-modal .ds-wizard-step > span:last-child { min-width:0; overflow-wrap:normal; }
+        #deepsky-modal .ds-wizard-step .ds-step-n {
+            width: 21px; height: 21px; display: inline-grid; place-items: center; border-radius: 50%;
+            background: #1e293b; color: #94a3b8; font-size: .62rem;
+        }
+        #deepsky-modal .ds-wizard-step.active {
+            color: #f5f3ff; background: rgba(124,58,237,.22); border-color: rgba(167,139,250,.38);
+        }
+        #deepsky-modal .ds-wizard-step.active .ds-step-n { background: #7c3aed; color: white; }
+        #deepsky-modal .ds-wizard-step.done { color: #a7f3d0; }
+        #deepsky-modal .ds-wizard-step.done .ds-step-n { background: #047857; color: white; }
+        #deepsky-modal :is(button,input,select,summary):focus-visible {
+            outline: 2px solid #38bdf8 !important; outline-offset: 2px;
+        }
+        #deepsky-modal .ds-wizard-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 2px 5px 14px; }
+        #deepsky-modal .ds-wizard-page { display: none; animation: ds-page-in .16s ease-out; }
+        #deepsky-modal .ds-wizard-page.active { display: block; }
+        @keyframes ds-page-in { from { opacity: .25; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+        #deepsky-modal .ds-page-intro {
+            display: flex; align-items: flex-start; justify-content: space-between; gap: 18px;
+            margin: 2px 0 12px; padding: 12px 14px; border-radius: 12px;
+            background: rgba(56,189,248,.045); border: 1px solid rgba(56,189,248,.14);
+        }
+        #deepsky-modal .ds-page-intro strong { display:block; color:#e2e8f0; font-size:.79rem; margin-bottom:3px; }
+        #deepsky-modal .ds-page-intro span { color:#94a3b8; font-size:.73rem; line-height:1.5; }
+        #deepsky-modal .ds-profile-help { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin:0 0 12px; }
+        #deepsky-modal .ds-profile-note { padding:10px 12px; border-radius:10px; background:rgba(30,41,59,.55); color:#94a3b8; font-size:.71rem; line-height:1.48; }
+        #deepsky-modal .ds-profile-note b { display:block; color:#ddd6fe; font-size:.76rem; margin-bottom:3px; }
+        #deepsky-modal .ds-advanced { margin: 0 0 12px; border:1px solid rgba(124,58,237,.2); border-radius:13px; overflow:hidden; }
+        #deepsky-modal .ds-advanced > summary { padding:11px 14px; color:#c4b5fd; background:rgba(124,58,237,.06); cursor:pointer; font-size:.72rem; font-weight:700; }
+        #deepsky-modal .ds-advanced .ds-opts { padding:12px; margin:0; }
+        #deepsky-modal .ds-preflight { min-height:80px; padding:14px 16px; margin-bottom:12px; border-radius:12px; border:1px solid #334155; background:rgba(15,23,42,.72); font-size:.74rem; color:#cbd5e1; line-height:1.58; overflow-wrap:anywhere; }
+        #deepsky-modal .ds-preflight[data-state="error"] { border-color:rgba(248,113,113,.55); background:rgba(127,29,29,.12); }
+        #deepsky-modal .ds-preflight[data-state="ok"] { border-color:rgba(52,211,153,.35); background:rgba(6,78,59,.10); }
+        #deepsky-modal .ds-wizard-footer {
+            flex: 0 0 auto; display:flex; align-items:center; gap:9px; padding-top:12px;
+            border-top:1px solid rgba(148,163,184,.14); background:rgba(15,23,42,.72);
+        }
+        #deepsky-modal .ds-wizard-footer button { min-height:40px; }
+        #deepsky-modal #btn-deepsky-prev { width:auto; min-width:105px; background:#1e293b; color:#cbd5e1; border:1px solid #334155; }
+        #deepsky-modal #btn-deepsky-next { width:auto; min-width:150px; margin-left:auto; background:linear-gradient(135deg,#2563eb,#7c3aed); color:white; }
+        #deepsky-modal #btn-deepsky-run { width:auto !important; min-width:210px; }
+        #deepsky-modal #btn-deepsky-combine-open { width:auto !important; margin:0 !important; }
+        #deepsky-modal .ds-footer-status { color:#94a3b8; font-size:.72rem; max-width:none; line-height:1.4; }
+        #deepsky-modal .ds-filter-badge { font-size:.7rem; color:#67e8f9; background:rgba(103,232,249,.12); border:1px solid rgba(103,232,249,.32); padding:3px 9px; border-radius:7px; font-weight:700; }
+        #deepsky-modal .ds-session-note { display:flex; align-items:flex-start; gap:10px; margin-top:9px; padding:11px 13px; border-radius:11px; border:1px solid rgba(45,212,191,.3); background:rgba(13,148,136,.08); color:#99f6e4; font-size:.73rem; line-height:1.5; }
+        #deepsky-modal .ds-session-note svg { width:16px; height:16px; flex:0 0 auto; margin-top:2px; }
+        #deepsky-modal .ds-session-note strong { display:block; color:#ccfbf1; margin-bottom:2px; }
+        #deepsky-modal .ds-session-note span { color:#a7f3d0; }
+        #deepsky-modal .ds-multiband-card { margin:0 0 12px; padding:13px 15px; border:1px solid rgba(45,212,191,.26); border-radius:13px; background:rgba(13,148,136,.06); }
+        #deepsky-modal .ds-multiband-card > label { display:flex; gap:10px; align-items:flex-start; color:#e2e8f0; font-size:.76rem; font-weight:700; }
+        #deepsky-modal .ds-multiband-card small { display:block; margin:4px 0 11px 32px; color:#94a3b8; font-size:.7rem; line-height:1.45; }
+        #deepsky-modal .ds-multiband-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:9px; }
+        #deepsky-modal .ds-multiband-grid label { color:#94a3b8; font-size:.69rem; line-height:1.4; }
+        #deepsky-modal .ds-multiband-grid .ds-sel { width:100%; margin-top:5px; }
+        #deepsky-modal .ds-session-overview, #deepsky-modal .ds-quality-title { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:10px; }
+        #deepsky-modal .ds-session-overview > div, #deepsky-modal .ds-quality-title > div { display:flex; flex-direction:column; gap:2px; }
+        #deepsky-modal .ds-session-overview b, #deepsky-modal .ds-quality-title strong { color:#a7f3d0; font-size:.82rem; }
+        #deepsky-modal .ds-session-overview span, #deepsky-modal .ds-quality-title span { color:#94a3b8; }
+        #deepsky-modal .ds-session-time { color:#7dd3fc!important; white-space:nowrap; }
+        #deepsky-modal .ds-resource-grid { display:flex; flex-wrap:wrap; gap:8px 20px; margin-bottom:11px; color:#94a3b8; }
+        #deepsky-modal .ds-resource-grid b { color:#e2e8f0; }
+        #deepsky-modal .ds-session-groups { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:9px; }
+        #deepsky-modal .ds-session-group { padding:11px 12px; border-radius:11px; border:1px solid rgba(124,58,237,.22); background:rgba(124,58,237,.05); min-width:0; }
+        #deepsky-modal .ds-session-group-head, #deepsky-modal .ds-quality-head { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
+        #deepsky-modal .ds-session-group-head > div, #deepsky-modal .ds-quality-head > div { display:flex; flex-direction:column; min-width:0; }
+        #deepsky-modal .ds-session-group-head strong, #deepsky-modal .ds-quality-head strong { color:#e2e8f0; font-size:.79rem; }
+        #deepsky-modal .ds-session-group-head span, #deepsky-modal .ds-quality-head span { color:#94a3b8; font-size:.68rem; }
+        #deepsky-modal .ds-plan-state { padding:2px 8px; border-radius:999px; white-space:nowrap; }
+        #deepsky-modal .ds-plan-state.ok { color:#6ee7b7; background:rgba(16,185,129,.12); }
+        #deepsky-modal .ds-plan-state.error { color:#fca5a5; background:rgba(239,68,68,.12); }
+        #deepsky-modal .ds-session-group-meta { display:flex; flex-wrap:wrap; gap:4px 12px; margin:8px 0; color:#a5b4fc; font-size:.68rem; }
+        #deepsky-modal .ds-component-flow { display:flex; flex-wrap:wrap; align-items:center; gap:5px; color:#94a3b8; font-size:.67rem; }
+        #deepsky-modal .ds-component-chip { padding:2px 7px; border-radius:6px; color:#cffafe; background:rgba(8,145,178,.13); border:1px solid rgba(34,211,238,.2); }
+        #deepsky-modal .ds-alert { margin-top:7px; padding:7px 9px; border-radius:8px; }
+        #deepsky-modal .ds-alert.warn { color:#fde68a; background:rgba(245,158,11,.08); }
+        #deepsky-modal .ds-alert.error { color:#fecaca; background:rgba(239,68,68,.09); }
+        #deepsky-modal .ds-quality-panel { margin-top:12px; padding:14px; border:1px solid rgba(56,189,248,.22); border-radius:13px; background:rgba(14,116,144,.06); }
+        #deepsky-modal .ds-quality-title > span { max-width:55%; text-align:right; overflow-wrap:anywhere; }
+        #deepsky-modal .ds-quality-card { padding:11px 12px; border-top:1px solid rgba(148,163,184,.13); }
+        #deepsky-modal .ds-quality-head > b { color:#6ee7b7; }
+        #deepsky-modal .ds-quality-head > b[data-grade="Revisar"] { color:#fca5a5; }
+        #deepsky-modal .ds-quality-metrics { display:flex; flex-wrap:wrap; gap:7px 18px; margin:8px 0; color:#94a3b8; }
+        #deepsky-modal .ds-quality-metrics b { color:#e2e8f0; }
+        #deepsky-modal .ds-output-list, #deepsky-modal .ds-quality-recommendations { margin:7px 0 0; padding-left:18px; }
+        #deepsky-modal .ds-output-list li { display:grid; grid-template-columns:45px minmax(0,1fr); gap:8px; }
+        #deepsky-modal .ds-output-list span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#94a3b8; }
+        @media (max-width: 760px) {
+            #deepsky-modal .ds-opts { grid-template-columns: 1fr; }
+            #deepsky-modal .ds-multiband-grid, #deepsky-modal .ds-session-groups { grid-template-columns:1fr; }
+        }
+        @media (max-width: 1050px), (max-height: 740px) {
+            #deepsky-modal .ds-wizard-box { height: 94vh; }
+            #deepsky-modal .ds-wizard-shell { padding: 14px 18px 12px; }
+            #deepsky-modal .ds-wizard-head { grid-template-columns:42px minmax(190px,1fr); gap:8px 12px; margin-bottom:9px; }
+            #deepsky-modal .ds-wizard-head p { display:none; }
+            #deepsky-modal .ds-wizard-steps { grid-column:1 / -1; }
+            #deepsky-modal .ds-wizard-head h2 { max-width:none; }
+        }
+    </style>
+    <div id="deepsky-modal" class="modal-overlay donation-modal" style="display:none;"
+        role="dialog" aria-modal="true" aria-labelledby="deepsky-dialog-title">
+        <div class="donation-modal-box ds-wizard-box">
             <div class="donation-glow donation-glow-pink" style="background:rgba(124,58,237,0.35);"></div>
             <button id="btn-deepsky-close" class="donation-close-btn" type="button" aria-label="Cerrar">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"
@@ -1140,147 +1368,328 @@
                     <path d="m6 6 12 12"></path>
                 </svg>
             </button>
-            <div class="donation-content">
-                <div class="donation-heart-mark" style="color:#a78bfa; background:rgba(124,58,237,0.14);">
-                    <svg class="zas-icon" style="width:32px; height:32px;"><use href="#icon-galaxy"></use></svg>
-                </div>
-                <h2 data-i18n="deepsky.title">Apilado de Cielo Profundo</h2>
-                <p data-i18n="deepsky.hint">Selecciona tus lights y (opcional) calibración. Referencia, alineación por
-                    estrellas, rechazo de satélites y estiramiento: automáticos.</p>
+            <div class="donation-content ds-wizard-shell">
+                <header class="ds-wizard-head">
+                    <div class="donation-heart-mark" style="color:#a78bfa; background:rgba(124,58,237,0.14);">
+                        <svg class="zas-icon" style="width:32px; height:32px;"><use href="#icon-galaxy"></use></svg>
+                    </div>
+                    <h2 id="deepsky-dialog-title" data-i18n="deepsky.title">Apilado de Cielo Profundo</h2>
+                    <p data-i18n="deepsky.hint">Selecciona tus lights y (opcional) calibración. Referencia, alineación por
+                        estrellas, rechazo de satélites y estiramiento: automáticos.</p>
+                    <nav class="ds-wizard-steps" aria-label="Etapas del apilado">
+                        <button type="button" class="ds-wizard-step active" data-step="0" aria-current="step"><span class="ds-step-n">1</span><span>Datos</span></button>
+                        <button type="button" class="ds-wizard-step" data-step="1"><span class="ds-step-n">2</span><span>Inspección de tomas</span></button>
+                        <button type="button" class="ds-wizard-step" data-step="2"><span class="ds-step-n">3</span><span>Receta</span></button>
+                        <button type="button" class="ds-wizard-step" data-step="3"><span class="ds-step-n">4</span><span>Revisar y apilar</span></button>
+                    </nav>
+                </header>
+                <div class="ds-wizard-scroll" id="ds-wizard-scroll">
+                <section class="ds-wizard-page active" data-step="0" aria-label="Datos">
+                    <div class="ds-page-intro"><div><strong>Datos de la sesión</strong><span>Añade lights y calibraciones. Zenith agrupa por geometría, Bayer, filtro, exposición, ganancia, binning y temperatura.</span></div></div>
 
                 <!-- PALABRAS CLAVE (agrupación estilo WBPP) -->
                 <div style="margin:0 0 12px; padding:8px 10px; background:rgba(56,189,248,0.05); border:1px solid rgba(56,189,248,0.14); border-radius:12px; text-align:left;">
-                    <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+                    <label for="ds-keywords" style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
                         <svg class="zas-icon" style="color:#38bdf8; width:13px; height:13px;"><use href="#icon-search"></use></svg>
                         <span style="font-size:0.68rem; color:#7dd3fc; font-weight:600; letter-spacing:0.03em;" data-i18n="deepsky.keywords_label">Palabras clave (opcional, separadas por coma)</span>
-                    </div>
+                    </label>
                     <input type="text" id="ds-keywords" placeholder="300s, 180s, Ha, ISO800..."
                         style="width:100%; background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:8px; font-size:0.72rem; padding:6px 9px; outline:none;">
                     <div id="ds-group-chips" style="display:none; gap:6px; margin-top:8px; flex-wrap:wrap;"></div>
                 </div>
 
                 <!-- SECCIONES (filas estilo donation-option, render dinámico) -->
-                <div style="font-size:0.62rem; color:#64748b; margin:0 0 6px; display:flex; align-items:center; gap:6px;">
+                <div style="font-size:0.62rem; color:#94a3b8; margin:0 0 6px; display:flex; align-items:center; gap:6px;">
                     <span style="color:#7c3aed;">⠿</span>
                     <span data-i18n="deepsky.drag_hint">Arrastra un archivo a otra categoría para reclasificarlo · ✕ para quitarlo</span>
                 </div>
                 <div class="donation-options" id="ds-sections" style="margin-bottom:12px; gap:10px;"></div>
+                </section>
 
                 <!-- RESUMEN DE EMPAREJAMIENTO -->
+                <section class="ds-wizard-page" data-step="1" aria-label="Inspección de tomas">
+                <div class="ds-page-intro"><div><strong>Inspección y compatibilidad</strong><span>Revisa agrupación, calibraciones aplicables, incompatibilidades y advertencias antes de elegir la receta.</span></div></div>
                 <div id="ds-match-summary"
                     style="display:none; font-size:0.68rem; color:#cbd5e1; background:rgba(16,185,129,0.05); border:1px solid rgba(16,185,129,0.15); border-radius:12px; padding:8px 12px; margin-bottom:12px; line-height:1.55; text-align:left;">
                 </div>
+                <div id="ds-preflight-inspection" class="ds-preflight" data-state="idle">Añade lights para preparar el plan.</div>
+                <div id="ds-frame-inspection" class="ds-preflight" data-state="idle" aria-live="polite">La inspección PSF se ejecutará al entrar en este paso.</div>
+                </section>
 
-                <!-- OPCIONES -->
-                <div style="display:flex; flex-wrap:wrap; align-items:center; gap:12px 16px; margin-bottom:14px; padding:10px 12px; background:rgba(124,58,237,0.06); border:1px solid rgba(124,58,237,0.18); border-radius:12px;">
-                    <label style="display:flex; align-items:center; gap:6px; font-size:0.72rem; color:#cbd5e1;">
-                        <span data-i18n="deepsky.sigma_clip">Rechazo σ-clip</span>
-                        <span class="switch" style="transform:scale(0.72);">
-                            <input type="checkbox" id="chk-ds-sigma" checked>
-                            <span class="slider round"></span>
-                        </span>
-                    </label>
-                    <label style="display:flex; align-items:center; gap:6px; font-size:0.72rem; color:#cbd5e1;">
-                        κ
-                        <input type="number" id="num-ds-kappa" value="3.0" min="1.5" max="6" step="0.1" class="input-val"
-                            style="width:60px;">
-                    </label>
-                    <label style="display:flex; align-items:center; gap:6px; font-size:0.72rem; color:#cbd5e1;"
-                        title="Elimina píxeles calientes cuando no hay darks">
-                        <span data-i18n="deepsky.cosmetic">Corrección cosmética</span>
-                        <span class="switch" style="transform:scale(0.72);">
-                            <input type="checkbox" id="chk-ds-cosmetic" checked>
-                            <span class="slider round"></span>
-                        </span>
-                    </label>
-                    <label style="display:flex; align-items:center; gap:6px; font-size:0.72rem; color:#cbd5e1;"
-                        title="OPCIONAL (como PixInsight, mejor hacerlo después): resta el gradiente de fondo (ABE grado 2) + elimina el verde (SCNR) + neutraliza. Por defecto OFF para dejar un máster lineal limpio.">
-                        <span data-i18n="deepsky.gradient">Limpieza de fondo y color (ABE+SCNR)</span>
-                        <span class="switch" style="transform:scale(0.72);">
-                            <input type="checkbox" id="chk-ds-gradient">
-                            <span class="slider round"></span>
-                        </span>
-                    </label>
-                    <label style="display:flex; align-items:center; gap:6px; font-size:0.72rem; color:#cbd5e1;"
-                        title="Escala el master dark a cada light para cancelar mejor el patrón térmico (requiere darks + bias)">
-                        <span data-i18n="deepsky.dark_opt">Optimizar darks (escala térmica)</span>
-                        <span class="switch" style="transform:scale(0.72);">
-                            <input type="checkbox" id="chk-ds-darkopt" checked>
-                            <span class="slider round"></span>
-                        </span>
-                    </label>
-                    <label style="display:flex; align-items:center; gap:6px; font-size:0.72rem; color:#cbd5e1;"
-                        title="Drizzle drop-kernel real (Fruchter & Hook): super-resolución por dispersión de gotas en rejilla fina. Requiere dithering entre tomas.">
-                        <span data-i18n="deepsky.drizzle">Drizzle</span>
-                        <select id="sel-ds-drizzle"
-                            style="background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:6px; font-size:0.72rem; padding:3px 6px; outline:none;">
-                            <option value="1">Off (1×)</option>
-                            <option value="2">2×</option>
-                            <option value="3">3×</option>
-                        </select>
-                    </label>
-                    <label id="lbl-ds-pixfrac" style="display:none; align-items:center; gap:6px; font-size:0.72rem; color:#cbd5e1;"
-                        title="Tamaño de la gota (pixfrac): menor = más nitidez pero necesita más tomas bien ditheradas.">
-                        <span data-i18n="deepsky.pixfrac">Gota (pixfrac)</span>
-                        <select id="sel-ds-pixfrac"
-                            style="background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:6px; font-size:0.72rem; padding:3px 6px; outline:none;">
-                            <option value="1.0">1.0 (suave)</option>
-                            <option value="0.8" selected>0.8 (equilibrado)</option>
-                            <option value="0.65">0.65 (nítido)</option>
-                            <option value="0.5">0.5 (máx · muchas tomas)</option>
-                        </select>
-                    </label>
-                    <label style="display:flex; align-items:center; gap:6px; font-size:0.72rem; color:#cbd5e1;"
-                        title="Normalización local (PixInsight LocalNormalization): iguala el fondo por zonas para gradientes que cambian entre tomas (contaminación lumínica en movimiento, luna). Más lento.">
-                        <span data-i18n="deepsky.local_norm">Normalización local</span>
-                        <span class="switch" style="transform:scale(0.72);">
-                            <input type="checkbox" id="chk-ds-localnorm">
-                            <span class="slider round"></span>
-                        </span>
-                    </label>
-                    <label style="display:flex; align-items:center; gap:6px; font-size:0.72rem; color:#cbd5e1;"
-                        title="Recorta los bordes con cobertura parcial (menos tomas solapadas) en apilados con dithering/rotación, como DSS/PixInsight.">
-                        <span data-i18n="deepsky.auto_crop">Recortar bordes (cobertura parcial)</span>
-                        <span class="switch" style="transform:scale(0.72);">
-                            <input type="checkbox" id="chk-ds-autocrop" checked>
-                            <span class="slider round"></span>
-                        </span>
-                    </label>
+                <!-- PRESETS (estilo WBPP) -->
+                <section class="ds-wizard-page" data-step="2" aria-label="Receta">
+                <div class="ds-page-intro"><div><strong>Receta de integración</strong><span>Elige un perfil recomendado. Abre las opciones avanzadas sólo cuando necesites controlar cada etapa.</span></div></div>
+                <div class="ds-presets">
+                    <span class="ds-presets-label" data-i18n="deepsky.preset_label">Preset</span>
+                    <div class="ds-preset-btns">
+                        <button type="button" class="ds-preset" data-preset="fast" data-i18n="deepsky.preset_fast">Rápido</button>
+                        <button type="button" class="ds-preset active" data-preset="balanced" data-i18n="deepsky.preset_balanced">Equilibrado</button>
+                        <button type="button" class="ds-preset" data-preset="max" data-i18n="deepsky.preset_max">Máxima calidad</button>
+                        <button type="button" class="ds-preset" data-preset="custom" data-i18n="deepsky.preset_custom">Personalizado</button>
+                    </div>
+                </div>
+                <div class="ds-profile-help">
+                    <div class="ds-profile-note"><b>Rápido</b>Bilineal, normalización aditiva y una pasada sigma.</div>
+                    <div class="ds-profile-note"><b>Equilibrado</b>Lanczos-3, escala robusta y sigma iterativo.</div>
+                    <div class="ds-profile-note"><b>Máxima calidad</b>Winsorized y normalización local; exige más RAM/CPU.</div>
                 </div>
 
+                <div id="ds-multiband-options" class="ds-multiband-card" hidden>
+                    <label>
+                        <span class="switch" style="transform:scale(.76);transform-origin:top left;"><input type="checkbox" id="chk-ds-multiband-session" checked><span class="slider round"></span></span>
+                        <span>Procesar todos los filtros en una sesión multibanda</span>
+                    </label>
+                    <small id="ds-multiband-summary">Zenith separará cada integración y conservará una receta común.</small>
+                    <div class="ds-multiband-grid">
+                        <label>Extracción de OIII
+                            <select id="sel-ds-oiii-mix" class="ds-sel">
+                                <option value="0.5">G 50% · B 50%</option>
+                                <option value="0.65" selected>G 65% · B 35% (recomendado)</option>
+                                <option value="0.75">G 75% · B 25%</option>
+                            </select>
+                        </label>
+                        <label>Contaminación entre bandas
+                            <select id="sel-ds-crosstalk" class="ds-sel">
+                                <option value="0" selected>Off · conservar señal lineal</option>
+                                <option value="0.1">Suave · 10%</option>
+                                <option value="0.2">Media · 20%</option>
+                            </select>
+                        </label>
+                        <label>Paleta sugerida
+                            <select id="sel-ds-session-palette" class="ds-sel">
+                                <option value="none">Sólo masters científicos</option>
+                                <option value="sho" selected>SHO · SII / Ha / OIII</option>
+                                <option value="hoo">HOO · Ha / OIII</option>
+                            </select>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- OPCIONES (grupos etiquetados estilo WBPP) -->
+                <details class="ds-advanced" id="ds-advanced-options">
+                    <summary>Opciones avanzadas · registro, rechazo, normalización, memoria y motor</summary>
+                <div class="ds-opts">
+                    <!-- CALIBRACIÓN -->
+                    <div class="ds-og">
+                        <div class="ds-og-h">
+                            <svg class="zas-icon"><use href="#icon-moon"></use></svg>
+                            <span data-i18n="deepsky.grp_calib">Calibración</span>
+                        </div>
+                        <label class="ds-row" title="Elimina píxeles calientes/muertos cuando no hay darks (SIRIL-style)">
+                            <span data-i18n="deepsky.cosmetic">Corrección cosmética</span>
+                            <span class="switch"><input type="checkbox" id="chk-ds-cosmetic" checked><span class="slider round"></span></span>
+                        </label>
+                        <label class="ds-row" title="Escala el master dark a cada light para cancelar mejor el patrón térmico (requiere darks + bias)">
+                            <span data-i18n="deepsky.dark_opt">Optimizar darks (escala térmica)</span>
+                            <span class="switch"><input type="checkbox" id="chk-ds-darkopt" checked><span class="slider round"></span></span>
+                        </label>
+                        <label class="ds-row" title="El máster científico float32 conserva negativos y headroom. Añade un pedestal sólo si un flujo externo lo necesita.">
+                            <span data-i18n="deepsky.pedestal">Pedestal de salida</span>
+                            <select id="sel-ds-pedestal" class="ds-sel">
+                                <option value="0" selected>Off · float32 recomendado</option>
+                                <option value="100">100 ADU</option>
+                                <option value="200">200 ADU</option>
+                                <option value="500">500 ADU</option>
+                            </select>
+                        </label>
+                    </div>
+
+                    <!-- REGISTRO -->
+                    <div class="ds-og">
+                        <div class="ds-og-h">
+                            <svg class="zas-icon"><use href="#icon-star"></use></svg>
+                            <span data-i18n="deepsky.grp_register">Registro</span>
+                        </div>
+                        <label class="ds-row" title="Interpolación del registro: Lanczos-3 (la de PixInsight — estrellas más finas, ruido sin correlacionar) o bilineal (más suave y rápida).">
+                            <span data-i18n="deepsky.interp">Interpolación</span>
+                            <select id="sel-ds-interp" class="ds-sel">
+                                <option value="lanczos3" selected>Lanczos-3</option>
+                                <option value="bilinear">Bilineal</option>
+                            </select>
+                        </label>
+                        <label class="ds-row" title="Drizzle drop-kernel real (Fruchter & Hook): super-resolución por dispersión de gotas en rejilla fina. Requiere dithering entre tomas.">
+                            <span data-i18n="deepsky.drizzle">Drizzle</span>
+                            <select id="sel-ds-drizzle" class="ds-sel">
+                                <option value="1">Off (1×)</option>
+                                <option value="2">2×</option>
+                                <option value="3">3×</option>
+                            </select>
+                        </label>
+                        <label id="lbl-ds-pixfrac" class="ds-row" style="display:none;"
+                            title="Tamaño de la gota (pixfrac): menor = más nitidez pero necesita más tomas bien ditheradas.">
+                            <span data-i18n="deepsky.pixfrac">Gota (pixfrac)</span>
+                            <select id="sel-ds-pixfrac" class="ds-sel">
+                                <option value="1.0">1.0 (suave)</option>
+                                <option value="0.8" selected>0.8 (equilibrado)</option>
+                                <option value="0.65">0.65 (nítido)</option>
+                                <option value="0.5">0.5 (máx · muchas tomas)</option>
+                            </select>
+                        </label>
+                    </div>
+
+                    <!-- INTEGRACIÓN -->
+                    <div class="ds-og">
+                        <div class="ds-og-h">
+                            <svg class="zas-icon"><use href="#icon-batch"></use></svg>
+                            <span data-i18n="deepsky.grp_integrate">Integración y rechazo</span>
+                        </div>
+                        <label class="ds-row" title="Método de apilado/rechazo. Sigma (κσ) y Media usan el motor streaming (rápido). Los métodos por-píxel (Winsorized, ajuste lineal, mediana, percentil) usan el motor de máxima calidad que carga el stack completo por franjas (nivel PixInsight/Siril; sin drizzle, cae a σ-clip si falta RAM).">
+                            <span data-i18n="deepsky.rejection">Método de rechazo</span>
+                            <select id="sel-ds-rejection" class="ds-sel">
+                                <option value="sigma" selected data-i18n="deepsky.rej_sigma">Sigma (κσ)</option>
+                                <option value="average" data-i18n="deepsky.rej_average">Media (sin rechazo)</option>
+                                <option value="winsorized" data-i18n="deepsky.rej_winsorized">Winsorized</option>
+                                <option value="linearfit" data-i18n="deepsky.rej_linearfit">Ajuste lineal</option>
+                                <option value="median" data-i18n="deepsky.rej_median">Mediana</option>
+                                <option value="percentile" data-i18n="deepsky.rej_percentile">Percentil</option>
+                            </select>
+                        </label>
+                        <label class="ds-row" title="Factor κ del recorte por sigma. κ↓ recorta valores oscuros (píxeles muertos), κ↑ los brillantes (satélites, cósmicos, aviones). Menor = más agresivo. 3.0 es el equilibrio habitual.">
+                            <span data-i18n="deepsky.kappa_lowhigh">Factor κ (bajo / alto)</span>
+                            <span class="ds-kappa2">
+                                <input type="number" id="num-ds-kappa-low" value="3.0" min="1" max="8" step="0.1" class="input-val" title="κ bajo (oscuros)">
+                                <input type="number" id="num-ds-kappa-high" value="3.0" min="1" max="8" step="0.1" class="input-val" title="κ alto (brillantes)">
+                            </span>
+                        </label>
+                        <label class="ds-row" title="Iteraciones del rechazo κσ: cada iteración recalcula la estadística SIN los atípicos ya rechazados — 2 elimina trazas de satélite que sobreviven a una sola pasada. Auto = 2 con ≥6 tomas.">
+                            <span data-i18n="deepsky.clip_iters">Iteraciones σ-clip</span>
+                            <select id="sel-ds-clipiters" class="ds-sel">
+                                <option value="auto" selected>Auto</option>
+                                <option value="1">1</option>
+                                <option value="2">2</option>
+                                <option value="3">3</option>
+                            </select>
+                        </label>
+                        <label class="ds-row" title="Normalización del fondo entre tomas. Aditiva + escala (def): iguala nivel y ruido al de referencia. Aditiva: solo el nivel. Local: por zonas, para gradientes que cambian entre tomas (luna, contaminación en movimiento; más lento). Ninguna: sin normalizar.">
+                            <span data-i18n="deepsky.normalization">Normalización</span>
+                            <select id="sel-ds-normalization" class="ds-sel">
+                                <option value="scaling" selected data-i18n="deepsky.norm_scaling">Aditiva + escala</option>
+                                <option value="additive" data-i18n="deepsky.norm_additive">Aditiva</option>
+                                <option value="local" data-i18n="deepsky.norm_local">Local (por zonas)</option>
+                                <option value="none" data-i18n="deepsky.norm_none">Ninguna</option>
+                            </select>
+                        </label>
+                    </div>
+
+                    <!-- ACABADO -->
+                    <div class="ds-og">
+                        <div class="ds-og-h">
+                            <svg class="zas-icon"><use href="#icon-magic"></use></svg>
+                            <span data-i18n="deepsky.grp_finish">Acabado</span>
+                        </div>
+                        <label class="ds-row" title="Recorta los bordes con cobertura parcial (menos tomas solapadas) en apilados con dithering/rotación, como DSS/PixInsight.">
+                            <span data-i18n="deepsky.auto_crop">Recortar bordes (cobertura parcial)</span>
+                            <span class="switch"><input type="checkbox" id="chk-ds-autocrop" checked><span class="slider round"></span></span>
+                        </label>
+                        <div style="font-size:.58rem;color:#64748b;margin:-2px 0 6px 2px;" data-i18n="deepsky.auto_crop_note">Al final se recorta el marco de bordes donde se solapan menos tomas (dithering/rotación). Desactívalo para conservar el encuadre completo, con bordes más ruidosos.</div>
+                        <label class="ds-row" title="Lucky-DSO: pondera cada toma POR REGIÓN según la nitidez local medida en sus estrellas (FWHM). El máster toma más señal de las tomas y zonas con mejor seeing. Media ponderada lineal: la fotometría no se sesga. Disponible con rechazo sigma/average (motor streaming).">
+                            <span data-i18n="deepsky.local_weighting">Rescate de detalle (ponderación local por seeing)</span>
+                            <span class="switch"><input type="checkbox" id="chk-ds-localw"><span class="slider round"></span></span>
+                        </label>
+                        <div style="font-size:.58rem;color:#64748b;margin:-2px 0 6px 2px;" data-i18n="deepsky.local_weighting_note">Cada zona del cielo se apila prefiriendo las tomas donde ESA zona salió más nítida (seeing local). Exclusivo de Zenith: los apiladores tradicionales solo ponderan la toma completa.</div>
+                        <label class="ds-row" title="OPCIONAL (como PixInsight, mejor hacerlo después): resta el gradiente de fondo (ABE grado 2) + elimina el verde (SCNR) + neutraliza. Por defecto OFF para dejar un máster lineal limpio.">
+                            <span data-i18n="deepsky.gradient">Limpieza de fondo y color (ABE+SCNR)</span>
+                            <span class="switch"><input type="checkbox" id="chk-ds-gradient"><span class="slider round"></span></span>
+                        </label>
+                        <label class="ds-row" title="Auto/Hybrid permiten fallback CPU seguro. GPU only cancela si una etapa no tiene paridad o recursos suficientes.">
+                            <span>Motor de cómputo</span>
+                            <select id="sel-ds-compute" class="ds-sel">
+                                <option value="hybrid" selected>Hybrid v2 (experimental)</option>
+                                <option value="auto">Auto (tras validación)</option>
+                                <option value="cpu_only">Sólo CPU</option>
+                                <option value="gpu_only">Sólo GPU</option>
+                            </select>
+                        </label>
+                    </div>
+                </div>
+                </details>
+                </section>
+
+                <!-- DIAGRAMA DE PROCESO + DATOS TÉCNICOS + TIEMPO ESTIMADO -->
+                <section class="ds-wizard-page" data-step="3" aria-label="Revisar y apilar">
+                <div class="ds-page-intro"><div><strong>Plan final</strong><span>Confirma grupos, método efectivo, CPU/GPU por etapa y presupuesto estimado. Los fallbacks se muestran antes de iniciar.</span></div></div>
+                <div id="ds-preflight-review" class="ds-preflight" data-state="idle">Preparando plan reproducible…</div>
+                <div id="ds-diagram" class="ds-diagram" style="display:none;"></div>
+                <div id="ds-session-quality" class="ds-quality-panel" hidden aria-live="polite"></div>
+                </section>
+                </div>
+
+                <footer class="ds-wizard-footer">
+                <button id="btn-deepsky-prev" type="button">← Anterior</button>
+                <span id="ds-wizard-status" class="ds-footer-status" aria-live="polite">Paso 1 de 4 · selecciona los datos</span>
                 <button id="btn-deepsky-run" class="primary"
-                    style="width:100%; background:linear-gradient(135deg,#7c3aed,#db2777); font-size:0.85rem; padding:12px; display:flex; align-items:center; justify-content:center; gap:8px; border-radius:12px;">
+                    style="background:linear-gradient(135deg,#7c3aed,#db2777); font-size:0.85rem; padding:10px 16px; display:none; align-items:center; justify-content:center; gap:8px; border-radius:12px;">
                     <svg class="zas-icon" style="width:15px; height:15px;"><use href="#icon-lightning"></use></svg>
                     <span data-i18n="deepsky.run">Apilar Cielo Profundo</span>
                 </button>
                 <button id="btn-deepsky-combine-open" type="button"
-                    style="width:100%; margin-top:8px; background:transparent; border:1px solid rgba(124,58,237,0.45); color:#c4b5fd; font-size:0.76rem; padding:9px; display:flex; align-items:center; justify-content:center; gap:8px; border-radius:11px;">
+                    style="background:transparent; border:1px solid rgba(124,58,237,0.45); color:#c4b5fd; font-size:0.76rem; padding:9px 12px; display:flex; align-items:center; justify-content:center; gap:8px; border-radius:11px;">
                     <svg class="zas-icon" style="width:14px; height:14px;"><use href="#icon-galaxy"></use></svg>
                     <span data-i18n="deepsky.combine_open">Combinar canales (LRGB / SHO)</span>
                 </button>
-                <div style="font-size:0.62rem; color:#64748b; margin-top:10px; text-align:center; letter-spacing:0.04em;"
-                    data-i18n="deepsky.post_hint">El resultado queda lineal y listo para wavelets, deconvolución y color
-                    en el panel de post-procesado.</div>
+                <button id="btn-deepsky-next" type="button">Siguiente →</button>
+                </footer>
             </div>
         </div>
     </div>
 
     <!-- ============ VENTANA DE PROGRESO CIELO PROFUNDO (estilo WBPP) ============ -->
-    <div id="ds-progress" class="modal-overlay donation-modal" style="display:none; z-index:905;">
+    <style>
+        /* Cielo animado del progreso deepsky: SOLO CSS (compositor GPU, sin JS,
+           sin rAF) — no roba ni un ms al apilado. Interactivo: al pasar el
+           cursor la nebulosa se acerca suavemente. */
+        .ds-sky { position:relative; height:74px; margin:-6px 0 12px; border-radius:10px; overflow:hidden; background:radial-gradient(120% 140% at 20% 0%, #1e1b4b 0%, #0b1020 55%, #020617 100%); border:1px solid rgba(124,58,237,.2); }
+        .ds-sky-nebula { position:absolute; inset:-40%; background:
+            radial-gradient(35% 45% at 30% 55%, rgba(124,58,237,.32), transparent 70%),
+            radial-gradient(28% 38% at 68% 40%, rgba(219,39,119,.22), transparent 70%),
+            radial-gradient(20% 30% at 52% 62%, rgba(56,189,248,.14), transparent 70%);
+            animation: dsNebulaSpin 90s linear infinite; transition: transform .6s ease; will-change: transform; }
+        .ds-sky:hover .ds-sky-nebula { transform: scale(1.12); }
+        .ds-sky-stars { position:absolute; width:2px; height:2px; border-radius:50%; background:transparent; }
+        .ds-sky-stars.s1 { box-shadow: 24px 12px #e2e8f0, 88px 40px #cbd5e1, 150px 18px #e2e8f0, 210px 52px #a5b4fc, 268px 26px #e2e8f0, 330px 44px #cbd5e1, 396px 14px #e2e8f0, 452px 50px #a5b4fc, 508px 30px #e2e8f0; animation: dsTwinkle 3.2s ease-in-out infinite; }
+        .ds-sky-stars.s2 { box-shadow: 48px 56px #94a3b8, 120px 8px #94a3b8, 184px 38px #cbd5e1, 246px 60px #94a3b8, 306px 10px #cbd5e1, 372px 58px #94a3b8, 428px 34px #cbd5e1, 486px 8px #94a3b8; animation: dsTwinkle 4.4s ease-in-out .9s infinite; }
+        .ds-sky-stars.s3 { width:1px; height:1px; box-shadow: 14px 34px #64748b, 70px 22px #64748b, 132px 52px #64748b, 200px 28px #64748b, 262px 48px #64748b, 320px 20px #64748b, 384px 46px #64748b, 442px 22px #64748b, 500px 44px #64748b, 534px 16px #64748b; animation: dsTwinkle 5.6s ease-in-out 1.7s infinite; }
+        .ds-sky-meteor { position:absolute; top:12px; left:-12%; width:70px; height:1px; background:linear-gradient(90deg, transparent, #e0f2fe 60%, #fff); border-radius:1px; transform:rotate(16deg); opacity:0; animation: dsMeteor 13s ease-in 4s infinite; will-change: transform, opacity; }
+        @keyframes dsNebulaSpin { to { rotate: 360deg; } }
+        @keyframes dsTwinkle { 0%,100% { opacity:.55; } 50% { opacity:1; } }
+        @keyframes dsMeteor {
+            0%, 92% { opacity:0; transform:translate(0,0) rotate(16deg); }
+            93% { opacity:.9; }
+            98% { opacity:0; transform:translate(660px,190px) rotate(16deg); }
+            100% { opacity:0; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .ds-sky-nebula, .ds-sky-stars, .ds-sky-meteor { animation: none; }
+        }
+    </style>
+    <div id="ds-progress" class="modal-overlay donation-modal" style="display:none; z-index:905;"
+        role="dialog" aria-modal="true" aria-labelledby="ds-progress-title">
         <div class="donation-modal-box" style="width:560px; max-width:94vw; padding:20px;">
             <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px;">
                 <svg class="zas-icon" style="width:22px; height:22px; color:#a78bfa;"><use href="#icon-galaxy"></use></svg>
-                <h2 style="font-size:0.95rem; margin:0; color:#e2e8f0;" data-i18n="deepsky.prog_title">Apilado de Cielo Profundo</h2>
+                <h2 id="ds-progress-title" style="font-size:0.95rem; margin:0; color:#e2e8f0;" data-i18n="deepsky.prog_title">Apilado de Cielo Profundo</h2>
                 <span id="ds-prog-elapsed" style="margin-left:auto; font-size:0.75rem; color:#94a3b8; font-family:'Courier New',monospace;">00:00</span>
+            </div>
+            <!-- Cielo animado (CSS puro, no consume CPU del apilado) -->
+            <div class="ds-sky" aria-hidden="true">
+                <div class="ds-sky-nebula"></div>
+                <div class="ds-sky-stars s1"></div>
+                <div class="ds-sky-stars s2"></div>
+                <div class="ds-sky-stars s3"></div>
+                <div class="ds-sky-meteor"></div>
             </div>
             <!-- Barra global -->
             <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">
                 <div style="flex:1; height:8px; background:rgba(15,23,42,0.9); border-radius:6px; overflow:hidden;">
-                    <div id="ds-prog-bar" style="height:100%; width:0%; background:linear-gradient(90deg,#7c3aed,#db2777); transition:width 0.25s;"></div>
+                    <div id="ds-prog-bar" role="progressbar" aria-label="Progreso del apilado" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
+                        style="height:100%; width:0%; background:linear-gradient(90deg,#7c3aed,#db2777); transition:width 0.25s;"></div>
                 </div>
                 <span id="ds-prog-pct" style="font-size:0.78rem; color:#c4b5fd; font-weight:700; min-width:38px; text-align:right;">0%</span>
             </div>
-            <div id="ds-prog-current" style="font-size:0.68rem; color:#94a3b8; margin-bottom:14px; min-height:14px; font-family:'Courier New',monospace;"></div>
+            <div id="ds-prog-current" aria-live="polite" style="font-size:0.68rem; color:#94a3b8; margin-bottom:14px; min-height:14px; font-family:'Courier New',monospace;"></div>
+            <div id="ds-prog-resources" aria-live="polite"
+                style="display:none; grid-template-columns:repeat(4,minmax(0,1fr)); gap:5px 10px; margin:-6px 0 12px; padding:8px 10px; border:1px solid rgba(124,58,237,.18); border-radius:9px; background:rgba(15,23,42,.55); font:0.62rem 'Courier New',monospace; color:#94a3b8;"></div>
+            <div id="ds-prog-warning" role="status" style="display:none; margin:-4px 0 10px; padding:7px 9px; border-radius:8px; background:rgba(245,158,11,.08); color:#fcd34d; font-size:.64rem;"></div>
             <!-- Lista de fases (render dinámico) -->
             <div id="ds-prog-steps" style="display:flex; flex-direction:column; gap:2px; margin-bottom:14px;"></div>
             <button id="ds-prog-cancel" type="button" class="donation-option"
@@ -1291,18 +1700,19 @@
     </div>
 
     <!-- ============ COMBINAR CANALES (LRGB / NARROWBAND SHO) ============ -->
-    <div id="ds-combine-modal" class="modal-overlay donation-modal" style="display:none; z-index:906;">
+    <div id="ds-combine-modal" class="modal-overlay donation-modal" style="display:none; z-index:906;"
+        role="dialog" aria-modal="true" aria-labelledby="ds-combine-title">
         <div class="donation-modal-box" style="width:640px; max-width:95vw; padding:22px; max-height:92vh; overflow-y:auto;">
-            <button id="ds-combine-close" type="button" class="donation-close-btn">&times;</button>
+            <button id="ds-combine-close" type="button" class="donation-close-btn" aria-label="Cerrar combinación de canales">&times;</button>
             <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">
                 <svg class="zas-icon" style="width:22px; height:22px; color:#a78bfa;"><use href="#icon-galaxy"></use></svg>
-                <h2 style="font-size:1rem; margin:0; color:#e2e8f0;" data-i18n="deepsky.combine_title">Combinar canales (LRGB / SHO)</h2>
+                <h2 id="ds-combine-title" style="font-size:1rem; margin:0; color:#e2e8f0;" data-i18n="deepsky.combine_title">Combinar canales (LRGB / SHO)</h2>
             </div>
             <p style="font-size:0.72rem; color:#94a3b8; margin:0 0 14px; line-height:1.4;" data-i18n="deepsky.combine_desc">
                 Asigna un apilado MONO por canal. Se registran entre sí por estrellas y se combinan. La luminancia (L) es opcional y aporta detalle/SNR conservando el color.
             </p>
 
-            <label style="display:block; font-size:0.72rem; color:#cbd5e1; margin-bottom:6px;" data-i18n="deepsky.combine_preset">Paleta / preset</label>
+            <label for="ds-combine-preset" style="display:block; font-size:0.72rem; color:#cbd5e1; margin-bottom:6px;" data-i18n="deepsky.combine_preset">Paleta / preset</label>
             <select id="ds-combine-preset"
                 style="width:100%; background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:8px; font-size:0.78rem; padding:8px; outline:none; margin-bottom:16px;">
                 <option value="rgb" data-i18n="deepsky.combine_rgb">RGB / LRGB (color real · neutraliza fondo + SCNR)</option>
@@ -1349,6 +1759,16 @@
         </div>
         <div id="accel-label"
             style="margin-top: 10px; color:#10b981; font-family:'Courier New',monospace; font-size:0.72rem; letter-spacing:0.5px; opacity:0.9; display:flex; align-items:center; gap:4px;"></div>
+
+        <!-- TELEMETRIA EN VIVO del apilado (evento stack_telemetry): modo de
+             acumulacion GPU/CPU, rendimiento y recursos en tiempo real. -->
+        <div id="stack-telemetry"
+            style="display:none; margin-top:10px; padding:8px 12px; background:rgba(15,23,42,0.6); border:1px solid rgba(56,189,248,0.15); border-radius:8px; font-family:'Courier New',monospace; font-size:0.66rem; color:#94a3b8; letter-spacing:0.3px; min-width:420px;">
+            <div id="stack-telemetry-mode"
+                style="color:#38bdf8; font-size:0.7rem; margin-bottom:5px; text-align:center;"></div>
+            <div id="stack-telemetry-grid"
+                style="display:grid; grid-template-columns:repeat(4, 1fr); gap:3px 14px; text-align:left;"></div>
+        </div>
 
         <button id="btn-cancel-process"
             style="margin-top: 15px; width: auto; display: inline-block; background: none; border: none; color: #ef4444; cursor: pointer; font-family: sans-serif; font-size: 0.75rem; letter-spacing: 0.5px; opacity: 0.7; transition: all 0.2s; padding: 4px 8px; border-radius: 4px;"
@@ -1705,6 +2125,31 @@
                             </div>
                         </div>
 
+                        <!-- GPU COMPUTE (aceleracion de la acumulacion del apilado) -->
+                        <div
+                            style="margin-top:15px; margin-bottom:15px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px;">
+                            <label
+                                style="color:#cbd5e1; font-weight:bold; font-size:0.9rem; display:block; margin-bottom:8px;"
+                                data-i18n="settings.general.gpu_title">Aceleración GPU (apilado)</label>
+                            <p style="color:#64748b; font-size:0.72rem; line-height:1.35; margin:0 0 10px 0;"
+                                data-i18n="settings.general.gpu_hint">
+                                La acumulación del apilado puede correr en la GPU (Metal en Mac, DX12/Vulkan en Windows). En Auto se usa solo si pasa la verificación de paridad numérica y el video lo amerita; ante cualquier problema vuelve a CPU con resultado idéntico.
+                            </p>
+                            <div id="gpu-info-line"
+                                style="color:#38bdf8; font-family:'Courier New',monospace; font-size:0.72rem; margin:0 0 10px 0;"></div>
+                            <div style="display:flex; align-items:center; justify-content:space-between;">
+                                <span style="color:#94a3b8; font-size:0.8rem;"
+                                    data-i18n="settings.general.gpu_mode">Modo</span>
+                                <select id="sel-gpu-mode"
+                                    style="background:#0f172a; color:#38bdf8; border:1px solid #334155; padding:4px 8px; border-radius:6px; font-size:0.8rem;">
+                                    <option value="hybrid" selected>Hybrid v2 (experimental)</option>
+                                    <option value="auto" data-i18n="settings.general.gpu_auto">Auto (tras validación)</option>
+                                    <option value="gpu" data-i18n="settings.general.gpu_force">Forzar GPU</option>
+                                    <option value="cpu" data-i18n="settings.general.gpu_cpu">Solo CPU</option>
+                                </select>
+                            </div>
+                        </div>
+
                         <!-- Tutorial Settings -->
                         <div
                             style="margin-top:15px; margin-bottom:15px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px;">
@@ -1864,40 +2309,38 @@
                 </div>
 
                 <div style="display: flex; flex-direction: column; gap: 10px;">
-                    <button id="btn-analyze" class="primary" data-i18n="general.import_video">📂 Importar Video (SER /
-                        AVI)</button>
+                    <button id="btn-analyze" class="primary" data-i18n="general.import_video"><svg class="zas-icon"><use href="#icon-folder"></use></svg> Importar Video (SER / AVI)</button>
+                    <!-- Cielo profundo es uno de los dos flujos primarios. Se mantiene
+                         junto a la importación planetaria para que sea visible sin
+                         desplazar la barra lateral a 1280×720. -->
+                    <button id="btn-deepsky-mode" class="primary"
+                        style="background: linear-gradient(135deg, #1e1b4b, #7c3aed);"><svg class="zas-icon">
+                            <use href="#icon-galaxy"></use>
+                        </svg> <span data-i18n="general.deepsky_mode">Apilado Cielo Profundo</span></button>
                     <button id="btn-analyze-fits" class="primary"
                         style="background: linear-gradient(135deg, #0ea5e9, #2563eb); margin-top: 5px; opacity: 0.5; cursor: not-allowed;"
                         disabled><svg class="zas-icon">
                             <use href="#icon-sequence"></use>
                         </svg> Añadir Secuencia FITS/TIF</button>
                     <button id="btn-batch-mode" class="primary"
-                        style="background: linear-gradient(135deg, #a855f7, #6366f1);" data-i18n="general.batch_mode">📚
-                        Apilado por Lotes</button>
+                        style="background: linear-gradient(135deg, #a855f7, #6366f1);" data-i18n="general.batch_mode"><svg class="zas-icon"><use href="#icon-batch"></use></svg> Apilado por Lotes</button>
                     <button id="btn-mosaic-mode" class="primary"
                         style="background: linear-gradient(135deg, #06b6d4, #3b82f6);"
-                        data-i18n="general.mosaic_mode">🧩 Crear Mosaico</button>
+                        data-i18n="general.mosaic_mode"><svg class="zas-icon"><use href="#icon-mosaic"></use></svg> Crear Mosaico</button>
                     <!-- NEW: Direct Animation Load -->
                     <button id="btn-load-animation" class="primary"
                         style="background: linear-gradient(135deg, #10b981, #059669);"
-                        data-i18n="general.load_animation">🎞 Cargar Animación (Imágenes)</button>
+                        data-i18n="general.load_animation"><svg class="zas-icon"><use href="#icon-film"></use></svg> Cargar Animación (Imágenes)</button>
                     <!-- NEW: Video Converter Tool -->
                     <button id="btn-tools-convert" class="primary"
                         style="background: linear-gradient(135deg, #f59e0b, #d97706); margin-top: 5px;"
-                        data-i18n="general.tools_convert">🛠 Convertir Video a SER</button>
-                    <!-- PLANETARY DEROTATION (temporalmente deshabilitado — flujo intacto) -->
-                    <button id="btn-derotate-mode" class="primary" disabled aria-disabled="true"
-                        style="background: linear-gradient(135deg, #8b5cf6, #6366f1); margin-top: 5px; opacity:0.4; cursor:not-allowed; filter:grayscale(0.4);"
-                        title="Función en desarrollo — temporalmente deshabilitada"
+                        data-i18n="general.tools_convert"><svg class="zas-icon"><use href="#icon-tools"></use></svg> Convertir Video a SER</button>
+                    <!-- PLANETARY DEROTATION -->
+                    <button id="btn-derotate-mode" class="primary"
+                        style="background: linear-gradient(135deg, #8b5cf6, #6366f1); margin-top: 5px;"
                         data-i18n="general.derotate_mode"><svg class="zas-icon">
                             <use href="#icon-planet"></use>
                         </svg> Derotación Planetaria</button>
-                    <!-- DEEP-SKY STACKING (temporalmente deshabilitado — flujo intacto) -->
-                    <button id="btn-deepsky-mode" class="primary" disabled aria-disabled="true"
-                        style="background: linear-gradient(135deg, #1e1b4b, #7c3aed); margin-top: 5px; opacity:0.4; cursor:not-allowed; filter:grayscale(0.4);"
-                        title="Función en desarrollo — temporalmente deshabilitada"><svg class="zas-icon">
-                            <use href="#icon-galaxy"></use>
-                        </svg> <span data-i18n="general.deepsky_mode">Apilado Cielo Profundo</span></button>
                 </div>
 
                 <div id="analysis-actions"
@@ -2372,7 +2815,10 @@
                                 (Multi-Point)</option>
                             <option value="liquid_v3" data-i18n="analysis.algorithms.liquid_v3">Zenith Precision v3
                                 (Multi-Point)</option>
-                            <option value="elite_v4" style="color:#f472b6; font-weight:bold;">Zenith Elite v4 (Neural-Restoration)</option>
+                            <!-- Zenith Elite v4 RETIRADO del selector: backend legado sin lotes
+                                 de RAM (OOM con videos grandes), sin cancelacion y con la config
+                                 ignorada (ver zenith_stack_video_elite_impl). No reactivar sin
+                                 reescribirlo sobre el motor unificado. -->
                         </select>
                         <div id="liquid-warning"
                             style="display:none; font-size:0.7rem; color:#f59e0b; margin-top:4px; font-style:italic; border-left:2px solid #f59e0b; padding-left:4px;"
@@ -2639,21 +3085,6 @@
                     </select>
                 </div>
 
-                <!-- WAVELET PRESETS (esquemas guardables, estilo RegiStax) -->
-                <div style="display:flex; align-items:center; gap:6px; margin-bottom:15px;">
-                    <select id="wavelet-preset-select" title="Esquemas guardados"
-                        style="flex:1; background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:6px; font-size:0.72rem; padding:4px 8px; outline:none;">
-                        <option value="" data-i18n="wavelets.presets.placeholder">— Esquemas guardados —</option>
-                    </select>
-                    <input type="text" id="wavelet-preset-name" data-i18n-placeholder="wavelets.presets.name"
-                        placeholder="Nombre..." maxlength="24"
-                        style="width:90px; background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:6px; font-size:0.72rem; padding:4px 6px; outline:none;">
-                    <button id="btn-wavelet-preset-save" title="Guardar la configuración actual como esquema"
-                        style="background:rgba(16,185,129,0.15); color:#6ee7b7; border:1px solid rgba(16,185,129,0.3); border-radius:6px; font-size:0.72rem; padding:4px 8px; cursor:pointer;">💾</button>
-                    <button id="btn-wavelet-preset-del" title="Borrar el esquema seleccionado"
-                        style="background:rgba(239,68,68,0.12); color:#fca5a5; border:1px solid rgba(239,68,68,0.25); border-radius:6px; font-size:0.72rem; padding:4px 8px; cursor:pointer;">🗑</button>
-                </div>
-
                 <div class="control-group" style="border-left: 3px solid #60a5fa;">
                     <div class="group-header">
                         <h3 data-i18n="wavelets.deconvolution.title">Deconvolucion Zenith</h3>
@@ -2707,6 +3138,14 @@
                             <input type="number" id="num-vc-iter" value="0" class="input-val">
                         </div>
                     </div>
+                    <!-- A: PSF medida del limbo -->
+                    <div style="border-top:1px dashed #334155; padding-top:8px; margin-top:6px; display:flex; justify-content:space-between; align-items:center;">
+                        <span style="color:#93c5fd; font-size:0.72rem;" data-i18n="wavelets.psf_limb"
+                            title="Mide la PSF real del borde del disco (edge-spread) y deconvoluciona con ella en vez de una gaussiana. Cae a gaussiana si no hay un limbo claro.">PSF medida del limbo</span>
+                        <label class="switch-container"><span class="switch" style="transform:scale(0.8);">
+                            <input type="checkbox" id="chk-psf-limb">
+                            <span class="slider round"></span></span></label>
+                    </div>
                 </div>
 
                 <div class="control-group" style="border-left: 3px solid #f472b6;">
@@ -2741,6 +3180,32 @@
                 <div class="control-group" style="border-left: 3px solid #38bdf8;">
                     <div class="group-header">
                         <h3 data-i18n="wavelets.multiscale.title">Wavelets Multiescala</h3>
+                    </div>
+                    <!-- B: descomposicion edge-aware (anti-ringing en bordes de alto contraste) -->
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; padding-bottom:6px; border-bottom:1px dashed #334155;">
+                        <span style="color:#7dd3fc; font-size:0.72rem;" data-i18n="wavelets.edge_aware.toggle"
+                            title="Descompone las bandas finas con un filtro que preserva los bordes: al subir Intensidad no aparecen halos/ringing en el limbo del planeta o la Luna. Un poco más lento.">Wavelets edge-aware (anti-halo limbo)</span>
+                        <label class="switch-container"><span class="switch" style="transform:scale(0.8);">
+                            <input type="checkbox" id="chk-edge-wavelets">
+                            <span class="slider round"></span></span></label>
+                    </div>
+                    <!-- B+: intensidad edge-aware (nº de bandas bilaterales + estrechez del rango) -->
+                    <div class="control-row" style="margin-bottom:6px;">
+                        <label data-i18n="wavelets.edge_aware.strength"
+                            title="Más intensidad = más bandas finas edge-aware (hasta σ4) y borde mejor protegido. 50 = equilibrio (comportamiento clásico). Solo actúa con el edge-aware activado.">Intensidad
+                            Edge-Aware</label>
+                        <input type="range" id="sl-edge-strength" min="0" max="100" value="50" step="1"
+                            class="slider-cyan">
+                        <input type="number" id="num-edge-strength" value="50" class="input-val">
+                    </div>
+                    <!-- Sharpening ADAPTATIVO: modula el realce por SNR local (anti ruido "wormy") -->
+                    <div class="control-row" style="margin-bottom:8px;">
+                        <label data-i18n="wavelets.auto_mask"
+                            title="Máscara adaptativa: amplifica el detalle solo donde hay estructura real y frena el realce sobre ruido plano. 0 = desactivado. Supera al sharpening uniforme de RegiStax/WaveSharp.">Auto-máscara
+                            (adaptativo)</label>
+                        <input type="range" id="sl-auto-mask" min="0" max="100" value="0" step="1"
+                            class="slider-green">
+                        <input type="number" id="num-auto-mask" value="0" class="input-val">
                     </div>
                     <div class="wavelet-row header-row"><span>#</span> <span
                             data-i18n="wavelets.multiscale.intensity">Intensidad</span> <span>Val</span>
@@ -2783,6 +3248,36 @@
                                 step="0.1" value="0" class="slider-green"><input type="number" id="num-d6" step="0.1"
                                 value="0" class="input-val-w">
                         </div>
+                    </div>
+                </div>
+
+                <!-- Histograma + Niveles (estiramiento por histograma estilo RegiStax) -->
+                <div class="control-group" style="border-left: 3px solid #a78bfa;">
+                    <div class="group-header">
+                        <h3 data-i18n="wavelets.levels.title">Histograma y Niveles</h3>
+                    </div>
+                    <canvas id="hist-canvas" width="256" height="80"
+                        style="width:100%; height:80px; display:block; background:#0b1220; border-radius:6px; margin-bottom:8px;"></canvas>
+                    <div class="control-row">
+                        <label data-i18n="wavelets.levels.black"
+                            title="Punto negro de entrada: todo lo más oscuro que esto se vuelve negro.">Punto Negro</label>
+                        <input type="range" id="sl-levels-black" min="0" max="900" value="0" step="1"
+                            class="slider-cyan">
+                        <input type="number" id="num-levels-black" value="0" class="input-val">
+                    </div>
+                    <div class="control-row">
+                        <label data-i18n="wavelets.levels.gamma"
+                            title="Gamma de medios tonos: sube para aclarar los medios, baja para oscurecerlos.">Medios (γ)</label>
+                        <input type="range" id="sl-levels-gamma" min="10" max="300" value="100" step="1"
+                            class="slider-yellow">
+                        <input type="number" id="num-levels-gamma" value="1" class="input-val">
+                    </div>
+                    <div class="control-row">
+                        <label data-i18n="wavelets.levels.white"
+                            title="Punto blanco de entrada: todo lo más brillante que esto se vuelve blanco.">Punto Blanco</label>
+                        <input type="range" id="sl-levels-white" min="100" max="1000" value="1000" step="1"
+                            class="slider-pink">
+                        <input type="number" id="num-levels-white" value="1" class="input-val">
                     </div>
                 </div>
 
@@ -3186,7 +3681,7 @@
                         <button id="btn-anim-manage-frames" class="secondary"
                             style="font-size:0.8rem; padding: 8px 12px; background:linear-gradient(135deg, #6366f1, #8b5cf6);"
                             data-i18n="animation.manage_frames">
-                            🎞 Frames
+                            <svg class="zas-icon"><use href="#icon-film"></use></svg> Frames
                         </button>
                     </div>
                     <p style="font-size:0.65rem; color:#94a3b8; margin:2px 0 0 0; text-align:center;" data-i18n="animation.manage_frames_hint">Elimina
@@ -3222,6 +3717,18 @@
                             <button class="planet-icon compact" data-planet="mars" title="Marte"
                                 style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); color:#94a3b8;">
                                 <svg class="planet-svg"><use href="#icon-mars-planet"></use></svg><span>Marte</span>
+                            </button>
+                            <button class="planet-icon compact" data-planet="venus" title="Venus (nubes UV)"
+                                style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); color:#94a3b8;">
+                                <svg class="planet-svg"><use href="#icon-planet"></use></svg><span>Venus</span>
+                            </button>
+                            <button class="planet-icon compact" data-planet="uranus" title="Urano"
+                                style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); color:#94a3b8;">
+                                <svg class="planet-svg"><use href="#icon-planet"></use></svg><span>Urano</span>
+                            </button>
+                            <button class="planet-icon compact" data-planet="neptune" title="Neptuno"
+                                style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); color:#94a3b8;">
+                                <svg class="planet-svg"><use href="#icon-planet"></use></svg><span>Neptuno</span>
                             </button>
                         </div>
                         <label style="color:#94a3b8; font-size:0.7rem; display:block; margin-bottom:4px;" data-i18n="animation.derotation.cm_system">Sistema
@@ -3555,6 +4062,12 @@
                             <svg class="zas-icon" style="width:14px; height:14px;" aria-hidden="true"><use href="#icon-sequence"></use></svg>
                             Fusión Multi-stack
                         </button>
+                        <button id="btn-derot-fusion-rgb" class="secondary"
+                            style="width:100%; font-size:0.72rem; padding:8px; margin-top:8px; border:1px solid rgba(139,92,246,0.42); color:#c4b5fd; display:flex; align-items:center; justify-content:center; gap:7px;"
+                            title="Cámara mono + rueda de filtros: elige 3 apilados (R, G, B) capturados a tiempos distintos; se derota cada canal a un tiempo común y se ensambla el color sin desfase de rotación por cambio de filtro.">
+                            <svg class="zas-icon" style="width:14px; height:14px;" aria-hidden="true"><use href="#icon-planet"></use></svg>
+                            RGB por canal (mono+filtros)
+                        </button>
                     </div>
 
                     <!-- Diagnostics -->
@@ -3591,6 +4104,18 @@
                             <button class="planet-icon" data-planet="mars" title="Marte"
                                 style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); color:#94a3b8;">
                                 <svg class="planet-svg"><use href="#icon-mars-planet"></use></svg><span>Marte</span>
+                            </button>
+                            <button class="planet-icon" data-planet="venus" title="Venus (nubes UV, super-rotación ~4.4 d)"
+                                style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); color:#94a3b8;">
+                                <svg class="planet-svg"><use href="#icon-planet"></use></svg><span>Venus</span>
+                            </button>
+                            <button class="planet-icon" data-planet="uranus" title="Urano"
+                                style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); color:#94a3b8;">
+                                <svg class="planet-svg"><use href="#icon-planet"></use></svg><span>Urano</span>
+                            </button>
+                            <button class="planet-icon" data-planet="neptune" title="Neptuno"
+                                style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); color:#94a3b8;">
+                                <svg class="planet-svg"><use href="#icon-planet"></use></svg><span>Neptuno</span>
                             </button>
                         </div>
                     </div>

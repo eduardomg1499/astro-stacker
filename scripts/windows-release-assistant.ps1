@@ -321,6 +321,12 @@ Assert-MacAssetsRemain $defaultRelease $Version
 Download-LatestJson $DefaultTag $ProjectRoot | Out-Null
 Assert-LatestJson $LatestPath $Version $DefaultTag $false | Out-Null
 
+$hybridGateScript = Join-Path $ProjectRoot "scripts\release\verify-hybrid-v2-gate.ps1"
+Write-Step "Verificando Hybrid v2 (CPU, fallos sinteticos y GPU fisica)"
+Invoke-Native "powershell.exe" @(
+    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $hybridGateScript
+) "El gate obligatorio Hybrid v2 fallo."
+
 $env:GITHUB_RELEASE_TAG = $DefaultTag
 Write-Step "Ejecutando build_installer.ps1"
 $buildScript = Join-Path $ProjectRoot "build_installer.ps1"

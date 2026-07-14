@@ -30,6 +30,34 @@ fn cancel_processing(app: tauri::AppHandle, state: State<'_, AppState>) {
         .store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Espacio libre del volumen que contiene `path` — la UI lo muestra junto a
+/// la carpeta de trabajo para que el usuario vea si su disco externo aguanta
+/// los cachés de calibración (varios GB).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskSpaceInfo {
+    available_mb: u64,
+    total_mb: u64,
+    mount: String,
+}
+
+#[tauri::command]
+fn disk_space_info(path: String) -> Result<DiskSpaceInfo, String> {
+    let target = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let best = disks
+        .list()
+        .iter()
+        .filter(|d| target.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .ok_or("No se encontró el volumen de esa ruta")?;
+    Ok(DiskSpaceInfo {
+        available_mb: best.available_space() / 1_048_576,
+        total_mb: best.total_space() / 1_048_576,
+        mount: best.mount_point().display().to_string(),
+    })
+}
+
 #[tauri::command]
 fn get_available_fonts() -> Vec<String> {
     let map = get_font_map();
@@ -1131,26 +1159,11 @@ async fn normalize_batch_brightness(
                 }
             }
 
-            // Preview for UI (Always 8-bit Base64)
-            let vis_8 = if let Some(rgb16) = dynamic_img.as_rgb16() {
-                to_8bit_visual(rgb16.as_raw(), 1.0)
-            } else {
-                dynamic_img.to_rgb8().into_raw()
-            };
-
-            let mut buf = Vec::new();
-            let (w, h) = (dynamic_img.width(), dynamic_img.height());
-            let _ = image::png::PngEncoder::new(&mut Cursor::new(&mut buf)).encode(
-                &vis_8,
-                w,
-                h,
-                image::ColorType::Rgb8,
-            );
-
-            format!(
-                "data:image/png;base64,{}",
-                general_purpose::STANDARD.encode(&buf)
-            )
+            // ASSET PROTOCOL: el archivo ya quedo sobrescrito en disco — la UI
+            // recarga la MISMA ruta via convertFileSrc (con cache-busting).
+            // Devolver base64 por IPC re-pinaba todos los frames en el heap
+            // del WebView (el mismo problema de RAM que se elimino del batch).
+            path
         })
         .collect();
 
@@ -1275,18 +1288,8 @@ async fn realign_animation_frames(
         .enumerate()
         .map(|(i, p)| {
             if i == 0 {
-                // Primer frame, solo recargar y devolver (ya es el anchor)
-                // Pero igual lo re-leemos para consistencia o usamos img0 si pudieramos pasarlo (dificil en par_iter)
-                // Simplemente leemos y devolvemos base64
-                let mut buf = Vec::new();
-                let img = image::open(Path::new(p)).map_err(|e| e.to_string())?;
-                DynamicImage::ImageRgba8(img.to_rgba8())
-                    .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
-                    .map_err(|e| e.to_string())?;
-                return Ok(format!(
-                    "data:image/png;base64,{}",
-                    general_purpose::STANDARD.encode(&buf)
-                ));
+                // Primer frame = anchor: no se toca en disco, devolver su ruta.
+                return Ok(p.clone());
             }
 
             let path = Path::new(p);
@@ -1418,21 +1421,10 @@ async fn realign_animation_frames(
 
             final_img.save(path).map_err(|e| e.to_string())?;
 
-            let mut buf = Vec::new();
-            let vis_8 = if let Some(rgb16) = final_img.as_rgb16() {
-                to_8bit_visual(rgb16.as_raw(), 1.0)
-            } else {
-                final_img.to_rgb8().into_raw()
-            };
-
-            image::png::PngEncoder::new(&mut Cursor::new(&mut buf))
-                .encode(&vis_8, w as u32, h as u32, image::ColorType::Rgb8)
-                .map_err(|e| e.to_string())?;
-
-            Ok(format!(
-                "data:image/png;base64,{}",
-                general_purpose::STANDARD.encode(&buf)
-            ))
+            // ASSET PROTOCOL: el frame realineado ya esta sobrescrito en disco;
+            // la UI lo recarga por ruta (cache-busting en el frontend). El
+            // base64 por IPC pinaba todos los frames en el heap del WebView.
+            Ok(p.clone())
         })
         .collect();
 
@@ -1528,6 +1520,14 @@ async fn process_batch_entry(
     ap_grid_size: Option<u32>,  // R13: AP size del flujo Zenith (32 por defecto)
     ap_threshold: Option<f32>,  // R13: umbral de malla del flujo Zenith
     align_rgb: Option<bool>,    // switch de alineacion RGB automatica
+    gpu_mode: Option<String>,   // GPU compute: "auto" | "gpu" | "cpu"
+    edge_aware_wavelets: Option<bool>, // B: wavelets edge-aware
+    psf_from_limb: Option<bool>,       // A: deconv con PSF medida
+    edge_aware_strength: Option<f32>,  // B+: intensidad edge-aware (0..100)
+    auto_mask: Option<f32>,            // Calidad: sharpening adaptativo por SNR
+    levels_black: Option<f32>,         // Niveles: punto negro (0..1)
+    levels_white: Option<f32>,         // Niveles: punto blanco (0..1)
+    levels_gamma: Option<f32>,         // Niveles: gamma medios (0.1..5)
 ) -> Result<BatchEntryResult, String> {
     state.license_manager.check_access()?;
     // Nueva entrada del lote: limpiar cancelaciones previas. Si el usuario
@@ -1581,7 +1581,6 @@ async fn process_batch_entry(
     let h = r.height();
     let bpp = r.bpp();
     let cid = bayer_override.unwrap_or_else(|| r.color_id());
-    let is_color_video = r.is_color() || ser::ser_color_is_color(cid);
 
     let ref_idx = select_signal_frame_index(&r, w, h, bpp, cid, total / 2);
 
@@ -1589,11 +1588,19 @@ async fn process_batch_entry(
     let suffix =
         zenith_analysis_cache_suffix(&target_type, is_surface_batch, warping_analysis, anchor_override.is_some());
     let cache_path = get_analysis_cache_path(&file_path, &suffix);
- 
+    let source_fingerprint = planetary_source_fingerprint(&file_path)?;
     let mut cached_opt: Option<CachedAnalysis> = if Path::new(&cache_path).exists() {
-        fs::read_to_string(&cache_path)
-            .ok()
-            .and_then(|c| serde_json::from_str(&c).ok())
+        load_cached_analysis(&cache_path).filter(|cached| {
+            cached.path_hash == source_fingerprint
+                && cached.width == Some(w)
+                && cached.height == Some(h)
+                // Igual que el análisis interactivo: el total puede ser una
+                // estimación en vídeos comprimidos — el fingerprint manda.
+                && cached.frame_stats.as_ref().is_some_and(|stats| {
+                    !stats.is_empty()
+                        && stats.iter().all(|item| item.idx < total.max(stats.len()))
+                })
+        })
     } else {
         None
     };
@@ -1609,11 +1616,12 @@ async fn process_batch_entry(
             bayer_override,
             anchor_override.clone(),
             progress_prefix,
+            // El lote respeta el mismo selector GPU de Ajustes que el flujo
+            // individual (antes forzaba Auto e ignoraba la elección).
+            ComputePolicy::from_legacy(gpu_mode.as_deref()),
         )
         .await?;
-        if let Ok(content) = fs::read_to_string(&cache_path) {
-            cached_opt = serde_json::from_str(&content).ok();
-        }
+        cached_opt = load_cached_analysis(&cache_path);
     }
 
     if cached_opt.is_none() {
@@ -1680,6 +1688,7 @@ async fn process_batch_entry(
         Some(get_msg("")),
         None, // keep_full_frame: el lote usa el recorte por defecto
         align_rgb, // switch de usuario (mismo toggle que el flujo individual)
+        gpu_mode.clone(), // GPU compute: mismo select de Ajustes que el flujo individual
     )
     .await?;
 
@@ -1958,6 +1967,9 @@ async fn process_batch_entry(
     let is_mono = cid == 0 || cid == 12;
     let (r_bal, b_bal) = if is_mono { (0.0, 0.0) } else { (r_bal, b_bal) };
 
+    // Batch: la descomposición GPU interactiva no aplica aquí (el apilado ya usa
+    // su propio motor GPU de acumulación); el post se re-aplica en CPU.
+    let gpu_allowed = false;
     let processed = run_processing_pipeline(
         &app,
         &state,
@@ -1996,6 +2008,14 @@ async fn process_batch_entry(
         master_denoise_detail,
         master_denoise_chroma,
         use_rgb_sharpening, // PHASE 15
+        edge_aware_wavelets.unwrap_or(false), // B
+        psf_from_limb.unwrap_or(false),        // A
+        edge_aware_strength.unwrap_or(50.0),   // B+
+        auto_mask.unwrap_or(0.0),              // adaptativo
+        gpu_allowed,                           // Velocidad: GPU wavelets (paridad+fallback)
+        levels_black.unwrap_or(0.0),           // Niveles
+        levels_white.unwrap_or(1.0),
+        levels_gamma.unwrap_or(1.0),
     );
 
     // --- FINAL EXPORT: High Quality 16-bit PNG (Matches save_final_image) ---
@@ -2018,19 +2038,14 @@ async fn process_batch_entry(
         )
         .map_err(|e| e.to_string())?;
 
-    // PrevisualizaciÃ³n de 8-bit para el UI (Base64)
-    let vis = to_8bit_visual(&processed, 1.0);
-    let mut png_mem = Vec::new();
-    image::png::PngEncoder::new(&mut Cursor::new(&mut png_mem))
-        .encode(&vis, safe_w as u32, safe_h as u32, image::ColorType::Rgb8)
-        .map_err(|e| e.to_string())?;
-
+    // ASSET PROTOCOL: la UI (batch y mosaico) carga `path` con convertFileSrc,
+    // asi que ya no se genera el preview base64 por entrada. Antes cada archivo
+    // del lote pagaba un PNG 8-bit + base64 (CPU) y megabytes de IPC, y el
+    // frontend RETENIA todos esos strings en RAM para el reproductor — en lotes
+    // grandes empujaba el heap del WebView a >1 GB (crash del renderer).
     Ok(BatchEntryResult {
         path: clean_windows_path(dunce::canonicalize(&save_path).unwrap_or(save_path)),
-        preview_base64: format!(
-            "data:image/png;base64,{}",
-            general_purpose::STANDARD.encode(&png_mem)
-        ),
+        preview_base64: String::new(),
     })
 }
 
@@ -2055,6 +2070,7 @@ struct AnalysisBufferSet {
     pub blur_temp: Vec<u16>, // Reuse for separable blur intermediate
     pub blur_out: Vec<u16>,  // Reuse for blur result
     pub lap_out: Vec<u16>,   // Reuse for Laplacian result
+    pub quarter_u16: Vec<u16>, // Pirámide 4× para el SAD grueso GPU
 }
 
 impl AnalysisBufferSet {
@@ -2065,6 +2081,7 @@ impl AnalysisBufferSet {
             blur_temp: vec![0u16; size],
             blur_out: vec![0u16; size],
             lap_out: vec![0u16; size],
+            quarter_u16: vec![0u16; size / 16 + 4],
         }
     }
 }
@@ -2478,26 +2495,19 @@ async fn analyze_video(
 ) -> Result<AnalysisResult, String> {
     state.license_manager.check_access()?;
 
-    // 2. Logic Selection based on Mode
-    // MODOS V2: planet_v2, surface_v2
-    let mut use_v2 = false;
-    let mut is_surface_mode = false;
+    // Compatibilidad de una versión: todos los nombres de modo, incluidos los
+    // v1 históricos, entran al motor tipado Hybrid v2. El bloque antiguo queda
+    // sólo para poder retirar formatos de caché heredados sin cambiar hoy la
+    // firma pública del comando.
+    let is_surface_mode = matches!(
+        mode.as_str(),
+        "surface_v3" | "surface_v2" | "zenith_ultimate_surface" | "surface" | "surface_v1"
+    );
+    // Se conserva como decisión explícita para retirar el cuerpo v1 en la
+    // siguiente versión sin romper hoy su formato de llamada.
+    let compatibility_uses_hybrid_v2 = |_requested_mode: &str| true;
 
-    match mode.as_str() {
-        "planet_v3" | "planet_v2" | "zenith_ultimate_planet" => {
-            use_v2 = true;
-        }
-        "surface_v3" | "surface_v2" | "zenith_ultimate_surface" => {
-            use_v2 = true;
-            is_surface_mode = true;
-        }
-        "surface" | "surface_v1" => {
-            is_surface_mode = true;
-        }
-        _ => {}
-    }
-
-    if use_v2 {
+    if compatibility_uses_hybrid_v2(&mode) {
         return analyze_video_v2(
             app,
             state,
@@ -2940,7 +2950,7 @@ async fn analyze_video(
     let cache_data = CachedAnalysis {
         scores: scores_tuples.clone(),
         roi: roi.clone(),
-        path_hash: 0,
+        path_hash: planetary_source_fingerprint(&path)?,
         frame_stats: None,
         quality_graph: None,
         width: None,
@@ -3089,7 +3099,6 @@ async fn analyze_video(
     })
 }
 
-#[tauri::command]
 // Helper to calculate Local Entropy/Variance for Surface Mode
 fn get_area_complexity(
     data: &[u16],
@@ -3513,6 +3522,7 @@ async fn stack_video(
     is_v3: bool,                       // NEW
     target_type: String,               // NEW
     keep_full_frame: Option<bool>,     // NEW: mantener encuadre completo (no recortar)
+    gpu_mode: Option<String>,          // GPU compute: "auto" | "gpu" | "cpu"
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
  
@@ -3549,8 +3559,62 @@ async fn stack_video(
         target_type, // NEW
         keep_full_frame,
         None, // align_rgb: el legacy usa el default (activado, con gates de seguridad)
+        gpu_mode,
     )
     .await;
+}
+
+/// Downsample de un buffer RGB16 entrelazado por un factor entero (2/4) con
+/// promedio de bloque (area). Para el preview rapido en vivo: procesar a 1/N de
+/// resolucion abarata la deconvolucion/wavelets ~N². Devuelve (data, w', h').
+fn downsample_rgb_u16(data: &[u16], w: usize, h: usize, factor: usize) -> (Vec<u16>, usize, usize) {
+    let sw = w / factor;
+    let sh = h / factor;
+    let mut out = vec![0u16; sw * sh * 3];
+    let n = (factor * factor) as u32;
+    out.par_chunks_exact_mut(sw * 3)
+        .enumerate()
+        .for_each(|(ty, row)| {
+            for tx in 0..sw {
+                let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+                for dy in 0..factor {
+                    let sy = ty * factor + dy;
+                    let base = (sy * w + tx * factor) * 3;
+                    for dx in 0..factor {
+                        let p = base + dx * 3;
+                        r += data[p] as u32;
+                        g += data[p + 1] as u32;
+                        b += data[p + 2] as u32;
+                    }
+                }
+                let o = tx * 3;
+                row[o] = (r / n) as u16;
+                row[o + 1] = (g / n) as u16;
+                row[o + 2] = (b / n) as u16;
+            }
+        });
+    (out, sw, sh)
+}
+
+/// Re-escala (nearest) un buffer RGB8 al tamaño destino. Se usa para devolver el
+/// preview downscaled a dimensiones COMPLETAS → el pan/zoom del visor no salta
+/// entre el preview rapido (arrastre) y el render final (al soltar).
+fn upscale_rgb8_nearest(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+    let mut out = vec![0u8; dw * dh * 3];
+    out.par_chunks_exact_mut(dw * 3)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let sy = (y * sh / dh).min(sh.saturating_sub(1));
+            for x in 0..dw {
+                let sx = (x * sw / dw).min(sw.saturating_sub(1));
+                let sp = (sy * sw + sx) * 3;
+                let o = x * 3;
+                row[o] = src[sp];
+                row[o + 1] = src[sp + 1];
+                row[o + 2] = src[sp + 2];
+            }
+        });
+    out
 }
 
 #[tauri::command]
@@ -3603,6 +3667,15 @@ async fn apply_wavelets(
     master_denoise_detail: f32,
     master_denoise_chroma: f32,
     use_rgb_sharpening: bool,
+    edge_aware_wavelets: Option<bool>, // B: wavelets edge-aware
+    psf_from_limb: Option<bool>,       // A: deconv con PSF medida
+    edge_aware_strength: Option<f32>,  // B+: intensidad edge-aware (0..100)
+    auto_mask: Option<f32>,            // Calidad: sharpening adaptativo por SNR
+    preview_downscale: Option<u32>,    // Interactividad: 2/4 = preview rapido en arrastre
+    gpu_mode: Option<String>,          // Velocidad: "auto"|"gpu"|"cpu" (descomposicion GPU)
+    levels_black: Option<f32>,         // Niveles: punto negro (0..1)
+    levels_white: Option<f32>,         // Niveles: punto blanco (0..1)
+    levels_gamma: Option<f32>,         // Niveles: gamma medios (0.1..5)
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
     state.active_req_id.store(req_id, Ordering::Relaxed);
@@ -3634,13 +3707,41 @@ async fn apply_wavelets(
         (r_bal, b_bal)
     };
 
+    // PREVIEW EN VIVO (interactividad): durante el arrastre de sliders el front
+    // pide un downscale (2/4). Procesamos a 1/N de resolucion (deconv/wavelets
+    // ~N² mas rapidos) y luego re-escalamos el resultado a dimensiones COMPLETAS
+    // (abajo) para que el visor (pan/zoom) no salte. Stats globales/limbo/norma-
+    // lizacion siguen coherentes → el render final al soltar (downscale=1) es exacto.
+    let ds = preview_downscale.unwrap_or(1).max(1) as usize;
+    let use_ds = ds > 1 && original.width >= 256 * ds && original.height >= 256 * ds;
+    let ds_holder;
+    let (proc_ref, pw, ph): (&StackResult, usize, usize) = if use_ds {
+        let (small, sw, sh) =
+            downsample_rgb_u16(&original.data, original.width, original.height, ds);
+        ds_holder = StackResult {
+            data: small,
+            width: sw,
+            height: sh,
+            is_mono: original.is_mono,
+            is_surface: original.is_surface,
+        };
+        (&ds_holder, sw, sh)
+    } else {
+        (&original, original.width, original.height)
+    };
+
+    // GPU wavelets: permitido salvo modo "cpu"; run_processing_pipeline aún exige
+    // tamaño mínimo + paridad, y cae a CPU ante cualquier problema.
+    let gpu_allowed = gpu_mode.as_deref().map(|m| m != "cpu").unwrap_or(true)
+        && crate::gpu_stack::gpu_runtime().is_some();
+
     let final_u16 = run_processing_pipeline(
         &app,
         &state,
         req_id,
-        &original,
-        original.width,
-        original.height,
+        proc_ref,
+        pw,
+        ph,
         [u1, u2, u3, u4, u5],
         [w1, w2, w3, w4, w5, w6],
         [d1, d2, d3, d4, d5, d6],
@@ -3672,6 +3773,14 @@ async fn apply_wavelets(
         master_denoise_detail,
         master_denoise_chroma,
         use_rgb_sharpening, // PHASE 15
+        edge_aware_wavelets.unwrap_or(false), // B
+        psf_from_limb.unwrap_or(false),        // A
+        edge_aware_strength.unwrap_or(50.0),   // B+
+        auto_mask.unwrap_or(0.0),              // adaptativo
+        gpu_allowed,                           // Velocidad: GPU wavelets (paridad+fallback)
+        levels_black.unwrap_or(0.0),           // Niveles
+        levels_white.unwrap_or(1.0),
+        levels_gamma.unwrap_or(1.0),
     );
 
     if final_u16.is_empty() {
@@ -3679,7 +3788,13 @@ async fn apply_wavelets(
     }
 
     emit_progress(&app, "Generando vista...", 97.0, None);
-    let vis = to_8bit_visual(&final_u16, 1.0);
+    let vis_small = to_8bit_visual(&final_u16, 1.0);
+    // Re-escalar el preview downscaled a dimensiones completas (visor estable).
+    let vis = if use_ds {
+        upscale_rgb8_nearest(&vis_small, pw, ph, original.width, original.height)
+    } else {
+        vis_small
+    };
     let mut png = Vec::new();
     image::png::PngEncoder::new(&mut Cursor::new(&mut png))
         .encode(
@@ -3780,6 +3895,13 @@ async fn save_final_image(
     master_denoise_detail: f32,
     master_denoise_chroma: f32,
     use_rgb_sharpening: bool,
+    edge_aware_wavelets: Option<bool>, // B: wavelets edge-aware
+    psf_from_limb: Option<bool>,       // A: deconv con PSF medida
+    edge_aware_strength: Option<f32>,  // B+: intensidad edge-aware (0..100)
+    auto_mask: Option<f32>,            // Calidad: sharpening adaptativo por SNR
+    levels_black: Option<f32>,         // Niveles: punto negro (0..1)
+    levels_white: Option<f32>,         // Niveles: punto blanco (0..1)
+    levels_gamma: Option<f32>,         // Niveles: gamma medios (0.1..5)
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
     state.active_req_id.store(0, Ordering::Relaxed);
@@ -3798,6 +3920,8 @@ async fn save_final_image(
     };
     emit_progress(&app, "Procesando final...", 0.0, None);
 
+    // Export: siempre CPU (render final exacto, sin dependencia de GPU).
+    let gpu_allowed = false;
     let final_u16 = run_processing_pipeline(
         &app,
         &state,
@@ -3836,6 +3960,14 @@ async fn save_final_image(
         master_denoise_detail,
         master_denoise_chroma,
         use_rgb_sharpening, // PHASE 15
+        edge_aware_wavelets.unwrap_or(false), // B
+        psf_from_limb.unwrap_or(false),        // A
+        edge_aware_strength.unwrap_or(50.0),   // B+
+        auto_mask.unwrap_or(0.0),              // adaptativo
+        gpu_allowed,                           // Velocidad: GPU wavelets (paridad+fallback)
+        levels_black.unwrap_or(0.0),           // Niveles
+        levels_white.unwrap_or(1.0),
+        levels_gamma.unwrap_or(1.0),
     );
 
     if final_u16.is_empty() {
@@ -5643,6 +5775,213 @@ async fn fuse_planetary_derotation_stacks(
     })
 }
 
+/// DEROTACIÓN RGB POR CANAL (cámara mono + rueda de filtros): recibe 3 apilados
+/// mono (R, G, B) capturados a tiempos distintos, DEROTA cada uno al tiempo del
+/// canal verde (referencia) para eliminar el desfase de rotación entre filtros,
+/// y ENSAMBLA el color (R←luma(R derotado), G←luma(G), B←luma(B)). Es el flujo
+/// estrella de WinJUPOS para imagers mono. Reutiliza los mismos helpers que la
+/// fusión OSC pero SIN promediar: cada canal va a su plano de color.
+#[tauri::command]
+async fn fuse_planetary_derotation_rgb(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    red_path: String,
+    green_path: String,
+    blue_path: String,
+    planet: String,
+    cm_system: usize,
+    limb_strength: f64,
+    fallback_interval_sec: Option<f64>,
+    sub_earth_lat_deg: Option<f64>,
+    north_angle_deg: Option<f64>,
+    disc_override: Option<DerotationDiscDto>,
+) -> Result<PlanetaryDerotationFusionResult, String> {
+    state.license_manager.check_access()?;
+    state.active_req_id.store(1, Ordering::Relaxed);
+    let planet_body = crate::derotation::get_planet(&planet)
+        .ok_or_else(|| "Planeta no soportado para derotacion".to_string())?;
+
+    let channel_paths = [red_path, green_path, blue_path];
+    let channel_names = ["R", "G", "B"];
+    let mut warnings: Vec<String> = Vec::new();
+    emit_progress(&app, "Preparando derotacion RGB por canal...", 4.0, None);
+
+    // Cargar los 3 canales + su tiempo de captura (log / archivo / reloj).
+    let mut loaded: Vec<(Vec<u16>, usize, usize, f64, String)> = Vec::with_capacity(3);
+    for (i, path) in channel_paths.iter().enumerate() {
+        if state.active_req_id.load(Ordering::Relaxed) == 0 {
+            return Err("Operacion cancelada por el usuario".to_string());
+        }
+        let (rgb, w, h) = derot_load_rgb16_image(path)?;
+        let (meta, source) = derot_metadata_with_source(path, None);
+        emit_progress(
+            &app,
+            &format!("Leyendo canal {}...", channel_names[i]),
+            4.0 + i as f32 * 6.0,
+            None,
+        );
+        loaded.push((rgb, w, h, meta.mid_time_jd, source));
+    }
+    let (width, height) = (loaded[0].1, loaded[0].2);
+    if loaded.iter().any(|(_, w, h, _, _)| *w != width || *h != height) {
+        return Err("Los 3 canales (R/G/B) deben tener la misma resolucion.".to_string());
+    }
+
+    // Si los timestamps colapsan (sin datos útiles), usar el intervalo de respaldo:
+    // R = verde − Δt, B = verde + Δt (orden de captura R→G→B).
+    let green_jd = loaded[1].3;
+    let span_sec_raw = {
+        let mx = loaded.iter().map(|f| f.3).fold(f64::NEG_INFINITY, f64::max);
+        let mn = loaded.iter().map(|f| f.3).fold(f64::INFINITY, f64::min);
+        (mx - mn).abs() * 86400.0
+    };
+    let fallback_interval = fallback_interval_sec.unwrap_or(0.0).clamp(0.0, 3600.0);
+    if span_sec_raw < 1.0 && fallback_interval > 0.0 {
+        loaded[0].3 = green_jd - fallback_interval / 86400.0;
+        loaded[2].3 = green_jd + fallback_interval / 86400.0;
+        warnings.push(format!(
+            "Sin timestamps útiles: se asumió {:.1}s entre canales (R→G→B).",
+            fallback_interval
+        ));
+    }
+    let reference_jd = loaded[1].3; // canal verde
+
+    // Disco de referencia (canal verde o override manual) + geometría.
+    let green_mono = derot_rgb_to_mono(&loaded[1].0);
+    let mut disc = match disc_override.as_ref() {
+        Some(d) => crate::derotation::PlanetDisc::from(d),
+        None => crate::derotation::detect_planet_disc(&green_mono, width, height),
+    };
+    disc = crate::derotation::validate_disc_aspect(&disc, planet_body);
+    let geometry = crate::derotation::calculate_observer_geometry(planet_body, reference_jd);
+    let b0 = sub_earth_lat_deg
+        .unwrap_or(geometry.sub_earth_lat_deg)
+        .clamp(-35.0, 35.0);
+    disc.angle_deg = north_angle_deg.unwrap_or(geometry.north_pole_angle_deg);
+
+    let pixel_count = width.saturating_mul(height);
+    let mut out = vec![0u16; pixel_count.saturating_mul(3)];
+    let mut min_jd = f64::INFINITY;
+    let mut max_jd = f64::NEG_INFINITY;
+
+    // Derotar cada canal a reference_jd y colocar su LUMA en el plano de salida.
+    for (ch, (rgb, _, _, jd, source)) in loaded.iter().enumerate() {
+        if state.active_req_id.load(Ordering::Relaxed) == 0 {
+            return Err("Operacion cancelada por el usuario".to_string());
+        }
+        min_jd = min_jd.min(*jd);
+        max_jd = max_jd.max(*jd);
+        emit_progress(
+            &app,
+            &format!("Derotando canal {}...", channel_names[ch]),
+            30.0 + ch as f32 * 20.0,
+            None,
+        );
+        let derotated = crate::derotation::derotate_single_advanced(
+            rgb,
+            width,
+            height,
+            3,
+            planet_body,
+            *jd,
+            reference_jd,
+            limb_strength.clamp(0.0, 2.0),
+            cm_system.min(2),
+            b0,
+            Some(&disc),
+        );
+        let mono = derot_rgb_to_mono(&derotated);
+        for pix in 0..pixel_count {
+            out[pix * 3 + ch] = mono[pix];
+        }
+        log_to_front(
+            &app,
+            "INFO",
+            &format!(
+                "Derotacion RGB: canal {} desde {} ({})",
+                channel_names[ch],
+                Path::new(&channel_paths[ch])
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("stack"),
+                source
+            ),
+        );
+    }
+
+    let (g_meta, g_source) = derot_metadata_with_source(&channel_paths[1], None);
+    let diagnostics = derot_disc_diagnostics(
+        &green_mono,
+        width,
+        height,
+        &disc,
+        planet_body,
+        &g_source,
+        g_meta.duration_sec,
+        g_meta.fps,
+        reference_jd,
+        reference_jd,
+        cm_system.min(2),
+        geometry,
+    );
+
+    let parent = Path::new(&channel_paths[1])
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let out_path = parent.join(format!("Zenith_Derotated_RGB_{}.tiff", stamp));
+    emit_progress(&app, "Guardando RGB derotado 16-bit...", 92.0, None);
+    derot_save_rgb16_tiff(&out_path, &out, width, height)?;
+
+    {
+        let mut stacked = state.stacked_image.lock().unwrap();
+        *stacked = Some(StackResult {
+            data: out.clone(),
+            width,
+            height,
+            is_mono: false,
+            is_surface: false,
+        });
+    }
+    state.deconv_cache.lock().unwrap().clear();
+    state.wavelet_cache.lock().unwrap().clear();
+    state.filter_cache.lock().unwrap().clear();
+
+    let preview_base64 = derot_encode_preview(&out, width, height)?;
+    let time_span_sec = (max_jd - min_jd).abs() * 86400.0;
+    emit_progress(&app, "Derotacion RGB completada", 100.0, None);
+    log_to_front(
+        &app,
+        "SUCCESS",
+        &format!(
+            "RGB por canal derotado: 3 canales | {:.1}s | {}",
+            time_span_sec,
+            clean_windows_path(out_path.clone())
+        ),
+    );
+
+    Ok(PlanetaryDerotationFusionResult {
+        output_path: clean_windows_path(out_path),
+        preview_base64,
+        width,
+        height,
+        planet,
+        cm_system: cm_system.min(2),
+        frame_count: 3,
+        reference_frame: 2, // verde
+        reference_time_jd: reference_jd,
+        time_span_sec,
+        detected_disc: disc.into(),
+        diagnostics,
+        b0_deg: b0,
+        north_angle_deg: north_angle_deg.unwrap_or(geometry.north_pole_angle_deg),
+        weights: vec![1.0, 1.0, 1.0],
+        normalization_gains: vec![[1.0, 1.0, 1.0]; 3],
+        rejected_pixel_fraction: 0.0,
+        warnings,
+    })
+}
+
 // Helper: Auto-Stretch 16-bit/8-bit range to 0..255 for feature detection
 // This is critical for linear Astro data which often appears "black" in raw 8-bit conversion
 fn auto_stretch_gray(img: &image::GrayImage) -> image::GrayImage {
@@ -6593,17 +6932,29 @@ fn correct_white_balance(data: &mut [u16], w: usize, h: usize) {
         return;
     }
 
-    // PHASE 37: Robust Multi-Pass White Balance for Small Objects (Jupiter Fix)
-    // 1. Intelligent Sampling focusing on SIGNAL (Ignore background)
-    // Increased sampling to 20,000 to capture small planets in large frames.
+    // WHITE BALANCE ROBUSTO PARA CUALQUIER TAMAÑO DE OBJETO (pequeño, grande o
+    // que llene el cuadro). El umbral de señal ya NO es fijo (2000): se adapta
+    // al brillo REAL de la imagen — asi funciona igual con un planeta diminuto
+    // sobre negro que con una Luna que ocupa todo el encuadre.
+    // 1. Estimar el pico de verde para fijar un umbral relativo.
+    let mut g_peak = 0u16;
+    {
+        let scan = (len / 30000).max(1);
+        for i in (0..len).step_by(scan) {
+            let g = data[i * 3 + 1];
+            if g > g_peak {
+                g_peak = g;
+            }
+        }
+    }
+    // Umbral = 18% del pico: aisla la SEÑAL del objeto (evita muestrear el
+    // fondo como "gris neutro") sin depender del tamaño del objeto.
+    let luma_threshold = ((g_peak as f32) * 0.18).clamp(600.0, 40000.0) as u16;
+
     let step = (len / 20000).max(1);
     let mut sampled_r = Vec::with_capacity(20000);
     let mut sampled_g = Vec::with_capacity(20000);
     let mut sampled_b = Vec::with_capacity(20000);
-
-    // Threshold: Ignore pixels below ~3% luminosity to avoid sampling background noise as neutral.
-    // This is critical for small objects like planets against black space.
-    let luma_threshold = 2000u16;
 
     for i in (0..len).step_by(step) {
         let off = i * 3;
@@ -6729,6 +7080,9 @@ fn apply_advanced_color_magic(
     b_bal: f32,
     contrast_pivot: f32,
     tone_white: f32,
+    levels_black: f32,
+    levels_white: f32,
+    levels_gamma: f32,
 ) {
     // Professional tone / colour engine working in NORMALISED 16-bit float space.
     // Every adjustment is computed in [0,1] (value / 65535) using smooth, clip-free
@@ -6747,6 +7101,25 @@ fn apply_advanced_color_magic(
     let mut rn = (*r * INV_N).max(0.0);
     let mut gn = (*g * INV_N).max(0.0);
     let mut bn = (*b * INV_N).max(0.0);
+
+    // --- 1b. LEVELS (estiramiento por histograma estilo RegiStax) -----------
+    // Punto NEGRO / BLANCO de entrada + GAMMA de medios tonos, todo en [0,1].
+    // Neutro: black 0, white 1, gamma 1 (identidad). Se aplica ANTES de las
+    // curvas de brillo/contraste/gamma para que estas operen sobre el resultado
+    // ya estirado (orden "levels → curves" clásico).
+    if levels_black > 0.0001
+        || (levels_white - 1.0).abs() > 0.0001
+        || (levels_gamma - 1.0).abs() > 0.001
+    {
+        let lb = levels_black.clamp(0.0, 0.98);
+        let lw = levels_white.clamp(lb + 0.01, 1.0);
+        let inv_span = 1.0 / (lw - lb);
+        let inv_lg = 1.0 / levels_gamma.clamp(0.1, 5.0);
+        let lv = |v: f32| ((v - lb) * inv_span).clamp(0.0, 1.0).powf(inv_lg);
+        rn = lv(rn);
+        gn = lv(gn);
+        bn = lv(bn);
+    }
 
     // --- 2. Brightness as exposure (multiplicative, hue-preserving) ---------
     // Slider -1..1 -> roughly -1.5..+1.5 stops. Highlights roll off smoothly
@@ -7204,6 +7577,7 @@ fn clear_app_memory(state: tauri::State<'_, AppState>) {
 #[tauri::command]
 fn clear_stack_memory(state: tauri::State<'_, AppState>) {
     *state.stacked_image.lock().unwrap() = None;
+    *state.deep_sky_result.lock().unwrap() = None;
     state.deconv_cache.lock().unwrap().clear();
     state.wavelet_cache.lock().unwrap().clear();
     state.filter_cache.lock().unwrap().clear();
@@ -7219,7 +7593,41 @@ async fn zas_stack_video_elite(
     config: EliteConfig,
     category: String,
 ) -> Result<String, String> {
-    crate::zenith_stack_video_elite_impl(app, state, path, percent, config, category).await
+    // Compatibilidad de una versión: Elite V4 fue retirado de la UI porque su
+    // prototipo cargaba el video completo y contenía un warp conceptual. No
+    // dejamos el comando registrado apuntando a esa ruta: traduce sus campos al
+    // contrato tipado y ejecuta el mismo motor híbrido/paritario que la UI actual.
+    let category_key = category.to_ascii_lowercase();
+    let is_surface = category_key.contains("surface")
+        || category_key.contains("solar")
+        || category_key.contains("lunar");
+    run_planetary_stack(
+        app,
+        state,
+        PlanetaryStackRequest {
+            path,
+            percent,
+            custom_points: Vec::new(),
+            drizzle: 1.0,
+            is_surface,
+            bayer_override: None,
+            ap_size: 48,
+            sharpened: config.post_sharpen > 0.0,
+            sharpen_intensity: config.post_sharpen.clamp(0.0, 1.0),
+            double_pass: true,
+            warping_analysis: true,
+            anchor_override: None,
+            stacking_roi: None,
+            normalize_colors: true,
+            is_v3: true,
+            target_type: category,
+            keep_full_frame: Some(false),
+            align_rgb: Some(true),
+            compute_policy: ComputePolicy::Hybrid,
+            profile: PipelineProfile::Custom,
+        },
+    )
+    .await
 }
 
 fn main() {
@@ -7264,6 +7672,7 @@ fn main() {
             let license_manager = Arc::new(LicenseManager::new(app_data_dir));
             app.manage(AppState {
                 stacked_image: Mutex::new(None),
+                deep_sky_result: Mutex::new(None),
                 deconv_cache: Mutex::new(Vec::new()),
                 wavelet_cache: Mutex::new(Vec::new()),
                 filter_cache: Mutex::new(Vec::new()),
@@ -7301,23 +7710,49 @@ fn main() {
             apply_current_stacked_planetary_derotation,
             derotate_animation_frames,
             fuse_planetary_derotation_stacks,
+            fuse_planetary_derotation_rgb,
             get_available_fonts,
             check_ffmpeg_status,
             check_avx2_support,
             get_accel_label,
+            get_gpu_info,
+            disk_space_info,
+            benchmark::get_benchmark_environment,
+            benchmark::get_benchmark_dataset_matrix,
+            benchmark::begin_benchmark_run,
+            benchmark::get_active_benchmark_run,
+            benchmark::finish_benchmark_run,
+            benchmark::abort_benchmark_run,
+            benchmark::clear_pipeline_telemetry,
+            benchmark::export_pipeline_telemetry,
+            benchmark::generate_benchmark_report,
+            benchmark::validate_benchmark_manifest,
+            benchmark::compare_linear_masters,
+            prepare_deepsky_stack,
+            run_deepsky_stack,
+            prepare_deepsky_session,
+            run_deepsky_session,
             stack_deepsky,
             deepsky_probe,
+            inspect_deepsky_frames,
             deepsky_scan_classify,
             deepsky_restretch,
+            deepsky_frame_preview,
+            deepsky_result_view,
             deepsky_export,
+            deepsky_export_float32,
             deepsky_histogram,
             deepsky_combine_channels,
+            deepsky_split_channels,
+            deepsky_dualband_hoo,
+            spcc_calibrate,
             check_license_status,
             activate_pro_license,
             deactivate_license,
             reset_license_state,
             cancel_processing,
             analyze_video_v2,
+            analyze_planetary,
             stop_analysis,
             activate_license,
             ver_licencia,
@@ -7325,6 +7760,7 @@ fn main() {
             load_image_thumbnail,
             generate_smart_ap_grid,     // Smart APs (Integrated)
             stack_video_liquid_warping, // Liquid Warping V2
+            run_planetary_stack,
             zas_stack_video_elite,          // Zenith Elite V4
             clear_app_memory,
             clear_stack_memory,

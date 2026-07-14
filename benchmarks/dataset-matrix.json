@@ -1,0 +1,66 @@
+{
+  "schemaVersion": "zenith-dataset-matrix-v1",
+  "requiredScenarios": [
+    {
+      "id": "planetary-ser-mono-surface",
+      "domain": "planetary",
+      "requiredTags": ["ser", "mono", "surface"],
+      "acceptance": ["analysis", "registration", "integration", "export", "cold-cache", "warm-cache"]
+    },
+    {
+      "id": "planetary-ser-bayer-small-planet",
+      "domain": "planetary",
+      "requiredTags": ["ser", "bayer", "small-planet"],
+      "acceptance": ["cfa", "cog", "sad", "ap-quality", "cpu-gpu-parity"]
+    },
+    {
+      "id": "planetary-ffmpeg-h264-surface",
+      "domain": "planetary",
+      "requiredTags": ["ffmpeg", "h264", "surface"],
+      "acceptance": ["cpu-decode-probe", "hardware-decode-confirmation", "fallback"]
+    },
+    {
+      "id": "planetary-ffmpeg-hevc-small-planet",
+      "domain": "planetary",
+      "requiredTags": ["ffmpeg", "hevc", "small-planet"],
+      "acceptance": ["cpu-decode-probe", "hardware-decode-confirmation", "fallback"]
+    },
+    {
+      "id": "deep-sky-osc-calibrated-dithered",
+      "domain": "deep_sky",
+      "requiredTags": ["osc", "calibration", "dither", "cfa-drizzle"],
+      "acceptance": ["bias", "dark", "flat", "bayer", "coverage", "photometry"]
+    },
+    {
+      "id": "deep-sky-mono-multisession",
+      "domain": "deep_sky",
+      "requiredTags": ["mono", "multisession", "filters"],
+      "acceptance": ["grouping", "normalization", "weights", "recipe"]
+    },
+    {
+      "id": "deep-sky-variable-gradients",
+      "domain": "deep_sky",
+      "requiredTags": ["gradients", "local-normalization"],
+      "acceptance": ["model-preview", "linear-master", "abe-excluded-from-benchmark"]
+    },
+    {
+      "id": "deep-sky-field-distortion",
+      "domain": "deep_sky",
+      "requiredTags": ["distortion", "projective", "local-model"],
+      "acceptance": ["ransac", "second-pass", "rms", "inliers", "residual-map"]
+    },
+    {
+      "id": "deep-sky-satellite-trails",
+      "domain": "deep_sky",
+      "requiredTags": ["satellite", "rejection"],
+      "acceptance": ["low-map", "high-map", "winsorized", "linear-fit", "sigma", "artifact-mask-residual"],
+      "requiredEvidence": ["artifactFreeReference", "artifactMask"]
+    },
+    {
+      "id": "deep-sky-high-resolution",
+      "domain": "deep_sky",
+      "requiredTags": ["high-resolution", "tiled", "mmap"],
+      "acceptance": ["ram", "vram", "disk", "cancellation", "cache-corruption"]
+    }
+  ]
+}

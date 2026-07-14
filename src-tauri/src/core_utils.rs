@@ -22,6 +22,15 @@ fn log_to_front(app: &tauri::AppHandle, level: &str, msg: &str) {
 }
 
 fn emit_progress(app: &tauri::AppHandle, step: &str, pct: f32, details: Option<String>) {
+    // SANEO CENTRAL: con totales estimados (MP4/MOV sin nb_frames) el cálculo
+    // c/total puede pasarse de 100 o producir NaN/inf; serde serializa NaN
+    // como null y el frontend lo lee como 0 → barra congelada en 0. Ningún
+    // emisor puede volver a romper la barra desde aquí.
+    let pct = if pct.is_finite() {
+        pct.clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
     let _ = app.emit(
         "progress",
         Progress {
@@ -30,6 +39,177 @@ fn emit_progress(app: &tauri::AppHandle, step: &str, pct: f32, details: Option<S
             details,
         },
     );
+}
+
+fn emit_pipeline_telemetry(app: &tauri::AppHandle, telemetry: PipelineTelemetry) {
+    crate::pipeline::record_pipeline_telemetry(&telemetry);
+    let _ = app.emit("pipeline_telemetry", telemetry);
+}
+
+/// Telemetria EN VIVO de la FASE DE ANALISIS (mismo evento "stack_telemetry"
+/// que el apilado, con phase="analysis" para que la UI etiquete bien).
+/// MATICES de aceleracion en el analisis (importante para no confundir):
+///  - wgpu procesa por lotes luma/pirámide/Laplaciano/CoG/calidad/SAD grueso;
+///    CPU/SIMD conserva refinamiento, validación y decisiones globales.
+///  - La DECODIFICACION de videos comprimidos también puede usar GPU hardware
+///    (VideoToolbox/NVDEC/D3D11VA via FFmpeg, el "Modo Turbo"). `decode_gpu`:
+///    Some(true) = decode HW-GPU activo, Some(false) = decode CPU (fallback),
+///    None = lector nativo SER/AVI/FITS (mmap, sin decode).
+/// `sys` se refresca bajo lock (barato, cada N frames). align_ms = ms/frame.
+#[allow(clippy::too_many_arguments)]
+fn emit_analysis_telemetry(
+    app: &tauri::AppHandle,
+    job_id: &str,
+    reader_kind: &str,
+    decode_gpu: Option<bool>,
+    compute_gpu: bool,
+    // Motivo visible cuando el cómputo cayó a CPU ("Auto eligió CPU",
+    // "VRAM insuficiente", "la GPU falló en un lote"...): el usuario no debe
+    // adivinar por qué la etiqueta dice "scoring CPU".
+    cpu_reason: Option<String>,
+    uploaded_bytes_per_frame: usize,
+    estimated_vram_mb: u64,
+    done: usize,
+    total: usize,
+    start: std::time::Instant,
+    threads: usize,
+    sys: &std::sync::Mutex<sysinfo::System>,
+) {
+    let elapsed = start.elapsed().as_secs_f32().max(0.001);
+    let d = done.max(1);
+    let (ram_mb, cpu_percent, io_read_mb, io_write_mb) = {
+        let mut s = sys.lock().unwrap();
+        // refresh_all() enumeraba TODOS los procesos del sistema bajo lock en
+        // cada emisión (cada 10-50 frames); estos refrescos puntuales producen
+        // exactamente los campos consumidos a una fracción del coste.
+        s.refresh_memory();
+        s.refresh_cpu();
+        let pid = sysinfo::get_current_pid().ok();
+        if let Some(p) = pid {
+            s.refresh_process(p);
+        }
+        let process = pid.and_then(|p| s.process(p));
+        let disk = process.map(|p| p.disk_usage());
+        (
+            process.map(|p| p.memory() / (1024 * 1024)).unwrap_or_else(|| s.used_memory() / (1024 * 1024)),
+            Some(s.global_cpu_info().cpu_usage()),
+            disk.map(|d| d.total_read_bytes as f64 / 1_048_576.0).unwrap_or(0.0),
+            disk.map(|d| d.total_written_bytes as f64 / 1_048_576.0).unwrap_or(0.0),
+        )
+    };
+    let decode_lbl = match decode_gpu {
+        Some(true) => " · decode HW-GPU",
+        Some(false) => " · decode CPU",
+        None => "",
+    };
+    let compute_lbl = if compute_gpu {
+        " · preprocess GPU + decisiones CPU".to_string()
+    } else {
+        match &cpu_reason {
+            Some(reason) => format!(" · scoring CPU — {reason}"),
+            None => " · scoring CPU".to_string(),
+        }
+    };
+    let _ = app.emit(
+        "stack_telemetry",
+        StackTelemetry {
+            phase: "analysis".to_string(),
+            // La UI ya antepone "Análisis:", asi que el modo NO lo repite
+            // (antes mostraba "Análisis: Analisis · SER..." duplicado).
+            mode: format!(
+                "{}{}{} {}",
+                reader_kind,
+                decode_lbl,
+                compute_lbl,
+                simd_backend_label()
+            ),
+            decode_gpu,
+            compute_gpu,
+            frames_done: done,
+            frames_total: total,
+            fps: d as f32 / elapsed,
+            align_ms: (elapsed * 1000.0) / d as f32,
+            accum_ms: 0.0,
+            upload_mbps: if compute_gpu {
+                (done.saturating_mul(uploaded_bytes_per_frame) as f32)
+                    / elapsed
+                    / 1_048_576.0
+            } else {
+                0.0
+            },
+            ram_mb,
+            vram_mb: if compute_gpu {
+                estimated_vram_mb.min(crate::gpu_stack::gpu_info().vram_budget_mb)
+            } else {
+                0
+            },
+            cache_hits: 0,
+            threads,
+        },
+    );
+    emit_pipeline_telemetry(
+        app,
+        PipelineTelemetry {
+            job_id: job_id.into(),
+            domain: PipelineDomain::Planetary,
+            phase: "analysis".into(),
+            engine: format!("{}{}{} {}", reader_kind, decode_lbl, compute_lbl, simd_backend_label()),
+            progress: done as f32 / total.max(1) as f32 * 100.0,
+            eta_seconds: if done > 0 && done < total {
+                Some(elapsed / done as f32 * (total - done) as f32)
+            } else { None },
+            items_done: done,
+            items_total: total,
+            throughput: Some(d as f32 / elapsed),
+            cpu_percent,
+            gpu_percent: None,
+            ram_mb,
+            vram_mb: if compute_gpu {
+                estimated_vram_mb.min(crate::gpu_stack::gpu_info().vram_budget_mb)
+            } else {
+                0
+            },
+            io_read_mb,
+            io_write_mb,
+            cache_hits: 0,
+            cache_misses: 0,
+            fallback_reason: None,
+        },
+    );
+}
+
+/// Escribe un preview PNG a un archivo temporal y devuelve su ruta absoluta
+/// (el frontend la carga via asset protocol / convertFileSrc). Transportar el
+/// PNG como data-URL base64 por IPC multiplicaba el pico de RAM del WebView.
+/// NOMBRE UNICO por llamada: el WebView cachea por URL — reutilizar el mismo
+/// nombre mostraria la imagen ANTERIOR. Los previews de sesiones pasadas
+/// (>24 h) se purgan en cada escritura. Devuelve None si el temp no es
+/// escribible (el caller cae al data-URL clasico).
+fn save_preview_png_to_temp(png_bytes: &[u8], tag: &str) -> Option<String> {
+    let dir = std::env::temp_dir().join("astro_stacker_previews");
+    std::fs::create_dir_all(&dir).ok()?;
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        let now = std::time::SystemTime::now();
+        for e in rd.flatten() {
+            let stale = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .map(|d| d.as_secs() > 24 * 3600)
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let path = dir.join(format!("{}_{}.png", tag, millis));
+    std::fs::write(&path, png_bytes).ok()?;
+    Some(clean_windows_path(path))
 }
 
 fn load_font_from_path(path: &str) -> Option<Font<'static>> {
@@ -384,6 +564,31 @@ fn raw_to_u16_buffer_into(
         width * height
     };
 
+    // GUARD SIMD: los kernels AVX2/NEON leen `size` elementos confiando en los
+    // metadatos (width*height), no en data.len(). Un SER/AVI truncado
+    // (captura interrumpida) devuelve el ultimo frame corto o vacio (&[]) y la
+    // lectura fuera de limites cerraba la app en seco (0xC0000005 / SIGSEGV)
+    // sin pasar por el panic hook. Camino frio (solo frames incompletos):
+    // convierte lo disponible y rellena el resto con negro.
+    let elem_bytes: usize = if bpp == 2 || bpp == 6 { 2 } else { 1 };
+    if data.len() < size * elem_bytes {
+        out_buf.clear();
+        out_buf.reserve(size);
+        let avail = (data.len() / elem_bytes).min(size);
+        if elem_bytes == 2 {
+            for i in 0..avail {
+                let s = i * 2;
+                out_buf.push((data[s + 1] as u16) << 8 | data[s] as u16);
+            }
+        } else {
+            for &v in data.iter().take(avail) {
+                out_buf.push(v as u16 * 257);
+            }
+        }
+        out_buf.resize(size, 0);
+        return;
+    }
+
     // AVX2 OPTIMIZATION CHECK
     #[cfg(target_arch = "x86_64")]
     {
@@ -584,9 +789,38 @@ fn select_signal_frame_index(
     }
 
     // Native readers are cheap random access. FFmpeg random seeks are expensive,
-    // so keep their existing behavior.
+    // pero devolver el preferido A CIEGAS era peligroso: si el total es una
+    // estimación alta o el seek cae en EOF, la referencia queda NEGRA y todas
+    // las puntuaciones del análisis salen 0. Se valida la señal del preferido
+    // y sólo si está vacío se sondean unos pocos candidatos baratos.
     if reader.is_ffmpeg() {
-        return preferred_idx.min(total - 1);
+        let preferred = preferred_idx.min(total - 1);
+        let raw = reader.get_frame(preferred, cid);
+        let (max_v, avg) = estimate_raw_frame_signal(&raw, width, height, bpp);
+        if max_v as f32 + avg * 8.0 > 512.0 {
+            return preferred;
+        }
+        let mut best_idx = preferred;
+        let mut best_score = max_v as f32 + avg * 8.0;
+        for idx in [total / 4, total / 10, (total * 3) / 4, 0] {
+            let idx = idx.min(total - 1);
+            if idx == preferred {
+                continue;
+            }
+            let raw = reader.get_frame(idx, cid);
+            let (max_v, avg) = estimate_raw_frame_signal(&raw, width, height, bpp);
+            let score = max_v as f32 + avg * 8.0;
+            if score > best_score {
+                best_score = score;
+                best_idx = idx;
+            }
+            // Con señal clara no hace falta seguir sondeando (cada probe es un
+            // seek+spawn de FFmpeg).
+            if best_score > 512.0 {
+                break;
+            }
+        }
+        return best_idx;
     }
 
     let mut candidates = vec![
@@ -680,6 +914,15 @@ fn raw_to_u16_buffer_into_roi(
     }
 
     if bpp == 6 {
+        // GUARD: mismo caso que raw_to_u16_buffer_into — un frame truncado o
+        // vacio (SER/AVI interrumpido) hacia que los get_unchecked de abajo
+        // leyeran fuera de limites (cierre en seco). Tambien cubre un ROI que
+        // exceda la altura real. El fallback negro es el mismo que el del ROI
+        // horizontal invalido de arriba.
+        if data.len() < (roi_y + roi_h) * width * 6 {
+            out_buf.resize(size, 0);
+            return;
+        }
         // RGB 16-bit Optimized -> MONO (Average)
         // Access pattern: y from roi_y to roi_y + roi_h
         unsafe {

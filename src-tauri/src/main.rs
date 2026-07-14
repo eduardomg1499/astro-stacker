@@ -8,12 +8,21 @@ mod avi;
 mod converter;
 mod derotation;
 mod fits_sequence;
+mod frame_source;
+mod frame_store;
+mod gpu_analysis; // preprocesado planetario por lotes (downscale/blur/Laplaciano)
+mod gpu_deepsky; // GPU compute para calibracion/warp/integracion de cielo profundo
+mod gpu_stack; // GPU compute (wgpu) para la etapa de acumulacion
+mod gpu_wavelet; // GPU compute (wgpu) para la descomposicion wavelet (blur separable)
 mod integral_image;
 mod license;
 mod liquid_warping;
+mod pipeline;
+mod benchmark;
 mod ser;
 mod smart_grid; // Added smart_grid module
 use liquid_warping::*;
+use pipeline::*;
 
 use alignment::*;
 use avi::AviReader;
@@ -22,6 +31,8 @@ use image::{ColorType, Delay, DynamicImage, Frame, GenericImageView, Rgba, RgbaI
 use imageproc::drawing::draw_text_mut;
 
 use fits_sequence::FitsSequenceReader;
+use frame_source::{FrameRoi, FrameSource, UnifiedFrameSource};
+use frame_store::AdaptiveFrameStore;
 use license::{AppStatus, LicenseManager};
 use rayon::prelude::*;
 use rusttype::{Font, Scale};
@@ -56,5 +67,6 @@ include!("advanced_wavelets.rs");
 include!("commands_v2_v3.rs");
 include!("commands_core.rs");
 include!("deepsky.rs");
+include!("spcc.rs");
 
 include!("smart_ap_generator.rs");

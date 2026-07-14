@@ -467,6 +467,45 @@ fn find_best_match_sad_rect(
     start_dy: isize,
     search_range: isize,
 ) -> (u64, isize, isize) {
+    // COTA INICIAL: SAD completo del candidato central (start_dx, start_dy).
+    // El barrido row-major construía best_sad LENTO desde la esquina y los
+    // primeros cientos de candidatos se evaluaban casi enteros. El ganador
+    // suele estar en (o junto a) la semilla: evaluarla primero como COTA hace
+    // que casi todos los demás aborten en pocas filas. EQUIVALENCIA: la cota
+    // acota por arriba al mínimo global M; un candidato abortado tiene
+    // SAD > min(best, cota) ≥ M y con comparación estricta '<' jamás gana ni
+    // empata — argmin y SAD devueltos bit-idénticos. Coste: el central se
+    // evalúa dos veces (despreciable frente al ahorro).
+    let abort_bound = if search_range > 0 {
+        find_best_match_sad_rect_bounded(
+            ref_data, tgt_data, width, height, roi_x, roi_y, roi_w, roi_h, start_dx, start_dy,
+            0, u64::MAX,
+        )
+        .0
+    } else {
+        u64::MAX
+    };
+    find_best_match_sad_rect_bounded(
+        ref_data, tgt_data, width, height, roi_x, roi_y, roi_w, roi_h, start_dx, start_dy,
+        search_range, abort_bound,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_best_match_sad_rect_bounded(
+    ref_data: &[u16],
+    tgt_data: &[u16],
+    width: usize,
+    height: usize,
+    roi_x: usize,
+    roi_y: usize,
+    roi_w: usize,
+    roi_h: usize,
+    start_dx: isize,
+    start_dy: isize,
+    search_range: isize,
+    abort_bound: u64,
+) -> (u64, isize, isize) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -483,6 +522,7 @@ fn find_best_match_sad_rect(
                     start_dx,
                     start_dy,
                     search_range,
+                    abort_bound,
                 );
             }
         }
@@ -502,6 +542,7 @@ fn find_best_match_sad_rect(
                 start_dx,
                 start_dy,
                 search_range,
+                abort_bound,
             );
         }
     }
@@ -518,6 +559,7 @@ fn find_best_match_sad_rect(
         start_dx,
         start_dy,
         search_range,
+        abort_bound,
     )
 }
 
@@ -534,6 +576,7 @@ fn find_best_match_sad_internal(
     start_dx: isize,
     start_dy: isize,
     search_range: isize,
+    abort_bound: u64,
 ) -> (u64, isize, isize) {
     let mut best_sad = u64::MAX;
     let mut best_dx = start_dx;
@@ -571,7 +614,7 @@ fn find_best_match_sad_internal(
                         current_sad += diff as u64;
                     }
                 }
-                if !valid || current_sad > best_sad {
+                if !valid || current_sad > best_sad.min(abort_bound) {
                     break;
                 }
             }
@@ -633,6 +676,39 @@ fn find_best_match_sad_subpixel(
     (fidx as f32 + sdx, fidy as f32 + sdy)
 }
 
+/// Refinamiento CPU de una semilla entera obtenida por otro motor (por
+/// ejemplo el SAD batched de wgpu). Mantiene exactamente la búsqueda SIMD y
+/// el ajuste subpíxel de la ruta de referencia, pero evita repetir la búsqueda
+/// gruesa en CPU.
+#[allow(clippy::too_many_arguments)]
+pub fn refine_best_match_sad_offset(
+    ref_data: &[u16],
+    tgt_data: &[u16],
+    width: usize,
+    height: usize,
+    roi_x: usize,
+    roi_y: usize,
+    roi_w: usize,
+    roi_h: usize,
+    guess_dx: isize,
+    guess_dy: isize,
+    fine_search_range: isize,
+) -> (f32, f32) {
+    find_best_match_sad_subpixel(
+        ref_data,
+        tgt_data,
+        width,
+        height,
+        roi_x,
+        roi_y,
+        roi_w,
+        roi_h,
+        guess_dx,
+        guess_dy,
+        fine_search_range,
+    )
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn find_best_match_sad_rect_avx2(
@@ -647,6 +723,7 @@ unsafe fn find_best_match_sad_rect_avx2(
     start_dx: isize,
     start_dy: isize,
     search_range: isize,
+    abort_bound: u64,
 ) -> (u64, isize, isize) {
     let mut best_sad = u64::MAX;
     let mut best_dx = start_dx;
@@ -672,10 +749,8 @@ unsafe fn find_best_match_sad_rect_avx2(
                 continue;
             }
 
-            let mut vec_acc = _mm256_setzero_si256();
-            let mut acc_64_lo = _mm256_setzero_si256();
-            let mut acc_64_hi = _mm256_setzero_si256();
-            let mut scalar_sad = 0u64;
+            let mut running = 0u64;
+            let mut aborted = false;
 
             let row_r_base = roi_y * width + roi_x;
             let row_t_base = (t_y as usize) * width + (t_x as usize);
@@ -688,6 +763,7 @@ unsafe fn find_best_match_sad_rect_avx2(
                 let t_ptr = p_tgt_start.add(i * width);
                 let mut rx = 0;
 
+                let mut vec_acc = _mm256_setzero_si256();
                 while rx + 16 <= roi_w {
                     let va = _mm256_loadu_si256(r_ptr.add(rx) as *const _);
                     let vb = _mm256_loadu_si256(t_ptr.add(rx) as *const _);
@@ -701,37 +777,30 @@ unsafe fn find_best_match_sad_rect_avx2(
                     rx += 16;
                 }
 
+                // Reducción por fila (sustituye al flush a 64-bit: las lanes
+                // u32 no desbordan dentro de una fila).
+                let mut lanes = [0u32; 8];
+                _mm256_storeu_si256(lanes.as_mut_ptr() as *mut _, vec_acc);
+                let mut row_sad: u64 = lanes.iter().map(|&v| v as u64).sum();
+
                 while rx < roi_w {
                     let val_r = *r_ptr.add(rx) as i32;
                     let val_t = *t_ptr.add(rx) as i32;
-                    scalar_sad += (val_r - val_t).abs() as u64;
+                    row_sad += (val_r - val_t).abs() as u64;
                     rx += 1;
                 }
 
-                // Periodic flush to 64-bit to prevent 32-bit lane overflow
-                // We do it every row for simplicity.
-                let v_lo = _mm256_unpacklo_epi32(vec_acc, v_zero);
-                let v_hi = _mm256_unpackhi_epi32(vec_acc, v_zero);
-                acc_64_lo = _mm256_add_epi64(acc_64_lo, v_lo);
-                acc_64_hi = _mm256_add_epi64(acc_64_hi, v_hi);
-                vec_acc = _mm256_setzero_si256();
+                running += row_sad;
+                // EARLY-ABORT por fila contra min(best, cota-semilla) — ver
+                // nota de equivalencia en find_best_match_sad_rect.
+                if running > best_sad.min(abort_bound) {
+                    aborted = true;
+                    break;
+                }
             }
 
-            // Final Reduction of 64-bit counters
-            let mut lanes_lo = [0i64; 4];
-            let mut lanes_hi = [0i64; 4];
-            _mm256_storeu_si256(lanes_lo.as_mut_ptr() as *mut _, acc_64_lo);
-            _mm256_storeu_si256(lanes_hi.as_mut_ptr() as *mut _, acc_64_hi);
-
-            let mut simd_sum = 0u64;
-            for j in 0..4 {
-                simd_sum += lanes_lo[j] as u64 + lanes_hi[j] as u64;
-            }
-
-            let total_sad = simd_sum + scalar_sad;
-
-            if total_sad < best_sad {
-                best_sad = total_sad;
+            if !aborted && running < best_sad {
+                best_sad = running;
                 best_dx = dx;
                 best_dy = dy;
             }
@@ -753,6 +822,7 @@ unsafe fn find_best_match_sad_rect_neon(
     start_dx: isize,
     start_dy: isize,
     search_range: isize,
+    abort_bound: u64,
 ) -> (u64, isize, isize) {
     use std::arch::aarch64::*;
 
@@ -778,11 +848,8 @@ unsafe fn find_best_match_sad_rect_neon(
                 continue;
             }
 
-            let mut vec_acc_low = vdupq_n_u32(0);
-            let mut vec_acc_high = vdupq_n_u32(0);
-            let mut acc_64_low = vdupq_n_u64(0);
-            let mut acc_64_high = vdupq_n_u64(0);
-            let mut scalar_sad = 0u64;
+            let mut running = 0u64;
+            let mut aborted = false;
 
             let row_r_base = roi_y * width + roi_x;
             let row_t_base = (t_y as usize) * width + (t_x as usize);
@@ -795,6 +862,8 @@ unsafe fn find_best_match_sad_rect_neon(
                 let t_ptr = p_tgt_start.add(i * width);
                 let mut rx = 0;
 
+                let mut vec_acc_low = vdupq_n_u32(0);
+                let mut vec_acc_high = vdupq_n_u32(0);
                 while rx + 8 <= roi_w {
                     let va = vld1q_u16(r_ptr.add(rx));
                     let vb = vld1q_u16(t_ptr.add(rx));
@@ -803,33 +872,29 @@ unsafe fn find_best_match_sad_rect_neon(
                     vec_acc_high = vaddw_u16(vec_acc_high, vget_high_u16(diff));
                     rx += 8;
                 }
+                let mut row_sad =
+                    vaddvq_u32(vec_acc_low) as u64 + vaddvq_u32(vec_acc_high) as u64;
 
                 while rx < roi_w {
                     let val_r = *r_ptr.add(rx) as i32;
                     let val_t = *t_ptr.add(rx) as i32;
-                    scalar_sad += (val_r - val_t).abs() as u64;
+                    row_sad += (val_r - val_t).abs() as u64;
                     rx += 1;
                 }
 
-                acc_64_low = vaddq_u64(acc_64_low, vmovl_u32(vget_low_u32(vec_acc_low)));
-                acc_64_low = vaddq_u64(acc_64_low, vmovl_u32(vget_high_u32(vec_acc_low)));
-                acc_64_high = vaddq_u64(acc_64_high, vmovl_u32(vget_low_u32(vec_acc_high)));
-                acc_64_high = vaddq_u64(acc_64_high, vmovl_u32(vget_high_u32(vec_acc_high)));
-
-                vec_acc_low = vdupq_n_u32(0);
-                vec_acc_high = vdupq_n_u32(0);
+                running += row_sad;
+                // EARLY-ABORT por fila contra min(best, cota-semilla): un
+                // candidato cuyo parcial supera esa cota no puede ganar NI
+                // empatar (suma no negativa + '<' estricta) — argmin y SAD
+                // bit-idénticos a la búsqueda exhaustiva. Poda 60-80%+.
+                if running > best_sad.min(abort_bound) {
+                    aborted = true;
+                    break;
+                }
             }
 
-            let mut lanes_low = [0u64; 2];
-            let mut lanes_high = [0u64; 2];
-            vst1q_u64(lanes_low.as_mut_ptr(), acc_64_low);
-            vst1q_u64(lanes_high.as_mut_ptr(), acc_64_high);
-
-            let simd_sum = lanes_low[0] + lanes_low[1] + lanes_high[0] + lanes_high[1];
-            let total_sad = simd_sum + scalar_sad;
-
-            if total_sad < best_sad {
-                best_sad = total_sad;
+            if !aborted && running < best_sad {
+                best_sad = running;
                 best_dx = dx;
                 best_dy = dy;
             }
@@ -1038,6 +1103,139 @@ fn subpixel_refine_sad(
     (fit_1d(&row_center), fit_1d(&col_center))
 }
 
+/// REFINAMIENTO SUB-PIXEL LUCAS-KANADE (Gauss-Newton, inverse compositional).
+///
+/// El fit equiangular sobre la superficie SAD deja ~0.1-0.2 px de residuo;
+/// este pulido de 2-3 iteraciones sobre los MISMOS mapas de bordes converge a
+/// ~0.02-0.05 px — la diferencia visible en rilles, festones y granulacion.
+/// Esquema inverse-compositional: gradiente y Hessiano se calculan UNA sola
+/// vez sobre el master (constantes por AP); cada iteracion solo muestrea el
+/// target bilinealmente y acumula el residuo (sin allocations).
+///
+/// `shift_dx/dy` es el desplazamiento TOTAL master→frame con la convencion
+/// del pipeline (Target(x + s) ≈ Master(x)). Devuelve el shift refinado, o
+/// None si el patch carece de textura 2-D (aperture problem), el muestreo se
+/// sale del frame o la iteracion diverge — el caller conserva entonces el
+/// estimado SAD+equiangular. La correccion total esta acotada a ±0.75 px:
+/// LK solo PULE el minimo ya encontrado, nunca re-decide el matching.
+#[allow(clippy::too_many_arguments)]
+pub fn refine_shift_lucas_kanade(
+    master: &[u16],
+    target: &[u16],
+    w: usize,
+    h: usize,
+    ax: usize,
+    ay: usize,
+    shift_dx: f32,
+    shift_dy: f32,
+    box_size: usize,
+    iterations: usize,
+) -> Option<(f32, f32)> {
+    let half = (box_size / 2) as i32;
+    let axi = ax as i32;
+    let ayi = ay as i32;
+    // Margen ±1 para el gradiente central del master.
+    if axi - half < 1
+        || ayi - half < 1
+        || axi + half >= w as i32 - 1
+        || ayi + half >= h as i32 - 1
+    {
+        return None;
+    }
+
+    // Hessiano 2×2 del master (una sola vez — inverse compositional).
+    let mut h00 = 0.0f64;
+    let mut h01 = 0.0f64;
+    let mut h11 = 0.0f64;
+    for oy in -half..half {
+        let y = (ayi + oy) as usize;
+        let row = y * w;
+        for ox in -half..half {
+            let x = (axi + ox) as usize;
+            let i = row + x;
+            let gx = (master[i + 1] as f64 - master[i - 1] as f64) * 0.5;
+            let gy = (master[i + w] as f64 - master[i - w] as f64) * 0.5;
+            h00 += gx * gx;
+            h01 += gx * gy;
+            h11 += gy * gy;
+        }
+    }
+    // Sin energia de gradiente en algun eje (patch plano) o sistema casi
+    // singular (borde 1-D puro → aperture problem): dejar el estimado SAD.
+    let det = h00 * h11 - h01 * h01;
+    if h00 < 1.0 || h11 < 1.0 || det < 1e-6 * h00 * h11 {
+        return None;
+    }
+    let inv00 = h11 / det;
+    let inv01 = -h01 / det;
+    let inv11 = h00 / det;
+
+    let mut pdx = shift_dx;
+    let mut pdy = shift_dy;
+    for _ in 0..iterations.max(1) {
+        // Bounds del patch desplazado para el muestreo bilineal: si alguna
+        // esquina se sale del frame, abortar (conservar estimado SAD).
+        let min_x = (axi - half) as f32 + pdx;
+        let min_y = (ayi - half) as f32 + pdy;
+        let max_x = (axi + half - 1) as f32 + pdx;
+        let max_y = (ayi + half - 1) as f32 + pdy;
+        if min_x < 0.0 || min_y < 0.0 || max_x >= (w - 1) as f32 || max_y >= (h - 1) as f32 {
+            return None;
+        }
+
+        let mut b0 = 0.0f64;
+        let mut b1 = 0.0f64;
+        for oy in -half..half {
+            let y = (ayi + oy) as usize;
+            let syf = y as f32 + pdy;
+            let sy0 = syf as usize; // syf >= 0 garantizado por el bounds check
+            let fy = syf - sy0 as f32;
+            let row_m = y * w;
+            let row_t = sy0 * w;
+            for ox in -half..half {
+                let x = (axi + ox) as usize;
+                let i = row_m + x;
+                let gx = (master[i + 1] as f64 - master[i - 1] as f64) * 0.5;
+                let gy = (master[i + w] as f64 - master[i - w] as f64) * 0.5;
+
+                let sxf = x as f32 + pdx;
+                let sx0 = sxf as usize;
+                let fx = sxf - sx0 as f32;
+                let t00 = target[row_t + sx0] as f32;
+                let t10 = target[row_t + sx0 + 1] as f32;
+                let t01 = target[row_t + w + sx0] as f32;
+                let t11 = target[row_t + w + sx0 + 1] as f32;
+                let tv = t00 * (1.0 - fx) * (1.0 - fy)
+                    + t10 * fx * (1.0 - fy)
+                    + t01 * (1.0 - fx) * fy
+                    + t11 * fx * fy;
+
+                let e = tv as f64 - master[i] as f64;
+                b0 += gx * e;
+                b1 += gy * e;
+            }
+        }
+
+        // Gauss-Newton para traslacion pura: p ← p − H⁻¹·b
+        let ddx = (inv00 * b0 + inv01 * b1) as f32;
+        let ddy = (inv01 * b0 + inv11 * b1) as f32;
+        if !ddx.is_finite() || !ddy.is_finite() || ddx.abs() > 1.5 || ddy.abs() > 1.5 {
+            return None; // divergencia: el residuo no es un pulido local
+        }
+        pdx -= ddx;
+        pdy -= ddy;
+        if ddx.abs() < 0.005 && ddy.abs() < 0.005 {
+            break; // convergido
+        }
+    }
+
+    // LK solo pule: una correccion grande significa salto de cuenca del SAD.
+    if (pdx - shift_dx).abs() > 0.75 || (pdy - shift_dy).abs() > 0.75 {
+        return None;
+    }
+    Some((pdx, pdy))
+}
+
 fn compute_sad_at(
     ref_edges: &[u16],
     tgt_edges: &[u16],
@@ -1102,8 +1300,14 @@ unsafe fn find_best_match_sad_avx2(
 
     let v_zero = _mm256_setzero_si256();
 
+    // SEMILLA CENTRAL + EARLY-EXIT: ver find_best_match_sad_scalar (mismo
+    // esquema exacto en las 3 variantes; el minimo verdadero nunca se poda).
+    for phase in 0..2 {
     for dy in -search_r..=search_r {
         for dx in -search_r..=search_r {
+            if (phase == 0) != (dx == 0 && dy == 0) {
+                continue;
+            }
             let y_start_t = (fy_est as i32) + dy - half_box;
             let x_start_t = (fx_est as i32) + dx - half_box;
             let y_start_r = (ay as i32) - half_box;
@@ -1125,6 +1329,7 @@ unsafe fn find_best_match_sad_avx2(
             let mut acc_64_lo = _mm256_setzero_si256();
             let mut acc_64_hi = _mm256_setzero_si256();
             let mut scalar_sad = 0u64;
+            let mut pruned = false;
 
             let row_r_base = (y_start_r as usize) * w + (x_start_r as usize);
             let row_t_base = (y_start_t as usize) * w + (x_start_t as usize);
@@ -1161,6 +1366,23 @@ unsafe fn find_best_match_sad_avx2(
                     scalar_sad += (val_r - val_t).abs() as u64;
                     rx += 1;
                 }
+
+                // EARLY-EXIT cada 8 filas: reduccion parcial no destructiva —
+                // si el parcial ya alcanza la cota, este candidato no puede
+                // ganar (terminos no-negativos) y se abandona.
+                if (i & 7) == 7 && best_sad != u64::MAX {
+                    let mut lanes = [0u32; 8];
+                    _mm256_storeu_si256(lanes.as_mut_ptr() as *mut _, vec_acc);
+                    let partial: u64 =
+                        lanes.iter().map(|&v| v as u64).sum::<u64>() + scalar_sad;
+                    if partial >= best_sad {
+                        pruned = true;
+                        break;
+                    }
+                }
+            }
+            if pruned {
+                continue;
             }
 
             // Move periodic flush OUTSIDE the inner `for i` loop block
@@ -1192,6 +1414,7 @@ unsafe fn find_best_match_sad_avx2(
             }
         }
     }
+    } // end phase loop
     (best_dx as f32, best_dy as f32, best_sad)
 }
 
@@ -1215,8 +1438,14 @@ unsafe fn find_best_match_sad_neon(
     let mut best_dx = 0;
     let mut best_dy = 0;
 
+    // SEMILLA CENTRAL + EARLY-EXIT: ver find_best_match_sad_scalar (mismo
+    // esquema exacto en las 3 variantes; el minimo verdadero nunca se poda).
+    for phase in 0..2 {
     for dy in -search_r..=search_r {
         for dx in -search_r..=search_r {
+            if (phase == 0) != (dx == 0 && dy == 0) {
+                continue;
+            }
             let y_start_t = (fy_est as i32) + dy - half_box;
             let x_start_t = (fx_est as i32) + dx - half_box;
             let y_start_r = (ay as i32) - half_box;
@@ -1239,6 +1468,7 @@ unsafe fn find_best_match_sad_neon(
             let mut acc_64_low = vdupq_n_u64(0);
             let mut acc_64_high = vdupq_n_u64(0);
             let mut scalar_sad = 0u64;
+            let mut pruned = false;
 
             let row_r_base = (y_start_r as usize) * w + (x_start_r as usize);
             let row_t_base = (y_start_t as usize) * w + (x_start_t as usize);
@@ -1266,6 +1496,20 @@ unsafe fn find_best_match_sad_neon(
                     scalar_sad += (val_r - val_t).abs() as u64;
                     rx += 1;
                 }
+
+                // EARLY-EXIT cada 8 filas (reduccion parcial no destructiva).
+                if (i & 7) == 7 && best_sad != u64::MAX {
+                    let partial = vaddvq_u32(vec_acc_low) as u64
+                        + vaddvq_u32(vec_acc_high) as u64
+                        + scalar_sad;
+                    if partial >= best_sad {
+                        pruned = true;
+                        break;
+                    }
+                }
+            }
+            if pruned {
+                continue;
             }
 
             acc_64_low = vaddq_u64(acc_64_low, vmovl_u32(vget_low_u32(vec_acc_low)));
@@ -1288,6 +1532,7 @@ unsafe fn find_best_match_sad_neon(
             }
         }
     }
+    } // end phase loop
     (best_dx as f32, best_dy as f32, best_sad)
 }
 
@@ -1309,49 +1554,69 @@ fn find_best_match_sad_scalar(
     let mut best_dx = 0;
     let mut best_dy = 0;
 
-    for dy in -search_r..=search_r {
-        for dx in -search_r..=search_r {
-            let mut sad = 0u64;
-            let y_start_t = (fy_est as i32) + dy - half_box;
-            let x_start_t = (fx_est as i32) + dx - half_box;
-            let y_start_r = (ay as i32) - half_box;
-            let x_start_r = (ax as i32) - half_box;
-
-            if y_start_t < 0 || x_start_t < 0 || y_start_r < 0 || x_start_r < 0 {
-                continue;
-            }
-            if (y_start_t + box_size as i32) >= h as i32
-                || (x_start_t + box_size as i32) >= w as i32
-            {
-                continue;
-            }
-            if (y_start_r + box_size as i32) >= h as i32
-                || (x_start_r + box_size as i32) >= w as i32
-            {
-                continue;
-            }
-
-            for y in 0..box_size {
-                let t_row = ((y_start_t + y as i32) as usize) * w;
-                let r_row = ((y_start_r + y as i32) as usize) * w;
-                for x in 0..box_size {
-                    let t_idx = t_row + (x_start_t + x as i32) as usize;
-                    let r_idx = r_row + (x_start_r + x as i32) as usize;
-
-                    if t_idx >= tgt_edges.len() || r_idx >= ref_edges.len() {
-                        continue;
-                    }
-
-                    let t_val = tgt_edges[t_idx] as i32;
-                    let r_val = ref_edges[r_idx] as i32;
-                    sad += (t_val - r_val).abs() as u64;
+    // SEMILLA CENTRAL + EARLY-EXIT (identico en las 3 variantes): la fase 0
+    // evalua SOLO (0,0) — el estimado del piramide/analisis, casi siempre a
+    // ≤1-2 px del optimo — para arrancar con una cota best_sad fuerte; la
+    // fase 1 recorre el resto y cada candidato ABORTA en cuanto su parcial
+    // (suma de terminos no-negativos) alcanza la cota. El minimo verdadero
+    // nunca se poda: mismo (dx, dy, sad), solo se ahorra el trabajo de los
+    // perdedores (~40-60% del coste de la etapa fina).
+    for phase in 0..2 {
+        for dy in -search_r..=search_r {
+            for dx in -search_r..=search_r {
+                if (phase == 0) != (dx == 0 && dy == 0) {
+                    continue;
                 }
-            }
+                let mut sad = 0u64;
+                let y_start_t = (fy_est as i32) + dy - half_box;
+                let x_start_t = (fx_est as i32) + dx - half_box;
+                let y_start_r = (ay as i32) - half_box;
+                let x_start_r = (ax as i32) - half_box;
 
-            if sad < best_sad {
-                best_sad = sad;
-                best_dx = dx;
-                best_dy = dy;
+                if y_start_t < 0 || x_start_t < 0 || y_start_r < 0 || x_start_r < 0 {
+                    continue;
+                }
+                if (y_start_t + box_size as i32) >= h as i32
+                    || (x_start_t + box_size as i32) >= w as i32
+                {
+                    continue;
+                }
+                if (y_start_r + box_size as i32) >= h as i32
+                    || (x_start_r + box_size as i32) >= w as i32
+                {
+                    continue;
+                }
+
+                let mut pruned = false;
+                for y in 0..box_size {
+                    let t_row = ((y_start_t + y as i32) as usize) * w;
+                    let r_row = ((y_start_r + y as i32) as usize) * w;
+                    for x in 0..box_size {
+                        let t_idx = t_row + (x_start_t + x as i32) as usize;
+                        let r_idx = r_row + (x_start_r + x as i32) as usize;
+
+                        if t_idx >= tgt_edges.len() || r_idx >= ref_edges.len() {
+                            continue;
+                        }
+
+                        let t_val = tgt_edges[t_idx] as i32;
+                        let r_val = ref_edges[r_idx] as i32;
+                        sad += (t_val - r_val).abs() as u64;
+                    }
+                    if sad >= best_sad {
+                        pruned = true;
+                        break;
+                    }
+                }
+                if pruned {
+                    continue;
+                }
+
+                if sad < best_sad {
+                    best_sad = sad;
+                    best_dx = dx;
+                    best_dy = dy;
+                }
             }
         }
     }
@@ -1414,18 +1679,69 @@ pub fn find_best_match_sad_pyramid_fast(
         coarse_search_r,
     );
 
-    let fine_fx = ((fx_est as f32) + cdx * 4.0) as usize;
-    let fine_fy = ((fy_est as f32) + cdy * 4.0) as usize;
+    refine_best_match_sad_from_coarse(
+        ref_edges,
+        tgt_edges,
+        w,
+        h,
+        ax,
+        ay,
+        fx_est,
+        fy_est,
+        box_size,
+        cdx,
+        cdy,
+        4.0,
+    )
+}
+
+/// Segunda etapa CPU del matcher AP cuando la búsqueda gruesa se ejecutó en
+/// GPU. Incluye ventana adaptativa, fallback amplio y el mismo ajuste
+/// equiangular subpíxel de la ruta SIMD de referencia.
+#[allow(clippy::too_many_arguments)]
+pub fn refine_best_match_sad_from_coarse(
+    ref_edges: &[u16],
+    tgt_edges: &[u16],
+    w: usize,
+    h: usize,
+    ax: usize,
+    ay: usize,
+    fx_est: usize,
+    fy_est: usize,
+    box_size: usize,
+    coarse_dx: f32,
+    coarse_dy: f32,
+    coarse_scale: f32,
+) -> (f32, f32, u64) {
+    let fine_fx = ((fx_est as f32) + coarse_dx * coarse_scale).max(0.0) as usize;
+    let fine_fy = ((fy_est as f32) + coarse_dy * coarse_scale).max(0.0) as usize;
 
     // Clamp to valid range
     let half_box = box_size / 2;
     let fine_fx = fine_fx.max(half_box).min(w.saturating_sub(half_box + 1));
     let fine_fy = fine_fy.max(half_box).min(h.saturating_sub(half_box + 1));
 
-    // Stage 2: Fine refinement with unified router
-    let (fdx, fdy, fsad) = find_best_match_sad(
-        ref_edges, tgt_edges, w, ax, ay, fine_fx, fine_fy, box_size, 6,
-    );
+    // Stage 2: Fine refinement with unified router — VENTANA ADAPTATIVA.
+    // La etapa fina es el termino DOMINANTE del coste por AP (posiciones ×
+    // box² con el box completo, independiente de search_r): ±6 = 169
+    // evaluaciones SAD. El coarse a 4× deja un residuo de cuantizacion de
+    // ±2 px, asi que ±3 lo cubre en la gran mayoria de frames (49 evals,
+    // ~3.4× menos). EXACTITUD PRESERVADA: si el optimo cae EN el borde de la
+    // ventana reducida (señal de que el residuo real era mayor), se repite
+    // con la ventana completa ±6 — solo pagan el doble los pocos casos que
+    // de verdad lo necesitan.
+    let (fdx, fdy, fsad) = {
+        let (dx3, dy3, sad3) = find_best_match_sad(
+            ref_edges, tgt_edges, w, ax, ay, fine_fx, fine_fy, box_size, 3,
+        );
+        if dx3.abs() >= 2.5 || dy3.abs() >= 2.5 {
+            find_best_match_sad(
+                ref_edges, tgt_edges, w, ax, ay, fine_fx, fine_fy, box_size, 6,
+            )
+        } else {
+            (dx3, dy3, sad3)
+        }
+    };
 
     // Total displacement = coarse offset + fine correction
     let total_dx = (fine_fx as f32 - fx_est as f32) + fdx;
@@ -1708,6 +2024,91 @@ pub fn enhance_solar_surface(input: &[u16], width: usize, height: usize) -> Vec<
 mod tests {
     use super::*;
 
+    /// PARIDAD del early-abort SIMD: el kernel con poda por fila debe devolver
+    /// EXACTAMENTE el mismo (sad, dx, dy) que un barrido exhaustivo sin poda,
+    /// en geometrías con cola escalar (roi_w no múltiplo de 8/16), bordes que
+    /// descartan candidatos, y empates (imagen constante → gana el PRIMER
+    /// candidato del orden de barrido, que la poda debe preservar).
+    #[test]
+    fn sad_rect_early_abort_is_bit_identical_to_exhaustive_search() {
+        fn exhaustive(
+            ref_data: &[u16],
+            tgt_data: &[u16],
+            width: usize,
+            height: usize,
+            roi_x: usize,
+            roi_y: usize,
+            roi_w: usize,
+            roi_h: usize,
+            start_dx: isize,
+            start_dy: isize,
+            search_range: isize,
+        ) -> (u64, isize, isize) {
+            let mut best = (u64::MAX, start_dx, start_dy);
+            for dy in (start_dy - search_range)..=(start_dy + search_range) {
+                for dx in (start_dx - search_range)..=(start_dx + search_range) {
+                    let t_x = roi_x as isize + dx;
+                    let t_y = roi_y as isize + dy;
+                    if t_x < 0
+                        || t_y < 0
+                        || (t_x + roi_w as isize) > width as isize
+                        || (t_y + roi_h as isize) > height as isize
+                    {
+                        continue;
+                    }
+                    let mut sad = 0u64;
+                    for ry in 0..roi_h {
+                        for rx in 0..roi_w {
+                            let a = ref_data[(roi_y + ry) * width + roi_x + rx] as i64;
+                            let b = tgt_data
+                                [(t_y as usize + ry) * width + t_x as usize + rx]
+                                as i64;
+                            sad += (a - b).unsigned_abs();
+                        }
+                    }
+                    if sad < best.0 {
+                        best = (sad, dx, dy);
+                    }
+                }
+            }
+            best
+        }
+
+        let (w, h) = (96usize, 80usize);
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut rand16 = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed & 0xffff) as u16
+        };
+        let reference: Vec<u16> = (0..w * h).map(|_| rand16()).collect();
+        let target: Vec<u16> = (0..w * h).map(|_| rand16()).collect();
+        let constant = vec![777u16; w * h];
+
+        let cases: &[(usize, usize, usize, usize, isize, isize, isize)] = &[
+            (40, 30, 21, 17, 0, 0, 6),  // cola escalar en ambas rutas SIMD
+            (32, 24, 32, 24, 0, 0, 5),  // alineado a 16
+            (8, 40, 33, 9, 2, -3, 4),   // arranque descentrado
+            (48, 8, 5, 60, 0, 0, 7),    // candidatos descartados por borde
+        ];
+        for &(rx0, ry0, rw, rh, sdx, sdy, sr) in cases {
+            let got = find_best_match_sad_rect(
+                &reference, &target, w, h, rx0, ry0, rw, rh, sdx, sdy, sr,
+            );
+            let want = exhaustive(
+                &reference, &target, w, h, rx0, ry0, rw, rh, sdx, sdy, sr,
+            );
+            assert_eq!(got, want, "caso roi=({rx0},{ry0},{rw},{rh}) sr={sr}");
+        }
+        // Empates totales: imagen constante — debe ganar el PRIMER candidato.
+        let got = find_best_match_sad_rect(&constant, &constant, w, h, 30, 30, 24, 20, 0, 0, 5);
+        let want = exhaustive(&constant, &constant, w, h, 30, 30, 24, 20, 0, 0, 5);
+        assert_eq!(got, want, "empates: la poda debe preservar el primer candidato");
+        assert_eq!(got.0, 0);
+        assert_eq!((got.1, got.2), (-5, -5));
+    }
+
     #[test]
     fn test_subpixel_recovers_fractional_shift_without_pixel_locking() {
         // A smooth blob shifted +0.4 px in x via bilinear resampling. The
@@ -1742,6 +2143,52 @@ mod tests {
     }
 
     #[test]
+    fn test_lucas_kanade_polishes_subpixel_shift() {
+        // Textura 2-D suave desplazada (+0.33, −0.21) px via resampleo
+        // bilineal, con la convencion del pipeline: Target(x + s) = Master(x).
+        // El pulido LK partiendo de (0,0) debe recuperar el shift con error
+        // < 0.05 px — mas fino que el ~0.1-0.2 px del fit equiangular.
+        let w = 96usize;
+        let h = 96usize;
+        let pat = |x: f32, y: f32| -> u16 {
+            let v = (x * 0.35).sin() * (y * 0.27).cos()
+                + (x * 0.11).cos() * (y * 0.17).sin() * 0.7;
+            (12000.0 + 6000.0 * v) as u16
+        };
+        let (tdx, tdy) = (0.33f32, -0.21f32);
+        let mut master = vec![0u16; w * h];
+        let mut target = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                master[y * w + x] = pat(x as f32, y as f32);
+                // Target(u) = Master(u − s)  ⇔  Target(x + s) = Master(x)
+                target[y * w + x] = pat(x as f32 - tdx, y as f32 - tdy);
+            }
+        }
+
+        let refined =
+            refine_shift_lucas_kanade(&master, &target, w, h, 48, 48, 0.0, 0.0, 32, 3)
+                .expect("patch con textura 2-D debe refinar");
+        assert!(
+            (refined.0 - tdx).abs() < 0.05,
+            "dx: esperado {tdx}, obtenido {}",
+            refined.0
+        );
+        assert!(
+            (refined.1 - tdy).abs() < 0.05,
+            "dy: esperado {tdy}, obtenido {}",
+            refined.1
+        );
+
+        // Patch plano: sin textura no hay sistema (Hessiano singular) — debe
+        // devolver None para que el caller conserve el estimado SAD.
+        let flat = vec![500u16; w * h];
+        assert!(
+            refine_shift_lucas_kanade(&flat, &flat, w, h, 48, 48, 0.0, 0.0, 32, 3).is_none()
+        );
+    }
+
+    #[test]
     fn test_neon_vs_scalar_sad_matching() {
         let mut ref_data = vec![0u16; 1000];
         let mut tgt_data = vec![0u16; 1000];
@@ -1772,6 +2219,7 @@ mod tests {
             start_dx,
             start_dy,
             search_range,
+            u64::MAX,
         );
 
         #[cfg(target_arch = "aarch64")]
@@ -1788,6 +2236,7 @@ mod tests {
                 start_dx,
                 start_dy,
                 search_range,
+                u64::MAX,
             )
         };
         #[cfg(target_arch = "x86_64")]

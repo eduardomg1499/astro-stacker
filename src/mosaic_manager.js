@@ -671,7 +671,9 @@ export class MosaicManager {
                 tile.path = result.path;
                 tile.type = 'image';
                 tile.status = 'ready';
-                tile.src = result.preview_base64;
+                // process_batch_entry ya no manda preview base64: cargar el PNG
+                // guardado via asset protocol (fallback al base64 por compat).
+                tile.src = result.preview_base64 || convertFileSrc(result.path);
                 successCount++;
 
                 if (el) el.innerHTML = "";

@@ -53,6 +53,10 @@ if [[ ${#missing_bins[@]} -gt 0 ]]; then
 fi
 echo "-> Binarios FFmpeg ($ARCH_LABEL) presentes; se empaquetarán en el .app."
 
+# Una release Hybrid v2 no puede publicarse con los kernels GPU sin ejecutar.
+# El gate guarda los logs y aborta ante cualquier fallo de paridad física.
+scripts/release/verify-hybrid-v2-gate.sh
+
 scripts/apple/build-macos-updater-artifact.sh
 scripts/apple/create-custom-macos-dmg.sh
 npm run release:latest-json

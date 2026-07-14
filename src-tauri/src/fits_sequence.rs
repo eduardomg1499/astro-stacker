@@ -10,6 +10,7 @@ pub struct FitsSequenceReader {
     pub width: usize,
     pub height: usize,
     pub bytes_per_pixel: usize,
+    pub sample_bits: usize,
     pub frame_count: usize,
     pub color_id: i32,
     pub is_color: bool,
@@ -72,6 +73,7 @@ impl FitsSequenceReader {
             width: meta.width,
             height: meta.height,
             bytes_per_pixel: meta.bytes_per_pixel,
+            sample_bits: meta.sample_bits,
             frame_count,
             color_id: meta.color_id,
             is_color: meta.is_color,
@@ -141,6 +143,7 @@ impl FitsSequenceReader {
             width,
             height,
             bytes_per_pixel: total_bpp,
+            sample_bits: bitpix.unsigned_abs() as usize,
             is_color,
             color_id,
         })
@@ -276,6 +279,7 @@ struct FitsMeta {
     width: usize,
     height: usize,
     bytes_per_pixel: usize,
+    sample_bits: usize,
     is_color: bool,
     color_id: i32,
 }

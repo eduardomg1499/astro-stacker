@@ -10,6 +10,7 @@ pub struct AviInfo {
     pub height: usize,
     pub frame_count: usize,
     pub bytes_per_pixel: usize,
+    pub sample_bits: usize,
     pub color_id: i32,
     pub fps: f64,
 }
@@ -210,7 +211,8 @@ impl AviReader {
                 width,
                 height,
                 frame_count: frame_offsets.len(),
-                bytes_per_pixel,
+            bytes_per_pixel,
+            sample_bits: bit_count,
                 color_id,
                 fps,
             },

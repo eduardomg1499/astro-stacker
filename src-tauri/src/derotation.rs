@@ -68,11 +68,58 @@ pub const MARS: PlanetaryBody = PlanetaryBody {
     oblateness: 0.00589,
 };
 
+/// Venus: la superficie sólida gira en 243 días (retrógrada), pero el imaging
+/// amateur en UV/IR sigue los TOPES DE NUBE, que super-rotan retrógrados con un
+/// periodo de ~4.4 días. Para derotar rasgos de nube hay que usar la tasa
+/// ATMOSFÉRICA, no la sólida (si no, apenas rotaría y la derotación fallaría).
+/// El "CM" resultante es la longitud del patrón de nubes, no una superficie fija.
+pub const VENUS: PlanetaryBody = PlanetaryBody {
+    name: "Venus",
+    equatorial_radius_km: 6051.8,
+    polar_radius_km: 6051.8,
+    rotation_rates: [-81.818_18, -81.818_18, -81.818_18], // 360/4.4 días, retrógrada
+    pole_ra_deg: 272.76,
+    pole_dec_deg: 67.16,
+    w0_deg: [160.20, 160.20, 160.20],
+    w_dot: [-81.818_18, -81.818_18, -81.818_18],
+    oblateness: 0.0,
+};
+
+/// Uranus: rotación RETRÓGRADA (eje volcado ~98°). IAU 2015: W = 203.81 − 501.7928812·d.
+pub const URANUS: PlanetaryBody = PlanetaryBody {
+    name: "Uranus",
+    equatorial_radius_km: 25559.0,
+    polar_radius_km: 24973.0,
+    rotation_rates: [-501.792_881_2, -501.792_881_2, -501.792_881_2],
+    pole_ra_deg: 257.311,
+    pole_dec_deg: -15.175,
+    w0_deg: [203.81, 203.81, 203.81],
+    w_dot: [-501.792_881_2, -501.792_881_2, -501.792_881_2],
+    oblateness: 0.02293,
+};
+
+/// Neptune: la W IAU se refiere a los rasgos ATMOSFÉRICOS observados (Sistema II),
+/// W = 253.18 + 536.3128492·d (periodo ~16.11 h). Se omite el término −0.48·sinN.
+pub const NEPTUNE: PlanetaryBody = PlanetaryBody {
+    name: "Neptune",
+    equatorial_radius_km: 24764.0,
+    polar_radius_km: 24341.0,
+    rotation_rates: [536.312_849_2, 536.312_849_2, 536.312_849_2],
+    pole_ra_deg: 299.36,
+    pole_dec_deg: 43.46,
+    w0_deg: [253.18, 253.18, 253.18],
+    w_dot: [536.312_849_2, 536.312_849_2, 536.312_849_2],
+    oblateness: 0.0171,
+};
+
 pub fn get_planet(id: &str) -> Option<&'static PlanetaryBody> {
     match id.to_lowercase().as_str() {
         "jupiter" => Some(&JUPITER),
         "saturn" => Some(&SATURN),
         "mars" => Some(&MARS),
+        "venus" => Some(&VENUS),
+        "uranus" => Some(&URANUS),
+        "neptune" => Some(&NEPTUNE),
         _ => None,
     }
 }
@@ -222,6 +269,145 @@ pub fn earth_ecliptic_longitude(t_centuries: f64) -> f64 {
 /// Uses IAU 2015 rotation elements + light-time corrected position.
 ///
 /// Returns (CM1, CM2, CM3) in degrees [0, 360).
+// =============================================================================
+// EFEMÉRIDES KEPLERIANAS (Standish/JPL, elementos J2000 + tasas/siglo, válido
+// ~1800–2050). Sustituye el modelo de órbita circular por órbitas ELÍPTICAS con
+// inclinación (excentricidad + ecuación de Kepler) → posiciones geocéntricas
+// (α, δ, Δ) precisas a ~1 arcmin, más que suficiente para B0/CM/diámetro. No es
+// VSOP87 completo (arcsec) pero es la mejora que de verdad importa para derotar.
+// =============================================================================
+
+#[derive(Clone, Copy)]
+struct KeplerElements {
+    a0: f64,
+    a_dot: f64, // semieje mayor (AU) + tasa/siglo
+    e0: f64,
+    e_dot: f64, // excentricidad
+    i0: f64,
+    i_dot: f64, // inclinación (deg)
+    l0: f64,
+    l_dot: f64, // longitud media (deg)
+    peri0: f64,
+    peri_dot: f64, // longitud del perihelio ϖ (deg)
+    node0: f64,
+    node_dot: f64, // longitud del nodo ascendente Ω (deg)
+}
+
+/// Baricentro Tierra-Luna (Standish).
+const EARTH_ELEMENTS: KeplerElements = KeplerElements {
+    a0: 1.00000261, a_dot: 0.00000562,
+    e0: 0.01671123, e_dot: -0.00004392,
+    i0: -0.00001531, i_dot: -0.01294668,
+    l0: 100.46457166, l_dot: 35999.37244981,
+    peri0: 102.93768193, peri_dot: 0.32327364,
+    node0: 0.0, node_dot: 0.0,
+};
+
+fn planet_elements(name: &str) -> Option<KeplerElements> {
+    Some(match name {
+        "Mercury" => KeplerElements {
+            a0: 0.38709927, a_dot: 0.00000037, e0: 0.20563593, e_dot: 0.00001906,
+            i0: 7.00497902, i_dot: -0.00594749, l0: 252.25032350, l_dot: 149472.67411175,
+            peri0: 77.45779628, peri_dot: 0.16047689, node0: 48.33076593, node_dot: -0.12534081,
+        },
+        "Venus" => KeplerElements {
+            a0: 0.72333566, a_dot: 0.00000390, e0: 0.00677672, e_dot: -0.00004107,
+            i0: 3.39467605, i_dot: -0.00078890, l0: 181.97909950, l_dot: 58517.81538729,
+            peri0: 131.60246718, peri_dot: 0.00268329, node0: 76.67984255, node_dot: -0.27769418,
+        },
+        "Mars" => KeplerElements {
+            a0: 1.52371034, a_dot: 0.00001847, e0: 0.09339410, e_dot: 0.00007882,
+            i0: 1.84969142, i_dot: -0.00813131, l0: -4.55343205, l_dot: 19140.30268499,
+            peri0: -23.94362959, peri_dot: 0.44441088, node0: 49.55953891, node_dot: -0.29257343,
+        },
+        "Jupiter" => KeplerElements {
+            a0: 5.20288700, a_dot: -0.00011607, e0: 0.04838624, e_dot: -0.00013253,
+            i0: 1.30439695, i_dot: -0.00183714, l0: 34.39644051, l_dot: 3034.74612775,
+            peri0: 14.72847983, peri_dot: 0.21252668, node0: 100.47390909, node_dot: 0.20469106,
+        },
+        "Saturn" => KeplerElements {
+            a0: 9.53667594, a_dot: -0.00125060, e0: 0.05386179, e_dot: -0.00050991,
+            i0: 2.48599187, i_dot: 0.00193609, l0: 49.95424423, l_dot: 1222.49362201,
+            peri0: 92.59887831, peri_dot: -0.41897216, node0: 113.66242448, node_dot: -0.28867794,
+        },
+        "Uranus" => KeplerElements {
+            a0: 19.18916464, a_dot: -0.00196176, e0: 0.04725744, e_dot: -0.00004397,
+            i0: 0.77263783, i_dot: -0.00242939, l0: 313.23810451, l_dot: 428.48202785,
+            peri0: 170.95427630, peri_dot: 0.40805281, node0: 74.01692503, node_dot: 0.04240589,
+        },
+        "Neptune" => KeplerElements {
+            a0: 30.06992276, a_dot: 0.00026291, e0: 0.00859048, e_dot: 0.00005105,
+            i0: 1.77004347, i_dot: 0.00035372, l0: -55.12002969, l_dot: 218.45945325,
+            peri0: 44.96476227, peri_dot: -0.32241464, node0: 131.78422574, node_dot: -0.00508664,
+        },
+        _ => return None,
+    })
+}
+
+/// Posición heliocéntrica ECLÍPTICA (J2000) rectangular en AU, resolviendo la
+/// ecuación de Kepler (E = M + e·sinE) por Newton.
+fn kepler_heliocentric_ecliptic(el: &KeplerElements, jd: f64) -> [f64; 3] {
+    let t = (jd - 2451545.0) / 36525.0;
+    let a = el.a0 + el.a_dot * t;
+    let e = el.e0 + el.e_dot * t;
+    let inc = (el.i0 + el.i_dot * t).to_radians();
+    let l = el.l0 + el.l_dot * t;
+    let peri = el.peri0 + el.peri_dot * t;
+    let node = (el.node0 + el.node_dot * t).to_radians();
+    let arg_peri = (peri - (el.node0 + el.node_dot * t)).to_radians();
+    // Anomalía media en [-180,180].
+    let mut m = (l - peri) % 360.0;
+    if m > 180.0 {
+        m -= 360.0;
+    } else if m < -180.0 {
+        m += 360.0;
+    }
+    let m_rad = m.to_radians();
+    // Newton para E.
+    let mut ea = m_rad + e * m_rad.sin();
+    for _ in 0..12 {
+        let de = (m_rad - (ea - e * ea.sin())) / (1.0 - e * ea.cos());
+        ea += de;
+        if de.abs() < 1e-10 {
+            break;
+        }
+    }
+    // Posición en el plano orbital.
+    let x_orb = a * (ea.cos() - e);
+    let y_orb = a * (1.0 - e * e).max(0.0).sqrt() * ea.sin();
+    // Rotación ω (arg_peri) → i (inc) → Ω (node) al plano eclíptico.
+    let (cw, sw) = (arg_peri.cos(), arg_peri.sin());
+    let (co, so) = (node.cos(), node.sin());
+    let (ci, si) = (inc.cos(), inc.sin());
+    let x = (cw * co - sw * so * ci) * x_orb + (-sw * co - cw * so * ci) * y_orb;
+    let y = (cw * so + sw * co * ci) * x_orb + (-sw * so + cw * co * ci) * y_orb;
+    let z = (sw * si) * x_orb + (cw * si) * y_orb;
+    [x, y, z]
+}
+
+/// (α, δ) geocéntricas ECUATORIALES J2000 (radianes) y distancia Δ (AU) del
+/// planeta, con corrección de tiempo-luz iterada.
+fn geocentric_equatorial(el: &KeplerElements, jd: f64) -> (f64, f64, f64) {
+    let earth = kepler_heliocentric_ecliptic(&EARTH_ELEMENTS, jd);
+    let mut tau = 0.0f64;
+    let mut geo = [0.0f64; 3];
+    let mut dist = 1.0f64;
+    for _ in 0..3 {
+        let planet = kepler_heliocentric_ecliptic(el, jd - tau);
+        geo = [planet[0] - earth[0], planet[1] - earth[1], planet[2] - earth[2]];
+        dist = (geo[0] * geo[0] + geo[1] * geo[1] + geo[2] * geo[2]).sqrt().max(1e-6);
+        tau = dist * 0.005_775_518_3; // días-luz por AU
+    }
+    // Eclíptica → ecuatorial (oblicuidad J2000).
+    let eps = 23.439_291_1_f64.to_radians();
+    let xe = geo[0];
+    let ye = geo[1] * eps.cos() - geo[2] * eps.sin();
+    let ze = geo[1] * eps.sin() + geo[2] * eps.cos();
+    let alpha = ye.atan2(xe);
+    let delta = (ze / dist).clamp(-1.0, 1.0).asin();
+    (alpha, delta, dist)
+}
+
 pub fn calculate_central_meridian(planet: &PlanetaryBody, jd: f64) -> (f64, f64, f64) {
     let d = jd_to_days(jd);
     let t = jd_to_centuries(jd);
@@ -231,19 +417,18 @@ pub fn calculate_central_meridian(planet: &PlanetaryBody, jd: f64) -> (f64, f64,
     let planet_lon = planet_ecliptic_longitude(planet, t).to_radians();
     let earth_lon = earth_ecliptic_longitude(t).to_radians();
 
-    // Approximate semi-major axes (AU)
-    let (a_planet, a_earth) = match planet.name {
-        "Jupiter" => (5.2026, 1.0000),
-        "Saturn" => (9.5549, 1.0000),
-        "Mars" => (1.5237, 1.0000),
-        _ => (5.2026, 1.0000),
+    // Distancia geocéntrica: efeméride kepleriana precisa si hay elementos; si
+    // no, aproximación de órbita circular (law of cosines) como respaldo.
+    let dist_au = match planet_elements(planet.name) {
+        Some(el) => geocentric_equatorial(&el, jd).2,
+        None => {
+            let (a_planet, a_earth) = (5.2026_f64, 1.0000_f64);
+            let delta_lon = planet_lon - earth_lon;
+            (a_planet * a_planet + a_earth * a_earth
+                - 2.0 * a_planet * a_earth * delta_lon.cos())
+            .sqrt()
+        }
     };
-
-    // Distance via law of cosines (ecliptic plane approximation)
-    let delta_lon = planet_lon - earth_lon;
-    let dist_au = (a_planet * a_planet + a_earth * a_earth
-        - 2.0 * a_planet * a_earth * delta_lon.cos())
-    .sqrt();
 
     // Light-time in days (AU / speed_of_light_AU_per_day)
     let light_time_days = dist_au / 173.144_633;
@@ -337,49 +522,54 @@ fn normalize_signed_deg(mut deg: f64) -> f64 {
 /// It is not a full JPL/SPICE ephemeris, but gives the user realistic starting values and exposes
 /// them for manual correction when the camera angle is unknown.
 pub fn calculate_observer_geometry(planet: &PlanetaryBody, jd: f64) -> ObserverGeometry {
-    let t = jd_to_centuries(jd);
-    let planet_lon = planet_ecliptic_longitude(planet, t).to_radians();
-    let earth_lon = earth_ecliptic_longitude(t).to_radians();
-    let (a_planet, planet_radius_km) = match planet.name {
-        "Jupiter" => (5.2026, planet.equatorial_radius_km),
-        "Saturn" => (9.5549, planet.equatorial_radius_km),
-        "Mars" => (1.5237, planet.equatorial_radius_km),
-        _ => (5.2026, planet.equatorial_radius_km),
+    // (α, δ) geocéntricas + distancias, con efeméride kepleriana precisa. Si el
+    // planeta no tiene elementos (no debería), respaldo al modelo circular.
+    let (ra, dec, distance_au, sun_dist_au) = match planet_elements(planet.name) {
+        Some(el) => {
+            let (ra, dec, dist) = geocentric_equatorial(&el, jd);
+            let helio = kepler_heliocentric_ecliptic(&el, jd);
+            let sun_dist =
+                (helio[0] * helio[0] + helio[1] * helio[1] + helio[2] * helio[2]).sqrt();
+            (ra, dec, dist, sun_dist)
+        }
+        None => {
+            let t = jd_to_centuries(jd);
+            let planet_lon = planet_ecliptic_longitude(planet, t).to_radians();
+            let earth_lon = earth_ecliptic_longitude(t).to_radians();
+            let a_planet = 5.2026_f64;
+            let geo_x = a_planet * planet_lon.cos() - earth_lon.cos();
+            let geo_y = a_planet * planet_lon.sin() - earth_lon.sin();
+            let dist = (geo_x * geo_x + geo_y * geo_y).sqrt().max(0.001);
+            let obliquity = 23.439_291_f64.to_radians();
+            let (eq_x, eq_y, eq_z) = (geo_x, geo_y * obliquity.cos(), geo_y * obliquity.sin());
+            let ra = eq_y.atan2(eq_x);
+            let dec = eq_z.atan2((eq_x * eq_x + eq_y * eq_y).sqrt());
+            (ra, dec, dist, a_planet)
+        }
     };
-    let earth_x = earth_lon.cos();
-    let earth_y = earth_lon.sin();
-    let planet_x = a_planet * planet_lon.cos();
-    let planet_y = a_planet * planet_lon.sin();
-    let geo_x = planet_x - earth_x;
-    let geo_y = planet_y - earth_y;
-    let distance_au = (geo_x * geo_x + geo_y * geo_y).sqrt().max(0.001);
-
-    let obliquity = 23.439_291_f64.to_radians();
-    let eq_x = geo_x;
-    let eq_y = geo_y * obliquity.cos();
-    let eq_z = geo_y * obliquity.sin();
-    let ra = eq_y.atan2(eq_x);
-    let dec = eq_z.atan2((eq_x * eq_x + eq_y * eq_y).sqrt());
 
     let pole_ra = planet.pole_ra_deg.to_radians();
     let pole_dec = planet.pole_dec_deg.to_radians();
     let dra = pole_ra - ra;
 
+    // B0 = latitud planetocéntrica del punto sub-Terrestre (inclinación del eje
+    // hacia el observador); P = ángulo de posición del polo norte en el cielo.
     let b0 = (pole_dec.sin() * dec.sin() + pole_dec.cos() * dec.cos() * dra.cos()).asin();
     let p = (pole_dec.cos() * dra.sin())
         .atan2(pole_dec.sin() * dec.cos() - pole_dec.cos() * dec.sin() * dra.cos());
 
-    // Circular-orbit phase approximation via triangle Sun-Planet-Earth.
-    let sun_planet_au = a_planet;
+    // Fase Sol-planeta-observador con distancias REALES (radio heliocéntrico).
     let sun_earth_au = 1.0_f64;
-    let cos_phase = ((sun_planet_au * sun_planet_au) + (distance_au * distance_au)
+    let cos_phase = ((sun_dist_au * sun_dist_au) + (distance_au * distance_au)
         - (sun_earth_au * sun_earth_au))
-        / (2.0 * sun_planet_au * distance_au);
+        / (2.0 * sun_dist_au * distance_au).max(1e-6);
     let phase_angle_deg = cos_phase.clamp(-1.0, 1.0).acos().to_degrees();
+
     let au_km = 149_597_870.7_f64;
     let apparent_diameter_arcsec = 2.0
-        * (planet_radius_km / (distance_au * au_km))
-            .atan()
+        * (planet.equatorial_radius_km / (distance_au * au_km))
+            .clamp(-1.0, 1.0)
+            .asin()
             .to_degrees()
         * 3600.0;
 
@@ -1528,6 +1718,50 @@ mod tests {
             (delta - 350.89).abs() < 0.1,
             "Mars 1-day rotation should be ~350.89°, got {:.2}°",
             delta
+        );
+    }
+
+    #[test]
+    fn test_new_planets_rotation_rates() {
+        // Los 3 planetas nuevos existen y tienen la tasa/dirección correcta.
+        assert!(get_planet("venus").is_some());
+        assert!(get_planet("uranus").is_some());
+        assert!(get_planet("neptune").is_some());
+        // Venus: super-rotación atmosférica retrógrada ~4.4 d → ~-81.8°/día.
+        let venus = rotation_delta_deg(&VENUS, 2451545.0, 2451545.0 + 1.0, 0);
+        assert!((venus + 81.82).abs() < 0.1, "Venus ~-81.8°/día, dio {venus:.2}");
+        // Urano: retrógrado (negativo).
+        let uranus = rotation_delta_deg(&URANUS, 2451545.0, 2451545.0 + 1.0, 0);
+        assert!(uranus < 0.0 && (uranus + 501.79).abs() < 0.1, "Urano ~-501.79°/día, dio {uranus:.2}");
+        // Neptuno: prógrado ~536.3°/día (periodo ~16.1 h).
+        let neptune = rotation_delta_deg(&NEPTUNE, 2451545.0, 2451545.0 + 1.0, 0);
+        assert!((neptune - 536.31).abs() < 0.1, "Neptuno ~536.31°/día, dio {neptune:.2}");
+    }
+
+    #[test]
+    fn test_kepler_ephemeris_sanity() {
+        // Tierra: radio heliocéntrico ≈ 1 AU.
+        let earth = kepler_heliocentric_ecliptic(&EARTH_ELEMENTS, 2451545.0);
+        let r_earth = (earth[0] * earth[0] + earth[1] * earth[1] + earth[2] * earth[2]).sqrt();
+        assert!((r_earth - 1.0).abs() < 0.02, "Tierra |r| = {r_earth:.4} AU (esperado ~1)");
+
+        // Júpiter en su oposición 2024-12-07: Δ ≈ 4.1 AU, diámetro ≈ 48″, B0 pequeño.
+        let jd = datetime_to_jd(2024, 12, 7, 0, 0, 0.0);
+        let geo = calculate_observer_geometry(&JUPITER, jd);
+        assert!(
+            geo.distance_au > 3.9 && geo.distance_au < 4.35,
+            "Júpiter Δ = {:.3} AU (esperado ~4.1 en oposición)",
+            geo.distance_au
+        );
+        assert!(
+            geo.apparent_diameter_arcsec > 44.0 && geo.apparent_diameter_arcsec < 52.0,
+            "Júpiter diámetro = {:.1}″ (esperado ~48)",
+            geo.apparent_diameter_arcsec
+        );
+        assert!(
+            geo.sub_earth_lat_deg.abs() < 4.0,
+            "Júpiter B0 = {:.2}° (su eje solo se inclina ~3.1°)",
+            geo.sub_earth_lat_deg
         );
     }
 

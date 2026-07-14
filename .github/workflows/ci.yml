@@ -34,3 +34,9 @@ jobs:
 
       - name: Check Rust
         run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      # Las pruebas físicas GPU permanecen #[ignore] en CI hospedado. Este
+      # paso conserva la referencia CPU y toda la matriz sintética/fallos en
+      # macOS y Windows; los asistentes de release ejecutan además el gate GPU.
+      - name: Test CPU and synthetic pipelines
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast

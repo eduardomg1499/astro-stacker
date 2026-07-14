@@ -628,9 +628,6 @@ fn calculate_grid_quality(
 ) -> Vec<u64> {
     if is_surface {
         let mut grid_scores = vec![0u64; grid_size * grid_size];
-        let tile_w = (width as f32 / grid_size as f32).max(1.0);
-        let tile_h = (height as f32 / grid_size as f32).max(1.0);
-
         // Consistent with enhance_and_score_surface_buffered's noise gate: lap > 100 -> sq > 10,000
         let noise_gate_sq: u64 = 10_000;
         let step = if width > 1200 || height > 1200 { 4 } else { 2 };
@@ -663,8 +660,11 @@ fn calculate_grid_quality(
                 let sq = (lap as u64) * (lap as u64);
 
                 if sq > noise_gate_sq {
-                    let gx = ((x as f32 / tile_w).floor() as usize).min(grid_size - 1);
-                    let gy = ((y as f32 / tile_h).floor() as usize).min(grid_size - 1);
+                    // Partición entera determinista: evita que CPU y GPU
+                    // asignen un píxel de frontera a celdas distintas por el
+                    // redondeo de `width/grid` en f32.
+                    let gx = (x.saturating_mul(grid_size) / width.max(1)).min(grid_size - 1);
+                    let gy = (y.saturating_mul(grid_size) / height.max(1)).min(grid_size - 1);
                     let grid_idx = gy * grid_size + gx;
                     grid_scores[grid_idx] += sq;
                 }

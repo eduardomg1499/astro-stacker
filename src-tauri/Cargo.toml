@@ -14,7 +14,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2.0.0", features = [] }
+# protocol-asset: sirve archivos locales al WebView via convertFileSrc().
+# Sin esta feature, los previews nativos del mosaico (file_path:) y el
+# reproductor de animacion desde rutas estaban ROTOS, y los resultados de
+# apilado tenian que viajar como base64 por IPC (pico de RAM del WebView).
+tauri = { version = "2.0.0", features = ["macos-private-api", "protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-process = "2"
@@ -27,6 +31,7 @@ libc = "0.2"
 memmap2 = "0.9"
 byteorder = "1.5"
 image = "0.23.14"
+tiff = "0.6.1"
 base64 = "0.22"
 bincode = "1.3.3"
 sysinfo = "0.30"
@@ -46,6 +51,12 @@ num_cpus = "1.16.0"
 crossbeam-channel = "0.5"
 fitrs = "0.5.0"
 lz4_flex = "0.11.1"
+# GPU COMPUTE (etapa de acumulacion del apilado): wgpu = Metal en macOS,
+# DX12/Vulkan/GL en Windows. La ruta CPU queda intacta como referencia y
+# fallback total; ver src/gpu_stack.rs.
+wgpu = "23"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

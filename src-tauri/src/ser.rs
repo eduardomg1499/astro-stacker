@@ -10,6 +10,7 @@ pub struct SerInfo {
     pub height: usize,
     pub frame_count: usize,
     pub bytes_per_pixel: usize,
+    pub sample_bits: usize,
     pub color_id: i32,
     pub is_little_endian: bool, // <--- NUEVO
 }
@@ -271,6 +272,7 @@ impl SerReader {
                 height,
                 frame_count,
                 bytes_per_pixel,
+                sample_bits: pixel_depth,
                 color_id,
                 is_little_endian,
             },
@@ -297,5 +299,97 @@ impl SerReader {
         } else {
             std::borrow::Cow::Borrowed(slice)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// "SER DORADO" sintetico: fija DOS contratos que protegen a los usuarios.
+    /// (1) Contrato del lector: un .ser estandar (header 178 bytes, LE,
+    ///     mono16) se parsea con dimensiones/frames/profundidad exactos y los
+    ///     pixeles llegan intactos hasta despues de raw_to_u16_buffer.
+    /// (2) Contrato de SEGURIDAD con archivos truncados (captura interrumpida,
+    ///     el caso real mas comun de crash): el frame incompleto se descarta
+    ///     del conteo, get_frame fuera de rango devuelve slice VACIO, y
+    ///     raw_to_u16_buffer convierte vacios/cortos en buffers rellenos de
+    ///     negro DEL TAMANO CORRECTO — la guarda que evita la lectura fuera
+    ///     de limites (0xC0000005/SIGSEGV) en los kernels AVX2/NEON.
+    /// Si un cambio futuro rompe cualquiera de los dos, este test lo detiene.
+    #[test]
+    fn test_golden_synthetic_ser_and_truncation_safety() {
+        let (w, h, frames) = (32usize, 24usize, 5usize);
+        let frame_px = w * h;
+        let frame_bytes = frame_px * 2; // mono16
+
+        // --- Construir el .ser en memoria (header estandar de 178 bytes) ---
+        let mut data = Vec::with_capacity(178 + frames * frame_bytes);
+        data.extend_from_slice(b"LUCAM-RECORDER"); // FileID (14 bytes)
+        let put_i32 = |buf: &mut Vec<u8>, v: i32| buf.extend_from_slice(&v.to_le_bytes());
+        put_i32(&mut data, 0); // LuID
+        put_i32(&mut data, 0); // ColorID = MONO (offset 18)
+        put_i32(&mut data, 0); // LittleEndian flag (offset 22)
+        put_i32(&mut data, w as i32); // Width (offset 26)
+        put_i32(&mut data, h as i32); // Height
+        put_i32(&mut data, 16); // PixelDepth
+        put_i32(&mut data, frames as i32); // FrameCount
+        data.resize(162, 0); // Observer + Instrument + Telescope (40×3)
+        data.resize(178, 0); // DateTime + DateTimeUTC (8+8)
+        assert_eq!(data.len(), 178);
+        // Frames identificables: pixel = f·1000 + indice_lineal.
+        for f in 0..frames {
+            for i in 0..frame_px {
+                let v = (f * 1000 + i) as u16;
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+
+        let dir = std::env::temp_dir();
+        let p_full = dir.join(format!("zas_golden_{}.ser", std::process::id()));
+        let p_trunc = dir.join(format!("zas_golden_trunc_{}.ser", std::process::id()));
+        std::fs::write(&p_full, &data).unwrap();
+        // Truncado a mitad del ultimo frame (100 bytes menos).
+        std::fs::write(&p_trunc, &data[..data.len() - 100]).unwrap();
+
+        // --- (1) Contrato del lector: archivo integro ---
+        let r = SerReader::new(&p_full).expect("SER sintetico valido");
+        assert_eq!(r.info.width, w);
+        assert_eq!(r.info.height, h);
+        assert_eq!(r.info.frame_count, frames);
+        assert_eq!(r.info.bytes_per_pixel, 2);
+        assert_eq!(r.info.sample_bits, 16);
+        assert_eq!(r.info.color_id, 0);
+        assert!(r.info.is_little_endian);
+        let f2 = r.get_frame(2, 0);
+        assert_eq!(f2.len(), frame_bytes);
+        let u16s = crate::raw_to_u16_buffer(&f2, w, h, 2);
+        assert_eq!(u16s.len(), frame_px);
+        assert_eq!(u16s[3 * w + 5], (2 * 1000 + 3 * w + 5) as u16);
+
+        // --- (2) Contrato de seguridad: archivo truncado ---
+        let rt = SerReader::new(&p_trunc).expect("SER truncado sigue siendo legible");
+        assert_eq!(
+            rt.info.frame_count,
+            frames - 1,
+            "el frame incompleto del final debe descartarse del conteo"
+        );
+        let last_ok = rt.get_frame(frames - 2, 0);
+        assert_eq!(last_ok.len(), frame_bytes);
+        // Fuera de rango → slice VACIO (contrato de get_frame)...
+        let beyond = rt.get_frame(frames - 1, 0);
+        assert!(beyond.is_empty());
+        // ...y la conversion produce NEGRO del tamano correcto, jamas OOB.
+        let safe = crate::raw_to_u16_buffer(&beyond, w, h, 2);
+        assert_eq!(safe.len(), frame_px);
+        assert!(safe.iter().all(|&v| v == 0));
+        // Frame corto NO-vacio: convierte lo disponible y rellena con negro.
+        let partial = crate::raw_to_u16_buffer(&f2[..100], w, h, 2);
+        assert_eq!(partial.len(), frame_px);
+        assert_eq!(partial[10], (2 * 1000 + 10) as u16);
+        assert!(partial[50..].iter().all(|&v| v == 0));
+
+        let _ = std::fs::remove_file(&p_full);
+        let _ = std::fs::remove_file(&p_trunc);
     }
 }

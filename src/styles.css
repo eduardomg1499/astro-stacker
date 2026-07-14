@@ -710,6 +710,13 @@ header {
     border-radius: 13px;
 }
 
+/* El icono va SOLO dentro de su caja: el margin-right:8px de .zas-icon (pensado
+   para separar icono+texto en línea) lo descentraba ~4px a la izquierda. Aquí
+   se anula para que quede perfectamente centrado en el recuadro. */
+.donation-option-icon .zas-icon {
+    margin: 0;
+}
+
 .donation-option-copy {
     display: flex;
     flex-direction: column;

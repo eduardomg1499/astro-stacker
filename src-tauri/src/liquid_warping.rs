@@ -33,6 +33,119 @@ pub fn compute_idw_map_with_power(
 /// `top_k`: number of nearest APs blended per pixel (≤8). Smaller K makes the
 /// warp field MORE LOCAL (follows seeing cells more tightly → sharper surface
 /// texture); larger K smooths it (safer for sparse planetary grids).
+/// Rejilla espacial de APs para el Top-K EXACTO en O(vecindario) por pixel.
+/// Con mallas densas (24px + umbral bajo → ~6000 APs) el barrido lineal del
+/// builder IDW costaba n_px × n_APs ≈ 2×10^10 distancias por apilado —
+/// decenas de segundos SOLO en construir el warp map. La busqueda por anillos
+/// Chebyshev crecientes es exacta: se detiene cuando el K-esimo mejor esta
+/// garantizado mas cerca que cualquier celda sin visitar (cota (r−1)·celda).
+struct ApSpatialGrid {
+    cell: f32,
+    gw: usize,
+    gh: usize,
+    min_x: f32,
+    min_y: f32,
+    cells: Vec<Vec<u16>>,
+}
+
+impl ApSpatialGrid {
+    fn build(points: &[ApPoint]) -> Self {
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for p in points {
+            min_x = min_x.min(p.x);
+            min_y = min_y.min(p.y);
+            max_x = max_x.max(p.x);
+            max_y = max_y.max(p.y);
+        }
+        let span_x = (max_x - min_x).max(1.0);
+        let span_y = (max_y - min_y).max(1.0);
+        // ~2 puntos por celda de media (celda = espaciado tipico × 1.4).
+        let cell = ((span_x * span_y / points.len().max(1) as f32).sqrt() * 1.4).max(4.0);
+        let gw = ((span_x / cell).ceil() as usize + 1).max(1);
+        let gh = ((span_y / cell).ceil() as usize + 1).max(1);
+        let mut cells = vec![Vec::new(); gw * gh];
+        for (i, p) in points.iter().enumerate() {
+            let cx = (((p.x - min_x) / cell) as usize).min(gw - 1);
+            let cy = (((p.y - min_y) / cell) as usize).min(gh - 1);
+            cells[cy * gw + cx].push(i as u16);
+        }
+        Self { cell, gw, gh, min_x, min_y, cells }
+    }
+
+    /// Llena `top_k[..k]` con los k APs mas cercanos a (px, py), ordenados por
+    /// distancia — MISMO resultado que el barrido lineal (insertion sort
+    /// identico), solo que visitando celdas por anillos crecientes.
+    #[inline]
+    fn top_k_into(
+        &self,
+        px: f32,
+        py: f32,
+        k: usize,
+        top_k: &mut [(f32, u16)],
+        points: &[ApPoint],
+    ) {
+        for slot in top_k.iter_mut() {
+            *slot = (f32::MAX, 0u16);
+        }
+        let cx = (((px - self.min_x) / self.cell).floor() as isize)
+            .clamp(0, self.gw as isize - 1);
+        let cy = (((py - self.min_y) / self.cell).floor() as isize)
+            .clamp(0, self.gh as isize - 1);
+        let max_ring = (self.gw.max(self.gh)) as isize;
+
+        let visit = |gx: isize, gy: isize, top_k: &mut [(f32, u16)]| {
+            for &pi in &self.cells[gy as usize * self.gw + gx as usize] {
+                let p = &points[pi as usize];
+                let dx = px - p.x;
+                let dy = py - p.y;
+                let d2 = dx * dx + dy * dy;
+                if d2 < top_k[k - 1].0 {
+                    let mut ins = k - 1;
+                    while ins > 0 && d2 < top_k[ins - 1].0 {
+                        top_k[ins] = top_k[ins - 1];
+                        ins -= 1;
+                    }
+                    top_k[ins] = (d2, pi);
+                }
+            }
+        };
+
+        for r in 0..=max_ring {
+            // Parada EXACTA: toda celda del anillo r esta a ≥ (r−1)·cell del
+            // punto (que vive dentro de su propia celda) — si ya tenemos k
+            // vecinos y el peor esta mas cerca que esa cota, no hay nada
+            // mejor en anillos posteriores.
+            if top_k[k - 1].0 < f32::MAX {
+                let ring_min = ((r - 1).max(0) as f32) * self.cell;
+                if top_k[k - 1].0 <= ring_min * ring_min {
+                    return;
+                }
+            }
+            let (x0, x1) = (cx - r, cx + r);
+            let (y0, y1) = (cy - r, cy + r);
+            for gy in y0.max(0)..=y1.min(self.gh as isize - 1) {
+                if gy == y0 || gy == y1 {
+                    // fila superior/inferior del anillo: completa
+                    for gx in x0.max(0)..=x1.min(self.gw as isize - 1) {
+                        visit(gx, gy, top_k);
+                    }
+                } else {
+                    // filas intermedias: solo las columnas del borde
+                    if x0 >= 0 {
+                        visit(x0, gy, top_k);
+                    }
+                    if x1 != x0 && x1 < self.gw as isize {
+                        visit(x1, gy, top_k);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn compute_idw_map_for_output(
     width: usize,
     height: usize,
@@ -55,6 +168,14 @@ pub fn compute_idw_map_for_output(
     }
 
     let effective_k = top_k.clamp(1, WARP_K).min(n_points); // Handle cases with fewer than K APs
+
+    // Rejilla espacial solo para mallas densas: por debajo de ~96 APs el
+    // barrido lineal es mas barato que el overhead de anillos por pixel.
+    let grid = if n_points >= 96 {
+        Some(ApSpatialGrid::build(custom_points))
+    } else {
+        None
+    };
 
     // Flat arrays: warp_indices[pixel × K + k] = AP index, warp_weights[pixel × K + k] = normalized weight
     let total_pixels = width * height;
@@ -95,20 +216,25 @@ pub fn compute_idw_map_for_output(
                 // We maintain a fixed array of the K closest points. No heap allocations per pixel.
                 let mut top_k = [(f32::MAX, 0u16); WARP_K];
 
-                for (kp_i, kp) in custom_points.iter().enumerate() {
-                    let dx = px - kp.x;
-                    let dy = py - kp.y;
-                    let dist_sq = dx * dx + dy * dy;
+                if let Some(g) = grid.as_ref() {
+                    // Malla densa: Top-K exacto visitando solo celdas vecinas.
+                    g.top_k_into(px, py, effective_k, &mut top_k, custom_points);
+                } else {
+                    for (kp_i, kp) in custom_points.iter().enumerate() {
+                        let dx = px - kp.x;
+                        let dy = py - kp.y;
+                        let dist_sq = dx * dx + dy * dy;
 
-                    // If this point is closer than our FURTHEST point in the Top K list...
-                    if dist_sq < top_k[effective_k - 1].0 {
-                        // Find where to insert it (O(K), which is tiny, max 8)
-                        let mut insert_idx = effective_k - 1;
-                        while insert_idx > 0 && dist_sq < top_k[insert_idx - 1].0 {
-                            top_k[insert_idx] = top_k[insert_idx - 1];
-                            insert_idx -= 1;
+                        // If this point is closer than our FURTHEST point in the Top K list...
+                        if dist_sq < top_k[effective_k - 1].0 {
+                            // Find where to insert it (O(K), which is tiny, max 8)
+                            let mut insert_idx = effective_k - 1;
+                            while insert_idx > 0 && dist_sq < top_k[insert_idx - 1].0 {
+                                top_k[insert_idx] = top_k[insert_idx - 1];
+                                insert_idx -= 1;
+                            }
+                            top_k[insert_idx] = (dist_sq, kp_i as u16);
                         }
-                        top_k[insert_idx] = (dist_sq, kp_i as u16);
                     }
                 }
 
@@ -198,6 +324,129 @@ impl LanczosLUT {
 }
 
 static LANCZOS_LUT: OnceLock<LanczosLUT> = OnceLock::new();
+
+// ===========================================================================
+// DRIZZLE VERDADERO (kernel "drop" de solape de areas, estilo AS!4/HST).
+//
+// Con drizzle > 1x el muestreo anterior era un Lanczos-3 ESTRECHADO
+// (drop_size 0.75 → soporte ±2.25 px) sobre el grid fino: una interpolacion
+// excelente, pero correlaciona vecinos y limita la resolucion recuperable.
+// El drizzle real deposita el flujo de cada pixel fuente con una huella
+// reducida (pixfrac) y deja que el jitter sub-pixel del seeing rellene el
+// grid fino frame a frame — de ahi sale la resolucion extra con stacks
+// grandes. La UI no cambia: drop_size juega el rol de pixfrac (0.75).
+//
+// Formulacion INVERSE-MAPPING, equivalente al deposito forward clasico
+// cuando el warp es localmente constante (el campo IDW varia en escalas de
+// decenas de px, muy por encima del soporte del kernel): el peso de un pixel
+// fuente sobre el pixel de salida es el AREA DE SOLAPE entre el drop del
+// fuente (lado pixfrac, centrado en su coordenada entera) y la huella del
+// pixel de salida proyectada a coordenadas fuente (lado 1/escala, centrada
+// en sx_in). Separable en X e Y → producto de dos solapes 1-D trapezoidales:
+//     overlap(d) = clamp((h1 + h2) − |d|, 0, 2·min(h1, h2))
+// con h1 = 1/(2·escala), h2 = pixfrac/2. Soporte total h1+h2 < 1 px → bastan
+// los vecinos ±1 por eje. Kernel NO-NEGATIVO: cero ringing (no necesita el
+// clamp anti-ringing del Lanczos). Con pixfrac 0.75, h1+h2 > 0.5 siempre →
+// ningun pixel de salida queda sin cobertura dentro del frame.
+//
+// Nota de fidelidad: la ponderacion CRUZADA entre frames por cobertura (el
+// peso overlap del drizzle clasico) no se propaga al acumulador global (que
+// pondera por calidad q² del frame) — refinamiento posible si hiciera falta.
+// ===========================================================================
+#[inline(always)]
+fn drizzle_overlap_1d(d: f32, h1: f32, h2: f32) -> f32 {
+    ((h1 + h2) - d.abs()).clamp(0.0, 2.0 * h1.min(h2))
+}
+
+/// Muestreo drop mono en (sx_in, sy_in). Devuelve (suma_ponderada, suma_pesos);
+/// sum_w == 0 → sin cobertura (fuera del frame), el caller no escribe.
+#[inline(always)]
+fn drizzle_sample_mono(
+    mono_buf: &[u16],
+    w_in: usize,
+    h_in: usize,
+    sx_in: f32,
+    sy_in: f32,
+    h1: f32,
+    h2: f32,
+) -> (f32, f32) {
+    let x0 = sx_in.round() as isize;
+    let y0 = sy_in.round() as isize;
+    let mut sum_v = 0.0f32;
+    let mut sum_w = 0.0f32;
+    for ky in -1isize..=1 {
+        let py = y0 + ky;
+        if py < 0 || py >= h_in as isize {
+            continue;
+        }
+        let wy = drizzle_overlap_1d(py as f32 - sy_in, h1, h2);
+        if wy <= 0.0 {
+            continue;
+        }
+        let row = py as usize * w_in;
+        for kx in -1isize..=1 {
+            let px = x0 + kx;
+            if px < 0 || px >= w_in as isize {
+                continue;
+            }
+            let wx = drizzle_overlap_1d(px as f32 - sx_in, h1, h2);
+            if wx <= 0.0 {
+                continue;
+            }
+            let w = wx * wy;
+            sum_v += mono_buf[row + px as usize] as f32 * w;
+            sum_w += w;
+        }
+    }
+    (sum_v, sum_w)
+}
+
+/// Muestreo drop RGB interleaved. Devuelve (r, g, b, suma_pesos).
+#[inline(always)]
+fn drizzle_sample_rgb(
+    rgb_buf: &[u16],
+    w_in: usize,
+    h_in: usize,
+    sx_in: f32,
+    sy_in: f32,
+    h1: f32,
+    h2: f32,
+) -> (f32, f32, f32, f32) {
+    let x0 = sx_in.round() as isize;
+    let y0 = sy_in.round() as isize;
+    let mut sum_r = 0.0f32;
+    let mut sum_g = 0.0f32;
+    let mut sum_b = 0.0f32;
+    let mut sum_w = 0.0f32;
+    for ky in -1isize..=1 {
+        let py = y0 + ky;
+        if py < 0 || py >= h_in as isize {
+            continue;
+        }
+        let wy = drizzle_overlap_1d(py as f32 - sy_in, h1, h2);
+        if wy <= 0.0 {
+            continue;
+        }
+        let row = py as usize * w_in;
+        for kx in -1isize..=1 {
+            let px = x0 + kx;
+            if px < 0 || px >= w_in as isize {
+                continue;
+            }
+            let wx = drizzle_overlap_1d(px as f32 - sx_in, h1, h2);
+            if wx <= 0.0 {
+                continue;
+            }
+            let w = wx * wy;
+            let off = (row + px as usize) * 3;
+            sum_r += rgb_buf[off] as f32 * w;
+            sum_g += rgb_buf[off + 1] as f32 * w;
+            sum_b += rgb_buf[off + 2] as f32 * w;
+            sum_w += w;
+        }
+    }
+    (sum_r, sum_g, sum_b, sum_w)
+}
 
 // ===========================================================================
 // Fase 1b — SIMD para el fast-path del muestreo Lanczos RGB. El frame está
@@ -396,6 +645,17 @@ pub fn accumulate_frame_liquid(
     let lut = LANCZOS_LUT.get_or_init(|| LanczosLUT::new(30000, 3.0));
     let inv_drizzle = 1.0 / drizzle;
 
+    // DRIZZLE VERDADERO: con escala >1x se muestrea con el kernel drop de
+    // solape de areas (ver drizzle_sample_*) en vez del Lanczos estrechado.
+    let true_drizzle = drizzle > 1.01;
+    let drz_h1 = 0.5 * inv_drizzle; // media huella del pixel de salida (coords fuente)
+    let drz_h2 = 0.5 * drop_size.clamp(0.3, 1.0); // pixfrac/2
+    // Cobertura maxima del kernel (solape pleno en ambos ejes): normaliza cov a (0,1].
+    let drz_full_cov = {
+        let m = 2.0 * drz_h1.min(drz_h2);
+        (m * m).max(1e-9)
+    };
+
     for y_out in 0..h_out {
         let row_off = y_out * w_out;
         for x_out in 0..w_out {
@@ -470,6 +730,36 @@ pub fn accumulate_frame_liquid(
             }
 
             if pixel_weight < 0.001 {
+                continue;
+            }
+
+            // DRIZZLE VERDADERO: kernel drop no-negativo (sin ringing → sin
+            // clamp) con soporte < 1 px. La normalizacion sum/sum_w conserva
+            // la media local; sum_w == 0 solo fuera del frame (no se escribe).
+            if true_drizzle {
+                let (dr, dg, db, dw) =
+                    drizzle_sample_rgb(rgb_buf, w_in, h_in, sx_in, sy_in, drz_h1, drz_h2);
+                if dw > 1e-6 {
+                    let tidx = row_off + x_out;
+                    if tidx < acc_r.len() {
+                        // PONDERACION POR COBERTURA (drizzle clasico): un frame
+                        // cuyo drop apenas roza este pixel de salida aporta un
+                        // estimado dominado por UN solo pixel fuente (mas
+                        // ruidoso) — cov ∈ (0,1] viaja en el plano de pesos y
+                        // el acumulador global lo usa para ponderar ENTRE
+                        // frames (weight_by_coverage). El VALOR del frame no
+                        // cambia: (v·pw·cov)/(pw·cov) = v.
+                        let cov = (dw / drz_full_cov).min(1.0);
+                        let wq = pixel_weight * cov;
+                        let inv = 1.0 / dw;
+                        unsafe {
+                            *acc_r.get_unchecked_mut(tidx) += dr * inv * wq;
+                            *acc_g.get_unchecked_mut(tidx) += dg * inv * wq;
+                            *acc_b.get_unchecked_mut(tidx) += db * inv * wq;
+                            *acc_w.get_unchecked_mut(tidx) += wq;
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -780,6 +1070,17 @@ pub fn accumulate_frame_liquid_mono(
     let lut = LANCZOS_LUT.get_or_init(|| LanczosLUT::new(30000, 3.0));
     let inv_drizzle = 1.0 / drizzle;
 
+    // DRIZZLE VERDADERO: con escala >1x se muestrea con el kernel drop de
+    // solape de areas (ver drizzle_sample_*) en vez del Lanczos estrechado.
+    let true_drizzle = drizzle > 1.01;
+    let drz_h1 = 0.5 * inv_drizzle; // media huella del pixel de salida (coords fuente)
+    let drz_h2 = 0.5 * drop_size.clamp(0.3, 1.0); // pixfrac/2
+    // Cobertura maxima del kernel (solape pleno en ambos ejes): normaliza cov a (0,1].
+    let drz_full_cov = {
+        let m = 2.0 * drz_h1.min(drz_h2);
+        (m * m).max(1e-9)
+    };
+
     for y_out in 0..h_out {
         let row_off = y_out * w_out;
         for x_out in 0..w_out {
@@ -850,6 +1151,26 @@ pub fn accumulate_frame_liquid_mono(
             }
 
             if pixel_weight < 0.001 {
+                continue;
+            }
+
+            // DRIZZLE VERDADERO: kernel drop no-negativo (sin ringing → sin
+            // clamp) con soporte < 1 px; ver drizzle_sample_mono. cov pondera
+            // la cobertura del drop entre frames (ver la variante RGB).
+            if true_drizzle {
+                let (dv, dw) =
+                    drizzle_sample_mono(mono_buf, w_in, h_in, sx_in, sy_in, drz_h1, drz_h2);
+                if dw > 1e-6 {
+                    let tidx = row_off + x_out;
+                    if tidx < acc.len() {
+                        let cov = (dw / drz_full_cov).min(1.0);
+                        let wq = pixel_weight * cov;
+                        unsafe {
+                            *acc.get_unchecked_mut(tidx) += (dv / dw) * wq;
+                            *acc_w.get_unchecked_mut(tidx) += wq;
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -1402,5 +1723,229 @@ mod simd_validation {
         }
         eprintln!("RGB SIMD validado en {checked} casos. max_diff suma={max_diff_sum}");
         assert!(max_diff_sum < 0.5, "suma RGB difiere demasiado: {max_diff_sum}");
+    }
+}
+
+// ===========================================================================
+// Validación del DRIZZLE VERDADERO (kernel drop). Independiente de la
+// arquitectura (el kernel drop es escalar puro).
+// ===========================================================================
+#[cfg(test)]
+mod drizzle_tests {
+    use super::*;
+
+    /// La rejilla espacial del builder IDW debe dar EXACTAMENTE el mismo
+    /// Top-K que el barrido lineal (misma insertion sort, distinto orden de
+    /// visita). Puntos y queries pseudo-aleatorios deterministas (LCG),
+    /// incluyendo queries FUERA del bounding box de los APs (borde del canvas
+    /// con drizzle/ROI), y ambos valores de K usados en produccion (4 y 8).
+    #[test]
+    fn test_idw_spatial_grid_matches_brute_force() {
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / 16_777_216.0
+        };
+        let n = 700usize; // > umbral 96 → produccion usaria la rejilla
+        let points: Vec<ApPoint> = (0..n)
+            .map(|_| ApPoint {
+                x: rnd() * 640.0,
+                y: rnd() * 480.0,
+                size: 32,
+            })
+            .collect();
+        let grid = ApSpatialGrid::build(&points);
+
+        for q in 0..500 {
+            let px = rnd() * 700.0 - 30.0;
+            let py = rnd() * 540.0 - 30.0;
+            let k = if q % 2 == 0 { 4usize } else { 8 };
+
+            let mut got = [(f32::MAX, 0u16); 8];
+            grid.top_k_into(px, py, k, &mut got, &points);
+
+            let mut want = [(f32::MAX, 0u16); 8];
+            for (i, p) in points.iter().enumerate() {
+                let dx = px - p.x;
+                let dy = py - p.y;
+                let d2 = dx * dx + dy * dy;
+                if d2 < want[k - 1].0 {
+                    let mut ins = k - 1;
+                    while ins > 0 && d2 < want[ins - 1].0 {
+                        want[ins] = want[ins - 1];
+                        ins -= 1;
+                    }
+                    want[ins] = (d2, i as u16);
+                }
+            }
+            for j in 0..k {
+                assert_eq!(
+                    got[j].1, want[j].1,
+                    "indice distinto en j={j} (query {px:.1},{py:.1} k={k})"
+                );
+                assert!(
+                    (got[j].0 - want[j].0).abs() < 1e-3,
+                    "distancia distinta en j={j}"
+                );
+            }
+        }
+    }
+
+    /// Campo constante → cada pixel de salida cubierto debe devolver EXACTAMENTE
+    /// el valor del campo (la normalización sum/sum_w conserva la media local).
+    #[test]
+    fn test_true_drizzle_conserves_constant_field() {
+        let (w_in, h_in) = (32usize, 32usize);
+        let drizzle = 2.0f32;
+        let (w_out, h_out) = (64usize, 64usize);
+        let mono = vec![1000u16; w_in * h_in];
+        let mut acc = vec![0.0f32; w_out * h_out];
+        let mut acc_w = vec![0.0f32; w_out * h_out];
+
+        accumulate_frame_liquid_mono(
+            &mut acc, &mut acc_w, &mono, w_in, h_in, w_out, h_out, drizzle,
+            0.0, 0.0, 0.0, 0.0, &[], &[], &[], &[], &[], 1.0, 0.75,
+        );
+
+        let mut covered = 0usize;
+        for i in 0..w_out * h_out {
+            if acc_w[i] > 1e-6 {
+                let v = acc[i] / acc_w[i];
+                assert!(
+                    (v - 1000.0).abs() < 0.01,
+                    "pixel {} devolvio {} (esperado 1000)",
+                    i,
+                    v
+                );
+                covered += 1;
+            }
+        }
+        // Con pixfrac 0.75 el soporte h1+h2 > 0.5 garantiza cobertura total
+        // dentro del frame (solo el borde extremo puede quedar fuera).
+        assert!(
+            covered > (w_out - 2) * (h_out - 2),
+            "cobertura insuficiente: {} pixeles",
+            covered
+        );
+    }
+
+    /// Recuperación de detalle sub-pixel: una sinusoide con periodo 1.4 px
+    /// FUENTE (por encima del Nyquist de la fuente — aliased frame a frame,
+    /// resoluble en el grid 2x) capturada en 9 frames con dither sub-pixel
+    /// uniforme. El stack drizzle (kernel drop) debe reconstruir el patron
+    /// claramente mejor que el promedio de upsampleos bilineales de los
+    /// mismos frames — esa diferencia ES la resolucion que recupera drizzle.
+    #[test]
+    fn test_true_drizzle_recovers_subpixel_detail() {
+        let (w_in, h_in) = (48usize, 48usize);
+        let drizzle = 2.0f32;
+        let (w_out, h_out) = (96usize, 96usize);
+
+        // Patron continuo en coordenadas FUENTE.
+        let f = |x: f32, y: f32| -> f32 {
+            8000.0
+                + 3000.0 * (x * std::f32::consts::TAU / 1.4).sin()
+                + 3000.0 * (y * std::f32::consts::TAU / 1.6).cos()
+        };
+
+        // Frame k: pixel (i,j) = promedio de caja 1x1 (supersampleo 4x4) del
+        // patron desplazado -d_k (convencion del acumulador: la fuente se
+        // muestrea en sx = ref + global_dx, y source(sx) = ref(sx - d_k)).
+        let offsets: [(f32, f32); 9] = [
+            (0.0, 0.0), (1.0 / 3.0, 0.0), (2.0 / 3.0, 0.0),
+            (0.0, 1.0 / 3.0), (1.0 / 3.0, 1.0 / 3.0), (2.0 / 3.0, 1.0 / 3.0),
+            (0.0, 2.0 / 3.0), (1.0 / 3.0, 2.0 / 3.0), (2.0 / 3.0, 2.0 / 3.0),
+        ];
+        let render_frame = |dx: f32, dy: f32| -> Vec<u16> {
+            let mut buf = vec![0u16; w_in * h_in];
+            for j in 0..h_in {
+                for i in 0..w_in {
+                    let mut s = 0.0f32;
+                    for oy in 0..4 {
+                        for ox in 0..4 {
+                            let sx = i as f32 - dx - 0.375 + ox as f32 * 0.25;
+                            let sy = j as f32 - dy - 0.375 + oy as f32 * 0.25;
+                            s += f(sx, sy);
+                        }
+                    }
+                    buf[j * w_in + i] = (s / 16.0).clamp(0.0, 65535.0) as u16;
+                }
+            }
+            buf
+        };
+
+        // --- Stack drizzle (kernel drop) ---
+        let mut acc = vec![0.0f32; w_out * h_out];
+        let mut acc_w = vec![0.0f32; w_out * h_out];
+        // --- Referencia: promedio de upsampleos bilineales de los mismos frames ---
+        let mut bil = vec![0.0f32; w_out * h_out];
+        let mut bil_n = vec![0.0f32; w_out * h_out];
+
+        for &(dx, dy) in &offsets {
+            let frame = render_frame(dx, dy);
+            accumulate_frame_liquid_mono(
+                &mut acc, &mut acc_w, &frame, w_in, h_in, w_out, h_out, drizzle,
+                0.0, 0.0, dx, dy, &[], &[], &[], &[], &[], 1.0, 0.75,
+            );
+            for yo in 0..h_out {
+                for xo in 0..w_out {
+                    let sx = xo as f32 / drizzle + dx;
+                    let sy = yo as f32 / drizzle + dy;
+                    let x0 = sx.floor() as isize;
+                    let y0 = sy.floor() as isize;
+                    if x0 < 0 || y0 < 0 || x0 + 1 >= w_in as isize || y0 + 1 >= h_in as isize {
+                        continue;
+                    }
+                    let fx = sx - x0 as f32;
+                    let fy = sy - y0 as f32;
+                    let (x0, y0) = (x0 as usize, y0 as usize);
+                    let v = frame[y0 * w_in + x0] as f32 * (1.0 - fx) * (1.0 - fy)
+                        + frame[y0 * w_in + x0 + 1] as f32 * fx * (1.0 - fy)
+                        + frame[(y0 + 1) * w_in + x0] as f32 * (1.0 - fx) * fy
+                        + frame[(y0 + 1) * w_in + x0 + 1] as f32 * fx * fy;
+                    bil[yo * w_out + xo] += v;
+                    bil_n[yo * w_out + xo] += 1.0;
+                }
+            }
+        }
+
+        // RMSE contra el patron FILTRADO POR LA APERTURA del pixel (caja 1x1):
+        // ninguna reconstruccion puede deshacer el prefiltro fisico del sensor,
+        // asi que la referencia justa es la sinusoide con su amplitud atenuada
+        // por sinc(π·w/T) — lo mejor alcanzable desde estas muestras. Contra el
+        // patron puntual la perdida de apertura (compartida) diluia el ratio.
+        let sinc = |t: f32| if t.abs() < 1e-6 { 1.0 } else { t.sin() / t };
+        let ax = sinc(std::f32::consts::PI / 1.4);
+        let ay = sinc(std::f32::consts::PI / 1.6);
+        let f_ap = |x: f32, y: f32| -> f32 {
+            8000.0
+                + 3000.0 * ax * (x * std::f32::consts::TAU / 1.4).sin()
+                + 3000.0 * ay * (y * std::f32::consts::TAU / 1.6).cos()
+        };
+        let margin = 6usize;
+        let mut se_drz = 0.0f64;
+        let mut se_bil = 0.0f64;
+        let mut n = 0.0f64;
+        for yo in margin..h_out - margin {
+            for xo in margin..w_out - margin {
+                let i = yo * w_out + xo;
+                if acc_w[i] <= 1e-6 || bil_n[i] <= 0.0 {
+                    continue;
+                }
+                let gt = f_ap(xo as f32 / drizzle, yo as f32 / drizzle) as f64;
+                let d = (acc[i] / acc_w[i]) as f64 - gt;
+                let b = (bil[i] / bil_n[i]) as f64 - gt;
+                se_drz += d * d;
+                se_bil += b * b;
+                n += 1.0;
+            }
+        }
+        let rmse_drz = (se_drz / n).sqrt();
+        let rmse_bil = (se_bil / n).sqrt();
+        eprintln!("drizzle RMSE={rmse_drz:.1} vs bilineal RMSE={rmse_bil:.1} (n={n})");
+        assert!(
+            rmse_drz < rmse_bil * 0.8,
+            "el drizzle drop ({rmse_drz:.1}) debe superar claramente al upsample bilineal ({rmse_bil:.1})"
+        );
     }
 }

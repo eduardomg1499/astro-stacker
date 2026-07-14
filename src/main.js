@@ -65,6 +65,9 @@ function translateBackendProgressText(value) {
     let out = text
         .replace(/Procesando Frame/g, "Processing frame")
         .replace(/Procesando frame/g, "Processing frame")
+        .replace(/Analizando:/g, "Analyzing:")
+        .replace(/Midiendo decodificación GPU vs CPU/g, "Measuring GPU vs CPU decode")
+        .replace(/\(prueba corta\)/g, "(short probe)")
         .replace(/Cargando Lote/g, "Loading batch")
         .replace(/Generando Referencia Maestra/g, "Generating master reference")
         .replace(/Creando Referencia Low-Noise \(Doble Pasada\)/g, "Creating low-noise reference (double pass)")
@@ -1830,6 +1833,73 @@ async function checkAvx2Status() {
 // UTILIDADES GRAFICAS
 // =========================================================================
 
+// ASSET PROTOCOL: los resultados de apilado llegan ahora como RUTA de archivo
+// (PNG temporal servido por convertFileSrc) en vez de data-URL base64, que
+// duplicaba el pico de RAM del WebView en canvases grandes. Acepta ambos
+// formatos para no romper los comandos que siguen devolviendo base64.
+function toDisplaySrc(src) {
+    // `setImageAndWait` is the single normalization point, but a few older
+    // callers already hand us an asset/blob URL. Converting one of those a
+    // second time produces an invalid `asset://.../asset://...` URL and left
+    // the processed-result pane completely black after a successful stack.
+    if (
+        typeof src === "string" &&
+        src &&
+        !/^(?:data:|asset:|blob:|https?:)/i.test(src)
+    ) {
+        return convertFileSrc(src);
+    }
+    return src;
+}
+window.toDisplaySrc = toDisplaySrc;
+
+// CACHE-BUSTING para frames de animación recargados desde disco: normalize/
+// realign SOBRESCRIBEN los mismos archivos — sin esto el WebView serviría la
+// imagen vieja cacheada por URL. Se bumpea al completar esas operaciones; el
+// asset protocol resuelve por el path de la URL e ignora la query string.
+// ===== GPU COMPUTE: modo del usuario (Hybrid/Auto/GPU/CPU) + deteccion =====
+// Hybrid v2 permanece experimental hasta completar la matriz competitiva;
+// Auto sólo se promoverá a predeterminado después de superar ese gate.
+function getGpuMode() {
+    const v = localStorage.getItem("zas_gpu_mode");
+    return (v === "gpu" || v === "cpu" || v === "auto" || v === "hybrid") ? v : "hybrid";
+}
+window.getGpuMode = getGpuMode;
+
+(async function initGpuUi() {
+    try {
+        const selGpu = document.getElementById("sel-gpu-mode");
+        if (selGpu) {
+            selGpu.value = getGpuMode();
+            selGpu.addEventListener("change", () => {
+                localStorage.setItem("zas_gpu_mode", selGpu.value);
+                log("INFO", `Modo GPU: ${selGpu.value === "hybrid" ? "Hybrid v2 experimental" : selGpu.value === "auto" ? "Auto" : selGpu.value === "gpu" ? "Forzar GPU" : "Solo CPU"}`);
+            });
+        }
+        const info = await invoke("get_gpu_info");
+        window._gpuInfo = info;
+        const line = document.getElementById("gpu-info-line");
+        if (info && info.available) {
+            if (line) line.textContent = `✔ ${info.name} — ${info.backend} · VRAM presupuestada: ${info.vram_budget_mb} MB`;
+            log("INFO", `GPU detectada: ${info.name} (${info.backend}) — ${info.vram_budget_mb} MB presupuestados para el apilado.`);
+        } else {
+            if (line) line.textContent = tr("settings.general.gpu_none", "Sin GPU compatible — el apilado usa CPU (SIMD).");
+        }
+    } catch (e) {
+        console.warn("get_gpu_info:", e);
+    }
+})();
+
+let animAssetVersion = 0;
+function toAnimationSrc(item) {
+    if (typeof item !== "string" || !item) return item;
+    if (item.startsWith("data:") || item.startsWith("http") || item.startsWith("asset:")) {
+        return item; // ya es una URL lista para <img src>
+    }
+    const url = convertFileSrc(item);
+    return animAssetVersion > 0 ? `${url}?v=${animAssetVersion}` : url;
+}
+
 function setImageAndWait(imgElement, srcBase64, fitView = true) {
     return new Promise((resolve) => {
         if (!imgElement) { resolve(false); return; }
@@ -1869,8 +1939,11 @@ function setImageAndWait(imgElement, srcBase64, fitView = true) {
         };
 
         imgElement.onload = onReady;
-        imgElement.onerror = () => resolve(false);
-        imgElement.src = srcBase64;
+        imgElement.onerror = () => {
+            console.error("No se pudo cargar la vista previa", imgElement.src);
+            resolve(false);
+        };
+        imgElement.src = toDisplaySrc(srcBase64);
 
         setTimeout(() => {
             if (
@@ -1964,132 +2037,6 @@ function enhanceRangeInputs() {
     });
 }
 
-// ============================================================
-// ESQUEMAS DE WAVELETS (presets estilo RegiStax, en localStorage)
-// Guardan la configuración COMPLETA del panel de post-procesado y la
-// re-aplican con un clic (los listeners num→slider hacen el resto y el
-// pipeline se re-lanza con su debounce normal).
-// ============================================================
-const WAVELET_PRESETS_KEY = "zas_wavelet_presets_v1";
-
-function waveletPresetsLoad() {
-    try { return JSON.parse(localStorage.getItem(WAVELET_PRESETS_KEY)) || {}; }
-    catch (_) { return {}; }
-}
-function waveletPresetsSave(all) {
-    try { localStorage.setItem(WAVELET_PRESETS_KEY, JSON.stringify(all)); } catch (_) { }
-}
-
-function refreshWaveletPresetList(selectName) {
-    const sel = document.getElementById("wavelet-preset-select");
-    if (!sel) return;
-    const all = waveletPresetsLoad();
-    sel.innerHTML = "";
-    const ph = document.createElement("option");
-    ph.value = "";
-    ph.textContent = tr("wavelets.presets.placeholder", "— Esquemas guardados —");
-    sel.appendChild(ph);
-    Object.keys(all).sort().forEach((name) => {
-        const opt = document.createElement("option");
-        opt.value = name;
-        opt.textContent = name;
-        sel.appendChild(opt);
-    });
-    if (selectName) sel.value = selectName;
-}
-
-function applyWaveletPreset(p) {
-    const setNum = (id, val) => {
-        const el = document.getElementById("num-" + id);
-        if (!el || val === undefined || val === null || isNaN(val)) return;
-        el.value = val;
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-        el.dispatchEvent(new Event("change", { bubbles: true }));
-    };
-    (p.u || []).forEach((v, i) => setNum("u" + (i + 1), v));
-    (p.w || []).forEach((v, i) => setNum("w" + (i + 1), v));
-    (p.d || []).forEach((v, i) => setNum("d" + (i + 1), v));
-    setNum("crisp", p.crisp);
-    if (p.deconv) {
-        setNum("deconv-sigma", p.deconv.s); setNum("deconv-iter", p.deconv.i);
-        setNum("vc-sigma", p.deconv.vs); setNum("vc-iter", p.deconv.vi);
-    }
-    if (p.usm) { setNum("usm-amt", p.usm.a); setNum("usm-rad", p.usm.r); }
-    setNum("lce-amt", p.lce);
-    setNum("master-denoise", p.masterDenoise);
-    setNum("denoise-detail", p.denoiseDetail);
-    setNum("denoise-chroma", p.denoiseChroma);
-    if (p.color) {
-        setNum("gamma", p.color.g); setNum("sat", p.color.s);
-        setNum("contrast", p.color.c); setNum("brightness", p.color.b);
-        setNum("r-bal", p.color.rb); setNum("b-bal", p.color.bb);
-    }
-    if (p.dr) {
-        setNum("dr-rad", p.dr.rad); setNum("dr-dark", p.dr.dark); setNum("dr-light", p.dr.light);
-        if (ui.selDrMode) { ui.selDrMode.value = String(p.dr.mode ?? 0); ui.selDrMode.dispatchEvent(new Event("change", { bubbles: true })); }
-        if (ui.chkDrMask) ui.chkDrMask.checked = !!p.dr.mask;
-    }
-    if (p.shift) {
-        [["rx", p.shift.rx], ["ry", p.shift.ry], ["bx", p.shift.bx], ["by", p.shift.by]].forEach(([k, v]) => {
-            if (ui[k] && v !== undefined) { ui[k].value = v; ui[k].dispatchEvent(new Event("input", { bubbles: true })); }
-        });
-    }
-    if (p.blend !== undefined && ui.blendSlider) {
-        ui.blendSlider.value = p.blend;
-        ui.blendSlider.dispatchEvent(new Event("input", { bubbles: true }));
-    }
-    const selSharp = document.getElementById("sel-sharpen-mode");
-    if (selSharp && p.useRgbSharpening !== undefined) {
-        selSharp.value = p.useRgbSharpening ? "rgb" : "luminance";
-        selSharp.dispatchEvent(new Event("change", { bubbles: true }));
-    }
-    triggerUpdate();
-}
-
-function initWaveletPresets() {
-    const sel = document.getElementById("wavelet-preset-select");
-    const nameInput = document.getElementById("wavelet-preset-name");
-    const btnSave = document.getElementById("btn-wavelet-preset-save");
-    const btnDel = document.getElementById("btn-wavelet-preset-del");
-    if (!sel || !btnSave) return;
-
-    refreshWaveletPresetList();
-
-    btnSave.addEventListener("click", () => {
-        const name = (nameInput?.value || sel.value || "").trim();
-        if (!name) {
-            log("WARN", tr("wavelets.presets.need_name", "Escribe un nombre para guardar el esquema."));
-            return;
-        }
-        const all = waveletPresetsLoad();
-        all[name] = getPipelineParams();
-        waveletPresetsSave(all);
-        refreshWaveletPresetList(name);
-        if (nameInput) nameInput.value = "";
-        log("SUCCESS", tr("wavelets.presets.saved", "Esquema guardado: ") + name);
-    });
-
-    btnDel?.addEventListener("click", () => {
-        const name = sel.value;
-        if (!name) return;
-        const all = waveletPresetsLoad();
-        delete all[name];
-        waveletPresetsSave(all);
-        refreshWaveletPresetList();
-        log("INFO", tr("wavelets.presets.deleted", "Esquema borrado: ") + name);
-    });
-
-    sel.addEventListener("change", () => {
-        const name = sel.value;
-        if (!name) return;
-        const all = waveletPresetsLoad();
-        if (all[name]) {
-            applyWaveletPreset(all[name]);
-            log("INFO", tr("wavelets.presets.applied", "Esquema aplicado: ") + name);
-        }
-    });
-}
-
 window.addEventListener("load", () => {
     console.log("Zenith: Startup content loaded.");
 
@@ -2098,9 +2045,6 @@ window.addEventListener("load", () => {
 
     // Ajuste fino + doble-clic-reset en todos los sliders de la app.
     enhanceRangeInputs();
-
-    // Esquemas de wavelets guardables (paridad de flujo con RegiStax).
-    initWaveletPresets();
 
     // Double-check show if it somehow missed the module init
     if (appWindow && typeof appWindow.show === 'function') {
@@ -2402,6 +2346,11 @@ function showProcessing(msg = "PROCESANDO...") {
         txt.style.color = "";
         if (det) det.textContent = "Iniciando...";
         if (bar) bar.style.width = "0%";
+        // Telemetria: limpiar la rejilla de la operacion anterior (se vuelve
+        // a mostrar sola cuando llega el primer evento stack_telemetry).
+        const teleBox = $("#stack-telemetry");
+        if (teleBox) teleBox.style.display = "none";
+        _lastStackTelemetry = null;
         if (btnCancel) {
             btnCancel.disabled = false;
             btnCancel.style.opacity = "";
@@ -2415,6 +2364,8 @@ window.showProcessing = showProcessing;
 function hideProcessing() {
     const overlay = $("#processing-overlay");
     if (overlay) overlay.style.display = "none";
+    const teleBox = $("#stack-telemetry");
+    if (teleBox) teleBox.style.display = "none";
     isCancellationRequested = false;
     const btnCancel = $("#btn-cancel-process");
     if (btnCancel) {
@@ -2906,13 +2857,9 @@ function startAnimationPlayer(imageDataList, keepFilters = false) {
         }
     }
 
-    animState.images = imageDataList.filter(Boolean).map(item => {
-        if (typeof item === 'string' && item.startsWith("data:")) {
-            return item;
-        } else {
-            return convertFileSrc(item);
-        }
-    });
+    // Rutas → URLs del asset protocol (con cache-busting si los archivos
+    // fueron reescritos por normalize/realign); data-URLs pasan tal cual.
+    animState.images = imageDataList.filter(Boolean).map(toAnimationSrc);
 
     if (animState.images.length === 0) {
         showCustomAlert(tr("general.error", "Error"), tr("animation.errors.no_valid_images", "No se generaron imagenes validas para reproducir."));
@@ -3434,9 +3381,14 @@ linkTintControl("#sl-anim-tint-b", "#num-anim-tint-b", "b");
         showProcessing(tr("animation.normalize_processing", "NORMALIZANDO BRILLO..."));
 
         try {
-            const normalizedBase64List = await invoke("normalize_batch_brightness", { paths: batchResultPaths });
-            if (normalizedBase64List && normalizedBase64List.length > 0) {
-                batchGeneratedImages = normalizedBase64List;
+            // ASSET PROTOCOL: el backend sobrescribe los archivos y devuelve sus
+            // RUTAS (ya no base64 — retener todos los frames en base64 era el
+            // pico de RAM del WebView). Bump del cache-buster: mismo path,
+            // contenido nuevo en disco.
+            const normalizedPaths = await invoke("normalize_batch_brightness", { paths: batchResultPaths });
+            if (normalizedPaths && normalizedPaths.length > 0) {
+                animAssetVersion = Date.now();
+                batchGeneratedImages = normalizedPaths;
                 refreshAnimationFromFullFrames(batchGeneratedImages, true);
                 log("SUCCESS", i18n.t("animation.normalize_success_log"));
                 showCustomAlert(i18n.t("general.ready"), i18n.t("animation.normalize_success_message"));
@@ -4462,6 +4414,13 @@ linkControl("#sl-crisp", "#num-crisp", 10.0);
 linkControl("#sl-master-denoise", "#num-master-denoise", 1.0);
 linkControl("#sl-denoise-detail", "#num-denoise-detail", 1.0);
 linkControl("#sl-denoise-chroma", "#num-denoise-chroma", 1.0);
+// B+: intensidad edge-aware · auto-máscara adaptativa (ambos 0..100 enteros)
+linkControl("#sl-edge-strength", "#num-edge-strength", 1.0);
+linkControl("#sl-auto-mask", "#num-auto-mask", 1.0);
+// Niveles: negro/blanco en [0..1] (slider ×1000), gamma medios en [0.1..3] (×100)
+linkControl("#sl-levels-black", "#num-levels-black", 1000.0);
+linkControl("#sl-levels-white", "#num-levels-white", 1000.0);
+linkControl("#sl-levels-gamma", "#num-levels-gamma", 100.0);
 // linkControl("#sl-gamma", "#num-gamma", 100.0);
 // Custom Inverted Gamma Logic for Post-Processing
 const slGamma = $("#sl-gamma");
@@ -4508,6 +4467,12 @@ if (ui.blendSlider) {
 
 [ui.rx, ui.ry, ui.bx, ui.by].forEach(el => { if (el) el.addEventListener("input", triggerUpdate); });
 if (ui.chkDeringing) ui.chkDeringing.addEventListener("change", triggerUpdate);
+
+// B (wavelets edge-aware) y A (PSF del limbo): re-procesar al togglear.
+["chk-edge-wavelets", "chk-psf-limb"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", triggerUpdate);
+});
 
 function resetProcessingParams() {
     const zeroIds = [
@@ -4628,6 +4593,58 @@ function updateModeGlow() {
     }
 }
 
+// Histograma RGB del resultado actual (256 bins/canal, escala log para ver las
+// colas) + marcadores de los puntos negro/blanco de niveles. Se dibuja tras cada
+// render del pipeline. El resultado interactivo es un data-URL (mismo origen), así
+// que getImageData no contamina el canvas; con rutas asset-protocol podría fallar
+// → try/catch silencioso.
+function drawHistogram(imgEl) {
+    const canvas = document.getElementById("hist-canvas");
+    if (!canvas || !imgEl || !imgEl.naturalWidth) return;
+    const sw = 256;
+    const sh = Math.max(1, Math.round(256 * imgEl.naturalHeight / imgEl.naturalWidth));
+    const off = drawHistogram._off || (drawHistogram._off = document.createElement("canvas"));
+    off.width = sw; off.height = sh;
+    const octx = off.getContext("2d", { willReadFrequently: true });
+    let data;
+    try {
+        octx.drawImage(imgEl, 0, 0, sw, sh);
+        data = octx.getImageData(0, 0, sw, sh).data;
+    } catch (e) { return; }
+    const binsR = new Float32Array(256), binsG = new Float32Array(256), binsB = new Float32Array(256);
+    for (let i = 0; i < data.length; i += 4) { binsR[data[i]]++; binsG[data[i + 1]]++; binsB[data[i + 2]]++; }
+    let peak = 1;
+    for (let k = 0; k < 256; k++) { peak = Math.max(peak, binsR[k], binsG[k], binsB[k]); }
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+    const invLogPeak = 1 / Math.log(1 + peak);
+    const drawChannel = (bins, color) => {
+        ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.beginPath();
+        for (let k = 0; k < 256; k++) {
+            const x = k / 255 * (W - 1);
+            const h = Math.log(1 + bins[k]) * invLogPeak * (H - 2);
+            ctx.moveTo(x, H); ctx.lineTo(x, H - h);
+        }
+        ctx.stroke();
+    };
+    ctx.globalCompositeOperation = "lighter";
+    drawChannel(binsR, "rgba(248,113,113,0.75)");
+    drawChannel(binsG, "rgba(74,222,128,0.75)");
+    drawChannel(binsB, "rgba(96,165,250,0.75)");
+    ctx.globalCompositeOperation = "source-over";
+    // Marcadores de niveles negro/blanco.
+    try {
+        const p = getPipelineParams();
+        const mark = (v) => {
+            const x = Math.max(0, Math.min(1, v)) * (W - 1);
+            ctx.strokeStyle = "rgba(226,232,240,0.55)"; ctx.lineWidth = 1;
+            ctx.setLineDash([3, 2]); ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); ctx.setLineDash([]);
+        };
+        mark(p.levels.black); mark(p.levels.white);
+    } catch (e) { /* getPipelineParams no disponible aún */ }
+}
+
 function getPipelineParams() {
     const getVal = (id) => parseFloat($(`#num-${id}`)?.value) || 0;
     return {
@@ -4665,7 +4682,20 @@ function getPipelineParams() {
             light: getVal("dr-light"),
             mask: ui.chkDrMask?.checked || false
         },
-        useRgbSharpening: (document.getElementById("sel-sharpen-mode")?.value === "rgb")
+        useRgbSharpening: (document.getElementById("sel-sharpen-mode")?.value === "rgb"),
+        // B: wavelets edge-aware (anti-ringing en limbo) · A: deconv con PSF medida
+        edgeAwareWavelets: document.getElementById("chk-edge-wavelets")?.checked || false,
+        psfFromLimb: document.getElementById("chk-psf-limb")?.checked || false,
+        // B+: intensidad edge-aware (0..100, 50 = histórico) · auto-máscara adaptativa por SNR (0..100)
+        edgeAwareStrength: parseFloat($(`#num-edge-strength`)?.value ?? "50"),
+        autoMask: getVal("auto-mask"),
+        // Niveles (estiramiento por histograma estilo RegiStax): negro/blanco de
+        // entrada [0..1] + gamma de medios tonos. Neutro: 0 / 1 / 1.
+        levels: {
+            black: parseFloat($(`#num-levels-black`)?.value) || 0,
+            white: parseFloat($(`#num-levels-white`)?.value) || 1,
+            gamma: parseFloat($(`#num-levels-gamma`)?.value) || 1
+        }
     };
 }
 window.getPipelineParams = getPipelineParams;
@@ -4686,17 +4716,42 @@ function isPostConfigNeutral(p) {
         && zero(p.color.b) && zero(p.color.rb) && zero(p.color.bb)
         && zero(p.shift.rx) && zero(p.shift.ry) && zero(p.shift.bx) && zero(p.shift.by)
         && Math.abs(p.blend - 100) < 0.001
-        && p.dr.mode === 0;
+        && p.dr.mode === 0
+        && zero(p.levels.black) && one(p.levels.white) && one(p.levels.gamma);
 }
+
+// Preview en vivo: la vista actual está en baja resolución (render rápido de
+// arrastre) → hay que forzar el render completo aunque los params no cambien.
+let previewIsDownscaled = false;
+let lastFastPreview = 0;
+const FAST_PREVIEW_MS = 110;
 
 function triggerUpdate() {
     const currentParams = JSON.stringify(getPipelineParams());
-    if (currentParams === lastProcessedParams) return;
+    if (currentParams === lastProcessedParams && !previewIsDownscaled) return;
+
+    // PREVIEW RÁPIDO EN VIVO: durante el arrastre (inputs rápidos) render a 1/4
+    // de resolución como máximo cada ~110 ms → feedback casi instantáneo; el
+    // render final exacto (resolución completa) lo hace el debounce de abajo al
+    // soltar. Solo para configuraciones PESADAS (deconv/lce/edge-aware/auto-máscara/
+    // PSF), donde el render completo tarda; en ligeras el debounce ya es rápido y
+    // así evitamos parpadeo.
+    if (currentFilePath) {
+        const pf = getPipelineParams();
+        const heavy = pf.deconv.i > 0 || pf.deconv.vi > 0 || pf.lce > 0
+            || pf.edgeAwareWavelets || pf.autoMask > 0 || pf.psfFromLimb;
+        const nowT = performance.now();
+        if (heavy && nowT - lastFastPreview >= FAST_PREVIEW_MS) {
+            lastFastPreview = nowT;
+            pipelineRequestId++;
+            processPipeline(pipelineRequestId, currentParams, 4);
+        }
+    }
 
     clearTimeout(updateTimer);
     updateTimer = setTimeout(() => {
         const nowParams = JSON.stringify(getPipelineParams());
-        if (nowParams !== lastProcessedParams) {
+        if (nowParams !== lastProcessedParams || previewIsDownscaled) {
             pipelineRequestId++;
             showLocalProcessing("Pendiente...");
             showImgLoader();
@@ -4717,7 +4772,7 @@ function triggerUpdate() {
     }, 300);
 }
 
-async function processPipeline(requestId, paramsString) {
+async function processPipeline(requestId, paramsString, downscale = 1) {
     if (!currentFilePath) { hideImgLoader(); hideLocalProcessing(); return; }
     const p = JSON.parse(paramsString);
     const msg = $("#local-msg");
@@ -4749,17 +4804,30 @@ async function processPipeline(requestId, paramsString) {
             masterDenoise: p.masterDenoise,
             masterDenoiseDetail: p.denoiseDetail,
             masterDenoiseChroma: p.denoiseChroma,
-            useRgbSharpening: p.useRgbSharpening
+            useRgbSharpening: p.useRgbSharpening,
+            edgeAwareWavelets: p.edgeAwareWavelets,
+            psfFromLimb: p.psfFromLimb,
+            edgeAwareStrength: p.edgeAwareStrength,
+            autoMask: p.autoMask,
+            previewDownscale: downscale,
+            gpuMode: getGpuMode(),
+            levelsBlack: p.levels.black,
+            levelsWhite: p.levels.white,
+            levelsGamma: p.levels.gamma
         });
 
         if (requestId !== pipelineRequestId) { console.log("Descartado."); return; }
-        lastProcessedParams = paramsString;
+        // Solo el render a resolución COMPLETA fija el memo; el preview rápido
+        // (downscale) marca la vista como baja-res para forzar luego el full.
+        if (downscale === 1) lastProcessedParams = paramsString;
+        previewIsDownscaled = (downscale !== 1);
 
         if (ui.imgResult) {
             if (msg) msg.textContent = "Renderizando...";
             const viewportBeforeRender = captureViewportState();
             await setImageAndWait(ui.imgResult, b64, false);
             restoreViewportState(viewportBeforeRender);
+            drawHistogram(ui.imgResult);
 
             if (ui.statusText) { ui.statusText.textContent = "Vista actualizada."; ui.statusText.style.color = "#94a3b8"; }
         }
@@ -5094,7 +5162,11 @@ if ($("#btn-mosaic-mode")) {
     const planetRates = {
         jupiter: [877.9, 870.27, 870.536],
         saturn: [844.3, 812.0, 810.7938],
-        mars: [350.89198507, 350.89198507, 350.89198507]
+        mars: [350.89198507, 350.89198507, 350.89198507],
+        // Venus: tasa ATMOSFÉRICA (nubes UV, ~4.4 d retrógrado), no la sólida de 243 d.
+        venus: [-81.81818, -81.81818, -81.81818],
+        uranus: [-501.7928812, -501.7928812, -501.7928812],
+        neptune: [536.3128492, 536.3128492, 536.3128492]
     };
 
     function setDerotStatus(text, tone = "ready") {
@@ -5674,6 +5746,56 @@ if ($("#btn-mosaic-mode")) {
         }
     });
 
+    // RGB POR CANAL (mono + rueda de filtros): 3 selecciones (R, G, B) en orden.
+    document.getElementById("btn-derot-fusion-rgb")?.addEventListener("click", async () => {
+        try {
+            const pick = async (label) => {
+                const r = await openDialog({
+                    multiple: false,
+                    title: label,
+                    filters: [{ name: "Planetary stack", extensions: ["png", "tif", "tiff", "jpg", "jpeg"] }]
+                });
+                if (!r) return null;
+                return (typeof r === "object" && r !== null && r.path) ? r.path : r;
+            };
+            const redPath = await pick(tr("derotation.rgb.pick_red", "Canal ROJO (R)"));
+            if (!redPath) return;
+            const greenPath = await pick(tr("derotation.rgb.pick_green", "Canal VERDE (G)"));
+            if (!greenPath) return;
+            const bluePath = await pick(tr("derotation.rgb.pick_blue", "Canal AZUL (B)"));
+            if (!bluePath) return;
+
+            state.disc = readDiscInputs() || state.disc;
+            const fallbackIntervalSec = parseFloat(fusionIntervalInput?.value || "0");
+            showProcessing(tr("derotation.rgb.processing", "DEROTANDO CANALES RGB..."));
+            const fusion = await invoke("fuse_planetary_derotation_rgb", {
+                redPath, greenPath, bluePath,
+                planet: state.planet,
+                cmSystem: parseInt(cmSelect?.value || "1", 10),
+                limbStrength: parseFloat(limbSlider?.value || "0.5"),
+                fallbackIntervalSec: Number.isFinite(fallbackIntervalSec) ? fallbackIntervalSec : 0,
+                subEarthLatDeg: getB0Value(),
+                northAngleDeg: state.disc ? Number(state.disc.angle_deg || 0) : null,
+                discOverride: state.disc || null
+            });
+            state.diagnostics = fusion.diagnostics || state.diagnostics;
+            state.disc = fusion.detected_disc || state.disc;
+            syncDiscInputs(state.disc);
+            await loadDerotationResultIntoWorkspace(fusion, "Derotation RGB");
+            const warningText = (fusion.warnings || []).length ? `\n\nAvisos:\n${fusion.warnings.join("\n")}` : "";
+            log("SUCCESS", `RGB por canal derotado · ${Number(fusion.time_span_sec || 0).toFixed(1)}s · ${fusion.output_path}`);
+            showCustomAlert(
+                tr("derotation.rgb.done", "Derotación RGB completada"),
+                `${tr("derotation.rgb.saved", "Resultado guardado")}:\n${fusion.output_path}\n\n${tr("derotation.rgb.time_span", "Ventana temporal")}: ${Number(fusion.time_span_sec || 0).toFixed(1)}s${warningText}`
+            );
+        } catch (e) {
+            showCustomAlert(tr("general.error", "Error"), normalizeBackendText(e));
+            log("ERROR", "Derotación RGB: " + normalizeBackendText(e));
+        } finally {
+            hideProcessing();
+        }
+    });
+
     document.getElementById("btn-derot-apply")?.addEventListener("click", async () => {
         if (!state.imagePath) {
             showCustomAlert(tr("general.info", "Info"), tr("derotation.errors.load_first", "Carga primero una imagen planetaria."));
@@ -5946,6 +6068,13 @@ if (ui.btnBatchRun) {
                         masterDenoiseChroma: p.denoiseChroma,
                         blend: p.blend / 100.0,
                         useRgbSharpening: p.useRgbSharpening,
+                        edgeAwareWavelets: p.edgeAwareWavelets,
+                        psfFromLimb: p.psfFromLimb,
+                        edgeAwareStrength: p.edgeAwareStrength,
+                        autoMask: p.autoMask,
+                        levelsBlack: p.levels.black,
+                        levelsWhite: p.levels.white,
+                        levelsGamma: p.levels.gamma,
                         batchMode: actualBatchMode,
                         targetType: batchFlow.category,
                         bayerOverride: bOverride,
@@ -5959,10 +6088,15 @@ if (ui.btnBatchRun) {
                         apGridSize: batchFlow.apSize,
                         apThreshold: batchFlow.apThreshold,
                         progressPrefix: `[${displayIdx}/${batchFiles.length}]`,
-                        alignRgb: document.getElementById("chk-rgb-align") ? document.getElementById("chk-rgb-align").checked : true
+                        alignRgb: document.getElementById("chk-rgb-align") ? document.getElementById("chk-rgb-align").checked : true,
+                        gpuMode: getGpuMode()
                     });
 
-                    const preview = result?.preview_base64 || result?.path;
+                    // ASSET PROTOCOL: guardar la RUTA (string diminuto) en vez del
+                    // base64 — el reproductor ya convierte rutas con convertFileSrc.
+                    // Antes un lote grande retenia TODOS los PNG en base64 en el
+                    // heap del WebView (>1 GB → crash del renderer).
+                    const preview = result?.path || result?.preview_base64;
                     if (preview && result?.path) {
                         batchGeneratedImages.push(preview);
                         batchResultPaths.push(result.path);
@@ -6289,13 +6423,23 @@ if (ui.btnRunAnalysis) {
                 const warpingAnalysis = flow.warpingAnalysis;
                 log("INFO", `Iniciando ${flow.name} con modo: ${analysisMode} (${flow.category}, Warping: ${warpingAnalysis})`);
 
-                const res = await invoke("analyze_video", {
-                    path: currentFilePath,
-                    mode: analysisMode,
-                    targetType: flow.category,
-                    warpingAnalysis, // NEW
-                    bayerOverride: bOverride,
-                    anchorOverride: getManualAnchorOverrideValue()
+                const computePolicy = ({
+                    gpu: "gpu_only",
+                    cpu: "cpu_only",
+                    auto: "auto",
+                    hybrid: "hybrid"
+                })[getGpuMode()] || "hybrid";
+                const res = await invoke("analyze_planetary", {
+                    request: {
+                        path: currentFilePath,
+                        isSurface: analysisMode.includes("surface"),
+                        targetType: flow.category,
+                        warpingAnalysis,
+                        bayerOverride: bOverride,
+                        anchorOverride: getManualAnchorOverrideValue(),
+                        computePolicy,
+                        profile: "custom"
+                    }
                 });
 
                 const format = (v) => (v === undefined || v === null || isNaN(v)) ? "-" : Math.min(100, Math.max(0, v)).toFixed(2) + "%";
@@ -6626,6 +6770,10 @@ function showStackingReport(duration, stackContext = {}) {
                                                 <td style="padding:6px 0; text-align:right; color:#cbd5e1;">${escapeHtml(engineLabel)}</td>
                                             </tr>
                                             <tr style="border-bottom: 1px solid rgba(255,255,255,0.03);">
+                                                <td style="padding:6px 0; color:#64748b;"><span class="report-led led-green"></span>${tr('report.accum_mode', 'Acumulación')}</td>
+                                                <td style="padding:6px 0; text-align:right; color:${(_lastStackTelemetry?.mode || "").startsWith("GPU") ? "#34d399" : "#cbd5e1"}; font-weight:500;">${escapeHtml(_lastStackTelemetry?.mode || "CPU")}${(_lastStackTelemetry?.mode || "").startsWith("GPU") ? ` · ${_lastStackTelemetry.vram_mb} MB VRAM` : ""}</td>
+                                            </tr>
+                                            <tr style="border-bottom: 1px solid rgba(255,255,255,0.03);">
                                                 <td style="padding:6px 0; color:#64748b;"><span class="report-led led-green"></span>${i18n.t('report.alignment_points')}</td>
                                                 <td style="padding:6px 0; text-align:right; color:#cbd5e1;">${escapeHtml(apLabel)}</td>
                                             </tr>
@@ -6784,27 +6932,11 @@ if (ui.btnStack) {
                 // FIX DISPATCH: zenith_v3 (now used for BOTH surface and planet in Zenith Ultimate)
                 // must route through stack_video_liquid_warping, not stack_video.
                 // Previously "zenith_v3" fell into the else-global branch without AP points.
-                if (!isZenithUltimateSelected() && alignModeStr === "elite_v4") {
-                    log("INFO", "Iniciando Zenith Elite V4 (Neural-Restoration)...");
-                    const eliteConfig = {
-                        psf_radius: parseInt(document.getElementById("elite-psf-radius").value) || 15,
-                        fwhm_pixels: parseFloat(document.getElementById("elite-fwhm").value) || 2.5,
-                        airy_weight: parseFloat(document.getElementById("elite-airy").value) || 0.3,
-                        auto_psf_from_limb: document.getElementById("elite-auto-psf").checked,
-                        deconv_iterations: parseInt(document.getElementById("elite-iter").value) || 15,
-                        tv_lambda: parseFloat(document.getElementById("elite-lambda").value) || 0.01,
-                        snr_floor: parseFloat(document.getElementById("elite-snr").value) || 5.0,
-                        rejection_threshold: 0.1, 
-                        post_sharpen: parseFloat(document.getElementById("elite-sharpen").value) || 0.5,
-                        feather_px: 20
-                    };
-                    b64 = await invoke("zas_stack_video_elite", {
-                        path: currentFilePath,
-                        percent: parseFloat(ui.stackSlider.value),
-                        config: eliteConfig,
-                        category: flow.category
-                    });
-                } else if (isZenithUltimateSelected() || alignModeStr === "liquid_warping" || alignModeStr === "liquid_v3" || alignModeStr === "zenith_v3") {
+                // (Zenith Elite V4 retirado del selector: backend legado sin lotes de RAM —
+                // cargaba TODO el video como 3 planos f32 (OOM) —, sin cancelacion y con la
+                // config ignorada. Si un ajuste guardado aun trae "elite_v4", cae al modo
+                // global estandar del motor unificado, que es seguro.)
+                if (isZenithUltimateSelected() || alignModeStr === "liquid_warping" || alignModeStr === "liquid_v3" || alignModeStr === "zenith_v3") {
                     // Zenith Ultimate (both categories) + legacy liquid_warping modes
                     log("INFO", `Iniciando ${isZenithUltimateSelected() ? flow.name : (alignModeStr === "liquid_v3" ? "Zenith Precision V3 (Multipoint)" : "Liquid Warping V2")}...`);
                     b64 = await invoke("stack_video_liquid_warping", {
@@ -6825,7 +6957,8 @@ if (ui.btnStack) {
                         isV3: flow.isV3 || (alignModeStr === "liquid_v3") || (alignModeStr === "zenith_v3"), // V3 flag for all these modes
                         keepFullFrame: document.getElementById("chk-keep-full-frame") ? document.getElementById("chk-keep-full-frame").checked : false,
                         targetType: flow.category,
-                        alignRgb: document.getElementById("chk-rgb-align") ? document.getElementById("chk-rgb-align").checked : true
+                        alignRgb: document.getElementById("chk-rgb-align") ? document.getElementById("chk-rgb-align").checked : true,
+                        gpuMode: getGpuMode()
                     });
                 } else {
                     // MODO GLOBAL / STANDARD
@@ -6847,7 +6980,8 @@ if (ui.btnStack) {
                         normalizeColors: document.getElementById("chk-normalize-colors") ? document.getElementById("chk-normalize-colors").checked : true,
                         isV3: flow.isV3 || (alignModeStr === "zenith_v3"), // NEW FLAG
                         keepFullFrame: document.getElementById("chk-keep-full-frame") ? document.getElementById("chk-keep-full-frame").checked : false,
-                        targetType: flow.category
+                        targetType: flow.category,
+                        gpuMode: getGpuMode()
                     });
                 }
 
@@ -6860,7 +6994,7 @@ if (ui.btnStack) {
                         btnRoi.classList.remove("primary");
                         btnRoi.style.background = "rgba(16, 185, 129, 0.15)";
                         btnRoi.style.color = "#6ee7b7";
-                        btnRoi.textContent = "📐 Definir Área de Apilado";
+                        btnRoi.innerHTML = `<svg class="zas-icon" style="width:14px; height:14px; fill:none; stroke:currentColor;"><use href="#icon-ruler"></use></svg><span>Definir Área de Apilado</span>`;
                     }
                     const roiBox = document.getElementById("stacking-roi-box");
                     if (roiBox) roiBox.style.display = "none";
@@ -6868,7 +7002,12 @@ if (ui.btnStack) {
 
                 if (ui.viewResult) ui.viewResult.style.display = "flex";
                 if (ui.imgResult) {
-                    await setImageAndWait(ui.imgResult, b64, false);
+                    // Pass the raw temp path/data URL. setImageAndWait performs
+                    // exactly one asset-protocol conversion.
+                    const resultVisible = await setImageAndWait(ui.imgResult, b64, false);
+                    if (!resultVisible) {
+                        throw new Error("El apilado terminó, pero no se pudo publicar su vista previa. El máster de 16 bits permanece intacto.");
+                    }
                     fitToScreen(); // Recenter the viewport symmetrically to feature both images
                 }
 
@@ -7085,7 +7224,14 @@ async function fn_save(format_idx) {
                 masterDenoise: p.masterDenoise,
                 masterDenoiseDetail: p.denoiseDetail,
                 masterDenoiseChroma: p.denoiseChroma,
-                useRgbSharpening: p.useRgbSharpening
+                useRgbSharpening: p.useRgbSharpening,
+                edgeAwareWavelets: p.edgeAwareWavelets,
+                psfFromLimb: p.psfFromLimb,
+                edgeAwareStrength: p.edgeAwareStrength,
+                autoMask: p.autoMask,
+                levelsBlack: p.levels.black,
+                levelsWhite: p.levels.white,
+                levelsGamma: p.levels.gamma
             });
             log("SUCCESS", normalizeBackendText(msg)); showCustomAlert(tr("general.saved", "Guardado"), normalizeBackendText(msg));
         } catch (e) { log("ERROR", "Save: " + e); showCustomAlert("Error", "Error guardando: " + e); }
@@ -7469,6 +7615,21 @@ listen("log_event", (e) => log(e.payload.level, e.payload.msg));
 listen("backend_panic", (e) => {
     const msg = (e && e.payload != null) ? String(e.payload) : "Error interno";
     log("ERROR", "Backend panic: " + msg);
+    // DESBLOQUEO UI: tras un panic en el backend la promesa del invoke nunca
+    // se resuelve — el finally del handler de apilado no corre, y el overlay
+    // "APILANDO FRAMES..." + el boton deshabilitado quedaban fijos hasta
+    // reiniciar la app. Restaurar aqui todos los controles de proceso.
+    try {
+        hideProcessing();
+        hideLocalProcessing();
+        if (typeof stopStackingTimer === "function") stopStackingTimer();
+        if (typeof stopTipsCarousel === "function") stopTipsCarousel();
+        if (typeof dsStacking !== "undefined" && dsStacking && typeof dsProgressStop === "function") {
+            dsProgressStop();
+        }
+        if (ui.btnStack) ui.btnStack.disabled = false;
+        if (ui.btnBatchRun) ui.btnBatchRun.disabled = false;
+    } catch (_) { }
     try {
         showCustomAlert(
             tr("general.backend_panic_title", "Error inesperado"),
@@ -7486,10 +7647,100 @@ listen("ds-report", (e) => {
     if (btn) btn.style.display = dsFrameReport && dsFrameReport.length ? "inline-flex" : "none";
 });
 
+// Estadísticas de calidad del máster (estrellas, FWHM, SNR, rechazo, cobertura).
+let dsMasterStats = null;
+listen("ds-master-stats", (e) => {
+    dsMasterStats = e.payload || null;
+    if (typeof dsUpdateHistogram === "function") { try { dsUpdateHistogram(); } catch (_) { } }
+});
+
+// TELEMETRIA EN VIVO del apilado: modo GPU/CPU, rendimiento y recursos.
+// El backend la emite cada ~25 frames; se muestra bajo la barra del overlay
+// y el ultimo snapshot alimenta el bloque GPU del reporte final.
+let _lastStackTelemetry = null;
+let _lastPipelineTelemetry = null;
+listen("pipeline_telemetry", (e) => {
+    const t = e.payload || {};
+    _lastPipelineTelemetry = t;
+    window._lastPipelineTelemetry = t;
+    if (typeof dsStacking !== "undefined" && dsStacking && t.domain === "deep_sky") {
+        const eta = Number.isFinite(t.eta_seconds) ? ` · ETA ${dsFmtClock(t.eta_seconds * 1000)}` : "";
+        const engine = t.engine ? ` · ${t.engine}` : "";
+        const cur = document.getElementById("ds-prog-current");
+        if (cur) cur.textContent = `${t.phase || "Proceso"}${engine}${eta}`;
+        if (typeof dsProgressPhaseUpdate === "function") {
+            dsProgressPhaseUpdate(t.phase || "", t.phase === "complete");
+        }
+        const resources = document.getElementById("ds-prog-resources");
+        if (resources) {
+            const throughput = Number.isFinite(t.throughput) ? `${t.throughput.toFixed(1)} elem/s` : "—";
+            const pct = (v) => Number.isFinite(v) ? `${v.toFixed(0)}%` : "—";
+            resources.style.display = "grid";
+            resources.innerHTML = `<span>Rendimiento <b style="color:#e2e8f0">${throughput}</b></span>
+                <span>CPU <b style="color:#e2e8f0">${pct(t.cpu_percent)}</b></span>
+                <span>GPU <b style="color:#e2e8f0">${pct(t.gpu_percent)}</b></span>
+                <span>RAM <b style="color:#e2e8f0">${t.ram_mb || 0} MB</b></span>
+                <span>VRAM <b style="color:#e2e8f0">${t.vram_mb || 0} MB</b></span>
+                <span>I/O <b style="color:#e2e8f0">${(t.io_read_mb || 0).toFixed(1)}/${(t.io_write_mb || 0).toFixed(1)} MB</b></span>
+                <span>Caché <b style="color:#e2e8f0">${t.cache_hits || 0}/${(t.cache_hits || 0) + (t.cache_misses || 0)}</b></span>
+                <span>Motor <b style="color:#e2e8f0">${escapeHtml(t.engine || "—")}</b></span>`;
+        }
+        const warning = document.getElementById("ds-prog-warning");
+        if (warning) {
+            warning.style.display = t.fallback_reason ? "block" : "none";
+            warning.textContent = t.fallback_reason ? `Fallback: ${t.fallback_reason}` : "";
+        }
+    }
+});
+listen("stack_telemetry", (e) => {
+    const t = e.payload || {};
+    _lastStackTelemetry = t;
+    const box = document.getElementById("stack-telemetry");
+    const modeEl = document.getElementById("stack-telemetry-mode");
+    const grid = document.getElementById("stack-telemetry-grid");
+    if (!box || !modeEl || !grid) return;
+    box.style.display = "block";
+    const isAnalysis = t.phase === "analysis";
+    const decodeGpu = t.decode_gpu === true || (t.mode || "").includes("HW-GPU");
+    const computeGpu = t.compute_gpu === true || (t.mode || "").includes("preprocess GPU");
+    const isGpu = (t.mode || "").startsWith("GPU") || computeGpu;
+    // Iconos SVG del sistema (mismos que el resto de la app) — no emojis.
+    const svgIcon = (id) =>
+        `<svg class="zas-icon" style="width:1em;height:1em;vertical-align:-0.14em;"><use href="#${id}"></use></svg>`;
+    const iconId = isAnalysis ? "icon-search" : (isGpu ? "icon-lightning" : "icon-settings");
+    const verb = isAnalysis ? "Análisis" : "Acumulación";
+    modeEl.innerHTML = `${svgIcon(iconId)} ${verb}: ${escapeHtml(t.mode || "—")}`;
+    modeEl.style.color = isAnalysis ? "#c084fc" : (isGpu ? "#34d399" : "#38bdf8");
+    const pair = (k, v) =>
+        `<span style="color:#64748b;">${k}</span><span style="color:#e2e8f0;">${v}</span>`;
+    const rows = [
+        pair("Frames", `${t.frames_done}/${t.frames_total}`),
+        pair("Velocidad", `${(t.fps || 0).toFixed(1)} fps`),
+        pair(isAnalysis ? "Análisis/f" : "Alineación", `${(t.align_ms || 0).toFixed(1)} ms/f`),
+    ];
+    if (isAnalysis) {
+        // El modo trae "decode HW-GPU" cuando FFmpeg decodifica por hardware.
+        rows.push(pair("Decode", decodeGpu ? `${svgIcon("icon-lightning")} HW-GPU` : "CPU/mmap"));
+        rows.push(pair("Cómputo", computeGpu ? `${svgIcon("icon-lightning")} GPU por lotes` : "CPU SIMD"));
+    } else {
+        rows.push(pair(isGpu ? "GPU acum." : "Acumulación", isGpu ? `${(t.accum_ms || 0).toFixed(1)} ms/f` : "en CPU"));
+    }
+    rows.push(
+        pair("RAM", `${t.ram_mb || 0} MB`),
+        pair("VRAM", isGpu ? `${t.vram_mb || 0} MB` : "—"),
+        pair("Upload", isGpu ? `${(t.upload_mbps || 0).toFixed(0)} MB/s` : "—"),
+        pair(isAnalysis ? "Hilos" : "Caché/Hilos", isAnalysis ? `${t.threads || 0}` : `${t.cache_hits || 0} · ${t.threads || 0}`),
+    );
+    grid.innerHTML = rows.join("");
+});
+
 listen("progress", (e) => {
     const step = translateBackendProgressText(e.payload.step);
     const details = translateBackendProgressText(e.payload.details);
-    const pct = Number(e.payload.pct ?? 0);
+    // El backend ya satura a [0,100]; este clamp evita que cualquier payload
+    // no numérico o fuera de rango deje la barra congelada o desbordada.
+    const rawPct = Number(e.payload.pct);
+    const pct = Number.isFinite(rawPct) ? Math.max(0, Math.min(100, rawPct)) : 0;
 
     // Cielo Profundo: ventana WBPP dedicada (no la pantalla de carga genérica).
     if (typeof dsStacking !== "undefined" && dsStacking) {
@@ -7880,13 +8131,7 @@ function renderFrameManager() {
 
         const img = document.createElement("img");
         // Ensure src is valid (convert if needed) matches startAnimationPlayer logic
-        let imgSrc = src;
-        if (typeof src === 'string' && src.startsWith("data:")) {
-            imgSrc = src;
-        } else {
-            imgSrc = convertFileSrc(src);
-        }
-        img.src = imgSrc;
+        img.src = toAnimationSrc(src);
 
         img.style.width = "100%";
         img.style.height = "100%";
@@ -8178,8 +8423,9 @@ function dsRenderFileList(container, kind, files, lightsRef) {
         row.draggable = true;
         row.dataset.kind = kind;
         row.dataset.path = f.path;
-        // Grid: drag · estado · nombre COMPLETO · dims · exp · tags · borrar.
-        row.style.cssText = "display:grid; grid-template-columns:12px 14px minmax(0,1fr) 76px 48px auto 18px; align-items:center; gap:7px; padding:3px 4px; font-size:0.64rem; color:#94a3b8; font-family:'Courier New',monospace; border-radius:6px; cursor:grab;";
+        // Grid: drag · estado · nombre · dims · exp · tags · alternativa de
+        // reclasificación por teclado · borrar.
+        row.style.cssText = "display:grid; grid-template-columns:12px 14px minmax(0,1fr) 76px 48px auto 86px 24px; align-items:center; gap:7px; padding:3px 4px; font-size:0.64rem; color:#94a3b8; font-family:'Courier New',monospace; border-radius:6px; cursor:grab;";
         row.addEventListener("mouseenter", () => { row.style.background = "rgba(124,58,237,0.10)"; });
         row.addEventListener("mouseleave", () => { row.style.background = "transparent"; });
         row.addEventListener("dragstart", (e) => {
@@ -8191,12 +8437,13 @@ function dsRenderFileList(container, kind, files, lightsRef) {
 
         const grip = document.createElement("span");
         grip.textContent = "⠿";
+        grip.setAttribute("aria-hidden", "true");
         grip.style.color = "#475569";
         let warn = "";
         if (!f.ok) { warn = f.error || "ilegible"; }
         else if (lightsRef && (f.w !== lightsRef.w || f.h !== lightsRef.h)) { warn = tr("deepsky.warn_dims", "dims ≠"); }
         const status = document.createElement("span");
-        status.textContent = f.ok && !warn ? "✓" : "⚠";
+        status.textContent = f.ok && !warn ? "✓" : "⚠︎"; // marca de aviso en texto monocromo (VS15), no emoji
         status.style.color = f.ok && !warn ? "#34d399" : "#f59e0b";
         status.title = warn;
         const name = document.createElement("span");
@@ -8211,17 +8458,36 @@ function dsRenderFileList(container, kind, files, lightsRef) {
         exp.style.cssText = "text-align:right;";
         const tags = document.createElement("span");
         const parts = dsFileGroups(f);
+        const ff = dsFilterOfFile(f); // filtro por metadata O nombre
+        if (ff) parts.unshift(dsFilterLabel(ff));
         if (f.bayer) parts.unshift(f.bayer);
+        if (f.temp !== null && f.temp !== undefined) parts.push(`${f.temp.toFixed(0)}°`);
+        if (f.gain !== null && f.gain !== undefined) parts.push(`g${Math.round(f.gain)}`);
         tags.textContent = parts.join(" ");
         tags.style.cssText = "color:#7dd3fc; text-align:right; white-space:nowrap;";
-        const del = document.createElement("span");
+        const move = document.createElement("select");
+        move.setAttribute("aria-label", `${tr("deepsky.reclassify", "Reclasificar")}: ${f.name}`);
+        move.title = tr("deepsky.reclassify", "Reclasificar");
+        move.style.cssText = "min-width:0; width:86px; height:25px; padding:1px 3px; border:1px solid #334155; border-radius:6px; background:#0f172a; color:#94a3b8; font:0.58rem 'Courier New',monospace;";
+        DS_SECTIONS.forEach(section => {
+            const option = document.createElement("option");
+            option.value = section.kind;
+            option.textContent = section.kind.toUpperCase();
+            option.selected = section.kind === kind;
+            move.appendChild(option);
+        });
+        move.addEventListener("click", e => e.stopPropagation());
+        move.addEventListener("change", e => dsMoveFile(kind, f.path, e.target.value));
+        const del = document.createElement("button");
+        del.type = "button";
         del.textContent = "✕";
         del.title = tr("deepsky.remove_file", "Quitar este archivo");
-        del.style.cssText = "color:#64748b; cursor:pointer; text-align:center;";
+        del.setAttribute("aria-label", `${del.title}: ${f.name}`);
+        del.style.cssText = "width:24px; min-width:24px; height:24px; padding:0; border:0; background:transparent; color:#64748b; cursor:pointer; text-align:center;";
         del.addEventListener("click", (e) => { e.stopPropagation(); if (idx >= 0) { dsFiles[kind].splice(idx, 1); dsUpdateUI(); } });
         del.addEventListener("mouseenter", () => { del.style.color = "#f87171"; });
         del.addEventListener("mouseleave", () => { del.style.color = "#64748b"; });
-        row.append(grip, status, name, dims, exp, tags, del);
+        row.append(grip, status, name, dims, exp, tags, move, del);
         container.appendChild(row);
     });
     if (files.length > shown.length) {
@@ -8255,8 +8521,8 @@ function dsRenderSections() {
     auto.className = "donation-option";
     auto.style.cssText = "width:100%; min-height:52px; margin:0 0 4px;";
     auto.innerHTML = `
-        <span class="donation-option-icon" style="background:rgba(124,58,237,0.18); color:#c4b5fd; width:36px; height:36px;">
-            <svg class="zas-icon" style="width:18px; height:18px;"><use href="#icon-folder"></use></svg>
+        <span class="donation-option-icon" style="background:rgba(124,58,237,0.18); color:#c4b5fd; width:36px; height:36px; display:inline-flex; align-items:center; justify-content:center; flex:none;">
+            <svg class="zas-icon" style="width:18px; height:18px; display:block;"><use href="#icon-folder"></use></svg>
         </span>
         <span class="donation-option-copy" style="min-width:0;">
             <strong data-i18n="deepsky.scan_folder" style="letter-spacing:0.05em;">Escanear carpeta (auto-clasificar)</strong>
@@ -8264,6 +8530,48 @@ function dsRenderSections() {
         </span>`;
     auto.addEventListener("click", dsScanFolder);
     host.appendChild(auto);
+
+    // CARPETA DE TRABAJO Y SALIDA (estilo PixInsight): cachés de calibración
+    // (varios GB), masters y exportaciones van aquí — imprescindible cuando el
+    // disco del sistema anda justo. Persistente en localStorage.
+    const workBtn = document.createElement("button");
+    workBtn.type = "button";
+    workBtn.className = "donation-option";
+    workBtn.style.cssText = "width:100%; min-height:52px; margin:0 0 4px;";
+    const renderWorkDir = async () => {
+        const dir = localStorage.getItem("zas_ds_workdir") || "";
+        let space = "";
+        if (dir) {
+            try {
+                const info = await invoke("disk_space_info", { path: dir });
+                space = ` · ${(info.availableMb / 1024).toFixed(1)} GB libres`;
+            } catch (_) { }
+        }
+        workBtn.innerHTML = `
+        <span class="donation-option-icon" style="background:rgba(14,165,233,0.16); color:#7dd3fc; width:36px; height:36px; display:inline-flex; align-items:center; justify-content:center; flex:none;">
+            <svg class="zas-icon" style="width:18px; height:18px; display:block;"><use href="#icon-download"></use></svg>
+        </span>
+        <span class="donation-option-copy" style="min-width:0;">
+            <strong style="letter-spacing:0.05em;">${tr("deepsky.work_dir", "Carpeta de trabajo y salida")}</strong>
+            <small style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block;">${dir ? escapeHtml(dir) + escapeHtml(space) : tr("deepsky.work_dir_hint", "Junto a los lights (clic para elegir otro disco: cachés de varios GB + masters + exportaciones)")}</small>
+        </span>`;
+    };
+    workBtn.addEventListener("click", async () => {
+        const dir = await openDialog({ directory: true, multiple: false, title: tr("deepsky.work_dir_pick", "Carpeta de trabajo y salida (cachés, masters y exportaciones)") });
+        if (dir === null) return;
+        if (dir) localStorage.setItem("zas_ds_workdir", dir);
+        await renderWorkDir();
+        dsSchedulePreflight(true);
+        log("INFO", `Carpeta de trabajo: ${dir}`);
+    });
+    workBtn.addEventListener("contextmenu", async (e) => {
+        e.preventDefault();
+        localStorage.removeItem("zas_ds_workdir");
+        await renderWorkDir();
+        log("INFO", "Carpeta de trabajo restablecida (junto a los lights).");
+    });
+    renderWorkDir();
+    host.appendChild(workBtn);
 
     for (const s of DS_SECTIONS) {
         const wrap = document.createElement("div");
@@ -8289,8 +8597,8 @@ function dsRenderSections() {
         btn.className = "donation-option";
         btn.style.cssText = "flex:1 1 auto; width:auto; min-width:0; margin:0;";
         btn.innerHTML = `
-            <span class="donation-option-icon" style="background:${s.iconBg}; color:${s.iconColor};">
-                <svg class="zas-icon" style="width:18px; height:18px;"><use href="#${s.icon}"></use></svg>
+            <span class="donation-option-icon" style="background:${s.iconBg}; color:${s.iconColor}; display:inline-flex; align-items:center; justify-content:center; flex:none;">
+                <svg class="zas-icon" style="width:18px; height:18px; display:block;"><use href="#${s.icon}"></use></svg>
             </span>
             <span class="donation-option-copy" style="min-width:0;">
                 <strong data-i18n="${s.labelKey}" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${s.fallback}</strong>
@@ -8304,6 +8612,7 @@ function dsRenderSections() {
         const folder = document.createElement("button");
         folder.type = "button";
         folder.title = tr("deepsky.pick_folder", "Cargar carpeta (recursivo)");
+        folder.setAttribute("aria-label", `${folder.title}: ${s.fallback}`);
         folder.innerHTML = `<svg class="zas-icon" style="width:14px;height:14px;"><use href="#icon-folder"></use></svg>`;
         folder.style.cssText = "flex:0 0 auto; width:auto; background:none; border:1px solid #334155; color:#94a3b8; border-radius:8px; padding:6px 9px; cursor:pointer; display:flex; align-items:center;";
         folder.addEventListener("click", () => dsPickFolder(s.kind));
@@ -8311,6 +8620,7 @@ function dsRenderSections() {
         const clear = document.createElement("button");
         clear.type = "button";
         clear.title = tr("deepsky.clear", "Limpiar");
+        clear.setAttribute("aria-label", `${clear.title}: ${s.fallback}`);
         clear.textContent = "✕";
         clear.style.cssText = "flex:0 0 auto; width:auto; background:none; border:1px solid #334155; color:#64748b; border-radius:8px; padding:6px 10px; cursor:pointer; font-size:0.7rem;";
         clear.addEventListener("click", () => { dsFiles[s.kind] = []; dsUpdateUI(); });
@@ -8318,11 +8628,909 @@ function dsRenderSections() {
         rowTop.append(btn, folder, clear);
         const list = document.createElement("div");
         list.id = `ds-list-${s.kind}`;
-        list.style.cssText = "display:none; max-height:190px; overflow-y:auto; margin:2px 4px 0; border-left:2px solid rgba(124,58,237,0.25); padding:2px 4px 2px 8px;";
+        list.style.cssText = "display:none; max-height:240px; overflow-y:auto; margin:2px 4px 0; border-left:2px solid rgba(124,58,237,0.25); padding:2px 4px 2px 8px;";
         wrap.append(rowTop, list);
         host.appendChild(wrap);
         btn.addEventListener("click", () => dsPick(s.kind));
     }
+}
+
+// ---- Emparejamiento estilo WBPP: agrupa lights por exposición y empareja
+// cada grupo con su lote de darks (por exposición), bias (universal) y flats
+// (por filtro). Cada light sabe así con qué calibración se procesa. ----
+function dsExpKey(f) {
+    if (f.exptime === null || f.exptime === undefined) return "?";
+    return f.exptime >= 10 ? String(Math.round(f.exptime)) : String(Math.round(f.exptime * 10) / 10);
+}
+// Filtro canónico por TOKEN (mismo criterio que el backend). Las variantes
+// dual-band se detectan antes que las líneas individuales.
+function dsFilterToken(str) {
+    if (!str) return null;
+    const tokens = String(str).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    const has = (...values) => tokens.some(token => values.includes(token));
+    const hasHa = has("ha", "halpha", "h2");
+    const hasOiii = has("oiii", "o3");
+    const hasSii = has("sii", "s2");
+    const sv220 = has("sv220");
+    if (hasSii && (hasOiii || sv220)) return "SII_OIII";
+    if ((hasHa && hasOiii) || (sv220 && !hasSii)) return "HA_OIII";
+    for (const tok of tokens) {
+        switch (tok) {
+            case "ha": case "halpha": case "h2": return "HA";
+            case "oiii": case "o3": return "OIII";
+            case "sii": case "s2": return "SII";
+            case "r": case "red": case "rojo": return "R";
+            case "g": case "green": case "verde": return "G";
+            case "b": case "blue": case "azul": return "B";
+            case "l": case "lum": case "luminance": case "luminancia": return "L";
+        }
+    }
+    return null;
+}
+function dsFilterLabel(filter) {
+    return ({ HA_OIII: "Ha + OIII", SII_OIII: "SII + OIII", HA: "Ha" })[filter] || filter || "Banda ancha / OSC";
+}
+function dsFilterComponents(filter) {
+    if (filter === "HA_OIII") return ["HA", "OIII"];
+    if (filter === "SII_OIII") return ["SII", "OIII"];
+    return filter ? [filter] : [];
+}
+// Filtro de UN archivo: cabecera FITS FILTER primero (autoritativa), nombre de
+// archivo como respaldo. null = banda ancha / OSC (sin filtro nombrado).
+function dsFilterOfFile(f) {
+    const metadata = dsFilterToken(f.filter);
+    const filename = dsFilterToken(f.name) || dsFilterToken(f.path);
+    // FILTER=SV220 es ambiguo: la variante SII+OIII suele sobrevivir sólo en
+    // el nombre generado por la sesión de captura.
+    if (metadata === "HA_OIII" && filename === "SII_OIII") return filename;
+    return metadata || filename;
+}
+// Filtro dominante de un conjunto (para etiquetar un grupo).
+function dsFilterOf(files) {
+    const fs = files.map(dsFilterOfFile).filter(Boolean);
+    if (!fs.length) return null;
+    return fs.sort((a, b) => fs.filter(x => x === b).length - fs.filter(x => x === a).length)[0];
+}
+// Filtros DISTINTOS detectados entre los lights (para avisar de mezclas).
+function dsDistinctFilters(files) {
+    return [...new Set(files.map(dsFilterOfFile).filter(Boolean))];
+}
+// Una sesión integra cada perfil espectral por separado, aunque dentro de un
+// perfil pueda haber varias exposiciones que el motor normaliza por grupos.
+function dsIntegrationGroups(files) {
+    const groups = new Map();
+    for (const file of files.filter(f => f.ok)) {
+        const filter = dsFilterOfFile(file) || "BROADBAND";
+        if (!groups.has(filter)) groups.set(filter, { filter, files: [] });
+        groups.get(filter).files.push(file);
+    }
+    return [...groups.values()].sort((a, b) => a.filter.localeCompare(b.filter));
+}
+// Agrupa lights por (filtro · exposición): cada combinación es un apilado
+// independiente (el backend integra un solo filtro por pasada). Orden: por
+// filtro y luego exposición desc.
+function dsGroupLights(files) {
+    const m = new Map();
+    for (const f of files) {
+        const filt = dsFilterOfFile(f) || "";
+        const key = `${filt}|${dsExpKey(f)}`;
+        if (!m.has(key)) m.set(key, { filter: filt || null, expKey: dsExpKey(f), files: [] });
+        m.get(key).files.push(f);
+    }
+    return [...m.values()].sort((a, b) => {
+        if ((a.filter || "") !== (b.filter || "")) return (a.filter || "~").localeCompare(b.filter || "~");
+        if (a.expKey === "?") return 1; if (b.expKey === "?") return -1;
+        return parseFloat(b.expKey) - parseFloat(a.expKey);
+    });
+}
+function dsMetaBits(files) {
+    const f0 = files.find(f => f.ok) || files[0];
+    const bits = [];
+    if (f0) bits.push(`${f0.w}×${f0.h}`);
+    if (f0 && f0.bayer) bits.push(f0.bayer);
+    const temps = files.map(f => f.temp).filter(t => t !== null && t !== undefined);
+    if (temps.length) bits.push(`${(temps.reduce((a, b) => a + b, 0) / temps.length).toFixed(0)}°C`);
+    const gains = files.map(f => f.gain).filter(g => g !== null && g !== undefined);
+    if (gains.length) bits.push(`gain ${Math.round(gains[0])}`);
+    const filt = dsFilterOf(files);
+    if (filt) bits.push(dsFilterLabel(filt));
+    return bits;
+}
+
+// Renderiza el plan de calibración agrupado (una tarjeta por exposición).
+function dsRenderCalibrationPlan(container, lights) {
+    if (!lights.length) { container.style.display = "none"; return; }
+    container.style.display = "block";
+    const okLights = lights.filter(f => f.ok);
+    const groups = dsGroupLights(okLights);          // por filtro · exposición
+    const distinctFilters = dsDistinctFilters(okLights);
+    const biasPool = dsMatchedCalib("bias");
+    const darksPool = dsMatchedCalib("darks");
+    const flatsPool = dsMatchedCalib("flats");
+
+    const chip = (icon, color, label, count, detail, status) => {
+        const col = status === "ok" ? "#34d399" : status === "warn" ? "#fbbf24" : "#64748b";
+        const mark = status === "ok" ? "✓" : status === "warn" ? "⚠︎" : "—"; // aviso en texto (VS15)
+        return `<div style="display:flex; align-items:center; gap:9px; padding:7px 13px; background:rgba(15,23,42,0.55); border:1px solid ${status === "warn" ? "rgba(245,158,11,0.35)" : "rgba(255,255,255,0.07)"}; border-radius:11px; flex:1 1 190px; min-width:170px;">
+            <svg class="zas-icon" style="width:16px;height:16px;color:${color};"><use href="#${icon}"></use></svg>
+            <div style="min-width:0; flex:1;">
+                <div style="font-size:0.72rem; color:#e2e8f0; font-weight:600;">${label}</div>
+                <div style="font-size:0.63rem; color:${status === "warn" ? "#fbbf24" : "#94a3b8"};">${count} ${detail}</div>
+            </div>
+            <span style="color:${col}; font-weight:700; font-size:0.9rem;">${mark}</span>
+        </div>`;
+    };
+
+    let warned = false;
+    const cards = groups.map(({ filter: gFilterKey, expKey, files: gLights }) => {
+        const ref = gLights.find(f => f.ok);
+        const dimsOk = (arr) => !ref || arr.length === 0 || arr.every(f => f.w === ref.w && f.h === ref.h);
+        const nLights = gLights.filter(f => f.ok).length;
+        const gFilter = gFilterKey || dsFilterOf(gLights);
+
+        // BIAS: universal.
+        const biasChip = biasPool.length
+            ? chip("icon-film", "#67e8f9", tr("deepsky.step_bias_s", "Bias"), biasPool.length, tr("deepsky.frames_n", "tomas"), dimsOk(biasPool) ? "ok" : "warn")
+            : chip("icon-film", "#475569", tr("deepsky.step_bias_s", "Bias"), 0, tr("deepsky.none_opt", "opcional"), "none");
+
+        // DARKS: por exposición (±15%); si no hay exactos pero sí darks, se escalan (opt.dark).
+        let darkChip;
+        const expN = expKey === "?" ? null : parseFloat(expKey);
+        const tol = expN ? Math.max(expN * 0.15, 1) : 0;
+        const exactD = expN ? darksPool.filter(d => d.exptime != null && Math.abs(d.exptime - expN) <= tol) : darksPool;
+        if (exactD.length) {
+            darkChip = chip("icon-moon", "#94a3b8", tr("deepsky.step_dark_s", "Darks"), exactD.length, `@ ${dsFmtExp(expN)}`, dimsOk(exactD) ? "ok" : "warn");
+        } else if (darksPool.length) {
+            warned = true;
+            darkChip = chip("icon-moon", "#94a3b8", tr("deepsky.step_dark_s", "Darks"), darksPool.length, tr("deepsky.dark_scaled", "otra exp · se escalan"), "warn");
+        } else {
+            darkChip = chip("icon-moon", "#475569", tr("deepsky.step_dark_s", "Darks"), 0, tr("deepsky.cosmetic_fallback", "→ cosmética"), "none");
+        }
+
+        // FLATS: por filtro si lo hay (metadata o nombre); si no, todos.
+        let flatsM = flatsPool;
+        if (gFilter) {
+            const byF = flatsPool.filter(f => dsFilterOfFile(f) === gFilter);
+            if (byF.length) flatsM = byF;
+        }
+        const flatChip = flatsM.length
+            ? chip("icon-lightbulb", "#fbbf24", tr("deepsky.step_flat_s", "Flats"), flatsM.length, gFilter ? `(${gFilter})` : tr("deepsky.frames_n", "tomas"), dimsOk(flatsM) ? "ok" : "warn")
+            : chip("icon-lightbulb", "#475569", tr("deepsky.step_flat_s", "Flats"), 0, tr("deepsky.none_opt", "opcional"), "none");
+
+        const meta = dsMetaBits(gLights).join(" · ");
+        return `<div style="border:1px solid rgba(124,58,237,0.22); border-radius:14px; padding:13px 15px; margin-bottom:10px; background:rgba(124,58,237,0.05);">
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom:11px; flex-wrap:wrap;">
+                <svg class="zas-icon" style="width:17px;height:17px;color:#a5b4fc;"><use href="#icon-sequence"></use></svg>
+                <strong style="font-size:0.86rem; color:#e2e8f0;">${dsFmtExp(expN)}</strong>
+                ${gFilter ? `<span class="ds-filter-badge">${escapeHtml(dsFilterLabel(gFilter))}${dsFilterComponents(gFilter).length > 1 ? " · dual-band" : ""}</span>` : ""}
+                <span style="font-size:0.74rem; color:#c4b5fd; font-weight:600;">${nLights} lights</span>
+                <span style="margin-left:auto; font-size:0.66rem; color:#94a3b8; font-family:'Courier New',monospace;">${meta}</span>
+            </div>
+            <div style="display:flex; gap:9px; flex-wrap:wrap; align-items:stretch;">
+                ${biasChip}${darkChip}${flatChip}
+                <div style="display:flex; align-items:center; gap:7px; padding:7px 15px; background:rgba(240,171,252,0.08); border:1px solid rgba(240,171,252,0.22); border-radius:11px;">
+                    <svg class="zas-icon" style="width:16px;height:16px;color:#f0abfc;"><use href="#icon-galaxy"></use></svg>
+                    <span style="font-size:0.72rem; color:#f5d0fe; font-weight:600;">${tr("deepsky.step_integrate", "Integración κ-σ")}</span>
+                </div>
+            </div>
+        </div>`;
+    }).join("");
+
+    const note = warned
+        ? `<div style="font-size:0.62rem; color:#fbbf24; margin-top:2px;">⚠︎ ${tr("deepsky.plan_scale_note", "Hay darks de otra exposición: se escalarán automáticamente (optimización de dark). Ideal: darks con la misma exposición que los lights.")}</div>`
+        : "";
+    // Una sesión multibanda coordina varios masters sin mezclar sus muestras.
+    const mixNote = distinctFilters.length >= 2
+        ? `<div class="ds-session-note">
+            <svg class="zas-icon"><use href="#icon-sequence"></use></svg>
+            <div><strong>Sesión multibanda detectada</strong>
+            <span>${distinctFilters.map(dsFilterLabel).map(escapeHtml).join(" · ")}. Zenith ejecutará ${distinctFilters.length} integraciones separadas dentro de la misma sesión, extraerá sus líneas y conservará una receta común.</span></div>
+        </div>`
+        : "";
+    container.innerHTML = `
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px;">
+            <span style="font-size:0.66rem; color:#a5b4fc; font-weight:700; letter-spacing:0.05em;">${tr("deepsky.plan_title", "PLAN DE CALIBRACIÓN")}</span>
+            <span style="font-size:0.62rem; color:#64748b;">${groups.length} ${groups.length === 1 ? tr("deepsky.plan_group", "grupo") : tr("deepsky.plan_groups", "grupos")}${distinctFilters.length ? ` · ${distinctFilters.length} ${distinctFilters.length === 1 ? tr("deepsky.filter_one", "filtro") : tr("deepsky.filter_many", "filtros")}` : ""}</span>
+        </div>
+        ${cards}${note}${mixNote}`;
+}
+
+function dsUpdateMultibandControls() {
+    const panel = document.getElementById("ds-multiband-options");
+    if (!panel) return;
+    const groups = dsIntegrationGroups(dsActiveLights());
+    const multiband = groups.length > 1;
+    panel.hidden = !multiband;
+    const summary = document.getElementById("ds-multiband-summary");
+    if (summary) {
+        const outputs = groups.flatMap(group => dsFilterComponents(group.filter));
+        summary.textContent = multiband
+            ? `${groups.length} integraciones: ${groups.map(group => dsFilterLabel(group.filter)).join(" · ")} · salidas ${outputs.join(" / ")}`
+            : "Se mostrará cuando Zenith detecte dos o más perfiles espectrales.";
+    }
+    const runLabel = document.querySelector("#btn-deepsky-run span");
+    if (runLabel) runLabel.textContent = multiband ? "Apilar sesión multibanda" : tr("deepsky.run", "Apilar Cielo Profundo");
+}
+
+function dsRenderSessionResult(result) {
+    const panel = document.getElementById("ds-session-quality");
+    if (!panel || !result) return;
+    panel.hidden = false;
+    const cards = (result.groups || []).map(group => {
+        const q = group.quality || {};
+        const outputs = Object.entries(group.componentPaths || {})
+            .map(([name, path]) => `<li><b>${escapeHtml(name)}</b><span title="${escapeHtml(path)}">${escapeHtml(path.split(/[\\/]/).pop())}</span></li>`)
+            .join("");
+        const diagnosticCount = Object.keys(group.diagnosticPaths || {}).length;
+        const recommendations = (q.recommendations || []).map(item => `<li>${escapeHtml(item)}</li>`).join("");
+        return `<article class="ds-quality-card">
+            <div class="ds-quality-head"><div><strong>${escapeHtml(dsFilterLabel(group.filterProfile))}</strong><span>${group.framesUsed} usadas · ${group.framesRejected} rechazadas</span></div><b data-grade="${escapeHtml(q.grade || "Revisar")}">${escapeHtml(q.grade || "Revisar")}</b></div>
+            <div class="ds-quality-metrics"><span>Cobertura <b>${Number(q.coveragePercent || 0).toFixed(1)}%</b></span><span>Rechazo <b>${Number(q.rejectionPercent || 0).toFixed(1)}%</b></span><span>Ruido fondo <b>${Number(q.backgroundNoise || 0).toFixed(2)}</b></span></div>
+            ${outputs ? `<ul class="ds-output-list">${outputs}</ul>` : ""}
+            ${diagnosticCount ? `<div style="margin-top:7px;color:#7dd3fc;">${diagnosticCount} mapas científicos: cobertura, peso, rechazo y residuales.</div>` : ""}
+            <ul class="ds-quality-recommendations">${recommendations}</ul>
+        </article>`;
+    }).join("");
+    panel.innerHTML = `<div class="ds-quality-title"><div><strong>Control de calidad de la sesión</strong><span>Másters lineales y métricas medidos, no la vista STF.</span></div><span>${escapeHtml(result.outputDir || "")}</span></div>${cards}`;
+
+    const components = result.componentPaths || {};
+    if (components.SII?.[0] && components.HA?.[0] && components.OIII?.[0]) {
+        dsCombineFiles.r = components.SII[0];
+        dsCombineFiles.g = components.HA[0];
+        dsCombineFiles.b = components.OIII[0];
+        const preset = document.getElementById("ds-combine-preset");
+        if (preset) preset.value = "sho";
+    } else if (components.HA?.[0] && components.OIII?.[0]) {
+        dsCombineFiles.r = components.HA[0];
+        dsCombineFiles.g = components.OIII[0];
+        const preset = document.getElementById("ds-combine-preset");
+        if (preset) preset.value = "hoo";
+    }
+}
+
+// ============ PRESETS + DIAGRAMA DE PROCESO + TIEMPO ESTIMADO ============
+// Presets estilo WBPP: fijan todos los controles del modal con un clic.
+let dsActivePreset = "balanced";
+let dsWizardStep = 0;
+let dsPreparedPlan = null;
+let dsPreflightSerial = 0;
+let dsPreflightTimer = null;
+let dsFrameInspection = [];
+// Descartes MANUALES de la inspección PSF: los lights marcados no viajan al
+// plan ni al apilado, pero siguen visibles en la tabla para poder restaurarlos.
+const dsDiscardedPaths = new Set();
+let dsInspectionFingerprint = "";
+let dsInspectionSerial = 0;
+const DS_PRESETS = {
+    fast:     { interp: "bilinear", drizzle: "1", rejection: "sigma", kappaLow: 3.0, kappaHigh: 3.0, clipIters: "1",    norm: "additive", autocrop: true, cosmetic: true, darkopt: true, gradient: false, pedestal: "0" },
+    balanced: { interp: "lanczos3", drizzle: "1", rejection: "sigma", kappaLow: 3.0, kappaHigh: 3.0, clipIters: "auto", norm: "scaling",  autocrop: true, cosmetic: true, darkopt: true, gradient: false, pedestal: "0" },
+    max:      { interp: "lanczos3", drizzle: "1", rejection: "winsorized", kappaLow: 2.5, kappaHigh: 3.0, clipIters: "3", norm: "local", autocrop: true, cosmetic: true, darkopt: true, gradient: false, pedestal: "0" },
+};
+
+function dsCalibrationForIntegration(kind, filter) {
+    const pool = dsMatchedCalib(kind);
+    if (kind !== "flats" || !filter || filter === "BROADBAND") return pool;
+    const exact = pool.filter(file => dsFilterOfFile(file) === filter);
+    return exact.length ? exact : pool;
+}
+
+function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
+    // Los descartes manuales de la inspección PSF se excluyen SIEMPRE (plan,
+    // apilado individual y multibanda pasan por aquí).
+    const lights = (lightOverride || dsActiveLights())
+        .filter(f => !dsDiscardedPaths.has(f.path));
+    const filter = filterOverride || dsFilterOf(lights);
+    const value = (id, fallback) => document.getElementById(id)?.value ?? fallback;
+    const checked = (id, fallback = false) => document.getElementById(id)?.checked ?? fallback;
+    const rejection = value("sel-ds-rejection", "sigma");
+    const pedestalRaw = value("sel-ds-pedestal", "0");
+    const profile = ({ fast: "fast", balanced: "balanced", max: "maximum_quality" })[dsActivePreset] || "custom";
+    return {
+        lights: lights.map(f => f.path),
+        darks: dsCalibrationForIntegration("darks", filter).map(f => f.path),
+        flats: dsCalibrationForIntegration("flats", filter).map(f => f.path),
+        bias: dsCalibrationForIntegration("bias", filter).map(f => f.path),
+        computePolicy: value("sel-ds-compute", "hybrid"),
+        profile,
+        rejection,
+        kappaLow: parseFloat(value("num-ds-kappa-low", "3")) || 3,
+        kappaHigh: parseFloat(value("num-ds-kappa-high", "3")) || 3,
+        clipIters: parseInt(value("sel-ds-clipiters", "")) || null,
+        normalization: value("sel-ds-normalization", "scaling"),
+        interpolation: value("sel-ds-interp", "lanczos3"),
+        drizzle: parseFloat(value("sel-ds-drizzle", "1")) || 1,
+        pixfrac: parseFloat(value("sel-ds-pixfrac", "0.8")) || 0.8,
+        cosmetic: checked("chk-ds-cosmetic", true),
+        gradient: checked("chk-ds-gradient", false),
+        optimizeDark: checked("chk-ds-darkopt", true),
+        autoCrop: checked("chk-ds-autocrop", true),
+        localWeighting: checked("chk-ds-localw", false),
+        workDir: localStorage.getItem("zas_ds_workdir") || null,
+        pedestal: parseFloat(pedestalRaw) || null,
+    };
+}
+
+function dsIsMultibandSession() {
+    const enabled = document.getElementById("chk-ds-multiband-session")?.checked ?? true;
+    return enabled && dsIntegrationGroups(dsActiveLights()).length > 1;
+}
+
+function dsBuildSessionRequest() {
+    const lights = dsActiveLights();
+    const groups = dsIntegrationGroups(lights).map((group, index) => ({
+        id: `${String(index + 1).padStart(2, "0")}_${group.filter.toLowerCase()}`,
+        label: `${dsFilterLabel(group.filter)} · ${group.files.length} lights`,
+        filterProfile: group.filter,
+        request: dsBuildStackRequest(group.files, group.filter),
+    }));
+    return {
+        groups,
+        // La sesión escribe sus resultados en la carpeta de trabajo si existe.
+        basePath: localStorage.getItem("zas_ds_workdir") || lights[0]?.path || "",
+        extraction: {
+            oiiiGreenWeight: parseFloat(document.getElementById("sel-ds-oiii-mix")?.value || "0.65"),
+            crosstalkSuppression: parseFloat(document.getElementById("sel-ds-crosstalk")?.value || "0"),
+        },
+        palette: document.getElementById("sel-ds-session-palette")?.value || "none",
+    };
+}
+
+function dsFormatSessionPreflight(plan) {
+    const alerts = [
+        ...(plan.errors || []).map(error => `<div class="ds-alert error">${escapeHtml(error)}</div>`),
+        ...(plan.warnings || []).filter(warning => !warning.startsWith("Sesión multibanda"))
+            .map(warning => `<div class="ds-alert warn">${escapeHtml(warning)}</div>`),
+    ].join("");
+    const groups = (plan.groups || []).map(group => {
+        const p = group.plan || {};
+        const components = (group.componentFilters || []).map(component => `<span class="ds-component-chip">${escapeHtml(component)}</span>`).join("");
+        return `<article class="ds-session-group">
+            <div class="ds-session-group-head">
+                <div><strong>${escapeHtml(dsFilterLabel(group.filterProfile))}</strong><span>${escapeHtml(group.label)}</span></div>
+                <span class="ds-plan-state ${p.valid ? "ok" : "error"}">${p.valid ? "Listo" : "Revisar"}</span>
+            </div>
+            <div class="ds-session-group-meta">
+                <span>${p.groups?.reduce((sum, item) => sum + (item.frameCount || 0), 0) || 0} lights</span>
+                <span>${escapeHtml(p.effectiveEngine || "")}</span>
+                <span>${escapeHtml(p.effectiveRejection || "")}</span>
+                <span>~${Math.max(1, Math.round(p.estimatedSeconds || 0))} s</span>
+            </div>
+            <div class="ds-component-flow"><span>Salidas:</span>${components || `<span class="ds-component-chip">Máster</span>`}</div>
+            ${dsFormatSessionMap(p.sessionMap)}
+        </article>`;
+    }).join("");
+    return `<div class="ds-session-overview">
+        <div><b>${plan.valid ? "Sesión lista" : "Sesión requiere atención"}</b><span>${plan.groups?.length || 0} integraciones coordinadas · ${plan.totalFrames || 0} lights</span></div>
+        <span class="ds-session-time">~${Math.max(1, Math.round(plan.estimatedSeconds || 0))} s</span>
+    </div>
+    <div class="ds-resource-grid"><span>RAM pico <b>~${plan.estimatedRamMb || 0} MB</b></span><span>VRAM pico <b>~${plan.estimatedVramMb || 0} MB</b></span><span>Disco <b>~${plan.estimatedDiskMb || 0} MB</b></span></div>
+    <div class="ds-session-groups">${groups}</div>${alerts}`;
+}
+
+// Matriz lights↔flats por sesión (estilo PixInsight): qué flats calibran cada
+// noche de lights, con exposición total y distancia en días.
+function dsFormatSessionMap(map) {
+    if (!map?.length) return "";
+    const fmtExp = (s) => s >= 3600 ? `${(s / 3600).toFixed(1)} h` : s >= 60 ? `${Math.round(s / 60)} min` : `${Math.round(s)} s`;
+    const rows = map.map(e => `<tr style="border-top:1px solid rgba(148,163,184,.1);">
+        <td style="padding:4px 8px;color:#e2e8f0;">${escapeHtml(e.night)}</td>
+        <td style="padding:4px 8px;text-align:right;">${e.lights}</td>
+        <td style="padding:4px 8px;text-align:right;">${fmtExp(e.exposureSeconds || 0)}</td>
+        <td style="padding:4px 8px;color:${e.flatDistanceDays > 30 ? "#fcd34d" : "#cbd5e1"};">${e.flatNight ? `${escapeHtml(e.flatNight)} · ${e.flatCount} tomas${e.flatDistanceDays ? ` · Δ${e.flatDistanceDays} d` : ""}` : "—"}</td>
+        <td style="padding:4px 8px;color:#94a3b8;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(e.darks || "")}">${escapeHtml((e.darks || "—").replace(/^darks: /, ""))}</td>
+    </tr>`).join("");
+    return `<div style="margin-top:10px;">
+        <div style="font-size:.62rem;color:#a5b4fc;font-weight:700;letter-spacing:.05em;margin-bottom:4px;">${tr("deepsky.session_matrix", "CALIBRACIÓN POR SESIÓN")}</div>
+        <div style="overflow:auto;border:1px solid rgba(148,163,184,.12);border-radius:8px;">
+        <table style="width:100%;border-collapse:collapse;font-size:.6rem;min-width:540px;">
+            <thead style="background:#111827;color:#94a3b8;"><tr>
+                <th style="padding:4px 8px;text-align:left;">Noche (lights)</th><th style="padding:4px 8px;text-align:right;">Lights</th><th style="padding:4px 8px;text-align:right;">Exposición</th><th style="padding:4px 8px;text-align:left;">Flats que aplicará</th><th style="padding:4px 8px;text-align:left;">Darks</th>
+            </tr></thead><tbody>${rows}</tbody>
+        </table></div></div>`;
+}
+
+function dsFormatPreflight(plan) {
+    if (!plan) return `<span style="color:#94a3b8;">Preparando plan…</span>`;
+    if (plan.sessionId) return dsFormatSessionPreflight(plan);
+    const errors = plan.errors || [];
+    const warnings = plan.warnings || [];
+    const groups = plan.groups || [];
+    const stages = Object.entries(plan.stages || {})
+        .map(([stage, engine]) => `<span style="display:inline-flex;gap:5px;margin:2px 10px 2px 0;"><b style="color:#a5b4fc;">${escapeHtml(stage)}</b> ${escapeHtml(engine)}</span>`)
+        .join("");
+    const normModel = Object.entries(plan.normalizationModel || {})
+        .map(([key, value]) => `<span style="display:inline-flex;gap:5px;margin:2px 10px 2px 0;"><b style="color:#67e8f9;">${escapeHtml(key)}</b> ${escapeHtml(value)}</span>`)
+        .join("");
+    const groupRows = groups.map(g => `<div style="padding:5px 0;border-top:1px solid rgba(148,163,184,.1);">
+        <b style="color:#e2e8f0;">${g.frameCount} lights · ${g.width}×${g.height}×${g.channels}</b>
+        <span style="color:#64748b;"> · ${escapeHtml(g.bayerPattern || g.filter || "mono/RGB")} · ${escapeHtml(g.filter || "sin filtro")} · ${g.exposureSeconds ?? "?"} s · gain ${g.gain ?? "?"} · bin ${g.binning ?? "?"} · ${g.temperatureC ?? "?"} °C</span>
+    </div>`).join("");
+    const alerts = [
+        ...errors.map(e => `<div style="color:#fca5a5;">✕ ${escapeHtml(e)}</div>`),
+        ...warnings.map(w => `<div style="color:#fcd34d;">⚠ ${escapeHtml(w)}</div>`),
+    ].join("");
+    const recommendedKey = plan.recommendedProfile || "balanced";
+    const recommendedLabel = {
+        fast: "Rápido",
+        balanced: "Equilibrado",
+        maximum_quality: "Máxima calidad",
+        custom: "Personalizado",
+    }[recommendedKey] || recommendedKey;
+    const recommendation = (plan.recommendationReasons || [])
+        .map(reason => `<div>• ${escapeHtml(reason)}</div>`)
+        .join("");
+    const requestedRejection = plan.requestedRejection || "";
+    const effectiveRejection = plan.effectiveRejection || requestedRejection;
+    const methodLabel = requestedRejection && requestedRejection !== effectiveRejection
+        ? `${requestedRejection} → ${effectiveRejection}`
+        : effectiveRejection;
+    return `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:7px;">
+        <b style="color:${plan.valid ? "#6ee7b7" : "#fca5a5"};">${plan.valid ? "Plan válido" : "Requiere atención"}</b>
+        <span>${escapeHtml(plan.effectiveEngine || "")}</span>
+        <span style="color:#c4b5fd;">Método real <b>${escapeHtml(methodLabel)}</b></span>
+        <span style="margin-left:auto;color:#7dd3fc;">~${Math.max(1, Math.round(plan.estimatedSeconds || 0))} s</span>
+    </div>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;color:#94a3b8;margin-bottom:7px;">
+        <span>RAM <b style="color:#e2e8f0;">~${plan.estimatedRamMb || 0} MB</b></span>
+        <span>VRAM <b style="color:#e2e8f0;">~${plan.estimatedVramMb || 0} MB</b></span>
+        <span>Disco <b style="color:#e2e8f0;">~${plan.estimatedDiskMb || 0} MB</b></span>
+        <span><b style="color:#e2e8f0;">${groups.length}</b> grupo(s)</span>
+    </div>
+    <div style="margin:0 0 8px;padding:7px 9px;border:1px solid rgba(34,211,238,.2);border-radius:8px;background:rgba(8,145,178,.06);color:#a5f3fc;">
+        <b>Perfil recomendado: ${escapeHtml(recommendedLabel)}</b>
+        ${recommendation ? `<div style="margin-top:3px;color:#94a3b8;line-height:1.45;">${recommendation}</div>` : ""}
+    </div>${alerts}${groupRows}${dsFormatSessionMap(plan.sessionMap)}<div style="margin-top:8px;">${stages}</div>
+    ${normModel ? `<details style="margin-top:7px;"><summary style="cursor:pointer;color:#a5f3fc;">Modelo de normalización a inspeccionar</summary><div style="padding-top:5px;">${normModel}</div></details>` : ""}`;
+}
+
+function dsApplyPreparedPlan(plan) {
+    dsPreparedPlan = plan;
+    const firstSessionPlan = plan?.groups?.[0]?.plan;
+    const recommendedProfile = plan?.recommendedProfile || firstSessionPlan?.recommendedProfile;
+    const recommendedPreset = recommendedProfile === "maximum_quality" ? "max" : recommendedProfile;
+    document.querySelectorAll("#deepsky-modal .ds-preset").forEach(button => {
+        const recommended = button.dataset.preset === recommendedPreset;
+        button.classList.toggle("recommended", recommended);
+        if (recommended) button.setAttribute("aria-description", "Recomendado para los datos actuales");
+        else button.removeAttribute("aria-description");
+    });
+    for (const id of ["ds-preflight-inspection", "ds-preflight-review"]) {
+        const panel = document.getElementById(id);
+        if (!panel) continue;
+        panel.dataset.state = plan?.valid ? "ok" : "error";
+        panel.innerHTML = dsFormatPreflight(plan);
+    }
+    const run = document.getElementById("btn-deepsky-run");
+    if (run) {
+        run.disabled = !plan?.valid;
+        run.style.opacity = plan?.valid ? "1" : ".5";
+    }
+    dsSyncWizard();
+}
+
+function dsRenderFrameInspection(rows) {
+    const panel = document.getElementById("ds-frame-inspection");
+    if (!panel) return;
+    if (!rows?.length) {
+        panel.dataset.state = "idle";
+        panel.textContent = "No hay tomas inspeccionables.";
+        return;
+    }
+    const rejected = rows.filter(row => row.rejectable).length;
+    const discarded = rows.filter(row => dsDiscardedPaths.has(row.path)).length;
+    const reference = rows.find(row => row.recommendedReference);
+    const tableRows = rows.map((row, index) => {
+        const isDiscarded = dsDiscardedPaths.has(row.path);
+        const status = isDiscarded
+            ? `<span style="color:#94a3b8;font-weight:700;text-decoration:line-through;">descartada</span>`
+            : row.recommendedReference
+                ? `<span style="color:#fde68a;font-weight:700;">★ referencia</span>`
+                : row.rejectable
+                    ? `<span style="color:#fca5a5;font-weight:700;">revisar</span>`
+                    : `<span style="color:#6ee7b7;">utilizable</span>`;
+        const rowBg = isDiscarded
+            ? "opacity:.45;"
+            : row.rejectable
+                ? "background:rgba(127,29,29,.08);"
+                : "";
+        return `<tr data-ds-row="${index}" style="border-top:1px solid rgba(148,163,184,.12);cursor:pointer;${rowBg}" title="Clic para ver la toma y el motivo">
+            <td style="padding:6px 7px;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(row.path)}">${escapeHtml(row.name)}</td>
+            <td style="padding:6px 7px;text-align:right;">${row.stars}</td>
+            <td style="padding:6px 7px;text-align:right;">${Number(row.fwhm || 0).toFixed(2)}</td>
+            <td style="padding:6px 7px;text-align:right;">${Math.round(row.noise || 0)}</td>
+            <td style="padding:6px 7px;text-align:right;color:${row.eccentricity > .55 ? "#fca5a5" : "#cbd5e1"};">${Number(row.eccentricity || 0).toFixed(2)}</td>
+            <td style="padding:6px 7px;">${status}${row.rejectionReason ? `<div style="color:#94a3b8;font-size:.58rem;">${escapeHtml(row.rejectionReason)}</div>` : ""}</td>
+            <td style="padding:6px 7px;text-align:center;">
+                <button data-ds-discard="${index}" class="secondary" style="font-size:.58rem;padding:2px 8px;border-radius:6px;">${isDiscarded ? "Restaurar" : "Descartar"}</button>
+            </td>
+        </tr>`;
+    }).join("");
+    panel.dataset.state = rejected ? "error" : "ok";
+    panel.innerHTML = `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:7px;">
+        <b style="color:#e2e8f0;">Inspección PSF previa</b>
+        <span style="color:#94a3b8;">${rows.length} tomas · ${rejected} para revisar${discarded ? ` · ${discarded} descartadas a mano` : ""}</span>
+        ${reference ? `<span style="margin-left:auto;color:#fde68a;">Referencia sugerida: ${escapeHtml(reference.name)}</span>` : ""}
+    </div>
+    <div style="overflow:auto;max-height:260px;border:1px solid rgba(148,163,184,.12);border-radius:8px;">
+        <table style="width:100%;border-collapse:collapse;font-size:.62rem;min-width:650px;">
+            <thead style="position:sticky;top:0;background:#111827;color:#94a3b8;"><tr>
+                <th style="padding:6px 7px;text-align:left;">Toma</th><th>Estrellas</th><th>FWHM</th><th>Ruido</th><th>Ecc</th><th style="text-align:left;padding-left:7px;">Decisión provisional</th><th>Acción</th>
+            </tr></thead><tbody>${tableRows}</tbody>
+        </table>
+    </div>
+    <div style="margin-top:6px;color:#64748b;font-size:.58rem;">Clic en una fila para ver la toma estirada y su motivo. "Descartar" la excluye del plan y del apilado (reversible); la decisión final sobre las demás se recalcula con los datos calibrados completos.</div>`;
+
+    // Delegación: el tbody se regenera con cada render, los listeners van con él.
+    panel.querySelectorAll("[data-ds-discard]").forEach(btn => {
+        btn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            const row = rows[parseInt(btn.dataset.dsDiscard, 10)];
+            if (!row) return;
+            if (dsDiscardedPaths.has(row.path)) dsDiscardedPaths.delete(row.path);
+            else dsDiscardedPaths.add(row.path);
+            dsPreserveInspectionScroll(panel, () => dsRenderFrameInspection(rows));
+            dsSchedulePreflight(true);
+        });
+    });
+    panel.querySelectorAll("[data-ds-row]").forEach(tr => {
+        tr.addEventListener("click", () => {
+            const row = rows[parseInt(tr.dataset.dsRow, 10)];
+            if (row) dsOpenFramePreview(row, rows);
+        });
+    });
+}
+
+// Conserva el scroll de la tabla y de los contenedores del asistente al
+// re-renderizar la inspección (antes, descartar una toma saltaba al inicio
+// del paso).
+function dsPreserveInspectionScroll(panel, action) {
+    const ancestors = [];
+    let node = panel;
+    while (node) {
+        if (node.scrollTop > 0) ancestors.push([node, node.scrollTop]);
+        node = node.parentElement;
+    }
+    const table = panel.querySelector("div[style*='overflow']");
+    const tableTop = table ? table.scrollTop : 0;
+    action();
+    for (const [el, top] of ancestors) {
+        if (document.contains(el)) el.scrollTop = top;
+    }
+    const newTable = panel.querySelector("div[style*='overflow']");
+    if (newTable) newTable.scrollTop = tableTop;
+}
+
+// Visor de una toma individual: imagen estirada (deepsky_frame_preview) +
+// métricas + motivo + descarte reversible, en un overlay ligero.
+async function dsOpenFramePreview(row, allRows) {
+    let overlay = document.getElementById("ds-frame-viewer");
+    if (overlay) overlay.remove();
+    overlay = document.createElement("div");
+    overlay.id = "ds-frame-viewer";
+    overlay.style.cssText = "position:fixed;inset:0;z-index:2600;background:rgba(2,6,23,.88);display:flex;align-items:center;justify-content:center;padding:24px;";
+    const isDiscarded = () => dsDiscardedPaths.has(row.path);
+    const rows = allRows || dsFrameInspection;
+    const rowIndex = rows.indexOf(row);
+    const reason = row.rejectionReason
+        ? escapeHtml(row.rejectionReason)
+        : (row.rejectable ? "Métricas fuera de la mediana del lote" : "Sin observaciones: métricas dentro del lote");
+    overlay.innerHTML = `<div style="background:#0f172a;border:1px solid rgba(148,163,184,.25);border-radius:14px;max-width:min(980px,94vw);max-height:92vh;display:flex;flex-direction:column;overflow:hidden;">
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid rgba(148,163,184,.15);">
+            <button id="ds-viewer-prev" class="secondary" style="font-size:.62rem;padding:4px 10px;border-radius:8px;" ${rowIndex > 0 ? "" : "disabled"} title="Toma anterior (flecha izquierda)">‹</button>
+            <button id="ds-viewer-next" class="secondary" style="font-size:.62rem;padding:4px 10px;border-radius:8px;" ${rowIndex >= 0 && rowIndex < rows.length - 1 ? "" : "disabled"} title="Toma siguiente (flecha derecha)">›</button>
+            <b style="color:#e2e8f0;font-size:.72rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(row.path)}">${escapeHtml(row.name)}</b>
+            <span style="color:#64748b;font-size:.6rem;">${rowIndex + 1}/${rows.length}</span>
+            <span style="margin-left:auto;"></span>
+            <button id="ds-viewer-discard" class="secondary" style="font-size:.62rem;padding:4px 12px;border-radius:8px;">${isDiscarded() ? "Restaurar" : "Descartar del apilado"}</button>
+            <button id="ds-viewer-close" class="secondary" style="font-size:.62rem;padding:4px 12px;border-radius:8px;">Cerrar</button>
+        </div>
+        <div id="ds-viewer-body" style="flex:1;min-height:280px;display:flex;align-items:center;justify-content:center;background:#020617;color:#94a3b8;font-size:.66rem;">Cargando y estirando la toma…</div>
+        <div style="padding:9px 14px;border-top:1px solid rgba(148,163,184,.15);display:flex;gap:14px;flex-wrap:wrap;color:#cbd5e1;font-size:.62rem;">
+            <span>Estrellas <b>${row.stars}</b></span>
+            <span>FWHM <b>${Number(row.fwhm || 0).toFixed(2)}</b></span>
+            <span>Ruido <b>${Math.round(row.noise || 0)}</b></span>
+            <span>Ecc <b>${Number(row.eccentricity || 0).toFixed(2)}</b></span>
+            <span style="color:${row.rejectable ? "#fca5a5" : "#6ee7b7"};">Motivo: ${reason}</span>
+        </div>
+    </div>`;
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+    overlay.querySelector("#ds-viewer-close").addEventListener("click", () => overlay.remove());
+    const goTo = (delta) => {
+        const target = rows[rowIndex + delta];
+        if (target) dsOpenFramePreview(target, rows);
+    };
+    overlay.querySelector("#ds-viewer-prev").addEventListener("click", () => goTo(-1));
+    overlay.querySelector("#ds-viewer-next").addEventListener("click", () => goTo(1));
+    const onKeys = (e) => {
+        if (!document.getElementById("ds-frame-viewer")) {
+            document.removeEventListener("keydown", onKeys);
+            return;
+        }
+        if (e.key === "ArrowLeft") goTo(-1);
+        else if (e.key === "ArrowRight") goTo(1);
+        else if (e.key === "Escape") { overlay.remove(); document.removeEventListener("keydown", onKeys); }
+    };
+    document.addEventListener("keydown", onKeys);
+    overlay.querySelector("#ds-viewer-discard").addEventListener("click", (e) => {
+        if (isDiscarded()) dsDiscardedPaths.delete(row.path);
+        else dsDiscardedPaths.add(row.path);
+        e.target.textContent = isDiscarded() ? "Restaurar" : "Descartar del apilado";
+        const panel = document.getElementById("ds-frame-inspection");
+        if (panel) dsPreserveInspectionScroll(panel, () => dsRenderFrameInspection(allRows || dsFrameInspection));
+        dsSchedulePreflight(true);
+    });
+    document.body.appendChild(overlay);
+    try {
+        const dataUrl = await invoke("deepsky_frame_preview", { path: row.path });
+        const body = overlay.querySelector("#ds-viewer-body");
+        if (body) body.innerHTML = `<img src="${dataUrl}" style="max-width:100%;max-height:100%;object-fit:contain;" alt="">`;
+    } catch (error) {
+        const body = overlay.querySelector("#ds-viewer-body");
+        if (body) body.textContent = `No se pudo generar el preview: ${error}`;
+    }
+}
+
+async function dsInspectFrames(force = false) {
+    const lights = dsActiveLights();
+    const fingerprint = lights.map(light => light.path).sort().join("\n");
+    if (!lights.length) {
+        dsFrameInspection = [];
+        dsInspectionFingerprint = "";
+        dsRenderFrameInspection([]);
+        return [];
+    }
+    if (!force && fingerprint === dsInspectionFingerprint && dsFrameInspection.length) {
+        dsRenderFrameInspection(dsFrameInspection);
+        return dsFrameInspection;
+    }
+    const serial = ++dsInspectionSerial;
+    const panel = document.getElementById("ds-frame-inspection");
+    if (panel) {
+        panel.dataset.state = "idle";
+        panel.textContent = "Midiendo estrellas, PSF/FWHM, ruido y eccentricidad…";
+    }
+    try {
+        const rows = await invoke("inspect_deepsky_frames", { paths: lights.map(light => light.path) });
+        if (serial !== dsInspectionSerial) return dsFrameInspection;
+        dsFrameInspection = rows || [];
+        dsInspectionFingerprint = fingerprint;
+        // Descarte huérfano (el archivo ya no está en la lista): limpiarlo.
+        const currentPaths = new Set(lights.map(light => light.path));
+        for (const discarded of [...dsDiscardedPaths]) {
+            if (!currentPaths.has(discarded)) dsDiscardedPaths.delete(discarded);
+        }
+        dsRenderFrameInspection(dsFrameInspection);
+        return dsFrameInspection;
+    } catch (error) {
+        if (serial !== dsInspectionSerial) return dsFrameInspection;
+        if (panel) {
+            panel.dataset.state = "error";
+            panel.textContent = `No se pudo completar la inspección: ${error}`;
+        }
+        return [];
+    }
+}
+
+async function dsPreparePlan() {
+    const serial = ++dsPreflightSerial;
+    const stackRequest = dsBuildStackRequest();
+    if (!stackRequest.lights.length) {
+        dsPreparedPlan = null;
+        for (const id of ["ds-preflight-inspection", "ds-preflight-review"]) {
+            const panel = document.getElementById(id);
+            if (panel) { panel.dataset.state = "idle"; panel.textContent = "Añade lights para preparar el plan."; }
+        }
+        dsSyncWizard();
+        return null;
+    }
+    for (const id of ["ds-preflight-inspection", "ds-preflight-review"]) {
+        const panel = document.getElementById(id);
+        if (panel) { panel.dataset.state = "idle"; panel.textContent = "Leyendo cabeceras y preparando el plan…"; }
+    }
+    try {
+        const multiband = dsIsMultibandSession();
+        const command = multiband ? "prepare_deepsky_session" : "prepare_deepsky_stack";
+        const request = multiband ? dsBuildSessionRequest() : stackRequest;
+        const plan = await invoke(command, { request });
+        if (serial !== dsPreflightSerial) return null;
+        dsApplyPreparedPlan(plan);
+        return plan;
+    } catch (e) {
+        if (serial !== dsPreflightSerial) return null;
+        dsApplyPreparedPlan({ valid: false, errors: [String(e)], warnings: [], groups: [], stages: {} });
+        return null;
+    }
+}
+
+function dsSchedulePreflight(immediate = false) {
+    clearTimeout(dsPreflightTimer);
+    dsPreflightTimer = setTimeout(dsPreparePlan, immediate ? 0 : 180);
+}
+
+function dsSetWizardStep(next, force = false) {
+    const requested = Math.max(0, Math.min(3, Number(next) || 0));
+    if (!force && requested > 2 && dsPreparedPlan && !dsPreparedPlan.valid) {
+        dsWizardStep = 1;
+    } else {
+        dsWizardStep = requested;
+    }
+    dsSyncWizard();
+    if (dsWizardStep === 1 || dsWizardStep === 3) dsSchedulePreflight(true);
+    if (dsWizardStep === 1) dsInspectFrames();
+    const scroll = document.getElementById("ds-wizard-scroll");
+    if (scroll) scroll.scrollTop = 0;
+    const box = document.querySelector("#deepsky-modal .ds-wizard-box");
+    if (box) {
+        box.scrollTop = 0;
+        requestAnimationFrame(() => { box.scrollTop = 0; });
+    }
+}
+
+function dsSyncWizard() {
+    document.querySelectorAll("#deepsky-modal .ds-wizard-page").forEach(p => {
+        const active = Number(p.dataset.step) === dsWizardStep;
+        p.classList.toggle("active", active);
+        p.setAttribute("aria-hidden", String(!active));
+    });
+    document.querySelectorAll("#deepsky-modal .ds-wizard-step").forEach(b => {
+        const step = Number(b.dataset.step);
+        b.classList.toggle("active", step === dsWizardStep);
+        b.classList.toggle("done", step < dsWizardStep);
+        if (step === dsWizardStep) b.setAttribute("aria-current", "step"); else b.removeAttribute("aria-current");
+    });
+    const prev = document.getElementById("btn-deepsky-prev");
+    const next = document.getElementById("btn-deepsky-next");
+    const run = document.getElementById("btn-deepsky-run");
+    const combine = document.getElementById("btn-deepsky-combine-open");
+    if (prev) prev.style.visibility = dsWizardStep === 0 ? "hidden" : "visible";
+    if (next) next.style.display = dsWizardStep < 3 ? "block" : "none";
+    if (run) run.style.display = dsWizardStep === 3 ? "flex" : "none";
+    if (combine) combine.style.display = dsWizardStep === 0 ? "flex" : "none";
+    const status = document.getElementById("ds-wizard-status");
+    if (status) {
+        const messages = ["selecciona y agrupa los datos", "revisa compatibilidad y calibraciones", "elige perfil u opciones avanzadas", dsPreparedPlan?.valid ? "plan listo para ejecutar" : (dsActiveLights().length ? "corrige las alertas del plan" : "añade lights para preparar el plan")];
+        status.textContent = `Paso ${dsWizardStep + 1} de 4 · ${messages[dsWizardStep]}`;
+    }
+}
+
+function dsSetPresetButtons(name) {
+    document.querySelectorAll("#deepsky-modal .ds-preset").forEach(b =>
+        b.classList.toggle("active", b.dataset.preset === name));
+}
+
+function dsApplyPreset(name) {
+    dsActivePreset = name;
+    dsSetPresetButtons(name);
+    const p = DS_PRESETS[name];
+    if (!p) { dsRenderProcessPreview(); return; } // "custom": no toca controles
+    const set = (id, val) => { const el = document.getElementById(id); if (el) el.value = String(val); };
+    const chk = (id, val) => { const el = document.getElementById(id); if (el) { el.checked = val; el.dataset.touched = "1"; } };
+    set("sel-ds-interp", p.interp);
+    set("sel-ds-drizzle", p.drizzle);
+    set("sel-ds-rejection", p.rejection);
+    set("num-ds-kappa-low", p.kappaLow);
+    set("num-ds-kappa-high", p.kappaHigh);
+    set("sel-ds-clipiters", p.clipIters);
+    set("sel-ds-normalization", p.norm);
+    set("sel-ds-pedestal", p.pedestal);
+    chk("chk-ds-autocrop", p.autocrop);
+    chk("chk-ds-cosmetic", p.cosmetic);
+    chk("chk-ds-darkopt", p.darkopt);
+    chk("chk-ds-gradient", p.gradient);
+    const dz = document.getElementById("sel-ds-drizzle");
+    const pixfrac = document.getElementById("lbl-ds-pixfrac");
+    if (pixfrac) pixfrac.style.display = (parseFloat(dz?.value) > 1) ? "flex" : "none";
+    dsRenderProcessPreview();
+    dsSchedulePreflight();
+}
+
+// Un cambio manual pasa el preset a "Personalizado".
+function dsMarkCustomPreset() {
+    if (dsActivePreset !== "custom") { dsActivePreset = "custom"; dsSetPresetButtons("custom"); }
+    dsRenderProcessPreview();
+    dsSchedulePreflight();
+}
+
+// Heurística de tiempo de apilado (segundos). Aproximada: varía por equipo/disco.
+function dsEstimateTime(frames, mpIn, mpOut, nIters, drz, engineMult) {
+    const cores = Math.max(2, navigator.hardwareConcurrency || 8);
+    const coresFactor = Math.min(cores, 8) * 0.7; // paralelismo real efectivo
+    const kCal = 0.06, kReg = 0.10, kInt = 0.02;  // s por megapíxel por frame
+    const tCalReg = frames * (kCal + kReg) * mpIn;
+    const tInt = frames * kInt * mpOut * (1 + nIters) * (drz * drz) * engineMult;
+    return (tCalReg + tInt) / coresFactor + 2; // +2 s de sobrecarga fija
+}
+
+// Diagrama del pipeline + datos técnicos + tiempo estimado según los ajustes.
+function dsRenderProcessPreview() {
+    const panel = document.getElementById("ds-diagram");
+    if (!panel) return;
+    const lights = dsActiveLights();
+    if (!lights.length) { panel.style.display = "none"; return; }
+    panel.style.display = "block";
+    const used = lights.filter(f => f.ok);
+    const n = Math.max(used.length, 1);
+    const ref = used[0] || lights[0];
+    const w = ref?.w || 0, h = ref?.h || 0;
+    const ch = ref?.bayer ? 3 : (ref?.ch || 1);
+
+    const val = (id, d) => document.getElementById(id)?.value ?? d;
+    const on = (id) => document.getElementById(id)?.checked;
+    const drz = parseFloat(val("sel-ds-drizzle", "1")) || 1;
+    const wOut = Math.round(w * drz), hOut = Math.round(h * drz);
+    const requestedRejection = val("sel-ds-rejection", "sigma");
+    const rejection = dsPreparedPlan?.requestedRejection === requestedRejection
+        ? (dsPreparedPlan.effectiveRejection || requestedRejection)
+        : requestedRejection;
+    const norm = val("sel-ds-normalization", "scaling");
+    const gradient = on("chk-ds-gradient");
+    const autocrop = on("chk-ds-autocrop");
+    const nCalib = dsMatchedCalib("darks").length + dsMatchedCalib("flats").length + dsMatchedCalib("bias").length;
+    const clipSel = val("sel-ds-clipiters", "auto");
+    const nIters = rejection === "average" ? 0 : (clipSel === "auto" ? (n >= 6 ? 2 : 1) : (parseInt(clipSel) || 1));
+
+    const stage = (active, icon, label) =>
+        `<span class="ds-stage ${active ? "on" : "off"}"><svg class="zas-icon"><use href="#${icon}"></use></svg>${label}</span>`;
+    const arrow = `<span class="ds-arrow">→</span>`;
+    const rejectionLabels = { sigma: "σ-clip", average: tr("deepsky.rej_average_s", "media"), winsorized: "Winsorized", linearfit: tr("deepsky.rej_lf_s", "aj. lineal"), median: tr("deepsky.rej_med_s", "mediana"), percentile: "percentil" };
+    const effectiveRejLabel = rejectionLabels[rejection] || rejection;
+    const requestedRejLabel = rejectionLabels[requestedRejection] || requestedRejection;
+    const rejLabel = requestedRejection !== rejection
+        ? `${requestedRejLabel} → ${effectiveRejLabel}`
+        : effectiveRejLabel;
+    const stages = [
+        stage(nCalib > 0, "icon-moon", tr("deepsky.st_calib", "Calibración")),
+        stage(true, "icon-star", tr("deepsky.st_register", "Registro")),
+        stage(norm !== "none", "icon-sequence", tr("deepsky.st_normalize", "Normalización")),
+        stage(true, "icon-batch", `${tr("deepsky.st_integrate", "Integración")} · ${rejLabel}`),
+    ];
+    if (drz > 1) stages.push(stage(true, "icon-galaxy", `Drizzle ${drz}×`));
+    // El recorte SIEMPRE aparece con su estado: antes el chip "Recorte" surgía
+    // sin contexto y no se veía dónde configurarlo (paso 3 › Acabado).
+    stages.push(stage(autocrop, "icon-scissors", autocrop
+        ? tr("deepsky.st_crop_on", "Recorte de bordes (Acabado): activado")
+        : tr("deepsky.st_crop_off", "Recorte de bordes: desactivado")));
+    if (gradient) stages.push(stage(true, "icon-magic", tr("deepsky.st_cleanup", "Limpieza")));
+    stages.push(stage(true, "icon-chart", tr("deepsky.st_stretch", "Estirado STF")));
+
+    // Los métodos por-píxel cargan el stack completo por franjas → más pesados.
+    const perPixel = ["winsorized", "linearfit", "median", "percentile", "minmax"].includes(rejection);
+    const gi = window._gpuInfo;
+    const compute = val("sel-ds-compute", "hybrid");
+    const gpuTiled = gi?.available && compute !== "cpu_only"
+        && ["winsorized", "linearfit"].includes(rejection) && drz <= 1;
+    const engineMult = perPixel && drz <= 1 ? (gpuTiled ? 1.15 : 1.7) : 1.0;
+    const mpIn = (w * h) / 1e6, mpOut = (wOut * hOut) / 1e6;
+    const secs = dsEstimateTime(n, mpIn, mpOut, perPixel ? 1 : nIters, drz, engineMult);
+    const fmtT = (s) => s < 90 ? `${Math.max(1, Math.round(s))} s` : `${(s / 60).toFixed(s < 600 ? 1 : 0)} min`;
+    const fmtSize = (mb) => mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+    const ramMB = (wOut * hOut * ch * 8 * 3 + w * h * ch * 4) / 1e6; // acumuladores f64 + 1 frame
+    const outMB = (wOut * hOut * 3 * 2) / 1e6;                        // TIFF 16-bit RGB
+    // Indicador del motor previsto. Winsorized/linear-fit ejecutan el rechazo
+    // tiled en GPU; la CPU conserva warp/modelos y valida paridad.
+    const canGpuIntegrate = gi?.available && compute !== "cpu_only"
+        && (!perPixel || gpuTiled) && drz <= 1;
+    const accel = canGpuIntegrate
+        ? `<span>${tr("deepsky.accel", "motor")}: <b>${gpuTiled ? "Hybrid CPU warp + GPU tiled" : "Hybrid CPU+GPU"}</b> · ${escapeHtml(gi.name)} · wgpu</span>`
+        : gi?.available && compute !== "cpu_only"
+            ? `<span>${tr("deepsky.accel", "motor")}: <b>Hybrid</b> · GPU calibración / CPU integración</span>`
+            : `<span>${tr("deepsky.accel", "motor")}: <b>CPU</b> (rayon)</span>`;
+    const tech = [
+        `<span><b>${used.length}</b>/${lights.length} lights</span>`,
+        w ? `<span>${w}×${h}${drz > 1 ? ` → <b>${wOut}×${hOut}</b>` : ""} · ${ch === 1 ? "mono" : "RGB"}</span>` : "",
+        `<span>RAM ~<b>${fmtSize(ramMB)}</b></span>`,
+        `<span>${tr("deepsky.tech_out", "salida")} ~<b>${fmtSize(outMB)}</b></span>`,
+        accel,
+        `<span class="ds-tech-time">${tr("deepsky.time_est", "tiempo est.")} <b>~${fmtT(secs * 0.6)}–${fmtT(secs * 1.4)}</b></span>`,
+    ].filter(Boolean).join("");
+
+    panel.innerHTML = `
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:9px;">
+            <svg class="zas-icon" style="width:13px;height:13px;color:#38bdf8;"><use href="#icon-batch"></use></svg>
+            <span style="font-size:0.6rem; color:#7dd3fc; font-weight:700; letter-spacing:0.08em; text-transform:uppercase;">${tr("deepsky.process_title", "Proceso que se ejecutará")}</span>
+        </div>
+        <div class="ds-diagram-flow">${stages.join(arrow)}</div>
+        <div class="ds-techrow">${tech}</div>`;
 }
 
 function dsUpdateUI() {
@@ -8388,77 +9596,22 @@ function dsUpdateUI() {
         }
     }
 
-    // MAPA DE CALIBRACIÓN (pipeline visual estilo WBPP): pasos encadenados de
-    // cómo se calibrará cada light, con validación de dims y exposición.
+    // PLAN DE CALIBRACIÓN estilo WBPP: una tarjeta por grupo de exposición, cada
+    // una con su lote de bias/darks/flats emparejado → el usuario ve con qué se
+    // calibra cada light.
     const sum = document.getElementById("ds-match-summary");
-    if (sum) {
-        if (dsFiles.lights.length === 0) {
-            sum.style.display = "none";
-        } else {
-            sum.style.display = "block";
-            const expOf = (arr) => {
-                const es = arr.map(f => f.exptime).filter(e => e !== null && e !== undefined);
-                if (es.length === 0) return null;
-                return es.reduce((a, b) => a + b, 0) / es.length;
-            };
-            const lExp = expOf(lights);
-            const usedB = dsMatchedCalib("bias");
-            const usedD = dsMatchedCalib("darks");
-            const usedF = dsMatchedCalib("flats");
-            const dimsWarn = (arr) => lightsRef && arr.length > 0 && !arr.every(f => f.w === lightsRef.w && f.h === lightsRef.h);
-
-            const step = (icon, color, title, detail, warn) => `
-                <div style="display:flex; align-items:center; gap:7px; padding:4px 8px; border-radius:8px; background:rgba(15,23,42,0.55); border:1px solid ${warn ? 'rgba(245,158,11,0.4)' : 'rgba(255,255,255,0.06)'};">
-                    <svg class="zas-icon" style="width:14px;height:14px;color:${color};"><use href="#${icon}"></use></svg>
-                    <div style="min-width:0;">
-                        <div style="font-weight:600;color:#e2e8f0;font-size:0.66rem;">${title}</div>
-                        <div style="font-size:0.6rem;color:${warn ? '#fbbf24' : '#94a3b8'};">${detail}</div>
-                    </div>
-                </div>`;
-            const arrow = `<div style="color:#475569; align-self:center;">→</div>`;
-
-            const parts = [];
-            const grpTxt = dsSelectedGroup ? ` · «${dsSelectedGroup}»` : "";
-            parts.push(step("icon-sequence", "#a5b4fc", `${lights.length} Lights${grpTxt}`,
-                `${lightsRef ? lightsRef.w + "×" + lightsRef.h : "—"} · ${dsFmtExp(lExp)}${(lightsRef && lightsRef.bayer) ? " · " + lightsRef.bayer : ""}`, false));
-
-            if (usedB.length) {
-                parts.push(arrow);
-                parts.push(step("icon-film", "#67e8f9", tr("deepsky.step_bias", "− Master Bias"),
-                    `${usedB.length} bias`, dimsWarn(usedB)));
-            }
-            if (usedD.length) {
-                const dExp = expOf(usedD);
-                const expWarn = lExp !== null && dExp !== null && Math.abs(dExp - lExp) > lExp * 0.05;
-                parts.push(arrow);
-                parts.push(step("icon-moon", "#94a3b8", tr("deepsky.step_dark", "− Master Dark"),
-                    `${usedD.length} darks${dExp !== null ? " · " + dsFmtExp(dExp) : ""}`, dimsWarn(usedD) || expWarn));
-            }
-            if (usedF.length) {
-                parts.push(arrow);
-                parts.push(step("icon-lightbulb", "#fbbf24", tr("deepsky.step_flat", "÷ Master Flat"),
-                    `${usedF.length} flats`, dimsWarn(usedF)));
-            }
-            // Cosmética si aplica (sin darks) + integración
-            if (usedD.length === 0) {
-                parts.push(arrow);
-                parts.push(step("icon-magic", "#c4b5fd", tr("deepsky.step_cosmetic", "Cosmética"),
-                    tr("deepsky.step_cosmetic_d", "píxeles calientes"), false));
-            }
-            parts.push(arrow);
-            parts.push(step("icon-galaxy", "#f0abfc", tr("deepsky.step_integrate", "Integración κ-σ"),
-                tr("deepsky.step_integrate_d", "registro + peso FWHM"), false));
-
-            sum.innerHTML = `<div style="font-size:0.62rem;color:#64748b;margin-bottom:6px;font-weight:600;letter-spacing:0.05em;">${tr("deepsky.plan_title", "PLAN DE CALIBRACIÓN")}</div><div style="display:flex;flex-wrap:wrap;gap:6px;align-items:stretch;">${parts.join("")}</div>`;
-        }
-    }
+    if (sum) dsRenderCalibrationPlan(sum, lights);
+    dsUpdateMultibandControls();
+    dsRenderProcessPreview(); // diagrama + datos técnicos + tiempo estimado
 
     const run = document.getElementById("btn-deepsky-run");
     if (run) {
         // 1 light = flujo valido (calibrar + estirar); ≥2 = integracion completa.
-        run.disabled = lights.length < 1;
-        run.style.opacity = lights.length < 1 ? "0.5" : "1";
+        run.disabled = lights.length < 1 || (dsPreparedPlan && !dsPreparedPlan.valid);
+        run.style.opacity = run.disabled ? "0.5" : "1";
     }
+    dsSchedulePreflight();
+    dsSyncWizard();
 }
 
 async function dsPick(kind) {
@@ -8473,7 +9626,7 @@ async function dsPick(kind) {
         const probes = await invoke("deepsky_probe", { paths });
         dsFiles[kind] = probes;
         const bad = probes.filter(p => !p.ok).length;
-        if (bad > 0) log("WARN", `${kind}: ${bad} archivo(s) ilegibles (marcados ⚠).`);
+        if (bad > 0) log("WARN", `${kind}: ${bad} archivo(s) ilegibles (marcados ⚠︎).`);
         dsUpdateUI();
     } catch (e) {
         console.error("deepsky pick:", e);
@@ -8501,15 +9654,20 @@ async function dsPickFolder(kind) {
 let dsStacking = false;
 let dsProgTimer = null;
 let dsProgStart = 0;
+let dsSessionProgressTotal = 1;
+let dsSessionProgressIndex = 1;
 const DS_PHASES = [
-    { id: "calib", label: "Calibración y detección de estrellas", rx: /calibr|master|detect/i },
-    { id: "register", label: "Registro estelar (triángulos)", rx: /registr/i },
-    { id: "int1", label: "Integración · pasada 1", rx: /pasada 1/i },
-    { id: "int2", label: "Integración · pasada 2 (σ-clip)", rx: /pasada 2/i },
-    { id: "bg", label: "Fondo: ABE + SCNR + neutralización", rx: /abe|gradiente|scnr|neutraliz/i },
-    { id: "stretch", label: "Estiramiento automático (STF)", rx: /estir|stf/i }
+    { id: "calib", label: "Lectura, masters, calibración y estrellas", rx: /read|calibr|master|detect/i },
+    { id: "register", label: "Registro PSF + RANSAC", rx: /registr/i },
+    { id: "normalize", label: "Normalización robusta", rx: /normaliz/i },
+    { id: "integrate", label: "Integración · pasada base", rx: /integrate_pass_1|integrate_fallback|integrate_method_fallback|pasada 1/i },
+    { id: "reject", label: "Rechazo de píxeles", rx: /sigma_clip|tiled|reject|rechazo|pasada 2|por-píxel|franja/i },
+    { id: "drizzle", label: "Drizzle y cobertura", rx: /drizzle|cobertura/i, when: () => parseFloat(document.getElementById("sel-ds-drizzle")?.value || "1") > 1 },
+    { id: "bg", label: "Acabado opcional ABE + SCNR", rx: /abe|gradiente|scnr|neutraliz/i, when: () => !!document.getElementById("chk-ds-gradient")?.checked },
+    { id: "publish", label: "Vista previa y publicación del máster", rx: /preview|vista|public|complete|estir|stf/i }
 ];
 let dsPhaseTimes = {};
+let dsVisiblePhases = DS_PHASES;
 
 function dsFmtClock(ms) {
     const s = Math.floor(ms / 1000);
@@ -8520,21 +9678,28 @@ function dsProgressStart() {
     dsStacking = true;
     dsProgStart = Date.now();
     dsPhaseTimes = {};
+    dsVisiblePhases = DS_PHASES.filter(phase => !phase.when || phase.when());
     const steps = document.getElementById("ds-prog-steps");
     if (steps) {
         steps.innerHTML = "";
-        DS_PHASES.forEach(ph => {
+        dsVisiblePhases.forEach(ph => {
             const row = document.createElement("div");
             row.id = `ds-ph-${ph.id}`;
-            row.style.cssText = "display:flex; align-items:center; gap:9px; padding:4px 6px; border-radius:8px; font-size:0.72rem; color:#64748b;";
+            row.style.cssText = "display:flex; align-items:center; gap:9px; padding:4px 6px; border-radius:8px; font-size:0.72rem; color:#94a3b8;";
             row.innerHTML = `<span class="ds-ph-mark" style="width:16px; text-align:center;">○</span><span class="ds-ph-label" style="flex:1;">${ph.label}</span><span class="ds-ph-time" style="font-family:'Courier New',monospace; font-size:0.66rem; color:#475569;"></span>`;
             steps.appendChild(row);
         });
     }
-    const bar = document.getElementById("ds-prog-bar"); if (bar) bar.style.width = "0%";
+    const bar = document.getElementById("ds-prog-bar"); if (bar) { bar.style.width = "0%"; bar.setAttribute("aria-valuenow", "0"); }
     const pct = document.getElementById("ds-prog-pct"); if (pct) pct.textContent = "0%";
     const cur = document.getElementById("ds-prog-current"); if (cur) cur.textContent = "";
-    const ov = document.getElementById("ds-progress"); if (ov) ov.style.display = "flex";
+    const resources = document.getElementById("ds-prog-resources"); if (resources) { resources.style.display = "none"; resources.innerHTML = ""; }
+    const warning = document.getElementById("ds-prog-warning"); if (warning) { warning.style.display = "none"; warning.textContent = ""; }
+    const ov = document.getElementById("ds-progress");
+    if (ov) {
+        ov.style.display = "flex";
+        requestAnimationFrame(() => document.getElementById("ds-prog-cancel")?.focus());
+    }
     clearInterval(dsProgTimer);
     dsProgTimer = setInterval(() => {
         const el = document.getElementById("ds-prog-elapsed");
@@ -8544,14 +9709,48 @@ function dsProgressStart() {
 
 function dsProgressUpdate(step, pct) {
     if (!dsStacking) return;
-    const bar = document.getElementById("ds-prog-bar"); if (bar) bar.style.width = `${Math.min(100, pct)}%`;
-    const pe = document.getElementById("ds-prog-pct"); if (pe) pe.textContent = `${Math.round(pct)}%`;
-    const cur = document.getElementById("ds-prog-current"); if (cur) cur.textContent = step || "";
+    const sessionMarker = String(step || "").match(/Sesión multibanda\s+(\d+)\/(\d+)/i);
+    if (sessionMarker) {
+        const nextIndex = Number(sessionMarker[1]);
+        dsSessionProgressTotal = Math.max(1, Number(sessionMarker[2]));
+        if (nextIndex !== dsSessionProgressIndex) {
+            dsSessionProgressIndex = nextIndex;
+            dsPhaseTimes = {};
+            dsVisiblePhases.forEach(phase => {
+                const row = document.getElementById(`ds-ph-${phase.id}`);
+                if (!row) return;
+                const mark = row.querySelector(".ds-ph-mark");
+                const time = row.querySelector(".ds-ph-time");
+                if (mark) { mark.textContent = "○"; mark.style.color = ""; }
+                if (time) time.textContent = "";
+                row.style.color = "#94a3b8";
+                row.style.background = "transparent";
+            });
+        }
+    }
+    const effectivePct = dsSessionProgressTotal > 1 && !sessionMarker
+        ? ((dsSessionProgressIndex - 1) * 100 + pct) / dsSessionProgressTotal
+        : pct;
+    const effectiveStep = dsSessionProgressTotal > 1 && !sessionMarker
+        ? `Grupo ${dsSessionProgressIndex}/${dsSessionProgressTotal} · ${step}`
+        : step;
+    const bar = document.getElementById("ds-prog-bar");
+    if (bar) {
+        const value = Math.min(100, Math.max(0, effectivePct));
+        bar.style.width = `${value}%`;
+        bar.setAttribute("aria-valuenow", String(Math.round(value)));
+    }
+    const pe = document.getElementById("ds-prog-pct"); if (pe) pe.textContent = `${Math.round(effectivePct)}%`;
+    const cur = document.getElementById("ds-prog-current"); if (cur) cur.textContent = effectiveStep || "";
 
-    let active = DS_PHASES.findIndex(ph => ph.rx.test(step || ""));
-    if (pct >= 99.5) active = DS_PHASES.length; // todo hecho
+    dsProgressPhaseUpdate(step, !sessionMarker && pct >= 99.5);
+}
+
+function dsProgressPhaseUpdate(step, complete = false) {
+    let active = dsVisiblePhases.findIndex(ph => ph.rx.test(step || ""));
+    if (complete) active = dsVisiblePhases.length;
     if (active < 0) return;
-    DS_PHASES.forEach((ph, i) => {
+    dsVisiblePhases.forEach((ph, i) => {
         const row = document.getElementById(`ds-ph-${ph.id}`);
         if (!row) return;
         const mark = row.querySelector(".ds-ph-mark");
@@ -8600,9 +9799,37 @@ function dsExitResultMode() {
     delete document.body.dataset.dsResult;
 }
 
+function dsTrapDialogFocus(event, dialog) {
+    if (event.key !== "Tab" || !dialog) return;
+    const focusable = [...dialog.querySelectorAll(
+        'button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'
+    )].filter(element => {
+        const style = getComputedStyle(element);
+        return element.offsetParent !== null && style.visibility !== "hidden" && style.display !== "none";
+    });
+    if (!focusable.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (!dialog.contains(document.activeElement)) {
+        event.preventDefault();
+        first.focus();
+    } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+    }
+}
+
 // ---- Barra de estirado final (SIRIL-style screen transfer function) ----
 let dsStretchMode = "linked";
 let dsStretchStrength = 0.5;
+let dsResultView = "master";
 let dsResultBasePath = null; // primer light del apilado → carpeta de exportación
 
 // Exporta el resultado de cielo profundo (estirado 16-bit/PNG y/o lineal 16-bit).
@@ -8615,14 +9842,25 @@ async function dsExportResult(opts, triggerBtn) {
     const prevTxt = triggerBtn ? triggerBtn.textContent : null;
     if (triggerBtn) { triggerBtn.disabled = true; triggerBtn.style.opacity = "0.6"; triggerBtn.textContent = tr("deepsky.exporting", "Exportando…"); }
     try {
-        const msg = await invoke("deepsky_export", {
-            basePath: dsResultBasePath,
-            mode: dsStretchMode,
-            strength: dsStretchStrength,
-            saveStretched: !!opts.stretched,
-            saveLinear: !!opts.linear,
-            asPng: !!opts.png
-        });
+        const messages = [];
+        if (opts.stretched || opts.linear) {
+            messages.push(await invoke("deepsky_export", {
+                basePath: dsResultBasePath,
+                mode: dsStretchMode,
+                strength: dsStretchStrength,
+                saveStretched: !!opts.stretched,
+                saveLinear: !!opts.linear,
+                asPng: !!opts.png
+            }));
+        }
+        if (opts.float32) {
+            const scientific = await invoke("deepsky_export_float32", {
+                basePath: dsResultBasePath,
+                includeMaps: true,
+            });
+            messages.push(`FITS float32: ${scientific.masterFits}\nJSON: ${scientific.recipeJson}\nMapas: ${(scientific.diagnosticFits || []).length}`);
+        }
+        const msg = messages.join("\n");
         log("SUCCESS", normalizeBackendText(msg));
         showCustomAlert(tr("general.saved", "Guardado"), normalizeBackendText(msg));
     } catch (e) {
@@ -8639,6 +9877,88 @@ async function dsApplyStretch() {
         if (ui.imgResult) await setImageAndWait(ui.imgResult, b64, false);
         dsUpdateHistogram();
     } catch (e) { log("ERROR", `Re-estirado: ${e}`); }
+}
+
+async function dsShowResultView(kind) {
+    dsResultView = kind;
+    const selector = document.getElementById("ds-result-view");
+    if (selector) selector.value = kind;
+    const hist = document.getElementById("ds-histogram");
+    if (kind === "master") {
+        if (hist) hist.style.display = "block";
+        dsPositionHistogram();
+        await dsApplyStretch();
+        return;
+    }
+    if (hist) hist.style.display = "none";
+    // Vistas de sesión multibanda: preview PNG de un grupo (ya renderizado en
+    // disco) o componente FITS float32 estirado bajo demanda por el backend.
+    if (kind.startsWith("session:")) {
+        const path = kind.slice("session:".length);
+        if (ui.imgResult) {
+            const shown = await setImageAndWait(ui.imgResult, path, false);
+            if (!shown) log("ERROR", "No se pudo cargar la vista de esa integración.");
+        }
+        return;
+    }
+    if (kind.startsWith("component:")) {
+        const path = kind.slice("component:".length);
+        try {
+            const image = await invoke("deepsky_frame_preview", { path });
+            if (ui.imgResult) await setImageAndWait(ui.imgResult, image, false);
+        } catch (e) {
+            log("ERROR", `Componente: ${e}`);
+        }
+        return;
+    }
+    try {
+        const image = await invoke("deepsky_result_view", { kind });
+        if (ui.imgResult) await setImageAndWait(ui.imgResult, image, false);
+    } catch (e) {
+        log("ERROR", `Vista diagnóstica: ${e}`);
+        dsResultView = "master";
+        if (selector) selector.value = "master";
+        if (hist) hist.style.display = "block";
+        await dsApplyStretch();
+    }
+}
+
+// Rellena el selector de vistas con las integraciones y componentes de la
+// sesión multibanda terminada (se conservan hasta la siguiente sesión).
+function dsPopulateSessionViews(result) {
+    const view = document.getElementById("ds-result-view");
+    if (!view || !result) return;
+    view.querySelectorAll("[data-session]").forEach(el => el.remove());
+    const addGroup = (label, entries) => {
+        if (!entries.length) return;
+        const og = document.createElement("optgroup");
+        og.label = label;
+        og.dataset.session = "1";
+        for (const { text, value } of entries) {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = text;
+            og.appendChild(opt);
+        }
+        view.appendChild(og);
+    };
+    addGroup(
+        tr("deepsky.session_views", "Integraciones de la sesión"),
+        (result.groups || [])
+            .filter(group => group.previewPath)
+            .map(group => ({
+                text: `${dsFilterLabel(group.filterProfile)} · ${group.framesUsed} lights`,
+                value: `session:${group.previewPath}`,
+            }))
+    );
+    const components = [];
+    for (const [name, paths] of Object.entries(result.componentPaths || {})) {
+        (paths || []).forEach((path, index) => components.push({
+            text: paths.length > 1 ? `${name} (${index + 1})` : name,
+            value: `component:${path}`,
+        }));
+    }
+    addGroup(tr("deepsky.session_components", "Componentes extraídos"), components);
 }
 
 // Histograma RGB + lectura de fondo/recorte de la vista final (estilo PixInsight).
@@ -8675,8 +9995,16 @@ async function dsUpdateHistogram() {
         if (info) {
             const bg = hp.bg.map(v => Math.round(v));
             const bgTxt = hp.is_mono ? `${bg[0]}` : `${bg[0]}/${bg[1]}/${bg[2]}`;
-            info.innerHTML = `${tr("deepsky.hist_bg", "Fondo")}: <b>${bgTxt}</b> ADU · ` +
+            let html = `${tr("deepsky.hist_bg", "Fondo")}: <b>${bgTxt}</b> ADU · ` +
                 `${tr("deepsky.hist_clip", "recorte")} ▼${hp.clip_low.toFixed(2)}% ▲${hp.clip_high.toFixed(2)}%`;
+            // Calidad del máster (estrellas · FWHM · SNR · rechazo · cobertura).
+            const s = dsMasterStats;
+            if (s) {
+                html += `<br><span style="color:#7dd3fc;">${tr("deepsky.quality", "Calidad")}:</span> ` +
+                    `<b>${s.stars}</b> ${tr("deepsky.q_stars", "estrellas")} · FWHM <b>${s.fwhm}</b>px · SNR <b>~${s.snr}</b> · ` +
+                    `${tr("deepsky.q_reject", "rechazo")} <b>${s.rej_pct}%</b> · <b>${s.mean_cov}</b> ${tr("deepsky.q_cov", "tomas/px")}`;
+            }
+            info.innerHTML = html;
         }
     } catch (e) { /* sin resultado o incompatible — silencioso */ }
 }
@@ -8693,7 +10021,10 @@ function dsBuildHistogramPanel() {
     if (document.getElementById("ds-histogram")) return;
     const panel = document.createElement("div");
     panel.id = "ds-histogram";
-    panel.style.cssText = "position:fixed; bottom:78px; left:50%; transform:translateX(-50%); z-index:499; width:260px; padding:8px 10px 6px; background:rgba(15,23,42,0.94); border:1px solid rgba(124,58,237,0.35); border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(6px);";
+    // bottom clears the STF control bar even when it wraps to 2 rows (its top is
+    // ~112px), and z-index sits ABOVE the bar so the histogram is never hidden.
+    // dsPositionHistogram() refines the offset to the bar's real height on show.
+    panel.style.cssText = "position:fixed; bottom:132px; left:50%; transform:translateX(-50%); z-index:501; width:260px; padding:8px 10px 6px; background:rgba(15,23,42,0.94); border:1px solid rgba(124,58,237,0.35); border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(6px);";
     const cv = document.createElement("canvas");
     cv.width = 240; cv.height = 66;
     cv.style.cssText = "width:100%; height:66px; display:block; background:rgba(2,6,23,0.6); border-radius:6px;";
@@ -8703,6 +10034,22 @@ function dsBuildHistogramPanel() {
     info.textContent = tr("deepsky.hist_title", "Histograma");
     panel.append(cv, info);
     document.body.appendChild(panel);
+}
+
+// Coloca el histograma JUSTO encima de la barra STF, midiendo su altura real
+// (crece al hacer wrap en pantallas estrechas) para que nunca se solapen.
+function dsPositionHistogram() {
+    const hist = document.getElementById("ds-histogram");
+    if (!hist || hist.style.display === "none") return;
+    requestAnimationFrame(() => {
+        const bar = document.getElementById("ds-stretch-bar");
+        const barBottom = 12; // debe coincidir con el bottom de la barra STF
+        const barH = bar && bar.offsetParent !== null ? bar.getBoundingClientRect().height : 46;
+        hist.style.bottom = Math.round(barBottom + barH + 12) + "px";
+    });
+}
+if (typeof window !== "undefined") {
+    window.addEventListener("resize", () => dsPositionHistogram());
 }
 
 // Tabla de calidad por-toma (WBPP-style): FWHM, excentricidad, ruido, peso.
@@ -8766,7 +10113,18 @@ function dsShowStretchBar() {
     if (!bar) {
         bar = document.createElement("div");
         bar.id = "ds-stretch-bar";
-        bar.style.cssText = "position:fixed; bottom:22px; left:50%; transform:translateX(-50%); z-index:500; display:flex; align-items:center; gap:10px; padding:8px 14px; background:rgba(15,23,42,0.94); border:1px solid rgba(124,58,237,0.35); border-radius:14px; box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(6px);";
+        bar.style.cssText = "position:fixed; bottom:12px; left:50%; transform:translateX(-50%); z-index:500; display:flex; align-items:center; justify-content:center; flex-wrap:wrap; max-width:calc(100vw - 20px); gap:8px; padding:8px 12px; background:rgba(15,23,42,0.94); border:1px solid rgba(124,58,237,0.35); border-radius:14px; box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(6px);";
+        const view = document.createElement("select");
+        view.id = "ds-result-view";
+        view.title = tr("deepsky.result_view_hint", "Alternar máster y mapas científicos");
+        view.style.cssText = "width:auto; padding:5px 8px; border-radius:9px; font-size:0.7rem; border:1px solid #334155; background:#0f172a; color:#cbd5e1;";
+        view.innerHTML = `<option value="master">${tr("deepsky.view_master", "Máster")}</option>
+            <option value="rejection_low">${tr("deepsky.view_rejection_low", "Rechazo bajo")}</option>
+            <option value="rejection_high">${tr("deepsky.view_rejection_high", "Rechazo alto")}</option>
+            <option value="coverage">${tr("deepsky.view_coverage", "Cobertura")}</option>
+            <option value="weight">${tr("deepsky.view_weight", "Peso")}</option>
+            <option value="registration_residuals">${tr("deepsky.view_residuals", "Residuales")}</option>`;
+        view.addEventListener("change", () => dsShowResultView(view.value));
         const modes = [
             { m: "linked", label: tr("deepsky.stf_auto", "Auto (color)") },
             { m: "unlinked", label: tr("deepsky.stf_balanced", "Balanceado") },
@@ -8780,7 +10138,7 @@ function dsShowStretchBar() {
             b.dataset.mode = m;
             b.textContent = label;
             b.style.cssText = "width:auto; padding:5px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1;";
-            b.addEventListener("click", () => { dsStretchMode = m; dsSyncStretchBar(); dsApplyStretch(); });
+            b.addEventListener("click", () => { dsStretchMode = m; dsSyncStretchBar(); dsShowResultView("master"); });
             seg.appendChild(b);
         });
         const sldWrap = document.createElement("label");
@@ -8790,7 +10148,7 @@ function dsShowStretchBar() {
         sld.type = "range"; sld.min = "0"; sld.max = "1"; sld.step = "0.05"; sld.value = String(dsStretchStrength);
         sld.style.width = "90px";
         sld.addEventListener("input", () => { dsStretchStrength = parseFloat(sld.value); });
-        sld.addEventListener("change", () => dsApplyStretch());
+        sld.addEventListener("change", () => dsShowResultView("master"));
         sldWrap.appendChild(sld);
         const note = document.createElement("span");
         note.style.cssText = "font-size:0.6rem; color:#64748b; max-width:140px;";
@@ -8803,7 +10161,7 @@ function dsShowStretchBar() {
         exportWrap.style.cssText = "position:relative;";
         const btnExport = document.createElement("button");
         btnExport.type = "button";
-        btnExport.textContent = "⤓ " + tr("deepsky.export", "Exportar");
+        btnExport.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;vertical-align:-2px;margin-right:5px;"><use href="#icon-download"></use></svg>${tr("deepsky.export", "Exportar")}`;
         btnExport.style.cssText = "width:auto; padding:6px 13px; border-radius:9px; font-size:0.74rem; font-weight:600; cursor:pointer; border:1px solid #7c3aed; background:linear-gradient(135deg,#7c3aed,#db2777); color:#fff;";
         const pop = document.createElement("div");
         pop.style.cssText = "display:none; position:absolute; bottom:44px; right:0; width:250px; padding:12px; background:rgba(15,23,42,0.98); border:1px solid rgba(124,58,237,0.4); border-radius:12px; box-shadow:0 10px 34px rgba(0,0,0,0.6); flex-direction:column; gap:9px;";
@@ -8823,7 +10181,10 @@ function dsShowStretchBar() {
             <label style="display:flex; align-items:center; gap:7px; font-size:0.7rem; color:#cbd5e1; cursor:pointer;">
                 <input type="checkbox" id="ds-exp-linear" style="width:auto;"> ${tr("deepsky.export_linear", "Lineal 16-bit (PixInsight/PS)")}
             </label>
-            <div style="font-size:0.6rem; color:#64748b; line-height:1.3;">${tr("deepsky.export_hint", "Se guarda junto a tus lights. El estirado usa el modo/intensidad actual.")}</div>
+            <label style="display:flex; align-items:center; gap:7px; font-size:0.7rem; color:#c4b5fd; cursor:pointer;">
+                <input type="checkbox" id="ds-exp-float32" checked style="width:auto;"> ${tr("deepsky.export_float32", "FITS float32 + receta + mapas científicos")}
+            </label>
+            <div style="font-size:0.6rem; color:#64748b; line-height:1.3;">${tr("deepsky.export_hint", "Se guarda en tu carpeta de trabajo (o junto a tus lights si no elegiste una). El estirado usa el modo/intensidad actual.")}</div>
             <button type="button" id="ds-exp-go" style="width:100%; padding:8px; border-radius:8px; border:none; background:linear-gradient(135deg,#7c3aed,#db2777); color:#fff; font-weight:600; font-size:0.72rem; cursor:pointer;">${tr("deepsky.export_do", "Guardar")}</button>
         `;
         btnExport.addEventListener("click", (ev) => {
@@ -8835,13 +10196,14 @@ function dsShowStretchBar() {
         pop.querySelector("#ds-exp-go").addEventListener("click", () => {
             const stretched = pop.querySelector("#ds-exp-stretched").checked;
             const linear = pop.querySelector("#ds-exp-linear").checked;
+            const float32 = pop.querySelector("#ds-exp-float32").checked;
             const png = pop.querySelector("#ds-exp-png").checked;
-            if (!stretched && !linear) {
+            if (!stretched && !linear && !float32) {
                 showCustomAlert(tr("general.error", "Error"), tr("deepsky.export_pick", "Elige al menos una salida."));
                 return;
             }
             pop.style.display = "none";
-            dsExportResult({ stretched, linear, png }, pop.querySelector("#ds-exp-go"));
+            dsExportResult({ stretched, linear, float32, png }, pop.querySelector("#ds-exp-go"));
         });
         exportWrap.append(btnExport, pop);
 
@@ -8852,18 +10214,130 @@ function dsShowStretchBar() {
         const btnReport = document.createElement("button");
         btnReport.id = "ds-report-btn";
         btnReport.type = "button";
-        btnReport.textContent = "📋 " + tr("deepsky.report", "Tomas");
-        btnReport.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; display:" + (dsFrameReport && dsFrameReport.length ? "inline-flex" : "none") + ";";
+        btnReport.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-clipboard"></use></svg>${tr("deepsky.report", "Tomas")}`;
+        btnReport.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; align-items:center; display:" + (dsFrameReport && dsFrameReport.length ? "inline-flex" : "none") + ";";
         btnReport.addEventListener("click", (ev) => { ev.stopPropagation(); dsShowReportPanel(); });
-        bar.append(seg, sldWrap, note, divider, btnReport, exportWrap, close);
+        const btnRepeat = document.createElement("button");
+        btnRepeat.type = "button";
+        btnRepeat.textContent = tr("deepsky.repeat_integration", "Reintegrar");
+        btnRepeat.title = tr("deepsky.repeat_integration_hint", "Conservar tomas y registro; revisar sólo la receta de integración");
+        btnRepeat.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1;";
+        btnRepeat.addEventListener("click", () => {
+            const modal = document.getElementById("deepsky-modal");
+            if (modal) {
+                modal.style.display = "flex";
+                dsSetWizardStep(2, true);
+                dsPreparePlan();
+            }
+        });
+        // Separar canales (R/G/B/L) → másters mono para el flujo LRGB/SHO.
+        const btnSplit = document.createElement("button");
+        btnSplit.id = "ds-split-btn";
+        btnSplit.type = "button";
+        btnSplit.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-palette"></use></svg>${tr("deepsky.split", "Separar canales")}`;
+        btnSplit.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; align-items:center; display:inline-flex;";
+        btnSplit.title = tr("deepsky.split_hint", "Guarda R, G, B y una L sintética como TIFF mono 16-bit para retocar por canal y recombinar (LRGB/SHO).");
+        btnSplit.addEventListener("click", async (ev) => {
+            ev.stopPropagation();
+            if (!dsResultBasePath) { log("WARN", tr("deepsky.no_base", "No hay carpeta de destino para exportar.")); return; }
+            const prev = btnSplit.innerHTML;
+            btnSplit.disabled = true; btnSplit.style.opacity = "0.6";
+            btnSplit.innerHTML = `<svg class="zas-icon icon-spin" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-settings"></use></svg>${tr("deepsky.splitting", "Separando…")}`;
+            try {
+                const msg = await invoke("deepsky_split_channels", { basePath: dsResultBasePath, includeLuma: true });
+                log("SUCCESS", msg);
+                showCustomAlert(tr("deepsky.split", "Separar canales"), msg);
+            } catch (e) {
+                log("ERROR", `${e}`);
+                showCustomAlert(tr("general.error", "Error"), String(e));
+            } finally {
+                btnSplit.disabled = false; btnSplit.style.opacity = "1"; btnSplit.innerHTML = prev;
+            }
+        });
+        // HOO dual-band: convierte el máster OSC dual-band verde en Ha→R, OIII→G/B.
+        const btnHoo = document.createElement("button");
+        btnHoo.id = "ds-hoo-btn";
+        btnHoo.type = "button";
+        btnHoo.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-palette"></use></svg>${tr("deepsky.hoo", "HOO dual-band")}`;
+        btnHoo.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; align-items:center; display:inline-flex;";
+        btnHoo.title = tr("deepsky.hoo_hint", "Combina el máster OSC dual-band en HOO: Ha→R, OIII→G y B. Convierte el verde crudo en la imagen roja/turquesa. Reintegra para volver al RGB.");
+        btnHoo.addEventListener("click", async (ev) => {
+            ev.stopPropagation();
+            const prev = btnHoo.innerHTML;
+            btnHoo.disabled = true; btnHoo.style.opacity = "0.6";
+            btnHoo.innerHTML = `<svg class="zas-icon icon-spin" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-settings"></use></svg>${tr("deepsky.hoo_running", "Combinando HOO…")}`;
+            try {
+                const png = await invoke("deepsky_dualband_hoo", {});
+                if (ui.imgResult && png) await setImageAndWait(ui.imgResult, png, false);
+                dsResultView = "master";
+                dsUpdateHistogram();
+                log("SUCCESS", tr("deepsky.hoo_done", "HOO aplicado (Ha→R, OIII→G/B)."));
+            } catch (e) {
+                log("ERROR", `${e}`);
+                showCustomAlert(tr("general.error", "Error"), String(e));
+            } finally {
+                btnHoo.disabled = false; btnHoo.style.opacity = "1"; btnHoo.innerHTML = prev;
+            }
+        });
+        // SPCC: calibración de color fotométrica contra Gaia DR3 (banda ancha).
+        const btnSpcc = document.createElement("button");
+        btnSpcc.id = "ds-spcc-btn";
+        btnSpcc.type = "button";
+        btnSpcc.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-palette"></use></svg>${tr("deepsky.spcc", "SPCC color")}`;
+        btnSpcc.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; align-items:center; display:inline-flex;";
+        btnSpcc.title = tr("deepsky.spcc_hint", "Calibración de color fotométrica contra Gaia DR3 (banda ancha OSC/RGB, requiere internet). Para banda estrecha/dual-band usa HOO/SHO.");
+        btnSpcc.addEventListener("click", async (ev) => {
+            ev.stopPropagation();
+            const prev = btnSpcc.innerHTML;
+            const run = async (params) => await invoke("spcc_calibrate", { req: params });
+            btnSpcc.disabled = true; btnSpcc.style.opacity = "0.6";
+            btnSpcc.innerHTML = `<svg class="zas-icon icon-spin" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-settings"></use></svg>${tr("deepsky.spcc_running", "Calibrando color…")}`;
+            try {
+                let res;
+                try {
+                    res = await run({});
+                } catch (e) {
+                    const msg = String(e);
+                    if (/RA\/Dec|apuntado|escala|RA, Dec/i.test(msg)) {
+                        const ra = window.prompt(tr("deepsky.spcc_ra", "RA del objetivo (p.ej. 18 18 48 o 274.7):"), "");
+                        if (ra === null) throw new Error(tr("general.cancelled", "Cancelado"));
+                        const dec = window.prompt(tr("deepsky.spcc_dec", "Dec del objetivo (p.ej. -13 49 00 o -13.8):"), "");
+                        if (dec === null) throw new Error(tr("general.cancelled", "Cancelado"));
+                        const scale = window.prompt(tr("deepsky.spcc_scale", "Escala (arcsec/píxel, p.ej. 1.30):"), "");
+                        if (scale === null) throw new Error(tr("general.cancelled", "Cancelado"));
+                        res = await run({ ra, dec, scaleArcsecPx: parseFloat(scale) || null });
+                    } else { throw e; }
+                }
+                if (ui.imgResult && res && res.preview) await setImageAndWait(ui.imgResult, res.preview, false);
+                dsResultView = "master";
+                dsUpdateHistogram();
+                const rep = tr("deepsky.spcc_report", "SPCC: {matched} estrellas Gaia · ganancias R/G/B {gr}/{gg}/{gb}")
+                    .replace("{matched}", res.matched)
+                    .replace("{gr}", res.gainR.toFixed(3))
+                    .replace("{gg}", res.gainG.toFixed(3))
+                    .replace("{gb}", res.gainB.toFixed(3));
+                log("SUCCESS", rep);
+                showCustomAlert(tr("deepsky.spcc", "SPCC color"), `${rep}\n\n${res.note || ""}`);
+            } catch (e) {
+                log("ERROR", `${e}`);
+                showCustomAlert(tr("general.error", "Error"), String(e));
+            } finally {
+                btnSpcc.disabled = false; btnSpcc.style.opacity = "1"; btnSpcc.innerHTML = prev;
+            }
+        });
+        bar.append(view, seg, sldWrap, note, divider, btnSplit, btnHoo, btnSpcc, btnReport, btnRepeat, exportWrap, close);
         document.body.appendChild(bar);
     }
     bar.style.display = "flex";
+    dsResultView = "master";
+    const view = document.getElementById("ds-result-view");
+    if (view) view.value = "master";
     dsBuildHistogramPanel();
     const hist = document.getElementById("ds-histogram");
     if (hist) hist.style.display = "block";
     dsSyncStretchBar();
     dsUpdateHistogram();
+    dsPositionHistogram();
 }
 
 function dsSyncStretchBar() {
@@ -8897,6 +10371,54 @@ async function dsScanFolder() {
     }
 }
 
+// Fixture visual reproducible para auditoría responsive. Sólo existe en Vite
+// dev y nunca sustituye lecturas FITS ni respuestas del backend en release.
+function dsLoadUxFixtureIfRequested(modal) {
+    if (!import.meta.env.DEV || new URLSearchParams(window.location.search).get("ux-fixture") !== "multiband") return;
+    const probe = (name, filter, exptime, temp = -8) => ({
+        path: `/ux-fixture/${name}.fits`, name: `${name}.fits`, ok: true,
+        w: 4144, h: 2822, ch: 1, bayer: "GRBG", filter, exptime,
+        gain: 160, binning: 1, temp, error: null,
+    });
+    dsFiles.lights = [
+        ...Array.from({ length: 53 }, (_, index) => probe(`M42_SV220_Ha_OIII_${String(index + 1).padStart(3, "0")}`, "SV220 Ha OIII", 600, -8.1)),
+        ...Array.from({ length: 72 }, (_, index) => probe(`M42_SV220_SII_OIII_${String(index + 1).padStart(3, "0")}`, "SV220 SII OIII", 600, -8.0)),
+    ];
+    dsFiles.darks = Array.from({ length: 20 }, (_, index) => probe(`Dark_600s_${index + 1}`, null, 600));
+    dsFiles.flats = [
+        ...Array.from({ length: 180 }, (_, index) => probe(`Flat_SV220_Ha_OIII_${index + 1}`, "SV220 Ha OIII", .5)),
+        ...Array.from({ length: 300 }, (_, index) => probe(`Flat_SV220_SII_OIII_${index + 1}`, "SV220 SII OIII", .5)),
+    ];
+    dsFiles.bias = [];
+    dsRenderSections();
+    modal.style.display = "flex";
+    dsWizardStep = 1;
+    dsUpdateUI();
+    clearTimeout(dsPreflightTimer);
+    dsPreflightSerial += 1;
+    dsInspectionSerial += 1;
+    dsSyncWizard();
+    const groupPlan = (frames, seconds) => ({
+        valid: true, groups: [{ frameCount: frames }], recommendedProfile: "maximum_quality",
+        effectiveEngine: "Hybrid CPU+GPU · Apple M5 (Metal)", effectiveRejection: "winsorized",
+        estimatedSeconds: seconds, warnings: [], errors: [],
+    });
+    dsApplyPreparedPlan({
+        sessionId: "ux-session", valid: true, totalFrames: 125,
+        estimatedRamMb: 620, estimatedVramMb: 410, estimatedDiskMb: 11800, estimatedSeconds: 86,
+        componentFilters: ["HA", "OIII", "SII"], warnings: ["Sesión multibanda: 2 integraciones separadas y coordinadas"], errors: [],
+        groups: [
+            { id: "ha_oiii", label: "Ha + OIII · 53 lights", filterProfile: "HA_OIII", componentFilters: ["HA", "OIII"], plan: groupPlan(53, 38) },
+            { id: "sii_oiii", label: "SII + OIII · 72 lights", filterProfile: "SII_OIII", componentFilters: ["SII", "OIII"], plan: groupPlan(72, 48) },
+        ],
+    });
+    dsRenderFrameInspection([
+        { path: "/ux-fixture/M42_001.fits", name: "M42_SV220_Ha_OIII_001.fits", stars: 386, fwhm: 2.31, noise: 84, eccentricity: .41, score: .94, rejectable: false, recommendedReference: true },
+        { path: "/ux-fixture/M42_002.fits", name: "M42_SV220_SII_OIII_002.fits", stars: 352, fwhm: 2.57, noise: 91, eccentricity: .45, score: .89, rejectable: false, recommendedReference: false },
+        { path: "/ux-fixture/M42_003.fits", name: "M42_SV220_SII_OIII_003.fits", stars: 128, fwhm: 4.92, noise: 166, eccentricity: .72, score: .34, rejectable: true, recommendedReference: false, rejectionReason: "FWHM y eccentricidad fuera del rango robusto" },
+    ]);
+}
+
 (function initDeepSky() {
     const modal = document.getElementById("deepsky-modal");
     const btnOpen = document.getElementById("btn-deepsky-mode");
@@ -8906,15 +10428,35 @@ async function dsScanFolder() {
         dsRenderSections();
         if (typeof applyTranslations === "function") { try { applyTranslations(); } catch (_) { } }
         modal.style.display = "flex";
+        dsSetWizardStep(0, true);
         dsUpdateUI();
+        setTimeout(() => modal.querySelector('.ds-wizard-step[data-step="0"]')?.focus(), 0);
     });
-    document.getElementById("btn-deepsky-close")?.addEventListener("click", () => { modal.style.display = "none"; });
-    modal.addEventListener("click", (e) => { if (e.target === modal) modal.style.display = "none"; });
+    const closeWizard = () => { modal.style.display = "none"; btnOpen.focus(); };
+    document.getElementById("btn-deepsky-close")?.addEventListener("click", closeWizard);
+    modal.addEventListener("click", (e) => { if (e.target === modal) closeWizard(); });
+    document.getElementById("btn-deepsky-prev")?.addEventListener("click", () => dsSetWizardStep(dsWizardStep - 1));
+    document.getElementById("btn-deepsky-next")?.addEventListener("click", () => dsSetWizardStep(dsWizardStep + 1));
+    modal.querySelectorAll(".ds-wizard-step").forEach(btn => {
+        btn.addEventListener("click", () => dsSetWizardStep(Number(btn.dataset.step)));
+    });
+    modal.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") { e.preventDefault(); closeWizard(); }
+        if (e.altKey && e.key === "ArrowLeft") { e.preventDefault(); dsSetWizardStep(dsWizardStep - 1); }
+        if (e.altKey && e.key === "ArrowRight") { e.preventDefault(); dsSetWizardStep(dsWizardStep + 1); }
+        dsTrapDialogFocus(e, modal);
+    });
+    const progressDialog = document.getElementById("ds-progress");
+    progressDialog?.addEventListener("keydown", (e) => dsTrapDialogFocus(e, progressDialog));
     document.getElementById("ds-prog-cancel")?.addEventListener("click", async () => {
         try { await invoke("cancel_processing"); } catch (_) { }
         const c = document.getElementById("ds-prog-current"); if (c) c.textContent = tr("general.cancelling", "Cancelando...");
     });
     document.getElementById("ds-keywords")?.addEventListener("input", () => { dsSelectedGroup = null; dsUpdateUI(); });
+    document.getElementById("chk-ds-multiband-session")?.addEventListener("change", () => { dsUpdateMultibandControls(); dsSchedulePreflight(true); });
+    ["sel-ds-oiii-mix", "sel-ds-crosstalk", "sel-ds-session-palette"].forEach(id => {
+        document.getElementById(id)?.addEventListener("change", () => dsSchedulePreflight(true));
+    });
     document.getElementById("chk-ds-cosmetic")?.addEventListener("change", (e) => { e.target.dataset.touched = "1"; });
     // El control de gota (pixfrac) solo aplica con drizzle activo.
     const dsDrizzleSel = document.getElementById("sel-ds-drizzle");
@@ -8925,51 +10467,76 @@ async function dsScanFolder() {
     dsDrizzleSel?.addEventListener("change", dsSyncPixfrac);
     dsSyncPixfrac();
 
+    // Presets: cada botón fija todos los controles; "Personalizado" no toca nada.
+    document.querySelectorAll("#deepsky-modal .ds-preset").forEach(btn => {
+        btn.addEventListener("click", () => dsApplyPreset(btn.dataset.preset));
+    });
+    // Cambiar cualquier control manualmente pasa el preset a "Personalizado" y
+    // refresca el diagrama/tiempo estimado.
+    ["sel-ds-interp", "sel-ds-drizzle", "sel-ds-pixfrac", "sel-ds-rejection", "num-ds-kappa-low",
+        "num-ds-kappa-high", "sel-ds-clipiters", "sel-ds-normalization", "sel-ds-pedestal",
+        "sel-ds-compute", "chk-ds-autocrop", "chk-ds-cosmetic", "chk-ds-darkopt", "chk-ds-gradient"].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener("change", dsMarkCustomPreset);
+        });
+
     document.getElementById("btn-deepsky-run")?.addEventListener("click", async () => {
         const lights = dsActiveLights();
         if (lights.length < 1) {
             log("WARN", tr("deepsky.need_lights", "Selecciona al menos 1 light."));
             return;
         }
+        const multiband = dsIsMultibandSession();
+        const request = multiband ? dsBuildSessionRequest() : dsBuildStackRequest();
+        await dsInspectFrames();
+        const plan = await dsPreparePlan();
+        if (!plan?.valid) {
+            dsSetWizardStep(1, true);
+            showCustomAlert(tr("general.error", "Error"), (plan?.errors || ["El plan contiene incompatibilidades."]).join("\n"));
+            return;
+        }
         modal.style.display = "none";
-        dsResultBasePath = lights[0]?.path || null; // carpeta destino de exportación
+        dsResultBasePath = localStorage.getItem("zas_ds_workdir") || lights[0]?.path || null; // carpeta destino de exportación
+        dsSessionProgressTotal = multiband ? Math.max(1, request.groups.length) : 1;
+        dsSessionProgressIndex = 1;
         dsProgressStart(); // ventana WBPP dedicada (no la pantalla genérica)
         try {
-            const b64 = await invoke("stack_deepsky", {
-                lights: lights.map(f => f.path),
-                darks: dsMatchedCalib("darks").map(f => f.path),
-                flats: dsMatchedCalib("flats").map(f => f.path),
-                bias: dsMatchedCalib("bias").map(f => f.path),
-                kappa: parseFloat(document.getElementById("num-ds-kappa")?.value) || 3.0,
-                sigmaClip: document.getElementById("chk-ds-sigma")?.checked ?? true,
-                cosmetic: document.getElementById("chk-ds-cosmetic")?.checked ?? null,
-                gradient: document.getElementById("chk-ds-gradient")?.checked ?? false,
-                drizzle: parseFloat(document.getElementById("sel-ds-drizzle")?.value) || 1.0,
-                optimizeDark: document.getElementById("chk-ds-darkopt")?.checked ?? null,
-                pixfrac: parseFloat(document.getElementById("sel-ds-pixfrac")?.value) || 0.8,
-                localNorm: document.getElementById("chk-ds-localnorm")?.checked ?? false,
-                autoCrop: document.getElementById("chk-ds-autocrop")?.checked ?? true
-            });
+            const result = await invoke(multiband ? "run_deepsky_session" : "run_deepsky_stack", { request });
             dsProgressStop();
             // FLUJO DEDICADO DE CIELO PROFUNDO: solo la imagen final (sin vista
             // fuente ni el post-procesado planetario de wavelets).
             dsEnterResultMode();
             if (ui.imgResult) {
-                await setImageAndWait(ui.imgResult, b64, false);
+                await setImageAndWait(ui.imgResult, result.previewPath, false);
                 fitToScreen();
             }
             dsShowStretchBar();
-            log("SUCCESS", tr("deepsky.done", "Cielo Profundo apilado. Usa la barra inferior para ajustar el estirado (los datos quedan lineales)."));
+            if (multiband) {
+                dsRenderSessionResult(result);
+                // Vistas conmutables de la sesión: cada integración (Ha+OIII /
+                // SII+OIII) y cada componente extraído quedan en el selector.
+                dsPopulateSessionViews(result);
+                log("SUCCESS", `Sesión multibanda terminada: ${result.groups.length} masters · ${result.framesUsed} lights usadas · ${result.elapsedSeconds.toFixed(1)} s\nResultados: ${result.outputDir}`);
+            } else {
+                log("SUCCESS", `${tr("deepsky.done", "Cielo Profundo apilado. Usa la barra inferior para ajustar el estirado (los datos quedan lineales).")}
+Motor: ${result.engine} · ${result.framesUsed} usadas · ${result.framesRejected} rechazadas · ${result.elapsedSeconds.toFixed(1)} s`);
+            }
         } catch (e) {
             dsProgressStop();
             if (isCancellationError(e)) {
                 log("WARN", tr("general.cancelled", "Operación cancelada."));
+                modal.style.display = "flex";
+                dsSetWizardStep(3, true);
+                requestAnimationFrame(() => document.getElementById("btn-deepsky-run")?.focus());
             } else {
                 log("ERROR", `Cielo Profundo: ${e}`);
                 showCustomAlert(tr("general.error", "Error"), String(e));
+                modal.style.display = "flex";
+                dsSetWizardStep(3, true);
             }
         }
     });
+    setTimeout(() => dsLoadUxFixtureIfRequested(modal), 0);
 })();
 
 // ============ COMBINAR CANALES (LRGB / SHO / HOO) ============
@@ -9014,6 +10581,7 @@ function dsRenderCombineSlots() {
         const pick = document.createElement("button");
         pick.type = "button";
         pick.textContent = tr("deepsky.slot_pick", "Elegir");
+        pick.setAttribute("aria-label", `${pick.textContent}: ${slot.label()}`);
         pick.style.cssText = "flex:0 0 auto; width:auto; padding:6px 12px; border-radius:8px; font-size:0.7rem; cursor:pointer; border:1px solid #7c3aed; background:rgba(124,58,237,0.2); color:#ddd6fe;";
         pick.addEventListener("click", async () => {
             const f = await openDialog({ multiple: false, title: slot.label(), filters: [{ name: "Imagen", extensions: ["fit", "fits", "tif", "tiff", "png", "jpg", "jpeg"] }] });
@@ -9023,6 +10591,7 @@ function dsRenderCombineSlots() {
         if (path) {
             const clr = document.createElement("button");
             clr.type = "button"; clr.textContent = "✕";
+            clr.setAttribute("aria-label", `${tr("deepsky.clear", "Limpiar")}: ${slot.label()}`);
             clr.style.cssText = "flex:0 0 auto; width:auto; padding:6px 8px; border-radius:8px; border:none; background:none; color:#64748b; cursor:pointer;";
             clr.addEventListener("click", () => { dsCombineFiles[slot.key] = null; dsRenderCombineSlots(); });
             row.appendChild(clr);
@@ -9035,14 +10604,26 @@ function dsRenderCombineSlots() {
     const modal = document.getElementById("ds-combine-modal");
     const btnOpen = document.getElementById("btn-deepsky-combine-open");
     if (!modal || !btnOpen) return;
+    const wizard = document.getElementById("deepsky-modal");
+    const closeCombine = () => {
+        modal.style.display = "none";
+        if (wizard) wizard.style.display = "flex";
+        dsSyncWizard();
+        requestAnimationFrame(() => btnOpen.focus());
+    };
     btnOpen.addEventListener("click", () => {
-        document.getElementById("deepsky-modal").style.display = "none";
+        if (wizard) wizard.style.display = "none";
         dsRenderCombineSlots();
         if (typeof applyTranslations === "function") { try { applyTranslations(); } catch (_) { } }
         modal.style.display = "flex";
+        requestAnimationFrame(() => document.getElementById("ds-combine-close")?.focus());
     });
-    document.getElementById("ds-combine-close")?.addEventListener("click", () => { modal.style.display = "none"; });
-    modal.addEventListener("click", (e) => { if (e.target === modal) modal.style.display = "none"; });
+    document.getElementById("ds-combine-close")?.addEventListener("click", closeCombine);
+    modal.addEventListener("click", (e) => { if (e.target === modal) closeCombine(); });
+    modal.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") { e.preventDefault(); closeCombine(); return; }
+        dsTrapDialogFocus(e, modal);
+    });
     document.getElementById("ds-combine-preset")?.addEventListener("change", () => dsRenderCombineSlots());
 
     document.getElementById("ds-combine-run")?.addEventListener("click", async () => {
@@ -9100,6 +10681,20 @@ if (btnCancelProcess) {
 
             // Invoke Backend Command
             await invoke("cancel_processing");
+
+            // RECUPERACIÓN: si tras 10 s el overlay sigue visible (backend
+            // ocupado terminando un lote/espera GPU), re-armar el botón para
+            // que el usuario pueda reintentar en vez de quedarse sin salida.
+            setTimeout(() => {
+                const overlay = $("#processing-overlay");
+                if (overlay && overlay.style.display !== "none") {
+                    isCancellationRequested = false;
+                    btnCancelProcess.disabled = false;
+                    btnCancelProcess.style.opacity = "";
+                    btnCancelProcess.style.cursor = "";
+                    if (detEl) detEl.textContent = "El backend sigue deteniéndose... puedes reintentar.";
+                }
+            }, 10000);
 
         } catch (e) {
             console.error("Error sending cancel command:", e);
