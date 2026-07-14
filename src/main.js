@@ -8923,6 +8923,9 @@ function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
     const value = (id, fallback) => document.getElementById(id)?.value ?? fallback;
     const checked = (id, fallback = false) => document.getElementById(id)?.checked ?? fallback;
     const rejection = value("sel-ds-rejection", "sigma");
+    // Método de integración (F3): con "classic" NO se envía el campo para que el
+    // backend use el motor clásico exacto; NebulaFusion viaja como objeto camelCase.
+    const dsMethod = value("sel-ds-method", "classic");
     const pedestalRaw = value("sel-ds-pedestal", "0");
     const profile = ({ fast: "fast", balanced: "balanced", max: "maximum_quality" })[dsActivePreset] || "custom";
     return {
@@ -8933,6 +8936,9 @@ function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
         computePolicy: value("sel-ds-compute", "hybrid"),
         profile,
         rejection,
+        ...(dsMethod === "nebula_fusion"
+            ? { integrationMethod: { method: "nebula_fusion", mode: "lite" } }
+            : {}),
         kappaLow: parseFloat(value("num-ds-kappa-low", "3")) || 3,
         kappaHigh: parseFloat(value("num-ds-kappa-high", "3")) || 3,
         clipIters: parseInt(value("sel-ds-clipiters", "")) || null,
@@ -10156,7 +10162,10 @@ function dsShowStretchBar() {
             <option value="coverage">${tr("deepsky.view_coverage", "Cobertura")}</option>
             <option value="weight">${tr("deepsky.view_weight", "Peso")}</option>
             <option value="registration_residuals">${tr("deepsky.view_residuals", "Residuales")}</option>
-            <option value="background_model">${tr("deepsky.view_background_model", "Modelo de fondo (CL)")}</option>`;
+            <option value="background_model">${tr("deepsky.view_background_model", "Modelo de fondo (CL)")}</option>
+            <option value="variance">${tr("deepsky.view_variance", "Varianza (NF)")}</option>
+            <option value="neff">${tr("deepsky.view_neff", "NEFF — tomas efectivas (NF)")}</option>
+            <option value="dq">${tr("deepsky.view_dq", "Calidad de datos DQ (NF)")}</option>`;
         view.addEventListener("change", () => dsShowResultView(view.value));
         const modes = [
             { m: "linked", label: tr("deepsky.stf_auto", "Auto (color)") },
@@ -10506,7 +10515,9 @@ function dsLoadUxFixtureIfRequested(modal) {
     });
     // Cambiar cualquier control manualmente pasa el preset a "Personalizado" y
     // refresca el diagrama/tiempo estimado.
-    ["sel-ds-interp", "sel-ds-drizzle", "sel-ds-pixfrac", "sel-ds-rejection", "num-ds-kappa-low",
+    // sel-ds-method (NebulaFusion) también refresca el plan: el preflight es quien
+    // avisa de incompatibilidades (drizzle, GPU only, PNG/JPEG). Los presets no lo tocan.
+    ["sel-ds-interp", "sel-ds-drizzle", "sel-ds-pixfrac", "sel-ds-rejection", "sel-ds-method", "num-ds-kappa-low",
         "num-ds-kappa-high", "sel-ds-clipiters", "sel-ds-normalization", "sel-ds-pedestal",
         "sel-ds-compute", "chk-ds-autocrop", "chk-ds-cosmetic", "chk-ds-darkopt", "chk-ds-gradient"].forEach(id => {
             const el = document.getElementById(id);

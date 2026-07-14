@@ -895,6 +895,12 @@ pub struct DeepSkyResult {
     pub frames_rejected: usize,
     pub elapsed_seconds: f32,
     pub recipe: serde_json::Value,
+    /// Productos científicos (motores NebulaFusion/EIDR; None en clásico).
+    /// VAR y NEFF comparten el layout interleaved del máster; DQ es u32 por
+    /// píxel con los bits de `deepsky_variance::dq`.
+    pub variance: Option<Vec<f32>>,
+    pub neff: Option<Vec<f32>>,
+    pub dq: Option<Vec<u32>>,
 }
 
 /// Alias transitorio para los módulos internos previos a la API tipada v2.

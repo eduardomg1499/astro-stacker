@@ -2624,6 +2624,12 @@ fn ds_warp_accumulate(
     // Rescate de detalle: rejilla de calidad local (multiplica frame_w).
     wq: Option<(&[f32], usize, usize)>,
     lanczos: bool, // Lanczos-3 sampling (falls back to bilinear at borders)
+    // NF-Lite (F3): máscara congelada del frame en espacio de SALIDA (bitset
+    // de w*h bits, bit=1 ⇒ este frame no aporta en ese píxel) y acumulador
+    // opcional de Σw² por píxel-canal para NEFF. Con None ambos, el bucle es
+    // BIT-IDÉNTICO al comportamiento previo (ruta clásica).
+    skip_mask: Option<&[u64]>,
+    weight_sq: Option<&mut Vec<f64>>,
 ) {
     let inv_scale = 1.0 / scale.max(1.0);
     let lut = ds_l3_lut();
@@ -2633,6 +2639,7 @@ fn ds_warp_accumulate(
     let sum_ptr = sum.as_mut_ptr() as usize;
     let wgt_ptr = wgt.as_mut_ptr() as usize;
     let sq_ptr: Option<usize> = sumsq.map(|v| v.as_mut_ptr() as usize);
+    let wsq_ptr: Option<usize> = weight_sq.map(|v| v.as_mut_ptr() as usize);
     let (low_ptr, high_ptr): (Option<usize>, Option<usize>) = rejection_maps
         .map(|(low, high)| (Some(low.as_mut_ptr() as usize), Some(high.as_mut_ptr() as usize)))
         .unwrap_or((None, None));
@@ -2644,6 +2651,9 @@ fn ds_warp_accumulate(
         let mut sq_row = sq_ptr.map(|p| unsafe {
             std::slice::from_raw_parts_mut((p as *mut f64).add(y * w * ch), w * ch)
         });
+        let mut wsq_row = wsq_ptr.map(|p| unsafe {
+            std::slice::from_raw_parts_mut((p as *mut f64).add(y * w * ch), w * ch)
+        });
         let mut low_row = low_ptr.map(|p| unsafe {
             std::slice::from_raw_parts_mut((p as *mut f64).add(y * w), w)
         });
@@ -2653,6 +2663,14 @@ fn ds_warp_accumulate(
         // Reference-frame coordinate of this output pixel (drizzle-scaled).
         let ry_ref = y as f32 * inv_scale;
         for x in 0..w {
+            // Máscara congelada del frame (NF-Lite): el píxel de salida no
+            // recibe aportación de este frame. Antes de muestrear: gratis.
+            if let Some(mask) = skip_mask {
+                let p = y * w + x;
+                if (mask[p >> 6] >> (p & 63)) & 1 == 1 {
+                    continue;
+                }
+            }
             let rx_ref = x as f32 * inv_scale;
             let Some((sxf, syf)) = t.inverse(rx_ref, ry_ref) else { continue; };
             if sxf < 0.0 || syf < 0.0 || sxf >= (img.w - 1) as f32 || syf >= (img.h - 1) as f32 {
@@ -2721,6 +2739,9 @@ fn ds_warp_accumulate(
                     sum_row[x * ch + c] += v as f64 * frame_w;
                     if let Some(sq) = sq_row.as_mut() {
                         sq[x * ch + c] += (v as f64) * (v as f64) * frame_w;
+                    }
+                    if let Some(ws) = wsq_row.as_mut() {
+                        ws[x * ch + c] += frame_w * frame_w;
                     }
                     wgt_row[x * ch + c] += frame_w;
                 }
@@ -3538,6 +3559,43 @@ fn deepsky_result_view(state: State<'_, AppState>, kind: String) -> Result<Strin
         "rejection_low" => &result.rejection_low,
         "rejection_high" => &result.rejection_high,
         "registration_residuals" => &result.registration_residuals,
+        // Productos científicos NF (F3): luma media de canales; VAR con NaN
+        // (huecos) a 0 para el colormap; DQ como bits en float exacto.
+        "variance" | "neff" => {
+            let planes = if kind == "variance" {
+                result.variance.as_ref()
+            } else {
+                result.neff.as_ref()
+            };
+            let plane_data = planes.ok_or(
+                "El motor clásico no produce este mapa; usa NebulaFusion",
+            )?;
+            let (w, h, chn) = (result.width, result.height, result.channels);
+            let npx = w * h;
+            let mut luma = vec![0.0f32; npx];
+            for p in 0..npx {
+                let mut s = 0.0f32;
+                let mut cnt = 0.0f32;
+                for c in 0..chn {
+                    let v = plane_data[p * chn + c];
+                    if v.is_finite() {
+                        s += v;
+                        cnt += 1.0;
+                    }
+                }
+                luma[p] = if cnt > 0.0 { s / cnt } else { 0.0 };
+            }
+            bg_owned = luma;
+            &bg_owned
+        }
+        "dq" => {
+            let dq = result
+                .dq
+                .as_ref()
+                .ok_or("El motor clásico no produce DQ; usa NebulaFusion")?;
+            bg_owned = dq.iter().map(|&b| b as f32).collect();
+            &bg_owned
+        }
         // Modelo de fondo/contaminación lumínica (F2): se ajusta bajo demanda
         // sobre el máster (grado 2 robusto, no destructivo) y se muestra como
         // luma desplazada al rango positivo.
@@ -4022,6 +4080,48 @@ fn deepsky_export_float32(
                 )?;
                 diagnostics.push(path.display().to_string());
             }
+        }
+        // Productos científicos NF (F3): VAR/NEFF con el layout del máster;
+        // DQ como float32 exacto (bits < 2^24).
+        for (name, plane, chn) in [
+            ("variance", result.variance.as_deref(), result.channels),
+            ("neff", result.neff.as_deref(), result.channels),
+        ] {
+            if let Some(plane) = plane {
+                cancellation_checkpoint(cancel.as_ref(), "exportación de productos científicos")?;
+                let path = parent.join(format!("{stem}_{name}.fits"));
+                ds_save_float32_fits_cancellable(
+                    &path,
+                    plane,
+                    result.width,
+                    result.height,
+                    chn,
+                    &[
+                        ("EXTNAME", format!("'{}'", name.to_uppercase())),
+                        ("ZASJOB", format!("'{}'", result.id)),
+                    ],
+                    Some(cancel.as_ref()),
+                )?;
+                diagnostics.push(path.display().to_string());
+            }
+        }
+        if let Some(dq) = result.dq.as_ref() {
+            cancellation_checkpoint(cancel.as_ref(), "exportación de DQ")?;
+            let dq_f32: Vec<f32> = dq.iter().map(|&b| b as f32).collect();
+            let path = parent.join(format!("{stem}_dq.fits"));
+            ds_save_float32_fits_cancellable(
+                &path,
+                &dq_f32,
+                result.width,
+                result.height,
+                1,
+                &[
+                    ("EXTNAME", "'DQ'".to_string()),
+                    ("ZASJOB", format!("'{}'", result.id)),
+                ],
+                Some(cancel.as_ref()),
+            )?;
+            diagnostics.push(path.display().to_string());
         }
         // Producto BG (F2): modelo de fondo/contaminación lumínica ajustado
         // sobre el máster, REVERSIBLE (máster_sin_gradiente + BG = original si
@@ -5312,13 +5412,30 @@ fn prepare_deepsky_stack_impl(request: DeepSkyStackRequest, with_advisor: bool) 
         errors.push("pedestal debe ser un número finito".into());
     }
     // Métodos de integración versionados (receta v3). Sin fallback silencioso:
-    // pedir un motor que aún no existe es un error de plan, no una degradación.
+    // las restricciones de fase son errores de plan, no degradaciones.
     match request.resolved_integration_method() {
         pipeline::DeepSkyIntegrationMethod::Classic(_) => {}
-        pipeline::DeepSkyIntegrationMethod::NebulaFusion(_) => {
-            errors.push(
-                "NebulaFusion aún no está disponible en esta versión; usa el método clásico. El preflight no aplica fallbacks silenciosos".into(),
-            );
+        pipeline::DeepSkyIntegrationMethod::NebulaFusion(nf_cfg) => {
+            if !matches!(nf_cfg.mode, pipeline::NebulaFusionMode::Lite) {
+                errors.push(
+                    "NebulaFusion Full/STRUCT aún no está disponible; usa el modo Lite".into(),
+                );
+            }
+            if nf_cfg.cfa_direct {
+                errors.push(
+                    "El modo CFA directo de NebulaFusion llega en una fase posterior; usa la ruta demosaiced (queda registrada en la receta)".into(),
+                );
+            }
+            if request.drizzle > 1.01 {
+                errors.push(
+                    "NebulaFusion Lite integra a escala nativa: desactiva drizzle (la reconstrucción de muestreo llega con EIDR)".into(),
+                );
+            }
+            if matches!(request.compute_policy, ComputePolicy::GpuOnly) {
+                errors.push(
+                    "NebulaFusion Lite ejecuta en CPU en esta fase; usa Auto o Hybrid".into(),
+                );
+            }
         }
         pipeline::DeepSkyIntegrationMethod::Eidr(_) => {
             errors.push(
@@ -5430,6 +5547,14 @@ fn prepare_deepsky_stack_impl(request: DeepSkyStackRequest, with_advisor: bool) 
             shown,
             suffix
         ));
+        if matches!(
+            request.resolved_integration_method(),
+            pipeline::DeepSkyIntegrationMethod::NebulaFusion(_)
+        ) {
+            errors.push(
+                "NebulaFusion exige entradas lineales (FITS/TIFF): retira los lights PNG/JPEG o usa el método clásico".into(),
+            );
+        }
     }
 
     // Asesor de muestreo (F2): FWHM mediana de un light representativo (el
@@ -5649,7 +5774,15 @@ fn prepare_deepsky_stack_impl(request: DeepSkyStackRequest, with_advisor: bool) 
         effective_rejection = "sigma".into();
     }
     // Acumuladores de momentos + frame + márgenes de registro/normalización.
-    let estimated_ram_mb = (out_px.saturating_mul(ch as u64).saturating_mul(24)
+    // NebulaFusion Lite mantiene 7 planos f64 persistentes (totales, frame,
+    // limpios y Σw²) más los productos f32 (VAR/NEFF/DQ) — su huella real es
+    // ~3× la del streaming clásico y el preflight debe declararla.
+    let nf_requested = matches!(
+        request.resolved_integration_method(),
+        pipeline::DeepSkyIntegrationMethod::NebulaFusion(_)
+    );
+    let ram_bytes_per_px_ch: u64 = if nf_requested { 7 * 8 + 3 * 4 } else { 24 };
+    let estimated_ram_mb = (out_px.saturating_mul(ch as u64).saturating_mul(ram_bytes_per_px_ch)
         + in_px.saturating_mul(ch as u64).saturating_mul(8)
         + 64 * 1024 * 1024) / (1024 * 1024);
     let full_vram_mb = (out_px.saturating_mul(ch as u64).saturating_mul(20)
@@ -5659,7 +5792,8 @@ fn prepare_deepsky_stack_impl(request: DeepSkyStackRequest, with_advisor: bool) 
     let megapixel_frames = (in_px as f32 / 1_000_000.0) * n as f32;
     let estimated_seconds = (megapixel_frames / 35.0).max(1.0)
         * if request.drizzle > 1.01 { scale as f32 * scale as f32 } else { 1.0 }
-        * if matches!(effective_rejection.as_str(), "winsorized" | "linearfit" | "median" | "percentile") { 1.6 } else { 1.0 };
+        * if matches!(effective_rejection.as_str(), "winsorized" | "linearfit" | "median" | "percentile") { 1.6 } else { 1.0 }
+        * if nf_requested { 2.0 } else { 1.0 }; // NF-Lite: ~6 pasadas de warp vs ~3
 
     let gpu = crate::gpu_stack::gpu_info();
     // Prove every shader family that this recipe may execute. These gates are
@@ -7020,7 +7154,7 @@ fn ds_integrate_hybrid_split(
                         ds_warp_accumulate(
                             &img, t, &mut sum[..], Some(&mut *sq), &mut wgt[..], bounds,
                             Some((&mut rl[..], &mut rh[..])), w, h, ch, fw, 1.0,
-                            cpu_norms[j], loc_ref, None, use_lanczos,
+                            cpu_norms[j], loc_ref, None, use_lanczos, None, None,
                         );
                     }
                     Err(e) => {
@@ -7296,6 +7430,13 @@ async fn stack_deepsky(
     // el motor streaming κσ CPU la aplica en esta fase; se anuncia cuando se
     // ignora (rechazo por-píxel o GPU streaming).
     let local_weighting = local_weighting.unwrap_or(false);
+    // NebulaFusion Lite (F3): motor científico con pesos inverso-varianza y
+    // máscaras congeladas. El preflight ya validó las restricciones de fase
+    // (sin drizzle, sin CFA directo, sin GpuOnly, entradas lineales).
+    let nf_lite_active = matches!(
+        integration_method,
+        Some(pipeline::DeepSkyIntegrationMethod::NebulaFusion(_))
+    );
     // Carpeta de trabajo: los cachés multi-GB van al disco que elija el
     // usuario (p.ej. externo) en vez de al temp del sistema.
     let work_root: Option<PathBuf> = work_dir
@@ -8639,7 +8780,7 @@ async fn stack_deepsky(
     let mut used_gpu = false;
     let mut peak_vram_mb = if gpu_preprocessing_used || gpu_calibration_used { 32 } else { 0 };
     let mut effective_engine = if use_tiled { "CPU tiled".to_string() } else { "CPU streaming".to_string() };
-    let gpu_attempt = if compute_policy.allows_gpu() && gpu_stream_supported {
+    let gpu_attempt = if !nf_lite_active && compute_policy.allows_gpu() && gpu_stream_supported {
         match crate::gpu_stack::gpu_runtime() {
             None => {
                 if matches!(compute_policy, ComputePolicy::GpuOnly) {
@@ -8742,8 +8883,61 @@ async fn stack_deepsky(
         None => None,
     };
 
+    let mut nf_products: Option<crate::nebula_fusion::NfLiteProducts> = None;
     let (final_data, wgt1, weight_map, rejection_low, rejection_high, rej_pct, mean_cov):
-        (Vec<f32>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, f64, f64) = if let Some(gpu) = gpu_success {
+        (Vec<f32>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, f64, f64) = if nf_lite_active {
+        // --- Motor NebulaFusion Lite (F3): pesos inverso-varianza + máscaras
+        // congeladas por cross-fit. CPU siempre en esta fase; el preflight ya
+        // excluyó drizzle/CFA-directo/GpuOnly. ---
+        log_to_front(
+            &app,
+            "INFO",
+            &format!(
+                "NebulaFusion Lite: {} frames · pesos 1/σ² por celda · máscaras cross-fit LOO congeladas.",
+                registered.len()
+            ),
+        );
+        let nf_ctx = crate::nebula_fusion::NfLiteContext {
+            registered: &registered,
+            norms: &norms,
+            loc_fields: &loc_fields,
+            loc_grid: LN_G,
+            w_out,
+            h_out,
+            ch,
+            use_lanczos,
+            cancel: cancel.as_ref(),
+        };
+        let mut nf_progress = |phase: &str, k: usize, n: usize| {
+            emit_progress(
+                &app,
+                &format!("NebulaFusion Lite: {phase} {k}/{n}"),
+                35.0 + (k as f32 / n.max(1) as f32) * 55.0,
+                None,
+            );
+        };
+        let out = crate::nebula_fusion::run_lite(&nf_ctx, &load_cached, &mut nf_progress)?;
+        effective_engine = "nebula_fusion_lite".into();
+        rejection = "crossfit_loo".into();
+        log_to_front(
+            &app,
+            "INFO",
+            &format!(
+                "NebulaFusion Lite: {} muestras enmascaradas por cross-fit ({:.2}% del peso).",
+                out.products.masked_samples, out.rej_pct
+            ),
+        );
+        nf_products = Some(out.products);
+        (
+            out.final_data,
+            out.wgt1,
+            out.weight_map,
+            out.rejection_low,
+            out.rejection_high,
+            out.rej_pct,
+            out.mean_cov,
+        )
+    } else if let Some(gpu) = gpu_success {
         gpu
     } else if use_tiled {
         // --- PER-PIXEL (tiled) engine ---
@@ -8863,7 +9057,7 @@ async fn stack_deepsky(
             } else if drz > 1.01 {
                 ds_drizzle_accumulate(&img, t, &mut sum, Some(&mut sq), &mut wgt, None, None, w_out, h_out, ch, fw, drz, pixfrac, norms[k], loc_ref, wq_ref);
             } else {
-                ds_warp_accumulate(&img, t, &mut sum, Some(&mut sq), &mut wgt, None, None, w_out, h_out, ch, fw, drz, norms[k], loc_ref, wq_ref, use_lanczos);
+                ds_warp_accumulate(&img, t, &mut sum, Some(&mut sq), &mut wgt, None, None, w_out, h_out, ch, fw, drz, norms[k], loc_ref, wq_ref, use_lanczos, None, None);
             }
             if k % 4 == 0 || k + 1 == registered.len() {
                 emit_deepsky_pipeline_telemetry(
@@ -8954,7 +9148,7 @@ async fn stack_deepsky(
                         ds_warp_accumulate(
                             &img, t, &mut sum, Some(&mut sq), &mut wgt, Some((&lo, &hi)),
                             Some((&mut rejected_low, &mut rejected_high)), w_out, h_out, ch,
-                            fw, drz, norms[k], loc_ref, wq_ref, use_lanczos,
+                            fw, drz, norms[k], loc_ref, wq_ref, use_lanczos, None, None,
                         );
                     }
                     if k % 4 == 0 || k + 1 == registered.len() {
@@ -9034,6 +9228,26 @@ async fn stack_deepsky(
         w_out,
         h_out,
     );
+    // Los productos científicos comparten el recorte del máster.
+    let nf_products = nf_products.map(|p| {
+        if crop_x == 0 && crop_y == 0 && w_out == original_w && h_out == original_h {
+            p
+        } else {
+            crate::nebula_fusion::NfLiteProducts {
+                variance: crate::nebula_fusion::crop_interleaved_f32(
+                    &p.variance, original_w, original_h, ch, crop_x, crop_y, w_out, h_out,
+                ),
+                neff: crate::nebula_fusion::crop_interleaved_f32(
+                    &p.neff, original_w, original_h, ch, crop_x, crop_y, w_out, h_out,
+                ),
+                dq: crate::nebula_fusion::crop_plane_u32(
+                    &p.dq, original_w, crop_x, crop_y, w_out, h_out,
+                ),
+                masked_samples: p.masked_samples,
+                variance_origin: p.variance_origin,
+            }
+        }
+    });
 
     // Diagnostic: the LINEAR master's value range (helps spot a dead/clipped
     // integration before any cosmetic step touches it).
@@ -9089,7 +9303,17 @@ async fn stack_deepsky(
     // colour calibration are DELIBERATE post steps (with masks/previews), not
     // baked into integration. So this only runs when the user opts in — a safe
     // degree-2 ABE + SCNR + neutralization for a one-click finished look.
-    if use_gradient {
+    if use_gradient && nf_lite_active {
+        // ABE resta y neutralize desplaza (aditivos: VAR intacta), pero SCNR
+        // REMAPEA el canal verde y dejaría VAR/NEFF incoherentes con el SCI.
+        // Con NebulaFusion la limpieza opcional se omite entera y se declara:
+        // el modelo BG exportable (F2) cubre el diagnóstico de gradiente.
+        log_to_front(
+            &app,
+            "WARN",
+            "NebulaFusion: la limpieza ABE/SCNR opcional se omite (invalidaría VAR/NEFF del máster científico). Usa el producto de modelo de fondo exportado.",
+        );
+    } else if use_gradient {
         emit_progress(&app, "Cielo Profundo: limpieza de fondo y color (ABE + SCNR)...", 93.0, None);
         ds_extract_background_gradient(&mut final_data, w_out, h_out, ch);
         if ch == 3 {
@@ -9195,9 +9419,18 @@ async fn stack_deepsky(
             "effective": &effective_integration_method,
             "fallbacks": Vec::<String>::new(),
         },
-        // El motor clásico no produce varianza por píxel; los motores
-        // científicos (F3+) fijarán aquí propagated/camera_model/empirical.
-        "variance": { "origin": serde_json::Value::Null },
+        // Clásico: sin varianza por píxel (null). NF-Lite: empirical (σ MRS
+        // por celda del propio frame — pesos jamás dependientes del objeto).
+        "variance": {
+            "origin": nf_products
+                .as_ref()
+                .map(|p| serde_json::Value::String(p.variance_origin.as_str().into()))
+                .unwrap_or(serde_json::Value::Null),
+        },
+        // Entrada OSC debayerizada float32 (el modo CFA directo llega en F4):
+        // la receta lo declara para no reclamar la calidad del modo CFA.
+        "demosaicedInput": nf_lite_active && cfa_drizzle_pattern.is_some(),
+        "crossfitMaskedSamples": nf_products.as_ref().map(|p| p.masked_samples),
         "inputs": {
             "lights": lights,
             "darks": darks,
@@ -9255,7 +9488,9 @@ async fn stack_deepsky(
             rejection_low: rejection_low.iter().map(|&v| v as f32).collect(),
             rejection_high: rejection_high.iter().map(|&v| v as f32).collect(),
             registration_residuals: registration_residuals,
-            engine: if used_gpu {
+            engine: if nf_lite_active {
+                "nebula_fusion_lite".into()
+            } else if used_gpu {
                 "hybrid_wgpu".into()
             } else if use_tiled {
                 "cpu_tiled".into()
@@ -9267,6 +9502,9 @@ async fn stack_deepsky(
             frames_rejected: rejected,
             elapsed_seconds: ds_run_started.elapsed().as_secs_f32(),
             recipe,
+            variance: nf_products.as_ref().map(|p| p.variance.clone()),
+            neff: nf_products.as_ref().map(|p| p.neff.clone()),
+            dq: nf_products.as_ref().map(|p| p.dq.clone()),
         });
     }
 
@@ -9999,7 +10237,7 @@ mod ds_tests {
         let mut sum = vec![0.0f64; w * h];
         let mut wgt = vec![0.0f64; w * h];
         ds_warp_accumulate(
-            &img, t, &mut sum, None, &mut wgt, None, None, w, h, 1, 1.0, 1.0, ([1.0; 3], [0.0; 3]), None, None, true,
+            &img, t, &mut sum, None, &mut wgt, None, None, w, h, 1, 1.0, 1.0, ([1.0; 3], [0.0; 3]), None, None, true, None, None,
         );
         for y in 8..h - 8 {
             for x in 8..w - 8 {
@@ -10131,12 +10369,12 @@ mod ds_tests {
             ds_warp_accumulate(
                 &sharp, DsTransform::identity(), &mut sum, None, &mut wgt, None, None,
                 w, h, 1, 1.0, 1.0, ([1.0; 3], [0.0; 3]), None,
-                ga.as_ref().map(|g| (g.as_slice(), WQ_G, WQ_G)), false,
+                ga.as_ref().map(|g| (g.as_slice(), WQ_G, WQ_G)), false, None, None,
             );
             ds_warp_accumulate(
                 &blurred, DsTransform::identity(), &mut sum, None, &mut wgt, None, None,
                 w, h, 1, 1.0, 1.0, ([1.0; 3], [0.0; 3]), None,
-                gb.as_ref().map(|g| (g.as_slice(), WQ_G, WQ_G)), false,
+                gb.as_ref().map(|g| (g.as_slice(), WQ_G, WQ_G)), false, None, None,
             );
             (0..w * h).map(|i| (sum[i] / wgt[i].max(1e-12)) as f32).collect()
         };
@@ -10632,6 +10870,9 @@ mod ds_tests {
                 "parameters": {"optionalAbeScnr": false},
                 "frames": [{"path": "/fixture/light.fits", "used": true}]
             }),
+            variance: None,
+            neff: None,
+            dq: None,
         };
         ds_write_recipe(&path, &result).unwrap();
         let recipe: serde_json::Value =

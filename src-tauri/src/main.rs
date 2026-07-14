@@ -15,7 +15,9 @@ mod gpu_deepsky; // GPU compute para calibracion/warp/integracion de cielo profu
 mod gpu_stack; // GPU compute (wgpu) para la etapa de acumulacion
 mod gpu_wavelet; // GPU compute (wgpu) para la descomposicion wavelet (blur separable)
 mod deepsky_background; // F2: grafo de fondo/LP, modelo BG y asesor de muestreo
+mod deepsky_masks; // F3: máscaras de outlier congeladas por cross-fit
 mod deepsky_variance; // contrato lineal F1: VAR/NEFF/DQ (motores científicos)
+mod nebula_fusion; // F3: motor NF-Lite (pesos 1/σ² + máscaras congeladas)
 #[cfg(any(test, feature = "deepsky-sim"))]
 mod deepsky_sim; // simulador de verdad conocida (solo tests/benchmarks)
 mod integral_image;
