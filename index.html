@@ -1542,6 +1542,19 @@
                             </select>
                         </label>
                         <div style="font-size:.58rem;color:#64748b;margin:-2px 0 6px 2px;" data-i18n="deepsky.method_hint_nf">NebulaFusion: media ponderada por el ruido de cada toma + máscaras de rechazo congeladas + mapas científicos VAR/NEFF/DQ junto al máster.</div>
+                        <label id="lbl-ds-cfadirect" class="ds-row" title="Solo NebulaFusion: apila cada fotosito CFA en su propio canal, sin interpolar el debayer. Requiere lights CFA (RAW/FITS Bayer); el preflight lo valida.">
+                            <span data-i18n="deepsky.cfa_direct_label">Modo CFA directo (sin debayer)</span>
+                            <span class="switch"><input type="checkbox" id="chk-ds-cfadirect"><span class="slider round"></span></span>
+                        </label>
+                        <div style="font-size:.58rem;color:#64748b;margin:-2px 0 6px 2px;" data-i18n="deepsky.cfa_direct_hint">Cada fotosito conserva su color; requiere lights CFA.</div>
+                        <label id="lbl-ds-outputbin" class="ds-row" title="Solo NebulaFusion: escala del máster de salida. Las escalas reducidas (super-binning) promedian más muestras por píxel: menos ruido a costa de resolución.">
+                            <span data-i18n="deepsky.bin_label">Escala de salida</span>
+                            <select id="sel-ds-outputbin" class="ds-sel">
+                                <option value="native" selected data-i18n="deepsky.bin_native">Nativa (1x)</option>
+                                <option value="bin0_75" data-i18n="deepsky.bin_075">0.75x (super-binning)</option>
+                                <option value="bin0_5" data-i18n="deepsky.bin_05">0.5x (super-binning)</option>
+                            </select>
+                        </label>
                         <label class="ds-row" title="Método de apilado/rechazo. Sigma (κσ) y Media usan el motor streaming (rápido). Los métodos por-píxel (Winsorized, ajuste lineal, mediana, percentil) usan el motor de máxima calidad que carga el stack completo por franjas (nivel PixInsight/Siril; sin drizzle, cae a σ-clip si falta RAM).">
                             <span data-i18n="deepsky.rejection">Método de rechazo</span>
                             <select id="sel-ds-rejection" class="ds-sel">

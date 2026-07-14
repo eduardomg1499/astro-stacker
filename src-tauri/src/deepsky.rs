@@ -3014,12 +3014,19 @@ fn ds_drizzle_cfa_accumulate(
     loc: Option<(&[f32], usize, usize)>,
     // Rescate de detalle: rejilla de calidad local (multiplica frame_w).
     wq: Option<(&[f32], usize, usize)>,
+    // NF-Lite CFA (F4): peso multiplicativo POR CANAL (inverso-varianza del
+    // canal), máscara congelada por píxel de salida y Σw² para NEFF. Con
+    // None en los tres, el kernel es BIT-IDÉNTICO al clásico.
+    fw_rgb: Option<[f64; 3]>,
+    skip_mask: Option<&[u64]>,
+    weight_sq: Option<&mut Vec<f64>>,
 ) {
     if img.ch != 1 || !matches!(cid, 8..=11) { return; }
     let half = 0.5 * pixfrac.clamp(0.2, 1.0) * scale;
     let sum_ptr = sum.as_mut_ptr() as usize;
     let wgt_ptr = wgt_rgb.as_mut_ptr() as usize;
     let sq_ptr = sumsq.map(|v| v.as_mut_ptr() as usize);
+    let wsq_ptr = weight_sq.map(|v| v.as_mut_ptr() as usize);
     let (low_ptr, high_ptr): (Option<usize>, Option<usize>) = rejection_maps
         .map(|(low, high)| (Some(low.as_mut_ptr() as usize), Some(high.as_mut_ptr() as usize)))
         .unwrap_or((None, None));
@@ -3034,6 +3041,7 @@ fn ds_drizzle_cfa_accumulate(
         let sum_band = unsafe { std::slice::from_raw_parts_mut((sum_ptr as *mut f64).add(oy0 * w * 3), rows * w * 3) };
         let wgt_band = unsafe { std::slice::from_raw_parts_mut((wgt_ptr as *mut f64).add(oy0 * w * 3), rows * w * 3) };
         let mut sq_band = sq_ptr.map(|p| unsafe { std::slice::from_raw_parts_mut((p as *mut f64).add(oy0 * w * 3), rows * w * 3) });
+        let mut wsq_band = wsq_ptr.map(|p| unsafe { std::slice::from_raw_parts_mut((p as *mut f64).add(oy0 * w * 3), rows * w * 3) });
         let mut low_band = low_ptr.map(|p| unsafe { std::slice::from_raw_parts_mut((p as *mut f64).add(oy0 * w), rows * w) });
         let mut high_band = high_ptr.map(|p| unsafe { std::slice::from_raw_parts_mut((p as *mut f64).add(oy0 * w), rows * w) });
 
@@ -3092,9 +3100,14 @@ fn ds_drizzle_cfa_accumulate(
                         let area = (ax * ay) as f64;
                         if area <= 0.0 { continue; }
                         let gpix = opy as usize * w + opx as usize;
+                        if let Some(mask) = skip_mask {
+                            if (mask[gpix >> 6] >> (gpix & 63)) & 1 == 1 {
+                                continue;
+                            }
+                        }
                         let lpix = (opy as usize - oy0) * w + opx as usize;
                         let oi = gpix * 3 + c;
-                        let wv = area * frame_w;
+                        let wv = area * frame_w * fw_rgb.map(|f| f[c]).unwrap_or(1.0);
                         if let Some((lo, hi)) = bounds {
                             if value < lo[oi] || value > hi[oi] {
                                 // Normaliza densidad CFA para que el mapa se lea
@@ -3109,6 +3122,7 @@ fn ds_drizzle_cfa_accumulate(
                         let li = lpix * 3 + c;
                         sum_band[li] += value as f64 * wv;
                         if let Some(sq) = sq_band.as_deref_mut() { sq[li] += value as f64 * value as f64 * wv; }
+                        if let Some(ws) = wsq_band.as_deref_mut() { ws[li] += wv * wv; }
                         wgt_band[li] += wv;
                     }
                 }
@@ -5421,11 +5435,6 @@ fn prepare_deepsky_stack_impl(request: DeepSkyStackRequest, with_advisor: bool) 
                     "NebulaFusion Full/STRUCT aún no está disponible; usa el modo Lite".into(),
                 );
             }
-            if nf_cfg.cfa_direct {
-                errors.push(
-                    "El modo CFA directo de NebulaFusion llega en una fase posterior; usa la ruta demosaiced (queda registrada en la receta)".into(),
-                );
-            }
             if request.drizzle > 1.01 {
                 errors.push(
                     "NebulaFusion Lite integra a escala nativa: desactiva drizzle (la reconstrucción de muestreo llega con EIDR)".into(),
@@ -5929,6 +5938,15 @@ fn prepare_deepsky_stack_impl(request: DeepSkyStackRequest, with_advisor: bool) 
     stages.insert("register".into(), if gpu_fits && request.compute_policy.allows_gpu() { "GPU mapa estelar + CPU centroides PSF/RANSAC · similitud/afín/proyectivo/distorsión local" } else { "CPU PSF/RANSAC · similitud/afín/proyectivo/distorsión local automáticos" }.into());
     stages.insert("normalize".into(), if gpu_streaming { "CPU modelo robusto + GPU aplicación" } else { "CPU modelo robusto" }.into());
     let has_cfa = valid_probes.first().is_some_and(|p| p.bayer.is_some());
+    if let pipeline::DeepSkyIntegrationMethod::NebulaFusion(nf_cfg) =
+        request.resolved_integration_method()
+    {
+        if nf_cfg.cfa_direct && !has_cfa {
+            errors.push(
+                "El modo CFA directo requiere lights CFA (BAYERPAT); estos lights son mono/RGB — usa la ruta estándar".into(),
+            );
+        }
+    }
     stages.insert("integrate".into(), if gpu_streaming {
         "GPU tiled wgpu + CPU coordinación"
     } else if gpu_tiled_rejection {
@@ -7437,6 +7455,19 @@ async fn stack_deepsky(
         integration_method,
         Some(pipeline::DeepSkyIntegrationMethod::NebulaFusion(_))
     );
+    // F4: CFA directo (sin debayer, depósito por fotodiodo) y super-binning.
+    let (nf_cfa_direct, nf_output_bin) = match &integration_method {
+        Some(pipeline::DeepSkyIntegrationMethod::NebulaFusion(cfg)) => (
+            cfg.cfa_direct,
+            match cfg.output_bin {
+                pipeline::OutputBinning::Native => None,
+                pipeline::OutputBinning::Bin0_75 => Some((3usize, 4usize)),
+                pipeline::OutputBinning::Bin0_5 => Some((1usize, 2usize)),
+            },
+        ),
+        _ => (false, None),
+    };
+    let mut lights_were_cfa = false;
     // Carpeta de trabajo: los cachés multi-GB van al disco que elija el
     // usuario (p.ej. externo) en vez de al temp del sistema.
     let work_root: Option<PathBuf> = work_dir
@@ -8003,7 +8034,12 @@ async fn stack_deepsky(
                 }
             }
         }
-        let calibrated_cfa = if drz > 1.01 && img.bayer.is_some() {
+        if img.bayer.is_some() {
+            lights_were_cfa = true;
+        }
+        // Se conserva el plano CFA calibrado cuando lo consumirá un kernel
+        // por fotosito: drizzle CFA clásico o NF-Lite en modo CFA directo.
+        let calibrated_cfa = if (drz > 1.01 || nf_cfa_direct) && img.bayer.is_some() {
             Some(img.clone())
         } else {
             None
@@ -8907,6 +8943,9 @@ async fn stack_deepsky(
             ch,
             use_lanczos,
             cancel: cancel.as_ref(),
+            // CFA directo: los frames quedaron almacenados como plano CFA
+            // calibrado (ver calibrated_cfa) y el patrón viaja con ellos.
+            cfa: cfa_drizzle_pattern.filter(|_| nf_cfa_direct),
         };
         let mut nf_progress = |phase: &str, k: usize, n: usize| {
             emit_progress(
@@ -9053,6 +9092,7 @@ async fn stack_deepsky(
                 ds_drizzle_cfa_accumulate(
                     &img, cid, t, &mut sum, Some(&mut sq), &mut wgt, None, None,
                     w_out, h_out, fw, drz, pixfrac, norms[k], loc_ref, wq_ref,
+                    None, None, None,
                 );
             } else if drz > 1.01 {
                 ds_drizzle_accumulate(&img, t, &mut sum, Some(&mut sq), &mut wgt, None, None, w_out, h_out, ch, fw, drz, pixfrac, norms[k], loc_ref, wq_ref);
@@ -9137,6 +9177,7 @@ async fn stack_deepsky(
                             &img, cid, t, &mut sum, Some(&mut sq), &mut wgt, Some((&lo, &hi)),
                             Some((&mut rejected_low, &mut rejected_high)), w_out, h_out,
                             fw, drz, pixfrac, norms[k], loc_ref, wq_ref,
+                            None, None, None,
                         );
                     } else if drz > 1.01 {
                         ds_drizzle_accumulate(
@@ -9245,9 +9286,79 @@ async fn stack_deepsky(
                 ),
                 masked_samples: p.masked_samples,
                 variance_origin: p.variance_origin,
+                g1g2_offset_max: p.g1g2_offset_max,
             }
         }
     });
+    // --- Super-binning NF (F4): salida 0.75x/0.5x para sobremuestreo ---
+    // Área ponderada tras el auto-crop: SCI conserva la fotometría de
+    // superficie; VAR se propaga con Σa²·VAR/(Σa)²; NEFF media ponderada;
+    // DQ con NO_COVERAGE solo si todo el bloque carece de cobertura.
+    let (mut final_data, w_out, h_out, npx, wgt1, weight_map, rejection_low, rejection_high, registration_residuals, nf_products) =
+        if let (Some((num, den)), true) = (nf_output_bin, nf_products.is_some()) {
+            let bin_f64 = |v: &[f64]| -> Vec<f64> {
+                let v32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
+                crate::nebula_fusion::bin_area_f32(&v32, w_out, h_out, 1, num, den, false)
+                    .0
+                    .into_iter()
+                    .map(|x| x as f64)
+                    .collect()
+            };
+            let (b_data, nw, nh) =
+                crate::nebula_fusion::bin_area_f32(&final_data, w_out, h_out, ch, num, den, false);
+            let b_products = nf_products.map(|p| crate::nebula_fusion::NfLiteProducts {
+                variance: crate::nebula_fusion::bin_area_f32(
+                    &p.variance, w_out, h_out, ch, num, den, true,
+                )
+                .0,
+                neff: crate::nebula_fusion::bin_area_f32(&p.neff, w_out, h_out, ch, num, den, false)
+                    .0,
+                dq: crate::nebula_fusion::bin_dq(&p.dq, w_out, h_out, num, den),
+                masked_samples: p.masked_samples,
+                variance_origin: p.variance_origin,
+                g1g2_offset_max: p.g1g2_offset_max,
+            });
+            let b_wgt1 = bin_f64(&wgt1);
+            let b_weight = bin_f64(&weight_map);
+            let b_rlow = bin_f64(&rejection_low);
+            let b_rhigh = bin_f64(&rejection_high);
+            let b_res =
+                crate::nebula_fusion::bin_area_f32(&registration_residuals, w_out, h_out, 1, num, den, false)
+                    .0;
+            log_to_front(
+                &app,
+                "INFO",
+                &format!(
+                    "Super-binning {}x{} → {}x{} (escala {num}/{den}): SNR por píxel mejorado para datos sobremuestreados.",
+                    w_out, h_out, nw, nh
+                ),
+            );
+            (
+                b_data,
+                nw,
+                nh,
+                nw * nh,
+                b_wgt1,
+                b_weight,
+                b_rlow,
+                b_rhigh,
+                b_res,
+                b_products,
+            )
+        } else {
+            (
+                final_data,
+                w_out,
+                h_out,
+                npx,
+                wgt1,
+                weight_map,
+                rejection_low,
+                rejection_high,
+                registration_residuals,
+                nf_products,
+            )
+        };
 
     // Diagnostic: the LINEAR master's value range (helps spot a dead/clipped
     // integration before any cosmetic step touches it).
@@ -9427,9 +9538,16 @@ async fn stack_deepsky(
                 .map(|p| serde_json::Value::String(p.variance_origin.as_str().into()))
                 .unwrap_or(serde_json::Value::Null),
         },
-        // Entrada OSC debayerizada float32 (el modo CFA directo llega en F4):
-        // la receta lo declara para no reclamar la calidad del modo CFA.
-        "demosaicedInput": nf_lite_active && cfa_drizzle_pattern.is_some(),
+        // Entrada OSC debayerizada float32 vs CFA directo (F4): la receta
+        // declara cuál corrió para no reclamar la calidad del modo CFA.
+        "demosaicedInput": nf_lite_active && lights_were_cfa && !nf_cfa_direct,
+        "cfaDirect": nf_cfa_direct,
+        "cfaG1G2OffsetMax": nf_products.as_ref().and_then(|p| p.g1g2_offset_max),
+        "outputBin": match nf_output_bin {
+            Some((3, 4)) => "0.75x",
+            Some((1, 2)) => "0.5x",
+            _ => "1x",
+        },
         "crossfitMaskedSamples": nf_products.as_ref().map(|p| p.masked_samples),
         "inputs": {
             "lights": lights,
@@ -10453,6 +10571,9 @@ mod ds_tests {
                 2.0,
                 1.0,
                 ([1.0; 3], [0.0; 3]),
+                None,
+                None,
+                None,
                 None,
                 None,
             );

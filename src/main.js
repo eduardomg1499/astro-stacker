@@ -8937,7 +8937,16 @@ function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
         profile,
         rejection,
         ...(dsMethod === "nebula_fusion"
-            ? { integrationMethod: { method: "nebula_fusion", mode: "lite" } }
+            ? {
+                integrationMethod: {
+                    method: "nebula_fusion",
+                    mode: "lite",
+                    // F4: CFA directo y super-binning de salida (solo viajan con
+                    // NebulaFusion; el preflight valida cfaDirect sin lights CFA).
+                    cfaDirect: checked("chk-ds-cfadirect", false),
+                    outputBin: value("sel-ds-outputbin", "native"),
+                },
+            }
             : {}),
         kappaLow: parseFloat(value("num-ds-kappa-low", "3")) || 3,
         kappaHigh: parseFloat(value("num-ds-kappa-high", "3")) || 3,
@@ -10508,6 +10517,21 @@ function dsLoadUxFixtureIfRequested(modal) {
     };
     dsDrizzleSel?.addEventListener("change", dsSyncPixfrac);
     dsSyncPixfrac();
+    // Los controles F4 de NebulaFusion (CFA directo y escala de salida) solo
+    // aplican con ese método: con "classic" se deshabilitan y atenúan (y
+    // dsBuildStackRequest tampoco los envía).
+    const dsMethodSel = document.getElementById("sel-ds-method");
+    const dsSyncNebulaFusionControls = () => {
+        const nfActive = dsMethodSel?.value === "nebula_fusion";
+        [["chk-ds-cfadirect", "lbl-ds-cfadirect"], ["sel-ds-outputbin", "lbl-ds-outputbin"]].forEach(([inputId, labelId]) => {
+            const input = document.getElementById(inputId);
+            if (input) input.disabled = !nfActive;
+            const label = document.getElementById(labelId);
+            if (label) label.style.opacity = nfActive ? "1" : "0.5";
+        });
+    };
+    dsMethodSel?.addEventListener("change", dsSyncNebulaFusionControls);
+    dsSyncNebulaFusionControls();
 
     // Presets: cada botón fija todos los controles; "Personalizado" no toca nada.
     document.querySelectorAll("#deepsky-modal .ds-preset").forEach(btn => {
@@ -10517,7 +10541,8 @@ function dsLoadUxFixtureIfRequested(modal) {
     // refresca el diagrama/tiempo estimado.
     // sel-ds-method (NebulaFusion) también refresca el plan: el preflight es quien
     // avisa de incompatibilidades (drizzle, GPU only, PNG/JPEG). Los presets no lo tocan.
-    ["sel-ds-interp", "sel-ds-drizzle", "sel-ds-pixfrac", "sel-ds-rejection", "sel-ds-method", "num-ds-kappa-low",
+    ["sel-ds-interp", "sel-ds-drizzle", "sel-ds-pixfrac", "sel-ds-rejection", "sel-ds-method", "chk-ds-cfadirect",
+        "sel-ds-outputbin", "num-ds-kappa-low",
         "num-ds-kappa-high", "sel-ds-clipiters", "sel-ds-normalization", "sel-ds-pedestal",
         "sel-ds-compute", "chk-ds-autocrop", "chk-ds-cosmetic", "chk-ds-darkopt", "chk-ds-gradient"].forEach(id => {
             const el = document.getElementById(id);

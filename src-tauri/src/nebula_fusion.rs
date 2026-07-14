@@ -47,6 +47,9 @@ pub(crate) struct NfLiteProducts {
     pub masked_samples: usize,
     /// Origen de la varianza para la receta.
     pub variance_origin: crate::deepsky_variance::VarianceOrigin,
+    /// Máximo |mediana(G1)−mediana(G2)| entre frames (solo CFA directo):
+    /// auditoría del mismo canal físico (§6.8 del plan técnico).
+    pub g1g2_offset_max: Option<f32>,
 }
 
 pub(crate) struct NfLiteOutput {
@@ -73,6 +76,212 @@ pub(crate) struct NfLiteContext<'a> {
     pub ch: usize,
     pub use_lanczos: bool,
     pub cancel: &'a AtomicBool,
+    /// Some(cid) = modo CFA DIRECTO (F4): los frames llegan como plano CFA
+    /// mono calibrado SIN debayer y cada fotosito deposita solo en su canal
+    /// del máster RGB (`ch` debe ser 3). None = ruta mono/RGB demosaiced.
+    pub cfa: Option<i32>,
+}
+
+/// Pesos de un frame: rejilla espacial 1/σ² (mono/RGB) o escalar por canal
+/// (CFA directo: la varianza se mide por sub-plano Bayer; la variación
+/// espacial por canal llega con NF-Full).
+enum FrameWeights {
+    Grid(Vec<f32>),
+    Rgb([f64; 3]),
+}
+
+/// σ MRS por canal desde los SUB-PLANOS Bayer del frame CFA calibrado (cada
+/// sub-plano es una imagen coherente a media resolución — el mosaico entero
+/// inflaría la capa fina de la wavelet con el patrón 2×2). Devuelve también
+/// el offset mediano G1−G2 (mismo canal físico, auditable: un offset grande
+/// delata un problema de calibración por fila/columna).
+pub(crate) fn cfa_channel_sigmas(img: &crate::DsImage, cid: i32) -> ([f32; 3], f32) {
+    let hw = (img.w / 2).max(1);
+    let hh = (img.h / 2).max(1);
+    let mut planes: [Vec<f32>; 4] = [
+        Vec::with_capacity(hw * hh),
+        Vec::with_capacity(hw * hh),
+        Vec::with_capacity(hw * hh),
+        Vec::with_capacity(hw * hh),
+    ];
+    for y in 0..hh * 2 {
+        for x in 0..hw * 2 {
+            planes[(y & 1) * 2 + (x & 1)].push(img.data[y * img.w + x]);
+        }
+    }
+    let mut sigma_ch = [0.0f32; 3];
+    let mut g_sigmas: Vec<f32> = Vec::new();
+    let mut g_medians: Vec<f32> = Vec::new();
+    for (pos, plane) in planes.iter().enumerate() {
+        let (py, px) = (pos / 2, pos % 2);
+        let c = crate::ds_cfa_channel(cid, px, py);
+        let sigma = crate::ds_mrs_noise(plane, hw, hh).max(1e-3);
+        if c == 1 {
+            g_sigmas.push(sigma);
+            let step = (plane.len() / 100_000).max(1);
+            let mut s: Vec<f32> = plane.iter().step_by(step).copied().collect();
+            s.sort_by(|a, b| a.total_cmp(b));
+            g_medians.push(s[s.len() / 2]);
+        } else {
+            sigma_ch[c] = sigma;
+        }
+    }
+    sigma_ch[1] = g_sigmas.iter().sum::<f32>() / g_sigmas.len().max(1) as f32;
+    let g_offset = if g_medians.len() == 2 {
+        g_medians[0] - g_medians[1]
+    } else {
+        0.0
+    };
+    (sigma_ch, g_offset)
+}
+
+/// Una acumulación NF (despacho mono/RGB vs CFA directo) con los parámetros
+/// comunes del contexto. Mantiene la geometría idéntica entre pasadas.
+#[allow(clippy::too_many_arguments)]
+fn nf_accumulate(
+    ctx: &NfLiteContext,
+    k: usize,
+    t: crate::DsTransform,
+    img: &crate::DsImage,
+    weights: &FrameWeights,
+    sum: &mut [f64],
+    wgt: &mut [f64],
+    mask: Option<&[u64]>,
+    wsq: Option<&mut Vec<f64>>,
+) {
+    let loc_ref = ctx.loc_fields[k]
+        .as_ref()
+        .map(|f| (f.as_slice(), ctx.loc_grid, ctx.loc_grid));
+    match (ctx.cfa, weights) {
+        (Some(cid), FrameWeights::Rgb(fw_rgb)) => {
+            crate::ds_drizzle_cfa_accumulate(
+                img, cid, t, sum, None, wgt, None, None, ctx.w_out, ctx.h_out, 1.0, 1.0, 1.0,
+                ctx.norms[k], loc_ref, None, Some(*fw_rgb), mask, wsq,
+            );
+        }
+        (_, FrameWeights::Grid(grid)) => {
+            crate::ds_warp_accumulate(
+                img,
+                t,
+                sum,
+                None,
+                wgt,
+                None,
+                None,
+                ctx.w_out,
+                ctx.h_out,
+                ctx.ch,
+                1.0,
+                1.0,
+                ctx.norms[k],
+                loc_ref,
+                Some((grid.as_slice(), WEIGHT_GRID, WEIGHT_GRID)),
+                ctx.use_lanczos,
+                mask,
+                wsq,
+            );
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Super-binning (F4): salida 0.75x/0.5x para datos sobremuestreados.
+// ---------------------------------------------------------------------------
+
+/// Remuestreo por ÁREA de un plano interleaved f32 al factor s = num/den < 1.
+/// SCI: media ponderada por área (fotometría de superficie conservada).
+/// Con `as_variance`, propaga varianza: VAR' = Σa²·VAR/(Σa)² (independencia
+/// aproximada — la correlación del Lanczos se ignora en Lite, documentado).
+/// Los NaN (huecos) se excluyen del numerador y del denominador.
+pub(crate) fn bin_area_f32(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    ch: usize,
+    num: usize,
+    den: usize,
+    as_variance: bool,
+) -> (Vec<f32>, usize, usize) {
+    let nw = (w * num / den).max(1);
+    let nh = (h * num / den).max(1);
+    let inv = den as f64 / num as f64; // lado del bloque de entrada por píxel de salida
+    let mut out = vec![f32::NAN; nw * nh * ch];
+    for oy in 0..nh {
+        let y0 = oy as f64 * inv;
+        let y1 = ((oy + 1) as f64 * inv).min(h as f64);
+        for ox in 0..nw {
+            let x0 = ox as f64 * inv;
+            let x1 = ((ox + 1) as f64 * inv).min(w as f64);
+            for c in 0..ch {
+                let mut acc = 0.0f64;
+                let mut acc_sq = 0.0f64;
+                let mut area_sum = 0.0f64;
+                let mut iy = y0.floor() as usize;
+                while (iy as f64) < y1 && iy < h {
+                    let ay = (y1.min(iy as f64 + 1.0) - y0.max(iy as f64)).max(0.0);
+                    let mut ix = x0.floor() as usize;
+                    while (ix as f64) < x1 && ix < w {
+                        let ax = (x1.min(ix as f64 + 1.0) - x0.max(ix as f64)).max(0.0);
+                        let a = ax * ay;
+                        let v = data[(iy * w + ix) * ch + c];
+                        if a > 0.0 && v.is_finite() {
+                            area_sum += a;
+                            if as_variance {
+                                acc_sq += a * a * v as f64;
+                            } else {
+                                acc += a * v as f64;
+                            }
+                        }
+                        ix += 1;
+                    }
+                    iy += 1;
+                }
+                if area_sum > 0.0 {
+                    out[(oy * nw + ox) * ch + c] = if as_variance {
+                        (acc_sq / (area_sum * area_sum)) as f32
+                    } else {
+                        (acc / area_sum) as f32
+                    };
+                }
+            }
+        }
+    }
+    (out, nw, nh)
+}
+
+/// Binning del plano DQ: NO_COVERAGE solo si TODOS los píxeles del bloque lo
+/// llevan; el resto de bits se acumulan con OR (defecto en cualquier parte
+/// del bloque ⇒ declarado).
+pub(crate) fn bin_dq(dq: &[u32], w: usize, h: usize, num: usize, den: usize) -> Vec<u32> {
+    let nw = (w * num / den).max(1);
+    let nh = (h * num / den).max(1);
+    let inv = den as f64 / num as f64;
+    let mut out = vec![0u32; nw * nh];
+    for oy in 0..nh {
+        for ox in 0..nw {
+            let y0 = (oy as f64 * inv).floor() as usize;
+            let y1 = (((oy + 1) as f64 * inv).ceil() as usize).min(h);
+            let x0 = (ox as f64 * inv).floor() as usize;
+            let x1 = (((ox + 1) as f64 * inv).ceil() as usize).min(w);
+            let mut bits = 0u32;
+            let mut all_uncovered = true;
+            for iy in y0..y1.max(y0 + 1) {
+                for ix in x0..x1.max(x0 + 1) {
+                    let b = dq[iy.min(h - 1) * w + ix.min(w - 1)];
+                    bits |= b & !crate::deepsky_variance::dq::NO_COVERAGE;
+                    if b & crate::deepsky_variance::dq::NO_COVERAGE == 0 {
+                        all_uncovered = false;
+                    }
+                }
+            }
+            if all_uncovered {
+                bits |= crate::deepsky_variance::dq::NO_COVERAGE;
+            }
+            out[oy * nw + ox] = bits;
+        }
+    }
+    out
 }
 
 /// σ MRS por celda nativa (~64 px) sobre la luma del frame calibrado.
@@ -277,47 +486,50 @@ pub(crate) fn run_lite(
 
     let mut total_sum = vec![0.0f64; npx * ch];
     let mut total_wgt = vec![0.0f64; npx * ch];
-    let mut weight_grids: Vec<Vec<f32>> = Vec::with_capacity(n);
+    let mut frame_weights: Vec<FrameWeights> = Vec::with_capacity(n);
+    let mut g1g2_offset_max = 0.0f32;
 
-    // --- Pasada A: rejillas de pesos + totales S=Σw·y, W=Σw ---
+    // --- Pasada A: pesos por frame + totales S=Σw·y, W=Σw ---
     for (k, &(i, t, _fw)) in ctx.registered.iter().enumerate() {
         crate::pipeline::cancellation_checkpoint(ctx.cancel, "NebulaFusion: totales")?;
         progress("pesos y totales", k + 1, n);
         let img = load(i)?;
-        let sigma = native_sigma_grid(&img);
-        let mul_mean = {
-            let m = ctx.norms[k].0;
-            if ch == 1 {
-                m[0]
-            } else {
-                (m[0] + m[1] + m[2]) / 3.0
+        let weights = if let Some(cid) = ctx.cfa {
+            // CFA directo: 1/σ′² POR CANAL desde los sub-planos Bayer.
+            let (sigmas, g_off) = cfa_channel_sigmas(&img, cid);
+            g1g2_offset_max = g1g2_offset_max.max(g_off.abs());
+            let mut fw = [0.0f64; 3];
+            for c in 0..3 {
+                let s = (sigmas[c] * ctx.norms[k].0[c].max(1e-6)).max(1e-3) as f64;
+                fw[c] = 1.0 / (s * s);
             }
+            FrameWeights::Rgb(fw)
+        } else {
+            let sigma = native_sigma_grid(&img);
+            let mul_mean = {
+                let m = ctx.norms[k].0;
+                if ch == 1 {
+                    m[0]
+                } else {
+                    (m[0] + m[1] + m[2]) / 3.0
+                }
+            };
+            FrameWeights::Grid(reference_weight_grid(
+                &sigma, &t, mul_mean, img.w, img.h, w_out, h_out,
+            ))
         };
-        let grid = reference_weight_grid(&sigma, &t, mul_mean, img.w, img.h, w_out, h_out);
-        let loc_ref = ctx.loc_fields[k]
-            .as_ref()
-            .map(|f| (f.as_slice(), ctx.loc_grid, ctx.loc_grid));
-        crate::ds_warp_accumulate(
-            &img,
+        nf_accumulate(
+            ctx,
+            k,
             t,
+            &img,
+            &weights,
             &mut total_sum,
-            None,
             &mut total_wgt,
             None,
             None,
-            w_out,
-            h_out,
-            ch,
-            1.0,
-            1.0,
-            ctx.norms[k],
-            loc_ref,
-            Some((grid.as_slice(), WEIGHT_GRID, WEIGHT_GRID)),
-            ctx.use_lanczos,
-            None,
-            None,
         );
-        weight_grids.push(grid);
+        frame_weights.push(weights);
     }
     let wgt1 = cov_reduce(&total_wgt, npx, ch);
     let total_cov: f64 = wgt1.iter().sum();
@@ -330,38 +542,17 @@ pub(crate) fn run_lite(
     let mut frame_sum = vec![0.0f64; npx * ch];
     let mut frame_wgt = vec![0.0f64; npx * ch];
     // Warp de la aportación de UN frame (reutiliza los buffers de arriba).
-    let mut warp_frame = |k: usize,
-                          i: usize,
-                          t: crate::DsTransform,
-                          fs: &mut Vec<f64>,
-                          fw: &mut Vec<f64>|
+    let frame_weights_ref = &frame_weights;
+    let warp_frame = |k: usize,
+                      i: usize,
+                      t: crate::DsTransform,
+                      fs: &mut Vec<f64>,
+                      fw: &mut Vec<f64>|
      -> Result<crate::DsImage, String> {
         let img = load(i)?;
         fs.iter_mut().for_each(|v| *v = 0.0);
         fw.iter_mut().for_each(|v| *v = 0.0);
-        let loc_ref = ctx.loc_fields[k]
-            .as_ref()
-            .map(|f| (f.as_slice(), ctx.loc_grid, ctx.loc_grid));
-        crate::ds_warp_accumulate(
-            &img,
-            t,
-            fs,
-            None,
-            fw,
-            None,
-            None,
-            w_out,
-            h_out,
-            ch,
-            1.0,
-            1.0,
-            ctx.norms[k],
-            loc_ref,
-            Some((weight_grids[k].as_slice(), WEIGHT_GRID, WEIGHT_GRID)),
-            ctx.use_lanczos,
-            None,
-            None,
-        );
+        nf_accumulate(ctx, k, t, &img, &frame_weights_ref[k], fs, fw, None, None);
         Ok(img)
     };
 
@@ -476,26 +667,14 @@ pub(crate) fn run_lite(
             bits = mask.to_bitset(npx);
             Some(bits.as_slice())
         };
-        let loc_ref = ctx.loc_fields[k]
-            .as_ref()
-            .map(|f| (f.as_slice(), ctx.loc_grid, ctx.loc_grid));
-        crate::ds_warp_accumulate(
-            &img,
+        nf_accumulate(
+            ctx,
+            k,
             t,
+            &img,
+            &frame_weights_ref[k],
             &mut clean_sum,
-            None,
             &mut clean_wgt,
-            None,
-            None,
-            w_out,
-            h_out,
-            ch,
-            1.0,
-            1.0,
-            ctx.norms[k],
-            loc_ref,
-            Some((weight_grids[k].as_slice(), WEIGHT_GRID, WEIGHT_GRID)),
-            ctx.use_lanczos,
             mask_ref,
             None,
         );
@@ -576,9 +755,6 @@ pub(crate) fn run_lite(
         crate::pipeline::cancellation_checkpoint(ctx.cancel, "NebulaFusion: integración")?;
         progress("integración final", k + 1, n);
         let img = load(i)?;
-        let loc_ref = ctx.loc_fields[k]
-            .as_ref()
-            .map(|f| (f.as_slice(), ctx.loc_grid, ctx.loc_grid));
         let bits;
         let mask_ref = if masks[k].is_empty() {
             None
@@ -586,23 +762,14 @@ pub(crate) fn run_lite(
             bits = masks[k].to_bitset(npx);
             Some(bits.as_slice())
         };
-        crate::ds_warp_accumulate(
-            &img,
+        nf_accumulate(
+            ctx,
+            k,
             t,
+            &img,
+            &frame_weights_ref[k],
             &mut total_sum,
-            None,
             &mut total_wgt,
-            None,
-            None,
-            w_out,
-            h_out,
-            ch,
-            1.0,
-            1.0,
-            ctx.norms[k],
-            loc_ref,
-            Some((weight_grids[k].as_slice(), WEIGHT_GRID, WEIGHT_GRID)),
-            ctx.use_lanczos,
             mask_ref,
             Some(&mut weight_sq),
         );
@@ -658,6 +825,7 @@ pub(crate) fn run_lite(
             dq,
             masked_samples,
             variance_origin: crate::deepsky_variance::VarianceOrigin::Empirical,
+            g1g2_offset_max: ctx.cfa.map(|_| g1g2_offset_max),
         },
     })
 }
@@ -746,6 +914,7 @@ mod tests {
             ch: 1,
             use_lanczos: false,
             cancel: &cancel,
+            cfa: None,
         };
         let load = |i: usize| -> Result<crate::DsImage, String> {
             Ok(crate::DsImage {
@@ -883,6 +1052,7 @@ mod tests {
             ch: 1,
             use_lanczos: false,
             cancel: &cancel,
+            cfa: None,
         };
         let frames_ref = &frames;
         let load = |i: usize| -> Result<crate::DsImage, String> {
@@ -986,6 +1156,202 @@ mod tests {
             (ratio - 1.0).abs() < 0.005,
             "pendiente de flujo {ratio:.4} fuera de 1±0.005"
         );
+    }
+
+    /// Gate F4: CFA directo — cociente de canales sin sesgo (<1%) y SIN
+    /// patrón 2×2 residual en la salida (las medias por fase de paridad de
+    /// cada canal coinciden). 8 frames RGGB con dithers que cubren las 4
+    /// paridades para que cada canal tenga cobertura completa.
+    #[test]
+    fn gate_f4_cfa_channel_ratio_and_no_mosaic_pattern() {
+        let (w, h) = (96, 96);
+        let color = [0.8f64, 1.0, 0.6];
+        let scene = crate::deepsky_sim::SimScene {
+            width: w,
+            height: h,
+            background_adu: 400.0,
+            gradient_adu_per_px: (0.0, 0.0),
+            color,
+            stars: Vec::new(),
+        };
+        let sensor = crate::deepsky_sim::SimSensor {
+            gain_e_per_adu: 1.0,
+            read_noise_e: 3.0,
+            bias_adu: 0.0,
+            dark_adu_per_s: 0.0,
+            full_well_adu: 65535.0,
+            hot_pixels: Vec::new(),
+            bayer: Some(8), // RGGB
+            vignette: None,
+        };
+        let dithers = [(0.0f32, 0.0f32), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)];
+        let mut frames = Vec::new();
+        let mut registered = Vec::new();
+        for k in 0..8usize {
+            let exp = crate::deepsky_sim::SimExposure {
+                exposure_s: 60.0,
+                dx: 0.0,
+                dy: 0.0,
+                seed: 51_000 + k as u64,
+            };
+            frames.push(crate::deepsky_sim::render_light(&scene, &sensor, &exp).0);
+            let (dx, dy) = dithers[k % 4];
+            registered.push((
+                k,
+                crate::DsTransform::from_similarity((1.0, 0.0, dx, dy)),
+                1.0f64,
+            ));
+        }
+        let norms = neutral_norms(8);
+        let loc: Vec<Option<Vec<f32>>> = vec![None; 8];
+        let cancel = no_cancel();
+        let ctx = NfLiteContext {
+            registered: &registered,
+            norms: &norms,
+            loc_fields: &loc,
+            loc_grid: 24,
+            w_out: w,
+            h_out: h,
+            ch: 3,
+            use_lanczos: false,
+            cancel: &cancel,
+            cfa: Some(8),
+        };
+        let frames_ref = &frames;
+        let load = |i: usize| -> Result<crate::DsImage, String> {
+            Ok(crate::DsImage {
+                data: frames_ref[i].clone(),
+                w,
+                h,
+                ch: 1,
+                bayer: Some(8),
+            })
+        };
+        let out = run_lite(&ctx, &load, &mut |_, _, _| {}).expect("run_lite CFA");
+        // Cociente de canales: media interior por canal vs verdad 400·color.
+        let mut ch_mean = [0.0f64; 3];
+        let mut ch_cnt = [0.0f64; 3];
+        // Medias por fase de paridad 2×2 (patrón mosaico residual).
+        let mut phase_mean = [[0.0f64; 4]; 3];
+        let mut phase_cnt = [[0.0f64; 4]; 3];
+        for y in 4..h - 4 {
+            for x in 4..w - 4 {
+                let p = y * w + x;
+                for c in 0..3 {
+                    let v = out.final_data[p * 3 + c] as f64;
+                    if !v.is_finite() || v == 0.0 {
+                        continue;
+                    }
+                    ch_mean[c] += v;
+                    ch_cnt[c] += 1.0;
+                    let phase = (y & 1) * 2 + (x & 1);
+                    phase_mean[c][phase] += v;
+                    phase_cnt[c][phase] += 1.0;
+                }
+            }
+        }
+        for c in 0..3 {
+            let mean = ch_mean[c] / ch_cnt[c].max(1.0);
+            let truth = 400.0 * color[c];
+            assert!(
+                (mean / truth - 1.0).abs() < 0.01,
+                "canal {c}: media {mean:.2} vs verdad {truth:.2} (sesgo >1%)"
+            );
+            let phases: Vec<f64> = (0..4)
+                .map(|ph| phase_mean[c][ph] / phase_cnt[c][ph].max(1.0))
+                .collect();
+            let pmax = phases.iter().cloned().fold(f64::MIN, f64::max);
+            let pmin = phases.iter().cloned().fold(f64::MAX, f64::min);
+            assert!(
+                (pmax - pmin) / mean < 0.015,
+                "canal {c}: patrón CFA residual {:.3}% entre fases 2×2",
+                100.0 * (pmax - pmin) / mean
+            );
+        }
+        assert_eq!(out.products.dq.len(), w * h);
+        assert!(out.products.g1g2_offset_max.is_some());
+    }
+
+    /// Gate F4: super-binning — brillo de superficie conservado, varianza
+    /// propagada VAR/4 en 0.5x, flujo de apertura escala con el área del
+    /// píxel (unidad declarada en receta), dimensiones correctas en 0.75x.
+    #[test]
+    fn gate_f4_superbinning_flux_and_variance() {
+        let (w, h) = (64, 64);
+        let mut sci = vec![100.0f32; w * h];
+        // "Estrella": bloque 3×3 de +100 ADU (flujo 900 sobre fondo).
+        for dy in 0..3 {
+            for dx in 0..3 {
+                sci[(30 + dy) * w + 30 + dx] += 100.0;
+            }
+        }
+        let var = vec![4.0f32; w * h];
+        let (b_sci, nw, nh) = bin_area_f32(&sci, w, h, 1, 1, 2, false);
+        assert_eq!((nw, nh), (32, 32));
+        let (b_var, _, _) = bin_area_f32(&var, w, h, 1, 1, 2, true);
+        // Fondo conservado (brillo de superficie) y VAR = 4·(1²·4)/4² = 1.
+        assert!((b_sci[0] - 100.0).abs() < 1e-4);
+        assert!((b_var[0] - 1.0).abs() < 1e-4);
+        // Flujo de apertura: Σ(v−fondo) escala por el área del píxel (1/4).
+        let flux_in: f64 = sci.iter().map(|&v| (v - 100.0) as f64).sum();
+        let flux_out: f64 = b_sci.iter().map(|&v| (v - 100.0) as f64).sum();
+        assert!(
+            (flux_out / (flux_in * 0.25) - 1.0).abs() < 0.01,
+            "flujo binned {flux_out:.1} vs esperado {:.1}",
+            flux_in * 0.25
+        );
+        // 0.75x: dimensiones 3/4.
+        let (_, nw75, nh75) = bin_area_f32(&sci, w, h, 1, 3, 4, false);
+        assert_eq!((nw75, nh75), (48, 48));
+        // DQ: NO_COVERAGE solo si todo el bloque lo lleva.
+        let mut dq = vec![0u32; w * h];
+        dq[0] = crate::deepsky_variance::dq::NO_COVERAGE;
+        dq[1] = crate::deepsky_variance::dq::NO_COVERAGE;
+        dq[w] = crate::deepsky_variance::dq::NO_COVERAGE;
+        dq[w + 1] = crate::deepsky_variance::dq::NO_COVERAGE;
+        dq[2] = crate::deepsky_variance::dq::HOT_COLD;
+        let b_dq = bin_dq(&dq, w, h, 1, 2);
+        assert_eq!(b_dq[0], crate::deepsky_variance::dq::NO_COVERAGE);
+        assert_eq!(b_dq[1] & crate::deepsky_variance::dq::HOT_COLD, crate::deepsky_variance::dq::HOT_COLD);
+        assert_eq!(b_dq[1] & crate::deepsky_variance::dq::NO_COVERAGE, 0);
+    }
+
+    /// Auditoría G1/G2: un offset inyectado entre los dos sub-planos verdes
+    /// se mide con el signo/magnitud correctos.
+    #[test]
+    fn test_cfa_channel_sigmas_measures_g1g2_offset() {
+        let (w, h) = (64, 64);
+        let mut data = vec![0.0f32; w * h];
+        // RGGB (cid 8): R=(par,par), G1=(impar,par), G2=(par,impar), B=(impar,impar).
+        let mut lcg = 12345u64;
+        let mut noise = || {
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((lcg >> 33) as f32 / (1u64 << 32) as f32) - 0.5
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let base = match (x & 1, y & 1) {
+                    (0, 0) => 100.0,        // R
+                    (1, 0) => 200.0,        // G1
+                    (0, 1) => 210.0,        // G2 (offset +10)
+                    _ => 50.0,              // B
+                };
+                data[y * w + x] = base + noise();
+            }
+        }
+        let img = crate::DsImage {
+            data,
+            w,
+            h,
+            ch: 1,
+            bayer: Some(8),
+        };
+        let (sigmas, g_off) = cfa_channel_sigmas(&img, 8);
+        assert!(
+            g_off.abs() > 9.0 && g_off.abs() < 11.0,
+            "offset G1G2 {g_off:.2} fuera de ±[9,11]"
+        );
+        assert!(sigmas.iter().all(|&s| s > 0.0 && s < 5.0));
     }
 
     /// VAR y NEFF con frames idénticos en ruido: VAR≈σ²/N (±10%), NEFF≈N.
