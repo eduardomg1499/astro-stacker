@@ -205,6 +205,21 @@ fn ds_max_mean_f32(data: &[f32]) -> (f64, f64) {
     (maxv, sum / data.len() as f64)
 }
 
+/// Sustituye NaN/Inf por 0.0 (el mismo tratamiento que reciben los BLANK en
+/// enteros, que fitrs no expone) y devuelve cuántos había. Un solo NaN
+/// propagado envenena los másters de calibración y además rompe la decisión
+/// de escala float (max/mean → NaN → comparaciones falsas).
+fn ds_sanitize_nonfinite_f32(data: &mut [f32]) -> usize {
+    let mut n = 0usize;
+    for v in data.iter_mut() {
+        if !v.is_finite() {
+            *v = 0.0;
+            n += 1;
+        }
+    }
+    n
+}
+
 fn ds_read_image(path: &str) -> Result<DsImage, String> {
     let lower = path.to_lowercase();
     if lower.ends_with(".fits") || lower.ends_with(".fit") {
@@ -236,41 +251,59 @@ fn ds_read_image(path: &str) -> Result<DsImage, String> {
                     .collect(),
             ),
             fitrs::FitsData::FloatingPoint32(arr) => {
+                let shape = arr.shape.clone();
+                let mut raw = arr.data;
+                // Sanear ANTES de decidir la escala: un NaN vuelve NaN el
+                // max/mean y el heurístico 0..1-vs-ADU degrada a escala 1.
+                let nonfinite = ds_sanitize_nonfinite_f32(&mut raw);
+                if nonfinite > 0 {
+                    eprintln!(
+                        "WARN {path}: {nonfinite} muestras NaN/Inf sustituidas por 0 (tratamiento BLANK)"
+                    );
+                }
                 // SIRIL/PI floats are 0..1; some tools store real ADU. Decide from
                 // the DATAMAX header (if any) plus peak+mean, never peak alone.
                 let datamax = ds_hdr_num(&hdu, "DATAMAX");
-                let (maxv, mean) = ds_max_mean_f32(&arr.data);
+                let (maxv, mean) = ds_max_mean_f32(&raw);
                 let scale = ds_norm_scale_decision(maxv, mean, datamax) as f32;
-                (
-                    arr.shape.clone(),
-                    arr.data
-                        .iter()
-                        .map(|v| v * scale)
-                        .collect(),
-                )
+                if scale != 1.0 {
+                    raw.iter_mut().for_each(|v| *v *= scale);
+                }
+                (shape, raw)
             }
             fitrs::FitsData::FloatingPoint64(arr) => {
+                let shape = arr.shape.clone();
+                let mut raw = arr.data;
+                let mut nonfinite = 0usize;
+                for v in raw.iter_mut() {
+                    if !v.is_finite() {
+                        *v = 0.0;
+                        nonfinite += 1;
+                    }
+                }
+                if nonfinite > 0 {
+                    eprintln!(
+                        "WARN {path}: {nonfinite} muestras NaN/Inf sustituidas por 0 (tratamiento BLANK)"
+                    );
+                }
                 let datamax = ds_hdr_num(&hdu, "DATAMAX");
                 let (mut maxv, mut sum) = (0.0f64, 0.0f64);
-                for &v in arr.data.iter() {
+                for &v in raw.iter() {
                     let a = v.abs();
                     if a > maxv {
                         maxv = a;
                     }
                     sum += v;
                 }
-                let mean = if arr.data.is_empty() {
+                let mean = if raw.is_empty() {
                     0.0
                 } else {
-                    sum / arr.data.len() as f64
+                    sum / raw.len() as f64
                 };
                 let scale = ds_norm_scale_decision(maxv, mean, datamax);
                 (
-                    arr.shape.clone(),
-                    arr.data
-                        .iter()
-                        .map(|v| (v * scale) as f32)
-                        .collect(),
+                    shape,
+                    raw.iter().map(|v| (v * scale) as f32).collect(),
                 )
             }
             fitrs::FitsData::Characters(arr) => (
@@ -3070,6 +3103,63 @@ fn ds_cfa_coverage(wgt_rgb: &[f64]) -> Vec<f64> {
         .collect()
 }
 
+/// AGUJEROS DE DRIZZLE (cobertura cero): con dithering pobre o pixfrac
+/// agresivo quedaban speckles NEGROS sin aviso. Rellena cada hueco con la
+/// media 3×3 de vecinos cubiertos — SOLO continuidad visual del motor
+/// CLÁSICO: el mapa de cobertura conserva el 0 y delata la zona. Los motores
+/// científicos (NebulaFusion/EIDR) NO deben llamar a esta función: sus huecos
+/// permanecen enmascarados (NaN + DQ) y el relleno se limita al preview.
+/// Devuelve (huecos_detectados, huecos_rellenados).
+fn ds_fill_uncovered_gaps(
+    final_data: &mut [f32],
+    coverage: &[f64],
+    w_out: usize,
+    h_out: usize,
+    ch: usize,
+) -> (usize, usize) {
+    let mut holes = 0usize;
+    let mut filled = 0usize;
+    let snapshot = final_data.to_vec();
+    for y in 0..h_out {
+        for x in 0..w_out {
+            let p = y * w_out + x;
+            if coverage[p] > 0.0 {
+                continue;
+            }
+            holes += 1;
+            let mut acc = [0.0f64; 3];
+            let mut cnt = 0usize;
+            for dy in -1i64..=1 {
+                for dx in -1i64..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let nx = x as i64 + dx;
+                    let ny = y as i64 + dy;
+                    if nx < 0 || ny < 0 || nx >= w_out as i64 || ny >= h_out as i64 {
+                        continue;
+                    }
+                    let np = ny as usize * w_out + nx as usize;
+                    if coverage[np] <= 0.0 {
+                        continue;
+                    }
+                    for c in 0..ch {
+                        acc[c] += snapshot[np * ch + c] as f64;
+                    }
+                    cnt += 1;
+                }
+            }
+            if cnt > 0 {
+                for c in 0..ch {
+                    final_data[p * ch + c] = (acc[c] / cnt as f64) as f32;
+                }
+                filled += 1;
+            }
+        }
+    }
+    (holes, filled)
+}
+
 /// BACKGROUND NEUTRALIZATION (SIRIL parity — the fix for the green OSC cast):
 /// a one-shot-color sensor has TWICE the green pixels, so its sky background
 /// is green even after calibration. Estimate each channel's background level
@@ -4482,6 +4572,107 @@ fn deepsky_scan_classify(root: String) -> DsClassified {
     out
 }
 
+/// Canales que entregará realmente `ds_read_image` para un archivo no-FITS,
+/// leyendo solo cabeceras (sin decodificar píxeles). El probe anunciaba antes
+/// `ch: 3` incondicional, clasificando mono (TIFF Gray / PNG-JPEG Luma) como
+/// RGB y desincronizando la agrupación del preflight del loader real.
+fn ds_probe_nonfits_channels(path: &str) -> usize {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".tif") || lower.ends_with(".tiff") {
+        // Mismo mapeo que ds_read_tiff_float_safe: Gray/GrayA → 1, resto → 3.
+        if let Ok(file) = std::fs::File::open(path) {
+            if let Ok(mut dec) = tiff::decoder::Decoder::new(std::io::BufReader::new(file)) {
+                if let Ok(color) = dec.colortype() {
+                    return match color {
+                        tiff::ColorType::Gray(_) | tiff::ColorType::GrayA(_) => 1,
+                        _ => 3,
+                    };
+                }
+            }
+        }
+        return 3;
+    }
+    if lower.ends_with(".png") {
+        // IHDR: firma (8) + len (4) + "IHDR" (4) + ancho (4) + alto (4) +
+        // profundidad (1) + tipo de color (1). SOLO el tipo 0 (gris puro)
+        // llega como mono al loader: gris+alfa (tipo 4) decodifica como
+        // ImageLumaA*, que ds_read_image manda por el brazo genérico
+        // to_rgb16() → 3 canales. El probe debe reflejar el loader real.
+        if let Ok(mut f) = std::fs::File::open(path) {
+            let mut head = [0u8; 26];
+            if f.read_exact(&mut head).is_ok()
+                && head[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+                && &head[12..16] == b"IHDR"
+            {
+                return match head[25] {
+                    0 => 1,
+                    _ => 3,
+                };
+            }
+        }
+        return 3;
+    }
+    if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        // Buscar el SOFn (FFC0..FFCF salvo C4/C8/CC): precisión (1) + alto (2)
+        // + ancho (2) + Nf (1). Nf=1 → escala de grises; 3 → YCbCr.
+        if let Ok(f) = std::fs::File::open(path) {
+            let mut r = std::io::BufReader::new(f);
+            let mut two = [0u8; 2];
+            if r.read_exact(&mut two).is_ok() && two == [0xFF, 0xD8] {
+                loop {
+                    let mut b = [0u8; 1];
+                    if r.read_exact(&mut b).is_err() {
+                        break;
+                    }
+                    if b[0] != 0xFF {
+                        continue;
+                    }
+                    // Saltar bytes de relleno FF antes del código de marcador.
+                    let mut m = [0u8; 1];
+                    loop {
+                        if r.read_exact(&mut m).is_err() {
+                            return 3;
+                        }
+                        if m[0] != 0xFF {
+                            break;
+                        }
+                    }
+                    match m[0] {
+                        0x01 | 0xD0..=0xD8 => continue, // marcadores sin payload
+                        0xD9 | 0xDA => break,           // EOI / SOS sin SOF previo
+                        marker => {
+                            let mut lenb = [0u8; 2];
+                            if r.read_exact(&mut lenb).is_err() {
+                                break;
+                            }
+                            let len = u16::from_be_bytes(lenb) as usize;
+                            if len < 2 {
+                                break;
+                            }
+                            let is_sof = matches!(
+                                marker,
+                                0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF
+                            );
+                            if is_sof {
+                                let mut sof = [0u8; 6];
+                                if r.read_exact(&mut sof).is_ok() {
+                                    return if sof[5] == 1 { 1 } else { 3 };
+                                }
+                                break;
+                            }
+                            if r.seek_relative(len as i64 - 2).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return 3;
+    }
+    3
+}
+
 #[tauri::command]
 fn deepsky_probe(paths: Vec<String>) -> Vec<DsProbe> {
     paths
@@ -4569,7 +4760,7 @@ fn deepsky_probe(paths: Vec<String>) -> Vec<DsProbe> {
                     Ok((w, h)) => DsProbe {
                         w: w as usize,
                         h: h as usize,
-                        ch: 3,
+                        ch: ds_probe_nonfits_channels(p),
                         ok: true,
                         ..base
                     },
@@ -5088,6 +5279,34 @@ fn prepare_deepsky_stack(request: DeepSkyStackRequest) -> PreparedStackPlan {
         }
     }
 
+    // Elegibilidad científica: PNG/JPEG llevan gamma/cuantización de display
+    // sin prueba de linealidad. El motor clásico los sigue aceptando sin
+    // cambio de comportamiento; los motores científicos los excluirán.
+    let nonlinear_inputs: Vec<&str> = valid_probes
+        .iter()
+        .filter(|p| {
+            let l = p.path.to_lowercase();
+            l.ends_with(".png") || l.ends_with(".jpg") || l.ends_with(".jpeg")
+        })
+        .map(|p| p.name.as_str())
+        .collect();
+    let scientific_eligible = nonlinear_inputs.is_empty();
+    if !scientific_eligible {
+        let shown = nonlinear_inputs
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = if nonlinear_inputs.len() > 3 { ", …" } else { "" };
+        warnings.push(format!(
+            "{} light(s) PNG/JPEG sin linealidad demostrable ({}{}): aptos solo para el motor clásico; usa FITS o TIFF lineal para resultados científicos",
+            nonlinear_inputs.len(),
+            shown,
+            suffix
+        ));
+    }
+
     // Desglose de SESIONES (noches) de los lights, con EXPOSICIÓN TOTAL por
     // sesión. Si hay varias, cada una se calibrará con los flats de SU noche.
     let fmt_exposure = |secs: f32| -> String {
@@ -5485,6 +5704,7 @@ fn prepare_deepsky_stack(request: DeepSkyStackRequest) -> PreparedStackPlan {
         estimated_seconds,
         stages,
         normalization_model,
+        scientific_eligible,
     }
 }
 
@@ -8611,51 +8831,12 @@ async fn stack_deepsky(
         let mean_fw = registered.iter().map(|&(_, _, w)| w).sum::<f64>() / registered.len().max(1) as f64;
         let sum_pre: f64 = wgt1.iter().sum();
         let final_coverage = cov_reduce(&wgt);
-        // AGUJEROS DE DRIZZLE (cobertura cero): con dithering pobre o pixfrac
-        // agresivo quedaban speckles NEGROS sin aviso. Se rellenan con la media
-        // 3×3 de vecinos cubiertos (solo continuidad visual: el mapa de
-        // cobertura conserva el 0 y delata la zona) y se cuantifican en un WARN.
+        // AGUJEROS DE DRIZZLE (cobertura cero): relleno visual EXCLUSIVO del
+        // motor clásico — los motores científicos (NebulaFusion/EIDR) nunca
+        // llaman a esta función (sus huecos quedan como NaN + DQ).
         if drz > 1.01 {
-            let mut holes = 0usize;
-            let mut filled = 0usize;
-            let snapshot = final_data.clone();
-            for y in 0..h_out {
-                for x in 0..w_out {
-                    let p = y * w_out + x;
-                    if final_coverage[p] > 0.0 {
-                        continue;
-                    }
-                    holes += 1;
-                    let mut acc = [0.0f64; 3];
-                    let mut cnt = 0usize;
-                    for dy in -1i64..=1 {
-                        for dx in -1i64..=1 {
-                            if dx == 0 && dy == 0 {
-                                continue;
-                            }
-                            let nx = x as i64 + dx;
-                            let ny = y as i64 + dy;
-                            if nx < 0 || ny < 0 || nx >= w_out as i64 || ny >= h_out as i64 {
-                                continue;
-                            }
-                            let np = ny as usize * w_out + nx as usize;
-                            if final_coverage[np] <= 0.0 {
-                                continue;
-                            }
-                            for c in 0..ch {
-                                acc[c] += snapshot[np * ch + c] as f64;
-                            }
-                            cnt += 1;
-                        }
-                    }
-                    if cnt > 0 {
-                        for c in 0..ch {
-                            final_data[p * ch + c] = (acc[c] / cnt as f64) as f32;
-                        }
-                        filled += 1;
-                    }
-                }
-            }
+            let (holes, filled) =
+                ds_fill_uncovered_gaps(&mut final_data, &final_coverage, w_out, h_out, ch);
             if holes > 0 {
                 log_to_front(
                     &app,

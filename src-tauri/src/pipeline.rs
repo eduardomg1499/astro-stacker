@@ -510,6 +510,10 @@ pub struct PreparedStackPlan {
     /// Matriz de calibración por sesión (vacía cuando no hay metadatos de
     /// fecha o el plan no es válido).
     pub session_map: Vec<SessionMapEntry>,
+    /// `false` cuando algún light carece de linealidad demostrable (PNG/JPEG
+    /// con gamma/cuantización de display). El motor clásico los sigue
+    /// aceptando; los motores científicos (NebulaFusion/EIDR) los bloquearán.
+    pub scientific_eligible: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
