@@ -1817,6 +1817,38 @@ async fn perform_standardized_analysis(
                 ),
             );
         }
+        // PR-2.1 DECODE ÚNICO análisis→apilado: si el análisis decodifica el
+        // frame COMPLETO (sin ROI de recorte de vídeo), cada frame se escribe
+        // también al caché NVMe por-frame del apilado (misma clave y formato
+        // que stream_frames_ffmpeg_chunked). El primer apilado del mismo
+        // vídeo se sirve del caché íntegro y NO re-decodifica el H.264/HEVC
+        // de punta a punta (antes: 2 decodificaciones completas por run).
+        let ana_stream_bpp = if ffmpeg_stream_is_color(cid) { 6usize } else { 2usize };
+        let ana_cache_ctx: Option<std::sync::Arc<(PathBuf, u64)>> = {
+            let full_frame_decode = rx == 0 && ry == 0 && rw == tw && rh == th;
+            // Mismo presupuesto que el apilado: si ni con LZ4 ~2:1 cabe el
+            // vídeo entero, no escribir (solo se perdería la poda LRU).
+            let fits_budget = (tf as u64)
+                .saturating_mul((tw * th * ana_stream_bpp) as u64)
+                / 2
+                <= DECODE_CACHE_MAX_BYTES;
+            if full_frame_decode && fits_budget {
+                let cache_dir = std::env::temp_dir().join("astro_stacker_cache");
+                let _ = std::fs::create_dir_all(&cache_dir);
+                let key = ffmpeg_decode_cache_key(
+                    path,
+                    tw,
+                    th,
+                    r.bpp(),
+                    cid,
+                    rt.rotation(),
+                    rt.codec_name(),
+                );
+                Some(std::sync::Arc::new((cache_dir, key)))
+            } else {
+                None
+            }
+        };
         let decode_order = if decode_probe.prefer_hardware { [true, false] } else { [false, true] };
         for use_gpu in decode_order {
             ctr.store(0, Ordering::Relaxed);
@@ -1982,7 +2014,12 @@ async fn perform_standardized_analysis(
                                                 &ana_sys_c,
                                             );
                                         }
-                                        (analyze_preprocessed(i, &raw, bs, gpu), raw)
+                                        let result = analyze_preprocessed(i, &raw, bs, gpu);
+                                        // PR-2.1: sembrar el caché del apilado.
+                                        if let Some(ctx) = ana_cache_ctx.as_deref() {
+                                            cache_decoded_raw_frame(&ctx.0, ctx.1, i, &raw);
+                                        }
+                                        (result, raw)
                                     },
                                 )
                                 .collect()
@@ -2029,6 +2066,10 @@ async fn perform_standardized_analysis(
                                 );
                             }
                             let result = analyze_fn(i, &raw, bs);
+                            // PR-2.1: sembrar el caché del apilado.
+                            if let Some(ctx) = ana_cache_ctx.as_deref() {
+                                cache_decoded_raw_frame(&ctx.0, ctx.1, i, &raw);
+                            }
                             // Send empty block back to the producer pool
                             let _ = tx_empty.send(raw);
                             result
@@ -2568,6 +2609,23 @@ fn write_cached_frame(p: &Path, frame: &[u16]) {
     }
 }
 
+/// PR-2.1 (decode único): escribe al caché por-frame un frame CRUDO del
+/// stream FFmpeg (gray16le o rgb48le) tal y como lo decodificó el ANÁLISIS,
+/// en el MISMO formato que usa el apilado (Vec<u16>, misma clave): el primer
+/// apilado del mismo vídeo se sirve del caché sin re-decodificar. Idempotente
+/// (si el archivo ya existe no se reescribe) y silencioso ante fallos de E/S.
+fn cache_decoded_raw_frame(dir: &Path, key: u64, idx: usize, raw: &[u8]) {
+    let p = decode_cache_frame_path(dir, key, idx);
+    if p.exists() {
+        return;
+    }
+    let mut v = Vec::with_capacity(raw.len() / 2);
+    for ch in raw.chunks_exact(2) {
+        v.push(u16::from_le_bytes([ch[0], ch[1]]));
+    }
+    write_cached_frame(&p, &v);
+}
+
 /// Poda LRU por mtime hasta quedar bajo `max_bytes`. Tambien recoge los
 /// archivos del formato por-lote antiguo (batch_*.bin.lz4) con el tiempo.
 fn prune_decode_cache_to_budget(dir: &Path, max_bytes: u64) {
@@ -2843,187 +2901,6 @@ fn stream_frames_ffmpeg_chunked(
     }
 }
 
-#[allow(dead_code)] // superseded by stream_frames_ffmpeg_chunked (kept for reference)
-fn load_frames_ffmpeg_buffered(
-    reader: &FfmpegReader,
-    path: &str,
-    app: &tauri::AppHandle,
-    indices: &[usize], // MUST BE SORTED
-    width: usize,
-    height: usize,
-    bpp: usize,
-    color_id: i32,
-    _ffmpeg_cmd: &str,
-    _fps: f64,
-    message_prefix: &str,
-    _codec_name: &str,
-) -> Result<std::collections::HashMap<usize, Vec<u16>>, String> {
-    let total_frames = indices.len();
-    println!(
-        "DEBUG: Starting Phase 9 FFmpeg Seamless Batch Extraction for {} frames...",
-        total_frames
-    );
-
-    // PHASE 3 & 4 HYBRID: O(1) Sequential NVMe Check & GPU Cache Feed
-    let cache_dir = std::env::temp_dir().join("astro_stacker_cache");
-    if !cache_dir.exists() {
-        let _ = std::fs::create_dir_all(&cache_dir);
-    }
-
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    let path_hash = hasher.finish();
-
-    let batch_hash = {
-        let mut bh = DefaultHasher::new();
-        indices.hash(&mut bh);
-        bh.finish()
-    };
-
-    let cache_file = cache_dir.join(format!("batch_{}_{}.bin.lz4", path_hash, batch_hash));
-
-    // --- 1. TRY HYBRID DISK CACHE FIRST (EXTREME SPEED) ---
-    if cache_file.exists() {
-        if let Ok(compressed_data) = std::fs::read(&cache_file) {
-            if let Ok(decompressed) = lz4_flex::decompress_size_prepended(&compressed_data) {
-                if let Ok(f_map) = bincode::deserialize::<std::collections::HashMap<usize, Vec<u16>>>(
-                    &decompressed,
-                ) {
-                    emit_progress(
-                        app,
-                        &format!("{}: Recuperado de NVMe", message_prefix),
-                        100.0,
-                        None,
-                    );
-                    return Ok(f_map); // Elite O(1) Zero-Decode Restored from NVMe
-                }
-            }
-        }
-    }
-
-    let t_start = std::time::Instant::now();
-
-    // --- 2. FRAME-ACCURATE SEQUENTIAL EXTRACTION (single pass, exact indices) ---
-    // The old path (get_frames_batch) used FAST INPUT SEEKING (-ss before -i)
-    // plus select by RELATIVE frame number, assuming the first decoded frame
-    // after each seek was exactly `first_idx`. With inter-frame codecs
-    // (H.264/HEVC in MOV/MP4) and fractional fps that assumption breaks: the
-    // stack received THE WRONG FRAMES, so the analysis shifts were applied to
-    // different images → smeared/dim stacks, corner artifacts. It also applied
-    // an `unsharp` deblock filter the analysis pipeline does NOT apply
-    // (asymmetric preprocessing). We now stream the video SEQUENTIALLY through
-    // the SAME FfmpegStreamIterator the analysis uses: exact frame indices,
-    // identical preprocessing, and ONE ffmpeg process per batch instead of one
-    // per 200 frames. SER-style correctness for compressed videos.
-    let mut final_map = std::collections::HashMap::with_capacity(total_frames);
-    let wanted: std::collections::HashSet<usize> = indices.iter().copied().collect();
-    let last_wanted = indices.iter().copied().max().unwrap_or(0);
-    let is_color_stream = ffmpeg_stream_is_color(color_id);
-    let stream_bpp = if is_color_stream { 6usize } else { 2usize };
-    let mut raw_buf = vec![0u8; width * height * stream_bpp];
-    // Cancelacion cooperativa: sin esto, cancelar durante la decodificacion de
-    // un lote grande obligaria a esperar minutos a que FFmpeg lo termine.
-    let cancel_flag = app.state::<AppState>().cancel_requested.clone();
-
-    for use_gpu in [true, false] {
-        final_map.clear();
-        let it = FfmpegStreamIterator::new(
-            path,
-            width,
-            height,
-            0,
-            0,
-            width,
-            height,
-            color_id,
-            &reader.ffmpeg_path,
-            None, // NO seeking: sequential from frame 0 → indices are exact
-            use_gpu,
-            &reader.codec_name,
-            reader.rotation,
-        );
-        let mut it = match it {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let mut frame_idx: usize = 0;
-        while it.read_frame_into(&mut raw_buf) {
-            if frame_idx % 32 == 0 && cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                return Ok(std::collections::HashMap::new()); // cancelado
-            }
-            if wanted.contains(&frame_idx) {
-                final_map.insert(frame_idx, raw_to_u16_buffer(&raw_buf, width, height, bpp));
-                let got = final_map.len();
-                if got % 50 == 0 || got == total_frames {
-                    let elapsed = t_start.elapsed().as_secs_f32().max(0.001);
-                    let fps = frame_idx as f32 / elapsed;
-                    emit_progress(
-                        app,
-                        &format!(
-                            "{} - {}/{} frames (escaneo {:.0} FPS)",
-                            message_prefix, got, total_frames, fps
-                        ),
-                        (got as f32 / total_frames as f32) * 100.0,
-                        None,
-                    );
-                }
-                if got == total_frames {
-                    break; // all collected: stop decoding early
-                }
-            }
-            if frame_idx >= last_wanted {
-                break;
-            }
-            frame_idx += 1;
-        }
-
-        if final_map.len() == total_frames {
-            break; // complete set with this decoder mode
-        }
-        // GPU decode produced an incomplete stream → retry once on CPU.
-    }
-
-    // Last-resort fill for any frame still missing (corrupt tail, etc.).
-    if final_map.len() != total_frames {
-        for &idx in indices {
-            if !final_map.contains_key(&idx) {
-                let raw = reader.get_frame(idx, color_id);
-                if !raw.is_empty() {
-                    final_map.insert(idx, raw_to_u16_buffer(&raw, width, height, bpp));
-                }
-            }
-        }
-    }
-
-    // --- 3. SAVE HYBRID DISK CACHE (SYNCHRONOUS ON LOADING THREAD) ---
-    // Written sequentially on the loading thread to avoid concurrent memory-heavy clones.
-    // BOUNDED: long sessions with many batches must never saturate the disk.
-    const MAX_BATCH_CACHE_BYTES: usize = 768 * 1024 * 1024; // skip giant batches
-    const MAX_CACHE_DIR_BYTES: u64 = 3 * 1024 * 1024 * 1024; // 3 GB total cap
-    if let Ok(serialized) = bincode::serialize(&final_map) {
-        if serialized.len() <= MAX_BATCH_CACHE_BYTES {
-            let compressed = lz4_flex::compress_prepend_size(&serialized);
-            let dir_size: u64 = std::fs::read_dir(&cache_dir)
-                .map(|rd| {
-                    rd.flatten()
-                        .filter_map(|e| e.metadata().ok())
-                        .map(|m| m.len())
-                        .sum()
-                })
-                .unwrap_or(0);
-            if dir_size + compressed.len() as u64 <= MAX_CACHE_DIR_BYTES {
-                let _ = std::fs::write(&cache_file, compressed);
-            }
-        }
-    }
-
-    emit_progress(app, &format!("{}: Completado", message_prefix), 100.0, None);
-
-    Ok(final_map)
-}
 
 #[tauri::command]
 async fn stack_video_liquid_warping(
@@ -9186,6 +9063,36 @@ mod zas_v3_tests {
     /// Cache de decode por-frame: roundtrip fiel, rechazo de archivos con
     /// tamano inesperado (otra resolucion / corrupto / prefijo LZ4 malicioso)
     /// y poda LRU que elimina lo mas viejo primero hasta el presupuesto.
+    #[test]
+    /// PR-2.1 (decode único): un frame CRUDO del stream FFmpeg escrito por el
+    /// ANÁLISIS (cache_decoded_raw_frame) debe leerse por la ruta del APILADO
+    /// (read_cached_frame) con los mismos valores u16, tanto mono (gray16le)
+    /// como color (rgb48le), y ser idempotente si el archivo ya existe.
+    #[test]
+    fn test_analysis_seeded_cache_matches_stack_reader() {
+        let dir = std::env::temp_dir().join(format!("zas_seed_cache_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let key = 0xABCD_EF01_2345_6789u64;
+        // Color rgb48le 4x2: 24 muestras u16 little-endian.
+        let vals: Vec<u16> = (0..24).map(|i| (i * 2749 + 13) as u16).collect();
+        let mut raw = Vec::with_capacity(vals.len() * 2);
+        for &v in &vals {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        cache_decoded_raw_frame(&dir, key, 7, &raw);
+        let read = read_cached_frame(&decode_cache_frame_path(&dir, key, 7), vals.len())
+            .expect("frame sembrado por el análisis legible por el apilado");
+        assert_eq!(read, vals);
+        // Idempotencia: reescritura con contenido distinto NO debe pisar.
+        let raw2 = vec![0u8; raw.len()];
+        cache_decoded_raw_frame(&dir, key, 7, &raw2);
+        let read2 = read_cached_frame(&decode_cache_frame_path(&dir, key, 7), vals.len()).unwrap();
+        assert_eq!(read2, vals, "el archivo existente no debe reescribirse");
+        // Longitud inesperada → None (validación del lector intacta).
+        assert!(read_cached_frame(&decode_cache_frame_path(&dir, key, 7), vals.len() + 1).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_decode_frame_cache_roundtrip_and_prune() {
         let dir = std::env::temp_dir().join(format!("zas_dcache_test_{}", std::process::id()));
