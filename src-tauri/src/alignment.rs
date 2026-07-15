@@ -1038,56 +1038,49 @@ fn subpixel_refine_sad(
     let idx_i = idx as i32;
     let idy_i = idy as i32;
 
-    // ELITE 5x5 SUB-PIXEL GRID (V3 PRECISION)
-    // Evaluations at [-2, -1, 0, 1, 2] around the discrete minimum.
-    // This allows for a much more robust quadratic fit that filters out seeing-induced 'jitter'
-    // in the SAD surface, resulting in much smoother planetary limb transitions.
-
     // ANTI PIXEL-LOCKING: SAD is an L1 cost — near the true minimum its
     // surface is V-shaped (∝|d|), NOT parabolic. Fitting a parabola to a V
     // systematically shrinks the sub-pixel offset toward integer positions
     // ("pixel locking"), adding structured jitter that convolves the stack
     // with a blur kernel. The correct estimator for a V-shaped cost is the
-    // EQUIANGULAR (two-line intersection) fit — see fit_1d below.
-    let mut grid = [[0.0f64; 5]; 5];
-    for dy in -2..=2 {
-        for dx in -2..=2 {
-            if dx == 0 && dy == 0 {
-                grid[(dy + 2) as usize][(dx + 2) as usize] = best_sad as f64;
-                continue;
-            }
-            let s = compute_sad_at(
-                ref_edges,
-                tgt_edges,
-                w,
-                ax,
-                ay,
-                fx_est,
-                fy_est,
-                box_size,
-                idx_i + dx,
-                idy_i + dy,
-            );
-            if s > 1e18 as u64 {
-                return (0.0, 0.0);
-            } // Out of bounds
-            grid[(dy + 2) as usize][(dx + 2) as usize] = s as f64;
+    // EQUIANGULAR (two-line intersection) fit — see fit_axis below.
+    //
+    // PR-1.5: el fit equiangular solo consume S₋₁/S₀/S₊₁ por eje. La rejilla
+    // 5×5 anterior evaluaba 24 SADs de caja completa y descartaba 20 — y si
+    // CUALQUIER muestra (incluidas las ±2 y las esquinas, que nadie leía)
+    // caía fuera de rango, anulaba TODO el subpíxel del AP: pixel-locking
+    // estructural justo en los APs del limbo y del borde del ROI. Ahora se
+    // evalúan solo las 4 muestras útiles y cada eje degrada a 0.0 por
+    // separado únicamente si SU muestra ±1 no es evaluable.
+    let sample = |dx: i32, dy: i32| -> Option<f64> {
+        let s = compute_sad_at(
+            ref_edges,
+            tgt_edges,
+            w,
+            ax,
+            ay,
+            fx_est,
+            fy_est,
+            box_size,
+            idx_i + dx,
+            idy_i + dy,
+        );
+        if s > 1e18 as u64 {
+            None // Out of bounds
+        } else {
+            Some(s as f64)
         }
-    }
-
-    // Weighted Least Squares Quadratic Fit: f(x) = ax^2 + bx + c
-    // We fit X and Y independently but use the 5-point kernel for stability.
-    // Weights for 5-point derivative: [-2, -1, 0, 1, 2]
+    };
+    let s_0 = best_sad as f64;
 
     // EQUIANGULAR FIT (V-model): the L1/SAD cost near its minimum behaves as
     // S(d) = S_min + a·|d − δ|. The two-line intersection recovers δ without
     // the pixel-locking bias of a parabola fit:
     //   δ = ½·(S₋₁ − S₊₁) / (max(S₋₁, S₊₁) − S₀)
-    let fit_1d = |vals: &[f64; 5]| -> f32 {
-        let s_m1 = vals[1];
-        let s_0 = vals[2];
-        let s_p1 = vals[3];
-
+    let fit_axis = |m1: Option<f64>, p1: Option<f64>| -> f32 {
+        let (Some(s_m1), Some(s_p1)) = (m1, p1) else {
+            return 0.0; // muestra fuera de rango: sin subpíxel en ESTE eje
+        };
         let steeper = if s_m1 > s_p1 { s_m1 - s_0 } else { s_p1 - s_0 };
         if steeper <= 1e-9 {
             return 0.0; // flat cost: no sub-pixel information
@@ -1096,11 +1089,10 @@ fn subpixel_refine_sad(
         (offset as f32).clamp(-0.95, 0.95)
     };
 
-    // Extract central row/col for fits
-    let row_center = [grid[2][0], grid[2][1], grid[2][2], grid[2][3], grid[2][4]];
-    let col_center = [grid[0][2], grid[1][2], grid[2][2], grid[3][2], grid[4][2]];
-
-    (fit_1d(&row_center), fit_1d(&col_center))
+    (
+        fit_axis(sample(-1, 0), sample(1, 0)),
+        fit_axis(sample(0, -1), sample(0, 1)),
+    )
 }
 
 /// REFINAMIENTO SUB-PIXEL LUCAS-KANADE (Gauss-Newton, inverse compositional).

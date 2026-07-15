@@ -2088,7 +2088,55 @@ impl AnalysisBufferSet {
 
 // NUEVO: Buffered version of enhance_and_score_surface
 // Returns reference to the enhanced buffer (which is inside lap_out) and the score.
+/// Estira el mapa Laplaciano a 0..60000 para que el SAD compare mapas con
+/// el mismo rango entre frames. OJO: destruye la magnitud absoluta — toda
+/// métrica de NITIDEZ debe calcularse ANTES de esta llamada (el baseline F0
+/// demostró que puntuar sobre el mapa normalizado invierte el ranking:
+/// Spearman −1.0 contra la verdad conocida).
+fn normalize_lap_for_sad(lap_out: &mut [u16]) {
+    let mut min_val = 65535u16;
+    let mut max_val = 0u16;
+    for &v in lap_out.iter() {
+        if v < min_val {
+            min_val = v;
+        }
+        if v > max_val {
+            max_val = v;
+        }
+    }
+    if max_val > min_val {
+        let range = (max_val - min_val) as f32;
+        let scale = 60000.0 / range;
+        for v in lap_out.iter_mut() {
+            if *v > 0 {
+                let f = (*v as f32 - min_val as f32) * scale;
+                *v = f as u16;
+            }
+        }
+    }
+}
+
+/// Compatibilidad: blur + Laplaciano + score de superficie legado, dejando
+/// lap_out NORMALIZADO para SAD (comportamiento histórico). Los llamadores
+/// que necesiten magnitudes reales usan `enhance_and_lap_raw` + score v2 +
+/// `normalize_lap_for_sad` por separado.
 fn enhance_and_score_surface_buffered(
+    input: &[u16],
+    width: usize,
+    height: usize,
+    blur_temp: &mut Vec<u16>,
+    blur_out: &mut Vec<u16>,
+    lap_out: &mut Vec<u16>,
+) -> u64 {
+    let score = enhance_and_lap_raw(input, width, height, blur_temp, blur_out, lap_out);
+    normalize_lap_for_sad(lap_out);
+    score
+}
+
+/// Blur gaussiano entero + Laplaciano 8-vecinos con lap_out CRUDO (sin
+/// normalizar). Devuelve el score de superficie legado (Σ lap² con gate
+/// fijo >100) que hoy solo se usa como fallback/diagnóstico.
+fn enhance_and_lap_raw(
     input: &[u16],
     width: usize,
     height: usize,
@@ -2165,30 +2213,6 @@ fn enhance_and_score_surface_buffered(
             }
 
             out_inner[i] = lap as u16;
-        }
-    }
-
-    // 3. Normalization (Needed for SAD Alignment consistency)
-    let mut min_val = 65535;
-    let mut max_val = 0;
-
-    for &v in lap_out.iter() {
-        if v < min_val {
-            min_val = v;
-        }
-        if v > max_val {
-            max_val = v;
-        }
-    }
-
-    if max_val > min_val {
-        let range = (max_val - min_val) as f32;
-        let scale = 60000.0 / range;
-        for v in lap_out.iter_mut() {
-            if *v > 0 {
-                let f = (*v as f32 - min_val as f32) * scale;
-                *v = f as u16;
-            }
         }
     }
 
@@ -3878,7 +3902,7 @@ async fn save_final_image(
     deringing_radius: f32,
     deringing_dark: f32,
     deringing_light: f32,
-    _deringing_mask: bool,
+    deringing_mask: bool,
     crisp: f32,
     deconv_iter: usize,
     deconv_sigma: f32,
@@ -3942,7 +3966,10 @@ async fn save_final_image(
         deringing_radius,
         deringing_dark,
         deringing_light,
-        false, // deringing_mask (Force OFF for export)
+        // PR-1.7 (WYSIWYG): el export respeta el flag del usuario. Antes se
+        // forzaba a false y lo guardado NO coincidía con el preview del
+        // editor cuando la máscara de deringing estaba activa.
+        deringing_mask,
         crisp,
         deconv_iter,
         deconv_sigma,

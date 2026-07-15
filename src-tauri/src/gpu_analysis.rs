@@ -559,15 +559,10 @@ fn finish_analysis_output(
     });
     let half: Vec<u16> = half_raw.iter().map(|&v| v as u16).collect();
     let blurred: Vec<u16> = blur_raw.iter().map(|&v| v as u16).collect();
-    let mut laplacian: Vec<u16> = lap_raw.iter().map(|&v| v as u16).collect();
-    let min = laplacian.iter().copied().min().unwrap_or(0);
-    let max = laplacian.iter().copied().max().unwrap_or(0);
-    if max > min {
-        let scale = 60000.0 / (max - min) as f32;
-        for v in &mut laplacian {
-            if *v > 0 { *v = ((*v as f32 - min as f32) * scale) as u16; }
-        }
-    }
+    // El Laplaciano se devuelve CRUDO: el consumidor puntúa nitidez v2 sobre
+    // magnitudes reales y solo después llama a normalize_lap_for_sad (la
+    // normalización aquí invertía el ranking del scorer — baseline F0).
+    let laplacian: Vec<u16> = lap_raw.iter().map(|&v| v as u16).collect();
     AnalysisGpuOutput { half, blurred, laplacian, score, geometric_center, grid_scores }
 }
 
@@ -1368,7 +1363,9 @@ pub fn ensure_parity() -> bool {
     let mut temp = vec![0u16; hw * hh];
     let mut blur = vec![0u16; hw * hh];
     let mut lap = vec![0u16; hw * hh];
-    let score = crate::enhance_and_score_surface_buffered(&half, hw, hh, &mut temp, &mut blur, &mut lap);
+    // Referencia CPU en CRUDO: el shader no normaliza y finish_analysis_output
+    // ya no normaliza tampoco (el scorer v2 necesita magnitudes reales).
+    let score = crate::enhance_and_lap_raw(&half, hw, hh, &mut temp, &mut blur, &mut lap);
     let cpu_center = crate::compute_robust_geometric_center(&mono, w, h, 0, 0);
     let cpu_surface_grid = crate::calculate_grid_quality(&blur, hw, hh, 40, true);
     let cpu_planet_grid = crate::calculate_grid_quality(&half, hw, hh, 40, false);

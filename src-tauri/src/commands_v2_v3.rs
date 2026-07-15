@@ -36,11 +36,13 @@ fn zenith_analysis_cache_suffix(
     has_anchor: bool,
 ) -> String {
     let flow = if warping_analysis { "warp" } else { "global" };
-    // "_a6" = analysis v6: fingerprint obligatorio de origen/algoritmo. Impide
-    // reutilizar desplazamientos si un archivo se sobrescribe con el mismo
-    // nombre. ("_a5" añadió CoG pre-centering para movimiento amplio.)
+    // "_a7" = analysis v7: scorer v2 (Laplaciano CRUDO multi-escala,
+    // normalizado por área/brillo) + calidad local por caja de AP. Los
+    // scores v6 no son comparables (el scorer v1 puntuaba el mapa
+    // autonormalizado e invertía el ranking planetario). ("_a6" añadió el
+    // fingerprint obligatorio de origen/algoritmo; "_a5", CoG pre-centering.)
     let mut suffix = format!(
-        "{}_zenith_ultimate_{}_a6",
+        "{}_zenith_ultimate_{}_a7",
         zenith_target_key(target_type, is_surface),
         flow
     );
@@ -356,46 +358,214 @@ fn estimate_stack_chroma_noise(rgb: &[u16], w: usize, h: usize) -> f32 {
     mad * 1.4826 / 1.2247
 }
 
-/// **Dual-Frequency Planet Scorer (V3 Elite)**
-/// Focuses on both microscopic detail (High-pass) and structural contrast (Mid-pass).
-/// Robust to noise because it only counts signal that persists across both bands.
-fn score_planetary_frequency(
-    mono: &[u16],
-    w: usize,
-    h: usize,
-    _scratch1: &mut [u16], 
-    _scratch2: &mut [u16], 
-    laplacian: &[u16],    
-) -> u64 {
-    let mut total_score = 0u64;
-    let mut valid_pixels = 0u64;
-
-    // ELITE PLANET SCORER V3: Local Contrast Analysis
-    // We use the 5x5 Laplacian but only count signal that is 
-    // significantly above the local noise floor.
-    let max_v = mono.iter().cloned().max().unwrap_or(1) as f32;
-    let noise_floor = (max_v * 0.02).max(128.0);
-
-    for i in 0..(w * h) {
-        let val = mono[i] as f32;
-        if val < noise_floor { continue; } // Skip background
-
-        let lap = laplacian[i] as f32;
-        
-        // Multi-scale weight: favors fine detail over coarse edges
-        if lap > 350.0 {
-            // Laplacian^2 * Contrast. High contrast edges get higher scores.
-            let pixel_score = (lap * lap * (val / max_v)) / 65535.0;
-            total_score += pixel_score as u64;
-            valid_pixels += 1;
+/// Energía Laplaciana normalizada de UN nivel de escala: Σ lap² sobre los
+/// píxeles con señal (brillo > suelo robusto) y lap por encima del gate de
+/// ruido, dividida por el número de píxeles válidos y por el brillo medio
+/// al cuadrado (la ganancia de transparencia escala lap linealmente, lap²
+/// cuadráticamente — dividir por (brillo/8192)² desacopla la selección de
+/// las nubes finas/extinción). El gate se deriva del propio frame (mediana
+/// de |lap|, dominada por fondo/ruido), no de constantes fijas.
+fn lap_energy_normalized(bright: &[u16], lap: &[u16], n_px: usize) -> f64 {
+    if n_px == 0 || bright.len() < n_px || lap.len() < n_px {
+        return 0.0;
+    }
+    // Suelo de brillo robusto: 2 % del p99 (NO del máximo: un solo píxel
+    // caliente no debe definir el suelo).
+    let mut bhist = [0u32; 256];
+    for &v in &bright[..n_px] {
+        bhist[(v >> 8) as usize] += 1;
+    }
+    let target = n_px as u64 * 99 / 100;
+    let mut acc = 0u64;
+    let mut p99_bin = 255usize;
+    for (b, &c) in bhist.iter().enumerate() {
+        acc += c as u64;
+        if acc >= target {
+            p99_bin = b;
+            break;
         }
     }
+    let p99 = ((p99_bin as u32 + 1) << 8) as f64;
+    let floor = (p99 * 0.02).max(128.0);
+    // Gate de lap adaptativo: mediana de |lap| (≈ ruido: la mayoría del
+    // frame es fondo o zonas planas) escalada a sigma y multiplicada.
+    let mut lhist = [0u32; 4096];
+    for &v in &lap[..n_px] {
+        lhist[(v >> 4) as usize] += 1;
+    }
+    let half_px = n_px as u64 / 2;
+    let mut lacc = 0u64;
+    let mut med_bin = 0usize;
+    for (b, &c) in lhist.iter().enumerate() {
+        lacc += c as u64;
+        if lacc >= half_px {
+            med_bin = b;
+            break;
+        }
+    }
+    let sigma_lap = (med_bin as f64 + 0.5) * 16.0 * 1.4826;
+    let gate = (6.0 * sigma_lap).max(48.0);
+    // La energía se suma sobre los píxeles gated (quita la contribución del
+    // ruido), pero se divide por el ÁREA CON SEÑAL (píxeles sobre el suelo
+    // de brillo), que es estable entre frames. Dividir por el número de
+    // píxeles gated invierte el ranking: en un frame nítido pasan el gate
+    // muchos píxeles de detalle débil (diluyen la media), en uno borroso
+    // solo sobreviven los bordes más fuertes (media alta).
+    let (mut energy, mut n_signal, mut bsum) = (0.0f64, 0u64, 0.0f64);
+    for i in 0..n_px {
+        let b = bright[i] as f64;
+        if b < floor {
+            continue;
+        }
+        n_signal += 1;
+        bsum += b;
+        let l = lap[i] as f64;
+        if l > gate {
+            energy += l * l;
+        }
+    }
+    if n_signal < 20 {
+        return 0.0;
+    }
+    let mean_b = (bsum / n_signal as f64).max(1.0);
+    (energy / n_signal as f64) / (mean_b / 8192.0).powi(2)
+}
 
-    if valid_pixels > 20 {
-        // Boost factor for high-signal disks
-        let fill_factor = valid_pixels as f32 / (w * h) as f32;
-        let final_score = (total_score / valid_pixels) as f32 * (1.0 + fill_factor.sqrt());
-        final_score as u64
+/// **Scorer de calidad v2 (PR-1.1)** — métrica ÚNICA para planeta y
+/// superficie, calculada sobre el Laplaciano CRUDO (el v1 puntuaba sobre el
+/// mapa autonormalizado a 0..60000 y el baseline F0 midió Spearman = −1.0:
+/// ordenaba los frames al revés). Multi-escala: energía a media resolución
+/// (detalle fino, lo primero que mata el seeing) + energía a cuarto de
+/// resolución (estructura), combinadas 65/35. Determinista y sin unsafe.
+fn score_frame_quality_v2(
+    blurred: &[u16],
+    lap_raw: &[u16],
+    w: usize,
+    h: usize,
+    scratch_quarter: &mut Vec<u16>,
+) -> u64 {
+    let n_px = w * h;
+    let fine = lap_energy_normalized(blurred, lap_raw, n_px);
+    // Nivel grueso: downscale 2× del blur y Laplaciano 8-vecinos al vuelo
+    // (dos pasadas baratas a 1/4 de píxeles; sin buffer de lap adicional).
+    let mut coarse = 0.0f64;
+    if w >= 32 && h >= 32 {
+        let (qw, qh) = crate::alignment::downscale_2x_into(blurred, w, h, scratch_quarter);
+        let q = &scratch_quarter[..qw * qh];
+        let lap_at = |x: usize, y: usize| -> u16 {
+            let c = q[y * qw + x] as i32;
+            let n_sum = q[y * qw + x - 1] as i32
+                + q[y * qw + x + 1] as i32
+                + q[(y - 1) * qw + x - 1] as i32
+                + q[(y - 1) * qw + x] as i32
+                + q[(y - 1) * qw + x + 1] as i32
+                + q[(y + 1) * qw + x - 1] as i32
+                + q[(y + 1) * qw + x] as i32
+                + q[(y + 1) * qw + x + 1] as i32;
+            (c * 8 - n_sum).unsigned_abs().min(65535) as u16
+        };
+        // Mismo contrato que lap_energy_normalized pero generando el lap al
+        // vuelo: primero el gate (mediana) y el suelo, luego la energía.
+        let inner_px = (qw - 2) * (qh - 2);
+        if inner_px > 400 {
+            let mut bhist = [0u32; 256];
+            let mut lhist = [0u32; 4096];
+            for y in 1..qh - 1 {
+                for x in 1..qw - 1 {
+                    bhist[(q[y * qw + x] >> 8) as usize] += 1;
+                    lhist[(lap_at(x, y) >> 4) as usize] += 1;
+                }
+            }
+            let target = inner_px as u64 * 99 / 100;
+            let mut acc = 0u64;
+            let mut p99_bin = 255usize;
+            for (b, &c) in bhist.iter().enumerate() {
+                acc += c as u64;
+                if acc >= target {
+                    p99_bin = b;
+                    break;
+                }
+            }
+            let floor = (((p99_bin as u32 + 1) << 8) as f64 * 0.02).max(128.0);
+            let half_px = inner_px as u64 / 2;
+            let mut lacc = 0u64;
+            let mut med_bin = 0usize;
+            for (b, &c) in lhist.iter().enumerate() {
+                lacc += c as u64;
+                if lacc >= half_px {
+                    med_bin = b;
+                    break;
+                }
+            }
+            let gate = (6.0 * (med_bin as f64 + 0.5) * 16.0 * 1.4826).max(48.0);
+            // Mismo contrato que lap_energy_normalized: energía gated,
+            // denominador = área con señal (no los píxeles gated).
+            let (mut energy, mut n_signal, mut bsum) = (0.0f64, 0u64, 0.0f64);
+            for y in 1..qh - 1 {
+                for x in 1..qw - 1 {
+                    let b = q[y * qw + x] as f64;
+                    if b < floor {
+                        continue;
+                    }
+                    n_signal += 1;
+                    bsum += b;
+                    let l = lap_at(x, y) as f64;
+                    if l > gate {
+                        energy += l * l;
+                    }
+                }
+            }
+            if n_signal >= 20 {
+                let mean_b = (bsum / n_signal as f64).max(1.0);
+                coarse = (energy / n_signal as f64) / (mean_b / 8192.0).powi(2);
+            }
+        }
+    }
+    let score = 0.65 * fine + 0.35 * coarse;
+    score.clamp(0.0, 1.0e18) as u64
+}
+
+/// Calidad LOCAL de un AP: media ponderada por área de las celdas de la
+/// rejilla 40×40 que cubre la CAJA del AP. El v1 indexaba una única celda
+/// por el centro del AP: en sensores grandes cada celda cubre ~100×70 px y
+/// un AP podía puntuarse por una celda que apenas tocaba (auditoría F0).
+fn ap_grid_quality(
+    grid_scores: &[u64],
+    w_in: f32,
+    h_in: f32,
+    ap: &crate::smart_grid::ApPoint,
+) -> u64 {
+    if grid_scores.len() != 1600 || w_in <= 0.0 || h_in <= 0.0 {
+        return 0;
+    }
+    let cell_w = w_in / 40.0;
+    let cell_h = h_in / 40.0;
+    let half = ap.size as f32 * 0.5;
+    let x0 = (ap.x - half).clamp(0.0, w_in);
+    let x1 = (ap.x + half).clamp(0.0, w_in);
+    let y0 = (ap.y - half).clamp(0.0, h_in);
+    let y1 = (ap.y + half).clamp(0.0, h_in);
+    let gx0 = ((x0 / cell_w).floor() as usize).min(39);
+    let gx1 = ((x1 / cell_w).ceil() as usize).clamp(gx0 + 1, 40);
+    let gy0 = ((y0 / cell_h).floor() as usize).min(39);
+    let gy1 = ((y1 / cell_h).ceil() as usize).clamp(gy0 + 1, 40);
+    let mut sum = 0.0f64;
+    let mut wsum = 0.0f64;
+    for gy in gy0..gy1 {
+        let cy0 = gy as f32 * cell_h;
+        let oy = (y1.min(cy0 + cell_h) - y0.max(cy0)).max(0.0);
+        for gx in gx0..gx1 {
+            let cx0 = gx as f32 * cell_w;
+            let ox = (x1.min(cx0 + cell_w) - x0.max(cx0)).max(0.0);
+            let area = (ox * oy) as f64;
+            if area > 0.0 {
+                sum += grid_scores[gy * 40 + gx] as f64 * area;
+                wsum += area;
+            }
+        }
+    }
+    if wsum > 0.0 {
+        (sum / wsum) as u64
     } else {
         0
     }
@@ -503,13 +673,14 @@ fn process_analysis_frame(
     let gpu_frame_active = gpu_preprocessed.is_some();
     let mut gpu_center = None;
     let mut gpu_grid_scores = None;
-    let (hw, hh, mut score_val) = if let Some(gpu) = gpu_preprocessed {
+    let (hw, hh) = if let Some(gpu) = gpu_preprocessed {
         gpu_center = gpu.geometric_center;
         gpu_grid_scores = gpu.grid_scores;
         buffers.half_u16 = gpu.half;
         buffers.blur_out = gpu.blurred;
+        // lap CRUDO: finish_analysis_output ya no normaliza (scorer v2).
         buffers.lap_out = gpu.laplacian;
-        (roi_img_w / 2, roi_img_h / 2, gpu.score)
+        (roi_img_w / 2, roi_img_h / 2)
     } else {
         let (hw, hh) = crate::alignment::downscale_2x_into(
             &buffers.raw_u16,
@@ -517,7 +688,7 @@ fn process_analysis_frame(
             roi_img_h,
             &mut buffers.half_u16,
         );
-        let score = enhance_and_score_surface_buffered(
+        let _legacy_surface_score = enhance_and_lap_raw(
             &buffers.half_u16,
             hw,
             hh,
@@ -525,20 +696,23 @@ fn process_analysis_frame(
             &mut buffers.blur_out,
             &mut buffers.lap_out,
         );
-        (hw, hh, score)
+        (hw, hh)
     };
 
-    // DEDICATED PLANET SCORER: Focus only on the disk (true small planets only).
-    if !texture_align {
-        score_val = score_planetary_frequency(
-            &buffers.half_u16,
-            hw,
-            hh,
-            &mut buffers.blur_temp,
-            &mut buffers.blur_out,
-            &buffers.lap_out,
-        );
-    }
+    // SCORER v2 (PR-1.1): métrica única planeta/superficie sobre el
+    // Laplaciano CRUDO multi-escala, ANTES de normalizar el mapa para SAD.
+    // El v1 puntuaba el mapa ya autonormalizado y ordenaba los frames AL
+    // REVÉS (baseline F0: Spearman −1.0 contra verdad conocida). Ambos
+    // caminos (CPU y GPU) puntúan aquí con la MISMA función sobre los
+    // mismos buffers: paridad por construcción.
+    let score_val = score_frame_quality_v2(
+        &buffers.blur_out,
+        &buffers.lap_out,
+        hw,
+        hh,
+        &mut buffers.quarter_u16,
+    );
+    normalize_lap_for_sad(&mut buffers.lap_out);
 
     let search_w = hw / 2;
     let search_h = hh / 2;
@@ -2978,9 +3152,9 @@ async fn stack_video_liquid_warping_impl(
     let pipeline_started = std::time::Instant::now();
     let is_surface = is_surface || is_surface_target(&target_type);
     let warping_analysis = zenith_should_warp(&target_type, is_surface, warping_analysis);
-    // Derive category profile for tuned parameters
-    let category = TargetCategory::from_str(&target_type);
-    let cat_profile = category.profile();
+    // (PR-1.1) El peso por frame ya es por rango dentro del set seleccionado
+    // (compute_frame_weight_from_rank) y no consume el perfil de categoría,
+    // que aquí solo alimentaba a la antigua rampa "sigmoidal".
     #[cfg(target_arch = "x86_64")]
     let use_avx2 = is_x86_feature_detected!("avx2");
     #[cfg(not(target_arch = "x86_64"))]
@@ -3127,14 +3301,14 @@ async fn stack_video_liquid_warping_impl(
             let min_keep = (num_to_stack / 6).clamp(4, 16).min(num_to_stack.max(1));
 
             for (ap_idx, ap) in custom_points.iter().enumerate() {
-                let gx = ((ap.x / w_in as f32) * 40.0).floor().clamp(0.0, 39.0) as usize;
-                let gy = ((ap.y / h_in as f32) * 40.0).floor().clamp(0.0, 39.0) as usize;
-                let grid_idx = gy * 40 + gx;
-
                 let ap_scores: Vec<f32> = all_stats
                     .iter()
                     .map(|f| {
-                        (if let Some(gs) = &f.grid_scores { gs[grid_idx] } else { f.score }) as f32
+                        (if let Some(gs) = &f.grid_scores {
+                            ap_grid_quality(gs, w_in as f32, h_in as f32, ap)
+                        } else {
+                            f.score
+                        }) as f32
                     })
                     .collect();
                 let ap_best = ap_scores.iter().cloned().fold(1.0f32, f32::max);
@@ -3173,12 +3347,12 @@ async fn stack_video_liquid_warping_impl(
             
             // Step 1: Preliminary vote with adaptive quality check
             for ap in &custom_points {
-                let gx = ((ap.x / w_in as f32) * 40.0).floor().clamp(0.0, 39.0) as usize;
-                let gy = ((ap.y / h_in as f32) * 40.0).floor().clamp(0.0, 39.0) as usize;
-                let grid_idx = gy * 40 + gx;
-                
                 let mut ap_stats: Vec<(usize, u64)> = all_stats.iter().map(|f| {
-                    let s = if let Some(gs) = &f.grid_scores { gs[grid_idx] } else { f.score };
+                    let s = if let Some(gs) = &f.grid_scores {
+                        ap_grid_quality(gs, w_in as f32, h_in as f32, ap)
+                    } else {
+                        f.score
+                    };
                     (f.idx, s)
                 }).collect();
                 ap_stats.sort_by(|a, b| b.1.cmp(&a.1));
@@ -3204,12 +3378,12 @@ async fn stack_video_liquid_warping_impl(
 
             // Step 2: Final Acceptance with Moon Detection
             for (ap_idx, ap) in custom_points.iter().enumerate() {
-                let gx = ((ap.x / w_in as f32) * 40.0).floor().clamp(0.0, 39.0) as usize;
-                let gy = ((ap.y / h_in as f32) * 40.0).floor().clamp(0.0, 39.0) as usize;
-                let grid_idx = gy * 40 + gx;
-                
                 let mut ap_stats: Vec<(usize, u64)> = all_stats.iter().map(|f| {
-                    let s = if let Some(gs) = &f.grid_scores { gs[grid_idx] } else { f.score };
+                    let s = if let Some(gs) = &f.grid_scores {
+                        ap_grid_quality(gs, w_in as f32, h_in as f32, ap)
+                    } else {
+                        f.score
+                    };
                     (f.idx, s)
                 }).collect();
                 ap_stats.sort_by(|a, b| b.1.cmp(&a.1));
@@ -3581,28 +3755,81 @@ async fn stack_video_liquid_warping_impl(
         // per-AP alignment then refined against that slightly soft reference.
         // Bilinear sub-pixel placement keeps the reference crisp (AS!4-style),
         // which sharpens the whole downstream chain for free.
-        let mut ref_acc = vec![0.0f32; w_in * h_in * 3];
-        // Per-PIXEL weights: dividing by the global frame count darkened every
-        // border pixel that fewer shifted frames covered.
-        let mut ref_cnt_px = vec![0.0f32; w_in * h_in];
-
-        for (px_rgb, (dx, dy)) in &ref_data {
-            if px_rgb.is_empty() {
-                continue; // cancelled placeholder
+        // PR-1.2: REFERENCIA ROBUSTA. La media pura dejaba pasar cualquier
+        // transitorio del top-N (satélite, avión, rayo cósmico, ráfaga de
+        // píxeles calientes) directo a la referencia que siembra TODA la
+        // alineación posterior. Cada píxel combina ahora las muestras
+        // bilineales de los frames de referencia con MEDIA SIGMA-CLIPPED
+        // centrada en la MEDIANA (tolerancia 3·1.4826·MAD): SNR ≈ media,
+        // transitorios fuera. ref_data ya retiene los frames completos en
+        // RAM, así que no hay coste de memoria adicional (scratch por fila).
+        fn robust_ref_combine(vals: &mut Vec<f32>) -> f32 {
+            let n = vals.len();
+            if n == 0 {
+                return 0.0;
             }
-            let (dx, dy) = (*dx, *dy);
-            ref_acc
-                .par_chunks_mut(w_in * 3)
-                .zip(ref_cnt_px.par_chunks_mut(w_in))
-                .enumerate()
-                .for_each(|(y, (acc_row, cnt_row))| {
-                    let syf = y as f32 - dy;
-                    if syf < 0.0 || syf >= (h_in - 1) as f32 {
-                        return;
-                    }
-                    let y0 = syf as usize;
-                    let fy = syf - y0 as f32;
-                    for x in 0..w_in {
+            if n < 5 {
+                return vals.iter().sum::<f32>() / n as f32;
+            }
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med = if n % 2 == 1 {
+                vals[n / 2]
+            } else {
+                0.5 * (vals[n / 2 - 1] + vals[n / 2])
+            };
+            let mut devs: Vec<f32> = vals.iter().map(|&v| (v - med).abs()).collect();
+            devs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mad = if n % 2 == 1 {
+                devs[n / 2]
+            } else {
+                0.5 * (devs[n / 2 - 1] + devs[n / 2])
+            };
+            let tol = (3.0 * 1.4826 * mad).max(med.abs() * 0.001 + 8.0);
+            let (mut sum, mut kept) = (0.0f32, 0u32);
+            for &v in vals.iter() {
+                if (v - med).abs() <= tol {
+                    sum += v;
+                    kept += 1;
+                }
+            }
+            if kept > 0 {
+                sum / kept as f32
+            } else {
+                med
+            }
+        }
+
+        let mut final_ref_clean = vec![0u16; w_in * h_in * 3];
+        let covered = std::sync::atomic::AtomicBool::new(false);
+        let n_ref_frames = ref_data.iter().filter(|(p, _)| !p.is_empty()).count();
+        final_ref_clean
+            .par_chunks_mut(w_in * 3)
+            .enumerate()
+            .for_each(|(y, out_row)| {
+                // Geometría por fila y por frame (syf solo depende de y).
+                let row_geo: Vec<Option<(usize, f32)>> = ref_data
+                    .iter()
+                    .map(|(px_rgb, (_dx, dy))| {
+                        if px_rgb.is_empty() {
+                            return None;
+                        }
+                        let syf = y as f32 - dy;
+                        if syf < 0.0 || syf >= (h_in - 1) as f32 {
+                            None
+                        } else {
+                            Some((syf as usize, syf - syf.floor()))
+                        }
+                    })
+                    .collect();
+                let mut vals_r: Vec<f32> = Vec::with_capacity(n_ref_frames);
+                let mut vals_g: Vec<f32> = Vec::with_capacity(n_ref_frames);
+                let mut vals_b: Vec<f32> = Vec::with_capacity(n_ref_frames);
+                for x in 0..w_in {
+                    vals_r.clear();
+                    vals_g.clear();
+                    vals_b.clear();
+                    for (f_idx, (px_rgb, (dx, _dy))) in ref_data.iter().enumerate() {
+                        let Some((y0, fy)) = row_geo[f_idx] else { continue };
                         let sxf = x as f32 - dx;
                         if sxf < 0.0 || sxf >= (w_in - 1) as f32 {
                             continue;
@@ -3615,28 +3842,38 @@ async fn stack_video_liquid_warping_impl(
                         let w11 = fx * fy;
                         let i00 = (y0 * w_in + x0) * 3;
                         let i01 = i00 + w_in * 3;
-                        for c in 0..3 {
-                            acc_row[x * 3 + c] += px_rgb[i00 + c] as f32 * w00
-                                + px_rgb[i00 + 3 + c] as f32 * w10
-                                + px_rgb[i01 + c] as f32 * w01
-                                + px_rgb[i01 + 3 + c] as f32 * w11;
-                        }
-                        cnt_row[x] += 1.0;
+                        vals_r.push(
+                            px_rgb[i00] as f32 * w00
+                                + px_rgb[i00 + 3] as f32 * w10
+                                + px_rgb[i01] as f32 * w01
+                                + px_rgb[i01 + 3] as f32 * w11,
+                        );
+                        vals_g.push(
+                            px_rgb[i00 + 1] as f32 * w00
+                                + px_rgb[i00 + 4] as f32 * w10
+                                + px_rgb[i01 + 1] as f32 * w01
+                                + px_rgb[i01 + 4] as f32 * w11,
+                        );
+                        vals_b.push(
+                            px_rgb[i00 + 2] as f32 * w00
+                                + px_rgb[i00 + 5] as f32 * w10
+                                + px_rgb[i01 + 2] as f32 * w01
+                                + px_rgb[i01 + 5] as f32 * w11,
+                        );
                     }
-                });
-        }
-
-        let mut final_ref_clean = vec![0u16; w_in * h_in * 3];
-        let mut any_ref_frame = false;
-        for i in 0..w_in * h_in {
-            let c = ref_cnt_px[i];
-            if c > 0.0 {
-                any_ref_frame = true;
-                final_ref_clean[i * 3] = (ref_acc[i * 3] / c + 0.5).min(65535.0) as u16;
-                final_ref_clean[i * 3 + 1] = (ref_acc[i * 3 + 1] / c + 0.5).min(65535.0) as u16;
-                final_ref_clean[i * 3 + 2] = (ref_acc[i * 3 + 2] / c + 0.5).min(65535.0) as u16;
-            }
-        }
+                    if vals_r.is_empty() {
+                        continue;
+                    }
+                    covered.store(true, std::sync::atomic::Ordering::Relaxed);
+                    out_row[x * 3] =
+                        (robust_ref_combine(&mut vals_r) + 0.5).clamp(0.0, 65535.0) as u16;
+                    out_row[x * 3 + 1] =
+                        (robust_ref_combine(&mut vals_g) + 0.5).clamp(0.0, 65535.0) as u16;
+                    out_row[x * 3 + 2] =
+                        (robust_ref_combine(&mut vals_b) + 0.5).clamp(0.0, 65535.0) as u16;
+                }
+            });
+        let any_ref_frame = covered.load(std::sync::atomic::Ordering::Relaxed);
         // Si TODOS los frames de referencia se descartaron (negros/cancelados),
         // el mejor frame individual sigue siendo una referencia válida — nunca
         // continuar con un máster completamente vacío.
@@ -4193,15 +4430,28 @@ async fn stack_video_liquid_warping_impl(
         Vec::new()
     };
  
-    // Calculate Global Min/Max for Stacking Weight scaling
-    let (global_max_score, global_min_score) = {
-        let max_s = active_frames_data.iter().map(|f| f.score).max().unwrap_or(1000) as f32;
-        let min_s = active_frames_data.iter().map(|f| f.score).min().unwrap_or(0) as f32;
-        (max_s, min_s)
-    };
-    let _global_score_range = (global_max_score - global_min_score).max(1.0);
     let mut sorted_all = active_frames_data.clone();
     sorted_all.sort_by(|a, b| b.score.cmp(&a.score));
+    // PR-1.1: peso de apilado por RANGO real dentro del set seleccionado —
+    // lo que el antiguo compute_frame_weight_sigmoidal prometía en su
+    // comentario pero implementaba como rampa min-max de scores: con scores
+    // casi iguales, dos frames equivalentes recibían 1.0 y 0.1 solo por
+    // ruido de medición. El rango es estable y replica el weighting de AS!4.
+    let rank_norm_by_idx: std::collections::HashMap<usize, f32> = {
+        let n = sorted_all.len();
+        sorted_all
+            .iter()
+            .enumerate()
+            .map(|(rank, f)| {
+                let rank_norm = if n > 1 {
+                    1.0 - rank as f32 / (n - 1) as f32
+                } else {
+                    1.0
+                };
+                (f.idx, rank_norm)
+            })
+            .collect()
+    };
     let _lucky_threshold_v3 = if !sorted_all.is_empty() {
         let limit_idx = (num_to_stack.saturating_sub(1)).min(sorted_all.len().saturating_sub(1));
         sorted_all[limit_idx].score as f32
@@ -4215,7 +4465,10 @@ async fn stack_video_liquid_warping_impl(
     let surface_ref_p90 = if is_surface_logic || large_disc {
         surface_luma_percentile_rgb(&master_clean_rgb, 90)
     } else {
-        0.0
+        // PR-1.4: los planetas también se normalizan per-frame, pero el
+        // percentil se mide SOLO en el disco (el p90 global de un planeta
+        // pequeño cae en el cielo negro).
+        planetary_disc_luma_percentile_rgb(&master_clean_rgb, 90)
     };
     
     // 6. ELITE V4 ACCUMULATION (MULTI-PASS CAPABLE)
@@ -4763,11 +5016,16 @@ async fn stack_video_liquid_warping_impl(
                         sc.mono_buf.copy_from_slice(u16_data);
                         if is_surface_logic || large_disc {
                             normalize_surface_frame_exposure_mono_inplace(&mut sc.mono_buf, surface_ref_p90);
+                        } else {
+                            // PR-1.4: normalización per-frame también en planetas.
+                            normalize_planetary_frame_exposure_mono_inplace(&mut sc.mono_buf, surface_ref_p90);
                         }
                     } else {
                         debayer_into_buffer(u16_data, w_in, h_in, color_id, &mut sc.rgb_buf);
                         if is_surface_logic || large_disc {
                             normalize_surface_frame_exposure_inplace(&mut sc.rgb_buf, surface_ref_p90, false);
+                        } else {
+                            normalize_planetary_frame_exposure_rgb_inplace(&mut sc.rgb_buf, surface_ref_p90);
                         }
                         for i in 0..w_in * h_in {
                             sc.mono_buf[i] = sc.rgb_buf[i * 3 + 1];
@@ -4795,8 +5053,9 @@ async fn stack_video_liquid_warping_impl(
                         }
                     }
 
-                    let frame_score = frame_data.score as f32;
-                    let q_weight_opt = compute_frame_weight_sigmoidal(frame_score, global_min_score, global_max_score, cat_profile.rejection_percentile, cat_profile.sigmoid_steepness);
+                    let q_weight_opt = Some(compute_frame_weight_from_rank(
+                        *rank_norm_by_idx.get(&frame_data.idx).unwrap_or(&1.0),
+                    ));
 
                     if let Some(q_weight_raw) = q_weight_opt {
                         let q_weight = if is_surface_logic || large_disc {
@@ -4836,9 +5095,11 @@ async fn stack_video_liquid_warping_impl(
                         // ±search_r AP window and stacks a displaced GHOST copy
                         // (doubled limb). A cheap 4×-downscaled re-match against the
                         // master confirms or corrects it before the AP pass.
-                        // Large lunar discs get it too: they align by texture (no
-                        // per-frame CoG), so they need the same safety net.
-                        if is_surface_logic || large_disc {
+                        // PR-1.5: TODOS los objetivos la reciben. Antes los planetas
+                        // pequeños quedaban excluidos y su CoG per-frame entraba SIN
+                        // red de seguridad: en objetivos tenues (Neptuno, tránsitos)
+                        // un salto de CoG por ruido/ráfaga apilaba una copia fantasma.
+                        {
                             let w_ds = w_in / 4;
                             let h_ds = h_in / 4;
                             let cx = w_ds / 2;
@@ -5288,15 +5549,42 @@ async fn stack_video_liquid_warping_impl(
     // very end — discarding the sub-LSB precision gained by stacking, i.e.
     // exactly the faint filaments and smooth gray transitions.
     let bd_gain_f: f32 = {
-        let mut max_v = 0.0f32;
+        // PR-1.4: la profundidad de bits de la fuente se decide por el
+        // PERCENTIL 99.99 del stack, no por el máximo crudo. Un ÚNICO píxel
+        // espurio (caliente residual, overshoot del warp) por encima del
+        // rango nativo bucketizaba la fuente un nivel arriba y aplicaba una
+        // ganancia 2-4× menor a TODA la imagen (stack final oscuro con bits
+        // desperdiciados). El p99.99 ignora hasta el 0.01 % de outliers y
+        // sigue siendo exacto para el rango real de la señal.
+        let mut hist = [0u32; 4096]; // bins de 16 ADU (rango 0..65535)
+        let mut n = 0u64;
         for &v in stacked_f32.iter() {
-            if v > max_v { max_v = v; }
+            if v > 0.0 {
+                hist[((v as u32) >> 4).min(4095) as usize] += 1;
+                n += 1;
+            }
         }
-        if max_v <= 0.5 { 1.0 }
-        else if max_v <= 255.5 { 256.0 }
-        else if max_v <= 1023.5 { 64.0 }
-        else if max_v <= 4095.5 { 16.0 }
-        else if max_v <= 16383.5 { 4.0 }
+        let mut p9999 = 0.0f32;
+        if n > 0 {
+            // Excluir el 0.01 % superior (mínimo 1 píxel).
+            let target = (n - (n / 10_000).max(1)).max(1);
+            let mut acc = 0u64;
+            for (b, &c) in hist.iter().enumerate() {
+                acc += c as u64;
+                if acc >= target {
+                    // Valor máximo REPRESENTABLE dentro del bin (b*16+15):
+                    // usar el borde superior del bin (b+1)*16 clasificaría
+                    // una fuente 8-bit exacta (máx 255 → "256") como 10-bit.
+                    p9999 = (b * 16 + 15) as f32;
+                    break;
+                }
+            }
+        }
+        if p9999 <= 0.5 { 1.0 }
+        else if p9999 <= 255.5 { 256.0 }
+        else if p9999 <= 1023.5 { 64.0 }
+        else if p9999 <= 4095.5 { 16.0 }
+        else if p9999 <= 16383.5 { 4.0 }
         else { 1.0 }
     };
     let mut final_u16 = vec![0u16; w_out * h_out * 3];
@@ -7399,31 +7687,14 @@ fn convolve_spatial(img: &[f32], w: usize, h: usize, kernel: &[f32], k_size: usi
 
 // [ApPoint moved to smart_grid.rs]
 
-/// Rank-based quality weight — replicates AutoStakkert's frame weighting.
-///
-/// Unlike score-normalized sigmoid (which fails when all scores are similar),
-/// this computes weight from the frame's RANK within the selected set.
-/// Best frame = weight 1.0, worst selected frame = weight MIN_W (never zero).
-/// This guarantees every selected frame contributes, preventing black stacks.
-///
-/// Parameters kept for API compat but `rejection_percentile`/`steepness` are
-/// no longer used here — rejection is handled by frame selection (num_to_stack).
-fn compute_frame_weight_sigmoidal(
-    frame_score: f32,
-    global_min: f32,
-    global_max: f32,
-    _rejection_percentile: f32,
-    _steepness: f32,
-) -> Option<f32> {
+/// Peso de apilado por RANGO dentro del set seleccionado (estilo AS!4):
+/// mejor frame → 1.0, peor seleccionado → MIN_W (nunca 0: todo frame
+/// seleccionado contribuye, lo que evita stacks negros). El rango — y no un
+/// min-max de scores — es estable cuando todos los scores son parecidos.
+/// `rank_norm` ∈ [0, 1]: 1.0 = mejor frame del set.
+fn compute_frame_weight_from_rank(rank_norm: f32) -> f32 {
     const MIN_W: f32 = 0.10; // Worst selected frame still contributes 10%
-
-    let range = (global_max - global_min).max(1.0);
-    let normalized = ((frame_score - global_min) / range).clamp(0.0, 1.0);
-
-    // Linear ramp: best frame → 1.0, worst → MIN_W.
-    // All selected frames are guaranteed to be in [global_min, global_max].
-    let w = MIN_W + (1.0 - MIN_W) * normalized;
-    Some(w.clamp(MIN_W, 1.0))
+    (MIN_W + (1.0 - MIN_W) * rank_norm.clamp(0.0, 1.0)).clamp(MIN_W, 1.0)
 }
 
 // ==========================================

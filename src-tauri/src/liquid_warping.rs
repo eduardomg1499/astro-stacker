@@ -1358,33 +1358,22 @@ pub fn accumulate_frame_global_rgb(
                 if sum_w.abs() > 0.00001 {
                     let tidx = row_off + x_out;
                     let inv_sum = 1.0 / sum_w;
-                    let range_r = max_r - min_r;
-                    let range_g = max_g - min_g;
-                    let range_b = max_b - min_b;
-                    let clamp_r = if range_r > 3000.0 {
-                        0.80
-                    } else if range_r > 1000.0 {
-                        0.88
-                    } else {
-                        0.95
-                    };
-                    let clamp_g = if range_g > 3000.0 {
-                        0.80
-                    } else if range_g > 1000.0 {
-                        0.88
-                    } else {
-                        0.95
-                    };
-                    let clamp_b = if range_b > 3000.0 {
-                        0.80
-                    } else if range_b > 1000.0 {
-                        0.88
-                    } else {
-                        0.95
-                    };
-                    let px_r = (sum_r * inv_sum).clamp(min_r * clamp_r, 65535.0);
-                    let px_g = (sum_g * inv_sum).clamp(min_g * clamp_g, 65535.0);
-                    let px_b = (sum_b * inv_sum).clamp(min_b * clamp_b, 65535.0);
+                    // PR-1.5: SYMMETRIC RANGE-BASED ANTI-RINGING CLAMP — misma
+                    // política que las rutas líquidas (ver accumulate_frame_liquid).
+                    // El clamp antiguo (min·factor, sin tope superior) dejaba
+                    // pasar el overshoot de los lóbulos negativos del Lanczos en
+                    // las altas luces (halo/ringing en el limbo brillante — esta
+                    // ruta es justo la de planeta pequeño/global) y aclaraba
+                    // sistemáticamente la microestructura oscura.
+                    let band_r = (max_r - min_r) * 0.18 + 32.0;
+                    let band_g = (max_g - min_g) * 0.18 + 32.0;
+                    let band_b = (max_b - min_b) * 0.18 + 32.0;
+                    let px_r = (sum_r * inv_sum)
+                        .clamp((min_r - band_r).max(0.0), (max_r + band_r).min(65535.0));
+                    let px_g = (sum_g * inv_sum)
+                        .clamp((min_g - band_g).max(0.0), (max_g + band_g).min(65535.0));
+                    let px_b = (sum_b * inv_sum)
+                        .clamp((min_b - band_b).max(0.0), (max_b + band_b).min(65535.0));
                     let eff_w = base_weight;
                     unsafe {
                         *acc_r.get_unchecked_mut(tidx) += px_r * eff_w;
@@ -1570,33 +1559,22 @@ pub fn accumulate_frame_rigid_lanczos(
                     let tidx = row_off + x_out;
                     let inv_sum = 1.0 / sum_w;
                     // ADAPTIVE ANTI-RINGING: preserve micro-contrast in high-contrast areas
-                    let range_r = max_r - min_r;
-                    let range_g = max_g - min_g;
-                    let range_b = max_b - min_b;
-                    let clamp_r = if range_r > 3000.0 {
-                        0.80
-                    } else if range_r > 1000.0 {
-                        0.88
-                    } else {
-                        0.95
-                    };
-                    let clamp_g = if range_g > 3000.0 {
-                        0.80
-                    } else if range_g > 1000.0 {
-                        0.88
-                    } else {
-                        0.95
-                    };
-                    let clamp_b = if range_b > 3000.0 {
-                        0.80
-                    } else if range_b > 1000.0 {
-                        0.88
-                    } else {
-                        0.95
-                    };
-                    let px_r = (sum_r * inv_sum).clamp(min_r * clamp_r, 65535.0);
-                    let px_g = (sum_g * inv_sum).clamp(min_g * clamp_g, 65535.0);
-                    let px_b = (sum_b * inv_sum).clamp(min_b * clamp_b, 65535.0);
+                    // PR-1.5: SYMMETRIC RANGE-BASED ANTI-RINGING CLAMP — misma
+                    // política que las rutas líquidas (ver accumulate_frame_liquid).
+                    // El clamp antiguo (min·factor, sin tope superior) dejaba
+                    // pasar el overshoot de los lóbulos negativos del Lanczos en
+                    // las altas luces (halo/ringing en el limbo brillante — esta
+                    // ruta es justo la de planeta pequeño/global) y aclaraba
+                    // sistemáticamente la microestructura oscura.
+                    let band_r = (max_r - min_r) * 0.18 + 32.0;
+                    let band_g = (max_g - min_g) * 0.18 + 32.0;
+                    let band_b = (max_b - min_b) * 0.18 + 32.0;
+                    let px_r = (sum_r * inv_sum)
+                        .clamp((min_r - band_r).max(0.0), (max_r + band_r).min(65535.0));
+                    let px_g = (sum_g * inv_sum)
+                        .clamp((min_g - band_g).max(0.0), (max_g + band_g).min(65535.0));
+                    let px_b = (sum_b * inv_sum)
+                        .clamp((min_b - band_b).max(0.0), (max_b + band_b).min(65535.0));
 
                     acc_r[tidx] += px_r * quality_weight;
                     acc_g[tidx] += px_g * quality_weight;

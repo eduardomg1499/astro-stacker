@@ -1353,6 +1353,92 @@ fn normalize_surface_frame_exposure_mono_inplace(data: &mut [u16], target_p90: f
     }
 }
 
+/// Percentil de luma SOLO sobre los píxeles del DISCO (por encima de un
+/// suelo del 2 % del p99.9 muestreado): en un planeta pequeño el p90 global
+/// cae en el cielo negro y no mide la exposición del objeto. Devuelve 0.0
+/// si no hay suficientes píxeles con señal (sin disco → sin normalizar).
+fn planetary_disc_luma_percentile_rgb(data: &[u16], percentile: usize) -> f32 {
+    if data.len() < 3 {
+        return 0.0;
+    }
+    let pixels = data.len() / 3;
+    let step = (pixels / 250_000).max(1);
+    let mut sample = Vec::with_capacity((pixels / step).max(1));
+    for i in (0..pixels).step_by(step) {
+        let off = i * 3;
+        let luma = 0.299 * data[off] as f32
+            + 0.587 * data[off + 1] as f32
+            + 0.114 * data[off + 2] as f32;
+        sample.push(luma);
+    }
+    planetary_disc_percentile_from_samples(sample, percentile)
+}
+
+/// Variante mono de `planetary_disc_luma_percentile_rgb`.
+fn planetary_disc_percentile_mono(data: &[u16], percentile: usize) -> f32 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let step = (data.len() / 250_000).max(1);
+    let sample: Vec<f32> = data.iter().step_by(step).map(|&v| v as f32).collect();
+    planetary_disc_percentile_from_samples(sample, percentile)
+}
+
+fn planetary_disc_percentile_from_samples(mut sample: Vec<f32>, percentile: usize) -> f32 {
+    if sample.is_empty() {
+        return 0.0;
+    }
+    sample.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p999 = sample[(sample.len() * 999 / 1000).min(sample.len() - 1)];
+    let floor = (p999 * 0.02).max(64.0);
+    // sample está ordenado: los píxeles de disco son el sufijo >= floor.
+    let first = sample.partition_point(|&v| v < floor);
+    let disc = &sample[first..];
+    if disc.len() < 64 {
+        return 0.0;
+    }
+    disc[(disc.len() * percentile / 100).min(disc.len() - 1)]
+}
+
+/// PR-1.4: normalización de exposición per-frame para PLANETAS. Igual que
+/// la de superficie pero midiendo el percentil solo en el disco. Sin esto,
+/// con transparencia variable (nubes finas, extinción) los frames más
+/// brillantes dominaban la media ponderada sesgando fotometría y contraste.
+fn normalize_planetary_frame_exposure_mono_inplace(data: &mut [u16], target_p90: f32) {
+    if target_p90 < 1.0 || data.is_empty() {
+        return;
+    }
+    let current_p90 = planetary_disc_percentile_mono(data, 90);
+    if current_p90 < 1.0 {
+        return;
+    }
+    let gain = (target_p90 / current_p90).clamp(0.70, 1.45);
+    if (gain - 1.0).abs() < 0.003 {
+        return;
+    }
+    for v in data.iter_mut() {
+        *v = (*v as f32 * gain + 0.5).clamp(0.0, 65535.0) as u16;
+    }
+}
+
+/// Variante RGB de `normalize_planetary_frame_exposure_mono_inplace`.
+fn normalize_planetary_frame_exposure_rgb_inplace(data: &mut [u16], target_p90: f32) {
+    if target_p90 < 1.0 || data.len() < 3 {
+        return;
+    }
+    let current_p90 = planetary_disc_luma_percentile_rgb(data, 90);
+    if current_p90 < 1.0 {
+        return;
+    }
+    let gain = (target_p90 / current_p90).clamp(0.78, 1.30);
+    if (gain - 1.0).abs() < 0.003 {
+        return;
+    }
+    for v in data.iter_mut() {
+        *v = (*v as f32 * gain + 0.5).clamp(0.0, 65535.0) as u16;
+    }
+}
+
 fn normalize_surface_frame_exposure_inplace(data: &mut [u16], target_p90: f32, is_mono: bool) {
     if target_p90 < 1.0 || data.len() < 3 {
         return;

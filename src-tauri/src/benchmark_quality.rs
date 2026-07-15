@@ -891,10 +891,11 @@ mod tests {
         );
     }
 
-    /// EVIDENCIA F0 (baseline del bug PR-1.1): mide el ranking del scorer
-    /// de PRODUCCIÓN contra la verdad conocida del simulador. No exige un
-    /// umbral alto todavía — deja constancia numérica del estado actual; el
-    /// gate Spearman ≥ 0.95 se activa en PR-1.1.
+    /// GATE PR-1.1 (antes: evidencia F0): el scorer v2 de PRODUCCIÓN debe
+    /// ordenar los frames como la verdad conocida del simulador. El scorer
+    /// v1 (autonormalizado) medía Spearman = −1.0 en este mismo escenario
+    /// (ranking invertido; baseline commiteado en
+    /// benchmarks/baselines/planetary-f0-scorer-baseline.json).
     ///
     /// Con ZAS_F0_BASELINE_OUT=<ruta.json> escribe el informe de baseline.
     #[test]
@@ -905,51 +906,51 @@ mod tests {
         let sigmas = [
             1.75, 0.25, 3.0, 0.0, 2.25, 1.0, 2.75, 0.5, 1.5, 3.25, 0.75, 2.0, 1.25, 2.5,
         ];
-        let mut planet_scores = Vec::new();
-        let mut surface_scores = Vec::new();
+        let mut v2_scores = Vec::new();
         for (i, &sigma) in sigmas.iter().enumerate() {
             let frame = make_frame_mono16(
                 &scene,
                 &FrameSpec { dx: 0.0, dy: 0.0, blur_sigma: sigma, noise_adu: 80.0, seed: 100 + i as u64 },
             );
-            // Secuencia EXACTA de producción (camino CPU, planeta pequeño):
-            // downscale 2x -> enhance_and_score (normaliza lap_out) ->
-            // score_planetary_frequency sobre ese lap_out.
+            // Secuencia EXACTA de producción (process_analysis_frame, camino
+            // CPU): downscale 2x -> enhance_and_lap_raw (lap CRUDO) ->
+            // score_frame_quality_v2 -> (normalize_lap_for_sad, irrelevante
+            // para el score).
             let mut half = Vec::new();
             let (hw, hh) = crate::alignment::downscale_2x_into(&frame, 256, 256, &mut half);
             let mut blur_temp = Vec::new();
             let mut blur_out = Vec::new();
             let mut lap_out = Vec::new();
-            let surface_score = crate::enhance_and_score_surface_buffered(
+            let _legacy = crate::enhance_and_lap_raw(
                 &half, hw, hh, &mut blur_temp, &mut blur_out, &mut lap_out,
             );
-            let mut s1: Vec<u16> = Vec::new();
-            let mut s2: Vec<u16> = Vec::new();
-            let planet_score =
-                crate::score_planetary_frequency(&half, hw, hh, &mut s1, &mut s2, &lap_out);
-            planet_scores.push(planet_score as f64);
-            surface_scores.push(surface_score as f64);
+            let mut quarter: Vec<u16> = Vec::new();
+            let score =
+                crate::score_frame_quality_v2(&blur_out, &lap_out, hw, hh, &mut quarter);
+            v2_scores.push(score as f64);
         }
         let truth: Vec<f64> = sigmas.iter().map(|&s| -s).collect();
-        let rho_planet = spearman(&planet_scores, &truth);
-        let rho_surface = spearman(&surface_scores, &truth);
+        let rho_v2 = spearman(&v2_scores, &truth);
         println!(
-            "F0 baseline scorer: spearman_planet={rho_planet:.3} spearman_surface={rho_surface:.3} \
-             (verdad: sigma menor = mejor; objetivo PR-1.1: >= 0.95)"
+            "PR-1.1 scorer v2: spearman={rho_v2:.3} (verdad: sigma menor = mejor; \
+             v1 medía -1.0 en este escenario)"
         );
         if let Ok(out) = std::env::var("ZAS_F0_BASELINE_OUT") {
             let report = serde_json::json!({
                 "metrics_version": QUALITY_METRICS_VERSION,
                 "scenario": "sintetico jupiter_like 256x256, 14 frames, sigmas 0.0..3.25, ruido 80 ADU",
-                "spearman_planet_scorer": rho_planet,
-                "spearman_surface_scorer": rho_surface,
-                "target_pr11": 0.95,
+                "spearman_scorer_v2": rho_v2,
+                "spearman_scorer_v1_baseline": -1.0,
+                "gate_pr11": 0.95,
             });
             std::fs::write(&out, serde_json::to_string_pretty(&report).unwrap())
                 .expect("escribir baseline");
             println!("baseline escrito en {out}");
         }
-        assert!(rho_planet.is_finite() && rho_surface.is_finite());
+        assert!(
+            rho_v2 >= 0.95,
+            "GATE PR-1.1: el scorer v2 debe correlacionar >= 0.95 con la verdad (medido {rho_v2:.3})"
+        );
     }
 
     /// Runner A/B con ficheros reales (ignorado en CI): compara un stack

@@ -6053,7 +6053,10 @@ if (ui.btnBatchRun) {
                         rBal: p.color.rb, bBal: p.color.bb,
                         rX: p.shift.rx, rY: p.shift.ry, bX: p.shift.bx, bY: p.shift.by,
 
-                        deringingMode: 0, // Always Off in batch — prevents white blob artifacts
+                        // PR-1.7 (WYSIWYG): el lote respeta el deringing afinado en la
+                        // referencia — forzarlo a 0 hacía que la salida del lote no
+                        // coincidiera con el preview con el que el usuario lo ajustó.
+                        deringingMode: p.dr.mode,
                         deringingRadius: p.dr.rad,
                         deringingDark: p.dr.dark,
                         deringingLight: p.dr.light,
