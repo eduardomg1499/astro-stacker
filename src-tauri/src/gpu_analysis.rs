@@ -17,6 +17,13 @@ struct Params {
 }
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read> src: array<u32>;
+// PR-2.3: src viaja EMPAQUETADO (2 muestras u16 por palabra u32). Antes la
+// CPU expandía cada frame a un Vec<u32> (~47 MB a 11.7 Mpx) solo para subirlo
+// con el doble de ancho de banda; ahora sube los bits tal cual y el shader
+// desempaqueta al leer.
+fn src_at(i: u32) -> u32 {
+    return (src[i >> 1u] >> ((i & 1u) * 16u)) & 0xFFFFu;
+}
 @group(0) @binding(2) var<storage, read_write> half: array<u32>;
 @group(0) @binding(3) var<storage, read_write> temp: array<u32>;
 @group(0) @binding(4) var<storage, read_write> blur: array<u32>;
@@ -32,7 +39,7 @@ fn downscale(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = gid.x * 2u;
     let y = gid.y * 2u;
     let i0 = y * P.w + x;
-    let sum = src[i0] + src[i0 + 1u] + src[i0 + P.w] + src[i0 + P.w + 1u];
+    let sum = src_at(i0) + src_at(i0 + 1u) + src_at(i0 + P.w) + src_at(i0 + P.w + 1u);
     half[gid.y * P.hw + gid.x] = sum >> 2u;
 }
 
@@ -79,7 +86,7 @@ fn cog_x(@builtin(global_invocation_id) gid: vec3<u32>) {
     let threshold = threshold_for(t);
     var sum = 0.0;
     for (var y = 0u; y < P.h; y = y + 1u) {
-        let v = f32(src[y * P.w + x]);
+        let v = f32(src_at(y * P.w + x));
         if (v > threshold) {
             let d = v - threshold;
             sum = sum + d * d * d;
@@ -96,7 +103,7 @@ fn cog_y(@builtin(global_invocation_id) gid: vec3<u32>) {
     let threshold = threshold_for(t);
     var sum = 0.0;
     for (var x = 0u; x < P.w; x = x + 1u) {
-        let v = f32(src[y * P.w + x]);
+        let v = f32(src_at(y * P.w + x));
         if (v > threshold) {
             let d = v - threshold;
             sum = sum + d * d * d;
@@ -314,7 +321,8 @@ struct Engine {
 fn engine_vram_bytes(w: usize, h: usize) -> u64 {
     let hw = w / 2;
     let hh = h / 2;
-    let full_bytes = (w * h * 4) as u64;
+    // src empaquetado: 2 muestras u16 por u32 (PR-2.3).
+    let full_bytes = (w * h).div_ceil(2) as u64 * 4;
     let half_bytes = (hw * hh * 4) as u64;
     let cog_x_bytes = (w * 3 * 4) as u64;
     let cog_y_bytes = (h * 3 * 4) as u64;
@@ -328,7 +336,8 @@ impl Engine {
         let hw = w / 2;
         let hh = h / 2;
         if hw < 8 || hh < 8 { return Err("ROI demasiado pequeña para análisis GPU".into()); }
-        let full_bytes = (w * h * 4) as u64;
+        // src empaquetado: 2 muestras u16 por u32 (PR-2.3).
+        let full_bytes = (w * h).div_ceil(2) as u64 * 4;
         let half_bytes = (hw * hh * 4) as u64;
         let cog_x_bytes = (w * 3 * 4) as u64;
         let cog_y_bytes = (h * 3 * 4) as u64;
@@ -1060,95 +1069,17 @@ pub fn process_with_options(
     want_grid: bool,
     want_cog: bool,
 ) -> Result<AnalysisGpuOutput, String> {
-    if mono.len() < w * h { return Err("Frame mono truncado".into()); }
-    let rt = crate::gpu_stack::gpu_runtime().ok_or("No hay runtime wgpu")?;
-    let mx = ENGINE.get_or_init(|| std::sync::Mutex::new(None));
-    let mut guard = mx.lock().map_err(|_| "Mutex GPU de análisis dañado")?;
-    let rebuild = guard.as_ref().is_none_or(|e| e.w != w || e.h != h);
-    if rebuild { *guard = Some(Engine::new(rt, w, h)?); }
-    let e = guard.as_ref().unwrap();
-    let src_u32: Vec<u32> = mono[..w * h].iter().map(|&v| v as u32).collect();
-    rt.queue.write_buffer(&e.src, 0, bytemuck::cast_slice(&src_u32));
-    let thresholds = if want_cog { cog_thresholds(mono, w, h) } else { [0.0; 3] };
-    let p = Params {
-        w: w as u32,
-        h: h as u32,
-        hw: (w / 2) as u32,
-        hh: (h / 2) as u32,
-        threshold0: thresholds[0],
-        threshold1: thresholds[1],
-        threshold2: thresholds[2],
-        fp0: 0.0,
-        grid_size: if want_grid { 40 } else { 0 },
-        analytics_flags: u32::from(surface_grid),
-        up0: 0,
-        up1: 0,
-    };
-    rt.queue.write_buffer(&e.params, 0, bytemuck::bytes_of(&p));
-    let pp = pipelines(rt);
-    let mut enc = rt.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("zas-analysis-encoder") });
-    // Los kernels sólo escriben el interior de blur/Laplaciano. Limpiar los
-    // bordes evita que un slot reutilizado conserve píxeles del frame anterior.
-    enc.clear_buffer(&e.temp, 0, None);
-    enc.clear_buffer(&e.blur, 0, None);
-    enc.clear_buffer(&e.lap, 0, None);
-    for pipeline in [&pp.downscale, &pp.blur_h, &pp.blur_v, &pp.lap] {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("zas-analysis-stage"), timestamp_writes: None });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &e.bind, &[]);
-        pass.dispatch_workgroups(((w / 2) as u32).div_ceil(16), ((h / 2) as u32).div_ceil(16), 1);
+    // PR-2.3: delega en el motor por LOTES (un submit + un staging + UN solo
+    // map_async). El antiguo cuerpo unitario hacía hasta 7 readbacks
+    // bloqueantes por frame (half/blur/lap/score/cog_x/cog_y/grid), cada uno
+    // con su propio staging buffer y submit — la latencia de sincronización
+    // dominaba sobre el cómputo. Mismos kernels y parámetros → bit-idéntico.
+    if mono.len() < w * h {
+        return Err("Frame mono truncado".into());
     }
-    {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("zas-analysis-score-stage"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&pp.score_rows);
-        pass.set_bind_group(0, &e.bind, &[]);
-        pass.dispatch_workgroups(((h / 2) as u32).div_ceil(64), 1, 1);
-    }
-    if want_cog {
-        for (pipeline, len) in [(&pp.cog_x, w), (&pp.cog_y, h)] {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("zas-analysis-cog-stage"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &e.bind, &[]);
-            pass.dispatch_workgroups((len as u32).div_ceil(64), 3, 1);
-        }
-    }
-    if want_grid {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("zas-analysis-grid-stage"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&pp.grid);
-        pass.set_bind_group(0, &e.bind, &[]);
-        pass.dispatch_workgroups((40u32 * 40).div_ceil(64), 1, 1);
-    }
-    rt.queue.submit(Some(enc.finish()));
-    let n = (w / 2) * (h / 2);
-    let half_raw = read_u32(rt, &e.half, n)?;
-    let blur_raw = read_u32(rt, &e.blur, n)?;
-    let lap_raw = read_u32(rt, &e.lap, n)?;
-    let score_raw = read_u32(rt, &e.score_rows, (h / 2) * 2)?;
-    let cog_x_raw = want_cog.then(|| read_u32(rt, &e.cog_x, w * 3)).transpose()?;
-    let cog_y_raw = want_cog.then(|| read_u32(rt, &e.cog_y, h * 3)).transpose()?;
-    let grid_raw = want_grid.then(|| read_u32(rt, &e.grid, 40 * 40)).transpose()?;
-    if crate::gpu_stack::take_gpu_error() { return Err("Device loss/OOM durante análisis GPU".into()); }
-    drop(guard);
-    Ok(finish_analysis_output(
-        &half_raw,
-        &blur_raw,
-        &lap_raw,
-        &score_raw,
-        cog_x_raw.as_deref(),
-        cog_y_raw.as_deref(),
-        grid_raw.as_deref(),
-        w,
-        h,
-    ))
+    process_batch_slices(&[mono], w, h, surface_grid, want_grid, want_cog).map(|mut v| {
+        v.pop().expect("el lote de un frame produce exactamente un output")
+    })
 }
 
 /// Procesa varios frames con un único submit y un único map de readback.
@@ -1162,17 +1093,31 @@ pub fn process_batch_with_options(
     want_grid: bool,
     want_cog: bool,
 ) -> Result<Vec<AnalysisGpuOutput>, String> {
+    let refs: Vec<&[u16]> = frames.iter().map(|f| f.as_slice()).collect();
+    process_batch_slices(&refs, w, h, surface_grid, want_grid, want_cog)
+}
+
+fn process_batch_slices(
+    frames: &[&[u16]],
+    w: usize,
+    h: usize,
+    surface_grid: bool,
+    want_grid: bool,
+    want_cog: bool,
+) -> Result<Vec<AnalysisGpuOutput>, String> {
     if frames.is_empty() {
         return Ok(Vec::new());
     }
-    if frames.len() == 1 {
-        return process_with_options(&frames[0], w, h, surface_grid, want_grid, want_cog)
-            .map(|v| vec![v]);
-    }
-    if frames.len() > 8 {
+    // PR-2.3: el lote de UN frame ya NO delega en el antiguo camino unitario
+    // (que hacía 7 readbacks bloqueantes); el motor por lotes lo sirve con
+    // un submit + un staging + un solo map también para len == 1.
+    // PR-2.4: el tope por submit depende del backend — fuera de Metal se
+    // acota por presupuesto de TIEMPO (TDR de Windows), no solo por VRAM.
+    let submit_cap = crate::gpu_stack::analysis_submit_cap(w, h);
+    if frames.len() > submit_cap {
         let mut out = Vec::with_capacity(frames.len());
-        for chunk in frames.chunks(8) {
-            out.extend(process_batch_with_options(
+        for chunk in frames.chunks(submit_cap) {
+            out.extend(process_batch_slices(
                 chunk,
                 w,
                 h,
@@ -1211,7 +1156,12 @@ pub fn process_batch_with_options(
     let prepared: Vec<(Vec<u32>, [f32; 3])> = frames
         .par_iter()
         .map(|mono| {
-            let src: Vec<u32> = mono[..w * h].iter().map(|&v| v as u32).collect();
+            // PR-2.3: empaquetar 2×u16 por u32 — mitad de tamaño y de ancho
+            // de banda que la antigua expansión u16→u32 (~47 MB por frame 4K).
+            let src: Vec<u32> = mono[..w * h]
+                .chunks(2)
+                .map(|c| c[0] as u32 | ((c.get(1).copied().unwrap_or(0) as u32) << 16))
+                .collect();
             let thresholds = if want_cog { cog_thresholds(mono, w, h) } else { [0.0; 3] };
             (src, thresholds)
         })

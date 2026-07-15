@@ -291,21 +291,26 @@ fn gpu_decompose_raw(base: &[f32], width: usize, height: usize) -> Option<Vec<Ve
     }
     rt.queue.submit(Some(enc.finish()));
 
-    // Descargar las 6 blurs a CPU (staging reutilizado).
+    // PR-2.3: descargar las 6 blurs con UN solo encoder+submit+map (antes:
+    // 6 round-trips submit→map_async→wait SECUENCIALES sobre un staging
+    // reutilizado — 6 sincronizaciones CPU↔GPU en el lazo interactivo del
+    // editor, anulando parte de la ventaja de la GPU). Staging de 6·n4.
     let staging = dev.create_buffer(&wgpu::BufferDescriptor {
         label: Some("zas-blur-staging"),
-        size: n4,
+        size: n4 * 6,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
     let mut blurs: Vec<Vec<f32>> = Vec::with_capacity(6);
-    for buf in &blur_bufs {
+    {
         let mut denc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("zas-blur-download"),
         });
-        denc.copy_buffer_to_buffer(buf, 0, &staging, 0, n4);
+        for (bi, buf) in blur_bufs.iter().enumerate() {
+            denc.copy_buffer_to_buffer(buf, 0, &staging, bi as u64 * n4, n4);
+        }
         rt.queue.submit(Some(denc.finish()));
-        let slice = staging.slice(0..n4);
+        let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
@@ -316,7 +321,10 @@ fn gpu_decompose_raw(base: &[f32], width: usize, height: usize) -> Option<Vec<Ve
         {
             let data = slice.get_mapped_range();
             let vals: &[f32] = bytemuck::cast_slice(&data);
-            blurs.push(vals[..n].to_vec());
+            let stride = (n4 / 4) as usize;
+            for bi in 0..6 {
+                blurs.push(vals[bi * stride..bi * stride + n].to_vec());
+            }
         }
         staging.unmap();
     }

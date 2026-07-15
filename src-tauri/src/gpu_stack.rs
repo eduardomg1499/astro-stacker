@@ -695,6 +695,22 @@ const PARAM_STRIDE: u64 = 256;
 /// Píxeles por dispatch (~2M): mantiene cada dispatch < 50 ms incluso en
 /// iGPU → sin TDR (timeout del driver) en Windows.
 const PX_PER_DISPATCH: usize = 2_000_000;
+
+/// PR-2.4: tope de FRAMES por submit del lote de análisis. El TDR de Windows
+/// (~2 s) mata el command buffer COMPLETO — trocear en dispatches no salva
+/// del timeout si van todos en el mismo submit. En Metal el margen es amplio
+/// (y está medido: lotes de 8 a 4K en Apple Silicon); en DX12/Vulkan/GL el
+/// tope se ancla al kernel dominante del lote (CoG: ~w·h·3 iteraciones con
+/// cubo por frame): ~300M de presupuesto por submit deja el peor caso muy
+/// por debajo del TDR incluso en iGPU modestas (4K → 2-3 frames/submit;
+/// 1080p → 8). Sin runtime GPU devuelve 8 (irrelevante: no habrá submit).
+pub fn analysis_submit_cap(w: usize, h: usize) -> usize {
+    let is_metal = gpu_runtime().map(|rt| rt.backend == "Metal").unwrap_or(true);
+    if is_metal {
+        return 8;
+    }
+    (300_000_000usize / (w * h * 3).max(1)).clamp(1, 8)
+}
 /// Chunk de descarga (staging map): acota la memoria de readback.
 const DOWNLOAD_CHUNK: u64 = 128 * 1024 * 1024;
 
@@ -1057,27 +1073,44 @@ impl GpuPassAccumulator {
             .queue
             .write_buffer(&self.params_buf, 0, &self.params_scratch);
 
-        let mut enc = self
-            .rt
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("zas-accum-enc"),
-            });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("zas-accum-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.rt.pipeline);
-            let gx = (self.cfg.w_out as u32 + 7) / 8;
-            for (bi, &y0) in self.bands.iter().enumerate() {
-                let rows = (self.cfg.h_out as u32 - y0).min(self.band_rows);
-                let gy = (rows + 7) / 8;
-                pass.set_bind_group(0, &self.bind_group, &[bi as u32 * PARAM_STRIDE as u32]);
-                pass.dispatch_workgroups(gx, gy, 1);
+        // PR-2.4: el TDR de Windows se mide por COMMAND BUFFER, no por
+        // dispatch — el comentario histórico "cada dispatch < 50 ms → sin
+        // TDR" razonaba sobre la unidad equivocada. Con lienzos gigantes
+        // (drizzle 3× → 9× píxeles, Lanczos 6×6 + IDW por píxel) el submit
+        // único agregaba TODOS los dispatches de banda. Fuera de Metal se
+        // trocea en un submit por cada ~2 bandas (~4 Mpx); en Metal se
+        // conserva el submit único (medido sin problema en Apple Silicon).
+        let bands_indexed: Vec<(usize, u32)> =
+            self.bands.iter().copied().enumerate().collect();
+        let band_px = self.cfg.w_out.saturating_mul(self.band_rows as usize).max(1);
+        let bands_per_submit = if self.rt.backend == "Metal" {
+            bands_indexed.len().max(1)
+        } else {
+            (4_000_000usize / band_px).clamp(1, bands_indexed.len().max(1))
+        };
+        for chunk in bands_indexed.chunks(bands_per_submit) {
+            let mut enc = self
+                .rt
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("zas-accum-enc"),
+                });
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("zas-accum-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.rt.pipeline);
+                let gx = (self.cfg.w_out as u32 + 7) / 8;
+                for &(bi, y0) in chunk {
+                    let rows = (self.cfg.h_out as u32 - y0).min(self.band_rows);
+                    let gy = (rows + 7) / 8;
+                    pass.set_bind_group(0, &self.bind_group, &[bi as u32 * PARAM_STRIDE as u32]);
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
             }
+            self.rt.queue.submit(Some(enc.finish()));
         }
-        self.rt.queue.submit(Some(enc.finish()));
 
         if take_gpu_error() {
             return Err("error del device GPU durante la acumulación".into());
