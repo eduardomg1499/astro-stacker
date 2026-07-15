@@ -21,6 +21,9 @@ pub struct AviReader {
     pub info: AviInfo,
     pub frame_offsets: Vec<usize>,
     pub frame_sizes: Vec<usize>,
+    /// F3: DIB top-down (height negativa en el header). Los DIB clásicos son
+    /// bottom-up y el lector voltea las filas al servir RGB24.
+    pub top_down: bool,
 }
 
 fn is_avi(m: &[u8]) -> bool {
@@ -137,12 +140,29 @@ impl AviReader {
             return Err("No se pudieron leer las dimensiones del AVI".into());
         }
 
-        // bytes_per_pixel para el resto del pipeline (solo 1 o 2)
-        // rawvideo bayer_rggb8 -> 8 bits -> 1
-        // bayer 16 -> 2
-        let bytes_per_pixel = if bit_count > 8 { 2 } else { 1 };
+        // F3: RGB24 sin comprimir (biCompression=0/DIB/RGB con 24 bpp). Antes
+        // caía a bpp=2 + MONO y los bytes BGR se interpretaban como mono16 →
+        // imagen basura en el fallback nativo (FFmpeg lo tapaba casi siempre).
+        let is_raw_rgb24 = bit_count == 24
+            && (compression == [0, 0, 0, 0]
+                || &compression == b"DIB "
+                || &compression == b"RGB "
+                || &compression == b"raw ");
+        // bytes_per_pixel para el resto del pipeline:
+        // rawvideo bayer 8 bits -> 1; bayer 16 -> 2; RGB24 -> 3
+        let bytes_per_pixel = if is_raw_rgb24 {
+            3
+        } else if bit_count > 8 {
+            2
+        } else {
+            1
+        };
 
-        let color_id = fourcc_to_color_id(&compression);
+        let color_id = if is_raw_rgb24 {
+            101 // BGR directo (orden de bytes DIB), ya soportado por el pipeline SER
+        } else {
+            fourcc_to_color_id(&compression)
+        };
 
         // 3) Buscar movi (LIST movi o texto movi)
         let mut movi_start = 0usize;
@@ -201,10 +221,6 @@ impl AviReader {
             return Err("No se encontraron frames de video en movi".into());
         }
 
-        // Nota: top_down no se aplica aqui; tu pipeline no soporta flip.
-        // Se deja detectado por si luego quieres invertir lineas.
-        let _ = top_down;
-
         Ok(AviReader {
             mmap: Arc::new(mmap),
             info: AviInfo {
@@ -218,16 +234,37 @@ impl AviReader {
             },
             frame_offsets,
             frame_sizes,
+            top_down,
         })
     }
 
-    pub fn get_frame(&self, index: usize, _cid: i32) -> &[u8] {
+    pub fn get_frame(&self, index: usize, _cid: i32) -> std::borrow::Cow<'_, [u8]> {
         if index >= self.frame_offsets.len() {
-            return &[];
+            return std::borrow::Cow::Borrowed(&[]);
         }
 
         let start = self.frame_offsets[index];
         let chunk_size = self.frame_sizes[index];
+
+        // F3: RGB24 (DIB): filas alineadas a 4 bytes y orden bottom-up salvo
+        // top_down. Se sirve compactado (sin padding) y con las filas en
+        // orden natural (arriba→abajo).
+        if self.info.color_id == 101 && self.info.bytes_per_pixel == 3 {
+            let (w, h) = (self.info.width, self.info.height);
+            let row_bytes = w * 3;
+            let stride = (row_bytes + 3) & !3;
+            if start + stride * h > self.mmap.len() || chunk_size < stride * h {
+                return std::borrow::Cow::Borrowed(&[]);
+            }
+            let src = &self.mmap[start..start + stride * h];
+            let mut out = vec![0u8; row_bytes * h];
+            for y in 0..h {
+                let src_y = if self.top_down { y } else { h - 1 - y };
+                out[y * row_bytes..(y + 1) * row_bytes]
+                    .copy_from_slice(&src[src_y * stride..src_y * stride + row_bytes]);
+            }
+            return std::borrow::Cow::Owned(out);
+        }
 
         // Esperado para RAW bayer: width*height*bpp
         let expected = self.info.width * self.info.height * self.info.bytes_per_pixel;
@@ -236,9 +273,9 @@ impl AviReader {
         let read_size = expected.min(chunk_size);
 
         if start + read_size > self.mmap.len() {
-            return &[];
+            return std::borrow::Cow::Borrowed(&[]);
         }
 
-        &self.mmap[start..start + read_size]
+        std::borrow::Cow::Borrowed(&self.mmap[start..start + read_size])
     }
 }

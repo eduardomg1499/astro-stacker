@@ -262,13 +262,18 @@ fn box_blur_parallel(input: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
             }
         });
 
-    // Transpose
+    // Transpose (F3: paralela por columnas — las dos transposiciones en serie
+    // eran la fracción monohilo del blur, que corre 6 sigmas × canales ×
+    // (deconv+wavelets) en cada render interactivo del editor).
     let mut transp = vec![0.0; size];
-    for y in 0..h {
-        for x in 0..w {
-            transp[x * h + y] = temp[y * w + x];
-        }
-    }
+    transp
+        .par_chunks_exact_mut(h)
+        .enumerate()
+        .for_each(|(x, col_out)| {
+            for y in 0..h {
+                col_out[y] = temp[y * w + x];
+            }
+        });
 
     // Vertical Pass (Horizontal on Transposed)
     let mut temp_transp = vec![0.0; size];
@@ -296,12 +301,15 @@ fn box_blur_parallel(input: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
             }
         });
 
-    // Transpose Back
-    for x in 0..w {
-        for y in 0..h {
-            output[y * w + x] = temp_transp[x * h + y];
-        }
-    }
+    // Transpose Back (F3: paralela por filas de salida)
+    output
+        .par_chunks_exact_mut(w)
+        .enumerate()
+        .for_each(|(y, row_out)| {
+            for x in 0..w {
+                row_out[x] = temp_transp[x * h + y];
+            }
+        });
 
     output
 }
@@ -518,47 +526,57 @@ fn apply_van_cittert(
         // 1. Blur the Current Estimate
         let blurred_est = apply_gaussian_blur(&est, width, height, sigma);
 
-        // 2. Iterate block
-        for y in 1..(height - 1) {
-            for x in 1..(width - 1) {
-                let j = y * width + x;
+        // 2. Iterate block — F3: SNAPSHOT JACOBI + rayon (como richardson_lucy_core).
+        // El barrido Gauss-Seidel anterior leía vecinos YA modificados en la
+        // misma iteración (serie y=1.., x=1..): sesgo direccional
+        // arriba-izquierda→abajo-derecha en el detalle deconvolucionado, y
+        // además impedía paralelizar. El TV lee ahora est_prev (inmutable).
+        let est_prev = est.clone();
+        est.par_chunks_mut(width)
+            .enumerate()
+            .skip(1)
+            .take(height.saturating_sub(2))
+            .for_each(|(y, row)| {
+                for x in 1..(width - 1) {
+                    let j = y * width + x;
 
-                // Van Cittert Residual (Difference between Original and Blurred Estimate)
-                let residual = (original[j] - blurred_est[j]).clamp(-15000.0, 15000.0);
+                    // Van Cittert Residual (Difference between Original and Blurred Estimate)
+                    let residual = (original[j] - blurred_est[j]).clamp(-15000.0, 15000.0);
 
-                // Total Variation (TV) - Push pixel toward its neighborhood average if it's spiking
-                let n1 = est[y * width + (x - 1)];
-                let n2 = est[y * width + (x + 1)];
-                let n3 = est[(y - 1) * width + x];
-                let n4 = est[(y + 1) * width + x];
-                let local_mean = (n1 + n2 + n3 + n4) * 0.25;
-                let tv_gradient = local_mean - est[j];
+                    // Total Variation (TV) - Push pixel toward its neighborhood average if it's spiking
+                    let n1 = est_prev[y * width + (x - 1)];
+                    let n2 = est_prev[y * width + (x + 1)];
+                    let n3 = est_prev[(y - 1) * width + x];
+                    let n4 = est_prev[(y + 1) * width + x];
+                    let local_mean = (n1 + n2 + n3 + n4) * 0.25;
+                    let tv_gradient = local_mean - est_prev[j];
 
-                // Apply update natively
-                let mut update = est[j] + (residual * vc_dampening);
+                    // Apply update natively
+                    let mut update = est_prev[j] + (residual * vc_dampening);
 
-                // Apply TV Regularization to smooth out ringing/spikes
-                update += tv_gradient * tv_weight;
+                    // Apply TV Regularization to smooth out ringing/spikes
+                    update += tv_gradient * tv_weight;
 
-                let correction_weight = mask[j] * 0.50;
-                let mut final_val = est[j] * (1.0 - correction_weight) + update * correction_weight;
+                    let correction_weight = mask[j] * 0.50;
+                    let mut final_val =
+                        est_prev[j] * (1.0 - correction_weight) + update * correction_weight;
 
-                if final_val.is_nan() || final_val.is_infinite() {
-                    final_val = original[j];
+                    if final_val.is_nan() || final_val.is_infinite() {
+                        final_val = original[j];
+                    }
+
+                    // Hard mathematical limits for 16-bit space
+                    // Allow a tiny bit of negative headroom during intermediate VC steps, but not full -30,000 runaway
+                    if final_val > 65535.0 {
+                        final_val = 65535.0;
+                    }
+                    if final_val < -2000.0 {
+                        final_val = -2000.0;
+                    } // Very clamped bounce floor
+
+                    row[x] = final_val;
                 }
-
-                // Hard mathematical limits for 16-bit space
-                // Allow a tiny bit of negative headroom during intermediate VC steps, but not full -30,000 runaway
-                if final_val > 65535.0 {
-                    final_val = 65535.0;
-                }
-                if final_val < -2000.0 {
-                    final_val = -2000.0;
-                } // Very clamped bounce floor
-
-                est[j] = final_val;
-            }
-        }
+            });
     }
 
     // Final hard-clamp negative residual energy to solid black
@@ -726,7 +744,7 @@ fn run_processing_pipeline(
     let mut d_changed = false;
 
     {
-        let mut guard = state.deconv_cache.lock().unwrap();
+        let mut guard = state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner());
         let mut match_idx = None;
         for (i, c) in guard.iter().enumerate() {
             if c.params == d_params && c.width == width && c.height == height {
@@ -891,9 +909,11 @@ fn run_processing_pipeline(
             height,
         };
         {
-            let mut guard = state.deconv_cache.lock().unwrap();
+            let mut guard = state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner());
             guard.insert(0, nc);
-            if guard.len() > 3 {
+            // F3: tope 8 (antes 3): comparar >3 estados A/B/C/D expulsaba
+            // la entrada y forzaba recomputar el tramo más caro (deconv/wavelets).
+            if guard.len() > 8 {
                 guard.pop();
             }
         }
@@ -951,7 +971,7 @@ fn run_processing_pipeline(
     // CACHe DE WAVELETS
     let mut w_cache: Option<WaveletLayers> = None;
     if !d_changed {
-        let mut guard = state.wavelet_cache.lock().unwrap();
+        let mut guard = state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner());
         let mut match_idx = None;
         for (i, w) in guard.iter().enumerate() {
             if w.width == width
@@ -1055,9 +1075,11 @@ fn run_processing_pipeline(
             edge_aware_strength,
         };
         {
-            let mut guard = state.wavelet_cache.lock().unwrap();
+            let mut guard = state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner());
             guard.insert(0, wc.clone());
-            if guard.len() > 3 {
+            // F3: tope 8 (antes 3): comparar >3 estados A/B/C/D expulsaba
+            // la entrada y forzaba recomputar el tramo más caro (deconv/wavelets).
+            if guard.len() > 8 {
                 guard.pop();
             }
         }
@@ -1092,7 +1114,7 @@ fn run_processing_pipeline(
 
     let mut cached_filter: Option<FilterCache> = None;
     {
-        let mut guard = state.filter_cache.lock().unwrap();
+        let mut guard = state.filter_cache.lock().unwrap_or_else(|e| e.into_inner());
         let mut match_idx = None;
         for (i, c) in guard.iter().enumerate() {
             if c.params == f_params && c.width == width && c.height == height {
@@ -1127,9 +1149,14 @@ fn run_processing_pipeline(
         let recombine = |lys: &Vec<Vec<f32>>| -> Vec<f32> {
             let mut out = vec![0.0; size];
             let _ub = u_amts.iter().sum::<f32>() * 0.2;
+            // F3: el umbral de coring escala con img_scale (normalización p99),
+            // igual que high-pass/USM/deringing. Con el corte FIJO en ADU, el
+            // mismo slider cortaba ~16× más detalle relativo en un planeta
+            // tenue (img_scale≈0.06) que en la Luna brillante.
             let den = |v: f32, a: f32, t: f32| {
-                if v.abs() < t * 100.0 {
-                    v * (v.abs() / (t * 100.0 + 0.01)) * a
+                let cut = t * 100.0 * img_scale;
+                if v.abs() < cut {
+                    v * (v.abs() / (cut + 0.01)) * a
                 } else {
                     v * a
                 }
@@ -1231,9 +1258,11 @@ fn run_processing_pipeline(
             height,
         };
         {
-            let mut guard = state.filter_cache.lock().unwrap();
+            let mut guard = state.filter_cache.lock().unwrap_or_else(|e| e.into_inner());
             guard.insert(0, nc);
-            if guard.len() > 3 {
+            // F3: tope 8 (antes 3): comparar >3 estados A/B/C/D expulsaba
+            // la entrada y forzaba recomputar el tramo más caro (deconv/wavelets).
+            if guard.len() > 8 {
                 guard.pop();
             }
         }

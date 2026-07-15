@@ -996,7 +996,7 @@ fn benchmark_ffmpeg_decode_route(
         rotation,
     );
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(v) = cache.lock().unwrap().get(&key).cloned() {
+    if let Some(v) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned() {
         return v;
     }
 
@@ -1086,7 +1086,7 @@ fn benchmark_ffmpeg_decode_route(
         cpu_seconds: cpu_s.filter(|_| cpu_ok),
         backend,
     };
-    cache.lock().unwrap().insert(key, probe.clone());
+    cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, probe.clone());
     probe
 }
 
@@ -2526,6 +2526,13 @@ async fn analyze_planetary(
 #[tauri::command]
 fn stop_analysis(state: State<'_, AppState>) {
     let _ = state.active_req_id.fetch_add(1, Ordering::Relaxed);
+    // F3: semántica unificada con cancel_processing. Solo invalidar el
+    // req_id dejaba VIVOS a los productores (decoder FFmpeg, prefetcher),
+    // que únicamente comprueban cancel_requested: seguían decodificando el
+    // vídeo entero tras el stop.
+    state
+        .cancel_requested
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -4715,7 +4722,7 @@ fn stack_video_liquid_warping_impl(
                                 t_upload
                                     .fetch_add(job_bytes, std::sync::atomic::Ordering::Relaxed);
                                 // devolver el buffer de pixeles al pool
-                                pool.lock().unwrap().push(job.pixels);
+                                pool.lock().unwrap_or_else(|e| e.into_inner()).push(job.pixels);
                             }
                             Err(e) => {
                                 eprintln!("[gpu] fallo acumulando frame: {e}");
@@ -4845,7 +4852,7 @@ fn stack_video_liquid_warping_impl(
                     let elapsed = tele_start_ref.elapsed().as_secs_f32().max(0.001);
                     let done = completed.max(1) as u64;
                     let (ram_mb, cpu_percent, io_read_mb, io_write_mb) = {
-                        let mut s = tele_sys_ref.lock().unwrap();
+                        let mut s = tele_sys_ref.lock().unwrap_or_else(|e| e.into_inner());
                         // PR-2.5: refresh_all() enumeraba TODOS los procesos
                         // del sistema bajo mutex cada 25 frames — 10-40
                         // escaneos completos de la tabla de procesos POR
@@ -5165,7 +5172,7 @@ fn stack_video_liquid_warping_impl(
                         // del blend (acceptance ∧ validez → 0; ap_w·clamp(q)).
                         if let Some(gtx) = gpu_tx.as_ref() {
                             let mut px_buf =
-                                gpu_px_pool.lock().unwrap().pop().unwrap_or_default();
+                                gpu_px_pool.lock().unwrap_or_else(|e| e.into_inner()).pop().unwrap_or_default();
                             px_buf.clear();
                             if is_mono_stack {
                                 px_buf.extend_from_slice(&sc.mono_buf);
@@ -5670,16 +5677,16 @@ fn stack_video_liquid_warping_impl(
     };
 
     {
-        let mut res = state.stacked_image.lock().unwrap();
+        let mut res = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
         *res = Some(StackResult {
             width: w_out, height: h_out,
             data: final_u16.clone(),
             is_mono: color_id == 0 || color_id == 12,
             is_surface: is_surface,
         });
-        state.deconv_cache.lock().unwrap().clear();
-        state.wavelet_cache.lock().unwrap().clear();
-        state.filter_cache.lock().unwrap().clear();
+        state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     // CACHE DE DECODE PERSISTENTE: ya NO se borra al terminar — re-apilar el
@@ -5796,12 +5803,17 @@ fn compute_frame_local_shifts(
     // completa; cada entrada None cae localmente al matcher piramidal CPU.
     gpu_coarse: Option<&[Option<crate::gpu_analysis::SadMatch>]>,
 ) -> Vec<(f32, f32, f32)> {
-    let mut local_shifts = Vec::with_capacity(custom_points.len());
-
-    for (ap_i, ap) in custom_points.iter().enumerate() {
+    // F3: PARALELO por AP (rayon, orden preservado → misma salida que el
+    // bucle secuencial). El registro fino SAD+LK de miles de APs saturaba UN
+    // core por frame; con lucky imaging agresivo (pocos frames en vuelo,
+    // malla densa) el resto de núcleos quedaba ocioso. Anida bajo el
+    // paralelismo por frame vía work-stealing.
+    let mut local_shifts: Vec<(f32, f32, f32)> = custom_points
+        .par_iter()
+        .enumerate()
+        .map(|(ap_i, ap)| {
         if ap_i < ap_signal_valid.len() && !ap_signal_valid[ap_i] {
-            local_shifts.push((0.0, 0.0, 0.0));
-            continue;
+            return (0.0, 0.0, 0.0);
         }
         // AP sin textura real en el master (terminador oscuro, cielo residual):
         // su SAD mediria ruido → q=0 (sin medicion, el warp lo ignora) y se
@@ -5809,8 +5821,7 @@ fn compute_frame_local_shifts(
         if ap_lap_floor > 0.0
             && ap_master_lap.get(ap_i).copied().unwrap_or(f32::MAX) < ap_lap_floor
         {
-            local_shifts.push((0.0, 0.0, 0.0));
-            continue;
+            return (0.0, 0.0, 0.0);
         }
         let ax = ap.x as f32;
         let ay = ap.y as f32;
@@ -5905,11 +5916,12 @@ fn compute_frame_local_shifts(
                 1.0
             };
             let nq = (base_q * regional_boost * limb_damp).clamp(0.001, 1.0);
-            local_shifts.push((dx, dy, nq));
+            (dx, dy, nq)
         } else {
-            local_shifts.push((0.0, 0.0, 0.0));
+            (0.0, 0.0, 0.0)
         }
-    }
+        })
+        .collect();
 
     if !local_shifts.is_empty() {
         let (valid_mask, fallback_vectors) = if is_surface {
@@ -7098,7 +7110,7 @@ impl<'a> ScratchLease<'a> {
         is_mono: bool,
         with_output: bool,
     ) -> Self {
-        let sc = pool.lock().unwrap().pop().unwrap_or_else(|| {
+        let sc = pool.lock().unwrap_or_else(|e| e.into_inner()).pop().unwrap_or_else(|| {
             LiquidScratch::new(w_in, h_in, w_out, h_out, is_mono, with_output)
         });
         Self { pool, sc: Some(sc) }
@@ -7108,7 +7120,7 @@ impl<'a> ScratchLease<'a> {
 impl<'a> Drop for ScratchLease<'a> {
     fn drop(&mut self) {
         if let Some(sc) = self.sc.take() {
-            self.pool.lock().unwrap().push(sc);
+            self.pool.lock().unwrap_or_else(|e| e.into_inner()).push(sc);
         }
     }
 }
@@ -7222,7 +7234,7 @@ impl StripedAccum {
             if y0 >= y1 {
                 continue;
             }
-            let _guard = self.bands[b].lock().unwrap();
+            let _guard = self.bands[b].lock().unwrap_or_else(|e| e.into_inner());
             for y in y0..y1 {
                 let row = y * w;
                 for x in 1..w - 1 {
@@ -8114,39 +8126,7 @@ impl TvRlDeconvolver {
 // ELITE V4: SIGMA CLIPPING & SNR
 // ==========================================
 
-pub struct AdaptiveKappaClipper {
-    pub kappa: f32,
-    pub iterations: u32,
-    pub min_frames: usize,
-}
 
-impl AdaptiveKappaClipper {
-    pub fn clip_pixel_stack(&self, values: &mut Vec<(f32, f32)>) -> (f32, f32) {
-        if values.len() < self.min_frames {
-            let (ws, vs) = values.iter().fold((0.0, 0.0), |(ws, vs), &(v, w)| (ws + w, vs + v * w));
-            return if ws > 1e-7 { (vs / ws, ws) } else { (0.0, 0.0) };
-        }
-
-        for _ in 0..self.iterations {
-            if values.len() < self.min_frames { break; }
-            let (ws, vs) = values.iter().fold((0.0, 0.0), |(ws, vs), &(v, w)| (ws + w, vs + v * w));
-            let mean = vs / ws.max(1e-7);
-            
-            let mut devs: Vec<f32> = values.iter().map(|&(v, _)| (v - mean).abs()).collect();
-            devs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-            let sigma = devs[devs.len() / 2] * 1.4826;
-            if sigma < 0.5 { break; }
-
-            let thresh = self.kappa * sigma;
-            let len_before = values.len();
-            values.retain(|&(v, _)| (v - mean).abs() <= thresh);
-            if values.len() == len_before { break; }
-        }
-
-        let (ws, vs) = values.iter().fold((0.0, 0.0), |(ws, vs), &(v, w)| (ws + w, vs + v * w));
-        if ws > 1e-7 { (vs / ws, ws) } else { (0.0, 0.0) }
-    }
-}
 
 pub fn compute_snr_map(stacked: &[f32], w: usize, h: usize, noise_sigma: f32) -> Vec<f32> {
     let smoothed = atrous_smooth(stacked, w, h, 2);
@@ -8169,20 +8149,6 @@ pub fn compute_planet_mask(stacked: &[f32], w: usize, h: usize, feather: usize) 
     }).collect()
 }
 
-pub fn accumulate_with_sigma_clipping(
-    pixel_contributions: &mut Vec<Vec<(f32, f32)>>, // [pixel_idx][(val, weight)]
-    _width: usize,
-    _height: usize,
-    clipper: &AdaptiveKappaClipper,
-) -> Vec<f32> {
-    pixel_contributions
-        .iter_mut()
-        .map(|contributions| {
-            let (v, w) = clipper.clip_pixel_stack(contributions);
-            if w > 1e-9 { v.clamp(0.0, 65535.0) } else { 0.0 }
-        })
-        .collect()
-}
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct EliteConfig {
@@ -8363,126 +8329,6 @@ impl CategoryProfile {
 // LUMA CHROMA SEPARATION
 // ══════════════════════════════════════════════════════════════════
 
-pub struct LumaChromaSeparator;
-
-impl LumaChromaSeparator {
-    pub fn rgb_to_ycbcr(r: &[f32], g: &[f32], b: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-        let n = r.len();
-        let mut y  = vec![0.0f32; n];
-        let mut cb = vec![0.0f32; n];
-        let mut cr = vec![0.0f32; n];
-
-        for i in 0..n {
-            let luma = 0.2126 * r[i] + 0.7152 * g[i] + 0.0722 * b[i];
-            y[i]  = luma;
-            cb[i] = (b[i] - luma) * 0.5389 + 32768.0;
-            cr[i] = (r[i] - luma) * 0.6350 + 32768.0;
-        }
-        (y, cb, cr)
-    }
-
-    pub fn ycbcr_to_rgb(y: &[f32], cb: &[f32], cr: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-        let n = y.len();
-        let mut r = vec![0.0f32; n];
-        let mut g = vec![0.0f32; n];
-        let mut b = vec![0.0f32; n];
-
-        for i in 0..n {
-            let cb_c = cb[i] - 32768.0;
-            let cr_c = cr[i] - 32768.0;
-            let ri = y[i] + 1.5748 * cr_c;
-            let gi = y[i] - 0.1873 * cb_c - 0.4681 * cr_c;
-            let bi = y[i] + 1.8556 * cb_c;
-            r[i] = ri.clamp(0.0, 65535.0);
-            g[i] = gi.clamp(0.0, 65535.0);
-            b[i] = bi.clamp(0.0, 65535.0);
-        }
-        (r, g, b)
-    }
-
-    pub fn smooth_chroma(
-        cb: &[f32], cr: &[f32],
-        width: usize, height: usize,
-        sigma: f32,
-    ) -> (Vec<f32>, Vec<f32>) {
-        let cb_smooth = crate::apply_gaussian_blur_f32(cb, width, height, sigma);
-        let cr_smooth = crate::apply_gaussian_blur_f32(cr, width, height, sigma);
-        (cb_smooth, cr_smooth)
-    }
-}
-
-// ══════════════════════════════════════════════════════════════════
-// DECONVOLUTION BLEND
-// ══════════════════════════════════════════════════════════════════
-
-pub fn deconvolve_safe_blend(
-    luma: &[f32],
-    width: usize,
-    height: usize,
-    psf: &[f32],
-    psf_size: usize,
-    snr_map: &[f32],
-    planet_mask: &[f32],
-    profile: &CategoryProfile,
-) -> Vec<f32> {
-    if !profile.deconv_enabled || profile.deconv_blend < 0.01 {
-        return luma.to_vec();
-    }
-
-    let noise = estimate_stack_noise(luma, width, height);
-    let signal_sum: f64 = luma.iter()
-        .zip(planet_mask.iter())
-        .filter(|(_, &m)| m > 0.5)
-        .map(|(&v, _)| v as f64)
-        .sum();
-    let signal_count = luma.iter()
-        .zip(planet_mask.iter())
-        .filter(|(_, &m)| m > 0.5)
-        .count().max(1) as f64;
-    
-    let signal_mean = signal_sum / signal_count;
-    let global_snr = signal_mean as f32 / noise.max(1.0);
-
-    if global_snr < profile.snr_floor_deconv * 2.0 {
-        return luma.to_vec();
-    }
-
-    let deconvolver = TvRlDeconvolver {
-        max_iterations:  profile.deconv_iterations,
-        tv_lambda:       profile.tv_lambda,
-        convergence_eps: 0.00005,
-        snr_floor:       profile.snr_floor_deconv,
-    };
-
-    let deconvolved = deconvolver.deconvolve(
-        luma, width, height,
-        psf, psf_size,
-        snr_map, planet_mask,
-    );
-
-    luma.iter()
-        .zip(deconvolved.iter())
-        .zip(snr_map.iter())
-        .zip(planet_mask.iter())
-        .map(|(((&orig, &deconv), &snr), &mask)| {
-            let snr_factor = ((snr - profile.snr_floor_deconv)
-                / (profile.snr_floor_deconv * 3.0))
-                .clamp(0.0, 1.0)
-                .powf(1.5);
-
-            let effective_blend = profile.deconv_blend * snr_factor * mask;
-
-            let deconv_safe = if (deconv - orig).abs() > orig * 2.0 {
-                orig
-            } else {
-                deconv
-            };
-
-            (orig * (1.0 - effective_blend) + deconv_safe * effective_blend)
-                .clamp(0.0, 65535.0)
-        })
-        .collect()
-}
 
 // ══════════════════════════════════════════════════════════════════
 // PIPELINE COMPONENTS
@@ -8643,248 +8489,8 @@ fn warp_frame_lanczos3(frame: &[f32], w: usize, h: usize, warp: &[f32]) -> Vec<f
     output
 }
 
-fn stack_channel(
-    frames: &[Vec<f32>],
-    width: usize,
-    height: usize,
-    warp_fields: &[Vec<f32>], // Changed WarpField to Vec<f32>
-    profile: &CategoryProfile,
-    is_surface: bool,
-) -> Vec<f32> {
-    let quality_maps_scores: Vec<Vec<f32>> = frames.par_iter().map(|f| {
-        DenseQualityMap::build(f, width, height, profile.quality_window_radius).scores
-    }).collect();
 
-    let global_scores: Vec<f32> = quality_maps_scores.iter()
-        .map(|q| percentile_f32(q, 0.85))
-        .collect();
 
-    let g_min = global_scores.iter().cloned().fold(f32::MAX, f32::min);
-    let g_max = global_scores.iter().cloned().fold(f32::MIN, f32::max);
-    let g_range = (g_max - g_min).max(1e-6);
-
-    let mut grad_stacker = GradientDomainStacker::new(width, height);
-    let mut pixel_vals: Vec<Vec<(f32, f32)>> = vec![Vec::new(); width * height];
-    let clipper = AdaptiveKappaClipper {
-        kappa: profile.kappa_sigma,
-        iterations: 4,
-        min_frames: 4,
-    };
-
-    for (fi, frame) in frames.iter().enumerate() {
-        let norm = ((global_scores[fi] - g_min) / g_range).clamp(0.0, 1.0);
-        if norm < profile.rejection_percentile { continue; }
-
-        let renorm = (norm - profile.rejection_percentile)
-            / (1.0 - profile.rejection_percentile).max(1e-6);
-        let gw = 1.0 / (1.0 + (-profile.sigmoid_steepness * (renorm - 0.5)).exp());
-
-        let warped = warp_frame_lanczos3(frame, width, height, &warp_fields[fi]);
-
-        for i in 0..width * height {
-            let lq = quality_maps_scores[fi][i].powf(2.5);
-            let cw = gw * lq;
-            if cw > 0.005 {
-                pixel_vals[i].push((warped[i], cw));
-            }
-        }
-        grad_stacker.accumulate(&warped, &[], &quality_maps_scores[fi], width, height, 0.0, 0.0, gw);
-    }
-
-    let stacked_clipped = accumulate_with_sigma_clipping(
-        &mut pixel_vals, width, height, &clipper
-    );
-
-    // Bypass Poisson gradient stacking for surface targets to preserve micro-details
-    let pw = if is_surface { 0.0 } else { profile.poisson_weight };
-    if pw > 0.01 {
-        let stacked_poisson = grad_stacker.reconstruct(profile.poisson_iterations);
-        stacked_clipped.iter()
-            .zip(stacked_poisson.iter())
-            .map(|(&c, &p)| ((1.0 - pw) * c + pw * p).clamp(0.0, 65535.0))
-            .collect()
-    } else {
-        stacked_clipped
-    }
-}
-
-pub fn process_by_category(
-    frames_r: &[Vec<f32>],
-    frames_g: &[Vec<f32>],
-    frames_b: &[Vec<f32>],
-    width: usize,
-    height: usize,
-    category: TargetCategory,
-    warp_fields: &[Vec<f32>], // Changed WarpField to Vec<f32>
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-
-    let profile = category.profile();
-    let is_surface = category == TargetCategory::Surface;
-
-    let stacked_r = stack_channel(frames_r, width, height, warp_fields, &profile, is_surface);
-    let stacked_g = stack_channel(frames_g, width, height, warp_fields, &profile, is_surface);
-    let stacked_b = stack_channel(frames_b, width, height, warp_fields, &profile, is_surface);
-
-    let (luma, cb, cr) = LumaChromaSeparator::rgb_to_ycbcr(
-        &stacked_r, &stacked_g, &stacked_b
-    );
-
-    let (cb_smooth, cr_smooth) = LumaChromaSeparator::smooth_chroma(
-        &cb, &cr, width, height, profile.chroma_blur_sigma
-    );
-
-    let planet_mask = if profile.mask_feather_px == 0 {
-        vec![1.0f32; width * height]
-    } else {
-        compute_planet_mask(&luma, width, height, profile.mask_feather_px)
-    };
-
-    let noise_sigma = estimate_stack_noise(&luma, width, height);
-    let snr_map = compute_snr_map(&luma, width, height, noise_sigma); // Fixed arguments
-
-    let psf_estimator = PsfEstimator { psf_radius: profile.psf_radius };
-    let psf = if profile.use_limb_psf {
-        let limb_mask = compute_limb_mask(&planet_mask, width, height, 6);
-        let psf_from_limb = psf_estimator.estimate_from_limb(
-            &luma, width, height, &limb_mask, 0.85
-        );
-        if psf_is_valid(&psf_from_limb, profile.psf_radius) {
-            psf_from_limb
-        } else {
-            psf_estimator.estimate_gaussian_airy(
-                profile.psf_fwhm_pixels,
-                profile.psf_airy_weight,
-            )
-        }
-    } else {
-        psf_estimator.estimate_gaussian_airy(
-            profile.psf_fwhm_pixels,
-            profile.psf_airy_weight,
-        )
-    };
-
-    let psf_size = 2 * profile.psf_radius + 1;
-
-    let luma_deconv = deconvolve_safe_blend(
-        &luma, width, height,
-        &psf, psf_size,
-        &snr_map, &planet_mask,
-        &profile,
-    );
-
-    let luma_sharp = sharpen_atrous_masked(
-        &luma_deconv,
-        width, height,
-        &snr_map,
-        &planet_mask,
-        &profile,
-        noise_sigma,
-    );
-
-    let (out_r, out_g, out_b) = LumaChromaSeparator::ycbcr_to_rgb(
-        &luma_sharp, &cb_smooth, &cr_smooth
-    );
-
-    (out_r, out_g, out_b)
-}
-
-async fn zenith_stack_video_elite_impl(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    path: String,
-    percent: f32,
-    _config: EliteConfig,
-    category_str: String,
-) -> Result<String, String> {
-    emit_progress(&app, "Iniciando Zenith Elite V4 Stacking...", 0.0, None);
-
-    let r = VideoInput::open(&path, &app)?;
-    let w = r.width();
-    let h = r.height();
-    let frame_count = r.frame_count();
-    let is_color = r.is_color();
-    let color_id = r.color_id();
-    let bpp = r.bpp();
-
-    let cache_path = get_analysis_cache_path(&path, "planet_v2");
-    if !std::path::Path::new(&cache_path).exists() {
-        return Err("No se encontró análisis previo. Por favor analiza el video primero.".into());
-    }
-    let cached: CachedAnalysis = load_cached_analysis(&cache_path)
-        .ok_or("Análisis ilegible o corrupto. Por favor re-analiza el video.")?;
-
-    let mut stats = cached.frame_stats.ok_or("No hay estadísticas de frames en el caché")?;
-    stats.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    let limit = ((frame_count as f32 * percent) / 100.0).max(1.0) as usize;
-    let selected_indices: Vec<usize> = stats.iter().take(limit).map(|s| s.idx).collect();
-
-    emit_progress(&app, &format!("Procesando {} frames...", selected_indices.len()), 5.0, None);
-
-    let target_category = TargetCategory::from_str(&category_str);
-    
-    // Instead of processing channels individually, we collect all R, G, B frames.
-    let mut frames_r = Vec::with_capacity(selected_indices.len());
-    let mut frames_g = Vec::with_capacity(selected_indices.len());
-    let mut frames_b = Vec::with_capacity(selected_indices.len());
-    
-    emit_progress(&app, "Cargando frames RGB en memoria...", 10.0, None);
-    for (i, &idx) in selected_indices.iter().enumerate() {
-        let raw = r.get_frame(idx, color_id);
-        let u16_buf = raw_to_u16_buffer(&raw, w, h, bpp);
-        
-        if is_color {
-            let rgb = debayer_to_rgb(&u16_buf, w, h, color_id);
-            frames_r.push(rgb.chunks_exact(3).map(|p| p[0] as f32).collect());
-            frames_g.push(rgb.chunks_exact(3).map(|p| p[1] as f32).collect());
-            frames_b.push(rgb.chunks_exact(3).map(|p| p[2] as f32).collect());
-        } else {
-            let mono: Vec<f32> = u16_buf.iter().map(|&p| p as f32).collect();
-            frames_r.push(mono.clone());
-            frames_g.push(mono.clone());
-            frames_b.push(mono);
-        }
-
-        if i % 10 == 0 {
-            emit_progress(&app, &format!("Cargando frame {}/{}", i, selected_indices.len()), 10.0 + (i as f32 / selected_indices.len() as f32) * 20.0, None);
-        }
-    }
-
-    emit_progress(&app, "Ejecutando Pipeline Elite por Categorías (Luma/Chroma)...", 30.0, None);
-    let warp_fields = vec![vec![]; selected_indices.len()]; // Dummy warp fields
-    let (out_r, out_g, out_b) = process_by_category(&frames_r, &frames_g, &frames_b, w, h, target_category, &warp_fields);
-
-    emit_progress(&app, "Combinando canales y guardando...", 95.0, None);
-    let mut final_u16 = Vec::with_capacity(w * h * 3);
-    for i in 0..w * h {
-        if is_color {
-            final_u16.push(out_r[i] as u16);
-            final_u16.push(out_g[i] as u16);
-            final_u16.push(out_b[i] as u16);
-        } else {
-            let val = out_r[i] as u16;
-            final_u16.push(val);
-            final_u16.push(val);
-            final_u16.push(val);
-        }
-    }
-
-    let out_name = format!("{}_elite_v4.tiff", std::path::Path::new(&path).file_stem().unwrap().to_str().unwrap());
-    let out_path = std::path::Path::new(&path).parent().unwrap().join(out_name);
-    
-    {
-        let mut locked = state.stacked_image.lock().unwrap();
-        *locked = Some(StackResult {
-            data: final_u16.clone(),
-            width: w,
-            height: h,
-            is_mono: !is_color,
-            is_surface: category_str == "surface", 
-        });
-    }
-
-    emit_progress(&app, "¡Zenith Elite V4 Completado!", 100.0, None);
-    Ok(out_path.to_string_lossy().to_string())
-}
 
 // ==========================================
 // QA REGRESSION TESTS (ZAS quality helpers)
@@ -9117,6 +8723,9 @@ mod zas_v3_tests {
     #[test]
     fn test_analysis_seeded_cache_matches_stack_reader() {
         let dir = std::env::temp_dir().join(format!("zas_seed_cache_{}", std::process::id()));
+        // Aislamiento: partir de un directorio limpio (una corrida anterior
+        // pudo dejar el frame idempotente escrito con otra longitud).
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let key = 0xABCD_EF01_2345_6789u64;
         // Color rgb48le 4x2: 24 muestras u16 little-endian.

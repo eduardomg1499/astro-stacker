@@ -73,16 +73,33 @@ impl IntegralImage {
         // However, we just need to add `sum[x + (y-1)*width]` to `sum[x + y*width]`.
         // If we process strictly Row-by-Row, we read y-1 (cache hot?) and write y.
 
-        // Let's stick to simple scalar vertical pass for now, or parallel chunks of columns?
-        // Efficient way:
-        for y in 1..height {
-            let prev_row_start = (y - 1) * width;
-            let curr_row_start = y * width;
-            for x in 0..width {
-                sum[curr_row_start + x] += sum[prev_row_start + x];
-                sq_sum[curr_row_start + x] += sq_sum[prev_row_start + x];
+        // F3: PARALELO por FRANJAS DE COLUMNAS — cada columna solo depende de
+        // sí misma tras la pasada 1, y las franjas anchas conservan la
+        // localidad de caché fila a fila dentro de cada hilo. Índices
+        // disjuntos por franja → los punteros crudos son sonoros.
+        let n_stripes = rayon::current_num_threads().clamp(1, width.max(1));
+        let stripe_w = width.div_ceil(n_stripes);
+        let sum_addr = sum.as_mut_ptr() as usize;
+        let sq_addr = sq_sum.as_mut_ptr() as usize;
+        (0..n_stripes).into_par_iter().for_each(|s| {
+            let x0 = s * stripe_w;
+            let x1 = ((s + 1) * stripe_w).min(width);
+            if x0 >= x1 {
+                return;
             }
-        }
+            let p_sum = sum_addr as *mut u64;
+            let p_sq = sq_addr as *mut u64;
+            for y in 1..height {
+                let prev = (y - 1) * width;
+                let cur = y * width;
+                for x in x0..x1 {
+                    unsafe {
+                        *p_sum.add(cur + x) += *p_sum.add(prev + x);
+                        *p_sq.add(cur + x) += *p_sq.add(prev + x);
+                    }
+                }
+            }
+        });
 
         Self {
             width,

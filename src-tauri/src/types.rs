@@ -203,6 +203,60 @@ fn save_cached_analysis(cache_path: &str, cached: &CachedAnalysis) {
         // medios de solo lectura (SD, red) el write falla — no es un error.
         let _ = fs::write(cache_path, lz4_flex::compress_prepend_size(&bin));
     }
+    prune_stale_analysis_caches(cache_path);
+}
+
+/// F3: al guardar un caché de análisis, borra los HERMANOS del MISMO vídeo
+/// con TAG DE VERSIÓN de métrica distinto (p.ej. los "_a6" huérfanos tras
+/// el bump a "_a7"): cada bump dejaba cientos de MB de grid_scores muertos
+/// junto a los vídeos del usuario. Los cachés de OTROS MODOS con la versión
+/// vigente (warp/global, anchor, otras categorías) se conservan; solo se
+/// tocan archivos nuestros (mismo prefijo de vídeo + extensión propia).
+fn prune_stale_analysis_caches(current_cache_path: &str) {
+    fn version_tag(name: &str) -> Option<String> {
+        let stem = name.strip_suffix(".analysis_v2")?;
+        let i = stem.rfind("_a")?;
+        let digits: String = stem[i + 2..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if digits.is_empty() {
+            None
+        } else {
+            Some(format!("_a{digits}"))
+        }
+    }
+    let current = Path::new(current_cache_path);
+    let Some(dir) = current.parent() else { return };
+    let Some(cache_name) = current.file_name().map(|s| s.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let Some(cur_ver) = version_tag(&cache_name) else { return };
+    // Prefijo estable "video.ext_": el sufijo de modo va tras la extensión
+    // de vídeo conocida (cache = "{video}_{sufijo}.analysis_v2").
+    let Some(video_prefix) = cache_name.strip_suffix(".analysis_v2").and_then(|stem| {
+        ["ser_", "avi_", "mp4_", "mov_", "mkv_", "fits_", "fit_"]
+            .iter()
+            .filter_map(|ext| stem.to_ascii_lowercase().rfind(ext).map(|i| i + ext.len()))
+            .max()
+            .map(|end| stem[..end].to_ascii_lowercase())
+    }) else {
+        return;
+    };
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name == cache_name || !name.ends_with(".analysis_v2") {
+            continue;
+        }
+        if !name.to_ascii_lowercase().starts_with(&video_prefix) {
+            continue;
+        }
+        // Solo versiones DISTINTAS a la vigente (y con tag reconocible).
+        if version_tag(&name).is_some_and(|v| v != cur_ver) {
+            let _ = fs::remove_file(e.path());
+        }
+    }
 }
 
 // NUEVO: Helper para detectar ColorID en SER sin cargar todo el archivo
@@ -1352,7 +1406,7 @@ impl VideoInput {
     fn get_frame<'a>(&'a self, idx: usize, cid: i32) -> Cow<'a, [u8]> {
         match self {
             VideoInput::Ser(r) => r.get_frame(idx, cid),
-            VideoInput::Avi(r) => Cow::Borrowed(r.get_frame(idx, cid)),
+            VideoInput::Avi(r) => r.get_frame(idx, cid),
             VideoInput::Fits(r) => Cow::Owned(r.get_frame(idx)),
             VideoInput::Ffmpeg(r) => {
                 // Warn on console if using Ffmpeg for high-speed analysis
@@ -1417,7 +1471,7 @@ impl VideoInput {
             }
             VideoInput::Avi(r) => {
                 if roi_x == 0 && roi_y == 0 && roi_w == r.info.width && roi_h == r.info.height {
-                    return Cow::Borrowed(r.get_frame(idx, cid));
+                    return r.get_frame(idx, cid);
                 }
                 // Similar fallback for AVI
                 let full = r.get_frame(idx, cid);
@@ -1798,5 +1852,43 @@ mod frame_stream_tests {
         assert_eq!(frame[17], 17);
         assert!(!super::read_exact_ffmpeg_frame(&mut reader, &mut frame));
         assert_eq!(reader.position(), (frame_size + frame_size / 2) as u64);
+    }
+}
+
+#[cfg(test)]
+mod f3_cache_prune_tests {
+    use super::prune_stale_analysis_caches;
+    use std::fs;
+
+    /// F3: al guardar el caché _a7 de un vídeo, los hermanos _a6 del MISMO
+    /// vídeo se borran, pero se conservan los _a7 de otros modos y los cachés
+    /// de OTROS vídeos.
+    #[test]
+    fn prune_removes_only_stale_version_siblings() {
+        let dir = std::env::temp_dir().join(format!("zas_prune_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let base = dir.join("jupiter.ser");
+        let mk = |suffix: &str| {
+            let p = format!("{}_{}.analysis_v2", base.to_string_lossy(), suffix);
+            fs::write(&p, b"x").unwrap();
+            p
+        };
+        let current = mk("planet_zenith_ultimate_warp_a7");
+        let stale_a6 = mk("planet_zenith_ultimate_warp_a6");
+        let other_mode_a7 = mk("surface_zenith_ultimate_global_a7");
+        // Otro vídeo distinto no debe tocarse.
+        let other_video = format!(
+            "{}_planet_zenith_ultimate_warp_a6.analysis_v2",
+            dir.join("saturn.ser").to_string_lossy()
+        );
+        fs::write(&other_video, b"x").unwrap();
+
+        prune_stale_analysis_caches(&current);
+
+        assert!(fs::metadata(&current).is_ok(), "el caché vigente permanece");
+        assert!(fs::metadata(&other_mode_a7).is_ok(), "otro modo con la versión vigente permanece");
+        assert!(fs::metadata(&other_video).is_ok(), "otro vídeo no se toca");
+        assert!(fs::metadata(&stale_a6).is_err(), "la versión vieja del mismo vídeo se borra");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

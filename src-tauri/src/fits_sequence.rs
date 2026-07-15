@@ -194,6 +194,26 @@ impl FitsSequenceReader {
         let expected_size = width * height * expected_bpp;
         let mut out_buffer = Vec::with_capacity(expected_size);
 
+        // F3: aplicar BZERO/BSCALE del header — fitrs NO los aplica. El caso
+        // universal es BITPIX=16 "sin signo": se guarda como i16 con
+        // BZERO=32768; sin el offset, la mitad superior del rango llegaba
+        // recortada a 0/65535.
+        let keyword_f64 = |k: &str| -> Option<f64> {
+            match hdu.value(k) {
+                Some(fitrs::HeaderValue::RealFloatingNumber(v)) => Some(*v),
+                Some(fitrs::HeaderValue::IntegerNumber(v)) => Some(*v as f64),
+                _ => None,
+            }
+        };
+        let bzero = keyword_f64("BZERO").unwrap_or(0.0);
+        let bscale = keyword_f64("BSCALE").unwrap_or(1.0);
+        let phys = |raw: f64| raw * bscale + bzero;
+        let mut push_u16 = |out: &mut Vec<u8>, value: f64| {
+            let v = value.clamp(0.0, 65535.0) as u16;
+            out.push((v & 0xFF) as u8);
+            out.push(((v >> 8) & 0xFF) as u8);
+        };
+
         // We extract the data. fitrs returns `Result<FitsData>`
         match hdu.read_data() {
             fitrs::FitsData::Characters(arr) => {
@@ -205,36 +225,39 @@ impl FitsSequenceReader {
             fitrs::FitsData::IntegersI32(arr) => {
                 let flat: Vec<Option<i32>> = arr.data;
                 for val_opt in flat {
-                    let val = val_opt.unwrap_or(0);
-                    // Usually astronomy images are 16-bit. If fits returned them as i32, we crush it to u16.
-                    let u16_val = val.max(0).min(65535) as u16;
-                    out_buffer.push((u16_val & 0xFF) as u8);
-                    out_buffer.push(((u16_val >> 8) & 0xFF) as u8);
+                    push_u16(&mut out_buffer, phys(val_opt.unwrap_or(0) as f64));
                 }
             }
             fitrs::FitsData::IntegersU32(arr) => {
                 let flat: Vec<Option<u32>> = arr.data;
                 for val_opt in flat {
-                    let val = val_opt.unwrap_or(0);
-                    let u16_val = val.min(65535) as u16;
-                    out_buffer.push((u16_val & 0xFF) as u8);
-                    out_buffer.push(((u16_val >> 8) & 0xFF) as u8);
+                    push_u16(&mut out_buffer, phys(val_opt.unwrap_or(0) as f64));
                 }
             }
             fitrs::FitsData::FloatingPoint32(arr) => {
+                // F3: los FITS float de astronomía guardan ADU/flujo FÍSICO
+                // (p.ej. 1234.5), no [0,1]. Multiplicar ciegamente por 65535
+                // saturaba TODO a blanco. Solo se re-escala si el frame
+                // completo parece normalizado (máx ≤ 1.5 tras BZERO/BSCALE).
                 let flat: Vec<f32> = arr.data;
+                let phys_max = flat
+                    .iter()
+                    .map(|&v| phys(v as f64))
+                    .fold(f64::MIN, f64::max);
+                let gain = if phys_max <= 1.5 && phys_max > 0.0 { 65535.0 } else { 1.0 };
                 for val in flat {
-                    let u16_val = (val * 65535.0).max(0.0).min(65535.0) as u16;
-                    out_buffer.push((u16_val & 0xFF) as u8);
-                    out_buffer.push(((u16_val >> 8) & 0xFF) as u8);
+                    push_u16(&mut out_buffer, phys(val as f64) * gain);
                 }
             }
             fitrs::FitsData::FloatingPoint64(arr) => {
                 let flat: Vec<f64> = arr.data;
+                let phys_max = flat
+                    .iter()
+                    .map(|&v| phys(v))
+                    .fold(f64::MIN, f64::max);
+                let gain = if phys_max <= 1.5 && phys_max > 0.0 { 65535.0 } else { 1.0 };
                 for val in flat {
-                    let u16_val = (val * 65535.0).max(0.0).min(65535.0) as u16;
-                    out_buffer.push((u16_val & 0xFF) as u8);
-                    out_buffer.push(((u16_val >> 8) & 0xFF) as u8);
+                    push_u16(&mut out_buffer, phys(val) * gain);
                 }
             }
         }

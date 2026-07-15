@@ -2377,8 +2377,13 @@ function hideProcessing() {
 window.hideProcessing = hideProcessing;
 
 function isCancellationError(error) {
+    // F3: SOLO por el mensaje. El OR con el flag global clasificaba como
+    // "cancelación" cualquier error REAL (fallo GPU, OOM, decode roto) que
+    // llegara en la ventana entre pulsar Cancelar y el cierre del overlay,
+    // y se lo tragaba con un WARN en vez de mostrarlo al usuario. Los
+    // aborts genuinos del backend siempre dicen "Cancelado/Cancelled".
     const msg = String(error || "").toLowerCase();
-    return isCancellationRequested || msg.includes("cancelad") || msg.includes("cancelled") || msg.includes("cancelling");
+    return msg.includes("cancelad") || msg.includes("cancelled") || msg.includes("cancelling");
 }
 
 function showLocalProcessing(msg = "Calculando...") {

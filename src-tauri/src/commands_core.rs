@@ -28,6 +28,13 @@ fn cancel_processing(app: tauri::AppHandle, state: State<'_, AppState>) {
     state
         .cancel_requested
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    // 3. F3: liberar las cachés DERIVADAS pesadas. Antes quedaban retenidas
+    //    hasta que la SIGUIENTE operación llamara clear_app_memory: cancelar
+    //    y no continuar dejaba cientos de MB anclados. Son recomputables
+    //    (deconv/wavelets/filtros se regeneran del máster al primer render).
+    state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// Espacio libre del volumen que contiene `path` — la UI lo muestra junto a
@@ -1557,11 +1564,11 @@ async fn process_batch_entry(
     }
 
     {
-        state.deconv_cache.lock().unwrap().clear();
+        state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
     {
-        state.wavelet_cache.lock().unwrap().clear();
-        state.filter_cache.lock().unwrap().clear();
+        state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
     state.active_req_id.store(0, Ordering::Relaxed);
 
@@ -1766,8 +1773,8 @@ async fn process_batch_entry(
         }
 
         // Estabilizacion Solar usando el Anchor
-        let mut anchor_guard = state.batch_anchor.lock().unwrap();
-        let mut dims_guard = state.batch_anchor_dims.lock().unwrap();
+        let mut anchor_guard = state.batch_anchor.lock().unwrap_or_else(|e| e.into_inner());
+        let mut dims_guard = state.batch_anchor_dims.lock().unwrap_or_else(|e| e.into_inner());
 
         if anchor_guard.is_none() {
             *anchor_guard = Some(solar_out.clone());
@@ -1885,7 +1892,7 @@ async fn process_batch_entry(
         // del lote. Dimensiones compartidas via batch_anchor_dims para que
         // todos los PNG salgan del mismo tamano aunque el auto-crop varie.
         let (tw, th) = {
-            let mut dims_guard = state.batch_anchor_dims.lock().unwrap();
+            let mut dims_guard = state.batch_anchor_dims.lock().unwrap_or_else(|e| e.into_inner());
             if dims_guard.0 == 0 || dims_guard.1 == 0 {
                 *dims_guard = (out_w, out_h);
             }
@@ -2394,7 +2401,7 @@ async fn crop_stacked_image(
     emit_progress(&app, "Recortando...", 0.0, None);
 
     let (new_data, new_w, new_h) = {
-        let mut guard = state.stacked_image.lock().unwrap();
+        let mut guard = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
         let img = match &*guard {
             Some(i) => i,
             None => return Err("Sin imagen para recortar".into()),
@@ -2425,9 +2432,9 @@ async fn crop_stacked_image(
     };
 
     {
-        state.deconv_cache.lock().unwrap().clear();
-        state.wavelet_cache.lock().unwrap().clear();
-        state.filter_cache.lock().unwrap().clear();
+        state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     emit_progress(&app, "Actualizando vista...", 50.0, None);
@@ -3725,7 +3732,7 @@ async fn apply_wavelets(
     state.license_manager.check_access()?;
     state.active_req_id.store(req_id, Ordering::Relaxed);
     let original = {
-        let s = state.stacked_image.lock().unwrap();
+        let s = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
         match &*s {
             Some(img) => img.clone(),
             None => return Err("Sin imagen".into()),
@@ -3869,7 +3876,7 @@ async fn apply_wavelets(
 async fn analyze_psf(state: State<'_, AppState>) -> Result<PsfResult, String> {
     state.license_manager.check_access()?;
     let original = {
-        let s = state.stacked_image.lock().unwrap();
+        let s = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
         match &*s {
             Some(img) => img.clone(),
             None => return Err("No hay imagen apilada.".into()),
@@ -3966,7 +3973,7 @@ async fn save_final_image(
     }
 
     let original = {
-        let s = state.stacked_image.lock().unwrap();
+        let s = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
         match &*s {
             Some(img) => img.clone(),
             None => return Err("Sin imagen".into()),
@@ -4094,7 +4101,7 @@ async fn export_mosaic_result(
     }
 
     let original = {
-        let s = state.stacked_image.lock().unwrap();
+        let s = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
         match &*s {
             Some(img) => img.clone(),
             None => return Err("No hay mosaico generado para guardar.".into()),
@@ -4963,7 +4970,7 @@ async fn get_current_stacked_derotation_preflight(
 ) -> Result<PlanetaryDerotationPreflight, String> {
     state.license_manager.check_access()?;
     let stack = {
-        let guard = state.stacked_image.lock().unwrap();
+        let guard = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
         guard
             .clone()
             .ok_or_else(|| "No hay una imagen apilada activa para derotar.".to_string())?
@@ -5164,7 +5171,7 @@ async fn apply_planetary_derotation(
     derot_save_rgb16_tiff(&out_path, &derotated, width, height)?;
 
     {
-        let mut stacked = state.stacked_image.lock().unwrap();
+        let mut stacked = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
         *stacked = Some(StackResult {
             data: derotated.clone(),
             width,
@@ -5173,9 +5180,9 @@ async fn apply_planetary_derotation(
             is_surface: false,
         });
     }
-    state.deconv_cache.lock().unwrap().clear();
-    state.wavelet_cache.lock().unwrap().clear();
-    state.filter_cache.lock().unwrap().clear();
+    state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
 
     let preview_base64 = derot_encode_preview(&derotated, width, height)?;
     emit_progress(&app, "Derotacion completada", 100.0, None);
@@ -5231,7 +5238,7 @@ async fn apply_current_stacked_planetary_derotation(
         .map_err(|e| format!("Tiempo de referencia invalido: {}", e))?;
 
     let stack = {
-        let guard = state.stacked_image.lock().unwrap();
+        let guard = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
         guard
             .clone()
             .ok_or_else(|| "No hay una imagen apilada activa para derotar.".to_string())?
@@ -5305,7 +5312,7 @@ async fn apply_current_stacked_planetary_derotation(
     derot_save_rgb16_tiff(&out_path, &derotated, width, height)?;
 
     {
-        let mut stacked = state.stacked_image.lock().unwrap();
+        let mut stacked = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
         *stacked = Some(StackResult {
             data: derotated.clone(),
             width,
@@ -5314,9 +5321,9 @@ async fn apply_current_stacked_planetary_derotation(
             is_surface: false,
         });
     }
-    state.deconv_cache.lock().unwrap().clear();
-    state.wavelet_cache.lock().unwrap().clear();
-    state.filter_cache.lock().unwrap().clear();
+    state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
 
     let preview_base64 = derot_encode_preview(&derotated, width, height)?;
     emit_progress(&app, "Derotacion completada", 100.0, None);
@@ -5785,7 +5792,7 @@ async fn fuse_planetary_derotation_stacks(
     derot_save_rgb16_tiff(&out_path, &fused, width, height)?;
 
     {
-        let mut stacked = state.stacked_image.lock().unwrap();
+        let mut stacked = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
         *stacked = Some(StackResult {
             data: fused.clone(),
             width,
@@ -5794,9 +5801,9 @@ async fn fuse_planetary_derotation_stacks(
             is_surface: false,
         });
     }
-    state.deconv_cache.lock().unwrap().clear();
-    state.wavelet_cache.lock().unwrap().clear();
-    state.filter_cache.lock().unwrap().clear();
+    state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
 
     let preview_base64 = derot_encode_preview(&fused, width, height)?;
     let time_span_sec = (max_jd - min_jd).abs() * 86400.0;
@@ -5993,7 +6000,7 @@ async fn fuse_planetary_derotation_rgb(
     derot_save_rgb16_tiff(&out_path, &out, width, height)?;
 
     {
-        let mut stacked = state.stacked_image.lock().unwrap();
+        let mut stacked = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
         *stacked = Some(StackResult {
             data: out.clone(),
             width,
@@ -6002,9 +6009,9 @@ async fn fuse_planetary_derotation_rgb(
             is_surface: false,
         });
     }
-    state.deconv_cache.lock().unwrap().clear();
-    state.wavelet_cache.lock().unwrap().clear();
-    state.filter_cache.lock().unwrap().clear();
+    state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
 
     let preview_base64 = derot_encode_preview(&out, width, height)?;
     let time_span_sec = (max_jd - min_jd).abs() * 86400.0;
@@ -7068,7 +7075,7 @@ async fn stitch_mosaic(
     };
 
     {
-        let mut locked = state.stacked_image.lock().unwrap();
+        let mut locked = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
         *locked = Some(StackResult {
             data: raw_u16.to_vec(),
             width: cv_w as usize,
@@ -7782,12 +7789,12 @@ fn apply_advanced_deringing(
 
 #[tauri::command]
 fn clear_app_memory(state: tauri::State<'_, AppState>) {
-    *state.stacked_image.lock().unwrap() = None;
-    state.deconv_cache.lock().unwrap().clear();
-    state.wavelet_cache.lock().unwrap().clear();
-    state.filter_cache.lock().unwrap().clear();
-    *state.batch_anchor.lock().unwrap() = None;
-    *state.batch_anchor_dims.lock().unwrap() = (0, 0);
+    *state.stacked_image.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *state.batch_anchor.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *state.batch_anchor_dims.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0);
     state.active_req_id.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -7797,11 +7804,11 @@ fn clear_app_memory(state: tauri::State<'_, AppState>) {
 /// sobrevivia mas alla del primer video).
 #[tauri::command]
 fn clear_stack_memory(state: tauri::State<'_, AppState>) {
-    *state.stacked_image.lock().unwrap() = None;
-    *state.deep_sky_result.lock().unwrap() = None;
-    state.deconv_cache.lock().unwrap().clear();
-    state.wavelet_cache.lock().unwrap().clear();
-    state.filter_cache.lock().unwrap().clear();
+    *state.stacked_image.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *state.deep_sky_result.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     state.active_req_id.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
