@@ -6250,55 +6250,62 @@ async fn stitch_mosaic(
             //     continue;
             // }
 
-            let mut potential_matches = Vec::new();
-
             // ROBUST MATCHING S.O.P. (Standard Operating Procedure):
             // 1. Find Best Match I->J
             // 2. Find Best Match J->I
             // 3. Keep ONLY if they agree (Cross-Check / Reciprocal Match)
+            //
+            // PR-2.6: PARALELO por feature. La fuerza bruta (hasta 3000×3000
+            // distancias Hamming de 61 bytes por par de teselas, más el
+            // cross-check) corría en UN solo hilo. par_iter preserva el orden
+            // de los matches → misma salida que el bucle secuencial.
+            let potential_matches: Vec<_> = feats_i
+                .par_iter()
+                .enumerate()
+                .filter_map(|(fi_idx, fi)| {
+                    // 1. Forward Match I -> J with LOWE'S RATIO and HAMMING DISTANCE
+                    let mut best_dist1 = u32::MAX;
+                    let mut best_dist2 = u32::MAX;
+                    let mut best_j = 0;
 
-            for (fi_idx, fi) in feats_i.iter().enumerate() {
-                // 1. Forward Match I -> J with LOWE'S RATIO and HAMMING DISTANCE
-                let mut best_dist1 = u32::MAX;
-                let mut best_dist2 = u32::MAX;
-                let mut best_j = 0;
+                    for (fj_idx, fj) in feats_j.iter().enumerate() {
+                        // Use new distance method on FeaturePoint directly
+                        let dist = fi.distance(fj);
 
-                for (fj_idx, fj) in feats_j.iter().enumerate() {
-                    // Use new distance method on FeaturePoint directly
-                    let dist = fi.distance(fj);
-
-                    if dist < best_dist1 {
-                        best_dist2 = best_dist1;
-                        best_dist1 = dist;
-                        best_j = fj_idx;
-                    } else if dist < best_dist2 {
-                        best_dist2 = dist;
-                    }
-                }
-
-                // Lowe's Ratio Test: 0.9 allows more valid matches for lunar surfaces.
-                // Hamming distance < 180 is also more relaxed for noisy data.
-                if best_dist1 < 180 && (best_dist1 as f32) < (best_dist2 as f32 * 0.9) {
-                    // 2. Backward Match J -> I (Cross Check for Safety)
-                    let fj_candidate = &feats_j[best_j];
-                    let mut best_back_dist = u32::MAX;
-                    let mut best_i_back = 0;
-
-                    for (fk_idx, fk) in feats_i.iter().enumerate() {
-                        let dist = fj_candidate.distance(fk);
-                        if dist < best_back_dist {
-                            best_back_dist = dist;
-                            best_i_back = fk_idx;
+                        if dist < best_dist1 {
+                            best_dist2 = best_dist1;
+                            best_dist1 = dist;
+                            best_j = fj_idx;
+                        } else if dist < best_dist2 {
+                            best_dist2 = dist;
                         }
                     }
 
-                    // 3. Consistency Check (Mutual Best Match)
-                    if best_i_back == fi_idx {
-                        // IT'S A MATCH! Mutual agreement.
-                        potential_matches.push((fi, fj_candidate, fi_idx));
+                    // Lowe's Ratio Test: 0.9 allows more valid matches for lunar surfaces.
+                    // Hamming distance < 180 is also more relaxed for noisy data.
+                    if best_dist1 < 180 && (best_dist1 as f32) < (best_dist2 as f32 * 0.9) {
+                        // 2. Backward Match J -> I (Cross Check for Safety)
+                        let fj_candidate = &feats_j[best_j];
+                        let mut best_back_dist = u32::MAX;
+                        let mut best_i_back = 0;
+
+                        for (fk_idx, fk) in feats_i.iter().enumerate() {
+                            let dist = fj_candidate.distance(fk);
+                            if dist < best_back_dist {
+                                best_back_dist = dist;
+                                best_i_back = fk_idx;
+                            }
+                        }
+
+                        // 3. Consistency Check (Mutual Best Match)
+                        if best_i_back == fi_idx {
+                            // IT'S A MATCH! Mutual agreement.
+                            return Some((fi, fj_candidate, fi_idx));
+                        }
                     }
-                }
-            }
+                    None
+                })
+                .collect();
 
             // RANSAC Translation
             // Find most common (dx, dy) with subpixel precision
@@ -6982,7 +6989,50 @@ async fn stitch_mosaic(
     // Image buffer provides as_raw which is &[u16] ordered R,G,B
     let raw_u16 = result_img.as_raw();
     emit_progress(&app, "Generando PrevisualizaciÃ³n...", 98.0, None);
-    let preview_bytes = to_8bit_preview_visual(raw_u16);
+    // PR-2.6: preview ACOTADO. Un mosaico lunar de 200+ MP generaba un PNG
+    // de "preview" a tamaño completo (estirado + codificado + decodificado
+    // por el WebView). Se reduce por box-average a ≤2400 px de lado — el
+    // TIFF 16-bit completo de al lado sigue siendo el dato real.
+    const PREVIEW_MAX_SIDE: u32 = 2400;
+    let (preview_bytes, pv_w, pv_h) = if cv_w.max(cv_h) > PREVIEW_MAX_SIDE {
+        let factor = (cv_w.max(cv_h) as f32 / PREVIEW_MAX_SIDE as f32).ceil() as usize;
+        let dw = (cv_w as usize / factor).max(1);
+        let dh = (cv_h as usize / factor).max(1);
+        let mut small = vec![0u16; dw * dh * 3];
+        small
+            .par_chunks_mut(dw * 3)
+            .enumerate()
+            .for_each(|(dy, row)| {
+                for dx in 0..dw {
+                    let (mut sr, mut sg, mut sb, mut n) = (0u64, 0u64, 0u64, 0u64);
+                    for oy in 0..factor {
+                        let sy = dy * factor + oy;
+                        if sy >= cv_h as usize {
+                            break;
+                        }
+                        for ox in 0..factor {
+                            let sx = dx * factor + ox;
+                            if sx >= cv_w as usize {
+                                break;
+                            }
+                            let idx = (sy * cv_w as usize + sx) * 3;
+                            sr += raw_u16[idx] as u64;
+                            sg += raw_u16[idx + 1] as u64;
+                            sb += raw_u16[idx + 2] as u64;
+                            n += 1;
+                        }
+                    }
+                    if n > 0 {
+                        row[dx * 3] = (sr / n) as u16;
+                        row[dx * 3 + 1] = (sg / n) as u16;
+                        row[dx * 3 + 2] = (sb / n) as u16;
+                    }
+                }
+            });
+        (to_8bit_preview_visual(&small), dw as u32, dh as u32)
+    } else {
+        (to_8bit_preview_visual(raw_u16), cv_w, cv_h)
+    };
 
     let mut raw_bytes = Vec::with_capacity(raw_u16.len() * 2);
     for s in raw_u16 {
@@ -7001,7 +7051,7 @@ async fn stitch_mosaic(
     let preview_writer = BufWriter::new(f_preview);
     let preview_encoder = image::codecs::png::PngEncoder::new(preview_writer);
     preview_encoder
-        .encode(&preview_bytes, cv_w, cv_h, image::ColorType::Rgb8)
+        .encode(&preview_bytes, pv_w, pv_h, image::ColorType::Rgb8)
         .map_err(|e| e.to_string())?;
     let path_preview_clean =
         clean_windows_path(dunce::canonicalize(&path_preview).unwrap_or(path_preview));

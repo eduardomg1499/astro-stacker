@@ -442,8 +442,12 @@ fn init_runtime() -> Option<GpuRuntime> {
     let mut req_limits = wgpu::Limits::default();
     req_limits.max_buffer_size = alim.max_buffer_size;
     req_limits.max_storage_buffer_binding_size = alim.max_storage_buffer_binding_size;
+    // PR-2.3: mínimo 10 (antes 8). El bind layout del ANÁLISIS declara 9
+    // storage buffers: en un adapter que reporte exactamente 8 por etapa se
+    // pedían 8, la creación del bind group fallaba y el análisis caía a CPU
+    // sin necesidad (degradación silenciosa en iGPU/drivers antiguos).
     req_limits.max_storage_buffers_per_shader_stage =
-        alim.max_storage_buffers_per_shader_stage.min(12).max(8);
+        alim.max_storage_buffers_per_shader_stage.min(12).max(10);
 
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
