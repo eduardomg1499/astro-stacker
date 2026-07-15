@@ -4040,6 +4040,13 @@ async fn save_final_image(
 
     emit_progress(&app, "Guardando...", 97.0, None);
 
+    if format_idx == 2 {
+        // F3: FITS 16-bit de salida (WinJUPOS/derotación, fotometría).
+        let name = format!("{}_Final.fits", path);
+        write_rgb16_fits(&name, &final_u16, original.width, original.height)?;
+        emit_progress(&app, "Listo", 100.0, None);
+        return Ok(format!("FITS 16-bit Guardado: {}", name));
+    }
     if format_idx == 0 {
         // PNG 16-BIT EXPORT (Requested: "tal cual" 16-bit preservation)
         let name = format!("{}_Final.png", path);

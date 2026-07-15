@@ -2430,6 +2430,7 @@ const ui = {
     btnSmartGrid: $("#btn-smart-grid"),
     btnSavePng: $("#btn-save-png"),
     btnSaveTiff: $("#btn-save-tiff"),
+    btnSaveFits: $("#btn-save-fits"),
     btnToggleLog: $("#btn-toggle-log"),
 
     analysisActions: $("#analysis-actions"),
@@ -7311,6 +7312,8 @@ async function fn_save(format_idx) {
 
 if (ui.btnSavePng) ui.btnSavePng.addEventListener("click", () => fn_save(0));
 if (ui.btnSaveTiff) ui.btnSaveTiff.addEventListener("click", () => fn_save(1));
+// F3: FITS 16-bit de salida (WinJUPOS/derotación, fotometría).
+if (ui.btnSaveFits) ui.btnSaveFits.addEventListener("click", () => fn_save(2));
 
 if (ui.btnToggleLog) ui.btnToggleLog.addEventListener("click", () => ui.consolePanel.classList.toggle("open"));
 

@@ -86,28 +86,22 @@ impl FitsSequenceReader {
             Fits::open(path).map_err(|e| format!("Error abriendo FITS {}: {:?}", path, e))?;
         let hdu = fits.get(0).ok_or("No Primary HDU in FITS")?;
 
-        let width_str = match hdu.value("NAXIS1") {
-            Some(v) => format!("{:?}", v),
-            None => "".to_string(),
+        // F3: leer por PATRÓN de HeaderValue en vez de parsear su Debug. El
+        // parser antiguo (parse_header_int sobre "{:?}") esperaba "Int(N)",
+        // pero fitrs formatea "IntegerNumber(N)" → todas las dimensiones
+        // caían al default (width/height=0): la LECTURA de secuencias FITS
+        // estaba efectivamente rota. Este helper es robusto a la variante.
+        let header_int = |kw: &str| -> Option<i64> {
+            match hdu.value(kw)? {
+                fitrs::HeaderValue::IntegerNumber(v) => Some(*v as i64),
+                fitrs::HeaderValue::RealFloatingNumber(v) => Some(*v as i64),
+                other => Self::parse_header_int(&format!("{:?}", other)),
+            }
         };
-        let height_str = match hdu.value("NAXIS2") {
-            Some(v) => format!("{:?}", v),
-            None => "".to_string(),
-        };
-        let bitpix_str = match hdu.value("BITPIX") {
-            Some(v) => format!("{:?}", v),
-            None => "".to_string(),
-        };
-
-        let naxis3_str = match hdu.value("NAXIS3") {
-            Some(v) => format!("{:?}", v),
-            None => "".to_string(),
-        };
-
-        let width = Self::parse_header_int(&width_str).unwrap_or(0) as usize;
-        let height = Self::parse_header_int(&height_str).unwrap_or(0) as usize;
-        let bitpix = Self::parse_header_int(&bitpix_str).unwrap_or(8);
-        let naxis3 = Self::parse_header_int(&naxis3_str).unwrap_or(1);
+        let width = header_int("NAXIS1").unwrap_or(0) as usize;
+        let height = header_int("NAXIS2").unwrap_or(0) as usize;
+        let bitpix = header_int("BITPIX").unwrap_or(8);
+        let naxis3 = header_int("NAXIS3").unwrap_or(1);
 
         let is_color = naxis3 >= 3;
 

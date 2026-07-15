@@ -1892,3 +1892,31 @@ mod f3_cache_prune_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod f3_fits_output_tests {
+    /// F3: el FITS 16-bit de salida debe releerse con las MISMAS dimensiones
+    /// y valores por el propio lector de secuencias FITS (que aplica
+    /// BZERO/BSCALE), cerrando el round-trip write→read.
+    #[test]
+    fn rgb16_fits_roundtrips_through_reader() {
+        let (w, h) = (5usize, 4usize);
+        let rgb: Vec<u16> = (0..w * h * 3).map(|i| ((i * 4099 + 7) % 65536) as u16).collect();
+        let dir = std::env::temp_dir().join(format!("zas_fits_out_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stack.fits");
+        crate::write_rgb16_fits(path.to_str().unwrap(), &rgb, w, h).unwrap();
+
+        let reader = crate::fits_sequence::FitsSequenceReader::new(path.to_str().unwrap())
+            .expect("FITS de salida legible por el lector de secuencias");
+        assert_eq!(reader.width, w);
+        assert_eq!(reader.height, h);
+        // El lector devuelve el PRIMER plano (canal R) como mono16 LE.
+        let frame = reader.get_frame(0);
+        assert!(!frame.is_empty(), "el frame no debe venir vacío");
+        let r0 = u16::from_le_bytes([frame[0], frame[1]]);
+        assert_eq!(r0, rgb[0], "el primer píxel R debe sobrevivir el round-trip FITS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -212,6 +212,57 @@ fn emit_analysis_telemetry(
 /// nombre mostraria la imagen ANTERIOR. Los previews de sesiones pasadas
 /// (>24 h) se purgan en cada escritura. Devuelve None si el temp no es
 /// escribible (el caller cae al data-URL clasico).
+/// F3: escritor FITS 16-bit para SALIDA planetaria/lunar/solar (WinJUPOS,
+/// fotometría, apilado posterior). `rgb` interleaved u16 (w*h*3). Estándar
+/// FITS: BITPIX=16 (i16 con BZERO=32768 para el rango sin signo 0..65535),
+/// big-endian, datos PLANARES por canal (todo R, luego G, luego B) con
+/// NAXIS=3/NAXIS3=3; el bloque de datos se rellena a múltiplo de 2880 bytes.
+fn write_rgb16_fits(path: &str, rgb: &[u16], width: usize, height: usize) -> Result<(), String> {
+    if rgb.len() != width * height * 3 {
+        return Err("Buffer RGB16 inválido para FITS".into());
+    }
+    let mut header = String::new();
+    let mut card = |kw: &str, val: &str| {
+        // Cada card ocupa EXACTAMENTE 80 caracteres.
+        let line = if val.is_empty() {
+            format!("{:<80}", kw)
+        } else {
+            format!("{:<8}= {:>20}{:<50}", kw, val, "")
+        };
+        header.push_str(&line[..80]);
+    };
+    card("SIMPLE", "T");
+    card("BITPIX", "16");
+    card("NAXIS", "3");
+    card("NAXIS1", &width.to_string());
+    card("NAXIS2", &height.to_string());
+    card("NAXIS3", "3");
+    card("BZERO", "32768");
+    card("BSCALE", "1");
+    card("COMMENT   Zenith Astro Stacker — planetary 16-bit RGB", "");
+    card("END", "");
+    // Relleno del header a múltiplo de 2880 con espacios.
+    while header.len() % 2880 != 0 {
+        header.push(' ');
+    }
+
+    let n = width * height;
+    let mut data = Vec::with_capacity(n * 3 * 2 + 2880);
+    // Planar R,G,B; i16 big-endian con offset −32768 (BZERO lo revierte).
+    for c in 0..3 {
+        for i in 0..n {
+            let signed = rgb[i * 3 + c] as i32 - 32768;
+            data.extend_from_slice(&(signed as i16).to_be_bytes());
+        }
+    }
+    while data.len() % 2880 != 0 {
+        data.push(0);
+    }
+    let mut out = header.into_bytes();
+    out.extend_from_slice(&data);
+    std::fs::write(path, out).map_err(|e| e.to_string())
+}
+
 fn save_preview_png_to_temp(png_bytes: &[u8], tag: &str) -> Option<String> {
     let dir = std::env::temp_dir().join("astro_stacker_previews");
     std::fs::create_dir_all(&dir).ok()?;
