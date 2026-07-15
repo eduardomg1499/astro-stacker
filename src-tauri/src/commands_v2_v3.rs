@@ -1090,7 +1090,10 @@ fn benchmark_ffmpeg_decode_route(
     probe
 }
 
-async fn perform_standardized_analysis(
+// PR-2.5: SÍNCRONA (antes async sin ningún .await interno): minutos de
+// cómputo rayon bloqueaban un worker del runtime async de Tauri y retrasaban
+// cualquier otro comando. Los comandos la envuelven en spawn_blocking.
+fn perform_standardized_analysis(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, AppState>,
     path: &str,
@@ -1294,10 +1297,12 @@ async fn perform_standardized_analysis(
                         },
                         recommended_pct: compute_smart_stack_pct(qg, &target_type, is_surface),
                         quality_graph: qg.iter().enumerate().map(|(i, &v)| (i, v as f64)).collect(),
-                        preview_base64: format!(
-                            "data:image/png;base64,{}",
-                            general_purpose::STANDARD.encode(&buf)
-                        ),
+                        // PR-2.5: temp + asset protocol (ver arriba).
+                        preview_base64: save_preview_png_to_temp(&buf, "analysis")
+                            .unwrap_or_else(|| format!(
+                                "data:image/png;base64,{}",
+                                general_purpose::STANDARD.encode(&buf)
+                            )),
                         path: path.to_string(),
                         ap_points: vec![],
                         best_frame_idx: bi,
@@ -2431,10 +2436,18 @@ async fn perform_standardized_analysis(
         },
         recommended_pct: compute_smart_stack_pct(&qg, &target_type, is_surface),
         quality_graph: qg.iter().enumerate().map(|(i, &v)| (i, v as f64)).collect(),
-        preview_base64: format!(
-            "data:image/png;base64,{}",
-            general_purpose::STANDARD.encode(&buf)
-        ),
+        // PR-2.5: preview por archivo temporal + asset protocol (patrón del
+        // apilado). El data-URL base64 a resolución completa duplicaba el
+        // pico de RAM del WebView y cruzaba el IPC como string de varios MB
+        // (WebView2 es frágil con strings >50 MB). Fallback a base64 solo si
+        // el temp no es escribible; setImageAndWait/toDisplaySrc ya
+        // normalizan rutas planas con convertFileSrc.
+        preview_base64: save_preview_png_to_temp(&buf, "analysis").unwrap_or_else(|| {
+            format!(
+                "data:image/png;base64,{}",
+                general_purpose::STANDARD.encode(&buf)
+            )
+        }),
         best_frame_idx,
         path: path.to_string(),
         ap_points: vec![],
@@ -2457,19 +2470,25 @@ async fn analyze_video_v2(
     state
         .cancel_requested
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    perform_standardized_analysis(
-        &app,
-        &state,
-        &path,
-        is_surface,
-        target_type, // NEW
-        warping_analysis,
-        bayer_override,
-        anchor_override,
-        progress_prefix,
-        ComputePolicy::Hybrid,
-    )
+    // PR-2.5: el análisis corre en el pool blocking (no ocupa un worker del
+    // runtime async — antes otros comandos se encolaban minutos).
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        perform_standardized_analysis(
+            &app,
+            &state,
+            &path,
+            is_surface,
+            target_type, // NEW
+            warping_analysis,
+            bayer_override,
+            anchor_override,
+            progress_prefix,
+            ComputePolicy::Hybrid,
+        )
+    })
     .await
+    .map_err(|e| format!("El hilo de análisis terminó inesperadamente: {e}"))?
 }
 
 /// Contrato tipado del análisis planetario. El wrapper legado permanece para
@@ -2484,19 +2503,24 @@ async fn analyze_planetary(
     state
         .cancel_requested
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    perform_standardized_analysis(
-        &app,
-        &state,
-        &request.path,
-        request.is_surface,
-        request.target_type,
-        request.warping_analysis,
-        request.bayer_override,
-        request.anchor_override,
-        request.progress_prefix,
-        request.compute_policy,
-    )
+    // PR-2.5: pool blocking (ver analyze_video_v2).
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        perform_standardized_analysis(
+            &app,
+            &state,
+            &request.path,
+            request.is_surface,
+            request.target_type,
+            request.warping_analysis,
+            request.bayer_override,
+            request.anchor_override,
+            request.progress_prefix,
+            request.compute_policy,
+        )
+    })
     .await
+    .map_err(|e| format!("El hilo de análisis terminó inesperadamente: {e}"))?
 }
 
 #[tauri::command]
@@ -2930,31 +2954,36 @@ async fn stack_video_liquid_warping(
     state
         .cancel_requested
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    stack_video_liquid_warping_impl(
-        &app,
-        &state,
-        path,
-        percent,
-        custom_points,
-        drizzle,
-        is_surface,
-        bayer_override,
-        ap_size,
-        sharpened,
-        sharpen_intensity,
-        double_pass,
-        warping_analysis,
-        anchor_override,
-        stacking_roi,
-        normalize_colors,
-        is_v3,
-        target_type,
-        None,
-        keep_full_frame,
-        align_rgb,
-        gpu_mode,
-    )
+    // PR-2.5: pool blocking (ver analyze_video_v2).
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        stack_video_liquid_warping_impl(
+            &app,
+            &state,
+            path,
+            percent,
+            custom_points,
+            drizzle,
+            is_surface,
+            bayer_override,
+            ap_size,
+            sharpened,
+            sharpen_intensity,
+            double_pass,
+            warping_analysis,
+            anchor_override,
+            stacking_roi,
+            normalize_colors,
+            is_v3,
+            target_type,
+            None,
+            keep_full_frame,
+            align_rgb,
+            gpu_mode,
+        )
+    })
     .await
+    .map_err(|e| format!("El hilo de apilado terminó inesperadamente: {e}"))?
 }
 
 /// Contrato tipado del segundo paso planetario. Toda decisión de GPU se delega
@@ -2969,38 +2998,45 @@ async fn run_planetary_stack(
     state
         .cancel_requested
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    stack_video_liquid_warping_impl(
-        &app,
-        &state,
-        request.path,
-        request.percent,
-        request.custom_points,
-        request.drizzle,
-        request.is_surface,
-        request.bayer_override,
-        request.ap_size,
-        request.sharpened,
-        request.sharpen_intensity,
-        request.double_pass,
-        request.warping_analysis,
-        request.anchor_override,
-        request.stacking_roi,
-        request.normalize_colors,
-        request.is_v3,
-        request.target_type,
-        None,
-        request.keep_full_frame,
-        request.align_rgb,
-        Some(request.compute_policy.legacy_value().into()),
-    )
+    // PR-2.5: pool blocking (ver analyze_video_v2).
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        stack_video_liquid_warping_impl(
+            &app,
+            &state,
+            request.path,
+            request.percent,
+            request.custom_points,
+            request.drizzle,
+            request.is_surface,
+            request.bayer_override,
+            request.ap_size,
+            request.sharpened,
+            request.sharpen_intensity,
+            request.double_pass,
+            request.warping_analysis,
+            request.anchor_override,
+            request.stacking_roi,
+            request.normalize_colors,
+            request.is_v3,
+            request.target_type,
+            None,
+            request.keep_full_frame,
+            request.align_rgb,
+            Some(request.compute_policy.legacy_value().into()),
+        )
+    })
     .await
+    .map_err(|e| format!("El hilo de apilado terminó inesperadamente: {e}"))?
 }
 
 /// Internal engine entry point — callable from other commands (batch mode)
 /// with `&AppHandle`/`&State` (same pattern as perform_standardized_analysis).
 /// `progress_prefix` lets batch mode tag progress messages ("[2/7] …").
 #[allow(clippy::too_many_arguments)]
-async fn stack_video_liquid_warping_impl(
+// PR-2.5: SÍNCRONA (antes async sin ningún .await interno) — ver
+// perform_standardized_analysis; los comandos usan spawn_blocking.
+fn stack_video_liquid_warping_impl(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, AppState>,
     path: String,
@@ -4810,7 +4846,17 @@ async fn stack_video_liquid_warping_impl(
                     let done = completed.max(1) as u64;
                     let (ram_mb, cpu_percent, io_read_mb, io_write_mb) = {
                         let mut s = tele_sys_ref.lock().unwrap();
-                        s.refresh_all();
+                        // PR-2.5: refresh_all() enumeraba TODOS los procesos
+                        // del sistema bajo mutex cada 25 frames — 10-40
+                        // escaneos completos de la tabla de procesos POR
+                        // SEGUNDO en SER mono rápidos, robando CPU justo en
+                        // la fase que debe saturar el warp (mismo arreglo que
+                        // ya tenía la telemetría del análisis).
+                        s.refresh_memory();
+                        s.refresh_cpu();
+                        if let Ok(pid) = sysinfo::get_current_pid() {
+                            s.refresh_process(pid);
+                        }
                         let process = sysinfo::get_current_pid()
                             .ok()
                             .and_then(|pid| s.process(pid));

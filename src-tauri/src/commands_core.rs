@@ -1642,8 +1642,7 @@ async fn process_batch_entry(
             // El lote respeta el mismo selector GPU de Ajustes que el flujo
             // individual (antes forzaba Auto e ignoraba la elección).
             ComputePolicy::from_legacy(gpu_mode.as_deref()),
-        )
-        .await?;
+        )?; // PR-2.5: síncrona (el lote ya corre por entrada, sin .await)
         cached_opt = load_cached_analysis(&cache_path);
     }
 
@@ -1712,8 +1711,7 @@ async fn process_batch_entry(
         None, // keep_full_frame: el lote usa el recorte por defecto
         align_rgb, // switch de usuario (mismo toggle que el flujo individual)
         gpu_mode.clone(), // GPU compute: mismo select de Ajustes que el flujo individual
-    )
-    .await?;
+    )?; // PR-2.5: síncrona (el lote ya corre por entrada, sin .await)
 
     // 3. Recoger el resultado del motor (y liberar el slot compartido).
     let engine_stack = state
@@ -3852,10 +3850,19 @@ async fn apply_wavelets(
         )
         .map_err(|e| e.to_string())?;
     emit_progress(&app, "Listo", 100.0, None);
-    Ok(format!(
-        "data:image/png;base64,{}",
-        general_purpose::STANDARD.encode(&png)
-    ))
+    // PR-2.5: el lazo MÁS caliente de la app (arrastre de sliders) enviaba
+    // un data-URL base64 a resolución completa por IPC en CADA render
+    // (decenas de MB por tick en mosaicos 4K, retenidos en el heap del
+    // WebView). Archivo temporal + asset protocol como el apilado; nombre
+    // único por render (el WebView cachea por URL) con poda agresiva de los
+    // previews de editor anteriores. Fallback a base64 si el temp falla.
+    prune_editor_previews_to_latest();
+    Ok(save_preview_png_to_temp(&png, "editor").unwrap_or_else(|| {
+        format!(
+            "data:image/png;base64,{}",
+            general_purpose::STANDARD.encode(&png)
+        )
+    }))
 }
 
 #[tauri::command]

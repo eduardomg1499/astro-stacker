@@ -31,6 +31,33 @@ fn emit_progress(app: &tauri::AppHandle, step: &str, pct: f32, details: Option<S
     } else {
         0.0
     };
+    // PR-2.5: THROTTLE temporal (~80 ms). Los bucles calientes se autolimitan
+    // por módulo de frames, pero en SER mono muy rápidos la frecuencia real
+    // seguía acoplada a los fps (decenas de eventos IPC/seg → jank en el
+    // WebView). Se agrupan solo los mensajes que difieren ÚNICAMENTE en sus
+    // números ("Frame 12/500" vs "Frame 37/500"): los hitos con texto
+    // distinto y los extremos de la barra pasan siempre.
+    {
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        static LAST_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+        static LAST_KEY: AtomicU64 = AtomicU64::new(0);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for b in step.bytes().filter(|b| !b.is_ascii_digit()) {
+            b.hash(&mut hasher);
+        }
+        let key = hasher.finish();
+        let now_ms = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+        if pct > 0.5 && pct < 99.5 && key == LAST_KEY.load(Ordering::Relaxed) {
+            let last = LAST_MS.load(Ordering::Relaxed);
+            if now_ms.wrapping_sub(last) < 80 {
+                return;
+            }
+        }
+        LAST_KEY.store(key, Ordering::Relaxed);
+        LAST_MS.store(now_ms, Ordering::Relaxed);
+    }
     let _ = app.emit(
         "progress",
         Progress {
@@ -210,6 +237,36 @@ fn save_preview_png_to_temp(png_bytes: &[u8], tag: &str) -> Option<String> {
     let path = dir.join(format!("{}_{}.png", tag, millis));
     std::fs::write(&path, png_bytes).ok()?;
     Some(clean_windows_path(path))
+}
+
+/// PR-2.5: poda agresiva de los previews del EDITOR (tag "editor_"). Cada
+/// render de sliders escribe un archivo nuevo (el WebView cachea por URL,
+/// reutilizar nombre mostraría la imagen vieja); sin esta poda una sesión
+/// larga de ajustes acumularía cientos de MB en el temp. Se conservan los
+/// de los últimos 60 s (renders aún en vuelo en el visor).
+fn prune_editor_previews_to_latest() {
+    let dir = std::env::temp_dir().join("astro_stacker_previews");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let is_editor = name.to_string_lossy().starts_with("editor_");
+        if !is_editor {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|d| d.as_secs() > 60)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 fn load_font_from_path(path: &str) -> Option<Font<'static>> {
