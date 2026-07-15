@@ -4951,9 +4951,9 @@ fn stack_video_liquid_warping_impl(
                         } else {
                             normalize_planetary_frame_exposure_rgb_inplace(&mut sc.rgb_buf, surface_ref_p90);
                         }
-                        for i in 0..w_in * h_in {
-                            sc.mono_buf[i] = sc.rgb_buf[i * 3 + 1];
-                        }
+                        // PR-2.2: deinterleave NEON en aarch64 (antes gather
+                        // escalar stride-3 por frame y por pasada).
+                        extract_green_channel_into(&sc.rgb_buf, &mut sc.mono_buf[..w_in * h_in]);
                     }
 
                     // PLANETARY per-frame CoG re-centering — SMALL discs only.

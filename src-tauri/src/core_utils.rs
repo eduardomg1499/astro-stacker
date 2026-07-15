@@ -269,6 +269,35 @@ fn prune_editor_previews_to_latest() {
     }
 }
 
+/// PR-2.2: deinterleave del canal VERDE (RGB u16 interleaved → mono) con
+/// vld3q_u16 en aarch64 (8 píxeles por iteración). El gather escalar con
+/// stride 3 corría por frame y por pasada en el bucle de acumulación color
+/// (~8.3M iteraciones/frame a 4K, hostil al prefetcher). En x86 se deja el
+/// escalar: LLVM lo autovectoriza con shuffles y no hay vld3 equivalente.
+fn extract_green_channel_into(rgb: &[u16], out: &mut [u16]) {
+    let n = out.len().min(rgb.len() / 3);
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            use std::arch::aarch64::*;
+            let mut i = 0usize;
+            while i + 8 <= n {
+                let v = vld3q_u16(rgb.as_ptr().add(i * 3));
+                vst1q_u16(out.as_mut_ptr().add(i), v.1);
+                i += 8;
+            }
+            for k in i..n {
+                out[k] = rgb[k * 3 + 1];
+            }
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for k in 0..n {
+        out[k] = rgb[k * 3 + 1];
+    }
+}
+
 fn load_font_from_path(path: &str) -> Option<Font<'static>> {
     if let Ok(data) = fs::read(path) {
         if let Some(font) = Font::try_from_vec(data) {

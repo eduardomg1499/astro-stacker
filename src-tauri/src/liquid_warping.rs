@@ -588,6 +588,98 @@ unsafe fn fast_sample_rgb_avx2(
     )
 }
 
+/// PR-2.2: espejo NEON del sampler RGB AVX2. En Apple Silicon el fallback
+/// CPU del warp (canvas pequeño, GPU caída, ZAS_FORCE_CPU) corría 100 %
+/// ESCALAR — la etapa por-frame más cara del pipeline sin vectorizar en la
+/// plataforma objetivo de macOS. Misma disciplina que AVX2: mul+add (sin
+/// FMA, que cambiaría el redondeo), lanes de relleno a 0 para las sumas y a
+/// 65535 para el mínimo; min/max exactos, sumas <1 ULP vs escalar.
+#[allow(clippy::type_complexity)]
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn fast_sample_rgb_neon(
+    rgb_buf: &[u16],
+    w_in: usize,
+    sx0: isize,
+    sy0: isize,
+    w_xs: &[f32; 6],
+    fy: f32,
+    lut: &LanczosLUT,
+    drop_size: f32,
+) -> (f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) {
+    use std::arch::aarch64::*;
+    let wxs_lo = vld1q_f32(w_xs.as_ptr());
+    let wxs_hi = vld1q_f32([w_xs[4], w_xs[5], 0.0f32, 0.0].as_ptr());
+    let pad_hi = vdupq_n_f32(65535.0);
+    let mut sum_r_lo = vdupq_n_f32(0.0);
+    let mut sum_r_hi = vdupq_n_f32(0.0);
+    let mut sum_g_lo = vdupq_n_f32(0.0);
+    let mut sum_g_hi = vdupq_n_f32(0.0);
+    let mut sum_b_lo = vdupq_n_f32(0.0);
+    let mut sum_b_hi = vdupq_n_f32(0.0);
+    let mut sum_w_lo = vdupq_n_f32(0.0);
+    let mut sum_w_hi = vdupq_n_f32(0.0);
+    let mut vmin_r = pad_hi;
+    let mut vmin_g = pad_hi;
+    let mut vmin_b = pad_hi;
+    let mut vmax_r = vdupq_n_f32(0.0);
+    let mut vmax_g = vdupq_n_f32(0.0);
+    let mut vmax_b = vdupq_n_f32(0.0);
+    for ky in -2..=3isize {
+        let wy = lut.get(fy - ky as f32, drop_size);
+        if wy.abs() < 0.001 {
+            continue;
+        }
+        let src_row = (sy0 + ky) as usize * w_in;
+        // base..base+18 son las 6 columnas RGB; índices garantizados en rango
+        // por el guard del fast-path (sx0>=2, sx0+3<w_in, sy0>=2, sy0+3<h_in).
+        let base = (src_row + (sx0 - 2) as usize) * 3;
+        let g = |o: usize| *rgb_buf.get_unchecked(base + o) as f32;
+        let rv_lo = vld1q_f32([g(0), g(3), g(6), g(9)].as_ptr());
+        let rv_hi = vld1q_f32([g(12), g(15), 0.0f32, 0.0].as_ptr());
+        let gv_lo = vld1q_f32([g(1), g(4), g(7), g(10)].as_ptr());
+        let gv_hi = vld1q_f32([g(13), g(16), 0.0f32, 0.0].as_ptr());
+        let bv_lo = vld1q_f32([g(2), g(5), g(8), g(11)].as_ptr());
+        let bv_hi = vld1q_f32([g(14), g(17), 0.0f32, 0.0].as_ptr());
+        let wyv = vdupq_n_f32(wy);
+        let wf_lo = vmulq_f32(wxs_lo, wyv);
+        let wf_hi = vmulq_f32(wxs_hi, wyv);
+        sum_r_lo = vaddq_f32(sum_r_lo, vmulq_f32(rv_lo, wf_lo));
+        sum_r_hi = vaddq_f32(sum_r_hi, vmulq_f32(rv_hi, wf_hi));
+        sum_g_lo = vaddq_f32(sum_g_lo, vmulq_f32(gv_lo, wf_lo));
+        sum_g_hi = vaddq_f32(sum_g_hi, vmulq_f32(gv_hi, wf_hi));
+        sum_b_lo = vaddq_f32(sum_b_lo, vmulq_f32(bv_lo, wf_lo));
+        sum_b_hi = vaddq_f32(sum_b_hi, vmulq_f32(bv_hi, wf_hi));
+        sum_w_lo = vaddq_f32(sum_w_lo, wf_lo);
+        sum_w_hi = vaddq_f32(sum_w_hi, wf_hi);
+        // Mínimo: lanes de relleno neutralizados a 65535.
+        vmin_r = vminq_f32(vmin_r, rv_lo);
+        vmin_r = vminq_f32(vmin_r, vld1q_f32([g(12), g(15), 65535.0f32, 65535.0].as_ptr()));
+        vmin_g = vminq_f32(vmin_g, gv_lo);
+        vmin_g = vminq_f32(vmin_g, vld1q_f32([g(13), g(16), 65535.0f32, 65535.0].as_ptr()));
+        vmin_b = vminq_f32(vmin_b, bv_lo);
+        vmin_b = vminq_f32(vmin_b, vld1q_f32([g(14), g(17), 65535.0f32, 65535.0].as_ptr()));
+        vmax_r = vmaxq_f32(vmax_r, rv_lo);
+        vmax_r = vmaxq_f32(vmax_r, rv_hi);
+        vmax_g = vmaxq_f32(vmax_g, gv_lo);
+        vmax_g = vmaxq_f32(vmax_g, gv_hi);
+        vmax_b = vmaxq_f32(vmax_b, bv_lo);
+        vmax_b = vmaxq_f32(vmax_b, bv_hi);
+    }
+    (
+        vaddvq_f32(sum_r_lo) + vaddvq_f32(sum_r_hi),
+        vaddvq_f32(sum_g_lo) + vaddvq_f32(sum_g_hi),
+        vaddvq_f32(sum_b_lo) + vaddvq_f32(sum_b_hi),
+        vaddvq_f32(sum_w_lo) + vaddvq_f32(sum_w_hi),
+        vminvq_f32(vmin_r),
+        vminvq_f32(vmin_g),
+        vminvq_f32(vmin_b),
+        vmaxvq_f32(vmax_r),
+        vmaxvq_f32(vmax_g),
+        vmaxvq_f32(vmax_b),
+    )
+}
+
 #[allow(clippy::type_complexity)]
 #[inline(always)]
 fn fast_sample_rgb(
@@ -608,6 +700,12 @@ fn fast_sample_rgb(
             };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON es baseline en aarch64: sin detección en runtime.
+        return unsafe { fast_sample_rgb_neon(rgb_buf, w_in, sx0, sy0, w_xs, fy, lut, drop_size) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     fast_sample_rgb_scalar(rgb_buf, w_in, sx0, sy0, w_xs, fy, lut, drop_size)
 }
 
@@ -1011,8 +1109,65 @@ unsafe fn fast_sample_mono_avx2(
     )
 }
 
-/// Despacho: usa AVX2 si está disponible; si no, el escalar (mismo resultado
-/// salvo <1 ULP en la suma). En aarch64/otros usa el escalar.
+/// PR-2.2: espejo NEON del sampler mono AVX2 (ver fast_sample_rgb_neon).
+/// El mono es el caso más común en planetaria/solar: era la pérdida escalar
+/// más grave del fallback CPU en Apple Silicon.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn fast_sample_mono_neon(
+    mono_buf: &[u16],
+    w_in: usize,
+    sx0: isize,
+    sy0: isize,
+    w_xs: &[f32; 6],
+    fy: f32,
+    lut: &LanczosLUT,
+    drop_size: f32,
+) -> (f32, f32, f32, f32) {
+    use std::arch::aarch64::*;
+    let wxs_lo = vld1q_f32(w_xs.as_ptr());
+    let wxs_hi = vld1q_f32([w_xs[4], w_xs[5], 0.0f32, 0.0].as_ptr());
+    let mut sum_v_lo = vdupq_n_f32(0.0);
+    let mut sum_v_hi = vdupq_n_f32(0.0);
+    let mut sum_w_lo = vdupq_n_f32(0.0);
+    let mut sum_w_hi = vdupq_n_f32(0.0);
+    let mut vmin = vdupq_n_f32(65535.0);
+    let mut vmax = vdupq_n_f32(0.0);
+    let base = (sx0 - 2) as usize;
+    for ky in -2..=3isize {
+        let wy = lut.get(fy - ky as f32, drop_size);
+        if wy.abs() < 0.001 {
+            continue;
+        }
+        let p = mono_buf.as_ptr().add((sy0 + ky) as usize * w_in + base);
+        // Carga de EXACTAMENTE 6 u16 (4 vectorizados + 2 escalares): el guard
+        // del fast-path solo garantiza índices [sx0-2 .. sx0+3].
+        let pv_lo = vcvtq_f32_u32(vmovl_u16(vld1_u16(p)));
+        let p4 = *p.add(4) as f32;
+        let p5 = *p.add(5) as f32;
+        let pv_hi = vld1q_f32([p4, p5, 0.0f32, 0.0].as_ptr());
+        let wyv = vdupq_n_f32(wy);
+        let wf_lo = vmulq_f32(wxs_lo, wyv);
+        let wf_hi = vmulq_f32(wxs_hi, wyv);
+        sum_v_lo = vaddq_f32(sum_v_lo, vmulq_f32(pv_lo, wf_lo));
+        sum_v_hi = vaddq_f32(sum_v_hi, vmulq_f32(pv_hi, wf_hi));
+        sum_w_lo = vaddq_f32(sum_w_lo, wf_lo);
+        sum_w_hi = vaddq_f32(sum_w_hi, wf_hi);
+        vmin = vminq_f32(vmin, pv_lo);
+        vmin = vminq_f32(vmin, vld1q_f32([p4, p5, 65535.0f32, 65535.0].as_ptr()));
+        vmax = vmaxq_f32(vmax, pv_lo);
+        vmax = vmaxq_f32(vmax, pv_hi); // lanes de relleno = 0, neutros (datos >= 0)
+    }
+    (
+        vaddvq_f32(sum_v_lo) + vaddvq_f32(sum_v_hi),
+        vaddvq_f32(sum_w_lo) + vaddvq_f32(sum_w_hi),
+        vminvq_f32(vmin),
+        vmaxvq_f32(vmax),
+    )
+}
+
+/// Despacho: AVX2 en x86_64, NEON en aarch64 (baseline, sin detección),
+/// escalar como red de seguridad (mismo resultado salvo <1 ULP en la suma).
 #[inline(always)]
 fn fast_sample_mono(
     mono_buf: &[u16],
@@ -1032,6 +1187,11 @@ fn fast_sample_mono(
             };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { fast_sample_mono_neon(mono_buf, w_in, sx0, sy0, w_xs, fy, lut, drop_size) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     fast_sample_mono_scalar(mono_buf, w_in, sx0, sy0, w_xs, fy, lut, drop_size)
 }
 
@@ -1925,5 +2085,110 @@ mod drizzle_tests {
             rmse_drz < rmse_bil * 0.8,
             "el drizzle drop ({rmse_drz:.1}) debe superar claramente al upsample bilineal ({rmse_bil:.1})"
         );
+    }
+}
+
+// ===========================================================================
+// PR-2.2: el fast-path NEON debe coincidir con el escalar (mismo contrato que
+// la validación AVX2 de arriba): min/max EXACTOS; sumas <1 ULP por el
+// reordenamiento. Solo se compila/ejecuta en aarch64.
+// ===========================================================================
+#[cfg(all(test, target_arch = "aarch64"))]
+mod simd_validation_neon {
+    use super::*;
+
+    #[test]
+    fn mono_fast_sample_neon_matches_scalar() {
+        let w_in = 96usize;
+        let h_in = 96usize;
+        let mut buf = vec![0u16; w_in * h_in];
+        let mut s = 0x1234_5678u32;
+        for v in buf.iter_mut() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = (s >> 16) as u16;
+        }
+        let lut = LanczosLUT::new(30000, 3.0);
+        let drop_size = 1.0f32;
+        let mut max_diff_v = 0.0f32;
+        let mut max_diff_w = 0.0f32;
+        let mut checked = 0u64;
+        for sy0 in 2..(h_in as isize - 3) {
+            for sx0 in 2..(w_in as isize - 3) {
+                for &fx in &[0.0f32, 0.2, 0.5, 0.51, 0.77, 0.999] {
+                    for &fy in &[0.0f32, 0.13, 0.49, 0.5, 0.86, 0.999] {
+                        let mut w_xs = [0.0f32; 6];
+                        for (i, kx) in (-2..=3).enumerate() {
+                            w_xs[i] = lut.get(fx - kx as f32, drop_size);
+                        }
+                        let sc = fast_sample_mono_scalar(
+                            &buf, w_in, sx0, sy0, &w_xs, fy, &lut, drop_size,
+                        );
+                        let si = unsafe {
+                            fast_sample_mono_neon(&buf, w_in, sx0, sy0, &w_xs, fy, &lut, drop_size)
+                        };
+                        assert_eq!(sc.2, si.2, "min difiere en sx0={sx0} sy0={sy0}");
+                        assert_eq!(sc.3, si.3, "max difiere en sx0={sx0} sy0={sy0}");
+                        max_diff_v = max_diff_v.max((sc.0 - si.0).abs());
+                        max_diff_w = max_diff_w.max((sc.1 - si.1).abs());
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "NEON mono validado en {checked} casos. max_diff sum_v={max_diff_v}, sum_w={max_diff_w}"
+        );
+        assert!(max_diff_v < 0.5, "sum_v difiere demasiado: {max_diff_v}");
+        assert!(max_diff_w < 1e-3, "sum_w difiere demasiado: {max_diff_w}");
+    }
+
+    #[test]
+    fn rgb_fast_sample_neon_matches_scalar() {
+        let w_in = 80usize;
+        let h_in = 80usize;
+        let mut buf = vec![0u16; w_in * h_in * 3];
+        let mut s = 0x9E37_79B9u32;
+        for v in buf.iter_mut() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = (s >> 16) as u16;
+        }
+        let lut = LanczosLUT::new(30000, 3.0);
+        let drop_size = 1.0f32;
+        let mut max_diff_sum = 0.0f32;
+        let mut checked = 0u64;
+        for sy0 in 2..(h_in as isize - 3) {
+            for sx0 in 2..(w_in as isize - 3) {
+                for &fx in &[0.0f32, 0.2, 0.5, 0.51, 0.77, 0.999] {
+                    for &fy in &[0.0f32, 0.13, 0.49, 0.5, 0.86, 0.999] {
+                        let mut w_xs = [0.0f32; 6];
+                        for (i, kx) in (-2..=3).enumerate() {
+                            w_xs[i] = lut.get(fx - kx as f32, drop_size);
+                        }
+                        let sc = fast_sample_rgb_scalar(
+                            &buf, w_in, sx0, sy0, &w_xs, fy, &lut, drop_size,
+                        );
+                        let si = unsafe {
+                            fast_sample_rgb_neon(&buf, w_in, sx0, sy0, &w_xs, fy, &lut, drop_size)
+                        };
+                        let sc_mm = [sc.4, sc.5, sc.6, sc.7, sc.8, sc.9];
+                        let si_mm = [si.4, si.5, si.6, si.7, si.8, si.9];
+                        for j in 0..6 {
+                            assert_eq!(
+                                sc_mm[j], si_mm[j],
+                                "min/max idx {j} difiere en sx0={sx0} sy0={sy0}"
+                            );
+                        }
+                        let sc_s = [sc.0, sc.1, sc.2, sc.3];
+                        let si_s = [si.0, si.1, si.2, si.3];
+                        for j in 0..4 {
+                            max_diff_sum = max_diff_sum.max((sc_s[j] - si_s[j]).abs());
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("NEON RGB validado en {checked} casos. max_diff={max_diff_sum}");
+        assert!(max_diff_sum < 0.5, "sumas difieren demasiado: {max_diff_sum}");
     }
 }
