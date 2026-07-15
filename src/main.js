@@ -6000,13 +6000,22 @@ if (ui.btnBatchRun) {
         try {
             await mkdir(batchOutputFolder);
         } catch (e) {
-            console.warn("No se pudo crear carpeta, se intentara guardar directo.", e);
-            batchOutputFolder = batchSourcePath;
+            // PR-1.9: sin fallback silencioso a la carpeta fuente — mezclaba
+            // salidas con los vídeos originales y podía sobrescribir.
+            log("ERROR", `No se pudo crear la carpeta de salida: ${batchOutputFolder} (${e})`);
+            showCustomAlert(tr("general.error", "Error"),
+                tr("batch.execution.mkdir_failed", "No se pudo crear la carpeta de salida del lote. Revisa permisos de escritura."));
+            return;
         }
 
         ui.btnBatchRun.disabled = true;
         ui.btnBatchTune.disabled = true;
         setBatchModeUI(true);
+        const btnBatchCancel = document.getElementById("btn-batch-cancel");
+        if (btnBatchCancel) {
+            btnBatchCancel.style.display = "block";
+            btnBatchCancel.disabled = false;
+        }
 
         try {
             const p = getPipelineParams();
@@ -6022,7 +6031,18 @@ if (ui.btnBatchRun) {
             // Obtener la categoría del objetivo desde el nuevo selector o un default seguro
             const actualBatchMode = batchFlow.batchMode;
 
+            const batchFailedNames = [];
+            let batchCancelled = false;
             for (let i = 0; i < batchFiles.length; i++) {
+                // PR-1.9: cierre del race de cancelación ENTRE vídeos — si el
+                // cancel llega durante clear_stack_memory o justo entre
+                // entradas, el siguiente process_batch_entry reseteaba el flag
+                // del backend y el lote seguía como si nada.
+                if (isCancellationRequested) {
+                    batchCancelled = true;
+                    log("WARN", tr("batch.logs.cancelled", "Lote cancelado por el usuario."));
+                    break;
+                }
                 const file = batchFiles[i];
                 const displayIdx = i + 1;
                 const fileName = pathBaseName(file);
@@ -6104,6 +6124,7 @@ if (ui.btnBatchRun) {
                         batchGeneratedImages.push(preview);
                         batchResultPaths.push(result.path);
                     } else {
+                        batchFailedNames.push(fileName);
                         log("WARN", trFormat("batch.logs.file_failed", {
                             name: fileName,
                             error: tr("animation.errors.no_valid_images", "No se generaron imagenes validas para reproducir.")
@@ -6116,18 +6137,38 @@ if (ui.btnBatchRun) {
                 } catch (e) {
                     log("ERROR", trFormat("batch.logs.file_failed", { name: fileName, error: e }, `Fallo en ${file}: ${e}`));
                     if (isCancellationError(e)) {
+                        batchCancelled = true;
                         log("WARN", tr("batch.logs.cancelled", "Lote cancelado por el usuario."));
                         break; // no seguir con los archivos restantes
                     }
+                    batchFailedNames.push(fileName);
                 }
             }
 
+            // PR-1.9: resumen final — antes solo se alertaba con 0 éxitos y
+            // los fallos intermedios quedaban enterrados en el log.
+            if (batchFailedNames.length > 0) {
+                log("WARN", trFormat("batch.logs.summary_failures", {
+                    failed: batchFailedNames.length,
+                    total: batchFiles.length,
+                    names: batchFailedNames.join(", ")
+                }, `Lote: ${batchFailedNames.length}/${batchFiles.length} vídeos fallaron: ${batchFailedNames.join(", ")}`));
+            }
             if (batchGeneratedImages.length === 0) {
                 showCustomAlert(tr("general.error", "Error"), tr("batch.execution.no_outputs", "El lote terminó, pero no se generaron frames válidos."));
                 return;
             }
+            if (batchCancelled) {
+                log("WARN", trFormat("batch.logs.summary_cancelled", {
+                    done: batchGeneratedImages.length,
+                    total: batchFiles.length
+                }, `Lote cancelado: ${batchGeneratedImages.length}/${batchFiles.length} completados antes de cancelar.`));
+            }
 
-            log("SUCCESS", tr("batch.logs.completed", "Lote completado: PNGs Guardados. Iniciando modo Animacion..."));
+            log("SUCCESS", trFormat("batch.logs.completed_summary", {
+                ok: batchGeneratedImages.length,
+                total: batchFiles.length
+            }, `Lote completado: ${batchGeneratedImages.length}/${batchFiles.length} PNGs guardados. Iniciando modo Animacion...`));
             startAnimationPlayer(batchGeneratedImages);
             if (shouldPauseBatchRunTutorial) {
                 tutorialManager.showOverlay();
@@ -6140,9 +6181,30 @@ if (ui.btnBatchRun) {
             setBatchModeUI(false);
             ui.btnBatchRun.disabled = false;
             ui.btnBatchTune.disabled = false;
+            const btnBatchCancelEnd = document.getElementById("btn-batch-cancel");
+            if (btnBatchCancelEnd) btnBatchCancelEnd.style.display = "none";
         }
     });
 }
+
+// PR-1.9: cancelación del LOTE — el único botón de cancelar vivía dentro de
+// #processing-overlay, que el modo lote nunca muestra: el usuario no tenía
+// forma de parar un lote salvo cerrar la app.
+(() => {
+    const btn = document.getElementById("btn-batch-cancel");
+    if (!btn) return;
+    btn.addEventListener("click", async () => {
+        if (isCancellationRequested) return;
+        isCancellationRequested = true;
+        btn.disabled = true;
+        log("WARN", tr("batch.logs.cancelling", "Cancelando lote... se detendrá al terminar la operación en curso."));
+        try {
+            await invoke("cancel_processing");
+        } catch (e) {
+            console.error("Error sending cancel command:", e);
+        }
+    });
+})();
 
 if (ui.btnAutoPsf) {
     ui.btnAutoPsf.addEventListener("click", async () => {

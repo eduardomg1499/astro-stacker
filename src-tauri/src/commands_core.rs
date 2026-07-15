@@ -88,7 +88,10 @@ async fn scan_directory(
                     visit_dirs(&path, files, recursive)?;
                 } else if let Some(ext) = path.extension() {
                     let ext_str = ext.to_string_lossy().to_lowercase();
-                    if ext_str == "ser" || ext_str == "avi" {
+                    // PR-1.9: el motor decodifica mp4/mov/mkv vía FFmpeg desde
+                    // siempre, pero el escaneo del lote los OMITÍA en silencio
+                    // (el usuario obtenía un lote vacío sin saber por qué).
+                    if matches!(ext_str.as_str(), "ser" | "avi" | "mp4" | "mov" | "mkv") {
                         files.push(clean_windows_path(path));
                     }
                 }
@@ -1563,8 +1566,28 @@ async fn process_batch_entry(
     state.active_req_id.store(0, Ordering::Relaxed);
 
     let path_obj = Path::new(&file_path);
-    let fname = path_obj.file_stem().unwrap().to_string_lossy();
-    let save_path = Path::new(&output_folder).join(format!("{}.png", fname));
+    let fname = path_obj
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "frame".to_string());
+    // PR-1.9: sin colisiones de salida. El escaneo recursivo puede traer
+    // vídeos homónimos de subcarpetas distintas (A/Mars.ser y B/Mars.ser);
+    // nombrar solo por file_stem SOBRESCRIBÍA el primero en silencio.
+    let save_path = {
+        let base = Path::new(&output_folder).join(format!("{}.png", fname));
+        if !base.exists() {
+            base
+        } else {
+            let mut k = 2usize;
+            loop {
+                let candidate = Path::new(&output_folder).join(format!("{}_{}.png", fname, k));
+                if !candidate.exists() {
+                    break candidate;
+                }
+                k += 1;
+            }
+        }
+    };
 
     let prefix_str = progress_prefix.clone().unwrap_or_default();
     let get_msg = |msg: &str| {
@@ -4166,8 +4189,10 @@ struct ImageNode {
     idx: usize,
     width: u32,
     height: u32,
-    global_x: i32,
-    global_y: i32,
+    // PR-1.8: posiciones SUBPÍXEL. El redondeo a entero del registro
+    // introducía hasta ±0.5 px de desregistro por costura (micro-seams).
+    global_x: f32,
+    global_y: f32,
     placed: bool,
     img_gray: image::GrayImage,
     img_gray_stretched: image::GrayImage,
@@ -4178,8 +4203,8 @@ struct ImageNode {
 #[derive(Clone, Copy, Debug)]
 struct MatchEdge {
     target_idx: usize,
-    dx: i32,
-    dy: i32,
+    dx: f32,
+    dy: f32,
     score: usize,
 }
 
@@ -6082,7 +6107,10 @@ async fn stitch_mosaic(
 
     // Initialize Akaze: Restore original threshold (0.001) for stability
     let akaze_solver = akaze::Akaze::new(0.001);
-    let work_scale = 0.5;
+    // PR-1.8: DEBE coincidir con la escala real de img_gray (0.75, ver
+    // abajo). El 0.5 anterior hacía que el snap del modo guiado buscara con
+    // un factor de conversión erróneo (~1.5×) y con rango insuficiente.
+    let work_scale = 0.75;
 
     let mut nodes: Vec<ImageNode> = Vec::with_capacity(tiles.len());
 
@@ -6159,8 +6187,8 @@ async fn stitch_mosaic(
             idx: i,
             width: dyn_img.width(),
             height: dyn_img.height(),
-            global_x: 0,
-            global_y: 0,
+            global_x: 0.0,
+            global_y: 0.0,
             placed: false,
             img_gray: gray_small,
             img_gray_stretched: gray_small_stretched,
@@ -6268,8 +6296,8 @@ async fn stitch_mosaic(
             // RANSAC Translation
             // Find most common (dx, dy) with subpixel precision
             let match_tolerance = 20.0; // Tolerance for RANSAC clustering (pixels)
-            let mut best_dx = 0;
-            let mut best_dy = 0;
+            let mut best_dx = 0.0f32;
+            let mut best_dy = 0.0f32;
             let mut max_inliers = 0;
 
             let mut shifts = Vec::with_capacity(potential_matches.len());
@@ -6297,8 +6325,20 @@ async fn stitch_mosaic(
 
                 if inliers > max_inliers {
                     max_inliers = inliers;
-                    best_dx = ref_dx.round() as i32; // Fix type mismatch
-                    best_dy = ref_dy.round() as i32;
+                    // PR-1.8: MEDIA de los inliers del clúster (subpíxel).
+                    // El round() al mejor sample individual metía hasta
+                    // ±0.5 px de sesgo por costura.
+                    let (mut sx, mut sy, mut cnt) = (0.0f32, 0.0f32, 0.0f32);
+                    for (dx, dy) in &shifts {
+                        let dist = ((dx - ref_dx).powi(2) + (dy - ref_dy).powi(2)).sqrt();
+                        if dist <= match_tolerance {
+                            sx += dx;
+                            sy += dy;
+                            cnt += 1.0;
+                        }
+                    }
+                    best_dx = sx / cnt.max(1.0);
+                    best_dy = sy / cnt.max(1.0);
                 }
             }
 
@@ -6329,23 +6369,21 @@ async fn stitch_mosaic(
             };
 
             // manual_dx is vector from I to J in pixels (J.x - I.x)
-            let manual_dx_real = ((t_j.x - t_i.x) as f32 * scale_factor) as i32;
-            let manual_dy_real = ((t_j.y - t_i.y) as f32 * scale_factor) as i32;
+            let manual_dx_real = (t_j.x - t_i.x) as f32 * scale_factor;
+            let manual_dy_real = (t_j.y - t_i.y) as f32 * scale_factor;
 
             // Decision Logic
             let mut use_ransac = false;
-            let mut final_dx = 0;
-            let mut final_dy = 0;
+            let mut final_dx = 0.0f32;
+            let mut final_dy = 0.0f32;
             let mut final_score = 0;
 
             if max_inliers > 5 {
                 // Minimum 5 inliers for valid match (relaxed for lunar images)
-                // RANSAC found a good match.
-                // CRITICAL: Features are now extracted at FULL resolution (not scaled)
-                // and NO WORK SCALE division because work_scale is 1.0 for features.
-                // UNLESS we use 0.5 work_scale.
-                let ransac_dx = (best_dx as f32 / 1.0) as i32;
-                let ransac_dy = (best_dy as f32 / 1.0) as i32;
+                // RANSAC found a good match. Features are at FULL resolution,
+                // and PR-1.8 keeps the consensus SUBPIXEL (mean of inliers).
+                let ransac_dx = best_dx;
+                let ransac_dy = best_dy;
 
                 log_to_front(
                     &app,
@@ -6362,7 +6400,7 @@ async fn stitch_mosaic(
                     // But if it's completely different (e.g. wrong star field), reject it.
                     let diff_x = (ransac_dx - manual_dx_real).abs();
                     let diff_y = (ransac_dy - manual_dy_real).abs();
-                    let threshold = (w_i_real * 0.3) as i32; // 30% tolerance
+                    let threshold = w_i_real * 0.3; // 30% tolerance
 
                     if diff_x < threshold && diff_y < threshold {
                         use_ransac = true;
@@ -6528,12 +6566,12 @@ async fn stitch_mosaic(
                 }
 
                 let final_dx = if snapped {
-                    (best_snap_dx as f32 / work_scale) as i32
+                    best_snap_dx as f32 / work_scale
                 } else {
                     manual_dx_real
                 };
                 let final_dy = if snapped {
-                    (best_snap_dy as f32 / work_scale) as i32
+                    best_snap_dy as f32 / work_scale
                 } else {
                     manual_dy_real
                 };
@@ -6601,8 +6639,8 @@ async fn stitch_mosaic(
     }
 
     nodes[root_idx].placed = true;
-    nodes[root_idx].global_x = 0;
-    nodes[root_idx].global_y = 0; // Fix: was using uninitialized values if not 0
+    nodes[root_idx].global_x = 0.0;
+    nodes[root_idx].global_y = 0.0; // Fix: was using uninitialized values if not 0
                                   // Use img_gray to confirm root placed (debug)
     log_to_front(
         &app,
@@ -6641,24 +6679,44 @@ async fn stitch_mosaic(
         }
     }
 
-    // Check orphan nodes? logic simple for now: ignore or place at 0,0 (will overlap root)
-    // Ideally we warn.
-    let unplaced = nodes.iter().filter(|n| !n.placed).count();
-    if unplaced > 0 {
+    // PR-1.8: las teselas-isla se EXCLUYEN del mosaico — hacerlo visible con
+    // nombre y remedio, no un descarte silencioso (antes un panel de mare
+    // liso desaparecía del resultado sin más aviso que un WARN genérico).
+    let unplaced_names: Vec<String> = nodes
+        .iter()
+        .filter(|n| !n.placed)
+        .map(|n| {
+            Path::new(&n.original_path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| n.original_path.clone())
+        })
+        .collect();
+    if !unplaced_names.is_empty() {
         log_to_front(
             &app,
             "WARN",
-            &format!("{} teselas no pudieron conectarse (islas).", unplaced),
+            &format!(
+                "{} tesela(s) SIN CONEXIÓN excluidas del mosaico: {}. Aumenta el solape (>20%) o revisa el contraste de esos paneles.",
+                unplaced_names.len(),
+                unplaced_names.join(", ")
+            ),
+        );
+        emit_progress(
+            &app,
+            &format!("Aviso: {} panel(es) sin conexión quedarán fuera", unplaced_names.len()),
+            48.0,
+            None,
         );
     }
 
     // 4. Calculate Canvas Bounds & Render
     emit_progress(&app, "Renderizando y Mezclando...", 50.0, None);
 
-    let mut min_x = i32::MAX;
-    let mut max_x = i32::MIN;
-    let mut min_y = i32::MAX;
-    let mut max_y = i32::MIN;
+    let mut min_x = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut min_y = f32::MAX;
+    let mut max_y = f32::MIN;
 
     for n in &nodes {
         if !n.placed {
@@ -6671,8 +6729,8 @@ async fn stitch_mosaic(
             min_y = n.global_y;
         }
 
-        let r = n.global_x + n.width as i32;
-        let b = n.global_y + n.height as i32;
+        let r = n.global_x + n.width as f32;
+        let b = n.global_y + n.height as f32;
         if r > max_x {
             max_x = r;
         }
@@ -6681,10 +6739,23 @@ async fn stitch_mosaic(
         }
     }
 
-    let padding = 50;
-    let cv_w = (max_x - min_x) as u32 + (padding * 2) as u32;
-    let cv_h = (max_y - min_y) as u32 + (padding * 2) as u32;
+    let padding = 50.0f32;
+    let cv_w = (max_x - min_x).ceil() as u32 + (padding * 2.0) as u32;
+    let cv_h = (max_y - min_y).ceil() as u32 + (padding * 2.0) as u32;
 
+    // PR-1.8: TOPE anti-OOM. Un match erróneo que coloque una tesela a
+    // decenas de miles de píxeles disparaba un lienzo gigante y un panic en
+    // la reserva (antes solo se logueaba a >15000 px). Los buffers cuestan
+    // ~22 bytes/px: 300 MP ≈ 6.6 GB, techo razonable para mosaicos reales.
+    let total_px = cv_w as u64 * cv_h as u64;
+    if cv_w.max(cv_h) > 30_000 || total_px > 300_000_000 {
+        return Err(format!(
+            "Lienzo de mosaico implausible ({cv_w}x{cv_h}, {} MP): casi siempre indica un \
+             emparejamiento erróneo entre paneles. Revisa que los paneles compartan solape \
+             real y reintenta; si el mosaico es genuinamente así de grande, únelo por partes.",
+            total_px / 1_000_000
+        ));
+    }
     if cv_w.max(cv_h) > 15000 {
         log_to_front(
             &app,
@@ -6711,6 +6782,15 @@ async fn stitch_mosaic(
     let mut acc_b = vec![0.0f32; len];
     let mut acc_w = vec![0.0f32; len];
 
+    // PR-1.8: FEATHER REAL + IGUALACIÓN DE GANANCIA + SUBPÍXEL.
+    // El "blending" anterior era winner-take-all por máxima luminosidad:
+    // escalón de brillo abrupto en la costura cuando los paneles difieren en
+    // transparencia, y sesgo sistemático a ruido/píxeles calientes (el
+    // sample más brillante gana). Ahora: media ponderada por distancia al
+    // borde de la tesela (feather), con la exposición de cada panel igualada
+    // al lienzo ya acumulado (mediana del ratio en el solape) y colocación
+    // subpíxel con muestreo bilineal.
+    const FEATHER_PX: f32 = 64.0;
     for (i, n) in nodes.iter().enumerate() {
         if !n.placed {
             continue;
@@ -6732,11 +6812,54 @@ async fn stitch_mosaic(
         let n_w = n.width;
         let n_h = n.height;
 
-        let offset_x = (n.global_x - min_x + padding as i32) as usize;
-        let offset_y = (n.global_y - min_y + padding as i32) as usize;
+        let off_fx = n.global_x - min_x + padding;
+        let off_fy = n.global_y - min_y + padding;
+        let offset_x = off_fx.floor() as usize;
+        let offset_y = off_fy.floor() as usize;
+        let frac_x = off_fx - off_fx.floor();
+        let frac_y = off_fy - off_fy.floor();
 
         let crop_margin = 35.0f32;
 
+        // 1) GANANCIA del panel: mediana de lienzo/panel en el solape ya
+        // acumulado (el primer panel ancla la exposición de referencia).
+        // Corrige la transparencia variable entre capturas — la causa
+        // principal del escalón visible en la costura.
+        let mut ratios: Vec<f32> = Vec::new();
+        for y in (0..n_h).step_by(4) {
+            for x in (0..n_w).step_by(4) {
+                let px = rgba.get_pixel(x, y);
+                if px[3] == 0 {
+                    continue;
+                }
+                let lum_t = px[0] as f32 + px[1] as f32 + px[2] as f32;
+                if lum_t < 4500.0 {
+                    continue; // solo señal (≈1500 por canal)
+                }
+                let cv_idx = (offset_y + y as usize) * cv_w as usize + offset_x + x as usize;
+                if cv_idx < len && acc_w[cv_idx] > 0.05 {
+                    let lum_c = (acc_r[cv_idx] + acc_g[cv_idx] + acc_b[cv_idx]) / acc_w[cv_idx];
+                    if lum_c > 4500.0 {
+                        ratios.push(lum_c / lum_t);
+                    }
+                }
+            }
+        }
+        let gain = if ratios.len() >= 200 {
+            ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            ratios[ratios.len() / 2].clamp(0.85, 1.18)
+        } else {
+            1.0
+        };
+        if (gain - 1.0).abs() > 0.005 {
+            log_to_front(
+                &app,
+                "INFO",
+                &format!("Tesela {}: ganancia de exposición x{:.3} (igualada al lienzo)", i + 1, gain),
+            );
+        }
+
+        // 2) Acumulación feather + bilineal.
         // OPTIMIZED: Parallel execution across rows using Rayon for massive speedup
         use rayon::prelude::*;
 
@@ -6752,44 +6875,59 @@ async fn stitch_mosaic(
             let p_w = ptr_w as *mut f32;
 
             for x in 0..n_w {
-                let px = rgba.get_pixel(x, y);
-                if px[3] == 0 {
+                // Muestra del panel en la posición SUBPÍXEL que corresponde
+                // al píxel entero del lienzo (backward bilinear).
+                let sxf = x as f32 - frac_x;
+                let syf = y as f32 - frac_y;
+                if sxf < 0.0 || syf < 0.0 {
                     continue;
                 }
+                let x0 = sxf as u32;
+                let y0 = syf as u32;
+                if x0 + 1 >= n_w || y0 + 1 >= n_h {
+                    continue;
+                }
+                let p00 = rgba.get_pixel(x0, y0);
+                let p10 = rgba.get_pixel(x0 + 1, y0);
+                let p01 = rgba.get_pixel(x0, y0 + 1);
+                let p11 = rgba.get_pixel(x0 + 1, y0 + 1);
+                if p00[3] == 0 || p10[3] == 0 || p01[3] == 0 || p11[3] == 0 {
+                    continue;
+                }
+                let fx = sxf - x0 as f32;
+                let fy = syf - y0 as f32;
+                let w00 = (1.0 - fx) * (1.0 - fy);
+                let w10 = fx * (1.0 - fy);
+                let w01 = (1.0 - fx) * fy;
+                let w11 = fx * fy;
+                let r = p00[0] as f32 * w00 + p10[0] as f32 * w10 + p01[0] as f32 * w01 + p11[0] as f32 * w11;
+                let g = p00[1] as f32 * w00 + p10[1] as f32 * w10 + p01[1] as f32 * w01 + p11[1] as f32 * w11;
+                let b = p00[2] as f32 * w00 + p10[2] as f32 * w10 + p01[2] as f32 * w01 + p11[2] as f32 * w11;
 
-                // 1. EDGE CROP (Requested by user to avoid bad sensor edges)
-                // Discard pixels near the boundaries where cameras often leave artifacts or straight cuts.
-                let dx = x.min(n_w - 1 - x) as f32;
-                let dy = y.min(n_h - 1 - y) as f32;
-                let dist = dx.min(dy);
-
+                // 1. EDGE CROP (bordes de sensor sucios) + FEATHER: el peso
+                // crece de 0→1 en FEATHER_PX píxeles desde el margen.
+                let dx_e = sxf.min(n_w as f32 - 1.0 - sxf);
+                let dy_e = syf.min(n_h as f32 - 1.0 - syf);
+                let dist = dx_e.min(dy_e);
                 if dist < crop_margin {
                     continue;
                 }
+                let wgt = ((dist - crop_margin) / FEATHER_PX).clamp(0.05, 1.0);
 
                 // 2. BLACK BACKGROUND REJECTION
                 // Skip padding and deep space to prevent overlapping solid black on top of craters.
-                if px[0] < 1500 && px[1] < 1500 && px[2] < 1500 {
+                if r < 1500.0 && g < 1500.0 && b < 1500.0 {
                     continue;
                 }
-
-                // 3. MAXIMUM LUMINOSITY BLENDING (NO AVERAGING = NO BLURRING)
-                // Keep the conservative behavior that preserves the sharpest
-                // existing sample instead of synthesizing seam pixels.
-                let lum_f32 = px[0] as f32 + px[1] as f32 + px[2] as f32;
 
                 let cv_idx = (offset_y + y as usize) * cv_w as usize + (offset_x + x as usize);
 
                 if cv_idx < len {
                     unsafe {
-                        // acc_w tracks the current maximum luminosity at this pixel.
-                        let current_lum = *p_w.add(cv_idx);
-                        if lum_f32 > current_lum {
-                            *p_r.add(cv_idx) = px[0] as f32;
-                            *p_g.add(cv_idx) = px[1] as f32;
-                            *p_b.add(cv_idx) = px[2] as f32;
-                            *p_w.add(cv_idx) = lum_f32;
-                        }
+                        *p_r.add(cv_idx) += r * gain * wgt;
+                        *p_g.add(cv_idx) += g * gain * wgt;
+                        *p_b.add(cv_idx) += b * gain * wgt;
+                        *p_w.add(cv_idx) += wgt;
                     }
                 }
             }
@@ -6801,15 +6939,14 @@ async fn stitch_mosaic(
     // 6. Normalize & Output
     // 16-bit output buffer
     let mut out_u16: Vec<u16> = vec![0; len * 3]; // RGB
-    
-    // OPTIMIZED: Parallel normalization. The luminosity winner pass already chose
-    // the final 16-bit sample for each pixel, so no averaging division is needed.
+
+    // Media ponderada por feather (PR-1.8): dividir por el peso acumulado.
     out_u16.par_chunks_mut(3).enumerate().for_each(|(idx, pixel)| {
-        let lum = acc_w[idx];
-        if lum > 0.0 {
-            pixel[0] = acc_r[idx] as u16;
-            pixel[1] = acc_g[idx] as u16;
-            pixel[2] = acc_b[idx] as u16;
+        let wsum = acc_w[idx];
+        if wsum > 0.0 {
+            pixel[0] = (acc_r[idx] / wsum + 0.5).clamp(0.0, 65535.0) as u16;
+            pixel[1] = (acc_g[idx] / wsum + 0.5).clamp(0.0, 65535.0) as u16;
+            pixel[2] = (acc_b[idx] / wsum + 0.5).clamp(0.0, 65535.0) as u16;
         }
     });
 

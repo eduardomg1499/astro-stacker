@@ -2619,6 +2619,12 @@
                         <button id="btn-batch-run" class="success" style="width:100%; font-size:1rem; padding:10px;" data-i18n="batch.execution.start_btn">
                             Iniciar Lote Completo
                         </button>
+                        <!-- PR-1.9: el lote no mostraba NINGÚN control de cancelación
+                             (el único botón vivía en el overlay de proceso, que el
+                             modo lote no usa). -->
+                        <button id="btn-batch-cancel" class="danger" style="width:100%; font-size:0.85rem; padding:8px; margin-top:6px; display:none;" data-i18n="batch.execution.cancel_btn">
+                            Cancelar Lote
+                        </button>
 
                         <!-- BATCH: POST-STACK FRESH ANALYSIS HELP -->
                         <div id="panel-batch-reanalyze"
