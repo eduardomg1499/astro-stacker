@@ -16,10 +16,15 @@ mod gpu_stack; // GPU compute (wgpu) para la etapa de acumulacion
 mod gpu_wavelet; // GPU compute (wgpu) para la descomposicion wavelet (blur separable)
 mod deepsky_background; // F2: grafo de fondo/LP, modelo BG y asesor de muestreo
 mod deepsky_masks; // F3: máscaras de outlier congeladas por cross-fit
+mod deepsky_psf; // F5: PSF Moffat elíptica + campo espacial con holdout
 mod deepsky_variance; // contrato lineal F1: VAR/NEFF/DQ (motores científicos)
 mod nebula_fusion; // F3: motor NF-Lite (pesos 1/σ² + máscaras congeladas)
+mod nebula_fusion_full; // F6: coadición GLS por frecuencia con PSF objetivo
 #[cfg(any(test, feature = "deepsky-sim"))]
 mod deepsky_sim; // simulador de verdad conocida (solo tests/benchmarks)
+mod benchmark_quality; // métricas de artefactos planetarios (arnés A/B F0)
+#[cfg(any(test, feature = "planetary-sim"))]
+mod planetary_sim; // simulador planetario de verdad conocida (solo tests/benchmarks)
 mod integral_image;
 mod license;
 mod liquid_warping;

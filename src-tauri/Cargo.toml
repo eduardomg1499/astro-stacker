@@ -14,6 +14,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # Compila el simulador de verdad conocida (deepsky_sim) fuera de los tests,
 # p.ej. para generar datasets sintéticos de benchmark desde un binario.
 deepsky-sim = []
+# Ídem para el simulador planetario (planetary_sim, arnés A/B F0).
+planetary-sim = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -32,6 +34,8 @@ tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rayon = "1.10"
+# FFT CPU para NF-Full (coadición GLS por frecuencia, tiles con overlap-add).
+rustfft = "6"
 libc = "0.2"
 memmap2 = "0.9"
 byteorder = "1.5"

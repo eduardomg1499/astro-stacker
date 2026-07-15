@@ -64,6 +64,10 @@ pub(crate) struct NfLiteOutput {
     /// Frames efectivos por píxel (aprox.: N·Σw_final/Σw_total).
     pub mean_cov: f64,
     pub products: NfLiteProducts,
+    /// Modo Full: (FWHM de la Γ objetivo, tiles con fallback, tiles totales).
+    pub full_report: Option<(f32, usize, usize)>,
+    /// Modo Full solicitado pero degradado a Lite: la razón (para receta/log).
+    pub full_fallback: Option<String>,
 }
 
 pub(crate) struct NfLiteContext<'a> {
@@ -80,6 +84,12 @@ pub(crate) struct NfLiteContext<'a> {
     /// mono calibrado SIN debayer y cada fotosito deposita solo en su canal
     /// del máster RGB (`ch` debe ser 3). None = ruta mono/RGB demosaiced.
     pub cfa: Option<i32>,
+    /// Modo Full (F6): tras las máscaras y el pase C, recombina el máster por
+    /// frecuencia con PSF objetivo (nebula_fusion_full). Solo demosaiced.
+    pub full: bool,
+    /// Catálogos estelares por índice ORIGINAL de frame (frames[i].1 del
+    /// pipeline) — los usa el ajuste PSF Moffat del modo Full.
+    pub stars: &'a [Vec<(f32, f32, f32)>],
 }
 
 /// Pesos de un frame: rejilla espacial 1/σ² (mono/RGB) o escalar por canal
@@ -798,6 +808,124 @@ pub(crate) fn run_lite(
             dq[p] |= crate::deepsky_variance::dq::NO_COVERAGE;
         }
     }
+    // --- Modo Full (F6): recombinación espectral con PSF objetivo ---
+    // Mantiene NEFF/cobertura/rechazos del pase C y REEMPLAZA SCI y VAR por
+    // la combinación GLS por frecuencia. Si la PSF no es utilizable, degrada
+    // a Lite con la razón REGISTRADA (jamás en silencio).
+    let mut full_report: Option<(f32, usize, usize)> = None;
+    let mut full_fallback: Option<String> = None;
+    if ctx.full {
+        if ctx.cfa.is_some() {
+            full_fallback =
+                Some("el modo Full requiere la ruta demosaiced (CFA directo llega después)".into());
+        } else {
+            // 1. PSF Moffat por frame (espacio nativo; la rotación del
+            //    registro se ignora en v1 — campos con rotación pequeña).
+            let mut psfs: Vec<crate::deepsky_psf::MoffatPsf> = Vec::with_capacity(n);
+            let mut psf_fail: Option<String> = None;
+            for (k, &(i, _t, _fw)) in ctx.registered.iter().enumerate() {
+                crate::pipeline::cancellation_checkpoint(ctx.cancel, "NebulaFusion Full: PSF")?;
+                progress("ajuste PSF Moffat", k + 1, n);
+                let img = load(i)?;
+                let npx_native = img.w * img.h;
+                let luma: Vec<f32> = if img.ch == 1 {
+                    img.data.clone()
+                } else {
+                    (0..npx_native)
+                        .map(|p| {
+                            (img.data[p * img.ch]
+                                + img.data[p * img.ch + 1]
+                                + img.data[p * img.ch + 2])
+                                / 3.0
+                        })
+                        .collect()
+                };
+                let stars = ctx.stars.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+                match crate::deepsky_psf::fit_frame_psf(&luma, img.w, img.h, stars, 0.2) {
+                    Some((fp, _rep)) => psfs.push(fp.at(0.5, 0.5)),
+                    None => {
+                        psf_fail = Some(format!(
+                            "frame {i}: censo estelar insuficiente para la PSF Moffat (se integra en Lite)"
+                        ));
+                        break;
+                    }
+                }
+            }
+            if let Some(reason) = psf_fail {
+                full_fallback = Some(reason);
+            } else {
+                // 2. σ′ por frame/canal desde los pesos inverso-varianza.
+                let sigmas: Vec<[f32; 3]> = frame_weights
+                    .iter()
+                    .map(|fw| match fw {
+                        FrameWeights::Rgb(w3) => {
+                            let mut s = [0f32; 3];
+                            for c in 0..3 {
+                                s[c] = (1.0 / w3[c].max(1e-12)).sqrt() as f32;
+                            }
+                            s
+                        }
+                        FrameWeights::Grid(g) => {
+                            let mut sg = g.clone();
+                            sg.sort_by(|a, b| a.total_cmp(b));
+                            let s = (1.0 / sg[sg.len() / 2].max(1e-12) as f64).sqrt() as f32;
+                            [s, s, s]
+                        }
+                    })
+                    .collect();
+                // 3. Pase W: frames warpeados con outliers sustituidos por el
+                //    piloto limpio (bit INTERPOLATED en DQ — compromiso v1
+                //    documentado: el solver local exacto llega después).
+                let dir = std::env::temp_dir().join("zenith_nf_full");
+                let tag = format!(
+                    "nf_full_{}_{}",
+                    std::process::id(),
+                    crate::pipeline::new_job_id("w")
+                );
+                let mut wstore =
+                    crate::frame_store::AdaptiveFrameStore::new(n, npx * ch, &dir, &tag)?;
+                for (k, &(i, t, _fw)) in ctx.registered.iter().enumerate() {
+                    crate::pipeline::cancellation_checkpoint(ctx.cancel, "NebulaFusion Full: warp")?;
+                    progress("warp para recombinación", k + 1, n);
+                    warp_frame(k, i, t, &mut frame_sum, &mut frame_wgt)?;
+                    let mut y = vec![0.0f32; npx * ch];
+                    for idx in 0..npx * ch {
+                        if frame_wgt[idx] > 0.0 {
+                            y[idx] = (frame_sum[idx] / frame_wgt[idx]) as f32;
+                        }
+                    }
+                    for &p in masks[k].positive.iter().chain(&masks[k].negative) {
+                        let p = p as usize;
+                        for c in 0..ch {
+                            let idx = p * ch + c;
+                            if clean_wgt[idx] > 0.0 {
+                                y[idx] = (clean_sum[idx] / clean_wgt[idx]) as f32;
+                            }
+                        }
+                        dq[p] |= crate::deepsky_variance::dq::INTERPOLATED;
+                    }
+                    wstore.put(k, &y)?;
+                }
+                // 4. Recombinación GLS por frecuencia con Γ objetivo.
+                let inputs = crate::nebula_fusion_full::NfFullInputs {
+                    warped: &wstore,
+                    n_frames: n,
+                    w: w_out,
+                    h: h_out,
+                    ch,
+                    sigmas: &sigmas,
+                    psfs: &psfs,
+                    lanczos: ctx.use_lanczos,
+                    cancel: ctx.cancel,
+                };
+                let fout = crate::nebula_fusion_full::combine_full(&inputs, progress)?;
+                final_data = fout.sci;
+                variance = fout.var_map;
+                full_report = Some((fout.target_fwhm, fout.tiles_fallback, fout.tiles_total));
+            }
+        }
+    }
+
     let weight_map = cov_reduce(&total_wgt, npx, ch);
     let final_cov: f64 = weight_map.iter().sum();
     let rej_pct = if total_cov > 0.0 {
@@ -827,6 +955,8 @@ pub(crate) fn run_lite(
             variance_origin: crate::deepsky_variance::VarianceOrigin::Empirical,
             g1g2_offset_max: ctx.cfa.map(|_| g1g2_offset_max),
         },
+        full_report,
+        full_fallback,
     })
 }
 
@@ -915,6 +1045,8 @@ mod tests {
             use_lanczos: false,
             cancel: &cancel,
             cfa: None,
+            full: false,
+            stars: &[],
         };
         let load = |i: usize| -> Result<crate::DsImage, String> {
             Ok(crate::DsImage {
@@ -1053,6 +1185,8 @@ mod tests {
             use_lanczos: false,
             cancel: &cancel,
             cfa: None,
+            full: false,
+            stars: &[],
         };
         let frames_ref = &frames;
         let load = |i: usize| -> Result<crate::DsImage, String> {
@@ -1216,6 +1350,8 @@ mod tests {
             use_lanczos: false,
             cancel: &cancel,
             cfa: Some(8),
+            full: false,
+            stars: &[],
         };
         let frames_ref = &frames;
         let load = |i: usize| -> Result<crate::DsImage, String> {
@@ -1352,6 +1488,144 @@ mod tests {
             "offset G1G2 {g_off:.2} fuera de ±[9,11]"
         );
         assert!(sigmas.iter().all(|&s| s > 0.0 && s < 5.0));
+    }
+
+    /// Gate F5+F6 end-to-end: run_lite en modo Full con seeing mixto (2.6 y
+    /// 4.5 px). El flujo completo: detección estelar real → PSF Moffat por
+    /// frame → pase W → recombinación espectral. La FWHM del máster queda
+    /// cerca de la Γ objetivo (no degradada a la peor PSF) y la fotometría
+    /// se conserva.
+    #[test]
+    fn gate_f56_full_mode_end_to_end() {
+        let (w, h) = (256, 256);
+        let n = 12usize;
+        let sensor = flat_sensor(3.0);
+        let mut lcg = 777u64;
+        let mut jit = || {
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((lcg >> 33) as f64 / (1u64 << 32) as f64) - 0.5
+        };
+        // Rejilla 5×5 de estrellas con jitter (mismas posiciones en todos los
+        // frames; la FWHM cambia por frame = seeing).
+        let positions: Vec<(f64, f64, f64)> = (0..25)
+            .map(|s| {
+                let (gx, gy) = (s % 5, s / 5);
+                (
+                    30.0 + gx as f64 * 48.0 + jit() * 4.0,
+                    30.0 + gy as f64 * 48.0 + jit() * 4.0,
+                    18_000.0 + s as f64 * 900.0,
+                )
+            })
+            .collect();
+        let mut frames = Vec::new();
+        let mut catalogs: Vec<Vec<(f32, f32, f32)>> = Vec::new();
+        for k in 0..n {
+            let fwhm = if k < 6 { 2.6 } else { 4.5 };
+            let scene = crate::deepsky_sim::SimScene {
+                width: w,
+                height: h,
+                background_adu: 200.0,
+                gradient_adu_per_px: (0.0, 0.0),
+                color: [1.0, 1.0, 1.0],
+                stars: positions
+                    .iter()
+                    .map(|&(x, y, flux)| crate::deepsky_sim::SimStar {
+                        x,
+                        y,
+                        flux_adu: flux,
+                        fwhm_px: fwhm,
+                        moffat_beta: Some(2.5),
+                    })
+                    .collect(),
+            };
+            let exp = crate::deepsky_sim::SimExposure {
+                exposure_s: 60.0,
+                dx: 0.0,
+                dy: 0.0,
+                seed: 61_000 + k as u64,
+            };
+            let (frame, _) = crate::deepsky_sim::render_light(&scene, &sensor, &exp);
+            catalogs.push(crate::ds_detect_stars(&frame, w, h, 80));
+            frames.push(frame);
+        }
+        let registered = identity_registered(n);
+        let norms = neutral_norms(n);
+        let loc: Vec<Option<Vec<f32>>> = vec![None; n];
+        let cancel = no_cancel();
+        let ctx = NfLiteContext {
+            registered: &registered,
+            norms: &norms,
+            loc_fields: &loc,
+            loc_grid: 24,
+            w_out: w,
+            h_out: h,
+            ch: 1,
+            use_lanczos: false,
+            cancel: &cancel,
+            cfa: None,
+            full: true,
+            stars: &catalogs,
+        };
+        let frames_ref = &frames;
+        let load = |i: usize| -> Result<crate::DsImage, String> {
+            Ok(crate::DsImage {
+                data: frames_ref[i].clone(),
+                w,
+                h,
+                ch: 1,
+                bayer: None,
+            })
+        };
+        let out = run_lite(&ctx, &load, &mut |_, _, _| {}).expect("run_lite full");
+        assert!(
+            out.full_fallback.is_none(),
+            "Full degradado: {:?}",
+            out.full_fallback
+        );
+        let (target_fwhm, _fb, total) = out.full_report.expect("full_report");
+        assert!(total > 0);
+        // Con β=2.5 las alas Moffat hunden la MTF a media frecuencia y la
+        // restricción de amplificación ≤1.5 exige una Γ más ancha que con
+        // PSFs gaussianas (el gate espectral puro converge en 3.2 px con
+        // β≈gaussiano). Lo exigible aquí: NO degradarse a la peor población.
+        assert!(
+            target_fwhm < 4.4,
+            "Γ objetivo {target_fwhm:.2} px degradada hacia la peor PSF (4.5)"
+        );
+        // FWHM medida en el máster sobre la estrella más brillante (lejos de
+        // bordes): no degradada a la peor población (4.5 px).
+        let bright = positions[24];
+        let fit = crate::ds_fit_star_psf(
+            &out.final_data,
+            w,
+            h,
+            bright.0.round() as usize,
+            bright.1.round() as usize,
+            200.0,
+        )
+        .expect("fit máster");
+        let master_fwhm = fit.sigma * 2.3548;
+        assert!(
+            master_fwhm < 4.7,
+            "FWHM del máster {master_fwhm:.2} px — la combinación se degradó a la peor PSF"
+        );
+        // Fotometría: apertura r=12 sobre una estrella aislada del centro.
+        let star = positions[12];
+        let mut flux = 0.0f64;
+        for y in 0..h {
+            for x in 0..w {
+                let dx = x as f64 - star.0;
+                let dy = y as f64 - star.1;
+                if dx * dx + dy * dy <= 144.0 {
+                    flux += out.final_data[y * w + x] as f64 - 200.0;
+                }
+            }
+        }
+        let ratio = flux / star.2;
+        assert!(
+            (ratio - 1.0).abs() < 0.05,
+            "flujo end-to-end {ratio:.3} fuera de 1±0.05"
+        );
     }
 
     /// VAR y NEFF con frames idénticos en ruido: VAR≈σ²/N (±10%), NEFF≈N.

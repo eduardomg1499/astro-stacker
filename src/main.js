@@ -8939,13 +8939,15 @@ function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
         computePolicy: value("sel-ds-compute", "hybrid"),
         profile,
         rejection,
-        ...(dsMethod === "nebula_fusion"
+        ...(dsMethod === "nebula_fusion" || dsMethod === "nebula_fusion_full"
             ? {
                 integrationMethod: {
                     method: "nebula_fusion",
-                    mode: "lite",
+                    // F6: el modo Full recombina por frecuencia con PSF objetivo.
+                    mode: dsMethod === "nebula_fusion_full" ? "full" : "lite",
                     // F4: CFA directo y super-binning de salida (solo viajan con
-                    // NebulaFusion; el preflight valida cfaDirect sin lights CFA).
+                    // NebulaFusion; el preflight valida cfaDirect sin lights CFA
+                    // y Full+cfaDirect).
                     cfaDirect: checked("chk-ds-cfadirect", false),
                     outputBin: value("sel-ds-outputbin", "native"),
                 },
@@ -10525,7 +10527,8 @@ function dsLoadUxFixtureIfRequested(modal) {
     // dsBuildStackRequest tampoco los envía).
     const dsMethodSel = document.getElementById("sel-ds-method");
     const dsSyncNebulaFusionControls = () => {
-        const nfActive = dsMethodSel?.value === "nebula_fusion";
+        const nfActive =
+            dsMethodSel?.value === "nebula_fusion" || dsMethodSel?.value === "nebula_fusion_full";
         [["chk-ds-cfadirect", "lbl-ds-cfadirect"], ["sel-ds-outputbin", "lbl-ds-outputbin"]].forEach(([inputId, labelId]) => {
             const input = document.getElementById(inputId);
             if (input) input.disabled = !nfActive;

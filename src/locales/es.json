@@ -1015,6 +1015,7 @@
     "method_label": "Método de integración",
     "method_classic": "Clásico (κσ/Winsorized)",
     "method_nebula_fusion": "NebulaFusion Lite (beta)",
+    "method_nebula_fusion_full": "NebulaFusion Full (beta)",
     "method_eidr": "EIDR super-res (próximamente)",
     "method_hint_nf": "NebulaFusion: media ponderada por el ruido de cada toma + máscaras de rechazo congeladas + mapas científicos VAR/NEFF/DQ junto al máster.",
     "cfa_direct_label": "Modo CFA directo (sin debayer)",

@@ -5430,9 +5430,14 @@ fn prepare_deepsky_stack_impl(request: DeepSkyStackRequest, with_advisor: bool) 
     match request.resolved_integration_method() {
         pipeline::DeepSkyIntegrationMethod::Classic(_) => {}
         pipeline::DeepSkyIntegrationMethod::NebulaFusion(nf_cfg) => {
-            if !matches!(nf_cfg.mode, pipeline::NebulaFusionMode::Lite) {
+            if matches!(nf_cfg.mode, pipeline::NebulaFusionMode::FullWithStruct) {
                 errors.push(
-                    "NebulaFusion Full/STRUCT aún no está disponible; usa el modo Lite".into(),
+                    "NebulaFusion STRUCT aún no está disponible; usa Lite o Full".into(),
+                );
+            }
+            if matches!(nf_cfg.mode, pipeline::NebulaFusionMode::Full) && nf_cfg.cfa_direct {
+                errors.push(
+                    "NebulaFusion Full requiere la ruta demosaiced en esta fase: desactiva el modo CFA directo".into(),
                 );
             }
             if request.drizzle > 1.01 {
@@ -7456,7 +7461,8 @@ async fn stack_deepsky(
         Some(pipeline::DeepSkyIntegrationMethod::NebulaFusion(_))
     );
     // F4: CFA directo (sin debayer, depósito por fotodiodo) y super-binning.
-    let (nf_cfa_direct, nf_output_bin) = match &integration_method {
+    // F6: modo Full (recombinación espectral con PSF objetivo).
+    let (nf_cfa_direct, nf_output_bin, nf_full_mode) = match &integration_method {
         Some(pipeline::DeepSkyIntegrationMethod::NebulaFusion(cfg)) => (
             cfg.cfa_direct,
             match cfg.output_bin {
@@ -7464,8 +7470,9 @@ async fn stack_deepsky(
                 pipeline::OutputBinning::Bin0_75 => Some((3usize, 4usize)),
                 pipeline::OutputBinning::Bin0_5 => Some((1usize, 2usize)),
             },
+            matches!(cfg.mode, pipeline::NebulaFusionMode::Full),
         ),
-        _ => (false, None),
+        _ => (false, None, false),
     };
     let mut lights_were_cfa = false;
     // Carpeta de trabajo: los cachés multi-GB van al disco que elija el
@@ -8920,6 +8927,8 @@ async fn stack_deepsky(
     };
 
     let mut nf_products: Option<crate::nebula_fusion::NfLiteProducts> = None;
+    let mut nf_full_report: Option<(f32, usize, usize)> = None;
+    let mut nf_full_fallback: Option<String> = None;
     let (final_data, wgt1, weight_map, rejection_low, rejection_high, rej_pct, mean_cov):
         (Vec<f32>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, f64, f64) = if nf_lite_active {
         // --- Motor NebulaFusion Lite (F3): pesos inverso-varianza + máscaras
@@ -8946,6 +8955,8 @@ async fn stack_deepsky(
             // CFA directo: los frames quedaron almacenados como plano CFA
             // calibrado (ver calibrated_cfa) y el patrón viaja con ellos.
             cfa: cfa_drizzle_pattern.filter(|_| nf_cfa_direct),
+            full: nf_full_mode,
+            stars: &star_catalogs,
         };
         let mut nf_progress = |phase: &str, k: usize, n: usize| {
             emit_progress(
@@ -8956,7 +8967,29 @@ async fn stack_deepsky(
             );
         };
         let out = crate::nebula_fusion::run_lite(&nf_ctx, &load_cached, &mut nf_progress)?;
-        effective_engine = "nebula_fusion_lite".into();
+        nf_full_report = out.full_report;
+        nf_full_fallback = out.full_fallback.clone();
+        if let Some((fwhm, fb, total)) = out.full_report {
+            log_to_front(
+                &app,
+                "SUCCESS",
+                &format!(
+                    "NebulaFusion Full: PSF objetivo {fwhm:.2} px · {fb}/{total} tiles degradados a media plana."
+                ),
+            );
+        }
+        if let Some(reason) = &out.full_fallback {
+            log_to_front(
+                &app,
+                "WARN",
+                &format!("NebulaFusion Full degradado a Lite: {reason}."),
+            );
+        }
+        effective_engine = if out.full_report.is_some() {
+            "nebula_fusion_full".into()
+        } else {
+            "nebula_fusion_lite".into()
+        };
         rejection = "crossfit_loo".into();
         log_to_front(
             &app,
@@ -9528,7 +9561,10 @@ async fn stack_deepsky(
         "integrationMethod": {
             "requested": effective_integration_method.label(),
             "effective": &effective_integration_method,
-            "fallbacks": Vec::<String>::new(),
+            "fallbacks": nf_full_fallback.iter().cloned().collect::<Vec<String>>(),
+            "targetPsfFwhmPx": nf_full_report.map(|(f, _, _)| f),
+            "tilesFallback": nf_full_report.map(|(_, fb, _)| fb),
+            "tilesTotal": nf_full_report.map(|(_, _, t)| t),
         },
         // Clásico: sin varianza por píxel (null). NF-Lite: empirical (σ MRS
         // por celda del propio frame — pesos jamás dependientes del objeto).
@@ -9607,7 +9643,7 @@ async fn stack_deepsky(
             rejection_high: rejection_high.iter().map(|&v| v as f32).collect(),
             registration_residuals: registration_residuals,
             engine: if nf_lite_active {
-                "nebula_fusion_lite".into()
+                effective_engine.clone()
             } else if used_gpu {
                 "hybrid_wgpu".into()
             } else if use_tiled {
