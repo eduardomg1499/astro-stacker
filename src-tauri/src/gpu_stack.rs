@@ -16,7 +16,7 @@
 //
 // PRECISIÓN SIN f64 (Metal no lo soporta): los acumuladores viven en PUNTO
 // FIJO de 64 bits emulado con pares (lo, hi) u32 y carry manual — Q40.24
-// para las sumas (val ≤ 65535 × w ≤ 1 × ~20k frames) y Q48.16 para m2
+// para las sumas (val ≤ 65535 × w ≤ 1 × ~20k frames) y Q56.8 para m2
 // (val² ≤ 4.3e9). Por qué no Kahan-f32: el compilador Metal aplica fast-math
 // y la reasociación DESTRUYE la compensación de Kahan; el punto fijo es
 // inmune, determinista y reproducible (mejor aún que la CPU, cuyo orden de
@@ -185,7 +185,7 @@ fn lut_get(x: f32, drop: f32) -> f32 {
 // ---------------------------------------------------------------------------
 // PUNTO FIJO 64-bit emulado (lo, hi) con carry manual — inmune al fast-math
 // del compilador Metal (Kahan-f32 se rompería por reasociación) y
-// determinista. Q40.24 para sumas; Q48.16 para m2 (valores hasta 4.3e9).
+// determinista. Q40.24 para sumas; Q56.8 para m2 (términos hasta 4.3e9; techo 7.2e16 ≈ 1.6M frames).
 // ---------------------------------------------------------------------------
 fn fx_add_q24(slot: u32, v: f32) {
     let vi = floor(v);
@@ -200,10 +200,15 @@ fn fx_add_q24(slot: u32, v: f32) {
     acc[slot] = vec2<u32>(nlo, old.y + add_hi + carry);
 }
 
-fn fx_add_q16(slot: u32, v: f32) {
-    var hi = floor(v / 65536.0);
-    let rem = v - hi * 65536.0;
-    let lo_f = rem * 65536.0;
+// PR-1.3: Q56.8 (antes Q48.16). Con Q48.16 el techo era 2^48 ≈ 2.8e14 en
+// unidades de m2: con términos de hasta val²·cw ≈ 4.3e9 por frame, la suma
+// DESBORDABA a ~65k frames — justo los SER de alta velocidad. Q56.8 sube el
+// techo a ~7.2e16 (>1.6M frames de headroom); la resolución de 1/256 ADU²
+// es ruido despreciable frente a magnitudes de m2 ≥ 1e6.
+fn fx_add_q8(slot: u32, v: f32) {
+    var hi = floor(v / 16777216.0);
+    let rem = v - hi * 16777216.0;
+    let lo_f = rem * 256.0;
     var lo: u32;
     if (lo_f >= 4294967040.0) { hi = hi + 1.0; lo = 0u; }
     else { lo = u32(round(lo_f)); }
@@ -398,15 +403,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         fx_add_q24(2u * n + pix, val.b * cw);
         fx_add_q24(3u * n + pix, cw);
         if ((P.flags & 8u) != 0u) {
-            fx_add_q16(4u * n + pix, val.r * val.r * cw);
-            fx_add_q16(5u * n + pix, val.g * val.g * cw);
-            fx_add_q16(6u * n + pix, val.b * val.b * cw);
+            fx_add_q8(4u * n + pix, val.r * val.r * cw);
+            fx_add_q8(5u * n + pix, val.g * val.g * cw);
+            fx_add_q8(6u * n + pix, val.b * val.b * cw);
         }
     } else {
         fx_add_q24(pix, val.g * cw);
         fx_add_q24(n + pix, cw);
         if ((P.flags & 8u) != 0u) {
-            fx_add_q16(2u * n + pix, val.g * val.g * cw);
+            fx_add_q8(2u * n + pix, val.g * val.g * cw);
         }
     }
 }
@@ -1122,9 +1127,9 @@ impl GpuPassAccumulator {
             return Err("error del device GPU durante la descarga".into());
         }
 
-        // Punto fijo → f64: sums en Q40.24, m2 en Q48.16.
+        // Punto fijo → f64: sums en Q40.24, m2 en Q56.8 (PR-1.3: Q48.16 desbordaba a ~65k frames).
         let to_f64_q24 = |v: u64| v as f64 / 16_777_216.0;
-        let to_f64_q16 = |v: u64| v as f64 / 65_536.0;
+        let to_f64_q8 = |v: u64| v as f64 / 256.0;
         let plane = |i: usize| &raw[i * n_px..(i + 1) * n_px];
 
         let mut out = GpuDownload {
@@ -1142,15 +1147,15 @@ impl GpuPassAccumulator {
             out.direct_b = plane(2).iter().map(|&v| to_f64_q24(v)).collect();
             out.direct_w = plane(3).iter().map(|&v| to_f64_q24(v)).collect();
             if self.cfg.track_m2 {
-                out.m2_r = plane(4).iter().map(|&v| to_f64_q16(v)).collect();
-                out.m2_g = plane(5).iter().map(|&v| to_f64_q16(v)).collect();
-                out.m2_b = plane(6).iter().map(|&v| to_f64_q16(v)).collect();
+                out.m2_r = plane(4).iter().map(|&v| to_f64_q8(v)).collect();
+                out.m2_g = plane(5).iter().map(|&v| to_f64_q8(v)).collect();
+                out.m2_b = plane(6).iter().map(|&v| to_f64_q8(v)).collect();
             }
         } else {
             out.direct_g = plane(0).iter().map(|&v| to_f64_q24(v)).collect();
             out.direct_w = plane(1).iter().map(|&v| to_f64_q24(v)).collect();
             if self.cfg.track_m2 {
-                out.m2_g = plane(2).iter().map(|&v| to_f64_q16(v)).collect();
+                out.m2_g = plane(2).iter().map(|&v| to_f64_q8(v)).collect();
             }
         }
         Ok(out)
@@ -1626,6 +1631,46 @@ mod tests {
         assert!(
             rmse <= PARITY_RMSE_TOLERANCE,
             "RMSE {rmse:.4} supera la tolerancia {PARITY_RMSE_TOLERANCE}"
+        );
+    }
+
+    /// PR-1.3: réplica exacta en u64 de la aritmética Q56.8 del shader
+    /// (fx_add_q8 + decode /256). Un SER de alta velocidad de 200k frames
+    /// con píxeles saturados (término máximo val²·cw = 65535² ≈ 4.29e9) NO
+    /// debe desbordar y el decode debe coincidir con la suma f64 dentro de
+    /// la resolución del formato. En Q48.16 esta misma suma desbordaba a
+    /// ~65k frames (techo 2^48 ≈ 2.8e14 < 200k × 4.29e9 ≈ 8.6e14).
+    #[test]
+    fn m2_q56_8_survives_200k_saturated_frames() {
+        // Emulación bit-exacta de fx_add_q8 sobre (lo, hi) u32 con carry.
+        let fx_add_q8 = |acc: &mut (u32, u32), v: f64| {
+            let mut hi = (v / 16_777_216.0).floor();
+            let rem = v - hi * 16_777_216.0;
+            let lo_f = rem * 256.0;
+            let lo: u32 = if lo_f >= 4_294_967_040.0 {
+                hi += 1.0;
+                0
+            } else {
+                lo_f.round() as u32
+            };
+            let (nlo, carry) = acc.0.overflowing_add(lo);
+            acc.0 = nlo;
+            acc.1 = acc.1.wrapping_add(hi as u32).wrapping_add(carry as u32);
+        };
+        let term = 65_535.0f64 * 65_535.0; // val²·cw con cw=1 (peor caso)
+        let n_frames = 200_000u64;
+        let mut acc = (0u32, 0u32);
+        for _ in 0..n_frames {
+            fx_add_q8(&mut acc, term);
+        }
+        let decoded = ((acc.1 as u64) << 32 | acc.0 as u64) as f64 / 256.0;
+        let truth = term * n_frames as f64;
+        // Comprobar que NO desbordó (Q48.16 habría dado un valor ~3x menor
+        // por wrap) y que la precisión es sobrada para una sigma fiable.
+        let rel_err = (decoded - truth).abs() / truth;
+        assert!(
+            rel_err < 1e-9,
+            "Q56.8 debe representar 200k frames saturados sin desbordar: decode={decoded:.3e} truth={truth:.3e} rel={rel_err:.2e}"
         );
     }
 }

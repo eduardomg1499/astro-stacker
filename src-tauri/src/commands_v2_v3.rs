@@ -4480,14 +4480,14 @@ async fn stack_video_liquid_warping_impl(
     // R11: planets earn the true two-pass too (pass 2 re-aligns against the
     // pass-1 stack — pass 2 is even SYMMETRIC for planets, since the rebuilt
     // master skips the micro-contrast pre-boost of pass 1).
-    let total_passes = if double_pass
-        && (drizzle - 1.0).abs() < 0.01
-        && stacking_roi.is_none()
-    {
-        2
-    } else {
-        1
-    };
+    // PR-1.3: la doble pasada (y con ella la rejection kappa-sigma) se
+    // habilita en TODOS los modos. La restricción histórica a drizzle 1× y
+    // sin ROI existía porque la referencia de la pasada 2 se reconstruía
+    // asumiendo lienzo de salida == geometría de entrada; el rebuild ahora
+    // mapea el lienzo (drizzle/ROI) de vuelta a coordenadas de entrada. Los
+    // modos drizzle 1.5×/3× — el caso estrella de resolución — apilaban
+    // SIEMPRE en pasada única y sin rechazo de outliers.
+    let total_passes = if double_pass { 2 } else { 1 };
 
     // RAM: direct-only stackers (Poisson reconstruction is disabled in this
     // path) and channel-less R/B accumulators for mono videos.
@@ -4501,8 +4501,9 @@ async fn stack_video_liquid_warping_impl(
     // frame contribution to them. Transient artifacts (satellites, birds,
     // dust, compression glitches) are statistical outliers at their pixels and
     // get clamped to plausible values; real detail lives inside ±kσ of the
-    // seeing distribution and passes untouched. Only active with the double
-    // pass (same canvas guaranteed: drizzle 1×, no ROI).
+    // seeing distribution and passes untouched. PR-1.3: activa con la doble
+    // pasada en CUALQUIER modo (drizzle/ROI incluidos; las estadísticas y los
+    // bounds viven en el lienzo de salida, que es idéntico en ambas pasadas).
     let sigma_clip_enabled = total_passes == 2;
     const SIGMA_CLIP_K: f32 = 4.0;
     const SIGMA_CLIP_FLOOR: f32 = 6.0; // ADU16: guards zero-variance pixels
@@ -5440,9 +5441,53 @@ async fn stack_video_liquid_warping_impl(
             }
         }
         emit_progress(&app, "Doble Pasada: regenerando referencia desde el apilado...", 92.0, None);
-        for i in 0..w_in * h_in {
-            let w_g = acc_grad_g.direct_w[i].max(1e-9);
-            master_mono[i] = ((acc_grad_g.direct[i] / w_g) as f32).clamp(0.0, 65535.0) as u16;
+        // PR-1.3: el lienzo de la pasada 1 puede llevar drizzle/ROI; el
+        // máster de alineación vive en geometría de ENTRADA. Convención del
+        // acumulador: in = out·inv_drizzle + roi_offset ⇒ out = (in −
+        // roi_offset)·drizzle. Muestreo bilineal ponderado por cobertura;
+        // fuera de cobertura (ROI, esquinas) se CONSERVA el máster previo
+        // para que la alineación siga teniendo referencia allí.
+        {
+            let same_geometry = (drizzle - 1.0).abs() < 0.01 && stacking_roi.is_none();
+            for y in 0..h_in {
+                for x in 0..w_in {
+                    let i = y * w_in + x;
+                    if same_geometry {
+                        let w_g = acc_grad_g.direct_w[i].max(1e-9);
+                        master_mono[i] =
+                            ((acc_grad_g.direct[i] / w_g) as f32).clamp(0.0, 65535.0) as u16;
+                        continue;
+                    }
+                    let ox = (x as f32 - roi_offset_x) * drizzle;
+                    let oy = (y as f32 - roi_offset_y) * drizzle;
+                    if ox < 0.0 || oy < 0.0 {
+                        continue;
+                    }
+                    let x0 = ox as usize;
+                    let y0 = oy as usize;
+                    if x0 + 1 >= w_out || y0 + 1 >= h_out {
+                        continue;
+                    }
+                    let fx = ox - x0 as f32;
+                    let fy = oy - y0 as f32;
+                    let mut acc_v = 0.0f32;
+                    let mut acc_cov = 0.0f32;
+                    for (dy2, wy) in [(0usize, 1.0 - fy), (1usize, fy)] {
+                        for (dx2, wx) in [(0usize, 1.0 - fx), (1usize, fx)] {
+                            let j = (y0 + dy2) * w_out + (x0 + dx2);
+                            let cov = acc_grad_g.direct_w[j];
+                            if cov > 1e-6 {
+                                let wgt = wx * wy;
+                                acc_v += (acc_grad_g.direct[j] / cov) as f32 * wgt;
+                                acc_cov += wgt;
+                            }
+                        }
+                    }
+                    if acc_cov > 0.05 {
+                        master_mono[i] = (acc_v / acc_cov).clamp(0.0, 65535.0) as u16;
+                    }
+                }
+            }
         }
         master_edges = enhance_for_alignment_with_amount(&master_mono, w_in, h_in, align_amount);
         let (ds_w, _ds_h) = downscale_4x(&master_edges, w_in, h_in, &mut master_ds_buf);
@@ -6208,9 +6253,15 @@ fn build_sigma_clip_bounds(
     if acc.m2.len() != n {
         return (lo, hi);
     }
+    // PR-1.3: guarda de cobertura mínima. Con drizzle alto o en bordes tras
+    // el warp, un píxel puede estar cubierto por ~1 frame de peso bajo: su σ
+    // de pasada 1 no es fiable y unos bounds estrechos rechazarían señal
+    // real al azar. Por debajo del umbral los bounds quedan ABIERTOS (sin
+    // rejection en ese píxel). 0.75 ≈ un frame de peso típico.
+    const MIN_COVERAGE_W: f64 = 0.75;
     for i in 0..n {
         let w = acc.direct_w[i];
-        if w > 1e-9 {
+        if w > MIN_COVERAGE_W {
             let mean = acc.direct[i] / w;
             let var = (acc.m2[i] / w - mean * mean).max(0.0);
             let sigma = var.sqrt().max(sigma_floor as f64);

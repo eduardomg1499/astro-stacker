@@ -188,7 +188,10 @@ pub struct PlanetaryStackRequest {
     pub sharpened: bool,
     #[serde(default = "default_sharpen_intensity")]
     pub sharpen_intensity: f32,
-    #[serde(default)]
+    // PR-1.3: doble pasada POR DEFECTO — activa la rejection kappa-sigma y
+    // la re-alineación contra el stack de la pasada 1 (estilo AS!4). El
+    // perfil Fast la sigue desactivando explícitamente.
+    #[serde(default = "default_true_flag")]
     pub double_pass: bool,
     #[serde(default = "default_true")]
     pub warping_analysis: bool,
