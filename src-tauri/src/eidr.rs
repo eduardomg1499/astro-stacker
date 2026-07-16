@@ -998,6 +998,499 @@ pub(crate) fn eidr_prolong(
 }
 
 // ---------------------------------------------------------------------------
+// Puerta local de recuperabilidad (F9.3, §7.4)
+// ---------------------------------------------------------------------------
+//
+// Para cada tile τ y frecuencia base κ (clase de alias del muestreo del
+// detector), la matriz Q(i,ℓ) = ĥ_i(κ+ℓ·f_s)·e^{−2πi(κ+ℓ·f_s)·Δ_i}/σ_i mide
+// cuánta evidencia INDEPENDIENTE aportan los frames para separar las réplicas
+// aliasadas ℓ. Su SVD da: κ_cond = σ_max/σ_min (amplificación de ruido del
+// modo peor determinado) y R = σ̃²/(σ̃²+η) (recuperabilidad 0..1). Sin
+// diversidad de fases de dither (o con PSF ancha sin MTF más allá del
+// Nyquist nativo) σ_min ≈ 0: el grid fino sería interpolación, no evidencia
+// — y la puerta lo declara ANTES de resolver.
+//
+// Umbrales §7.4 (iniciales, pendientes de calibración con corpus):
+// κ ≤ 30 apto · 30 < κ ≤ 100 degradar · κ > 100 o pérdida de rango fallback.
+// CFA: la retícula por canal tiene paso 2 (f_s = ½) ⇒ más réplicas por eje y
+// G aporta dos filas por frame (sus dos paridades quincunx).
+
+/// Umbral κ apto / degradar (§7.4).
+pub(crate) const EIDR_KAPPA_APT: f64 = 30.0;
+/// Umbral κ degradar / fallback (§7.4).
+pub(crate) const EIDR_KAPPA_MAX: f64 = 100.0;
+/// η de la recuperabilidad R = σ̃²/(σ̃²+η), con σ̃ relativa a ‖Q‖_F/√L.
+const EIDR_GATE_ETA: f64 = 1e-2;
+/// R mínima de la banda extendida baja para clase APTO / DEGRADAR: por
+/// debajo no hay evidencia superresuelta (PSF ancha ⇒ fallback aunque el
+/// dither sea perfecto, §7.8).
+const EIDR_GATE_R_APT: f64 = 0.05;
+const EIDR_GATE_R_MIN: f64 = 0.02;
+
+/// Entrada por frame de la puerta: geometría + PSF ajustada (None ⇒ Γ
+/// nominal) + σ′ del frame en unidades normalizadas.
+pub(crate) struct EidrGateFrame {
+    pub geom: EidrGeom,
+    pub psf: Option<MoffatPsf>,
+    pub sigma: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EidrTileGate {
+    /// Índice de tile (tx, ty) sobre el grid nativo.
+    pub tx: usize,
+    pub ty: usize,
+    /// Peor κ = σ_max/σ_min de la banda extendida BAJA (primer radio del
+    /// anillo): ahí la MTF aún tiene señal, así que κ mide la diversidad de
+    /// fases del dither — el criterio de clase de §7.4. Las frecuencias más
+    /// altas del anillo pueden carecer de MTF por pura física (seeing) y eso
+    /// lo captura `r_band`, no la clase.
+    pub kappa: f64,
+    /// Recuperabilidad media del anillo extendido (0..1): fracción de la
+    /// banda superresuelta con evidencia real; alimenta el mapa RECOV y el
+    /// taper. 1.0 a escala nativa.
+    pub r_band: f64,
+    /// 0 = apto, 1 = degradar, 2 = fallback local.
+    pub class: u8,
+}
+
+#[derive(Debug)]
+pub(crate) struct EidrGateReport {
+    pub scale: f32,
+    pub tile: usize,
+    pub tiles_x: usize,
+    pub tiles_y: usize,
+    pub tiles: Vec<EidrTileGate>,
+    pub frac_apt: f64,
+    pub frac_degrade: f64,
+    pub frac_fallback: f64,
+}
+
+impl EidrGateReport {
+    /// Mapa RECOV a resolución de salida: R por tile (constante en el tile).
+    pub(crate) fn recov_map(&self, w_out: usize, h_out: usize) -> Vec<f32> {
+        let mut map = vec![0.0f32; w_out * h_out];
+        let s = self.scale as f64;
+        let tpx = (self.tile as f64 * s).max(1.0);
+        for qy in 0..h_out {
+            let ty = ((qy as f64 / tpx) as usize).min(self.tiles_y.saturating_sub(1));
+            for qx in 0..w_out {
+                let tx = ((qx as f64 / tpx) as usize).min(self.tiles_x.saturating_sub(1));
+                map[qy * w_out + qx] = self.tiles[ty * self.tiles_x + tx].r_band as f32;
+            }
+        }
+        map
+    }
+
+    /// ¿La escala está soportada globalmente? Criterio conservador: mayoría
+    /// de tiles aptos y fallback minoritario.
+    pub(crate) fn scale_supported(&self) -> bool {
+        self.frac_apt >= 0.5 && self.frac_fallback <= 0.3
+    }
+}
+
+/// MTF de una Moffat elíptica en la frecuencia (vx, vy) ciclos/px (coords del
+/// frame), por suma coseno directa sobre un raster 1/4 px (la PSF es par ⇒
+/// MTF real). Incluye normalización a MTF(0)=1.
+fn moffat_mtf(psf: &MoffatPsf, freqs: &[(f64, f64)]) -> Vec<f64> {
+    let step = 0.25f64;
+    let r_m = (3.0 * psf.fwhm_x.max(psf.fwhm_y) as f64).max(4.0);
+    let n = (2.0 * r_m / step).ceil() as usize + 1;
+    let c = (n as f64 - 1.0) * 0.5;
+    let ax = moffat_alpha(psf.fwhm_x as f64, psf.beta as f64);
+    let ay = moffat_alpha(psf.fwhm_y as f64, psf.beta as f64);
+    let (st, ct) = (psf.theta as f64).sin_cos();
+    let beta = psf.beta.max(1.05) as f64;
+    let mut vals = vec![0.0f64; n * n];
+    let mut sum = 0.0f64;
+    for j in 0..n {
+        let dy = (j as f64 - c) * step;
+        for i in 0..n {
+            let dx = (i as f64 - c) * step;
+            let u = ct * dx + st * dy;
+            let v = -st * dx + ct * dy;
+            let r2 = (u / ax) * (u / ax) + (v / ay) * (v / ay);
+            let val = (1.0 + r2).powf(-beta);
+            vals[j * n + i] = val;
+            sum += val;
+        }
+    }
+    freqs
+        .iter()
+        .map(|&(vx, vy)| {
+            let mut acc = 0.0f64;
+            for j in 0..n {
+                let dy = (j as f64 - c) * step;
+                for i in 0..n {
+                    let dx = (i as f64 - c) * step;
+                    acc += vals[j * n + i]
+                        * (2.0 * std::f64::consts::PI * (vx * dx + vy * dy)).cos();
+                }
+            }
+            acc / sum
+        })
+        .collect()
+}
+
+/// sinc normalizada sin(πx)/(πx) — MTF de la apertura del fotosito.
+fn sinc(x: f64) -> f64 {
+    if x.abs() < 1e-9 {
+        1.0
+    } else {
+        let px = std::f64::consts::PI * x;
+        px.sin() / px
+    }
+}
+
+/// Resuelve G·x = e_t para G hermitiana L×L (compleja, como pares re/im)
+/// por eliminación gaussiana con pivoteo parcial. Devuelve la componente t
+/// de la solución (real para G hermitiana definida positiva) o None si G es
+/// numéricamente singular — que es exactamente la pérdida de rango de §7.4.
+fn hermitian_solve_diag(
+    gre: &[f64],
+    gim: &[f64],
+    l: usize,
+    t: usize,
+) -> Option<f64> {
+    // Copias de trabajo aumentadas con e_t.
+    let mut a: Vec<(f64, f64)> = (0..l * l).map(|i| (gre[i], gim[i])).collect();
+    let mut b: Vec<(f64, f64)> = (0..l).map(|i| ((i == t) as u8 as f64, 0.0)).collect();
+    let scale = (0..l)
+        .map(|i| a[i * l + i].0.abs())
+        .fold(0.0f64, f64::max)
+        .max(1e-300);
+    for col in 0..l {
+        // Pivoteo parcial por módulo.
+        let (mut best, mut bmag) = (col, 0.0f64);
+        for row in col..l {
+            let (re, im) = a[row * l + col];
+            let m = re * re + im * im;
+            if m > bmag {
+                bmag = m;
+                best = row;
+            }
+        }
+        if bmag.sqrt() < 1e-13 * scale {
+            return None; // rango perdido
+        }
+        if best != col {
+            for k in 0..l {
+                a.swap(col * l + k, best * l + k);
+            }
+            b.swap(col, best);
+        }
+        let (pr, pi) = a[col * l + col];
+        let pinv = 1.0 / (pr * pr + pi * pi);
+        for row in (col + 1)..l {
+            let (er, ei) = a[row * l + col];
+            if er == 0.0 && ei == 0.0 {
+                continue;
+            }
+            // factor = a[row,col] / pivote
+            let fr = (er * pr + ei * pi) * pinv;
+            let fi = (ei * pr - er * pi) * pinv;
+            for k in col..l {
+                let (cr, ci) = a[col * l + k];
+                let (rr, ri) = a[row * l + k];
+                a[row * l + k] = (rr - (fr * cr - fi * ci), ri - (fr * ci + fi * cr));
+            }
+            let (cr, ci) = b[col];
+            let (rr, ri) = b[row];
+            b[row] = (rr - (fr * cr - fi * ci), ri - (fr * ci + fi * cr));
+        }
+    }
+    // Sustitución hacia atrás.
+    let mut x: Vec<(f64, f64)> = vec![(0.0, 0.0); l];
+    for col in (0..l).rev() {
+        let (mut sr, mut si) = b[col];
+        for k in (col + 1)..l {
+            let (ar, ai) = a[col * l + k];
+            let (xr, xi) = x[k];
+            sr -= ar * xr - ai * xi;
+            si -= ar * xi + ai * xr;
+        }
+        let (pr, pi) = a[col * l + col];
+        let pinv = 1.0 / (pr * pr + pi * pi);
+        x[col] = ((sr * pr + si * pi) * pinv, (si * pr - sr * pi) * pinv);
+    }
+    let v = x[t].0;
+    v.is_finite().then_some(v)
+}
+
+/// Puerta de recuperabilidad por tiles para la escala `scale`. `cfa` =
+/// Some((cid, canal)) evalúa la retícula CFA de ese canal (G: 2 filas por
+/// frame). A escala ≤1.05 no hay banda extendida y todo tile es apto.
+pub(crate) fn eidr_recoverability_gate(
+    frames: &[EidrGateFrame],
+    gamma: MoffatPsf,
+    w: usize,
+    h: usize,
+    scale: f32,
+    cfa: Option<(i32, usize)>,
+    tile: usize,
+) -> EidrGateReport {
+    let tile = tile.max(32).min(w.max(h));
+    let tiles_x = (w + tile - 1) / tile;
+    let tiles_y = (h + tile - 1) / tile;
+    let s = scale as f64;
+    let mut report = EidrGateReport {
+        scale,
+        tile,
+        tiles_x,
+        tiles_y,
+        tiles: Vec::with_capacity(tiles_x * tiles_y),
+        frac_apt: 0.0,
+        frac_degrade: 0.0,
+        frac_fallback: 0.0,
+    };
+    if s <= 1.05 || frames.is_empty() {
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                report.tiles.push(EidrTileGate {
+                    tx,
+                    ty,
+                    kappa: 1.0,
+                    r_band: 1.0,
+                    class: 0,
+                });
+            }
+        }
+        report.frac_apt = 1.0;
+        return report;
+    }
+
+    // Frecuencias objetivo: anillo superresuelto (más allá del Nyquist nativo
+    // 0.5 hasta el Nyquist de salida s/2), 4 radios × 4 ángulos.
+    let radii: [f64; 4] = [0.2, 0.5, 0.8, 0.98];
+    let angles: [f64; 4] = [0.0, 45.0, 90.0, 135.0];
+    let mut targets: Vec<(f64, f64)> = Vec::new();
+    for &rf in &radii {
+        let r = 0.5 + (0.5 * s - 0.5) * rf;
+        for &ang in &angles {
+            let a = ang.to_radians();
+            targets.push((r * a.cos(), r * a.sin()));
+        }
+    }
+    // Paso de la retícula del canal (CFA: 2) y paridades (filas por frame).
+    let (step_lat, parities): (f64, Vec<(usize, usize)>) = match cfa {
+        Some((cid, c)) => (2.0, cfa_parities(cid, c)),
+        None => (1.0, vec![(0usize, 0usize)]),
+    };
+    let fs = 1.0 / step_lat;
+    // Réplicas por objetivo: κ = alias base; ℓ recorre |κ+m·fs| ≤ s/2.
+    let replicas_of = |vt: (f64, f64)| -> (Vec<(f64, f64)>, usize) {
+        let base = (
+            vt.0 - fs * (vt.0 / fs).round(),
+            vt.1 - fs * (vt.1 / fs).round(),
+        );
+        let mut reps = Vec::new();
+        let lim = 0.5 * s - 1e-6;
+        let mmax = ((lim / fs).ceil() as i64) + 1;
+        for my in -mmax..=mmax {
+            let vy = base.1 + my as f64 * fs;
+            if vy.abs() > lim {
+                continue;
+            }
+            for mx in -mmax..=mmax {
+                let vx = base.0 + mx as f64 * fs;
+                if vx.abs() > lim {
+                    continue;
+                }
+                reps.push((vx, vy));
+            }
+        }
+        let l = reps.len();
+        (reps, l)
+    };
+    // MTF por frame y por frecuencia absoluta (cacheado: no depende del tile).
+    // La frecuencia se lleva a coords del frame con ν_f = (G2ᵀ/s)·ν y se
+    // multiplica por la apertura del fotosito sinc(ν_fx)·sinc(ν_fy).
+    let mut mtf_cache: Vec<Vec<Vec<f64>>> = Vec::with_capacity(frames.len());
+    let all_reps: Vec<(Vec<(f64, f64)>, usize)> =
+        targets.iter().map(|&t| replicas_of(t)).collect();
+    for fr in frames {
+        let g2 = [fr.geom.gx, fr.geom.gy]; // columnas: ∂out/∂px, ∂out/∂py
+        let psf = fr.psf.unwrap_or(gamma);
+        let mut per_target = Vec::with_capacity(all_reps.len());
+        for (reps, _) in &all_reps {
+            let freqs_f: Vec<(f64, f64)> = reps
+                .iter()
+                .map(|&(vx, vy)| {
+                    (
+                        (g2[0][0] * vx + g2[0][1] * vy) / s,
+                        (g2[1][0] * vx + g2[1][1] * vy) / s,
+                    )
+                })
+                .collect();
+            let mut vals = moffat_mtf(&psf, &freqs_f);
+            for (v, &(fx, fy)) in vals.iter_mut().zip(freqs_f.iter()) {
+                *v *= sinc(fx) * sinc(fy);
+            }
+            per_target.push(vals);
+        }
+        mtf_cache.push(per_target);
+    }
+
+    let (mut n_apt, mut n_deg, mut n_fb) = (0usize, 0usize, 0usize);
+    for ty in 0..tiles_y {
+        for tx in 0..tiles_x {
+            // Puntos de evaluación: centro + 4 esquinas (rotación ⇒ la fase
+            // deriva dentro del tile; el peor caso manda).
+            let x0 = (tx * tile) as f64;
+            let y0 = (ty * tile) as f64;
+            let x1 = ((tx + 1) * tile).min(w) as f64;
+            let y1 = ((ty + 1) * tile).min(h) as f64;
+            let pts = [
+                (0.5 * (x0 + x1), 0.5 * (y0 + y1)),
+                (x0 + 2.0, y0 + 2.0),
+                (x1 - 2.0, y0 + 2.0),
+                (x0 + 2.0, y1 - 2.0),
+                (x1 - 2.0, y1 - 2.0),
+            ];
+            let mut kappa_low = 1.0f64;
+            let mut r_low = 1.0f64;
+            let mut r_sum = 0.0f64;
+            let mut r_cnt = 0usize;
+            for (ti, (reps, l)) in all_reps.iter().enumerate() {
+                let low_band = ti < angles.len();
+                if *l < 2 {
+                    // Sin réplicas dentro de banda: nada que separar aquí.
+                    r_sum += 1.0;
+                    r_cnt += 1;
+                    continue;
+                }
+                let mut r_target = 1.0f64;
+                for &(rx, ry) in &pts {
+                    // Matriz Q: filas = frame × paridad; cols = réplicas.
+                    let mut rows: Vec<Vec<(f64, f64)>> = Vec::new();
+                    let mut dc2 = 0.0f64; // ‖columna DC‖²: sensibilidad total
+                    for (fi, fr) in frames.iter().enumerate() {
+                        let (pfx, pfy) = fr.geom.f(rx * s, ry * s);
+                        if !pfx.is_finite() || !pfy.is_finite() {
+                            continue;
+                        }
+                        for &(ox, oy) in &parities {
+                            // Fotosito de la retícula más próximo y su
+                            // posición REAL en coords nativas de referencia.
+                            let snap = |v: f64, o: usize| -> f64 {
+                                let r = v.round();
+                                if (r as i64).rem_euclid(2) as usize == o || step_lat < 1.5 {
+                                    r
+                                } else if v >= r {
+                                    r + 1.0
+                                } else {
+                                    r - 1.0
+                                }
+                            };
+                            let (px, py) = (snap(pfx, ox), snap(pfy, oy));
+                            let (gx, gy) = fr.geom.g(px, py);
+                            let (dx, dy) = (gx / s, gy / s);
+                            let inv_sigma = 1.0 / fr.sigma.max(1e-12);
+                            dc2 += inv_sigma * inv_sigma;
+                            let row: Vec<(f64, f64)> = reps
+                                .iter()
+                                .enumerate()
+                                .map(|(ri, &(vx, vy))| {
+                                    let amp = mtf_cache[fi][ti][ri] * inv_sigma;
+                                    let ph = -2.0
+                                        * std::f64::consts::PI
+                                        * (vx * dx + vy * dy);
+                                    (amp * ph.cos(), amp * ph.sin())
+                                })
+                                .collect();
+                            rows.push(row);
+                        }
+                    }
+                    if rows.len() < *l {
+                        if low_band {
+                            kappa_low = f64::INFINITY;
+                            r_low = 0.0;
+                        }
+                        r_target = 0.0;
+                        continue;
+                    }
+                    // G = QᴴQ y precisión marginal del MODO OBJETIVO t:
+                    // var_t = [(G)⁻¹]_{tt}. De ahí:
+                    //  - amp = √var_t·‖col_t‖ ≥ 1: amplificación de ruido del
+                    //    modo por tener que separarlo de sus réplicas — mide
+                    //    la DIVERSIDAD de fases (κ de §7.4);
+                    //  - s_t = 1/√var_t: evidencia absoluta que queda para el
+                    //    modo (→ R). PSF sin MTF ⇒ s_t≈0 aunque amp sea 1.
+                    let target_idx = reps
+                        .iter()
+                        .position(|&(vx, vy)| {
+                            (vx - targets[ti].0).abs() < 1e-9
+                                && (vy - targets[ti].1).abs() < 1e-9
+                        })
+                        .unwrap_or(0);
+                    let mut gre = vec![0.0f64; *l * *l];
+                    let mut gim = vec![0.0f64; *l * *l];
+                    for a in 0..*l {
+                        for bcol in 0..*l {
+                            let (mut re, mut im) = (0.0f64, 0.0f64);
+                            for row in &rows {
+                                let (ar, ai) = row[a];
+                                let (br, bi) = row[bcol];
+                                re += ar * br + ai * bi;
+                                im += ar * bi - ai * br;
+                            }
+                            gre[a * *l + bcol] = re;
+                            gim[a * *l + bcol] = im;
+                        }
+                    }
+                    let var_t = hermitian_solve_diag(&gre, &gim, *l, target_idx);
+                    let coln = gre[target_idx * *l + target_idx].max(0.0).sqrt();
+                    let (amp, s_t) = match var_t {
+                        Some(v) if v > 0.0 && coln > 1e-300 => {
+                            (v.sqrt() * coln, 1.0 / v.sqrt())
+                        }
+                        _ => (f64::INFINITY, 0.0),
+                    };
+                    // Evidencia RELATIVA A LA SENSIBILIDAD DC del stack: la
+                    // fracción de SNR total que retiene este modo. Con PSF
+                    // ancha TODAS las réplicas extendidas colapsan y s̃→0
+                    // aunque amp≈1: sin evidencia no hay clase apta (§7.8).
+                    let s_tilde = s_t / dc2.sqrt().max(1e-300);
+                    let r = s_tilde * s_tilde / (s_tilde * s_tilde + EIDR_GATE_ETA);
+                    if low_band {
+                        kappa_low = kappa_low.max(amp);
+                        r_low = r_low.min(r);
+                    }
+                    r_target = r_target.min(r);
+                }
+                r_sum += r_target;
+                r_cnt += 1;
+            }
+            // Clase §7.4: diversidad (amp) Y evidencia (R) de la banda baja.
+            let class = if kappa_low <= EIDR_KAPPA_APT && r_low > EIDR_GATE_R_APT {
+                0u8
+            } else if kappa_low <= EIDR_KAPPA_MAX && r_low > EIDR_GATE_R_MIN {
+                1u8
+            } else {
+                2u8
+            };
+            match class {
+                0 => n_apt += 1,
+                1 => n_deg += 1,
+                _ => n_fb += 1,
+            }
+            report.tiles.push(EidrTileGate {
+                tx,
+                ty,
+                kappa: kappa_low,
+                r_band: r_sum / r_cnt.max(1) as f64,
+                class,
+            });
+        }
+    }
+    let total = (tiles_x * tiles_y).max(1) as f64;
+    report.frac_apt = n_apt as f64 / total;
+    report.frac_degrade = n_deg as f64 / total;
+    report.frac_fallback = n_fb as f64 / total;
+    report
+}
+
+// ---------------------------------------------------------------------------
 // Tests — F9.1: identidad adjunta, conservación de flujo, CFA
 // ---------------------------------------------------------------------------
 
@@ -1256,6 +1749,156 @@ mod tests {
                     up[y2 * 20 + x2]
                 );
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Gate F9.3 — puerta de recuperabilidad
+    // -----------------------------------------------------------------------
+
+    fn gate_frames(dithers: &[(f64, f64)], fwhm: f32, scale: f32) -> Vec<EidrGateFrame> {
+        dithers
+            .iter()
+            .map(|&(dx, dy)| {
+                let t = crate::DsTransform::from_similarity((1.0, 0.0, -dx as f32, -dy as f32));
+                EidrGateFrame {
+                    geom: eidr_geom(&t, scale).unwrap(),
+                    psf: Some(MoffatPsf {
+                        fwhm_x: fwhm,
+                        fwhm_y: fwhm,
+                        theta: 0.0,
+                        beta: 2.5,
+                    }),
+                    sigma: 14.0,
+                }
+            })
+            .collect()
+    }
+
+    fn golden_dithers(n: usize) -> Vec<(f64, f64)> {
+        (0..n)
+            .map(|i| {
+                (
+                    (i as f64 * 0.618033988749895).fract() + (i % 3) as f64 - 1.0,
+                    (i as f64 * 0.754877666246693).fract() + ((i / 3) % 3) as f64 - 1.0,
+                )
+            })
+            .collect()
+    }
+
+    /// §7.4: dithers subpíxel diversos con PSF submuestreada ⇒ apto a 2x;
+    /// dithers ENTEROS (fases degeneradas) ⇒ fallback: el 2x sería pura
+    /// interpolación y la puerta lo dice antes de resolver. PSF ancha (bien
+    /// muestreada) ⇒ tampoco hay evidencia superresuelta. Escala 1 ⇒ trivial.
+    #[test]
+    fn gate_f93_recoverability_diverse_vs_degenerate() {
+        // Diversos, submuestreado (FWHM 1.3 px) ⇒ todo apto.
+        let rep = eidr_recoverability_gate(
+            &gate_frames(&golden_dithers(16), 1.3, 2.0),
+            MoffatPsf { fwhm_x: 1.3, fwhm_y: 1.3, theta: 0.0, beta: 2.5 },
+            256,
+            192,
+            2.0,
+            None,
+            128,
+        );
+        assert!(
+            rep.frac_apt > 0.99 && rep.scale_supported(),
+            "diversos: apt={:.2} deg={:.2} fb={:.2} κ0={:.1}",
+            rep.frac_apt,
+            rep.frac_degrade,
+            rep.frac_fallback,
+            rep.tiles[0].kappa
+        );
+        assert!(rep.tiles.iter().all(|t| t.r_band > 0.01));
+
+        // Dithers enteros ⇒ réplicas indistinguibles ⇒ fallback.
+        let deg: Vec<(f64, f64)> = (0..16).map(|i| ((i % 4) as f64, (i / 4) as f64)).collect();
+        let rep = eidr_recoverability_gate(
+            &gate_frames(&deg, 1.3, 2.0),
+            MoffatPsf { fwhm_x: 1.3, fwhm_y: 1.3, theta: 0.0, beta: 2.5 },
+            256,
+            192,
+            2.0,
+            None,
+            128,
+        );
+        assert!(
+            rep.frac_fallback > 0.99 && !rep.scale_supported(),
+            "enteros: fb={:.2} κ0={:.1}",
+            rep.frac_fallback,
+            rep.tiles[0].kappa
+        );
+
+        // PSF ancha (3.5 px, bien muestreada): sin MTF extendida ⇒ no apto
+        // aunque el dither sea perfecto (§7.8: no se promete superresolución).
+        let rep = eidr_recoverability_gate(
+            &gate_frames(&golden_dithers(16), 3.5, 2.0),
+            MoffatPsf { fwhm_x: 3.5, fwhm_y: 3.5, theta: 0.0, beta: 2.5 },
+            256,
+            192,
+            2.0,
+            None,
+            128,
+        );
+        assert!(
+            rep.frac_apt < 0.01,
+            "PSF ancha: apt={:.2} κ0={:.1}",
+            rep.frac_apt,
+            rep.tiles[0].kappa
+        );
+
+        // Escala nativa: sin banda extendida, todo apto por definición.
+        let rep = eidr_recoverability_gate(
+            &gate_frames(&golden_dithers(16), 1.3, 1.0),
+            MoffatPsf { fwhm_x: 1.3, fwhm_y: 1.3, theta: 0.0, beta: 2.5 },
+            256,
+            192,
+            1.0,
+            None,
+            128,
+        );
+        assert!(rep.frac_apt > 0.99 && rep.tiles.iter().all(|t| t.r_band == 1.0));
+    }
+
+    /// CFA a 2x: la retícula por canal (paso 2) exige más diversidad; con 24
+    /// dithers dorados hay evidencia, con dithers enteros PARES (fase CFA
+    /// congelada) no la hay ni siquiera para el verde quincunx.
+    #[test]
+    fn gate_f93_recoverability_cfa() {
+        let gamma = MoffatPsf { fwhm_x: 1.4, fwhm_y: 1.4, theta: 0.0, beta: 2.5 };
+        for c in [0usize, 1, 2] {
+            let rep = eidr_recoverability_gate(
+                &gate_frames(&golden_dithers(24), 1.4, 2.0),
+                gamma,
+                256,
+                192,
+                2.0,
+                Some((8, c)),
+                128,
+            );
+            assert!(
+                rep.frac_fallback < 0.01,
+                "CFA c={c} diversos: fb={:.2} κ0={:.1}",
+                rep.frac_fallback,
+                rep.tiles[0].kappa
+            );
+            let deg: Vec<(f64, f64)> =
+                (0..24).map(|i| (2.0 * (i % 4) as f64, 2.0 * (i / 4) as f64)).collect();
+            let rep = eidr_recoverability_gate(
+                &gate_frames(&deg, 1.4, 2.0),
+                gamma,
+                256,
+                192,
+                2.0,
+                Some((8, c)),
+                128,
+            );
+            assert!(
+                rep.frac_fallback > 0.99,
+                "CFA c={c} enteros pares: fb={:.2}",
+                rep.frac_fallback
+            );
         }
     }
 
