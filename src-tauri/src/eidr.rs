@@ -569,6 +569,8 @@ pub(crate) struct EidrOperator {
     pub h_out: usize,
     /// `Some(cid)` ⇒ frames CFA de 1 plano; el canal selecciona la retícula.
     pub cfa: Option<i32>,
+    /// Canales de salida (informativo: el solve es por canal).
+    #[allow(dead_code)]
     pub ch: usize,
 }
 
@@ -1161,6 +1163,38 @@ pub(crate) fn eidr_prolong(
     out
 }
 
+/// Marca como INVÁLIDOS los fotositos cuya ventana de depósito NO cae
+/// íntegra dentro del lienzo: sus filas de A serían parciales y acoplan la
+/// escala del interior con el borde (sesgo multiplicativo cazado por el
+/// holdout de F9.4). Con el lienzo acolchado son pocos; devuelve cuántos.
+pub(crate) fn eidr_mask_partial_rows(
+    f: &mut EidrFrameOp,
+    w_out: usize,
+    h_out: usize,
+) -> usize {
+    let q_rad = f.lut.radius as f64 * f.geom.q_rad_factor + 2.0;
+    let mut masked = 0usize;
+    for py in 0..f.h {
+        for px in 0..f.w {
+            let (gx, gy) = f.geom.g(px as f64, py as f64);
+            let inside = gx.is_finite()
+                && gy.is_finite()
+                && gx - q_rad >= 0.0
+                && gy - q_rad >= 0.0
+                && gx + q_rad <= (w_out - 1) as f64
+                && gy + q_rad <= (h_out - 1) as f64;
+            if !inside {
+                let idx = py * f.w + px;
+                if !bit(&f.mask, idx) {
+                    masked += 1;
+                    f.mask[idx >> 6] |= 1u64 << (idx & 63);
+                }
+            }
+        }
+    }
+    masked
+}
+
 // ---------------------------------------------------------------------------
 // Holdout y FRC (F9.4, §7.5/§7.9/§7.10)
 // ---------------------------------------------------------------------------
@@ -1345,7 +1379,7 @@ pub(crate) fn frc_cutoff(
     let mut planner = FftPlanner::<f64>::new();
     let fft_w = planner.plan_fft_forward(w);
     let fft_h = planner.plan_fft_forward(h);
-    let mut fft2_rect = |buf: &mut Vec<Complex<f64>>| {
+    let fft2_rect = |buf: &mut Vec<Complex<f64>>| {
         for row in buf.chunks_exact_mut(w) {
             fft_w.process(row);
         }

@@ -9098,6 +9098,19 @@ function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
         computePolicy: value("sel-ds-compute", "hybrid"),
         profile,
         rejection,
+        ...(dsMethod === "eidr"
+            ? {
+                integrationMethod: {
+                    method: "eidr",
+                    // F9: sucesor forward-model de drizzle. La escala Auto la
+                    // decide la PSF medida + la puerta de recuperabilidad; los
+                    // fallbacks quedan en receta (nunca silenciosos).
+                    scale: value("sel-ds-eidrscale", "auto"),
+                    solveMode: "scientificQuadratic",
+                    cfaDirect: checked("chk-ds-cfadirect", false),
+                },
+            }
+            : {}),
         ...(dsMethod === "nebula_fusion" || dsMethod === "nebula_fusion_full" || dsMethod === "nebula_fusion_struct"
             ? {
                 integrationMethod: {
@@ -10343,6 +10356,7 @@ function dsShowStretchBar() {
             <option value="neff">${tr("deepsky.view_neff", "NEFF — tomas efectivas (NF)")}</option>
             <option value="dq">${tr("deepsky.view_dq", "Calidad de datos DQ (NF)")}</option>
             <option value="struct">${tr("deepsky.view_struct", "STRUCT (evidencia A/B)")}</option>
+            <option value="recoverability">${tr("deepsky.view_recoverability", "Recuperabilidad (EIDR)")}</option>
             <option value="struct_residual">${tr("deepsky.view_struct_residual", "Residual de STRUCT")}</option>`;
         view.addEventListener("change", () => dsShowResultView(view.value));
         const modes = [
@@ -10695,11 +10709,16 @@ function dsLoadUxFixtureIfRequested(modal) {
             dsMethodSel?.value === "nebula_fusion" ||
             dsMethodSel?.value === "nebula_fusion_full" ||
             dsMethodSel?.value === "nebula_fusion_struct";
-        [["chk-ds-cfadirect", "lbl-ds-cfadirect"], ["sel-ds-outputbin", "lbl-ds-outputbin"]].forEach(([inputId, labelId]) => {
+        const eidrActive = dsMethodSel?.value === "eidr";
+        // CFA directo aplica a NF y a EIDR; super-binning solo a NF; la
+        // escala solo a EIDR.
+        [["chk-ds-cfadirect", "lbl-ds-cfadirect", nfActive || eidrActive],
+         ["sel-ds-outputbin", "lbl-ds-outputbin", nfActive],
+         ["sel-ds-eidrscale", "lbl-ds-eidrscale", eidrActive]].forEach(([inputId, labelId, active]) => {
             const input = document.getElementById(inputId);
-            if (input) input.disabled = !nfActive;
+            if (input) input.disabled = !active;
             const label = document.getElementById(labelId);
-            if (label) label.style.opacity = nfActive ? "1" : "0.5";
+            if (label) label.style.opacity = active ? "1" : "0.5";
         });
     };
     dsMethodSel?.addEventListener("change", dsSyncNebulaFusionControls);

@@ -1540,10 +1540,19 @@
                                 <option value="nebula_fusion" data-i18n="deepsky.method_nebula_fusion">NebulaFusion Lite (beta)</option>
                                 <option value="nebula_fusion_full" data-i18n="deepsky.method_nebula_fusion_full">NebulaFusion Full (beta)</option>
                                 <option value="nebula_fusion_struct" data-i18n="deepsky.method_nebula_fusion_struct">NebulaFusion Full + STRUCT (beta)</option>
-                                <option value="eidr" disabled data-i18n="deepsky.method_eidr">EIDR super-res (próximamente)</option>
+                                <option value="eidr" data-i18n="deepsky.method_eidr">EIDR super-resolución (beta)</option>
                             </select>
                         </label>
                         <div style="font-size:.58rem;color:#64748b;margin:-2px 0 6px 2px;" data-i18n="deepsky.method_hint_nf">NebulaFusion: media ponderada por el ruido de cada toma + máscaras de rechazo congeladas + mapas científicos VAR/NEFF/DQ junto al máster.</div>
+                        <label id="lbl-ds-eidrscale" class="ds-row" title="Solo EIDR: escala de reconstrucción. Auto decide con la PSF medida y la puerta de recuperabilidad (2x exige ≥12 tomas y dithers diversos; si no hay evidencia, degrada a 1.5x/1x y lo registra en la receta).">
+                            <span data-i18n="deepsky.eidr_scale_label">Escala EIDR</span>
+                            <select id="sel-ds-eidrscale" class="ds-sel">
+                                <option value="auto" selected data-i18n="deepsky.eidr_scale_auto">Auto (PSF + puerta)</option>
+                                <option value="x1" data-i18n="deepsky.eidr_scale_1">1x</option>
+                                <option value="x1_5" data-i18n="deepsky.eidr_scale_15">1.5x</option>
+                                <option value="x2" data-i18n="deepsky.eidr_scale_2">2x</option>
+                            </select>
+                        </label>
                         <label id="lbl-ds-cfadirect" class="ds-row" title="Solo NebulaFusion: apila cada fotosito CFA en su propio canal, sin interpolar el debayer. Requiere lights CFA (RAW/FITS Bayer); el preflight lo valida.">
                             <span data-i18n="deepsky.cfa_direct_label">Modo CFA directo (sin debayer)</span>
                             <span class="switch"><input type="checkbox" id="chk-ds-cfadirect"><span class="slider round"></span></span>

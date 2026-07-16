@@ -833,6 +833,10 @@ pub struct EidrConfig {
     pub warm_start: bool,
     #[serde(default = "crate::pipeline::default_true_flag")]
     pub multigrid: bool,
+    /// CFA directo (sin debayer, por fotodiodo): resuelve x_R/x_G/x_B sobre
+    /// las retículas Bayer (§7.6). 2x exige N≥24.
+    #[serde(default)]
+    pub cfa_direct: bool,
 }
 
 pub fn default_true_flag() -> bool {
@@ -1238,6 +1242,9 @@ pub struct DeepSkyResult {
     /// (planos LUMA de w*h; None fuera del modo FullWithStruct).
     pub struct_map: Option<Vec<f32>>,
     pub struct_residual: Option<Vec<f32>>,
+    /// Mapa de recuperabilidad EIDR (R por tile, 0..1) a resolución del
+    /// máster. Solo con motor EIDR (F9).
+    pub recoverability: Option<Vec<f32>>,
 }
 
 /// Alias transitorio para los módulos internos previos a la API tipada v2.

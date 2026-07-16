@@ -3631,6 +3631,15 @@ fn deepsky_result_view(state: State<'_, AppState>, kind: String) -> Result<Strin
         // Modelo de fondo/contaminación lumínica (F2): se ajusta bajo demanda
         // sobre el máster (grado 2 robusto, no destructivo) y se muestra como
         // luma desplazada al rango positivo.
+        // Mapa de recuperabilidad EIDR (F9): R por tile, 0..1.
+        "recoverability" => {
+            let plane_src = result
+                .recoverability
+                .as_ref()
+                .ok_or("El mapa de recuperabilidad requiere el motor EIDR")?;
+            bg_owned = plane_src.clone();
+            &bg_owned
+        }
         "background_model" => {
             let (w, h, ch) = (result.width, result.height, result.channels);
             let model = crate::deepsky_background::fit_background_model(&result.data, w, h, ch)
@@ -4161,6 +4170,26 @@ fn deepsky_export_float32(
                 )?;
                 diagnostics.push(path.display().to_string());
             }
+        }
+        // Mapa de recuperabilidad EIDR (F9): R por tile a resolución del
+        // máster — el "qué frecuencias contienen evidencia" publicado (§7.4).
+        if let Some(plane) = result.recoverability.as_deref() {
+            cancellation_checkpoint(cancel.as_ref(), "exportación de RECOV")?;
+            let path = parent.join(format!("{stem}_recov.fits"));
+            ds_save_float32_fits_cancellable(
+                &path,
+                plane,
+                result.width,
+                result.height,
+                1,
+                &[
+                    ("EXTNAME", "'RECOV'".to_string()),
+                    ("ZASJOB", format!("'{}'", result.id)),
+                    ("ZASEVID", "T".to_string()),
+                ],
+                Some(cancel.as_ref()),
+            )?;
+            diagnostics.push(path.display().to_string());
         }
         // Nebula Contrast (F7): export estético DECLARADAMENTE NO LINEAL —
         // el SCI con las estructuras VALIDADAS realzadas (ganancia
@@ -5551,10 +5580,34 @@ fn prepare_deepsky_stack_impl(request: DeepSkyStackRequest, with_advisor: bool) 
                 );
             }
         }
-        pipeline::DeepSkyIntegrationMethod::Eidr(_) => {
-            errors.push(
-                "EIDR aún no está disponible en esta versión; usa el método clásico. El preflight no aplica fallbacks silenciosos".into(),
-            );
+        pipeline::DeepSkyIntegrationMethod::Eidr(eidr_cfg) => {
+            if matches!(eidr_cfg.solve_mode, pipeline::EidrSolveMode::ExperimentalDetail) {
+                errors.push(
+                    "EIDR ExperimentalDetail (Huber+TGV) llega en la siguiente fase; usa el modo cuadrático científico".into(),
+                );
+            }
+            let n = request.lights.len();
+            let (min_n, label) = match eidr_cfg.scale {
+                pipeline::EidrScalePolicy::X2 => {
+                    (if eidr_cfg.cfa_direct { 24 } else { 12 }, "2x")
+                }
+                pipeline::EidrScalePolicy::X1_5 => (8, "1.5x"),
+                pipeline::EidrScalePolicy::X1 => (3, "1x"),
+                pipeline::EidrScalePolicy::Auto => (6, "auto"),
+            };
+            if n < min_n {
+                errors.push(format!(
+                    "EIDR a escala {label} requiere al menos {min_n} tomas (hay {n}); la puerta espectral valida además la diversidad de dithers"
+                ));
+            }
+            if request.drizzle > 1.01 {
+                errors.push(
+                    "EIDR sustituye a drizzle: deja drizzle en 1× (la escala 1x/1.5x/2x se elige en el método)".into(),
+                );
+            }
+            if matches!(request.compute_policy, ComputePolicy::GpuOnly) {
+                errors.push("EIDR ejecuta en CPU en esta fase; usa Auto o Hybrid".into());
+            }
         }
     }
     if probes.is_empty() {
@@ -5661,12 +5714,12 @@ fn prepare_deepsky_stack_impl(request: DeepSkyStackRequest, with_advisor: bool) 
             shown,
             suffix
         ));
-        if matches!(
+        if !matches!(
             request.resolved_integration_method(),
-            pipeline::DeepSkyIntegrationMethod::NebulaFusion(_)
+            pipeline::DeepSkyIntegrationMethod::Classic(_)
         ) {
             errors.push(
-                "NebulaFusion exige entradas lineales (FITS/TIFF): retira los lights PNG/JPEG o usa el método clásico".into(),
+                "Los motores científicos (NebulaFusion/EIDR) exigen entradas lineales (FITS/TIFF): retira los lights PNG/JPEG o usa el método clásico".into(),
             );
         }
     }
@@ -7519,6 +7572,537 @@ fn ds_integrate_gpu_streaming(
     ))
 }
 
+/// Resultado de la ejecución EIDR (F9): máster a la escala efectiva +
+/// productos científicos + metadatos para receta/log.
+struct DsEidrOutcome {
+    final_data: Vec<f32>,
+    coverage: Vec<f64>,
+    variance: Vec<f32>,
+    neff: Vec<f32>,
+    dq: Vec<u32>,
+    recov: Vec<f32>,
+    w2: usize,
+    h2: usize,
+    scale_requested: String,
+    scale_eff: f32,
+    fallbacks: Vec<String>,
+    gate_frac: (f64, f64, f64),
+    nu_cut: f64,
+    solver_iterations: usize,
+    solver_rel_residual: f64,
+    solver_converged: bool,
+    solver_ridge: f64,
+    lambda_f: f64,
+    holdout_frames: usize,
+    holdout_chi2_median: Option<f64>,
+    gamma_fwhm_px: Option<f32>,
+    geometry_only_frames: usize,
+    excluded_frames: usize,
+    pad: usize,
+    mean_cov: f64,
+}
+
+/// Motor EIDR (F9, ScientificQuadratic): reconstrucción forward-model a
+/// escala 1x/1.5x/2x desde los píxeles calibrados NATIVOS + transforms —
+/// jamás desde un máster intermedio. Flujo §7.5: PSF por frame → Γ → puerta
+/// de recuperabilidad (elige/valida escala, publica RECOV y perfil R) →
+/// b/diag/piloto → PCG con penalización espectral λ_F·ω (§7.3) → holdout →
+/// solve final con todos los frames (warm start del solve de entrenamiento).
+#[allow(clippy::too_many_arguments)]
+fn ds_run_eidr(
+    app: &tauri::AppHandle,
+    cfg: &pipeline::EidrConfig,
+    registered: &[(usize, DsTransform, f64)],
+    load_cached: &dyn Fn(usize) -> Result<DsImage, String>,
+    norms: &[([f32; 3], [f32; 3])],
+    star_catalogs: &[Vec<(f32, f32, f32)>],
+    frame_noise: &[f32],
+    w: usize,
+    h: usize,
+    ch_in: usize,
+    cfa: Option<i32>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<DsEidrOutcome, String> {
+    use crate::eidr::*;
+    let n = registered.len();
+    let ch_out = if cfa.is_some() { 3 } else { ch_in };
+
+    // --- Pase 1: PSF Moffat por frame + máscaras de inválidos ---
+    emit_progress(app, "EIDR: ajustando PSF por frame...", 36.0, None);
+    let mut psfs: Vec<Option<crate::deepsky_psf::MoffatPsf>> = Vec::with_capacity(n);
+    let mut masks: Vec<Vec<u64>> = Vec::with_capacity(n);
+    for (k, &(i, _, _)) in registered.iter().enumerate() {
+        cancellation_checkpoint(cancel, "EIDR: PSF por frame")?;
+        let img = load_cached(i)?;
+        let luma = if img.ch == 1 { img.data.clone() } else { ds_luma(&img) };
+        psfs.push(
+            crate::deepsky_psf::fit_frame_psf(&luma, img.w, img.h, &star_catalogs[i], 0.2)
+                .map(|(fp, _)| fp.at(0.5, 0.5)),
+        );
+        masks.push(eidr_invalid_mask(&img.data, img.w, img.h, img.ch));
+        if k % 4 == 0 {
+            emit_progress(
+                app,
+                &format!("EIDR: PSF por frame {}/{}", k + 1, n),
+                36.0 + 4.0 * k as f32 / n as f32,
+                None,
+            );
+        }
+    }
+    let geometry_only = psfs.iter().filter(|p| p.is_none()).count();
+    let gamma = eidr_target_psf(&psfs);
+    let gamma_nominal = gamma.unwrap_or(crate::deepsky_psf::MoffatPsf {
+        fwhm_x: 2.5,
+        fwhm_y: 2.5,
+        theta: 0.0,
+        beta: 2.5,
+    });
+    if gamma.is_none() {
+        log_to_front(
+            app,
+            "WARN",
+            "EIDR: sin ajustes PSF fiables — modo geometría pura (B=δ, Γ nominal declarada en la receta).",
+        );
+    }
+
+    // --- Geometrías afines (los modelos no afines se excluyen, §7.8) ---
+    let median_fwhm = {
+        let mut fw: Vec<f32> = psfs.iter().flatten().map(|p| p.fwhm_mean()).collect();
+        if fw.is_empty() {
+            2.5
+        } else {
+            fw.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            fw[fw.len() / 2]
+        }
+    };
+    let scale_requested = match cfg.scale {
+        pipeline::EidrScalePolicy::Auto => "auto".to_string(),
+        pipeline::EidrScalePolicy::X1 => "1x".to_string(),
+        pipeline::EidrScalePolicy::X1_5 => "1.5x".to_string(),
+        pipeline::EidrScalePolicy::X2 => "2x".to_string(),
+    };
+    let mut fallbacks: Vec<String> = Vec::new();
+    let mut scale_eff: f32 = match cfg.scale {
+        pipeline::EidrScalePolicy::X1 => 1.0,
+        pipeline::EidrScalePolicy::X1_5 => 1.5,
+        pipeline::EidrScalePolicy::X2 => 2.0,
+        pipeline::EidrScalePolicy::Auto => {
+            if median_fwhm < 2.0 {
+                2.0
+            } else if median_fwhm < 2.8 {
+                1.5
+            } else {
+                1.0
+            }
+        }
+    };
+    // Mínimos operativos §7.8 (el número por sí solo nunca habilita).
+    let min_for = |s: f32| -> usize {
+        if s > 1.75 {
+            if cfa.is_some() { 24 } else { 12 }
+        } else if s > 1.01 {
+            8
+        } else {
+            3
+        }
+    };
+    while scale_eff > 1.01 && n < min_for(scale_eff) {
+        let next = if scale_eff > 1.75 { 1.5 } else { 1.0 };
+        fallbacks.push(format!(
+            "{scale_eff}x requiere ≥{} tomas (hay {n}); se degrada a {next}x",
+            min_for(scale_eff)
+        ));
+        scale_eff = next;
+    }
+
+    // --- Puerta de recuperabilidad por escala (escalera con fallback) ---
+    let sigma_of = |k: usize, c: usize| -> f64 {
+        (frame_noise[registered[k].0] as f64 * norms[k].0[c.min(2)] as f64).max(1e-3)
+    };
+    let gate_report: Option<EidrGateReport>;
+    loop {
+        cancellation_checkpoint(cancel, "EIDR: puerta de recuperabilidad")?;
+        emit_progress(
+            app,
+            &format!("EIDR: puerta de recuperabilidad a {scale_eff:.1}x..."),
+            41.0,
+            None,
+        );
+        let mut gate_frames: Vec<EidrGateFrame> = Vec::with_capacity(n);
+        for (k, &(_, t, _)) in registered.iter().enumerate() {
+            if t.model == DsRegistrationModel::LocalDistortion {
+                continue;
+            }
+            if let Some(geom) = eidr_geom(&t, scale_eff) {
+                gate_frames.push(EidrGateFrame {
+                    geom,
+                    psf: psfs[k],
+                    sigma: sigma_of(k, 1),
+                });
+            }
+        }
+        if gate_frames.len() < min_for(scale_eff).min(n) {
+            return Err("EIDR: demasiados frames con registro no afín (proyectivo/local)".into());
+        }
+        // CFA: se evalúan las tres retículas y manda la peor (§7.6).
+        let rep = if let Some(cid) = cfa {
+            let mut worst: Option<EidrGateReport> = None;
+            for c in 0..3usize {
+                let r = eidr_recoverability_gate(
+                    &gate_frames,
+                    gamma_nominal,
+                    w,
+                    h,
+                    scale_eff,
+                    Some((cid, c)),
+                    256,
+                );
+                if worst.as_ref().map(|wr| r.frac_apt < wr.frac_apt).unwrap_or(true) {
+                    worst = Some(r);
+                }
+            }
+            worst.unwrap()
+        } else {
+            eidr_recoverability_gate(&gate_frames, gamma_nominal, w, h, scale_eff, None, 256)
+        };
+        if scale_eff <= 1.01 || rep.scale_supported() {
+            gate_report = Some(rep);
+            break;
+        }
+        let next = if scale_eff > 1.75 { 1.5 } else { 1.0 };
+        fallbacks.push(format!(
+            "la puerta no soporta {scale_eff}x (apto {:.0}%, degradar {:.0}%, fallback {:.0}%); se degrada a {next}x",
+            100.0 * rep.frac_apt,
+            100.0 * rep.frac_degrade,
+            100.0 * rep.frac_fallback
+        ));
+        scale_eff = next;
+    }
+    let gate_report = gate_report.ok_or("EIDR: la puerta no produjo reporte")?;
+    for fb in &fallbacks {
+        log_to_front(app, "WARN", &format!("EIDR: {fb}."));
+    }
+
+    // --- Operador a la escala efectiva (lienzo acolchado, §7.8) ---
+    let pad = ((2.0 * gamma_nominal.fwhm_x.max(gamma_nominal.fwhm_y) + 3.0).ceil() as usize)
+        .clamp(4, 16);
+    let w_pad_out = ((w + 2 * pad) as f32 * scale_eff).round() as usize;
+    let h_pad_out = ((h + 2 * pad) as f32 * scale_eff).round() as usize;
+    emit_progress(app, "EIDR: construyendo kernels de depósito...", 43.0, None);
+    let mut op_frames: Vec<EidrFrameOp> = Vec::with_capacity(n);
+    let mut kept_idx: Vec<usize> = Vec::new(); // índice en `registered`
+    for (k, &(_, t, _)) in registered.iter().enumerate() {
+        cancellation_checkpoint(cancel, "EIDR: kernels")?;
+        // El modelo de distorsión local no se representa con la matriz h (el
+        // desplazamiento del pad no le aplicaría): fuera explícitamente.
+        if t.model == DsRegistrationModel::LocalDistortion {
+            continue;
+        }
+        let mut tp = t;
+        // Lienzo acolchado: ref' = ref + pad (el pad entero no altera fases).
+        tp.h[2] += pad as f64 * tp.h[8];
+        tp.h[5] += pad as f64 * tp.h[8];
+        let Some(geom) = eidr_geom(&tp, scale_eff) else {
+            continue;
+        };
+        let lut = eidr_build_lut(psfs[k], gamma_nominal, &geom);
+        let mut inv_var = [0.0f32; 3];
+        for c in 0..3 {
+            let s = sigma_of(k, c);
+            inv_var[c] = (1.0 / (s * s)) as f32;
+        }
+        let mut fr = EidrFrameOp {
+            geom,
+            lut,
+            inv_var,
+            mask: masks[k].clone(),
+            w,
+            h,
+        };
+        eidr_mask_partial_rows(&mut fr, w_pad_out, h_pad_out);
+        op_frames.push(fr);
+        kept_idx.push(k);
+    }
+    let excluded = n - kept_idx.len();
+    if excluded > 0 {
+        log_to_front(
+            app,
+            "WARN",
+            &format!("EIDR: {excluded} frame(s) con registro no afín excluidos (§7.8)."),
+        );
+    }
+    if kept_idx.len() < 3 {
+        return Err("EIDR: quedan menos de 3 frames utilizables".into());
+    }
+    let op = EidrOperator {
+        frames: op_frames,
+        w_out: w_pad_out,
+        h_out: h_pad_out,
+        cfa,
+        ch: ch_out,
+    };
+    let nk = kept_idx.len();
+
+    // Holdout §7.5: 10-20% de frames fuera del solve de validación.
+    let n_hold = if kept_idx.len() >= 8 {
+        ((kept_idx.len() as f32 * cfg.holdout_fraction.clamp(0.05, 0.25)).round() as usize)
+            .clamp(1, kept_idx.len() / 4)
+    } else {
+        0
+    };
+    let hold_stride = if n_hold > 0 { nk / n_hold } else { usize::MAX };
+    let holdout: Vec<usize> = (0..nk).filter(|k| n_hold > 0 && k % hold_stride == hold_stride / 2).take(n_hold.max(1)).collect();
+    let train: Vec<usize> = (0..nk).filter(|k| !holdout.contains(k)).collect();
+    let all: Vec<usize> = (0..nk).collect();
+
+    // Penalización espectral (§7.3) desde el perfil R de la puerta.
+    let n_out = op.w_out * op.h_out;
+    let mut diag0 = vec![0.0f64; n_out];
+    for &fi in &all {
+        op.normal_diag_accum(fi, 0, &mut diag0);
+    }
+    let diag_med = {
+        let mut pos: Vec<f64> = diag0.iter().copied().filter(|&d| d > 0.0).collect();
+        if pos.is_empty() {
+            return Err("EIDR: sin cobertura en el lienzo".into());
+        }
+        let mid = pos.len() / 2;
+        pos.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        pos[mid]
+    };
+    let pen = eidr_freq_penalty(&gate_report, op.w_out, op.h_out, diag_med);
+    let nu_cut = eidr_cutoff_from_gate(&gate_report);
+
+    // --- Solve por canal (secuencial): b/diag/aone → train → holdout → all ---
+    let mut planes: Vec<Vec<f32>> = Vec::with_capacity(ch_out);
+    let mut variance: Vec<f32> = vec![f32::NAN; n_out * ch_out];
+    let mut neff_plane: Vec<f32> = vec![0.0; n_out * ch_out];
+    let mut coverage_luma = vec![0.0f64; n_out];
+    let mut chi2_medians: Vec<f64> = Vec::new();
+    let mut last_rep: Option<EidrSolveReport> = None;
+    let solve_cfg = EidrSolveConfig {
+        max_iterations: cfg.max_iterations.max(20) as usize,
+        data_size: train.len() * w * h,
+        ..EidrSolveConfig::default()
+    };
+    for c in 0..ch_out {
+        cancellation_checkpoint(cancel, "EIDR: solve")?;
+        emit_progress(
+            app,
+            &format!("EIDR: canal {}/{} — sistema normal...", c + 1, ch_out),
+            45.0 + 45.0 * c as f32 / ch_out as f32,
+            None,
+        );
+        // b (todos) y b_hold en una pasada de datos; diag por canal.
+        let mut b_all = vec![0.0f64; n_out];
+        let mut b_hold = vec![0.0f64; n_out];
+        let mut plane_buf = vec![0.0f32; w * h];
+        let mut hold_planes: Vec<(usize, Vec<f32>)> = Vec::new();
+        for (pos, &fi) in all.iter().enumerate() {
+            cancellation_checkpoint(cancel, "EIDR: retroproyección")?;
+            let k = kept_idx[fi];
+            let img = load_cached(registered[k].0)?;
+            let (mul, add) = norms[k];
+            if let Some(cid) = cfa {
+                for p in 0..w * h {
+                    let cc = ds_cfa_channel(cid, p % w, p / w);
+                    plane_buf[p] = img.data[p] * mul[cc] + add[cc];
+                }
+            } else {
+                for p in 0..w * h {
+                    let v = img.data[p * img.ch + c.min(img.ch - 1)];
+                    plane_buf[p] = v * mul[c.min(2)] + add[c.min(2)];
+                }
+            }
+            let ivar = op.frames[fi].inv_var[c.min(2)] as f64;
+            op.adjoint_accum(fi, c, &plane_buf, ivar, &mut b_all);
+            if holdout.contains(&fi) {
+                op.adjoint_accum(fi, c, &plane_buf, ivar, &mut b_hold);
+                hold_planes.push((fi, plane_buf.clone()));
+            }
+            let _ = pos;
+        }
+        let mut diag_all = vec![0.0f64; n_out];
+        let mut diag_hold = vec![0.0f64; n_out];
+        for &fi in &all {
+            op.normal_diag_accum(fi, c, &mut diag_all);
+        }
+        for &fi in &holdout {
+            op.normal_diag_accum(fi, c, &mut diag_hold);
+        }
+        let b_train: Vec<f64> = b_all.iter().zip(b_hold.iter()).map(|(&a, &b)| a - b).collect();
+        let diag_train: Vec<f64> =
+            diag_all.iter().zip(diag_hold.iter()).map(|(&a, &b)| a - b).collect();
+        let aone_all = eidr_backprojected_flat(&op, c, &all);
+        let z0 = eidr_pilot(&b_all, &aone_all);
+        let mut progress_cb = |k: usize, kmax: usize| {
+            if k % 8 == 0 {
+                emit_progress(
+                    app,
+                    &format!("EIDR: canal {}/{} — PCG {k}/{kmax}", c + 1, ch_out),
+                    45.0 + 45.0 * (c as f32 + 0.5) / ch_out as f32,
+                    None,
+                );
+            }
+        };
+        // Validación con holdout: solve de entrenamiento + χ² de predicción.
+        let z_final = if !holdout.is_empty() {
+            let (z_train, _rt) = eidr_solve_channel(
+                &op, c, &train, &b_train, &diag_train, &z0, &solve_cfg, pen.as_ref(),
+                Some(cancel), &mut progress_cb,
+            )?;
+            for &(fi, ref plane) in &hold_planes {
+                let st = eidr_holdout_stat(&op, fi, c, &z_train, plane, None);
+                if st.pixels > 500 && st.chi2_median.is_finite() {
+                    chi2_medians.push(st.chi2_median);
+                }
+            }
+            // Solve final con TODOS los frames, warm start del de train.
+            let (z, rep) = eidr_solve_channel(
+                &op, c, &all, &b_all, &diag_all, &z_train, &solve_cfg, pen.as_ref(),
+                Some(cancel), &mut progress_cb,
+            )?;
+            last_rep = Some(rep);
+            z
+        } else {
+            let (z, rep) = eidr_solve_channel(
+                &op, c, &all, &b_all, &diag_all, &z0, &solve_cfg, pen.as_ref(),
+                Some(cancel), &mut progress_cb,
+            )?;
+            last_rep = Some(rep);
+            z
+        };
+        // Varianza aproximada 1/diag (origen declarado) + NEFF = frames
+        // efectivos (aone·s²/ivar_medio) + cobertura para crop/DQ.
+        let ivar_c = {
+            let mut s = 0.0f64;
+            for &fi in &all {
+                s += op.frames[fi].inv_var[c.min(2)] as f64;
+            }
+            s / all.len() as f64
+        };
+        let cell = (scale_eff as f64) * (scale_eff as f64);
+        for q in 0..n_out {
+            if diag_all[q] > 0.0 {
+                variance[q * ch_out + c] = (1.0 / diag_all[q]) as f32;
+            }
+            let cov = (aone_all[q] * cell / ivar_c.max(1e-30)).max(0.0);
+            neff_plane[q * ch_out + c] = cov as f32;
+            if c == 0 {
+                coverage_luma[q] = cov;
+            } else {
+                coverage_luma[q] = coverage_luma[q].min(cov);
+            }
+        }
+        planes.push(z_final);
+    }
+    let chi2_median = if chi2_medians.is_empty() {
+        None
+    } else {
+        chi2_medians.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Some(chi2_medians[chi2_medians.len() / 2])
+    };
+    if let Some(chi2) = chi2_median {
+        if chi2 > 2.0 {
+            log_to_front(
+                app,
+                "WARN",
+                &format!(
+                    "EIDR: χ² de holdout {chi2:.2} (esperado ≈1): el modelo no explica del todo los frames reservados; revisa registro/PSF."
+                ),
+            );
+        } else {
+            log_to_front(
+                app,
+                "INFO",
+                &format!("EIDR: holdout {} frame(s), χ² mediano {chi2:.2}.", holdout.len()),
+            );
+        }
+    }
+
+    // --- Recorte del pad y ensamblado de productos ---
+    let (w2, h2) = (
+        (w as f32 * scale_eff).round() as usize,
+        (h as f32 * scale_eff).round() as usize,
+    );
+    let off = (pad as f32 * scale_eff).round() as usize;
+    let unpad_idx = |x: usize, y: usize| (y + off) * op.w_out + (x + off);
+    let mut final_data = vec![0.0f32; w2 * h2 * ch_out];
+    let mut var_out = vec![f32::NAN; w2 * h2 * ch_out];
+    let mut neff_out = vec![0.0f32; w2 * h2 * ch_out];
+    let mut dq = vec![0u32; w2 * h2];
+    let mut coverage = vec![0.0f64; w2 * h2];
+    let max_cov = coverage_luma.iter().cloned().fold(0.0f64, f64::max).max(1e-9);
+    for y in 0..h2 {
+        for x in 0..w2 {
+            let src = unpad_idx(x, y);
+            let dst = y * w2 + x;
+            let cov = coverage_luma[src];
+            coverage[dst] = cov;
+            for c in 0..ch_out {
+                final_data[dst * ch_out + c] = planes[c][src];
+                var_out[dst * ch_out + c] = variance[src * ch_out + c];
+                neff_out[dst * ch_out + c] = neff_plane[src * ch_out + c];
+            }
+            if cov <= 1e-9 {
+                dq[dst] |= crate::deepsky_variance::dq::NO_COVERAGE;
+                for c in 0..ch_out {
+                    final_data[dst * ch_out + c] = f32::NAN;
+                }
+            } else if cov < 0.5 * max_cov {
+                dq[dst] |= crate::deepsky_variance::dq::EDGE;
+            }
+        }
+    }
+    // Mapa RECOV al tamaño del máster (sin pad: mismos tiles nativos).
+    let recov_full = gate_report.recov_map(w2, h2);
+    let mean_cov = coverage.iter().sum::<f64>() / (w2 * h2).max(1) as f64 / nk as f64;
+    let rep = last_rep.ok_or("EIDR: sin reporte del solver")?;
+    log_to_front(
+        app,
+        "SUCCESS",
+        &format!(
+            "EIDR {scale_eff:.1}x: {} frames · PCG {} iter (residual {:.1e}) · puerta apto {:.0}% · corte publicado {:.3} c/px.",
+            nk,
+            rep.iterations,
+            rep.rel_residual,
+            100.0 * gate_report.frac_apt,
+            nu_cut
+        ),
+    );
+    Ok(DsEidrOutcome {
+        final_data,
+        coverage,
+        variance: var_out,
+        neff: neff_out,
+        dq,
+        recov: recov_full,
+        w2,
+        h2,
+        scale_requested,
+        scale_eff,
+        fallbacks,
+        gate_frac: (
+            gate_report.frac_apt,
+            gate_report.frac_degrade,
+            gate_report.frac_fallback,
+        ),
+        nu_cut,
+        solver_iterations: rep.iterations,
+        solver_rel_residual: rep.rel_residual,
+        solver_converged: rep.converged,
+        solver_ridge: rep.ridge,
+        lambda_f: pen.as_ref().map(|p| p.lambda).unwrap_or(0.0),
+        holdout_frames: holdout.len(),
+        holdout_chi2_median: chi2_median,
+        gamma_fwhm_px: gamma.map(|g| g.fwhm_x),
+        geometry_only_frames: geometry_only,
+        excluded_frames: excluded,
+        pad,
+        mean_cov,
+    })
+}
+
 #[tauri::command]
 async fn stack_deepsky(
     app: tauri::AppHandle,
@@ -7595,6 +8179,14 @@ async fn stack_deepsky(
         Some(pipeline::DeepSkyIntegrationMethod::NebulaFusion(cfg))
             if matches!(cfg.mode, pipeline::NebulaFusionMode::FullWithStruct)
     );
+    // EIDR (F9): reconstrucción forward-model. El preflight ya validó las
+    // restricciones (drizzle 1×, CPU, mínimos por escala, entradas lineales).
+    let eidr_cfg: Option<pipeline::EidrConfig> = match &integration_method {
+        Some(pipeline::DeepSkyIntegrationMethod::Eidr(cfg)) => Some(cfg.clone()),
+        _ => None,
+    };
+    let eidr_active = eidr_cfg.is_some();
+    let eidr_cfa_direct = eidr_cfg.as_ref().map(|c| c.cfa_direct).unwrap_or(false);
     let mut lights_were_cfa = false;
     // Carpeta de trabajo: los cachés multi-GB van al disco que elija el
     // usuario (p.ej. externo) en vez de al temp del sistema.
@@ -8167,7 +8759,7 @@ async fn stack_deepsky(
         }
         // Se conserva el plano CFA calibrado cuando lo consumirá un kernel
         // por fotosito: drizzle CFA clásico o NF-Lite en modo CFA directo.
-        let calibrated_cfa = if (drz > 1.01 || nf_cfa_direct) && img.bayer.is_some() {
+        let calibrated_cfa = if (drz > 1.01 || nf_cfa_direct || eidr_cfa_direct) && img.bayer.is_some() {
             Some(img.clone())
         } else {
             None
@@ -8944,7 +9536,7 @@ async fn stack_deepsky(
     let mut used_gpu = false;
     let mut peak_vram_mb = if gpu_preprocessing_used || gpu_calibration_used { 32 } else { 0 };
     let mut effective_engine = if use_tiled { "CPU tiled".to_string() } else { "CPU streaming".to_string() };
-    let gpu_attempt = if !nf_lite_active && compute_policy.allows_gpu() && gpu_stream_supported {
+    let gpu_attempt = if !nf_lite_active && !eidr_active && compute_policy.allows_gpu() && gpu_stream_supported {
         match crate::gpu_stack::gpu_runtime() {
             None => {
                 if matches!(compute_policy, ComputePolicy::GpuOnly) {
@@ -9052,8 +9644,56 @@ async fn stack_deepsky(
     let mut nf_full_fallback: Option<String> = None;
     let mut nf_struct: Option<(Vec<f32>, Vec<f32>)> = None;
     let mut nf_struct_accepted: Option<Vec<(usize, usize)>> = None;
+    // EIDR (F9): corre ANTES del despacho clásico/NF — produce su propio
+    // lienzo (w·s × h·s) y productos; el resto del pipeline (crop, STF,
+    // export) continúa con las dimensiones re-vinculadas tras la tupla.
+    let mut eidr_outcome: Option<DsEidrOutcome> = None;
     let (final_data, wgt1, weight_map, rejection_low, rejection_high, rej_pct, mean_cov):
-        (Vec<f32>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, f64, f64) = if nf_lite_active {
+        (Vec<f32>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, f64, f64) = if let Some(ecfg) =
+        eidr_cfg.as_ref()
+    {
+        log_to_front(
+            &app,
+            "INFO",
+            &format!(
+                "EIDR (cuadrático científico): {} frames · escala {:?} · consume calibrados nativos + transforms.",
+                registered.len(),
+                ecfg.scale
+            ),
+        );
+        let noise_by_frame: Vec<f32> = frames.iter().map(|f| f.3).collect();
+        let out = ds_run_eidr(
+            &app,
+            ecfg,
+            &registered,
+            &load_cached,
+            &norms,
+            &star_catalogs,
+            &noise_by_frame,
+            w,
+            h,
+            ch,
+            cfa_drizzle_pattern.filter(|_| eidr_cfa_direct),
+            cancel.as_ref(),
+        )?;
+        effective_engine = format!("eidr_{:.1}x", out.scale_eff).replace(".0x", "x");
+        rejection = "forward_model".into();
+        let npx2 = out.w2 * out.h2;
+        let coverage = out.coverage.clone();
+        let mean_cov = out.mean_cov;
+        let zeros = vec![0.0f64; npx2];
+        let data = out.final_data.clone();
+        eidr_outcome = Some(out);
+        (
+            data,
+            coverage.clone(),
+            coverage,
+            zeros.clone(),
+            zeros,
+            0.0,
+            mean_cov,
+        )
+    } else if nf_lite_active {
         // --- Motor NebulaFusion Lite (F3): pesos inverso-varianza + máscaras
         // congeladas por cross-fit. CPU siempre en esta fase; el preflight ya
         // excluyó drizzle/CFA-directo/GpuOnly. ---
@@ -9405,6 +10045,34 @@ async fn stack_deepsky(
 
     // (frame cache removed by _cache_guard on drop — every exit path)
 
+    // EIDR: el lienzo pasa a la escala efectiva; los mapas por píxel del
+    // pipeline clásico se recalculan o anulan a ese tamaño.
+    let (w_out, h_out) = if let Some(e) = &eidr_outcome {
+        (e.w2, e.h2)
+    } else {
+        (w_out, h_out)
+    };
+    let registration_residuals = if eidr_outcome.is_some() {
+        ds_registration_residual_map(&ref_stars, &star_catalogs, &registered, w, h, w_out, h_out)
+    } else {
+        registration_residuals
+    };
+    // Productos EIDR en el contenedor científico común (VAR/NEFF/DQ) para
+    // compartir recorte/export; recov viaja aparte.
+    let mut nf_products = nf_products;
+    let mut eidr_recov: Option<Vec<f32>> = None;
+    if let Some(e) = &mut eidr_outcome {
+        nf_products = Some(crate::nebula_fusion::NfLiteProducts {
+            variance: std::mem::take(&mut e.variance),
+            neff: std::mem::take(&mut e.neff),
+            dq: std::mem::take(&mut e.dq),
+            masked_samples: 0,
+            variance_origin: crate::deepsky_variance::VarianceOrigin::Empirical,
+            g1g2_offset_max: None,
+        });
+        eidr_recov = Some(std::mem::take(&mut e.recov));
+    }
+
     // --- 4.4 AUTO-CROP low-coverage borders (dithered/rotated stacks) ---
     let original_w = w_out;
     let original_h = h_out;
@@ -9450,6 +10118,9 @@ async fn stack_deepsky(
                 g1g2_offset_max: p.g1g2_offset_max,
             }
         }
+    });
+    let eidr_recov = eidr_recov.map(|r| {
+        ds_crop_plane(&r, original_w, original_h, crop_x, crop_y, w_out, h_out)
     });
     // STRUCT comparte recorte y binning del máster (planos luma).
     let nf_struct = nf_struct.map(|(sm, sr)| {
@@ -9719,8 +10390,39 @@ async fn stack_deepsky(
         },
         // Entrada OSC debayerizada float32 vs CFA directo (F4): la receta
         // declara cuál corrió para no reclamar la calidad del modo CFA.
-        "demosaicedInput": nf_lite_active && lights_were_cfa && !nf_cfa_direct,
-        "cfaDirect": nf_cfa_direct,
+        "demosaicedInput": (nf_lite_active || eidr_outcome.is_some()) && lights_were_cfa
+            && !nf_cfa_direct && !eidr_cfa_direct,
+        "cfaDirect": nf_cfa_direct || eidr_cfa_direct,
+        // EIDR (F9): escala, puerta, solver y holdout — reproducibilidad
+        // completa del sucesor de drizzle.
+        "eidr": eidr_outcome.as_ref().map(|e| serde_json::json!({
+            "scaleRequested": e.scale_requested,
+            "scaleEffective": e.scale_eff,
+            "fallbacks": e.fallbacks,
+            "gate": {
+                "fracApt": e.gate_frac.0,
+                "fracDegrade": e.gate_frac.1,
+                "fracFallback": e.gate_frac.2,
+                "publishedCutoffCyclesPerPx": e.nu_cut,
+            },
+            "solver": {
+                "mode": "scientificQuadratic",
+                "iterations": e.solver_iterations,
+                "relResidual": e.solver_rel_residual,
+                "converged": e.solver_converged,
+                "ridge": e.solver_ridge,
+                "lambdaFreqPenalty": e.lambda_f,
+            },
+            "holdout": {
+                "frames": e.holdout_frames,
+                "chi2Median": e.holdout_chi2_median,
+            },
+            "targetPsfFwhmPx": e.gamma_fwhm_px,
+            "geometryOnlyFrames": e.geometry_only_frames,
+            "excludedNonAffineFrames": e.excluded_frames,
+            "padNativePx": e.pad,
+            "varianceApproximation": "inverse_normal_diag",
+        })),
         "cfaG1G2OffsetMax": nf_products.as_ref().and_then(|p| p.g1g2_offset_max),
         "outputBin": match nf_output_bin {
             Some((3, 4)) => "0.75x",
@@ -9791,7 +10493,7 @@ async fn stack_deepsky(
             rejection_low: rejection_low.iter().map(|&v| v as f32).collect(),
             rejection_high: rejection_high.iter().map(|&v| v as f32).collect(),
             registration_residuals: registration_residuals,
-            engine: if nf_lite_active {
+            engine: if nf_lite_active || eidr_outcome.is_some() {
                 effective_engine.clone()
             } else if used_gpu {
                 "hybrid_wgpu".into()
@@ -9810,6 +10512,7 @@ async fn stack_deepsky(
             dq: nf_products.as_ref().map(|p| p.dq.clone()),
             struct_map: nf_struct.as_ref().map(|(sm, _)| sm.clone()),
             struct_residual: nf_struct.as_ref().map(|(_, sr)| sr.clone()),
+            recoverability: eidr_recov.clone(),
         });
     }
 
@@ -11183,6 +11886,7 @@ mod ds_tests {
             dq: None,
             struct_map: None,
             struct_residual: None,
+            recoverability: None,
         };
         ds_write_recipe(&path, &result).unwrap();
         let recipe: serde_json::Value =
