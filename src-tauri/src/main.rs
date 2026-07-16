@@ -21,6 +21,7 @@ mod deepsky_variance; // contrato lineal F1: VAR/NEFF/DQ (motores científicos)
 mod nebula_fusion; // F3: motor NF-Lite (pesos 1/σ² + máscaras congeladas)
 mod deepsky_struct; // F7: STRUCT — starlet B3 + validación split-half con FDR
 mod nebula_fusion_full; // F6: coadición GLS por frecuencia con PSF objetivo
+mod eidr; // F9: reconstrucción forward-model sucesora de Drizzle
 #[cfg(any(test, feature = "deepsky-sim"))]
 mod deepsky_sim; // simulador de verdad conocida (solo tests/benchmarks)
 mod benchmark_quality; // métricas de artefactos planetarios (arnés A/B F0)
