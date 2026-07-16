@@ -795,6 +795,209 @@ impl EidrOperator {
 }
 
 // ---------------------------------------------------------------------------
+// Solver PCG cuadrático (F9.2) — EidrSolveMode::ScientificQuadratic
+// ---------------------------------------------------------------------------
+
+/// Configuración del solve cuadrático. La regularización es una cresta
+/// UNIFORME λ = ridge_rel·mediana(diag>0) que ancla al piloto z0:
+/// (AᵀΣ⁻¹A + λI) z = AᵀΣ⁻¹y + λ·z0. En los modos bien determinados
+/// (diag ≫ λ) el sesgo es ≤ ridge_rel; en el espacio nulo (diag = 0, p.ej.
+/// zonas sin cobertura) la solución pasa a ser el piloto — que el DQ marca
+/// aparte como NO_COVERAGE. Nunca hay relleno inventado.
+pub(crate) struct EidrSolveConfig {
+    pub max_iterations: usize,
+    /// Convergencia por residual: ‖r‖/‖b‖ < tol.
+    pub tol: f64,
+    /// Convergencia por estancamiento (§7.5): decremento del objetivo por
+    /// iteración < step_tol × decremento acumulado durante 3 consecutivas.
+    pub step_tol: f64,
+    pub ridge_rel: f64,
+}
+
+impl Default for EidrSolveConfig {
+    fn default() -> Self {
+        Self {
+            max_iterations: 60,
+            tol: 1e-6,
+            step_tol: 1e-4,
+            ridge_rel: 1e-3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EidrSolveReport {
+    pub iterations: usize,
+    pub rel_residual: f64,
+    pub converged: bool,
+    /// λ efectiva empleada (unidades de la diagonal normal).
+    pub ridge: f64,
+}
+
+/// PCG con precondicionador Jacobi sobre las ecuaciones normales de UN canal.
+/// `b` = AᵀΣ⁻¹y; `diag` = diagonal de AᵀΣ⁻¹A; `z0` = piloto (warm start).
+/// Buffers f64 (rigor del solver); el resultado vuelve en f32.
+pub(crate) fn eidr_solve_channel(
+    op: &EidrOperator,
+    c: usize,
+    b: &[f64],
+    diag: &[f64],
+    z0: &[f32],
+    cfg: &EidrSolveConfig,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<(Vec<f32>, EidrSolveReport), String> {
+    let n = op.w_out * op.h_out;
+    debug_assert_eq!(b.len(), n);
+    debug_assert_eq!(diag.len(), n);
+    debug_assert_eq!(z0.len(), n);
+
+    // λ = ridge_rel · mediana de la diagonal positiva.
+    let mut pos: Vec<f64> = diag.iter().copied().filter(|&d| d > 0.0).collect();
+    if pos.is_empty() {
+        return Err("EIDR: ningún píxel de salida tiene cobertura".into());
+    }
+    let mid = pos.len() / 2;
+    pos.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let ridge = (cfg.ridge_rel * pos[mid]).max(1e-30);
+    drop(pos);
+
+    // b' = b + λ z0; M = diag + λ.
+    let mut z: Vec<f64> = z0.iter().map(|&v| v as f64).collect();
+    let bp: Vec<f64> = b
+        .iter()
+        .zip(z.iter())
+        .map(|(&bv, &zv)| bv + ridge * zv)
+        .collect();
+    let norm_b = bp.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-30);
+
+    let mut scratch_f32 = Vec::new();
+    let mut pf32 = vec![0.0f32; n];
+    let mut ap = vec![0.0f64; n];
+
+    // r = b' − (N + λ)z.
+    for (dst, &src) in pf32.iter_mut().zip(z.iter()) {
+        *dst = src as f32;
+    }
+    op.normal_apply(c, &pf32, &mut ap, &mut scratch_f32);
+    let mut r: Vec<f64> = (0..n).map(|i| bp[i] - ap[i] - ridge * z[i]).collect();
+    let mut d: Vec<f64> = (0..n).map(|i| r[i] / (diag[i] + ridge)).collect();
+    let mut p = d.clone();
+    let mut rho: f64 = r.iter().zip(d.iter()).map(|(&a, &b)| a * b).sum();
+
+    let mut iterations = 0usize;
+    let mut converged = false;
+    let mut stagnant = 0u32;
+    let mut objective_drop = 0.0f64;
+    for k in 0..cfg.max_iterations {
+        if let Some(cn) = cancel {
+            if cn.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("Cancelado".into());
+            }
+        }
+        iterations = k + 1;
+        for (dst, &src) in pf32.iter_mut().zip(p.iter()) {
+            *dst = src as f32;
+        }
+        op.normal_apply(c, &pf32, &mut ap, &mut scratch_f32);
+        for i in 0..n {
+            ap[i] += ridge * p[i];
+        }
+        let pap: f64 = p.iter().zip(ap.iter()).map(|(&a, &b)| a * b).sum();
+        if pap <= 0.0 || !pap.is_finite() {
+            break; // dirección degenerada: el estado actual es lo mejor honesto
+        }
+        let alpha = rho / pap;
+        for i in 0..n {
+            z[i] += alpha * p[i];
+            r[i] -= alpha * ap[i];
+        }
+        let rel_res = r.iter().map(|v| v * v).sum::<f64>().sqrt() / norm_b;
+        progress(k + 1, cfg.max_iterations);
+        if rel_res < cfg.tol {
+            converged = true;
+            break;
+        }
+        // Estancamiento del OBJETIVO (§7.5): en PCG el decremento de
+        // φ = ½zᵀ(N+λ)z − b′ᵀz por iteración es ½αρ; cuando cae por debajo
+        // de step_tol × el decremento acumulado durante 3 iteraciones, la
+        // solución ya no cambia de forma relevante.
+        let dec = 0.5 * alpha * rho;
+        objective_drop += dec.max(0.0);
+        if dec.abs() < cfg.step_tol * objective_drop.max(1e-300) {
+            stagnant += 1;
+            if stagnant >= 3 {
+                converged = true;
+                break;
+            }
+        } else {
+            stagnant = 0;
+        }
+        for i in 0..n {
+            d[i] = r[i] / (diag[i] + ridge);
+        }
+        let rho_new: f64 = r.iter().zip(d.iter()).map(|(&a, &b)| a * b).sum();
+        let beta = rho_new / rho.max(1e-300);
+        rho = rho_new;
+        for i in 0..n {
+            p[i] = d[i] + beta * p[i];
+        }
+    }
+    let rel_residual = r.iter().map(|v| v * v).sum::<f64>().sqrt() / norm_b;
+    Ok((
+        z.iter().map(|&v| v as f32).collect(),
+        EidrSolveReport {
+            iterations,
+            rel_residual,
+            converged,
+            ridge,
+        },
+    ))
+}
+
+/// Piloto de arranque: retroproyección normalizada b/diag (coadición
+/// ponderada por K² — el análogo drizzle del operador). Donde no hay
+/// cobertura queda 0 (el DQ lo marcará NO_COVERAGE).
+pub(crate) fn eidr_pilot(b: &[f64], diag: &[f64]) -> Vec<f32> {
+    b.iter()
+        .zip(diag.iter())
+        .map(|(&bv, &dv)| if dv > 0.0 { (bv / dv) as f32 } else { 0.0 })
+        .collect()
+}
+
+/// Prolongación bilineal coarse→fine para multigrid (1x → escala final).
+/// Ambos grids comparten la convención salida(q) ↔ ref(q/s): la razón de
+/// muestreo es w1/w2 exacta.
+pub(crate) fn eidr_prolong(
+    z: &[f32],
+    w1: usize,
+    h1: usize,
+    w2: usize,
+    h2: usize,
+) -> Vec<f32> {
+    let rx = w1 as f64 / w2 as f64;
+    let ry = h1 as f64 / h2 as f64;
+    let mut out = vec![0.0f32; w2 * h2];
+    for y2 in 0..h2 {
+        let sy = (y2 as f64 * ry).min((h1 - 1) as f64);
+        let y0 = sy as usize;
+        let y1 = (y0 + 1).min(h1 - 1);
+        let fy = (sy - y0 as f64) as f32;
+        for x2 in 0..w2 {
+            let sx = (x2 as f64 * rx).min((w1 - 1) as f64);
+            let x0 = sx as usize;
+            let x1 = (x0 + 1).min(w1 - 1);
+            let fx = (sx - x0 as f64) as f32;
+            out[y2 * w2 + x2] = z[y0 * w1 + x0] * (1.0 - fx) * (1.0 - fy)
+                + z[y0 * w1 + x1] * fx * (1.0 - fy)
+                + z[y1 * w1 + x0] * (1.0 - fx) * fy
+                + z[y1 * w1 + x1] * fx * fy;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests — F9.1: identidad adjunta, conservación de flujo, CFA
 // ---------------------------------------------------------------------------
 
@@ -1034,4 +1237,199 @@ mod tests {
         assert!(eidr_target_psf(&[None, None]).is_none());
     }
 
+    /// La prolongación bilineal conserva campos planos y rampas.
+    #[test]
+    fn eidr_prolong_flat_and_ramp() {
+        let (w1, h1) = (10usize, 8usize);
+        let flat = vec![7.5f32; w1 * h1];
+        let up = eidr_prolong(&flat, w1, h1, 20, 16);
+        assert!(up.iter().all(|&v| (v - 7.5).abs() < 1e-6));
+        let ramp: Vec<f32> = (0..w1 * h1).map(|i| (i % w1) as f32).collect();
+        let up = eidr_prolong(&ramp, w1, h1, 20, 16);
+        // salida(x2) ↔ coarse(x2/2): la rampa se conserva a mitad de paso.
+        for y2 in 0..16 {
+            for x2 in 0..18 {
+                let expect = (x2 as f32) * 0.5;
+                assert!(
+                    (up[y2 * 20 + x2] - expect).abs() < 1e-5,
+                    "({x2},{y2}): {} vs {expect}",
+                    up[y2 * 20 + x2]
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Gate F9.2 — solve cuadrático end-to-end con verdad del simulador
+    // -----------------------------------------------------------------------
+
+    /// Criterios §7.10: sesgo de flujo <0.5% (estrellas SNR alto) y sesgo
+    /// centroidal <0.02 px nativos, resolviendo a 2x un campo SUBMUESTREADO
+    /// (FWHM 1.3 px, Moffat β=2.5) con 16 frames y dithers subpíxel diversos.
+    /// Modo geometría pura (B=δ): z queda a la PSF común de los frames y la
+    /// verdad en apertura es analítica (Moffat integrada).
+    #[test]
+    fn gate_f92_eidr_quadratic_flux_centroid() {
+        use crate::deepsky_sim as sim;
+        let (w, h) = (96usize, 80usize);
+        let flux = 60000.0f64;
+        let fwhm = 1.3f64;
+        let beta = 2.5f64;
+        let mut stars = Vec::new();
+        let mut truth = Vec::new();
+        for j in 0..3 {
+            for i in 0..3 {
+                let x = 20.37 + 27.83 * i as f64;
+                let y = 16.21 + 23.9 * j as f64;
+                stars.push(sim::SimStar {
+                    x,
+                    y,
+                    flux_adu: flux,
+                    fwhm_px: fwhm,
+                    moffat_beta: Some(beta),
+                });
+                truth.push((x, y));
+            }
+        }
+        let scene = sim::SimScene {
+            width: w,
+            height: h,
+            background_adu: 200.0,
+            gradient_adu_per_px: (0.0, 0.0),
+            color: [1.0; 3],
+            stars,
+        };
+        let sensor = sim::SimSensor {
+            gain_e_per_adu: 1.0,
+            read_noise_e: 2.0,
+            bias_adu: 500.0,
+            dark_adu_per_s: 0.0,
+            full_well_adu: 1e12,
+            hot_pixels: vec![],
+            bayer: None,
+            vignette: None,
+        };
+        let scale = 2.0f32;
+        let n_frames = 16usize;
+        let mut datas: Vec<Vec<f32>> = Vec::new();
+        let mut trs: Vec<crate::DsTransform> = Vec::new();
+        for i in 0..n_frames {
+            let dx = (i as f64 * 0.618033988749895).fract() + (i % 3) as f64 - 1.0;
+            let dy = (i as f64 * 0.754877666246693).fract() + ((i / 3) % 3) as f64 - 1.0;
+            let exp = sim::SimExposure {
+                exposure_s: 1.0,
+                dx,
+                dy,
+                seed: 4200 + i as u64,
+            };
+            let (data, _var) = sim::render_light(&scene, &sensor, &exp);
+            // Calibración trivial: solo pedestal (sin dark/flat en la escena).
+            datas.push(data.iter().map(|&v| v - 500.0).collect());
+            // La escena se desplaza +d en el frame ⇒ ref = frame − d.
+            trs.push(crate::DsTransform::from_similarity((
+                1.0,
+                0.0,
+                -dx as f32,
+                -dy as f32,
+            )));
+        }
+        let w_out = (w as f32 * scale).round() as usize;
+        let h_out = (h as f32 * scale).round() as usize;
+        let gamma_nominal = MoffatPsf {
+            fwhm_x: fwhm as f32,
+            fwhm_y: fwhm as f32,
+            theta: 0.0,
+            beta: beta as f32,
+        };
+        let ivar = 1.0f32 / 204.0; // fondo 200 + lectura 2e (gain 1)
+        let frames_op: Vec<EidrFrameOp> = trs
+            .iter()
+            .map(|t| {
+                let geom = eidr_geom(t, scale).expect("similitud");
+                let lut = eidr_build_lut(None, gamma_nominal, &geom);
+                EidrFrameOp {
+                    geom,
+                    lut,
+                    inv_var: [ivar; 3],
+                    mask: vec![0u64; (w * h + 63) / 64],
+                    w,
+                    h,
+                }
+            })
+            .collect();
+        let op = EidrOperator {
+            frames: frames_op,
+            w_out,
+            h_out,
+            cfa: None,
+            ch: 1,
+        };
+        let n_out = w_out * h_out;
+        let mut b = vec![0.0f64; n_out];
+        let mut diag = vec![0.0f64; n_out];
+        for fi in 0..n_frames {
+            op.adjoint_accum(fi, 0, &datas[fi], ivar as f64, &mut b);
+            op.normal_diag_accum(fi, 0, &mut diag);
+        }
+        let z0 = eidr_pilot(&b, &diag);
+        let mut noop = |_k: usize, _n: usize| {};
+        let (z, rep) = eidr_solve_channel(
+            &op,
+            0,
+            &b,
+            &diag,
+            &z0,
+            &EidrSolveConfig::default(),
+            None,
+            &mut noop,
+        )
+        .expect("solve");
+        assert!(
+            rep.converged,
+            "PCG sin converger: iters={} rel_res={:.2e}",
+            rep.iterations, rep.rel_residual
+        );
+
+        // Verdad analítica en apertura: Moffat integrada hasta r_ap nativos.
+        let alpha = fwhm / (2.0 * (2f64.powf(1.0 / beta) - 1.0).sqrt());
+        let r_ap = 6.0f64; // px nativos
+        let frac = 1.0 - (1.0 + (r_ap / alpha).powi(2)).powf(1.0 - beta);
+        let expect = flux * frac;
+        let s = scale as f64;
+        for (k, &(sx, sy)) in truth.iter().enumerate() {
+            let (cx, cy) = (sx * s, sy * s);
+            let rq = r_ap * s;
+            let (mut sum, mut mx, mut my) = (0.0f64, 0.0f64, 0.0f64);
+            let x0 = (cx - rq).floor() as usize;
+            let x1 = (cx + rq).ceil() as usize;
+            let y0 = (cy - rq).floor() as usize;
+            let y1 = (cy + rq).ceil() as usize;
+            for qy in y0..=y1 {
+                for qx in x0..=x1 {
+                    let dx = qx as f64 - cx;
+                    let dy = qy as f64 - cy;
+                    if dx * dx + dy * dy > rq * rq {
+                        continue;
+                    }
+                    let v = (z[qy * w_out + qx] - 200.0) as f64;
+                    sum += v;
+                    mx += v * qx as f64;
+                    my += v * qy as f64;
+                }
+            }
+            let flux_est = sum / (s * s);
+            let rel = (flux_est - expect).abs() / expect;
+            assert!(
+                rel < 0.005,
+                "estrella {k}: flujo {flux_est:.0} vs {expect:.0} ({:+.2}%)",
+                100.0 * (flux_est / expect - 1.0)
+            );
+            let (ex, ey) = ((mx / sum - cx) / s, (my / sum - cy) / s);
+            let cerr = (ex * ex + ey * ey).sqrt();
+            assert!(
+                cerr < 0.02,
+                "estrella {k}: centroide desviado {cerr:.4} px nativos"
+            );
+        }
+    }
 }
