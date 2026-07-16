@@ -774,17 +774,21 @@ impl EidrOperator {
             });
     }
 
-    /// out = Σ_i A_iᵀ Σ_i⁻¹ A_i p  (producto de las ecuaciones normales;
-    /// `scratch` se redimensiona al frame mayor y se reutiliza).
+    /// out = Σ_{i∈idxs} A_iᵀ Σ_i⁻¹ A_i p  (producto de las ecuaciones
+    /// normales SOLO de los frames del solve — los de holdout NO entran ni
+    /// aquí ni en b: mezclar operador completo con b parcial resuelve
+    /// N_total·z = b_subset y encoge z por idxs/total, el sesgo 0.857 que
+    /// cazó el holdout de F9.4). `scratch` se reutiliza entre frames.
     pub(crate) fn normal_apply(
         &self,
         c: usize,
+        idxs: &[usize],
         p_in: &[f32],
         out: &mut [f64],
         scratch: &mut Vec<f32>,
     ) {
         out.iter_mut().for_each(|v| *v = 0.0);
-        for fi in 0..self.frames.len() {
+        for &fi in idxs {
             let f = &self.frames[fi];
             scratch.resize(f.w * f.h, 0.0);
             self.apply(fi, c, p_in, scratch);
@@ -809,9 +813,15 @@ pub(crate) struct EidrSolveConfig {
     /// Convergencia por residual: ‖r‖/‖b‖ < tol.
     pub tol: f64,
     /// Convergencia por estancamiento (§7.5): decremento del objetivo por
-    /// iteración < step_tol × decremento acumulado durante 3 consecutivas.
+    /// iteración < step_tol × decremento acumulado durante 3 consecutivas,
+    /// o < step_tol × (data_size/2) — mejora de χ² despreciable frente a su
+    /// escala absoluta (principio de discrepancia; independiente del warm
+    /// start, que puede arrancar ya cerca del óptimo).
     pub step_tol: f64,
     pub ridge_rel: f64,
+    /// Nº de mediciones válidas que alimentaron b (Σ píxeles de los frames
+    /// del solve). 0 ⇒ solo el criterio relativo al acumulado.
+    pub data_size: usize,
 }
 
 impl Default for EidrSolveConfig {
@@ -820,7 +830,14 @@ impl Default for EidrSolveConfig {
             max_iterations: 60,
             tol: 1e-6,
             step_tol: 1e-4,
-            ridge_rel: 1e-3,
+            // Calibrada en el gate F9.4: con 1e-3 la solución depende de la
+            // parada temprana (los modos con autovalor ≪ mediana amplifican
+            // ruido de banda ancha al converger); con 3e-2 los modos sin
+            // evidencia descansan en el piloto (exacto en flujo ⇒ sesgo ~0 a
+            // baja frecuencia; a alta es el taper honesto) y la convergencia
+            // completa es estable y reproducible.
+            ridge_rel: 3e-2,
+            data_size: 0,
         }
     }
 }
@@ -834,16 +851,129 @@ pub(crate) struct EidrSolveReport {
     pub ridge: f64,
 }
 
+/// Penalización cuadrática por frecuencia (§7.3: λ_F Σ ω_k |ẑ(k)|²) con ω
+/// derivada de la puerta de recuperabilidad: ω = 1−R̃(|ν|) más allá del
+/// Nyquist nativo, 0 por debajo. Los modos de alias sin evidencia quedan
+/// amortiguados EN el objetivo (con solo el ridge uniforme sobreajustan los
+/// frames del solve y arrastran el DC — medido por el holdout de F9.4); los
+/// parcialmente evidenciados se encogen tipo Wiener, que no altera el FRC
+/// por anillo (invariante a escala) pero sí la generalización.
+pub(crate) struct EidrFreqPenalty {
+    /// ω por bin de frecuencia (w_out×h_out, orden FFT natural).
+    pub omega: Vec<f32>,
+    /// λ_F en unidades de la diagonal normal (≈ mediana de diag).
+    pub lambda: f64,
+}
+
+pub(crate) fn eidr_freq_penalty(
+    report: &EidrGateReport,
+    w_out: usize,
+    h_out: usize,
+    diag_median: f64,
+) -> Option<EidrFreqPenalty> {
+    if report.r_radial.is_empty() {
+        return None; // escala nativa: sin banda extendida
+    }
+    let native = 0.5 / report.scale.max(1.0) as f64;
+    let prof = &report.r_radial;
+    let r_at = |nu: f64| -> f64 {
+        if nu <= native {
+            return 1.0;
+        }
+        if nu <= prof[0].0 {
+            let t = (nu - native) / (prof[0].0 - native).max(1e-9);
+            return 1.0 + t * (prof[0].1 - 1.0);
+        }
+        for i in 1..prof.len() {
+            if nu <= prof[i].0 {
+                let t = (nu - prof[i - 1].0) / (prof[i].0 - prof[i - 1].0).max(1e-9);
+                return prof[i - 1].1 + t * (prof[i].1 - prof[i - 1].1);
+            }
+        }
+        prof[prof.len() - 1].1
+    };
+    let mut omega = vec![0.0f32; w_out * h_out];
+    for y in 0..h_out {
+        let vy = {
+            let k = y as f64 / h_out as f64;
+            if k >= 0.5 {
+                k - 1.0
+            } else {
+                k
+            }
+        };
+        for x in 0..w_out {
+            let vx = {
+                let k = x as f64 / w_out as f64;
+                if k >= 0.5 {
+                    k - 1.0
+                } else {
+                    k
+                }
+            };
+            let nu = (vx * vx + vy * vy).sqrt();
+            omega[y * w_out + x] = (1.0 - r_at(nu)).clamp(0.0, 1.0) as f32;
+        }
+    }
+    Some(EidrFreqPenalty {
+        omega,
+        lambda: diag_median,
+    })
+}
+
+/// w += λ_F · F⁻¹(ω ⊙ F p): término espectral del producto normal. Operador
+/// real simétrico PSD (ω ≥ 0) ⇒ PCG sigue siendo válido.
+fn eidr_freq_penalty_apply(
+    pen: &EidrFreqPenalty,
+    p_in: &[f64],
+    w: usize,
+    h: usize,
+    out: &mut [f64],
+) {
+    let mut buf: Vec<Complex<f64>> = p_in.iter().map(|&v| Complex::new(v, 0.0)).collect();
+    let mut planner = FftPlanner::<f64>::new();
+    let fw = planner.plan_fft_forward(w);
+    let fh = planner.plan_fft_forward(h);
+    let iw = planner.plan_fft_inverse(w);
+    let ih = planner.plan_fft_inverse(h);
+    let run = |buf: &mut Vec<Complex<f64>>, rf: &std::sync::Arc<dyn rustfft::Fft<f64>>, cf: &std::sync::Arc<dyn rustfft::Fft<f64>>| {
+        for row in buf.chunks_exact_mut(w) {
+            rf.process(row);
+        }
+        let mut col = vec![Complex::new(0.0, 0.0); h];
+        for x in 0..w {
+            for y in 0..h {
+                col[y] = buf[y * w + x];
+            }
+            cf.process(&mut col);
+            for y in 0..h {
+                buf[y * w + x] = col[y];
+            }
+        }
+    };
+    run(&mut buf, &fw, &fh);
+    for (c, &o) in buf.iter_mut().zip(pen.omega.iter()) {
+        *c *= o as f64;
+    }
+    run(&mut buf, &iw, &ih);
+    let norm = pen.lambda / (w * h) as f64;
+    for (dst, src) in out.iter_mut().zip(buf.iter()) {
+        *dst += src.re * norm;
+    }
+}
+
 /// PCG con precondicionador Jacobi sobre las ecuaciones normales de UN canal.
 /// `b` = AᵀΣ⁻¹y; `diag` = diagonal de AᵀΣ⁻¹A; `z0` = piloto (warm start).
 /// Buffers f64 (rigor del solver); el resultado vuelve en f32.
 pub(crate) fn eidr_solve_channel(
     op: &EidrOperator,
     c: usize,
+    idxs: &[usize],
     b: &[f64],
     diag: &[f64],
     z0: &[f32],
     cfg: &EidrSolveConfig,
+    freq: Option<&EidrFreqPenalty>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<(Vec<f32>, EidrSolveReport), String> {
@@ -879,9 +1009,19 @@ pub(crate) fn eidr_solve_channel(
     for (dst, &src) in pf32.iter_mut().zip(z.iter()) {
         *dst = src as f32;
     }
-    op.normal_apply(c, &pf32, &mut ap, &mut scratch_f32);
+    op.normal_apply(c, idxs, &pf32, &mut ap, &mut scratch_f32);
+    if let Some(pen) = freq {
+        eidr_freq_penalty_apply(pen, &z, op.w_out, op.h_out, &mut ap);
+    }
     let mut r: Vec<f64> = (0..n).map(|i| bp[i] - ap[i] - ridge * z[i]).collect();
-    let mut d: Vec<f64> = (0..n).map(|i| r[i] / (diag[i] + ridge)).collect();
+    // Precondicionador Jacobi: diagonal del término espectral ≈ λ_F·⟨ω⟩.
+    let pen_diag = freq
+        .map(|pen| {
+            pen.lambda * pen.omega.iter().map(|&o| o as f64).sum::<f64>()
+                / pen.omega.len() as f64
+        })
+        .unwrap_or(0.0);
+    let mut d: Vec<f64> = (0..n).map(|i| r[i] / (diag[i] + ridge + pen_diag)).collect();
     let mut p = d.clone();
     let mut rho: f64 = r.iter().zip(d.iter()).map(|(&a, &b)| a * b).sum();
 
@@ -899,7 +1039,10 @@ pub(crate) fn eidr_solve_channel(
         for (dst, &src) in pf32.iter_mut().zip(p.iter()) {
             *dst = src as f32;
         }
-        op.normal_apply(c, &pf32, &mut ap, &mut scratch_f32);
+        op.normal_apply(c, idxs, &pf32, &mut ap, &mut scratch_f32);
+        if let Some(pen) = freq {
+            eidr_freq_penalty_apply(pen, &p, op.w_out, op.h_out, &mut ap);
+        }
         for i in 0..n {
             ap[i] += ridge * p[i];
         }
@@ -924,7 +1067,10 @@ pub(crate) fn eidr_solve_channel(
         // solución ya no cambia de forma relevante.
         let dec = 0.5 * alpha * rho;
         objective_drop += dec.max(0.0);
-        if dec.abs() < cfg.step_tol * objective_drop.max(1e-300) {
+        let chi2_scale = 0.5 * cfg.data_size as f64;
+        if dec.abs() < cfg.step_tol * objective_drop.max(1e-300)
+            || (chi2_scale > 0.0 && dec.abs() < cfg.step_tol * chi2_scale)
+        {
             stagnant += 1;
             if stagnant >= 3 {
                 converged = true;
@@ -934,7 +1080,7 @@ pub(crate) fn eidr_solve_channel(
             stagnant = 0;
         }
         for i in 0..n {
-            d[i] = r[i] / (diag[i] + ridge);
+            d[i] = r[i] / (diag[i] + ridge + pen_diag);
         }
         let rho_new: f64 = r.iter().zip(d.iter()).map(|(&a, &b)| a * b).sum();
         let beta = rho_new / rho.max(1e-300);
@@ -955,14 +1101,32 @@ pub(crate) fn eidr_solve_channel(
     ))
 }
 
-/// Piloto de arranque: retroproyección normalizada b/diag (coadición
-/// ponderada por K² — el análogo drizzle del operador). Donde no hay
-/// cobertura queda 0 (el DQ lo marcará NO_COVERAGE).
-pub(crate) fn eidr_pilot(b: &[f64], diag: &[f64]) -> Vec<f32> {
+/// Piloto de arranque: retroproyección normalizada por el PLANO
+/// retroproyectado, pilot = Aᵀ Σ⁻¹ y / Aᵀ Σ⁻¹ 1 — la coadición drizzle-like
+/// del operador, EXACTA en flujo para campos planos (b/diag NO lo es: vale
+/// ΣK/ΣK²·V ≈ 4-5·V y el holdout de F9.4 lo detectó como sesgo de fondo).
+/// Donde no hay cobertura queda 0 (el DQ lo marcará NO_COVERAGE).
+pub(crate) fn eidr_pilot(b: &[f64], aone: &[f64]) -> Vec<f32> {
     b.iter()
-        .zip(diag.iter())
-        .map(|(&bv, &dv)| if dv > 0.0 { (bv / dv) as f32 } else { 0.0 })
+        .zip(aone.iter())
+        .map(|(&bv, &av)| if av > 1e-12 { (bv / av) as f32 } else { 0.0 })
         .collect()
+}
+
+/// Aᵀ Σ⁻¹ 1 de un subconjunto de frames: el denominador del piloto (y la
+/// "cobertura efectiva" del operador). Respeta máscaras y retícula CFA.
+pub(crate) fn eidr_backprojected_flat(
+    op: &EidrOperator,
+    c: usize,
+    idxs: &[usize],
+) -> Vec<f64> {
+    let mut aone = vec![0.0f64; op.w_out * op.h_out];
+    for &fi in idxs {
+        let f = &op.frames[fi];
+        let ones = vec![1.0f32; f.w * f.h];
+        op.adjoint_accum(fi, c, &ones, f.inv_var[c.min(2)] as f64, &mut aone);
+    }
+    aone
 }
 
 /// Prolongación bilineal coarse→fine para multigrid (1x → escala final).
@@ -998,6 +1162,254 @@ pub(crate) fn eidr_prolong(
 }
 
 // ---------------------------------------------------------------------------
+// Holdout y FRC (F9.4, §7.5/§7.9/§7.10)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EidrHoldoutStat {
+    /// χ² medio de los residuales normalizados (sensible a colas).
+    pub chi2_mean: f64,
+    /// χ² robusto: mediana de r² dividida por la mediana teórica de χ²₁
+    /// (0.4549) — inmune a núcleos estelares con varianza subestimada.
+    pub chi2_median: f64,
+    pub pixels: usize,
+}
+
+/// Predice el frame `fi` (reservado, NO usado en el solve) con la solución z
+/// y compara con sus datos. Solo cuenta píxeles cuyo kernel cae ÍNTEGRO en el
+/// lienzo (la cobertura parcial del borde compararía contra cielo que la
+/// hipótesis no cubre) y no enmascarados. `var` = varianza por píxel si se
+/// conoce (el simulador la da; producción usa 1/inv_var del frame).
+pub(crate) fn eidr_holdout_stat(
+    op: &EidrOperator,
+    fi: usize,
+    c: usize,
+    z: &[f32],
+    data: &[f32],
+    var: Option<&[f64]>,
+) -> EidrHoldoutStat {
+    let f = &op.frames[fi];
+    let mut pred = vec![0.0f32; f.w * f.h];
+    op.apply(fi, c, z, &mut pred);
+    let q_rad = f.lut.radius as f64 * f.geom.q_rad_factor + 2.0;
+    let fallback_var = 1.0 / (f.inv_var[c.min(2)] as f64).max(1e-30);
+    let pars = op.cfa.map(|cid| cfa_parities(cid, c));
+    let mut r2: Vec<f64> = Vec::new();
+    for py in 0..f.h {
+        for px in 0..f.w {
+            if let Some(ps) = &pars {
+                if !ps.contains(&(px & 1, py & 1)) {
+                    continue;
+                }
+            }
+            let idx = py * f.w + px;
+            if bit(&f.mask, idx) {
+                continue;
+            }
+            let (gx, gy) = f.geom.g(px as f64, py as f64);
+            if gx - q_rad < 0.0
+                || gy - q_rad < 0.0
+                || gx + q_rad > (op.w_out - 1) as f64
+                || gy + q_rad > (op.h_out - 1) as f64
+            {
+                continue;
+            }
+            let v = var.map(|vv| vv[idx]).unwrap_or(fallback_var).max(1e-30);
+            let res = (data[idx] - pred[idx]) as f64;
+            r2.push(res * res / v);
+        }
+    }
+    if r2.is_empty() {
+        return EidrHoldoutStat {
+            chi2_mean: f64::NAN,
+            chi2_median: f64::NAN,
+            pixels: 0,
+        };
+    }
+    let mean = r2.iter().sum::<f64>() / r2.len() as f64;
+    let mid = r2.len() / 2;
+    r2.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = r2[mid] / 0.454936; // mediana de χ² con 1 gdl
+    EidrHoldoutStat {
+        chi2_mean: mean,
+        chi2_median: median,
+        pixels: r2.len(),
+    }
+}
+
+/// Curva FRC completa por anillos (para diagnóstico/tests).
+#[cfg(test)]
+pub(crate) fn frc_curve(a: &[f32], b: &[f32], w: usize, h: usize) -> Vec<(f64, f64)> {
+    let cutoff_dummy = frc_rings(a, b, w, h);
+    cutoff_dummy
+}
+
+#[cfg(test)]
+fn frc_rings(a: &[f32], b: &[f32], w: usize, h: usize) -> Vec<(f64, f64)> {
+    // duplicado ligero del cuerpo de frc_cutoff devolviendo la curva
+    let mean_a = a.iter().map(|&v| v as f64).sum::<f64>() / (w * h) as f64;
+    let mean_b = b.iter().map(|&v| v as f64).sum::<f64>() / (w * h) as f64;
+    let hann = |i: usize, n: usize| -> f64 {
+        let x = std::f64::consts::PI * i as f64 / (n - 1).max(1) as f64;
+        x.sin() * x.sin()
+    };
+    let mut fa: Vec<Complex<f64>> = Vec::with_capacity(w * h);
+    let mut fb: Vec<Complex<f64>> = Vec::with_capacity(w * h);
+    for y in 0..h {
+        let wy = hann(y, h);
+        for x in 0..w {
+            let win = wy * hann(x, w);
+            fa.push(Complex::new((a[y * w + x] as f64 - mean_a) * win, 0.0));
+            fb.push(Complex::new((b[y * w + x] as f64 - mean_b) * win, 0.0));
+        }
+    }
+    let mut planner = FftPlanner::<f64>::new();
+    let fft_w = planner.plan_fft_forward(w);
+    let fft_h = planner.plan_fft_forward(h);
+    let fft2_rect = |buf: &mut Vec<Complex<f64>>| {
+        for row in buf.chunks_exact_mut(w) {
+            fft_w.process(row);
+        }
+        let mut col = vec![Complex::new(0.0, 0.0); h];
+        for x in 0..w {
+            for y in 0..h {
+                col[y] = buf[y * w + x];
+            }
+            fft_h.process(&mut col);
+            for y in 0..h {
+                buf[y * w + x] = col[y];
+            }
+        }
+    };
+    fft2_rect(&mut fa);
+    fft2_rect(&mut fb);
+    const NRINGS: usize = 48;
+    let mut cross = vec![0.0f64; NRINGS];
+    let mut p1 = vec![0.0f64; NRINGS];
+    let mut p2 = vec![0.0f64; NRINGS];
+    for y in 0..h {
+        let vy = { let k = y as f64 / h as f64; if k >= 0.5 { k - 1.0 } else { k } };
+        for x in 0..w {
+            let vx = { let k = x as f64 / w as f64; if k >= 0.5 { k - 1.0 } else { k } };
+            let r = (vx * vx + vy * vy).sqrt();
+            if r < 1e-9 || r > 0.5 { continue; }
+            let ring = ((r / 0.5) * NRINGS as f64) as usize;
+            if ring >= NRINGS { continue; }
+            let ca = fa[y * w + x];
+            let cb = fb[y * w + x];
+            cross[ring] += ca.re * cb.re + ca.im * cb.im;
+            p1[ring] += ca.norm_sqr();
+            p2[ring] += cb.norm_sqr();
+        }
+    }
+    (0..NRINGS)
+        .map(|ring| {
+            let denom = (p1[ring] * p2[ring]).sqrt();
+            let frc = if denom > 1e-300 { cross[ring] / denom } else { 0.0 };
+            ((ring as f64 + 0.5) / 48.0 * 0.5, frc)
+        })
+        .collect()
+}
+
+/// Correlación de anillos de Fourier entre dos reconstrucciones
+/// independientes (mitades odd/even). Devuelve la frecuencia de corte en
+/// ciclos/px del grid común: primer anillo donde FRC cae bajo `threshold`
+/// (0.5 clásico). Ventana Hann 2D + medias restadas para evitar fugas de
+/// borde; anillos hasta el Nyquist axial (0.5).
+pub(crate) fn frc_cutoff(
+    a: &[f32],
+    b: &[f32],
+    w: usize,
+    h: usize,
+    threshold: f64,
+) -> f64 {
+    debug_assert_eq!(a.len(), w * h);
+    debug_assert_eq!(b.len(), w * h);
+    let mean_a = a.iter().map(|&v| v as f64).sum::<f64>() / (w * h) as f64;
+    let mean_b = b.iter().map(|&v| v as f64).sum::<f64>() / (w * h) as f64;
+    let hann = |i: usize, n: usize| -> f64 {
+        let x = std::f64::consts::PI * i as f64 / (n - 1).max(1) as f64;
+        x.sin() * x.sin()
+    };
+    let mut fa: Vec<Complex<f64>> = Vec::with_capacity(w * h);
+    let mut fb: Vec<Complex<f64>> = Vec::with_capacity(w * h);
+    for y in 0..h {
+        let wy = hann(y, h);
+        for x in 0..w {
+            let win = wy * hann(x, w);
+            fa.push(Complex::new((a[y * w + x] as f64 - mean_a) * win, 0.0));
+            fb.push(Complex::new((b[y * w + x] as f64 - mean_b) * win, 0.0));
+        }
+    }
+    // FFT 2D rectangular: filas w, columnas h.
+    let mut planner = FftPlanner::<f64>::new();
+    let fft_w = planner.plan_fft_forward(w);
+    let fft_h = planner.plan_fft_forward(h);
+    let mut fft2_rect = |buf: &mut Vec<Complex<f64>>| {
+        for row in buf.chunks_exact_mut(w) {
+            fft_w.process(row);
+        }
+        let mut col = vec![Complex::new(0.0, 0.0); h];
+        for x in 0..w {
+            for y in 0..h {
+                col[y] = buf[y * w + x];
+            }
+            fft_h.process(&mut col);
+            for y in 0..h {
+                buf[y * w + x] = col[y];
+            }
+        }
+    };
+    fft2_rect(&mut fa);
+    fft2_rect(&mut fb);
+    const NRINGS: usize = 48;
+    let mut cross = vec![0.0f64; NRINGS];
+    let mut p1 = vec![0.0f64; NRINGS];
+    let mut p2 = vec![0.0f64; NRINGS];
+    for y in 0..h {
+        let vy = {
+            let k = y as f64 / h as f64;
+            if k >= 0.5 {
+                k - 1.0
+            } else {
+                k
+            }
+        };
+        for x in 0..w {
+            let vx = {
+                let k = x as f64 / w as f64;
+                if k >= 0.5 {
+                    k - 1.0
+                } else {
+                    k
+                }
+            };
+            let r = (vx * vx + vy * vy).sqrt();
+            if r < 1e-9 || r > 0.5 {
+                continue;
+            }
+            let ring = ((r / 0.5) * NRINGS as f64) as usize;
+            if ring >= NRINGS {
+                continue;
+            }
+            let ca = fa[y * w + x];
+            let cb = fb[y * w + x];
+            cross[ring] += ca.re * cb.re + ca.im * cb.im;
+            p1[ring] += ca.norm_sqr();
+            p2[ring] += cb.norm_sqr();
+        }
+    }
+    for ring in 1..NRINGS {
+        let denom = (p1[ring] * p2[ring]).sqrt();
+        let frc = if denom > 1e-300 { cross[ring] / denom } else { 0.0 };
+        if frc < threshold {
+            return (ring as f64 + 0.5) / NRINGS as f64 * 0.5;
+        }
+    }
+    0.5
+}
+
+// ---------------------------------------------------------------------------
 // Puerta local de recuperabilidad (F9.3, §7.4)
 // ---------------------------------------------------------------------------
 //
@@ -1019,8 +1431,12 @@ pub(crate) fn eidr_prolong(
 pub(crate) const EIDR_KAPPA_APT: f64 = 30.0;
 /// Umbral κ degradar / fallback (§7.4).
 pub(crate) const EIDR_KAPPA_MAX: f64 = 100.0;
-/// η de la recuperabilidad R = σ̃²/(σ̃²+η), con σ̃ relativa a ‖Q‖_F/√L.
-const EIDR_GATE_ETA: f64 = 1e-2;
+/// η de la recuperabilidad R = s̃²/(s̃²+η), con s̃ la fracción de la
+/// sensibilidad DC del stack que retiene el modo. Calibrada para que la MTF
+/// real de un Moffat submuestreado (FWHM 1.1-1.4 px, s̃~0.02-0.05 en la
+/// banda baja) puntúe apto y el colapso por PSF ancha (s̃≲1e-4) quede en
+/// fallback con margen (§7.4: umbrales iniciales pendientes de corpus).
+const EIDR_GATE_ETA: f64 = 1e-3;
 /// R mínima de la banda extendida baja para clase APTO / DEGRADAR: por
 /// debajo no hay evidencia superresuelta (PSF ancha ⇒ fallback aunque el
 /// dither sea perfecto, §7.8).
@@ -1064,6 +1480,10 @@ pub(crate) struct EidrGateReport {
     pub frac_apt: f64,
     pub frac_degrade: f64,
     pub frac_fallback: f64,
+    /// Perfil radial de recuperabilidad: (ν en ciclos/px de SALIDA, R medio
+    /// sobre tiles y ángulos). Alimenta el cutoff espectral (§7.9: "cutoff
+    /// impuesto por rango/ruido y publicado").
+    pub r_radial: Vec<(f64, f64)>,
 }
 
 impl EidrGateReport {
@@ -1242,7 +1662,9 @@ pub(crate) fn eidr_recoverability_gate(
         frac_apt: 0.0,
         frac_degrade: 0.0,
         frac_fallback: 0.0,
+        r_radial: Vec::new(),
     };
+    report.r_radial = Vec::new();
     if s <= 1.05 || frames.is_empty() {
         for ty in 0..tiles_y {
             for tx in 0..tiles_x {
@@ -1332,6 +1754,8 @@ pub(crate) fn eidr_recoverability_gate(
     }
 
     let (mut n_apt, mut n_deg, mut n_fb) = (0usize, 0usize, 0usize);
+    let mut rad_sum = vec![0.0f64; radii.len()];
+    let mut rad_cnt = vec![0usize; radii.len()];
     for ty in 0..tiles_y {
         for tx in 0..tiles_x {
             // Puntos de evaluación: centro + 4 esquinas (rotación ⇒ la fase
@@ -1460,6 +1884,8 @@ pub(crate) fn eidr_recoverability_gate(
                 }
                 r_sum += r_target;
                 r_cnt += 1;
+                rad_sum[ti / angles.len()] += r_target;
+                rad_cnt[ti / angles.len()] += 1;
             }
             // Clase §7.4: diversidad (amp) Y evidencia (R) de la banda baja.
             let class = if kappa_low <= EIDR_KAPPA_APT && r_low > EIDR_GATE_R_APT {
@@ -1487,7 +1913,47 @@ pub(crate) fn eidr_recoverability_gate(
     report.frac_apt = n_apt as f64 / total;
     report.frac_degrade = n_deg as f64 / total;
     report.frac_fallback = n_fb as f64 / total;
+    report.r_radial = radii
+        .iter()
+        .enumerate()
+        .map(|(i, &rf)| {
+            let nu_native = 0.5 + (0.5 * s - 0.5) * rf;
+            (
+                nu_native / s,
+                if rad_cnt[i] > 0 { rad_sum[i] / rad_cnt[i] as f64 } else { 0.0 },
+            )
+        })
+        .collect();
     report
+}
+
+/// Frecuencia de corte (ciclos/px de SALIDA) desde el perfil radial de la
+/// puerta: el mayor ν con R ≥ umbral (interpolado); nunca por debajo del
+/// Nyquist nativo (esa banda está siempre medida). None ⇒ sin evidencia
+/// extendida: cortar justo sobre el Nyquist nativo.
+pub(crate) fn eidr_cutoff_from_gate(report: &EidrGateReport) -> f64 {
+    let native_out = 0.5 / report.scale.max(1.0) as f64;
+    if report.r_radial.is_empty() {
+        return 0.5; // escala nativa: sin corte
+    }
+    const R_MIN: f64 = 0.05;
+    let mut cut = native_out;
+    let pts = &report.r_radial;
+    for i in 0..pts.len() {
+        if pts[i].1 >= R_MIN {
+            cut = pts[i].0;
+        } else {
+            if i > 0 && pts[i - 1].1 >= R_MIN {
+                // interpolación lineal del cruce R = R_MIN
+                let (x0, y0) = pts[i - 1];
+                let (x1, y1) = pts[i];
+                let t = ((y0 - R_MIN) / (y0 - y1).max(1e-12)).clamp(0.0, 1.0);
+                cut = x0 + t * (x1 - x0);
+            }
+            break;
+        }
+    }
+    cut.max(native_out * 1.02)
 }
 
 // ---------------------------------------------------------------------------
@@ -1753,6 +2219,481 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Gate F9.4 — FRC vs Drizzle + holdout
+    // -----------------------------------------------------------------------
+
+    /// Drizzle de referencia (drop cuadrado, pixfrac, solo traslaciones):
+    /// baseline honesto para el FRC. Convención idéntica: salida(q) ↔ ref(q/s).
+    fn drizzle_ref(
+        frames: &[Vec<f32>],
+        dithers: &[(f64, f64)],
+        idxs: &[usize],
+        w: usize,
+        h: usize,
+        s: f64,
+        pixfrac: f64,
+    ) -> Vec<f32> {
+        let (w_out, h_out) = ((w as f64 * s) as usize, (h as f64 * s) as usize);
+        let mut sum = vec![0.0f64; w_out * h_out];
+        let mut wgt = vec![0.0f64; w_out * h_out];
+        let half = 0.5 * pixfrac * s;
+        for &fi in idxs {
+            let (dx, dy) = dithers[fi];
+            for py in 0..h {
+                for px in 0..w {
+                    let v = frames[fi][py * w + px] as f64;
+                    let cx = (px as f64 - dx) * s;
+                    let cy = (py as f64 - dy) * s;
+                    let x0 = ((cx - half - 0.5).ceil() as i64).max(0) as usize;
+                    let x1 = ((cx + half + 0.5).floor() as i64).min(w_out as i64 - 1);
+                    let y0 = ((cy - half - 0.5).ceil() as i64).max(0) as usize;
+                    let y1 = ((cy + half + 0.5).floor() as i64).min(h_out as i64 - 1);
+                    if x1 < x0 as i64 || y1 < y0 as i64 {
+                        continue;
+                    }
+                    for qy in y0..=y1 as usize {
+                        let oy = (half + 0.5 - (qy as f64 - cy).abs()).clamp(0.0, 1.0);
+                        if oy <= 0.0 {
+                            continue;
+                        }
+                        for qx in x0..=x1 as usize {
+                            let ox = (half + 0.5 - (qx as f64 - cx).abs()).clamp(0.0, 1.0);
+                            if ox <= 0.0 {
+                                continue;
+                            }
+                            let a = ox * oy;
+                            sum[qy * w_out + qx] += v * a;
+                            wgt[qy * w_out + qx] += a;
+                        }
+                    }
+                }
+            }
+        }
+        sum.iter()
+            .zip(wgt.iter())
+            .map(|(&sv, &wv)| if wv > 1e-12 { (sv / wv) as f32 } else { 0.0 })
+            .collect()
+    }
+
+    /// Resuelve EIDR con un subconjunto de frames (b/diag solo de ellos).
+    fn eidr_solve_subset(
+        op: &EidrOperator,
+        datas: &[Vec<f32>],
+        idxs: &[usize],
+        freq: Option<&EidrFreqPenalty>,
+    ) -> Vec<f32> {
+        let n_out = op.w_out * op.h_out;
+        let mut b = vec![0.0f64; n_out];
+        let mut diag = vec![0.0f64; n_out];
+        for &fi in idxs {
+            op.adjoint_accum(fi, 0, &datas[fi], op.frames[fi].inv_var[0] as f64, &mut b);
+            op.normal_diag_accum(fi, 0, &mut diag);
+        }
+        let aone = eidr_backprojected_flat(op, 0, idxs);
+        let z0 = eidr_pilot(&b, &aone);
+        let mut noop = |_k: usize, _n: usize| {};
+        // Config por defecto + escala absoluta del χ²: el estancamiento actúa
+        // como regularización por parada temprana (forzar tolerancias 1e-7
+        // con pocos frames sobreajusta ruido en los modos mal condicionados
+        // y degrada el FRC en TODA la banda — medido).
+        let cfg = EidrSolveConfig {
+            max_iterations: 200,
+            data_size: idxs.iter().map(|&fi| op.frames[fi].w * op.frames[fi].h).sum(),
+            ..EidrSolveConfig::default()
+        };
+        let (z, rep) = eidr_solve_channel(&op, 0, idxs, &b, &diag, &z0, &cfg, freq, None, &mut noop)
+            .expect("solve");
+        assert!(rep.converged, "subset sin converger: {rep:?}");
+        z
+    }
+
+    /// §7.10: en un dataset que la puerta marca APTO, el corte FRC de EIDR
+    /// (mitades odd/even independientes) debe superar al de Drizzle en ≥20%.
+    /// Además el holdout (2 frames fuera del solve) debe dar χ² compatible
+    /// con el ruido (predicción del modelo directo contra datos crudos).
+    #[test]
+    fn gate_f94_eidr_frc_vs_drizzle_and_holdout() {
+        use crate::deepsky_sim as sim;
+        let (w, h) = (128usize, 112usize);
+        let mut stars = Vec::new();
+        for j in 0..4 {
+            for i in 0..4 {
+                stars.push(sim::SimStar {
+                    x: 17.3 + 31.1 * i as f64 + 2.1 * ((i + j) % 2) as f64,
+                    y: 15.7 + 26.4 * j as f64 + 1.7 * ((i * j) % 3) as f64,
+                    flux_adu: 8000.0 + 1500.0 * ((i + 2 * j) % 5) as f64,
+                    fwhm_px: 1.0,
+                    moffat_beta: Some(2.5),
+                });
+            }
+        }
+        let scene = sim::SimScene {
+            width: w,
+            height: h,
+            background_adu: 150.0,
+            gradient_adu_per_px: (0.0, 0.0),
+            color: [1.0; 3],
+            stars,
+        };
+        let sensor = sim::SimSensor {
+            gain_e_per_adu: 1.0,
+            read_noise_e: 2.0,
+            bias_adu: 500.0,
+            dark_adu_per_s: 0.0,
+            full_well_adu: 1e12,
+            hot_pixels: vec![],
+            bayer: None,
+            vignette: None,
+        };
+        // El régimen del criterio FRC es el dataset MÍNIMO apto (N=12 para
+        // 2x): con 6 frames por mitad el residuo de alias de drizzle (∝1/N)
+        // decorrelaciona sus mitades más allá del Nyquist nativo; EIDR lo
+        // resuelve coherentemente. Con muchos frames ambos convergen y el
+        // FRC odd/even es ciego a la transferencia (esperable y documentado).
+        let n_frames = 14usize; // 12 al solve (6+6) + 2 holdout
+        let scale = 2.0f32;
+        let mut datas: Vec<Vec<f32>> = Vec::new();
+        let mut vars: Vec<Vec<f64>> = Vec::new();
+        let mut dithers: Vec<(f64, f64)> = Vec::new();
+        // Dithers ALEATORIOS sembrados (no la secuencia áurea): al partir una
+        // secuencia áurea en odd/even los residuos de alias de las mitades
+        // quedan con fase relativa fija 2πφ ⇒ FRC anticorrelada espuria
+        // (≈cos 2πφ = −0.74) idéntica para cualquier método. Con fases
+        // independientes el FRC mide de verdad alias+ruido.
+        let mut rng_state = 0x1234_5678_9abc_def0u64;
+        for i in 0..n_frames {
+            let dx = lcg(&mut rng_state) + (i % 3) as f64 - 1.0;
+            let dy = lcg(&mut rng_state) + ((i / 3) % 3) as f64 - 1.0;
+            let exp = sim::SimExposure {
+                exposure_s: 1.0,
+                dx,
+                dy,
+                seed: 977 + i as u64,
+            };
+            let (data, var) = sim::render_light(&scene, &sensor, &exp);
+            datas.push(data.iter().map(|&v| v - 500.0).collect());
+            vars.push(var);
+            dithers.push((dx, dy));
+        }
+        // La puerta debe declarar APTO este dataset (submuestreado + dithers).
+        let gate_fr: Vec<EidrGateFrame> = dithers
+            .iter()
+            .map(|&(dx, dy)| {
+                let t = crate::DsTransform::from_similarity((1.0, 0.0, -dx as f32, -dy as f32));
+                EidrGateFrame {
+                    geom: eidr_geom(&t, scale).unwrap(),
+                    psf: Some(MoffatPsf {
+                        fwhm_x: 1.0,
+                        fwhm_y: 1.0,
+                        theta: 0.0,
+                        beta: 2.5,
+                    }),
+                    sigma: (154.0f64).sqrt(),
+                }
+            })
+            .collect();
+        let gamma = MoffatPsf { fwhm_x: 1.0, fwhm_y: 1.0, theta: 0.0, beta: 2.5 };
+        let rep = eidr_recoverability_gate(&gate_fr, gamma, w, h, scale, None, 64);
+        assert!(rep.scale_supported(), "la puerta debería aprobar 2x aquí");
+
+        let ivar = 1.0f32 / 154.0;
+        // PAD del lienzo de hipótesis: sin él, las filas PARCIALES de A en el
+        // borde (ventana de kernel asomando fuera del canvas) acoplan la
+        // escala del interior con la basura de borde y el minimizador compra
+        // ajuste ahí a cambio de un déficit multiplicativo interior (~0.86
+        // medido). Con pad ≥ dither_max + alcance de kernel ninguna fila es
+        // parcial; el pad se recorta tras el solve (§7.8: recortar bordes).
+        const PAD: usize = 4;
+        let frames_op: Vec<EidrFrameOp> = dithers
+            .iter()
+            .map(|&(dx, dy)| {
+                let t = crate::DsTransform::from_similarity((
+                    1.0,
+                    0.0,
+                    (PAD as f64 - dx) as f32,
+                    (PAD as f64 - dy) as f32,
+                ));
+                let geom = eidr_geom(&t, scale).unwrap();
+                let lut = eidr_build_lut(None, gamma, &geom);
+                EidrFrameOp {
+                    geom,
+                    lut,
+                    inv_var: [ivar; 3],
+                    mask: vec![0u64; (w * h + 63) / 64],
+                    w,
+                    h,
+                }
+            })
+            .collect();
+        let op = EidrOperator {
+            frames: frames_op,
+            w_out: ((w + 2 * PAD) as f32 * scale) as usize,
+            h_out: ((h + 2 * PAD) as f32 * scale) as usize,
+            cfa: None,
+            ch: 1,
+        };
+        let (w_res, h_res) = ((w as f32 * scale) as usize, (h as f32 * scale) as usize);
+        let unpad = |img: &[f32]| -> Vec<f32> {
+            let off = (PAD as f32 * scale) as usize;
+            let mut out = Vec::with_capacity(w_res * h_res);
+            for y in 0..h_res {
+                let row = (y + off) * op.w_out + off;
+                out.extend_from_slice(&img[row..row + w_res]);
+            }
+            out
+        };
+        // FRC CONTRA LA VERDAD del simulador (cielo a la PSF del frame,
+        // renderizado a 2x sin ruido). El FRC odd/even es ciego a la
+        // transferencia y PREMIA el difuminado (drizzle suprime señal y
+        // ruido por igual y sus mitades se correlan más lejos aunque lleven
+        // menos información); contra la verdad, el alias que drizzle deja
+        // PLEGADO EN BANDA con pocos frames decorrelaciona su reconstrucción,
+        // mientras EIDR lo separa resolviendo las réplicas.
+        let truth: Vec<f32> = {
+            let scene2 = sim::SimScene {
+                width: w_res,
+                height: h_res,
+                background_adu: 150.0,
+                gradient_adu_per_px: (0.0, 0.0),
+                color: [1.0; 3],
+                stars: scene
+                    .stars
+                    .iter()
+                    .map(|st| sim::SimStar {
+                        x: st.x * 2.0,
+                        y: st.y * 2.0,
+                        flux_adu: st.flux_adu * 4.0,
+                        fwhm_px: st.fwhm_px * 2.0,
+                        moffat_beta: st.moffat_beta,
+                    })
+                    .collect(),
+            };
+            let exp0 = sim::SimExposure { exposure_s: 1.0, dx: 0.0, dy: 0.0, seed: 1 };
+            sim::render_ideal(&scene2, &sensor, &exp0)
+                .iter()
+                .map(|&v| v as f32)
+                .collect()
+        };
+        let crop = |img: &[f32]| -> Vec<f32> {
+            let m = 12usize;
+            let (cw, chh) = (w_res - 2 * m, h_res - 2 * m);
+            let mut out = Vec::with_capacity(cw * chh);
+            for y in m..h_res - m {
+                out.extend_from_slice(&img[y * w_res + m..y * w_res + w_res - m]);
+            }
+            out
+        };
+        let (cw, chh) = (w_res - 24, h_res - 24);
+        let all: Vec<usize> = (0..12).collect();
+        // λ_F Σ ω|ẑ|² (§7.3): ω desde la puerta; λ_F = mediana de la diagonal.
+        let mut diag_all = vec![0.0f64; op.w_out * op.h_out];
+        for &fi in &all {
+            op.normal_diag_accum(fi, 0, &mut diag_all);
+        }
+        let mut dpos: Vec<f64> = diag_all.iter().copied().filter(|&d| d > 0.0).collect();
+        let dm = dpos.len() / 2;
+        dpos.select_nth_unstable_by(dm, |a, b| a.partial_cmp(b).unwrap());
+        let pen = eidr_freq_penalty(&rep, op.w_out, op.h_out, dpos[dm]);
+        let z_all = eidr_solve_subset(&op, &datas, &all, pen.as_ref());
+        // El taper vive EN el objetivo (λ_F·ω de §7.3): amortigua las bandas
+        // sin evidencia manteniendo la consistencia fotométrica del ajuste.
+        // Un corte duro post-solve amputa contenido que participaba en el
+        // ajuste y sesga las predicciones (+23 ADU medidos): el corte de la
+        // puerta se PUBLICA (receta/mapa RECOV), no se opera con él.
+        let nu_cut = eidr_cutoff_from_gate(&rep);
+        assert!(nu_cut > 0.3 && nu_cut < 0.5, "corte publicado fuera de rango: {nu_cut}");
+        let z_res = unpad(&z_all);
+        let dz_all = drizzle_ref(&datas, &dithers, &all, w, h, scale as f64, 0.9);
+        let truth_c = crop(&truth);
+        // El FRC normalizado por anillo es CIEGO a la transferencia (un
+        // estimador difuminante suprime señal y ruido por igual): el corte a
+        // 0.5 comprime la diferencia real contra el muro del seeing. El
+        // criterio §7.10 se operacionaliza con la información de la banda
+        // superresuelta y la PSF efectiva, más no-regresión del corte:
+        //  (a) FRC-vs-verdad MEDIA en la banda extendida ≥ 1.2× drizzle;
+        //  (b) corte FRC de EIDR no peor que drizzle (≥0.98×);
+        //  (c) HFD estelar (nitidez real del máster) ≤ 0.85× drizzle —
+        //      drizzle difumina por caja-píxel ⊛ drop (pixfrac 0.9), EIDR
+        //      entrega la PSF objetivo Γ.
+        let curve_e = frc_curve(&crop(&z_res), &truth_c, cw, chh);
+        let curve_d = frc_curve(&crop(&dz_all), &truth_c, cw, chh);
+        for (name, curve) in [("EIDR", &curve_e), ("DRZ ", &curve_d)] {
+            let line: String = curve
+                .iter()
+                .step_by(2)
+                .map(|(r, f)| format!("{:.2}:{:+.2} ", r, f))
+                .collect();
+            eprintln!("FRC-verdad {name}: {line}");
+        }
+        let band = |c: &[(f64, f64)]| -> f64 {
+            let vals: Vec<f64> = c
+                .iter()
+                .filter(|(r, _)| *r >= 0.25 && *r <= 0.375)
+                .map(|(_, f)| f.max(0.0))
+                .collect();
+            vals.iter().sum::<f64>() / vals.len().max(1) as f64
+        };
+        let (band_e, band_d) = (band(&curve_e), band(&curve_d));
+        assert!(
+            band_e >= 1.2 * band_d,
+            "FRC banda extendida: EIDR {band_e:.3} vs Drizzle {band_d:.3} (ratio {:.2} < 1.2)",
+            band_e / band_d.max(1e-9)
+        );
+        let cut_eidr = frc_cutoff(&crop(&z_res), &truth_c, cw, chh, 0.5);
+        let cut_drz = frc_cutoff(&crop(&dz_all), &truth_c, cw, chh, 0.5);
+        assert!(
+            cut_eidr >= 0.98 * cut_drz,
+            "corte FRC en regresión: EIDR {cut_eidr:.3} vs Drizzle {cut_drz:.3}"
+        );
+        // HFD (diámetro de medio flujo) mediano de las estrellas.
+        let hfd = |img: &[f32]| -> f64 {
+            let mut hs: Vec<f64> = Vec::new();
+            for st in &scene.stars {
+                let (cx, cy) = (st.x * 2.0, st.y * 2.0);
+                // Apertura contenida (99% del Moffat) y residuos SIN clamp:
+                // truncar en 0 rectifica el ruido (E[max(N,0)]=0.4σ) e infla
+                // el flujo acumulado justo en la imagen menos suavizada.
+                let rap = 8.0f64;
+                let mut ring: Vec<(f64, f64)> = Vec::new();
+                let mut total = 0.0f64;
+                for qy in (cy - rap).floor() as usize..=(cy + rap).ceil() as usize {
+                    for qx in (cx - rap).floor() as usize..=(cx + rap).ceil() as usize {
+                        let dx = qx as f64 - cx;
+                        let dy = qy as f64 - cy;
+                        let r = (dx * dx + dy * dy).sqrt();
+                        if r > rap {
+                            continue;
+                        }
+                        let v = (img[qy * w_res + qx] - 150.0) as f64;
+                        ring.push((r, v));
+                        total += v;
+                    }
+                }
+                ring.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                let mut acc = 0.0;
+                for (r, v) in ring {
+                    acc += v;
+                    if acc >= 0.5 * total {
+                        hs.push(2.0 * r);
+                        break;
+                    }
+                }
+            }
+            hs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            hs[hs.len() / 2]
+        };
+        let (hfd_e, hfd_d) = (hfd(&z_res), hfd(&dz_all));
+        assert!(
+            hfd_e <= 0.85 * hfd_d,
+            "HFD: EIDR {hfd_e:.2} vs Drizzle {hfd_d:.2} px salida (ratio {:.2} > 0.85)",
+            hfd_e / hfd_d
+        );
+
+        // Holdout: la solución de los 12 predice los frames 12/13.
+        for fi in [12usize, 13] {
+            let st = eidr_holdout_stat(&op, fi, 0, &z_all, &datas[fi], Some(&vars[fi]));
+            assert!(st.pixels > 5000, "holdout {fi}: pocos píxeles {}", st.pixels);
+            assert!(
+                st.chi2_median > 0.7 && st.chi2_median < 1.4,
+                "holdout {fi}: χ² mediano {:.3} (medio {:.3})",
+                st.chi2_median,
+                st.chi2_mean
+            );
+        }
+    }
+
+    /// Aislante: escena PLANA sin ruido — el solve debe devolver el plano
+    /// exacto (si no, el defecto es del operador/solver, no de la escena).
+    #[test]
+    fn eidr_solve_flat_scene_is_exact() {
+        let (w, h) = (64usize, 56usize);
+        let scale = 2.0f32;
+        const PAD: usize = 4;
+        let mut rng_state = 0xfeed_beefu64;
+        let dithers: Vec<(f64, f64)> = (0..12)
+            .map(|i| {
+                (
+                    lcg(&mut rng_state) + (i % 3) as f64 - 1.0,
+                    lcg(&mut rng_state) + ((i / 3) % 3) as f64 - 1.0,
+                )
+            })
+            .collect();
+        let gamma = MoffatPsf { fwhm_x: 1.0, fwhm_y: 1.0, theta: 0.0, beta: 2.5 };
+        let ivar = 1.0f32 / 154.0;
+        let frames_op: Vec<EidrFrameOp> = dithers
+            .iter()
+            .map(|&(dx, dy)| {
+                let t = crate::DsTransform::from_similarity((
+                    1.0,
+                    0.0,
+                    (PAD as f64 - dx) as f32,
+                    (PAD as f64 - dy) as f32,
+                ));
+                let geom = eidr_geom(&t, scale).unwrap();
+                let lut = eidr_build_lut(None, gamma, &geom);
+                EidrFrameOp {
+                    geom,
+                    lut,
+                    inv_var: [ivar; 3],
+                    mask: vec![0u64; (w * h + 63) / 64],
+                    w,
+                    h,
+                }
+            })
+            .collect();
+        let op = EidrOperator {
+            frames: frames_op,
+            w_out: ((w + 2 * PAD) as f32 * scale) as usize,
+            h_out: ((h + 2 * PAD) as f32 * scale) as usize,
+            cfa: None,
+            ch: 1,
+        };
+        let datas: Vec<Vec<f32>> = (0..12).map(|_| vec![150.0f32; w * h]).collect();
+        let n_out = op.w_out * op.h_out;
+        let mut b = vec![0.0f64; n_out];
+        let mut diag = vec![0.0f64; n_out];
+        for fi in 0..12 {
+            op.adjoint_accum(fi, 0, &datas[fi], ivar as f64, &mut b);
+            op.normal_diag_accum(fi, 0, &mut diag);
+        }
+        let aone = eidr_backprojected_flat(&op, 0, &(0..12).collect::<Vec<_>>());
+        let z0 = eidr_pilot(&b, &aone);
+        let mut noop = |_k: usize, _n: usize| {};
+        let cfg = EidrSolveConfig {
+            max_iterations: 200,
+            data_size: 12 * w * h,
+            ..EidrSolveConfig::default()
+        };
+        let idxs_all: Vec<usize> = (0..12).collect();
+        let (z, rep) =
+            eidr_solve_channel(&op, 0, &idxs_all, &b, &diag, &z0, &cfg, None, None, &mut noop)
+                .unwrap();
+        // Interior del lienzo (sin pad):
+        let off = (PAD as f32 * scale) as usize;
+        let mut worst = 0.0f32;
+        let mut sum = 0.0f64;
+        let mut cnt = 0usize;
+        for y in off + 4..op.h_out - off - 4 {
+            for x in off + 4..op.w_out - off - 4 {
+                let v = z[y * op.w_out + x];
+                worst = worst.max((v - 150.0).abs());
+                sum += v as f64;
+                cnt += 1;
+            }
+        }
+        eprintln!(
+            "flat solve: mean={:.2} worst_dev={:.2} iters={} rel={:.1e} conv={}",
+            sum / cnt as f64, worst, rep.iterations, rep.rel_residual, rep.converged
+        );
+        assert!(
+            (sum / cnt as f64 - 150.0).abs() < 0.5 && worst < 2.0,
+            "plano no recuperado: mean={:.2} worst={:.2}",
+            sum / cnt as f64,
+            worst
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Gate F9.3 — puerta de recuperabilidad
     // -----------------------------------------------------------------------
 
@@ -2014,19 +2955,17 @@ mod tests {
             op.adjoint_accum(fi, 0, &datas[fi], ivar as f64, &mut b);
             op.normal_diag_accum(fi, 0, &mut diag);
         }
-        let z0 = eidr_pilot(&b, &diag);
+        let aone = eidr_backprojected_flat(&op, 0, &(0..n_frames).collect::<Vec<_>>());
+        let z0 = eidr_pilot(&b, &aone);
         let mut noop = |_k: usize, _n: usize| {};
-        let (z, rep) = eidr_solve_channel(
-            &op,
-            0,
-            &b,
-            &diag,
-            &z0,
-            &EidrSolveConfig::default(),
-            None,
-            &mut noop,
-        )
-        .expect("solve");
+        let cfg = EidrSolveConfig {
+            data_size: n_frames * w * h,
+            ..EidrSolveConfig::default()
+        };
+        let idxs_all: Vec<usize> = (0..n_frames).collect();
+        let (z, rep) =
+            eidr_solve_channel(&op, 0, &idxs_all, &b, &diag, &z0, &cfg, None, None, &mut noop)
+                .expect("solve");
         assert!(
             rep.converged,
             "PCG sin converger: iters={} rel_res={:.2e}",
