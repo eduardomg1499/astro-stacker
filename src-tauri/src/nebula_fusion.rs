@@ -945,6 +945,15 @@ pub(crate) fn run_lite(
                     for idx in 0..npx * ch {
                         if frame_wgt[idx] > 0.0 {
                             y[idx] = (frame_sum[idx] / frame_wgt[idx]) as f32;
+                        } else if clean_wgt[idx] > 0.0 {
+                            // Píxel NO cubierto por este frame: la FFT no
+                            // admite huecos y un 0 sesgaría hacia negro los
+                            // bordes con cobertura parcial (12/16 frames ⇒
+                            // 0.75·V). Se sustituye por el piloto limpio y
+                            // DQ|=EDGE lo declara (hallazgo de la revisión
+                            // adversarial F5-F8).
+                            y[idx] = (clean_sum[idx] / clean_wgt[idx]) as f32;
+                            dq[idx / ch] |= crate::deepsky_variance::dq::EDGE;
                         }
                     }
                     for &p in masks[k].positive.iter().chain(&masks[k].negative) {
