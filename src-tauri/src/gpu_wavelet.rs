@@ -89,6 +89,61 @@ struct BlurParams {
     axis: u32,
 }
 
+/// Arena de uniforms con offsets dinámicos. Antes cada pasada de blur/RL
+/// creaba un buffer y hacía un `queue.write_buffer`; una edición wavelet podía
+/// generar decenas y RL cientos de allocs/uploads de 16 bytes. Ahora todas las
+/// constantes de una operación viajan en un buffer y una sola escritura.
+const UNIFORM_STRIDE: usize = 256;
+
+struct UniformArena {
+    buffer: wgpu::Buffer,
+    bytes: Vec<u8>,
+    len: usize,
+    capacity: usize,
+}
+
+impl UniformArena {
+    fn new(dev: &wgpu::Device, capacity: usize, label: &str) -> Option<Self> {
+        let capacity = capacity.max(1);
+        let size = capacity.checked_mul(UNIFORM_STRIDE)?;
+        if size > u32::MAX as usize || size as u64 > dev.limits().max_buffer_size {
+            return None;
+        }
+        let buffer = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: size as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Some(Self {
+            buffer,
+            bytes: vec![0; size],
+            len: 0,
+            capacity,
+        })
+    }
+
+    fn push<T: bytemuck::Pod>(&mut self, value: &T) -> u32 {
+        let value = bytemuck::bytes_of(value);
+        assert!(value.len() <= 16, "uniform wavelet mayor de 16 bytes");
+        assert!(
+            self.len < self.capacity,
+            "arena de uniforms wavelet agotada"
+        );
+        let offset = self.len * UNIFORM_STRIDE;
+        self.bytes[offset..offset + value.len()].copy_from_slice(value);
+        self.len += 1;
+        offset as u32
+    }
+
+    fn upload(&self, queue: &wgpu::Queue) {
+        if self.len != 0 {
+            let used = (self.len - 1) * UNIFORM_STRIDE + 16;
+            queue.write_buffer(&self.buffer, 0, &self.bytes[..used]);
+        }
+    }
+}
+
 struct BlurGpu {
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
@@ -114,7 +169,7 @@ fn blur_gpu() -> Option<&'static BlurGpu> {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
+                        has_dynamic_offset: true,
                         min_binding_size: None,
                     },
                     count: None,
@@ -175,25 +230,62 @@ fn box_radii(sigma: f32) -> [usize; 3] {
     }
     let wl = wl.max(1) as usize;
     let wu = wl + 2;
-    let m_ideal = (12.0 * sigma * sigma
-        - (n * (wl * wl) as f32)
-        - (4.0 * n * wl as f32)
-        - (3.0 * n))
-        / (-4.0 * wl as f32 - 4.0);
+    let m_ideal =
+        (12.0 * sigma * sigma - (n * (wl * wl) as f32) - (4.0 * n * wl as f32) - (3.0 * n))
+            / (-4.0 * wl as f32 - 4.0);
     let m = m_ideal.round().clamp(0.0, n) as usize;
     let sizes = [
         if 0 < m { wl } else { wu },
         if 1 < m { wl } else { wu },
         if 2 < m { wl } else { wu },
     ];
-    [
-        (sizes[0] - 1) / 2,
-        (sizes[1] - 1) / 2,
-        (sizes[2] - 1) / 2,
-    ]
+    [(sizes[0] - 1) / 2, (sizes[1] - 1) / 2, (sizes[2] - 1) / 2]
 }
 
 const SIGMAS: [f32; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+
+fn nonzero_box_radii(sigma: f32) -> usize {
+    box_radii(sigma).into_iter().filter(|&r| r != 0).count()
+}
+
+fn wavelet_vram_bytes(n: usize) -> u64 {
+    // base + tmp + 6 salidas residentes, más staging de las 6 salidas.
+    (n as u64).saturating_mul(4).saturating_mul(14)
+}
+
+fn rl_vram_bytes(n: usize) -> u64 {
+    // 7 buffers de trabajo + un staging de salida.
+    (n as u64).saturating_mul(4).saturating_mul(8)
+}
+
+fn wavelet_sigmas_per_submit(n: usize, is_metal: bool) -> usize {
+    // Peor sigma: tres box blurs separables = seis recorridos de la imagen.
+    // DX12/Vulkan usan un margen estricto por TDR; Metal admite un buffer más
+    // grande, pero también se trocea 8K para no monopolizar la cola durante un
+    // command buffer gigantesco.
+    let work_per_sigma = n.saturating_mul(6).max(1);
+    let budget = if is_metal {
+        600_000_000usize
+    } else {
+        150_000_000usize
+    };
+    (budget / work_per_sigma).clamp(1, SIGMAS.len())
+}
+
+fn rl_iterations_per_submit(n: usize, sigma: f32, is_metal: bool, total: usize) -> usize {
+    if total == 0 {
+        return 1;
+    }
+    // Cada iteración: dos gaussianos (2 ejes por radio) + ratio + update.
+    let passes = nonzero_box_radii(sigma).saturating_mul(4).saturating_add(2);
+    let work_per_iteration = n.saturating_mul(passes).max(1);
+    let budget = if is_metal {
+        600_000_000usize
+    } else {
+        120_000_000usize
+    };
+    (budget / work_per_iteration).clamp(1, total.min(8).max(1))
+}
 
 /// Estado del self-test de paridad de wavelets: 0 pendiente, 1 ok, 2 fallido.
 static WAVELET_PARITY: AtomicU8 = AtomicU8::new(0);
@@ -209,9 +301,9 @@ pub fn gpu_decompose(base: &[f32], width: usize, height: usize) -> Option<Vec<Ve
     }
     let rt = gpu_runtime()?;
     let n = width * height;
-    // 8 buffers f32 (base + tmp + 6 blurs). Guarda de VRAM.
-    let needed = (n as u64) * 4 * 8;
-    if needed > rt.vram_budget {
+    let n4 = (n as u64).saturating_mul(4);
+    let needed = wavelet_vram_bytes(n);
+    if n4 > rt.max_binding || n4 > rt.max_buffer_size || needed > rt.vram_budget {
         return None;
     }
     gpu_decompose_raw(base, width, height)
@@ -227,6 +319,9 @@ fn gpu_decompose_raw(base: &[f32], width: usize, height: usize) -> Option<Vec<Ve
         return None;
     }
     let n4 = (n * 4) as u64;
+    if n4 > rt.max_binding || n4 > rt.max_buffer_size {
+        return None;
+    }
 
     let mk_storage = |label: &str, extra: wgpu::BufferUsages| {
         dev.create_buffer(&wgpu::BufferDescriptor {
@@ -255,78 +350,146 @@ fn gpu_decompose_raw(base: &[f32], width: usize, height: usize) -> Option<Vec<Ve
         })
         .collect();
 
-    // Un compute pass por dispatch (frontera de pass = barrera de memoria entre
-    // pasadas → la escritura de blur_h en tmp es visible por blur_v). Todo en un
-    // solo encoder/submit.
-    let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("zas-blur-enc"),
-    });
-
-    // Mantener vivos los uniform buffers y bind groups hasta el submit.
-    let mut keep_ubuf: Vec<wgpu::Buffer> = Vec::new();
+    // Mantener vivos los bind groups hasta que todos los command buffers se
+    // hayan enviado. Los uniforms viven en una única arena dinámica.
     let mut keep_bg: Vec<wgpu::BindGroup> = Vec::new();
-
-    // Graba una pasada (blur_h o blur_v) src→dst con radio r y eje.
-    // Devuelve el bind group creado (se guarda vivo por el caller).
     let radii_all: Vec<[usize; 3]> = SIGMAS.iter().map(|&s| box_radii(s)).collect();
+    let uniform_slots = radii_all
+        .iter()
+        .map(|radii| radii.iter().filter(|&&r| r != 0).count() * 2)
+        .sum();
+    let mut uniforms = UniformArena::new(dev, uniform_slots, "zas-blur-uniform-arena")?;
 
-    for (si, radii) in radii_all.iter().enumerate() {
-        // blur_bufs[si] = copia de base, luego box-passes in-place vía tmp.
-        enc.copy_buffer_to_buffer(&base_buf, 0, &blur_bufs[si], 0, n4);
-        for &r in radii.iter() {
-            if r == 0 {
-                continue;
-            }
-            // blur_h: src = blur_bufs[si], dst = tmp
-            record_pass(
-                rt, &mut enc, bg, &blur_bufs[si], &tmp_buf, width, height, r, 0, &mut keep_ubuf,
-                &mut keep_bg,
-            );
-            // blur_v: src = tmp, dst = blur_bufs[si]
-            record_pass(
-                rt, &mut enc, bg, &tmp_buf, &blur_bufs[si], width, height, r, 1, &mut keep_ubuf,
-                &mut keep_bg,
-            );
-        }
-    }
-    rt.queue.submit(Some(enc.finish()));
+    // Staging existe desde el inicio para que la última command buffer incluya
+    // también las copias: compute + descarga requieren una sola secuencia de
+    // submits y una única sincronización map_async.
+    let planes_per_staging = (rt.max_buffer_size / n4).clamp(1, 6) as usize;
+    let staging_count = 6usize.div_ceil(planes_per_staging);
+    let staging: Vec<wgpu::Buffer> = (0..staging_count)
+        .map(|group| {
+            let planes = planes_per_staging.min(6 - group * planes_per_staging);
+            dev.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("zas-blur-staging"),
+                size: n4 * planes as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        })
+        .collect();
 
-    // PR-2.3: descargar las 6 blurs con UN solo encoder+submit+map (antes:
-    // 6 round-trips submit→map_async→wait SECUENCIALES sobre un staging
-    // reutilizado — 6 sincronizaciones CPU↔GPU en el lazo interactivo del
-    // editor, anulando parte de la ventaja de la GPU). Staging de 6·n4.
-    let staging = dev.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("zas-blur-staging"),
-        size: n4 * 6,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut blurs: Vec<Vec<f32>> = Vec::with_capacity(6);
-    {
-        let mut denc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("zas-blur-download"),
+    let sigmas_per_submit = wavelet_sigmas_per_submit(n, rt.backend == "Metal");
+    let sigma_indices: Vec<usize> = (0..SIGMAS.len()).collect();
+    let sigma_chunks: Vec<&[usize]> = sigma_indices.chunks(sigmas_per_submit).collect();
+    let mut command_buffers = Vec::with_capacity(sigma_chunks.len());
+    for (chunk_index, chunk) in sigma_chunks.iter().enumerate() {
+        let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("zas-blur-enc"),
         });
-        for (bi, buf) in blur_bufs.iter().enumerate() {
-            denc.copy_buffer_to_buffer(buf, 0, &staging, bi as u64 * n4, n4);
+        for &si in chunk.iter() {
+            let radii = &radii_all[si];
+            let mut emitted = false;
+            for &r in radii.iter().filter(|&&r| r != 0) {
+                // La copia base→salida era redundante: la primera horizontal
+                // puede leer base directamente y produce exactamente los mismos
+                // bits. Las siguientes iteraciones sí leen la salida anterior.
+                let src = if emitted { &blur_bufs[si] } else { &base_buf };
+                record_pass(
+                    dev,
+                    &mut enc,
+                    bg,
+                    src,
+                    &tmp_buf,
+                    width,
+                    height,
+                    r,
+                    0,
+                    &mut uniforms,
+                    &mut keep_bg,
+                );
+                record_pass(
+                    dev,
+                    &mut enc,
+                    bg,
+                    &tmp_buf,
+                    &blur_bufs[si],
+                    width,
+                    height,
+                    r,
+                    1,
+                    &mut uniforms,
+                    &mut keep_bg,
+                );
+                emitted = true;
+            }
+            if !emitted {
+                enc.copy_buffer_to_buffer(&base_buf, 0, &blur_bufs[si], 0, n4);
+            }
         }
-        rt.queue.submit(Some(denc.finish()));
-        let slice = staging.slice(..);
+        if chunk_index + 1 == sigma_chunks.len() {
+            for (bi, buf) in blur_bufs.iter().enumerate() {
+                let group = bi / planes_per_staging;
+                let local = bi % planes_per_staging;
+                enc.copy_buffer_to_buffer(buf, 0, &staging[group], local as u64 * n4, n4);
+            }
+        }
+        command_buffers.push(enc.finish());
+    }
+
+    uniforms.upload(&rt.queue);
+    for command_buffer in command_buffers {
+        rt.queue.submit(Some(command_buffer));
+    }
+
+    let slices: Vec<wgpu::BufferSlice<'_>> =
+        staging.iter().map(|buffer| buffer.slice(..)).collect();
+    let mut receivers = Vec::with_capacity(slices.len());
+    for slice in &slices {
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        if crate::gpu_stack::wait_for_readback(&dev, &rx, "readback wavelet").is_err() {
+        receivers.push(rx);
+    }
+    for rx in &receivers {
+        if crate::gpu_stack::wait_for_readback(&dev, rx, "readback wavelet").is_err() {
             return None;
         }
-        {
-            let data = slice.get_mapped_range();
-            let vals: &[f32] = bytemuck::cast_slice(&data);
-            let stride = (n4 / 4) as usize;
-            for bi in 0..6 {
-                blurs.push(vals[bi * stride..bi * stride + n].to_vec());
-            }
+    }
+
+    // Recombinar directamente desde el mapping. La versión anterior copiaba
+    // primero seis imágenes completas a Vec y luego volvía a recorrerlas para
+    // crear siete capas (pico de RAM y ancho de banda host casi duplicados).
+    let ls = {
+        let views: Vec<wgpu::BufferView<'_>> = slices
+            .iter()
+            .map(|slice| slice.get_mapped_range())
+            .collect();
+        let groups: Vec<&[f32]> = views
+            .iter()
+            .map(|view| bytemuck::cast_slice::<u8, f32>(view))
+            .collect();
+        let plane = |i: usize| {
+            let group = i / planes_per_staging;
+            let local = i % planes_per_staging;
+            &groups[group][local * n..(local + 1) * n]
+        };
+        let mut layers: Vec<Vec<f32>> = Vec::with_capacity(7);
+        layers.push(base.iter().zip(plane(0)).map(|(a, b)| a - b).collect());
+        for i in 0..5 {
+            layers.push(
+                plane(i)
+                    .iter()
+                    .zip(plane(i + 1))
+                    .map(|(a, b)| a - b)
+                    .collect(),
+            );
         }
-        staging.unmap();
+        layers.push(plane(5).to_vec());
+        layers
+    };
+    drop(slices);
+    for buffer in &staging {
+        buffer.unmap();
     }
 
     if crate::gpu_stack::take_gpu_error() {
@@ -337,31 +500,12 @@ fn gpu_decompose_raw(base: &[f32], width: usize, height: usize) -> Option<Vec<Ve
         return None;
     }
 
-    // Recombinar en las 7 capas (idéntico a la descomposición de CPU):
-    // ls[0] = base - blur[0]; ls[i] = blur[i-1] - blur[i] (1..=5); ls[6] = blur[5].
-    let mut ls: Vec<Vec<f32>> = Vec::with_capacity(7);
-    ls.push(
-        base.iter()
-            .zip(&blurs[0])
-            .map(|(a, b)| a - b)
-            .collect(),
-    );
-    for i in 0..5 {
-        ls.push(
-            blurs[i]
-                .iter()
-                .zip(&blurs[i + 1])
-                .map(|(a, b)| a - b)
-                .collect(),
-        );
-    }
-    ls.push(blurs[5].clone());
     Some(ls)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn record_pass(
-    rt: &crate::gpu_stack::GpuRuntime,
+    dev: &wgpu::Device,
     enc: &mut wgpu::CommandEncoder,
     bg: &BlurGpu,
     src: &wgpu::Buffer,
@@ -370,28 +514,16 @@ fn record_pass(
     height: usize,
     r: usize,
     axis: u32,
-    keep_ubuf: &mut Vec<wgpu::Buffer>,
+    uniforms: &mut UniformArena,
     keep_bg: &mut Vec<wgpu::BindGroup>,
 ) {
-    let dev = &rt.device;
     let params = BlurParams {
         w: width as u32,
         h: height as u32,
         r: r as u32,
         axis,
     };
-    let ubuf = dev.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("zas-blur-params"),
-        size: std::mem::size_of::<BlurParams>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    // El uniform se rellena por la cola ANTES del submit del compute (todas las
-    // escrituras de la cola preceden al submit siguiente).
-    keep_ubuf.push(ubuf);
-    let ubuf_ref = keep_ubuf.last().unwrap();
-    rt.queue
-        .write_buffer(ubuf_ref, 0, bytemuck::bytes_of(&params));
+    let uniform_offset = uniforms.push(&params);
 
     let bind = dev.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("zas-blur-bg"),
@@ -399,7 +531,11 @@ fn record_pass(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: ubuf_ref.as_entire_binding(),
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &uniforms.buffer,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(16),
+                }),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -421,7 +557,7 @@ fn record_pass(
         timestamp_writes: None,
     });
     pass.set_pipeline(&bg.pipeline);
-    pass.set_bind_group(0, bind_ref, &[]);
+    pass.set_bind_group(0, bind_ref, &[uniform_offset]);
     pass.dispatch_workgroups(groups, 1, 1);
 }
 
@@ -436,7 +572,9 @@ fn wavelet_parity_ok() -> bool {
         _ => {
             let ok = match wavelet_parity_rmse() {
                 Ok(rmse) => {
-                    eprintln!("[gpu_wavelet] paridad descomposición GPU-vs-CPU: RMSE {rmse:.5} ADU");
+                    eprintln!(
+                        "[gpu_wavelet] paridad descomposición GPU-vs-CPU: RMSE {rmse:.5} ADU"
+                    );
                     rmse <= WAVELET_PARITY_TOL
                 }
                 Err(e) => {
@@ -474,7 +612,13 @@ pub fn wavelet_parity_rmse() -> Result<f64, String> {
         .collect();
     cpu.push(base.iter().zip(&blurs[0]).map(|(a, b)| a - b).collect());
     for i in 0..5 {
-        cpu.push(blurs[i].iter().zip(&blurs[i + 1]).map(|(a, b)| a - b).collect());
+        cpu.push(
+            blurs[i]
+                .iter()
+                .zip(&blurs[i + 1])
+                .map(|(a, b)| a - b)
+                .collect(),
+        );
     }
     cpu.push(blurs[5].clone());
 
@@ -596,7 +740,7 @@ fn build_pipeline(
         visibility: wgpu::ShaderStages::COMPUTE,
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
+            has_dynamic_offset: true,
             min_binding_size: None,
         },
         count: None,
@@ -633,8 +777,7 @@ fn rl_gpu() -> Option<&'static RlGpu> {
     static R: OnceLock<Option<RlGpu>> = OnceLock::new();
     R.get_or_init(|| {
         let rt = gpu_runtime()?;
-        let (ratio_pipe, ratio_layout) =
-            build_pipeline(&rt.device, RATIO_WGSL, "zas-rl-ratio", 2)?;
+        let (ratio_pipe, ratio_layout) = build_pipeline(&rt.device, RATIO_WGSL, "zas-rl-ratio", 2)?;
         let (update_pipe, update_layout) =
             build_pipeline(&rt.device, UPDATE_WGSL, "zas-rl-update", 4)?;
         Some(RlGpu {
@@ -649,7 +792,7 @@ fn rl_gpu() -> Option<&'static RlGpu> {
 
 /// Graba un Gaussiano (3 box-pass con los radios Kuckir) src→out usando tmp.
 fn record_gaussian(
-    rt: &crate::gpu_stack::GpuRuntime,
+    dev: &wgpu::Device,
     enc: &mut wgpu::CommandEncoder,
     bg: &BlurGpu,
     src: &wgpu::Buffer,
@@ -658,17 +801,19 @@ fn record_gaussian(
     w: usize,
     h: usize,
     sigma: f32,
-    keep_ubuf: &mut Vec<wgpu::Buffer>,
+    uniforms: &mut UniformArena,
     keep_bg: &mut Vec<wgpu::BindGroup>,
 ) {
     let n4 = (w * h * 4) as u64;
-    enc.copy_buffer_to_buffer(src, 0, out, 0, n4);
-    for &r in box_radii(sigma).iter() {
-        if r == 0 {
-            continue;
-        }
-        record_pass(rt, enc, bg, out, tmp, w, h, r, 0, keep_ubuf, keep_bg);
-        record_pass(rt, enc, bg, tmp, out, w, h, r, 1, keep_ubuf, keep_bg);
+    let mut emitted = false;
+    for r in box_radii(sigma).into_iter().filter(|&r| r != 0) {
+        let input = if emitted { out } else { src };
+        record_pass(dev, enc, bg, input, tmp, w, h, r, 0, uniforms, keep_bg);
+        record_pass(dev, enc, bg, tmp, out, w, h, r, 1, uniforms, keep_bg);
+        emitted = true;
+    }
+    if !emitted {
+        enc.copy_buffer_to_buffer(src, 0, out, 0, n4);
     }
 }
 
@@ -676,30 +821,24 @@ fn record_gaussian(
 /// binding 1.. (los RO primero, el RW al final, como el layout).
 #[allow(clippy::too_many_arguments)]
 fn record_pointwise(
-    rt: &crate::gpu_stack::GpuRuntime,
+    dev: &wgpu::Device,
     enc: &mut wgpu::CommandEncoder,
     pipeline: &wgpu::ComputePipeline,
     layout: &wgpu::BindGroupLayout,
     uniform: [u32; 4],
     bufs: &[&wgpu::Buffer],
     n: usize,
-    keep_ubuf: &mut Vec<wgpu::Buffer>,
+    uniforms: &mut UniformArena,
     keep_bg: &mut Vec<wgpu::BindGroup>,
 ) {
-    let dev = &rt.device;
-    let ubuf = dev.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("zas-rl-params"),
-        size: 16,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    keep_ubuf.push(ubuf);
-    let ubuf_ref = keep_ubuf.last().unwrap();
-    rt.queue
-        .write_buffer(ubuf_ref, 0, bytemuck::cast_slice(&uniform));
+    let uniform_offset = uniforms.push(&uniform);
     let mut entries = vec![wgpu::BindGroupEntry {
         binding: 0,
-        resource: ubuf_ref.as_entire_binding(),
+        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: &uniforms.buffer,
+            offset: 0,
+            size: std::num::NonZeroU64::new(16),
+        }),
     }];
     for (i, b) in bufs.iter().enumerate() {
         entries.push(wgpu::BindGroupEntry {
@@ -720,7 +859,7 @@ fn record_pointwise(
         timestamp_writes: None,
     });
     pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, bind_ref, &[]);
+    pass.set_bind_group(0, bind_ref, &[uniform_offset]);
     pass.dispatch_workgroups(groups, 1, 1);
 }
 
@@ -738,8 +877,10 @@ pub fn gpu_richardson_lucy(
         return None;
     }
     let rt = gpu_runtime()?;
-    let needed = (width * height) as u64 * 4 * 7;
-    if needed > rt.vram_budget {
+    let n = width.saturating_mul(height);
+    let n4 = (n as u64).saturating_mul(4);
+    let needed = rl_vram_bytes(n);
+    if n4 > rt.max_binding || needed > rt.vram_budget {
         return None;
     }
     gpu_richardson_lucy_raw(input, original, width, height, iterations, sigma)
@@ -761,7 +902,7 @@ fn gpu_richardson_lucy_raw(
     let rl = rl_gpu()?;
     let dev = &rt.device;
     let n = width * height;
-    if n == 0 || input.len() != n || original.len() != n {
+    if n == 0 || n > u32::MAX as usize || input.len() != n || original.len() != n {
         return None;
     }
     let n4 = (n * 4) as u64;
@@ -787,58 +928,104 @@ fn gpu_richardson_lucy_raw(
     let blur_buf = mk("rl-blur");
     let ratio_buf = mk("rl-ratio");
 
-    rt.queue.write_buffer(&est_a, 0, bytemuck::cast_slice(input));
+    rt.queue
+        .write_buffer(&est_a, 0, bytemuck::cast_slice(input));
     rt.queue
         .write_buffer(&orig_buf, 0, bytemuck::cast_slice(original));
     rt.queue
         .write_buffer(&mask_buf, 0, bytemuck::cast_slice(&mask));
 
     dev.push_error_scope(wgpu::ErrorFilter::Validation);
-    let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("zas-rl-enc"),
-    });
-    let mut keep_ubuf: Vec<wgpu::Buffer> = Vec::new();
+    let uniforms_per_iteration = nonzero_box_radii(sigma).saturating_mul(4).saturating_add(2);
+    let uniform_slots = iterations.checked_mul(uniforms_per_iteration)?;
+    let mut uniforms = UniformArena::new(dev, uniform_slots, "zas-rl-uniform-arena")?;
     let mut keep_bg: Vec<wgpu::BindGroup> = Vec::new();
 
-    let (mut cur, mut next) = (&est_a, &est_b);
-    for _ in 0..iterations {
-        // blurred_est = gaussian(cur) → blur_buf
-        record_gaussian(
-            rt, &mut enc, bg, cur, &blur_buf, &tmp_buf, width, height, sigma, &mut keep_ubuf,
-            &mut keep_bg,
-        );
-        // ratio: (orig, blur_buf) → ratio_buf
-        record_pointwise(
-            rt, &mut enc, &rl.ratio_pipe, &rl.ratio_layout, [n as u32, 0, 0, 0],
-            &[&orig_buf, &blur_buf, &ratio_buf], n, &mut keep_ubuf, &mut keep_bg,
-        );
-        // blurred_ratio = gaussian(ratio_buf) → blur_buf
-        record_gaussian(
-            rt, &mut enc, bg, &ratio_buf, &blur_buf, &tmp_buf, width, height, sigma,
-            &mut keep_ubuf, &mut keep_bg,
-        );
-        // update (Jacobi): (cur, blur_buf, mask, orig) → next
-        record_pointwise(
-            rt, &mut enc, &rl.update_pipe, &rl.update_layout,
-            [width as u32, height as u32, n as u32, 0],
-            &[cur, &blur_buf, &mask_buf, &orig_buf, next], n, &mut keep_ubuf, &mut keep_bg,
-        );
-        std::mem::swap(&mut cur, &mut next);
-    }
-    rt.queue.submit(Some(enc.finish()));
-
-    // Descargar `cur` (tras el último swap contiene el estimado final).
+    // Descargar `cur` dentro de la última command buffer evita un submit
+    // adicional y conserva un solo map_async al final.
     let staging = dev.create_buffer(&wgpu::BufferDescriptor {
         label: Some("zas-rl-staging"),
         size: n4,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let mut denc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("zas-rl-download"),
-    });
-    denc.copy_buffer_to_buffer(cur, 0, &staging, 0, n4);
-    rt.queue.submit(Some(denc.finish()));
+
+    let (mut cur, mut next) = (&est_a, &est_b);
+    let iterations_per_submit =
+        rl_iterations_per_submit(n, sigma, rt.backend == "Metal", iterations);
+    let mut command_buffers = Vec::with_capacity(iterations.div_ceil(iterations_per_submit));
+    let mut done = 0usize;
+    while done < iterations {
+        let end = (done + iterations_per_submit).min(iterations);
+        let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("zas-rl-enc"),
+        });
+        for _ in done..end {
+            // blurred_est = gaussian(cur) → blur_buf
+            record_gaussian(
+                dev,
+                &mut enc,
+                bg,
+                cur,
+                &blur_buf,
+                &tmp_buf,
+                width,
+                height,
+                sigma,
+                &mut uniforms,
+                &mut keep_bg,
+            );
+            // ratio: (orig, blur_buf) → ratio_buf
+            record_pointwise(
+                dev,
+                &mut enc,
+                &rl.ratio_pipe,
+                &rl.ratio_layout,
+                [n as u32, 0, 0, 0],
+                &[&orig_buf, &blur_buf, &ratio_buf],
+                n,
+                &mut uniforms,
+                &mut keep_bg,
+            );
+            // blurred_ratio = gaussian(ratio_buf) → blur_buf
+            record_gaussian(
+                dev,
+                &mut enc,
+                bg,
+                &ratio_buf,
+                &blur_buf,
+                &tmp_buf,
+                width,
+                height,
+                sigma,
+                &mut uniforms,
+                &mut keep_bg,
+            );
+            // update (Jacobi): (cur, blur_buf, mask, orig) → next
+            record_pointwise(
+                dev,
+                &mut enc,
+                &rl.update_pipe,
+                &rl.update_layout,
+                [width as u32, height as u32, n as u32, 0],
+                &[cur, &blur_buf, &mask_buf, &orig_buf, next],
+                n,
+                &mut uniforms,
+                &mut keep_bg,
+            );
+            std::mem::swap(&mut cur, &mut next);
+        }
+        if end == iterations {
+            enc.copy_buffer_to_buffer(cur, 0, &staging, 0, n4);
+        }
+        command_buffers.push(enc.finish());
+        done = end;
+    }
+    uniforms.upload(&rt.queue);
+    for command_buffer in command_buffers {
+        rt.queue.submit(Some(command_buffer));
+    }
+
     let slice = staging.slice(0..n4);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -938,6 +1125,25 @@ pub fn rl_parity_rmse() -> Result<f64, String> {
 mod gpu_wavelet_tests {
     use super::*;
 
+    #[test]
+    fn memory_guards_include_transient_readback_buffers() {
+        let n = 4096usize * 3072;
+        assert_eq!(wavelet_vram_bytes(n), n as u64 * 4 * 14);
+        assert_eq!(rl_vram_bytes(n), n as u64 * 4 * 8);
+    }
+
+    #[test]
+    fn non_metal_command_buffers_are_bounded_by_kernel_work() {
+        assert_eq!(wavelet_sigmas_per_submit(1920 * 1080, false), 6);
+        assert_eq!(wavelet_sigmas_per_submit(3840 * 2160, false), 3);
+        assert_eq!(wavelet_sigmas_per_submit(7680 * 4320, false), 1);
+        assert_eq!(wavelet_sigmas_per_submit(7680 * 4320, true), 3);
+
+        assert_eq!(rl_iterations_per_submit(1920 * 1080, 2.0, false, 20), 4);
+        assert_eq!(rl_iterations_per_submit(3840 * 2160, 2.0, false, 20), 1);
+        assert_eq!(rl_iterations_per_submit(3840 * 2160, 2.0, true, 20), 5);
+    }
+
     /// Requiere GPU física (Metal/DX12/Vulkan). Correr con:
     ///   cargo test --bin astro-stacker gpu_wavelet_parity -- --ignored --nocapture
     #[test]
@@ -946,7 +1152,10 @@ mod gpu_wavelet_tests {
         match wavelet_parity_rmse() {
             Ok(rmse) => {
                 eprintln!("RMSE descomposición GPU vs CPU = {rmse:.6} ADU16");
-                assert!(rmse <= WAVELET_PARITY_TOL, "paridad wavelets GPU insuficiente: {rmse}");
+                assert!(
+                    rmse <= WAVELET_PARITY_TOL,
+                    "paridad wavelets GPU insuficiente: {rmse}"
+                );
             }
             Err(e) => panic!("no se pudo correr el self-test (¿sin GPU?): {e}"),
         }

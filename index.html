@@ -1539,6 +1539,7 @@
                                 <option value="classic" selected data-i18n="deepsky.method_classic">Clásico (κσ/Winsorized)</option>
                                 <option value="nebula_fusion" data-i18n="deepsky.method_nebula_fusion">NebulaFusion Lite (beta)</option>
                                 <option value="nebula_fusion_full" data-i18n="deepsky.method_nebula_fusion_full">NebulaFusion Full (beta)</option>
+                                <option value="nebula_fusion_struct" data-i18n="deepsky.method_nebula_fusion_struct">NebulaFusion Full + STRUCT (beta)</option>
                                 <option value="eidr" disabled data-i18n="deepsky.method_eidr">EIDR super-res (próximamente)</option>
                             </select>
                         </label>
@@ -2306,7 +2307,7 @@
                         <div id="trigger-target-category" class="custom-select-trigger" style="display:flex; justify-content:space-between; align-items:center; background:#0f172a; border:1px solid #334155; padding:8px 12px; border-radius:6px; cursor:pointer; color:#e2e8f0; transition:all 0.3s ease;">
                             <div style="display:flex; align-items:center; gap:8px;">
                                 <div class="custom-select-selected-icon"><svg class='zas-icon' style="color:#38bdf8;"><use href='#icon-moon'></use></svg></div>
-                                <span id="text-target-category" style="font-weight:600; font-size:0.8rem;" data-i18n="analysis.targets.surface">General (Planetas / Superficies)</span>
+                                <span id="text-target-category" style="font-weight:600; font-size:0.8rem;" data-i18n="analysis.targets.surface">Superficie solar / lunar</span>
                             </div>
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="cs-arrow" style="width:14px; height:14px; transition:transform 0.3s;"><polyline points="6 9 12 15 18 9"></polyline></svg>
                         </div>
@@ -2314,17 +2315,15 @@
                             <div class="custom-option selected" data-value="surface">
                                 <svg class='zas-icon cs-icon cs-global'><use href='#icon-moon'></use></svg>
                                 <div>
-                                    <span data-i18n="analysis.targets.surface" style="font-weight:600;">General (Planetas / Superficies)</span>
-                                    <span data-i18n="analysis.targets.surface_desc" style="display:block; font-size:0.65rem; color:#94a3b8; font-weight:normal; margin-top:2px;">Planetas, Luna, Sol y superficies — motor universal de apilado.</span>
+                                    <span data-i18n="analysis.targets.surface" style="font-weight:600;">Superficie solar / lunar</span>
+                                    <span data-i18n="analysis.targets.surface_desc" style="display:block; font-size:0.65rem; color:#94a3b8; font-weight:normal; margin-top:2px;">Primeros planos, mosaicos y discos solar/lunar dominados por textura.</span>
                                 </div>
                             </div>
-                            <!-- PARKED: categoría Planeta oculta — todo se enruta a Superficie
-                                 (ver normalizeZenithCategory en main.js). Quitar el display:none para reactivar. -->
-                            <div class="custom-option" data-value="planet_small" style="display:none !important;">
+                            <div class="custom-option" data-value="planet_small">
                                 <svg class='zas-icon cs-icon cs-v3' style="transform: scale(0.75);"><use href='#icon-planet'></use></svg>
                                 <div>
-                                    <span data-i18n="analysis.targets.planet_small" style="font-weight:600;">Planeta / Fase Lunar</span>
-                                    <span data-i18n="analysis.targets.planet_small_desc" style="display:block; font-size:0.65rem; color:#94a3b8; font-weight:normal; margin-top:2px;">AP local para planetas, lunas y detalles debiles.</span>
+                                    <span data-i18n="analysis.targets.planet_small" style="font-weight:600;">Disco planetario / fase lunar</span>
+                                    <span data-i18n="analysis.targets.planet_small_desc" style="display:block; font-size:0.65rem; color:#94a3b8; font-weight:normal; margin-top:2px;">Planeta completo, Luna completa o por fases, lunas y tránsitos.</span>
                                 </div>
                             </div>
                         </div>
@@ -2374,17 +2373,12 @@
                         style="font-size:0.8rem; color:#fff; font-weight:bold; margin-bottom:15px; word-break:break-all;">
                         -</div>
 
-                    <!--
-                    LEGACY INDIVIDUAL INPUT SETTINGS
-                    Hidden because Zenith Ultimate now derives analysis/batch mode from the target
-                    category and Bayer/color defaults stay automatic internally. The selected filename
-                    above remains visible.
                     <div id="video-input-settings"
                         style="margin-bottom: 20px; background: rgba(255,255,255,0.03); padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
                         <h4 style="font-size: 0.75rem; color: #fcd34d; margin-top: 0; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px;"
                             data-i18n="video_settings.title">Configuración de Entrada</h4>
 
-                        <div style="margin-bottom: 12px;">
+                        <div>
                             <label style="display: block; font-size: 0.7rem; color: #94a3b8; margin-bottom: 5px;"
                                 data-i18n="video_settings.bayer_pattern">Patrón Bayer (Override)</label>
                             <select id="sel-bayer-override"
@@ -2396,33 +2390,12 @@
                                 <option value="10">GBRG</option>
                                 <option value="11">BGGR</option>
                             </select>
-                        </div>
-
-                        <div>
-                            <label style="display: block; font-size: 0.7rem; color: #94a3b8; margin-bottom: 5px;"
-                                data-i18n="video_settings.color_space">Espacio de Color</label>
-                            <select id="sel-color-space-override"
-                                style="width: 100%; background: #0f172a; border: 1px solid #334155; color: #e2e8f0; font-size: 0.8rem; padding: 4px; border-radius: 4px;">
-                                <option value="linear" data-i18n="video_settings.linear">Lineal / RAW</option>
-                                <option value="srgb" data-i18n="video_settings.srgb">sRGB / Procesado</option>
-                            </select>
-                        </div>
-
-                        <div style="margin-top: 10px;">
-                            <label style="display: block; font-size: 0.7rem; color: #94a3b8; margin-bottom: 5px;"
-                                data-i18n="video_settings.analysis_mode">Modo de Analisis</label>
-                            <select id="sel-analysis-mode"
-                                style="width: 100%; background: #0f172a; border: 1px solid #334155; color: #e2e8f0; font-size: 0.8rem; padding: 4px; border-radius: 4px;">
-                                <option value="planet_v3" data-i18n="video_settings.planet_v3">Zenith Presicion Ultimate - Planetario</option>
-                                <option value="surface_v3" data-i18n="video_settings.surface_v3">Zenith Presicion Ultimate - Superficie</option>
-                                <option value="planet_v2" selected>Planetaria v2 (PPA)</option>
-                                <option value="surface_v2">Superficie v2 (Features)</option>
-                                <option value="planet_v1">Planetaria v1 (Legacy)</option>
-                                <option value="surface_v1">Superficie v1 (Legacy)</option>
-                            </select>
+                            <p id="bayer-override-hint"
+                                style="font-size:0.65rem; color:#94a3b8; line-height:1.35; margin:6px 0 0;">
+                                Solo para CFA/mono RAW (SER, AVI RAW o FITS). Automático es la opción segura.
+                            </p>
                         </div>
                     </div>
-                    -->
 
                     <!--
                     LEGACY INDIVIDUAL MANUAL ANCHOR
@@ -2548,10 +2521,8 @@
                     <label style="font-size:0.7rem; color:#aaa; margin-top:10px; display:block;" data-i18n="batch.target_category">Categoría del Objetivo (Motor Zenith)</label>
                     <select id="sel-batch-target-category"
                         style="background:#0f172a; color:white; border:1px solid #334155; padding:4px; border-radius:4px; width:100%; margin-top:2px; font-size:0.75rem;">
-                        <option value="surface" data-i18n="analysis.targets.surface">🌕 General (Planetas / Superficies)</option>
-                        <!-- PARKED: categoría Planeta oculta — todo se enruta a Superficie
-                             (ver normalizeZenithCategory en main.js). Quitar hidden para reactivar. -->
-                        <option value="planet_small" data-i18n="analysis.targets.planet_small" hidden>🔴 Planeta / Fase Lunar</option>
+                        <option value="surface" data-i18n="analysis.targets.surface">☀️ Superficie solar / lunar</option>
+                        <option value="planet_small" data-i18n="analysis.targets.planet_small">🔴 Disco planetario / fase lunar</option>
                     </select>
                 </div>
 
@@ -2940,7 +2911,8 @@
                             Colores (Auto-Balance)</span>
                         <label class="switch-container">
                             <span class="switch" style="transform:scale(0.8);">
-                                <input type="checkbox" id="chk-normalize-colors" checked>
+                                <input type="checkbox" id="chk-normalize-colors"
+                                    title="Opt-in: actívalo solo si deseas neutralizar el color de captura.">
                                 <span class="slider round"></span>
                             </span>
                         </label>
@@ -3484,13 +3456,6 @@
                     <button id="btn-gen-mosaic" class="success" style="flex:2;">🧩 Generar Mosaico</button>
                     <button id="btn-arrange-mosaic" class="primary" style="flex:1;">🖐 Organizar</button>
                 </div>
-                <div id="chk-mosaic-guided-wrapper" style="margin-top:8px; display:flex; align-items:center; gap:5px;">
-                    <input type="checkbox" id="chk-mosaic-guided" checked>
-                    <label for="chk-mosaic-guided" style="font-size:0.8rem; color:#cbd5e1; cursor:pointer;"
-                        title="Usa la posicion manual como ayuda si falla el automatico">Alineacion Asistida
-                        (Guiado)</label>
-                </div>
-
                 <div id="save-actions" style="margin-top:20px; display:flex; gap:10px;">
                     <button id="btn-save-png" class="success" style="flex:1;"><span
                             data-i18n="export.save_png">💾 Guardar PNG</span></button>

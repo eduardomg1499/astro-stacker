@@ -478,16 +478,36 @@ fn find_best_match_sad_rect(
     // evalúa dos veces (despreciable frente al ahorro).
     let abort_bound = if search_range > 0 {
         find_best_match_sad_rect_bounded(
-            ref_data, tgt_data, width, height, roi_x, roi_y, roi_w, roi_h, start_dx, start_dy,
-            0, u64::MAX,
+            ref_data,
+            tgt_data,
+            width,
+            height,
+            roi_x,
+            roi_y,
+            roi_w,
+            roi_h,
+            start_dx,
+            start_dy,
+            0,
+            u64::MAX,
         )
         .0
     } else {
         u64::MAX
     };
     find_best_match_sad_rect_bounded(
-        ref_data, tgt_data, width, height, roi_x, roi_y, roi_w, roi_h, start_dx, start_dy,
-        search_range, abort_bound,
+        ref_data,
+        tgt_data,
+        width,
+        height,
+        roi_x,
+        roi_y,
+        roi_w,
+        roi_h,
+        start_dx,
+        start_dy,
+        search_range,
+        abort_bound,
     )
 }
 
@@ -872,8 +892,7 @@ unsafe fn find_best_match_sad_rect_neon(
                     vec_acc_high = vaddw_u16(vec_acc_high, vget_high_u16(diff));
                     rx += 8;
                 }
-                let mut row_sad =
-                    vaddvq_u32(vec_acc_low) as u64 + vaddvq_u32(vec_acc_high) as u64;
+                let mut row_sad = vaddvq_u32(vec_acc_low) as u64 + vaddvq_u32(vec_acc_high) as u64;
 
                 while rx < roi_w {
                     let val_r = *r_ptr.add(rx) as i32;
@@ -1127,10 +1146,7 @@ pub fn refine_shift_lucas_kanade(
     let axi = ax as i32;
     let ayi = ay as i32;
     // Margen ±1 para el gradiente central del master.
-    if axi - half < 1
-        || ayi - half < 1
-        || axi + half >= w as i32 - 1
-        || ayi + half >= h as i32 - 1
+    if axi - half < 1 || ayi - half < 1 || axi + half >= w as i32 - 1 || ayi + half >= h as i32 - 1
     {
         return None;
     }
@@ -1295,117 +1311,117 @@ unsafe fn find_best_match_sad_avx2(
     // SEMILLA CENTRAL + EARLY-EXIT: ver find_best_match_sad_scalar (mismo
     // esquema exacto en las 3 variantes; el minimo verdadero nunca se poda).
     for phase in 0..2 {
-    for dy in -search_r..=search_r {
-        for dx in -search_r..=search_r {
-            if (phase == 0) != (dx == 0 && dy == 0) {
-                continue;
-            }
-            let y_start_t = (fy_est as i32) + dy - half_box;
-            let x_start_t = (fx_est as i32) + dx - half_box;
-            let y_start_r = (ay as i32) - half_box;
-            let x_start_r = (ax as i32) - half_box;
+        for dy in -search_r..=search_r {
+            for dx in -search_r..=search_r {
+                if (phase == 0) != (dx == 0 && dy == 0) {
+                    continue;
+                }
+                let y_start_t = (fy_est as i32) + dy - half_box;
+                let x_start_t = (fx_est as i32) + dx - half_box;
+                let y_start_r = (ay as i32) - half_box;
+                let x_start_r = (ax as i32) - half_box;
 
-            if y_start_t < 0
-                || y_start_t + (box_size as i32) > (h as i32)
-                || x_start_t < 0
-                || x_start_t + (box_size as i32) > (w as i32)
-                || y_start_r < 0
-                || y_start_r + (box_size as i32) > (h as i32)
-                || x_start_r < 0
-                || x_start_r + (box_size as i32) > (w as i32)
-            {
-                continue;
-            }
-
-            let mut vec_acc = _mm256_setzero_si256();
-            let mut acc_64_lo = _mm256_setzero_si256();
-            let mut acc_64_hi = _mm256_setzero_si256();
-            let mut scalar_sad = 0u64;
-            let mut pruned = false;
-
-            let row_r_base = (y_start_r as usize) * w + (x_start_r as usize);
-            let row_t_base = (y_start_t as usize) * w + (x_start_t as usize);
-
-            let p_ref = ref_edges.as_ptr().add(row_r_base);
-            let p_tgt = tgt_edges.as_ptr().add(row_t_base);
-
-            // OPT 12: Loop Unrolling & Direct Pointer Arithmetic
-            for i in 0..box_size {
-                let r_ptr = p_ref.add(i * w);
-                let t_ptr = p_tgt.add(i * w);
-                let mut rx = 0;
-
-                while rx + 16 <= box_size {
-                    let va = _mm256_loadu_si256(r_ptr.add(rx) as *const _);
-                    let vb = _mm256_loadu_si256(t_ptr.add(rx) as *const _);
-
-                    // Absolute difference of epu16
-                    let vmin = _mm256_min_epu16(va, vb);
-                    let vmax = _mm256_max_epu16(va, vb);
-                    let diff = _mm256_sub_epi16(vmax, vmin);
-
-                    // Unpack to 32-bit and add to vec_acc
-                    let lo = _mm256_unpacklo_epi16(diff, v_zero);
-                    let hi = _mm256_unpackhi_epi16(diff, v_zero);
-                    vec_acc = _mm256_add_epi32(vec_acc, lo);
-                    vec_acc = _mm256_add_epi32(vec_acc, hi);
-                    rx += 16;
+                if y_start_t < 0
+                    || y_start_t + (box_size as i32) > (h as i32)
+                    || x_start_t < 0
+                    || x_start_t + (box_size as i32) > (w as i32)
+                    || y_start_r < 0
+                    || y_start_r + (box_size as i32) > (h as i32)
+                    || x_start_r < 0
+                    || x_start_r + (box_size as i32) > (w as i32)
+                {
+                    continue;
                 }
 
-                while rx < box_size {
-                    let val_r = *r_ptr.add(rx) as i32;
-                    let val_t = *t_ptr.add(rx) as i32;
-                    scalar_sad += (val_r - val_t).abs() as u64;
-                    rx += 1;
-                }
+                let mut vec_acc = _mm256_setzero_si256();
+                let mut acc_64_lo = _mm256_setzero_si256();
+                let mut acc_64_hi = _mm256_setzero_si256();
+                let mut scalar_sad = 0u64;
+                let mut pruned = false;
 
-                // EARLY-EXIT cada 8 filas: reduccion parcial no destructiva —
-                // si el parcial ya alcanza la cota, este candidato no puede
-                // ganar (terminos no-negativos) y se abandona.
-                if (i & 7) == 7 && best_sad != u64::MAX {
-                    let mut lanes = [0u32; 8];
-                    _mm256_storeu_si256(lanes.as_mut_ptr() as *mut _, vec_acc);
-                    let partial: u64 =
-                        lanes.iter().map(|&v| v as u64).sum::<u64>() + scalar_sad;
-                    if partial >= best_sad {
-                        pruned = true;
-                        break;
+                let row_r_base = (y_start_r as usize) * w + (x_start_r as usize);
+                let row_t_base = (y_start_t as usize) * w + (x_start_t as usize);
+
+                let p_ref = ref_edges.as_ptr().add(row_r_base);
+                let p_tgt = tgt_edges.as_ptr().add(row_t_base);
+
+                // OPT 12: Loop Unrolling & Direct Pointer Arithmetic
+                for i in 0..box_size {
+                    let r_ptr = p_ref.add(i * w);
+                    let t_ptr = p_tgt.add(i * w);
+                    let mut rx = 0;
+
+                    while rx + 16 <= box_size {
+                        let va = _mm256_loadu_si256(r_ptr.add(rx) as *const _);
+                        let vb = _mm256_loadu_si256(t_ptr.add(rx) as *const _);
+
+                        // Absolute difference of epu16
+                        let vmin = _mm256_min_epu16(va, vb);
+                        let vmax = _mm256_max_epu16(va, vb);
+                        let diff = _mm256_sub_epi16(vmax, vmin);
+
+                        // Unpack to 32-bit and add to vec_acc
+                        let lo = _mm256_unpacklo_epi16(diff, v_zero);
+                        let hi = _mm256_unpackhi_epi16(diff, v_zero);
+                        vec_acc = _mm256_add_epi32(vec_acc, lo);
+                        vec_acc = _mm256_add_epi32(vec_acc, hi);
+                        rx += 16;
+                    }
+
+                    while rx < box_size {
+                        let val_r = *r_ptr.add(rx) as i32;
+                        let val_t = *t_ptr.add(rx) as i32;
+                        scalar_sad += (val_r - val_t).abs() as u64;
+                        rx += 1;
+                    }
+
+                    // EARLY-EXIT cada 8 filas: reduccion parcial no destructiva —
+                    // si el parcial ya alcanza la cota, este candidato no puede
+                    // ganar (terminos no-negativos) y se abandona.
+                    if (i & 7) == 7 && best_sad != u64::MAX {
+                        let mut lanes = [0u32; 8];
+                        _mm256_storeu_si256(lanes.as_mut_ptr() as *mut _, vec_acc);
+                        let partial: u64 =
+                            lanes.iter().map(|&v| v as u64).sum::<u64>() + scalar_sad;
+                        if partial >= best_sad {
+                            pruned = true;
+                            break;
+                        }
                     }
                 }
-            }
-            if pruned {
-                continue;
-            }
+                if pruned {
+                    continue;
+                }
 
-            // Move periodic flush OUTSIDE the inner `for i` loop block
-            // An accumulation of 32-bit SAD for 16x pixels maxes out at 16 * 65535 = 1,048,560.
-            // A 32-bit int maxes at 2.14B. So we are COMPLETELY safe accumulating the whole AP box
-            // inside 32-bit `vec_acc` without overflowing before doing a single flush at the end!
-            let v_lo = _mm256_unpacklo_epi32(vec_acc, v_zero);
-            let v_hi = _mm256_unpackhi_epi32(vec_acc, v_zero);
-            acc_64_lo = _mm256_add_epi64(acc_64_lo, v_lo);
-            acc_64_hi = _mm256_add_epi64(acc_64_hi, v_hi);
+                // Move periodic flush OUTSIDE the inner `for i` loop block
+                // An accumulation of 32-bit SAD for 16x pixels maxes out at 16 * 65535 = 1,048,560.
+                // A 32-bit int maxes at 2.14B. So we are COMPLETELY safe accumulating the whole AP box
+                // inside 32-bit `vec_acc` without overflowing before doing a single flush at the end!
+                let v_lo = _mm256_unpacklo_epi32(vec_acc, v_zero);
+                let v_hi = _mm256_unpackhi_epi32(vec_acc, v_zero);
+                acc_64_lo = _mm256_add_epi64(acc_64_lo, v_lo);
+                acc_64_hi = _mm256_add_epi64(acc_64_hi, v_hi);
 
-            // Final Reduction
-            let mut lanes_lo = [0i64; 4];
-            let mut lanes_hi = [0i64; 4];
-            _mm256_storeu_si256(lanes_lo.as_mut_ptr() as *mut _, acc_64_lo);
-            _mm256_storeu_si256(lanes_hi.as_mut_ptr() as *mut _, acc_64_hi);
+                // Final Reduction
+                let mut lanes_lo = [0i64; 4];
+                let mut lanes_hi = [0i64; 4];
+                _mm256_storeu_si256(lanes_lo.as_mut_ptr() as *mut _, acc_64_lo);
+                _mm256_storeu_si256(lanes_hi.as_mut_ptr() as *mut _, acc_64_hi);
 
-            let mut simd_sum = 0u64;
-            for j in 0..4 {
-                simd_sum += lanes_lo[j] as u64 + lanes_hi[j] as u64;
-            }
+                let mut simd_sum = 0u64;
+                for j in 0..4 {
+                    simd_sum += lanes_lo[j] as u64 + lanes_hi[j] as u64;
+                }
 
-            let total_sad = simd_sum + scalar_sad;
+                let total_sad = simd_sum + scalar_sad;
 
-            if total_sad < best_sad {
-                best_sad = total_sad;
-                best_dx = dx as i32;
-                best_dy = dy as i32;
+                if total_sad < best_sad {
+                    best_sad = total_sad;
+                    best_dx = dx as i32;
+                    best_dy = dy as i32;
+                }
             }
         }
-    }
     } // end phase loop
     (best_dx as f32, best_dy as f32, best_sad)
 }
@@ -1433,97 +1449,97 @@ unsafe fn find_best_match_sad_neon(
     // SEMILLA CENTRAL + EARLY-EXIT: ver find_best_match_sad_scalar (mismo
     // esquema exacto en las 3 variantes; el minimo verdadero nunca se poda).
     for phase in 0..2 {
-    for dy in -search_r..=search_r {
-        for dx in -search_r..=search_r {
-            if (phase == 0) != (dx == 0 && dy == 0) {
-                continue;
-            }
-            let y_start_t = (fy_est as i32) + dy - half_box;
-            let x_start_t = (fx_est as i32) + dx - half_box;
-            let y_start_r = (ay as i32) - half_box;
-            let x_start_r = (ax as i32) - half_box;
+        for dy in -search_r..=search_r {
+            for dx in -search_r..=search_r {
+                if (phase == 0) != (dx == 0 && dy == 0) {
+                    continue;
+                }
+                let y_start_t = (fy_est as i32) + dy - half_box;
+                let x_start_t = (fx_est as i32) + dx - half_box;
+                let y_start_r = (ay as i32) - half_box;
+                let x_start_r = (ax as i32) - half_box;
 
-            if y_start_t < 0
-                || y_start_t + (box_size as i32) > (h as i32)
-                || x_start_t < 0
-                || x_start_t + (box_size as i32) > (w as i32)
-                || y_start_r < 0
-                || y_start_r + (box_size as i32) > (h as i32)
-                || x_start_r < 0
-                || x_start_r + (box_size as i32) > (w as i32)
-            {
-                continue;
-            }
-
-            let mut vec_acc_low = vdupq_n_u32(0);
-            let mut vec_acc_high = vdupq_n_u32(0);
-            let mut acc_64_low = vdupq_n_u64(0);
-            let mut acc_64_high = vdupq_n_u64(0);
-            let mut scalar_sad = 0u64;
-            let mut pruned = false;
-
-            let row_r_base = (y_start_r as usize) * w + (x_start_r as usize);
-            let row_t_base = (y_start_t as usize) * w + (x_start_t as usize);
-
-            let p_ref = ref_edges.as_ptr().add(row_r_base);
-            let p_tgt = tgt_edges.as_ptr().add(row_t_base);
-
-            for i in 0..box_size {
-                let r_ptr = p_ref.add(i * w);
-                let t_ptr = p_tgt.add(i * w);
-                let mut rx = 0;
-
-                while rx + 8 <= box_size {
-                    let va = vld1q_u16(r_ptr.add(rx));
-                    let vb = vld1q_u16(t_ptr.add(rx));
-                    let diff = vabdq_u16(va, vb);
-                    vec_acc_low = vaddw_u16(vec_acc_low, vget_low_u16(diff));
-                    vec_acc_high = vaddw_u16(vec_acc_high, vget_high_u16(diff));
-                    rx += 8;
+                if y_start_t < 0
+                    || y_start_t + (box_size as i32) > (h as i32)
+                    || x_start_t < 0
+                    || x_start_t + (box_size as i32) > (w as i32)
+                    || y_start_r < 0
+                    || y_start_r + (box_size as i32) > (h as i32)
+                    || x_start_r < 0
+                    || x_start_r + (box_size as i32) > (w as i32)
+                {
+                    continue;
                 }
 
-                while rx < box_size {
-                    let val_r = *r_ptr.add(rx) as i32;
-                    let val_t = *t_ptr.add(rx) as i32;
-                    scalar_sad += (val_r - val_t).abs() as u64;
-                    rx += 1;
-                }
+                let mut vec_acc_low = vdupq_n_u32(0);
+                let mut vec_acc_high = vdupq_n_u32(0);
+                let mut acc_64_low = vdupq_n_u64(0);
+                let mut acc_64_high = vdupq_n_u64(0);
+                let mut scalar_sad = 0u64;
+                let mut pruned = false;
 
-                // EARLY-EXIT cada 8 filas (reduccion parcial no destructiva).
-                if (i & 7) == 7 && best_sad != u64::MAX {
-                    let partial = vaddvq_u32(vec_acc_low) as u64
-                        + vaddvq_u32(vec_acc_high) as u64
-                        + scalar_sad;
-                    if partial >= best_sad {
-                        pruned = true;
-                        break;
+                let row_r_base = (y_start_r as usize) * w + (x_start_r as usize);
+                let row_t_base = (y_start_t as usize) * w + (x_start_t as usize);
+
+                let p_ref = ref_edges.as_ptr().add(row_r_base);
+                let p_tgt = tgt_edges.as_ptr().add(row_t_base);
+
+                for i in 0..box_size {
+                    let r_ptr = p_ref.add(i * w);
+                    let t_ptr = p_tgt.add(i * w);
+                    let mut rx = 0;
+
+                    while rx + 8 <= box_size {
+                        let va = vld1q_u16(r_ptr.add(rx));
+                        let vb = vld1q_u16(t_ptr.add(rx));
+                        let diff = vabdq_u16(va, vb);
+                        vec_acc_low = vaddw_u16(vec_acc_low, vget_low_u16(diff));
+                        vec_acc_high = vaddw_u16(vec_acc_high, vget_high_u16(diff));
+                        rx += 8;
+                    }
+
+                    while rx < box_size {
+                        let val_r = *r_ptr.add(rx) as i32;
+                        let val_t = *t_ptr.add(rx) as i32;
+                        scalar_sad += (val_r - val_t).abs() as u64;
+                        rx += 1;
+                    }
+
+                    // EARLY-EXIT cada 8 filas (reduccion parcial no destructiva).
+                    if (i & 7) == 7 && best_sad != u64::MAX {
+                        let partial = vaddvq_u32(vec_acc_low) as u64
+                            + vaddvq_u32(vec_acc_high) as u64
+                            + scalar_sad;
+                        if partial >= best_sad {
+                            pruned = true;
+                            break;
+                        }
                     }
                 }
-            }
-            if pruned {
-                continue;
-            }
+                if pruned {
+                    continue;
+                }
 
-            acc_64_low = vaddq_u64(acc_64_low, vmovl_u32(vget_low_u32(vec_acc_low)));
-            acc_64_low = vaddq_u64(acc_64_low, vmovl_u32(vget_high_u32(vec_acc_low)));
-            acc_64_high = vaddq_u64(acc_64_high, vmovl_u32(vget_low_u32(vec_acc_high)));
-            acc_64_high = vaddq_u64(acc_64_high, vmovl_u32(vget_high_u32(vec_acc_high)));
+                acc_64_low = vaddq_u64(acc_64_low, vmovl_u32(vget_low_u32(vec_acc_low)));
+                acc_64_low = vaddq_u64(acc_64_low, vmovl_u32(vget_high_u32(vec_acc_low)));
+                acc_64_high = vaddq_u64(acc_64_high, vmovl_u32(vget_low_u32(vec_acc_high)));
+                acc_64_high = vaddq_u64(acc_64_high, vmovl_u32(vget_high_u32(vec_acc_high)));
 
-            let mut lanes_low = [0u64; 2];
-            let mut lanes_high = [0u64; 2];
-            vst1q_u64(lanes_low.as_mut_ptr(), acc_64_low);
-            vst1q_u64(lanes_high.as_mut_ptr(), acc_64_high);
+                let mut lanes_low = [0u64; 2];
+                let mut lanes_high = [0u64; 2];
+                vst1q_u64(lanes_low.as_mut_ptr(), acc_64_low);
+                vst1q_u64(lanes_high.as_mut_ptr(), acc_64_high);
 
-            let simd_sum = lanes_low[0] + lanes_low[1] + lanes_high[0] + lanes_high[1];
-            let total_sad = simd_sum + scalar_sad;
+                let simd_sum = lanes_low[0] + lanes_low[1] + lanes_high[0] + lanes_high[1];
+                let total_sad = simd_sum + scalar_sad;
 
-            if total_sad < best_sad {
-                best_sad = total_sad;
-                best_dx = dx as i32;
-                best_dy = dy as i32;
+                if total_sad < best_sad {
+                    best_sad = total_sad;
+                    best_dx = dx as i32;
+                    best_dy = dy as i32;
+                }
             }
         }
-    }
     } // end phase loop
     (best_dx as f32, best_dy as f32, best_sad)
 }
@@ -1672,18 +1688,7 @@ pub fn find_best_match_sad_pyramid_fast(
     );
 
     refine_best_match_sad_from_coarse(
-        ref_edges,
-        tgt_edges,
-        w,
-        h,
-        ax,
-        ay,
-        fx_est,
-        fy_est,
-        box_size,
-        cdx,
-        cdy,
-        4.0,
+        ref_edges, tgt_edges, w, h, ax, ay, fx_est, fy_est, box_size, cdx, cdy, 4.0,
     )
 }
 
@@ -2052,9 +2057,8 @@ mod tests {
                     for ry in 0..roi_h {
                         for rx in 0..roi_w {
                             let a = ref_data[(roi_y + ry) * width + roi_x + rx] as i64;
-                            let b = tgt_data
-                                [(t_y as usize + ry) * width + t_x as usize + rx]
-                                as i64;
+                            let b =
+                                tgt_data[(t_y as usize + ry) * width + t_x as usize + rx] as i64;
                             sad += (a - b).unsigned_abs();
                         }
                     }
@@ -2079,24 +2083,24 @@ mod tests {
         let constant = vec![777u16; w * h];
 
         let cases: &[(usize, usize, usize, usize, isize, isize, isize)] = &[
-            (40, 30, 21, 17, 0, 0, 6),  // cola escalar en ambas rutas SIMD
-            (32, 24, 32, 24, 0, 0, 5),  // alineado a 16
-            (8, 40, 33, 9, 2, -3, 4),   // arranque descentrado
-            (48, 8, 5, 60, 0, 0, 7),    // candidatos descartados por borde
+            (40, 30, 21, 17, 0, 0, 6), // cola escalar en ambas rutas SIMD
+            (32, 24, 32, 24, 0, 0, 5), // alineado a 16
+            (8, 40, 33, 9, 2, -3, 4),  // arranque descentrado
+            (48, 8, 5, 60, 0, 0, 7),   // candidatos descartados por borde
         ];
         for &(rx0, ry0, rw, rh, sdx, sdy, sr) in cases {
-            let got = find_best_match_sad_rect(
-                &reference, &target, w, h, rx0, ry0, rw, rh, sdx, sdy, sr,
-            );
-            let want = exhaustive(
-                &reference, &target, w, h, rx0, ry0, rw, rh, sdx, sdy, sr,
-            );
+            let got =
+                find_best_match_sad_rect(&reference, &target, w, h, rx0, ry0, rw, rh, sdx, sdy, sr);
+            let want = exhaustive(&reference, &target, w, h, rx0, ry0, rw, rh, sdx, sdy, sr);
             assert_eq!(got, want, "caso roi=({rx0},{ry0},{rw},{rh}) sr={sr}");
         }
         // Empates totales: imagen constante — debe ganar el PRIMER candidato.
         let got = find_best_match_sad_rect(&constant, &constant, w, h, 30, 30, 24, 20, 0, 0, 5);
         let want = exhaustive(&constant, &constant, w, h, 30, 30, 24, 20, 0, 0, 5);
-        assert_eq!(got, want, "empates: la poda debe preservar el primer candidato");
+        assert_eq!(
+            got, want,
+            "empates: la poda debe preservar el primer candidato"
+        );
         assert_eq!(got.0, 0);
         assert_eq!((got.1, got.2), (-5, -5));
     }
@@ -2143,8 +2147,7 @@ mod tests {
         let w = 96usize;
         let h = 96usize;
         let pat = |x: f32, y: f32| -> u16 {
-            let v = (x * 0.35).sin() * (y * 0.27).cos()
-                + (x * 0.11).cos() * (y * 0.17).sin() * 0.7;
+            let v = (x * 0.35).sin() * (y * 0.27).cos() + (x * 0.11).cos() * (y * 0.17).sin() * 0.7;
             (12000.0 + 6000.0 * v) as u16
         };
         let (tdx, tdy) = (0.33f32, -0.21f32);
@@ -2158,9 +2161,8 @@ mod tests {
             }
         }
 
-        let refined =
-            refine_shift_lucas_kanade(&master, &target, w, h, 48, 48, 0.0, 0.0, 32, 3)
-                .expect("patch con textura 2-D debe refinar");
+        let refined = refine_shift_lucas_kanade(&master, &target, w, h, 48, 48, 0.0, 0.0, 32, 3)
+            .expect("patch con textura 2-D debe refinar");
         assert!(
             (refined.0 - tdx).abs() < 0.05,
             "dx: esperado {tdx}, obtenido {}",
@@ -2175,9 +2177,7 @@ mod tests {
         // Patch plano: sin textura no hay sistema (Hessiano singular) — debe
         // devolver None para que el caller conserve el estimado SAD.
         let flat = vec![500u16; w * h];
-        assert!(
-            refine_shift_lucas_kanade(&flat, &flat, w, h, 48, 48, 0.0, 0.0, 32, 3).is_none()
-        );
+        assert!(refine_shift_lucas_kanade(&flat, &flat, w, h, 48, 48, 0.0, 0.0, 32, 3).is_none());
     }
 
     #[test]

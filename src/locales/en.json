@@ -462,12 +462,12 @@
     "mode_label": "Quality / Analysis Type",
     "targets": {
       "title": "Target Category",
-      "surface": "General (Planets / Surfaces)",
-      "surface_desc": "Planets, Moon, Sun and surfaces — universal stacking engine.",
-      "planet_large": "Planet / Lunar Phase",
-      "planet_large_desc": "Legacy alias for the universal planetary flow.",
-      "planet_small": "Planet / Lunar Phase",
-      "planet_small_desc": "Jupiter, Saturn, Mars, Venus, moons, and transits with local APs."
+      "surface": "Solar / lunar surface",
+      "surface_desc": "Close-ups, mosaics, and texture-dominated solar or lunar discs.",
+      "planet_large": "Planetary disc / lunar phase",
+      "planet_large_desc": "Large disc with adaptive local registration.",
+      "planet_small": "Planetary disc / lunar phase",
+      "planet_small_desc": "Whole planets, full or phased Moon, moons, and transits."
     },
     "modes": {
       "zenith_ultimate": "Zenith Presicion Ultimate",
@@ -1016,6 +1016,9 @@
     "method_classic": "Classic (κσ/Winsorized)",
     "method_nebula_fusion": "NebulaFusion Lite (beta)",
     "method_nebula_fusion_full": "NebulaFusion Full (beta)",
+    "method_nebula_fusion_struct": "NebulaFusion Full + STRUCT (beta)",
+    "view_struct": "STRUCT",
+    "view_struct_residual": "STRUCT residual",
     "method_eidr": "EIDR super-res (coming soon)",
     "method_hint_nf": "NebulaFusion: noise-weighted mean per frame + frozen rejection masks + VAR/NEFF/DQ scientific maps alongside the master.",
     "cfa_direct_label": "Direct CFA mode (no debayer)",

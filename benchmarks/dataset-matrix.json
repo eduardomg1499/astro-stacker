@@ -1,29 +1,121 @@
 {
-  "schemaVersion": "zenith-dataset-matrix-v1",
+  "schemaVersion": "zenith-dataset-matrix-v3",
+  "claimPolicy": {
+    "ownCpu": {
+      "overallMedianMinSpeedup": 2.0,
+      "planetaryCompressedMedianMinSpeedup": 2.0,
+      "planetarySerMedianMinSpeedup": 1.5
+    },
+    "competitor": {
+      "minimumSpeedRatioPerDataset": 1.05,
+      "requireEveryRun": true
+    },
+    "quality": {
+      "maxFwhmRegressionPercent": 3.0,
+      "maxNoiseRegressionPercent": 3.0,
+      "maxFluxErrorPercent": 3.0,
+      "maxNormalizedRmse": 0.03,
+      "maxScaleErrorPercent": 3.0,
+      "maxNormalizedOffset": 0.03,
+      "maxRegistrationResidualPx": 0.5,
+      "maxRegistrationCorrectionPx": 1.0,
+      "minCorrelation": 0.8
+    },
+    "qualitySuperiority": {
+      "minimumObjectiveWinsPerDataset": 1,
+      "maximumObjectiveLossesPerDataset": 0,
+      "requireIndependentReference": true
+    },
+    "evidence": {
+      "sha256Required": true,
+      "acceptanceEvidenceRequired": true,
+      "automatedEvaluatorRequired": true
+    }
+  },
   "requiredScenarios": [
     {
       "id": "planetary-ser-mono-surface",
       "domain": "planetary",
       "requiredTags": ["ser", "mono", "surface"],
-      "acceptance": ["analysis", "registration", "integration", "export", "cold-cache", "warm-cache"]
+      "acceptance": ["analysis", "registration", "integration", "export", "cold-cache", "warm-cache", "analysis-cache-a10", "read-only-cache-fallback", "atomic-analysis-publication", "quality-superiority"]
     },
     {
       "id": "planetary-ser-bayer-small-planet",
       "domain": "planetary",
       "requiredTags": ["ser", "bayer", "small-planet"],
-      "acceptance": ["cfa", "cog", "sad", "ap-quality", "cpu-gpu-parity"]
+      "acceptance": ["cfa", "cog", "sad", "ap-quality", "cpu-gpu-parity", "atomic-derotation-publication", "animation-all-or-nothing", "supersession-rollback", "quality-superiority"]
     },
     {
       "id": "planetary-ffmpeg-h264-surface",
       "domain": "planetary",
       "requiredTags": ["ffmpeg", "h264", "surface"],
-      "acceptance": ["cpu-decode-probe", "hardware-decode-confirmation", "fallback"]
+      "acceptance": ["cpu-decode-probe", "hardware-decode-confirmation", "fallback", "route-isolated-cache", "attempt-atomic-cache", "cold-cache", "warm-cache", "quality-superiority"]
     },
     {
       "id": "planetary-ffmpeg-hevc-small-planet",
       "domain": "planetary",
       "requiredTags": ["ffmpeg", "hevc", "small-planet"],
-      "acceptance": ["cpu-decode-probe", "hardware-decode-confirmation", "fallback"]
+      "acceptance": ["cpu-decode-probe", "hardware-decode-confirmation", "fallback", "route-isolated-cache", "attempt-atomic-cache", "cold-cache", "warm-cache", "quality-superiority"]
+    },
+    {
+      "id": "planetary-ser-mono-solar-halpha",
+      "domain": "planetary",
+      "requiredTags": ["ser", "mono16", "solar", "halpha", "prominence"],
+      "acceptance": ["limb", "surface-detail", "dynamic-range", "ringing", "cpu-gpu-parity", "quality-superiority"]
+    },
+    {
+      "id": "planetary-ser-mono-full-moon",
+      "domain": "planetary",
+      "requiredTags": ["ser", "mono16", "full-moon", "large-disc"],
+      "acceptance": ["large-disc-routing", "ap-seams", "limb", "drizzle", "memory", "quality-superiority"]
+    },
+    {
+      "id": "planetary-ser-bayer-lunar-phase",
+      "domain": "planetary",
+      "requiredTags": ["ser", "bayer", "lunar-phase", "terminator"],
+      "acceptance": ["cfa", "terminator", "subpixel", "color-fidelity", "wysiwyg", "quality-superiority"]
+    },
+    {
+      "id": "planetary-ser-bayer-saturn-rings",
+      "domain": "planetary",
+      "requiredTags": ["ser", "bayer", "saturn", "rings", "small-planet"],
+      "acceptance": ["cog", "ap-quality", "ringing", "channel-alignment", "drizzle", "quality-superiority"]
+    },
+    {
+      "id": "planetary-ser-raw-format-matrix",
+      "domain": "planetary",
+      "requiredTags": ["ser", "mono", "rggb", "grbg", "gbrg", "bggr", "8bit", "10bit", "12bit", "14bit", "16bit", "big-endian", "little-endian", "timestamps", "truncated"],
+      "acceptance": ["exact-samples", "exact-indices", "metadata", "safe-truncation", "explicit-unsupported-cfa", "quality-superiority"]
+    },
+    {
+      "id": "planetary-avi-rgb-mono",
+      "domain": "planetary",
+      "requiredTags": ["avi", "rgb24", "bottom-up", "y800", "y16"],
+      "acceptance": ["orientation", "channel-order", "sample-depth", "exact-frame-count", "fallback", "quality-superiority"]
+    },
+    {
+      "id": "planetary-mov-prores10-vfr",
+      "domain": "planetary",
+      "requiredTags": ["mov", "prores", "10bit", "vfr", "rotation", "color-metadata"],
+      "acceptance": ["exact-indices", "range", "matrix", "transfer", "rotation", "cold-cache", "warm-cache", "route-isolated-cache", "attempt-atomic-cache", "quality-superiority"]
+    },
+    {
+      "id": "planetary-mp4-h264-vfr-bframes",
+      "domain": "planetary",
+      "requiredTags": ["mp4", "h264", "vfr", "bframes", "limited-range"],
+      "acceptance": ["exact-indices", "decoder-exit", "partial-decode-rejected", "color-range", "fallback", "route-isolated-cache", "attempt-atomic-cache", "quality-superiority"]
+    },
+    {
+      "id": "planetary-lunar-mosaic-four-panel",
+      "domain": "planetary",
+      "requiredTags": ["lunar", "mosaic", "four-panel", "gain-delta", "subpixel"],
+      "acceptance": ["zero-lost-panels", "seam-adu", "global-placement", "bounded-memory", "preview", "atomic-publication", "masters-only", "quality-superiority"]
+    },
+    {
+      "id": "planetary-batch-mixed-codecs",
+      "domain": "planetary",
+      "requiredTags": ["batch", "ser", "avi", "mp4", "mov", "mixed-resolution"],
+      "acceptance": ["collision-free-output", "cancellation", "resource-scheduler", "summary", "throughput", "atomic-publication", "quality-superiority"]
     },
     {
       "id": "deep-sky-osc-calibrated-dithered",

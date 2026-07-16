@@ -315,7 +315,28 @@ fn box_blur_parallel(input: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
 }
 
 fn check_cancel(state: &AppState, req_id: usize) -> bool {
-    state.active_req_id.load(Ordering::Relaxed) != req_id
+    state.cancel_requested.load(Ordering::Acquire)
+        || state.active_req_id.load(Ordering::Acquire) != req_id
+}
+
+/// Publica una entrada derivada sólo mientras la generación que la calculó
+/// sigue siendo propietaria. El orden global es siempre generation_gate →
+/// cache mutex, igual que clear/stack/derotación, de modo que un worker viejo
+/// no puede reinsertar canales después de que el nuevo máster los borró.
+fn commit_processing_cache_if_current(
+    state: &AppState,
+    req_id: usize,
+    commit: impl FnOnce(),
+) -> bool {
+    let _generation_guard = state
+        .planetary_generation_gate
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if check_cancel(state, req_id) {
+        return false;
+    }
+    commit();
+    true
 }
 
 fn apply_richardson_lucy(
@@ -903,12 +924,13 @@ fn run_processing_pipeline(
             return Vec::new();
         }
         let nc = DeconvCache {
-            channels: work_channels.clone(),
+            channels: Arc::new(work_channels),
             params: d_params.clone(),
             width,
             height,
         };
-        {
+        let result_channels = nc.channels.clone();
+        if !commit_processing_cache_if_current(state, req_id, || {
             let mut guard = state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner());
             guard.insert(0, nc);
             // F3: tope 8 (antes 3): comparar >3 estados A/B/C/D expulsaba
@@ -916,8 +938,10 @@ fn run_processing_pipeline(
             if guard.len() > 8 {
                 guard.pop();
             }
+        }) {
+            return Vec::new();
         }
-        work_channels
+        result_channels
     };
 
     // We also need original chrominance for reconstructing if in Luminance mode
@@ -1067,14 +1091,14 @@ fn run_processing_pipeline(
         }
 
         let wc = WaveletLayers {
-            channels: multi_layers,
+            channels: Arc::new(multi_layers),
             width,
             height,
             parent_deconv_params: d_params.clone(),
             edge_aware: edge_aware_wavelets,
             edge_aware_strength,
         };
-        {
+        if !commit_processing_cache_if_current(state, req_id, || {
             let mut guard = state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner());
             guard.insert(0, wc.clone());
             // F3: tope 8 (antes 3): comparar >3 estados A/B/C/D expulsaba
@@ -1082,6 +1106,8 @@ fn run_processing_pipeline(
             if guard.len() > 8 {
                 guard.pop();
             }
+        }) {
+            return Vec::new();
         }
         wc
     };
@@ -1252,12 +1278,13 @@ fn run_processing_pipeline(
         }
 
         let nc = FilterCache {
-            channels: work_filter.clone(),
+            channels: Arc::new(work_filter),
             params: f_params,
             width,
             height,
         };
-        {
+        let result_channels = nc.channels.clone();
+        if !commit_processing_cache_if_current(state, req_id, || {
             let mut guard = state.filter_cache.lock().unwrap_or_else(|e| e.into_inner());
             guard.insert(0, nc);
             // F3: tope 8 (antes 3): comparar >3 estados A/B/C/D expulsaba
@@ -1265,8 +1292,10 @@ fn run_processing_pipeline(
             if guard.len() > 8 {
                 guard.pop();
             }
+        }) {
+            return Vec::new();
         }
-        work_filter
+        result_channels
     };
 
     let (render_base_u, render_base_v) =

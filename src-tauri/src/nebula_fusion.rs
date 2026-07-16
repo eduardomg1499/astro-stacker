@@ -68,6 +68,12 @@ pub(crate) struct NfLiteOutput {
     pub full_report: Option<(f32, usize, usize)>,
     /// Modo Full solicitado pero degradado a Lite: la razón (para receta/log).
     pub full_fallback: Option<String>,
+    /// STRUCT (F7): mapa de evidencia multiescala validado A/B (luma, npx).
+    pub struct_map: Option<Vec<f32>>,
+    /// SCI_luma − STRUCT: detalles rechazados.
+    pub struct_residual: Option<Vec<f32>>,
+    /// (aceptados, total) por nivel starlet — para receta/QA.
+    pub struct_accepted: Option<Vec<(usize, usize)>>,
 }
 
 pub(crate) struct NfLiteContext<'a> {
@@ -87,6 +93,10 @@ pub(crate) struct NfLiteContext<'a> {
     /// Modo Full (F6): tras las máscaras y el pase C, recombina el máster por
     /// frecuencia con PSF objetivo (nebula_fusion_full). Solo demosaiced.
     pub full: bool,
+    /// Modo STRUCT (F7): acumula además dos MITADES independientes (paridad
+    /// de índice) en el pase C y valida las estructuras multiescala que
+    /// reaparecen en ambas (starlet B3 + BH-FDR). Requiere N≥16.
+    pub struct_mode: bool,
     /// Catálogos estelares por índice ORIGINAL de frame (frames[i].1 del
     /// pipeline) — los usa el ajuste PSF Moffat del modo Full.
     pub stars: &'a [Vec<(f32, f32, f32)>],
@@ -761,6 +771,17 @@ pub(crate) fn run_lite(
     total_sum.iter_mut().for_each(|v| *v = 0.0);
     total_wgt.iter_mut().for_each(|v| *v = 0.0);
     let mut weight_sq = vec![0.0f64; npx * ch];
+    // STRUCT (F7): mitades independientes por paridad de índice temporal.
+    let mut halves: Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> = if ctx.struct_mode {
+        Some((
+            vec![0.0f64; npx * ch],
+            vec![0.0f64; npx * ch],
+            vec![0.0f64; npx * ch],
+            vec![0.0f64; npx * ch],
+        ))
+    } else {
+        None
+    };
     for (k, &(i, t, _fw)) in ctx.registered.iter().enumerate() {
         crate::pipeline::cancellation_checkpoint(ctx.cancel, "NebulaFusion: integración")?;
         progress("integración final", k + 1, n);
@@ -783,6 +804,10 @@ pub(crate) fn run_lite(
             mask_ref,
             Some(&mut weight_sq),
         );
+        if let Some((sa, wa, sb, wb)) = halves.as_mut() {
+            let (hs, hw) = if k % 2 == 0 { (sa, wa) } else { (sb, wb) };
+            nf_accumulate(ctx, k, t, &img, &frame_weights_ref[k], hs, hw, mask_ref, None);
+        }
     }
 
     // --- Productos ---
@@ -808,6 +833,34 @@ pub(crate) fn run_lite(
             dq[p] |= crate::deepsky_variance::dq::NO_COVERAGE;
         }
     }
+    // STRUCT (F7): lumas y σ de las mitades (la validación corre tras el
+    // modo Full, sobre el SCI definitivo).
+    let struct_halves: Option<(Vec<f32>, Vec<f32>, f32, f32)> =
+        halves.take().map(|(sa, wa, sb, wb)| {
+            let luma = |s: &[f64], wgt_h: &[f64]| -> Vec<f32> {
+                (0..npx)
+                    .map(|p| {
+                        let mut vs = 0.0f64;
+                        let mut vw = 0.0f64;
+                        for c in 0..ch {
+                            vs += s[p * ch + c];
+                            vw += wgt_h[p * ch + c];
+                        }
+                        if vw > 0.0 {
+                            (vs / vw) as f32
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect()
+            };
+            let la = luma(&sa, &wa);
+            let lb = luma(&sb, &wb);
+            let s_a = crate::ds_mrs_noise(&la, w_out, h_out);
+            let s_b = crate::ds_mrs_noise(&lb, w_out, h_out);
+            (la, lb, s_a, s_b)
+        });
+
     // --- Modo Full (F6): recombinación espectral con PSF objetivo ---
     // Mantiene NEFF/cobertura/rechazos del pase C y REEMPLAZA SCI y VAR por
     // la combinación GLS por frecuencia. Si la PSF no es utilizable, degrada
@@ -926,6 +979,29 @@ pub(crate) fn run_lite(
         }
     }
 
+    // --- STRUCT (F7): validación split-half sobre el SCI definitivo ---
+    let mut struct_map: Option<Vec<f32>> = None;
+    let mut struct_residual: Option<Vec<f32>> = None;
+    let mut struct_accepted: Option<Vec<(usize, usize)>> = None;
+    if let Some((la, lb, s_a, s_b)) = struct_halves {
+        progress("STRUCT: validación por mitades", 1, 1);
+        let full_luma: Vec<f32> = if ch == 1 {
+            final_data.clone()
+        } else {
+            (0..npx)
+                .map(|p| {
+                    (final_data[p * ch] + final_data[p * ch + 1] + final_data[p * ch + 2]) / 3.0
+                })
+                .collect()
+        };
+        let out_s = crate::deepsky_struct::build_struct(
+            &full_luma, &la, &lb, w_out, h_out, s_a, s_b, 0.01, 2.5,
+        );
+        struct_accepted = Some(out_s.accepted_per_level);
+        struct_map = Some(out_s.struct_map);
+        struct_residual = Some(out_s.residual);
+    }
+
     let weight_map = cov_reduce(&total_wgt, npx, ch);
     let final_cov: f64 = weight_map.iter().sum();
     let rej_pct = if total_cov > 0.0 {
@@ -957,6 +1033,9 @@ pub(crate) fn run_lite(
         },
         full_report,
         full_fallback,
+        struct_map,
+        struct_residual,
+        struct_accepted,
     })
 }
 
@@ -1047,6 +1126,7 @@ mod tests {
             cfa: None,
             full: false,
             stars: &[],
+            struct_mode: false,
         };
         let load = |i: usize| -> Result<crate::DsImage, String> {
             Ok(crate::DsImage {
@@ -1187,6 +1267,7 @@ mod tests {
             cfa: None,
             full: false,
             stars: &[],
+            struct_mode: false,
         };
         let frames_ref = &frames;
         let load = |i: usize| -> Result<crate::DsImage, String> {
@@ -1352,6 +1433,7 @@ mod tests {
             cfa: Some(8),
             full: false,
             stars: &[],
+            struct_mode: false,
         };
         let frames_ref = &frames;
         let load = |i: usize| -> Result<crate::DsImage, String> {
@@ -1565,6 +1647,7 @@ mod tests {
             cfa: None,
             full: true,
             stars: &catalogs,
+            struct_mode: false,
         };
         let frames_ref = &frames;
         let load = |i: usize| -> Result<crate::DsImage, String> {

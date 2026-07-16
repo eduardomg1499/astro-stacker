@@ -1,5 +1,5 @@
 {
-  "suiteVersion": "2.0",
+  "suiteVersion": "4.0-example-incomplete",
   "environment": {
     "appVersion": "0.2.8",
     "os": "macos",
@@ -94,7 +94,7 @@
       ],
       "comparators": [
         {
-          "engine": "AutoStakkert",
+          "engine": "AutoStakkert!4",
           "version": "user-supplied-exact-version",
           "output": "/absolute/path/to/comparator-surface.tiff",
           "elapsedSeconds": 70.0,
@@ -249,5 +249,265 @@
         }
       ]
     }
-  ]
+  ],
+  "evidence": {
+    "artifacts": [
+      {
+        "id": "planet-surface-source",
+        "datasetId": "planetary-ser-mono-surface",
+        "kind": "source",
+        "path": "/absolute/path/to/surface.ser",
+        "sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS________________________",
+        "sizeBytes": 0
+      },
+      {
+        "id": "planet-surface-output-cold",
+        "datasetId": "planetary-ser-mono-surface",
+        "kind": "output",
+        "path": "/absolute/path/to/zenith-surface.tiff",
+        "sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS________________________",
+        "sizeBytes": 0
+      },
+      {
+        "id": "planet-surface-output-warm",
+        "datasetId": "planetary-ser-mono-surface",
+        "kind": "output",
+        "path": "/absolute/path/to/zenith-surface-warm.tiff",
+        "sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS________________________",
+        "sizeBytes": 0
+      },
+      {
+        "id": "planet-surface-baseline-output",
+        "datasetId": "planetary-ser-mono-surface",
+        "kind": "output",
+        "path": "/absolute/path/to/zenith-cpu-v1-surface.tiff",
+        "sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS________________________",
+        "sizeBytes": 0
+      },
+      {
+        "id": "planet-surface-comparator-output",
+        "datasetId": "planetary-ser-mono-surface",
+        "kind": "output",
+        "path": "/absolute/path/to/comparator-surface.tiff",
+        "sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS________________________",
+        "sizeBytes": 0
+      },
+      {
+        "id": "planet-surface-baseline-log",
+        "datasetId": "planetary-ser-mono-surface",
+        "kind": "log",
+        "path": "/absolute/path/to/zenith-cpu-v1-surface.log",
+        "sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS________________________",
+        "sizeBytes": 0
+      },
+      {
+        "id": "planet-surface-as4-log",
+        "datasetId": "planetary-ser-mono-surface",
+        "kind": "log",
+        "path": "/absolute/path/to/comparator-surface.log",
+        "sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS________________________",
+        "sizeBytes": 0
+      },
+      {
+        "id": "planet-surface-telemetry-cold",
+        "datasetId": "planetary-ser-mono-surface",
+        "kind": "telemetry",
+        "path": "/absolute/path/to/benchmark-session/telemetry.json",
+        "sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS________________________",
+        "sizeBytes": 0
+      },
+      {
+        "id": "planet-surface-telemetry-warm",
+        "datasetId": "planetary-ser-mono-surface",
+        "kind": "telemetry",
+        "path": "/absolute/path/to/benchmark-session-warm/telemetry.json",
+        "sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS________________________",
+        "sizeBytes": 0
+      },
+      {
+        "id": "planet-surface-independent-quality-reference",
+        "datasetId": "planetary-ser-mono-surface",
+        "kind": "quality-reference",
+        "path": "/absolute/path/to/independent-ground-truth-or-blind-ranking.json",
+        "sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS________________________",
+        "sizeBytes": 0
+      },
+      {
+        "id": "zenith-release-executable",
+        "datasetId": "suite",
+        "kind": "executable",
+        "path": "/absolute/path/to/Zenith Astro Stacker",
+        "sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS________________________",
+        "sizeBytes": 0
+      },
+      {
+        "id": "as4-release-executable",
+        "datasetId": "planetary-ser-mono-surface",
+        "kind": "executable",
+        "path": "/absolute/path/to/AutoStakkert4.exe",
+        "sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS________________________",
+        "sizeBytes": 0
+      }
+    ],
+    "executions": [
+      {
+        "id": "planet-surface-baseline",
+        "datasetId": "planetary-ser-mono-surface",
+        "role": "baseline-cpu",
+        "runKey": "baseline-cpu",
+        "product": "Zenith Astro Stacker CPU reference",
+        "vendor": "EMG",
+        "version": "replace-with-exact-build",
+        "distribution": "replace-with-release-or-commit-identifier",
+        "executableArtifactId": "zenith-release-executable",
+        "outputArtifactId": "planet-surface-baseline-output",
+        "logArtifactIds": ["planet-surface-baseline-log"],
+        "telemetryArtifactIds": [],
+        "supportingArtifactIds": [],
+        "configurationSha256": "REPLACE_WITH_SHA256_OF_CANONICAL_BASELINE_CPU_PARAMETERS______",
+        "configurationBytes": 0,
+        "invocation": ["replace with exact reproducible workflow"],
+        "timingMethod": "steady clock, input-open through durable output close"
+      },
+      {
+        "id": "planet-surface-zenith-cold",
+        "datasetId": "planetary-ser-mono-surface",
+        "role": "zenith",
+        "runKey": "zenith:hybrid-v2:cold",
+        "product": "Zenith Astro Stacker",
+        "vendor": "EMG",
+        "version": "0.2.8",
+        "distribution": "replace-with-release-or-commit-identifier",
+        "executableArtifactId": "zenith-release-executable",
+        "outputArtifactId": "planet-surface-output-cold",
+        "logArtifactIds": [],
+        "telemetryArtifactIds": ["planet-surface-telemetry-cold"],
+        "supportingArtifactIds": [],
+        "configurationSha256": "REPLACE_WITH_SHA256_OF_CANONICAL_COLD_PARAMETERS______________",
+        "configurationBytes": 0,
+        "invocation": ["begin_benchmark_run", "hybrid-v2", "cold-cache", "finish_benchmark_run"],
+        "timingMethod": "steady clock, begin_benchmark_run through finish_benchmark_run entry"
+      },
+      {
+        "id": "planet-surface-zenith-warm",
+        "datasetId": "planetary-ser-mono-surface",
+        "role": "zenith",
+        "runKey": "zenith:hybrid-v2:warm",
+        "product": "Zenith Astro Stacker",
+        "vendor": "EMG",
+        "version": "0.2.8",
+        "distribution": "replace-with-release-or-commit-identifier",
+        "executableArtifactId": "zenith-release-executable",
+        "outputArtifactId": "planet-surface-output-warm",
+        "logArtifactIds": [],
+        "telemetryArtifactIds": ["planet-surface-telemetry-warm"],
+        "supportingArtifactIds": [],
+        "configurationSha256": "REPLACE_WITH_SHA256_OF_CANONICAL_WARM_PARAMETERS______________",
+        "configurationBytes": 0,
+        "invocation": ["begin_benchmark_run", "hybrid-v2", "warm-cache", "finish_benchmark_run"],
+        "timingMethod": "steady clock, begin_benchmark_run through finish_benchmark_run entry"
+      },
+      {
+        "id": "planet-surface-as4",
+        "datasetId": "planetary-ser-mono-surface",
+        "role": "competitor",
+        "runKey": "competitor:autostakkert4:user-supplied-exact-version",
+        "product": "AutoStakkert!4",
+        "vendor": "Emil Kraaikamp",
+        "version": "user-supplied-exact-version",
+        "distribution": "replace-with-official-download-and-installer-identity",
+        "executableArtifactId": "as4-release-executable",
+        "outputArtifactId": "planet-surface-comparator-output",
+        "logArtifactIds": ["planet-surface-as4-log"],
+        "telemetryArtifactIds": [],
+        "supportingArtifactIds": [],
+        "configurationSha256": "REPLACE_WITH_SHA256_OF_CANONICAL_AS4_PARAMETERS_______________",
+        "configurationBytes": 0,
+        "invocation": ["replace with exact AutoStakkert!4 workflow or script"],
+        "timingMethod": "same end-to-end wall-clock boundary as Zenith"
+      }
+    ],
+    "requirements": [
+      {
+        "datasetId": "planetary-ser-mono-surface",
+        "category": "acceptance",
+        "requirementId": "analysis",
+        "passed": true,
+        "evaluator": "automated",
+        "method": "replace with exact test name and command",
+        "artifactIds": ["planet-surface-telemetry-cold"],
+        "metrics": { "assertions": 1 }
+      },
+      {
+        "datasetId": "planetary-ser-mono-surface",
+        "category": "acceptance",
+        "requirementId": "registration",
+        "passed": true,
+        "evaluator": "automated",
+        "method": "replace with exact test name and command",
+        "artifactIds": ["planet-surface-output-cold"],
+        "metrics": { "registrationCorrectionPx": 0 }
+      },
+      {
+        "datasetId": "planetary-ser-mono-surface",
+        "category": "acceptance",
+        "requirementId": "integration",
+        "passed": true,
+        "evaluator": "automated",
+        "method": "replace with exact test name and command",
+        "artifactIds": ["planet-surface-output-cold"],
+        "metrics": { "assertions": 1 }
+      },
+      {
+        "datasetId": "planetary-ser-mono-surface",
+        "category": "acceptance",
+        "requirementId": "export",
+        "passed": true,
+        "evaluator": "automated",
+        "method": "replace with exact test name and command",
+        "artifactIds": ["planet-surface-output-cold"],
+        "metrics": { "assertions": 1 }
+      },
+      {
+        "datasetId": "planetary-ser-mono-surface",
+        "category": "acceptance",
+        "requirementId": "cold-cache",
+        "passed": true,
+        "evaluator": "automated",
+        "method": "replace with exact test name and command",
+        "artifactIds": ["planet-surface-telemetry-cold"],
+        "metrics": { "elapsedSeconds": 50 }
+      },
+      {
+        "datasetId": "planetary-ser-mono-surface",
+        "category": "acceptance",
+        "requirementId": "warm-cache",
+        "passed": true,
+        "evaluator": "automated",
+        "method": "replace with exact test name and command",
+        "artifactIds": ["planet-surface-telemetry-warm"],
+        "metrics": { "elapsedSeconds": 42 }
+      },
+      {
+        "datasetId": "planetary-ser-mono-surface",
+        "category": "acceptance",
+        "requirementId": "quality-superiority",
+        "passed": true,
+        "evaluator": "automated",
+        "method": "replace with exact independent-reference evaluator and blind protocol",
+        "artifactIds": [
+          "planet-surface-independent-quality-reference",
+          "planet-surface-output-cold",
+          "planet-surface-comparator-output"
+        ],
+        "metrics": {
+          "objectiveWins": 1,
+          "objectiveLosses": 0,
+          "independentReferenceCount": 1,
+          "zenithCompositeScore": 0.91,
+          "competitorCompositeScore": 0.88
+        }
+      }
+    ]
+  }
 }

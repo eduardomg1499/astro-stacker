@@ -20,21 +20,15 @@ fn check_ffmpeg_status(app: tauri::AppHandle) -> bool {
 #[tauri::command]
 fn cancel_processing(app: tauri::AppHandle, state: State<'_, AppState>) {
     log_to_front(&app, "WARNING", "CancelaciÃ³n solicitada por el usuario.");
-    // 1. Invalida el req_id activo → los workers del analisis y el pipeline de
-    //    wavelets que consultan check_cancel() dejan de trabajar de inmediato.
-    state.active_req_id.store(0, Ordering::Relaxed);
-    // 2. Flag cooperativo → los bucles de apilado, el prefetcher y el decoder
-    //    FFmpeg abortan limpio y el comando devuelve Err("Cancelado...").
-    state
-        .cancel_requested
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    // Generación monotónica + flag cooperativo: ningún trabajo anterior puede
+    // revivir cuando una operación posterior rearma la cancelación.
+    cancel_planetary_jobs(&state);
     // 3. F3: liberar las cachés DERIVADAS pesadas. Antes quedaban retenidas
     //    hasta que la SIGUIENTE operación llamara clear_app_memory: cancelar
     //    y no continuar dejaba cientos de MB anclados. Son recomputables
     //    (deconv/wavelets/filtros se regeneran del máster al primer render).
-    state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    // La invalidación y estos clears ya ocurren juntos dentro de
+    // `cancel_planetary_jobs`, bajo el gate generacional.
 }
 
 /// Espacio libre del volumen que contiene `path` — la UI lo muestra junto a
@@ -468,6 +462,511 @@ fn mix_tint_factor(factor: f32, color_strength: f32) -> f32 {
     1.0 + (factor - 1.0) * color_strength.clamp(0.0, 1.0)
 }
 
+const ANIMATION_FFMPEG_STDERR_LIMIT: usize = 256 * 1024;
+const ANIMATION_FFMPEG_PIPE_IDLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+const ANIMATION_FFMPEG_EXIT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(60);
+const ANIMATION_FFMPEG_REAP_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+const ANIMATION_FFMPEG_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(25);
+static ANIMATION_EXPORT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+/// Drain the whole FFmpeg diagnostic pipe while retaining only its tail.  The
+/// drain is deliberately independent from the retained size: verbose FFmpeg
+/// output must never fill the OS pipe and deadlock an otherwise valid encode.
+fn drain_animation_ffmpeg_stderr<R: Read>(mut reader: R) -> Vec<u8> {
+    let mut retained = Vec::with_capacity(ANIMATION_FFMPEG_STDERR_LIMIT);
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        if read >= ANIMATION_FFMPEG_STDERR_LIMIT {
+            retained.clear();
+            retained.extend_from_slice(&chunk[read - ANIMATION_FFMPEG_STDERR_LIMIT..read]);
+            continue;
+        }
+        let overflow = retained
+            .len()
+            .saturating_add(read)
+            .saturating_sub(ANIMATION_FFMPEG_STDERR_LIMIT);
+        if overflow > 0 {
+            retained.drain(..overflow);
+        }
+        retained.extend_from_slice(&chunk[..read]);
+    }
+    retained
+}
+
+enum AnimationFfmpegWriterCommand {
+    Frame(Vec<u8>),
+    Finish,
+}
+
+enum AnimationFfmpegWriterEvent {
+    Progress,
+    FrameFinished(Result<(), String>),
+    StreamFinished(Result<(), String>),
+}
+
+/// Keep potentially blocking pipe I/O outside the command thread.  Progress
+/// events make a genuinely slow consumer distinguishable from a wedged one;
+/// cancellation or an idle deadline can therefore kill FFmpeg even while the
+/// writer is blocked in an OS `write`/`flush` call.
+fn spawn_animation_ffmpeg_writer(
+    mut stdin: std::process::ChildStdin,
+) -> (
+    crossbeam_channel::Sender<AnimationFfmpegWriterCommand>,
+    crossbeam_channel::Receiver<AnimationFfmpegWriterEvent>,
+    std::thread::JoinHandle<()>,
+) {
+    // One frame is enough to decouple image preparation without allowing an
+    // unbounded queue of full-resolution RGB frames in RAM.
+    let (command_tx, command_rx) = crossbeam_channel::bounded(1);
+    let (event_tx, event_rx) = crossbeam_channel::unbounded();
+    let thread = std::thread::spawn(move || {
+        while let Ok(command) = command_rx.recv() {
+            match command {
+                AnimationFfmpegWriterCommand::Frame(bytes) => {
+                    let mut offset = 0usize;
+                    let result = (|| -> Result<(), String> {
+                        while offset < bytes.len() {
+                            match stdin.write(&bytes[offset..]) {
+                                Ok(0) => {
+                                    return Err(
+                                        "FFmpeg cerro su entrada durante un frame".to_string()
+                                    )
+                                }
+                                Ok(written) => {
+                                    offset = offset.saturating_add(written);
+                                    let _ = event_tx.send(AnimationFfmpegWriterEvent::Progress);
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(error) => {
+                                    return Err(format!(
+                                        "Error escribiendo un frame a FFmpeg: {error}"
+                                    ))
+                                }
+                            }
+                        }
+                        Ok(())
+                    })();
+                    let failed = result.is_err();
+                    let _ = event_tx.send(AnimationFfmpegWriterEvent::FrameFinished(result));
+                    if failed {
+                        break;
+                    }
+                }
+                AnimationFfmpegWriterCommand::Finish => {
+                    let result = stdin
+                        .flush()
+                        .map_err(|error| format!("Error vaciando la entrada de FFmpeg: {error}"));
+                    let _ = event_tx.send(AnimationFfmpegWriterEvent::StreamFinished(result));
+                    break;
+                }
+            }
+        }
+        // Dropping ChildStdin is the EOF signal consumed by FFmpeg.
+    });
+    (command_tx, event_rx, thread)
+}
+
+fn terminate_animation_ffmpeg_child(child: &mut std::process::Child) -> bool {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return true;
+    }
+    let _ = child.kill();
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        if started.elapsed() >= ANIMATION_FFMPEG_REAP_TIMEOUT {
+            return false;
+        }
+        std::thread::sleep(ANIMATION_FFMPEG_POLL_INTERVAL);
+    }
+}
+
+/// Owns the complete FFmpeg lifecycle.  Any early return (decode error,
+/// cancellation, broken pipe, supersession or timeout) reaches Drop, which
+/// kills/reaps the encoder and joins both pipe-draining threads.
+struct AnimationFfmpegProcess {
+    child: Option<std::process::Child>,
+    writer_tx: Option<crossbeam_channel::Sender<AnimationFfmpegWriterCommand>>,
+    writer_rx: crossbeam_channel::Receiver<AnimationFfmpegWriterEvent>,
+    writer_thread: Option<std::thread::JoinHandle<()>>,
+    stderr_thread: Option<std::thread::JoinHandle<Vec<u8>>>,
+}
+
+impl AnimationFfmpegProcess {
+    fn spawn(mut command: Command) -> Result<Self, String> {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("Error iniciando FFmpeg: {error}"))?;
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                let _ = terminate_animation_ffmpeg_child(&mut child);
+                return Err("FFmpeg no expuso su canal de diagnostico".into());
+            }
+        };
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = terminate_animation_ffmpeg_child(&mut child);
+                return Err("FFmpeg no expuso su canal de entrada".into());
+            }
+        };
+        let (writer_tx, writer_rx, writer_thread) = spawn_animation_ffmpeg_writer(stdin);
+        let stderr_thread = std::thread::spawn(move || drain_animation_ffmpeg_stderr(stderr));
+        Ok(Self {
+            child: Some(child),
+            writer_tx: Some(writer_tx),
+            writer_rx,
+            writer_thread: Some(writer_thread),
+            stderr_thread: Some(stderr_thread),
+        })
+    }
+
+    fn submit_writer_command(
+        &mut self,
+        mut command: AnimationFfmpegWriterCommand,
+        job_token: &PlanetaryJobToken,
+        operation: &str,
+    ) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        loop {
+            if job_token.is_cancelled() {
+                self.abort();
+                return Err(format!("Exportacion cancelada durante {operation}"));
+            }
+            let sender = self
+                .writer_tx
+                .as_ref()
+                .ok_or_else(|| "El escritor FFmpeg ya fue cerrado".to_string())?;
+            match sender.send_timeout(command, ANIMATION_FFMPEG_POLL_INTERVAL) {
+                Ok(()) => return Ok(()),
+                Err(crossbeam_channel::SendTimeoutError::Timeout(returned)) => {
+                    command = returned;
+                    if started.elapsed() >= ANIMATION_FFMPEG_PIPE_IDLE_TIMEOUT {
+                        self.abort();
+                        return Err(format!(
+                            "FFmpeg no acepto {operation} durante {} s; se termino el proceso",
+                            ANIMATION_FFMPEG_PIPE_IDLE_TIMEOUT.as_secs()
+                        ));
+                    }
+                }
+                Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                    self.abort();
+                    return Err("El escritor FFmpeg termino antes de tiempo".to_string());
+                }
+            }
+        }
+    }
+
+    fn wait_writer_event(
+        &mut self,
+        job_token: &PlanetaryJobToken,
+        finish_stream: bool,
+    ) -> Result<(), String> {
+        let mut last_progress = std::time::Instant::now();
+        loop {
+            if job_token.is_cancelled() {
+                self.abort();
+                return Err("Exportacion cancelada mientras FFmpeg consumia datos".into());
+            }
+            match self.writer_rx.recv_timeout(ANIMATION_FFMPEG_POLL_INTERVAL) {
+                Ok(AnimationFfmpegWriterEvent::Progress) => {
+                    last_progress = std::time::Instant::now();
+                }
+                Ok(AnimationFfmpegWriterEvent::FrameFinished(result)) if !finish_stream => {
+                    return result;
+                }
+                Ok(AnimationFfmpegWriterEvent::StreamFinished(result)) if finish_stream => {
+                    return result;
+                }
+                Ok(_) => {
+                    self.abort();
+                    return Err("FFmpeg devolvio un evento de escritura inesperado".into());
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if let Some(child) = self.child.as_mut() {
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                self.abort();
+                                return Err(format!(
+                                    "FFmpeg termino prematuramente con estado {status}"
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                self.abort();
+                                return Err(format!("No se pudo consultar FFmpeg: {error}"));
+                            }
+                        }
+                    }
+                    if last_progress.elapsed() >= ANIMATION_FFMPEG_PIPE_IDLE_TIMEOUT {
+                        self.abort();
+                        return Err(format!(
+                            "FFmpeg dejo de consumir la tuberia durante {} s; se termino el proceso",
+                            ANIMATION_FFMPEG_PIPE_IDLE_TIMEOUT.as_secs()
+                        ));
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    self.abort();
+                    return Err("El escritor FFmpeg termino sin confirmar la operacion".into());
+                }
+            }
+        }
+    }
+
+    fn write_frame(
+        &mut self,
+        bytes: Vec<u8>,
+        job_token: &PlanetaryJobToken,
+    ) -> Result<(), String> {
+        self.submit_writer_command(
+            AnimationFfmpegWriterCommand::Frame(bytes),
+            job_token,
+            "la entrega de un frame",
+        )?;
+        self.wait_writer_event(job_token, false)
+    }
+
+    fn join_stderr(&mut self) -> Vec<u8> {
+        self.stderr_thread
+            .take()
+            .and_then(|thread| thread.join().ok())
+            .unwrap_or_default()
+    }
+
+    fn abort(&mut self) {
+        // Closing the sender alone is not sufficient when the worker is
+        // blocked in write/flush. Kill the reader first so the OS wakes it.
+        self.writer_tx.take();
+        let reaped = self
+            .child
+            .take()
+            .map(|mut child| terminate_animation_ffmpeg_child(&mut child))
+            .unwrap_or(true);
+        if reaped {
+            if let Some(thread) = self.writer_thread.take() {
+                let _ = thread.join();
+            }
+            let _ = self.join_stderr();
+        } else {
+            // A pathological kernel/device state must not freeze the UI. The
+            // detached drainers own no application state and will end once the
+            // OS closes the abandoned process pipes.
+            self.writer_thread.take();
+            self.stderr_thread.take();
+        }
+    }
+
+    fn finish(mut self, job_token: &PlanetaryJobToken) -> Result<(), String> {
+        self.submit_writer_command(
+            AnimationFfmpegWriterCommand::Finish,
+            job_token,
+            "el cierre de la tuberia",
+        )?;
+        self.wait_writer_event(job_token, true)?;
+        self.writer_tx.take();
+        if let Some(thread) = self.writer_thread.take() {
+            thread
+                .join()
+                .map_err(|_| "El escritor FFmpeg termino inesperadamente".to_string())?;
+        }
+
+        let exit_started = std::time::Instant::now();
+        let status = loop {
+            if job_token.is_cancelled() {
+                self.abort();
+                return Err("Exportacion cancelada mientras FFmpeg finalizaba".into());
+            }
+            match self.child.as_mut().expect("FFmpeg vigente").try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(error) => {
+                    self.abort();
+                    return Err(format!("Error esperando a FFmpeg: {error}"));
+                }
+            }
+            if exit_started.elapsed() >= ANIMATION_FFMPEG_EXIT_TIMEOUT {
+                self.abort();
+                return Err(format!(
+                    "FFmpeg no finalizo en {} s despues del EOF; se termino el proceso",
+                    ANIMATION_FFMPEG_EXIT_TIMEOUT.as_secs()
+                ));
+            }
+            std::thread::sleep(ANIMATION_FFMPEG_POLL_INTERVAL);
+        };
+        self.child.take();
+        let stderr = self.join_stderr();
+        if !status.success() {
+            let diagnostics = String::from_utf8_lossy(&stderr);
+            return Err(format!(
+                "FFmpeg termino con estado {}: {}",
+                status,
+                diagnostics.trim()
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AnimationFfmpegProcess {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+/// Sibling staging makes publication a single-filesystem rename.  Until
+/// `publish` succeeds there is no user-visible output, and Drop removes every
+/// interrupted or failed encode.
+struct StagedAnimationExport {
+    temporary_path: PathBuf,
+    final_path: PathBuf,
+    published: bool,
+}
+
+impl StagedAnimationExport {
+    fn reserve(parent: &Path, extension: &str) -> Result<(Self, File), String> {
+        for _ in 0..64 {
+            let sequence = ANIMATION_EXPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let suffix = format!(
+                "{}_p{}_{}_{}",
+                chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f"),
+                std::process::id(),
+                nanos,
+                sequence
+            );
+            let final_path = parent.join(format!("export_{suffix}.{extension}"));
+            if final_path.exists() {
+                continue;
+            }
+            // Keep the real extension last so FFmpeg can infer its muxer.
+            let temporary_path = parent.join(format!(".export_{suffix}.part.{extension}"));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .read(true)
+                .create_new(true)
+                .open(&temporary_path)
+            {
+                Ok(file) => {
+                    return Ok((
+                        Self {
+                            temporary_path,
+                            final_path,
+                            published: false,
+                        },
+                        file,
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "No se pudo reservar la salida de animacion: {error}"
+                    ));
+                }
+            }
+        }
+        Err("No se pudo obtener un nombre unico para la animacion".into())
+    }
+
+    fn sync_payload(&self) -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.temporary_path)
+            .map_err(|error| format!("No se pudo reabrir la animacion temporal: {error}"))?;
+        let length = file
+            .metadata()
+            .map_err(|error| format!("No se pudo validar la animacion temporal: {error}"))?
+            .len();
+        if length == 0 {
+            return Err("El codificador produjo una animacion vacia".into());
+        }
+        // image 0.23 delegates GIF finalization to Drop and the enabled
+        // `raii_no_panic` feature cannot return a trailer-write error. Verify
+        // the mandatory GIF trailer explicitly before reporting success.
+        if self
+            .temporary_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("gif")
+        {
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::End(-1))
+                .map_err(|error| format!("No se pudo validar el trailer GIF: {error}"))?;
+            let mut trailer = [0u8; 1];
+            file.read_exact(&mut trailer)
+                .map_err(|error| format!("No se pudo leer el trailer GIF: {error}"))?;
+            if trailer[0] != 0x3b {
+                return Err("El archivo GIF quedo incompleto (falta el trailer)".into());
+            }
+        }
+        file.sync_all()
+            .map_err(|error| format!("No se pudo sincronizar la animacion temporal: {error}"))
+    }
+
+    fn publish(&mut self) -> Result<(), String> {
+        if self.final_path.exists() {
+            return Err(format!(
+                "La salida de animacion ya existe: {}",
+                self.final_path.display()
+            ));
+        }
+        std::fs::rename(&self.temporary_path, &self.final_path)
+            .map_err(|error| format!("No se pudo publicar la animacion: {error}"))?;
+
+        #[cfg(not(target_os = "windows"))]
+        if let Some(parent) = self.final_path.parent() {
+            if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
+                let _ = std::fs::remove_file(&self.final_path);
+                return Err(format!(
+                    "No se pudo sincronizar la carpeta de salida: {error}"
+                ));
+            }
+        }
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedAnimationExport {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.temporary_path);
+        }
+    }
+}
+
+#[inline]
+fn animation_export_checkpoint(job_token: &PlanetaryJobToken, stage: &str) -> Result<(), String> {
+    if job_token.is_cancelled() {
+        Err(format!(
+            "Exportacion cancelada o sustituida durante {stage}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[tauri::command]
 async fn export_animation_video(
     app: tauri::AppHandle,
@@ -505,16 +1004,23 @@ async fn export_animation_video(
     crop_h: f32,
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
-    emit_progress(&app, "Iniciando exportacion...", 0.0, None);
 
     // 0. Preparar Paths
     let p = Path::new(&folder);
-    if !p.exists() {
+    if !p.is_dir() {
         return Err("Carpeta no existe".into());
     }
+    if !matches!(format.as_str(), "mp4" | "avi" | "gif") {
+        return Err(format!("Formato de animacion no compatible: {format}"));
+    }
+
+    let request_id = begin_planetary_user_job(&state);
+    let job_token =
+        PlanetaryJobToken::for_app(&app, request_id, state.cancel_requested.clone());
+    emit_progress(&app, "Iniciando exportacion...", 0.0, None);
 
     // 1. Validar FFmpeg si es video
-    let is_video = format == "mp4" || format == "avi";
+    let is_video = matches!(format.as_str(), "mp4" | "avi");
     let ffmpeg_cmd = if is_video {
         get_ffmpeg_command(&app) // Uses "ffmpeg" or resolved path
     } else {
@@ -533,6 +1039,7 @@ async fn export_animation_video(
         let mut f_list = Vec::new();
         let entries = fs::read_dir(&folder).map_err(|e| e.to_string())?;
         for entry in entries {
+            animation_export_checkpoint(&job_token, "el escaneo de imagenes")?;
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
             if path.is_file() {
@@ -559,6 +1066,7 @@ async fn export_animation_video(
 
     // Boomerang Logic (Solo duplicar referencias)
     if boomerang {
+        animation_export_checkpoint(&job_token, "la preparacion boomerang")?;
         let mut rev = files_to_process.clone();
         rev.reverse();
         // Remove first and last to avoid duplication at turning points
@@ -569,12 +1077,13 @@ async fn export_animation_video(
         }
     }
 
-    let out_filename = format!("export_{}.{}", chrono::Utc::now().timestamp(), format);
-    let out_file = p.join(&out_filename);
+    let (mut staged_export, reserved_staging_file) =
+        StagedAnimationExport::reserve(p, &format)?;
+    let out_file = staged_export.final_path.clone();
 
     // 3. Preparar Encoder (Deferred for Video)
-    let mut gif_encoder: Option<image::codecs::gif::GifEncoder<BufWriter<File>>> = None;
-    let mut ffmpeg_child: Option<std::process::Child> = None;
+    let mut gif_encoder: Option<image::codecs::gif::GifEncoder<File>> = None;
+    let mut ffmpeg_process: Option<AnimationFfmpegProcess> = None;
     let fps = 1000.0 / (delay_ms.max(20) as f64);
 
     // Canonical format to ensure FFmpeg stream homogeneity
@@ -583,13 +1092,15 @@ async fn export_animation_video(
     let mut canonical_depth_16 = false;
 
     if !is_video {
-        // GIF Init (can be done early)
-        let f = File::create(&out_file).map_err(|e| e.to_string())?;
-        let writer = BufWriter::new(f);
-        let mut enc = image::codecs::gif::GifEncoder::new(writer);
+        // El archivo temporal ya fue reservado con create_new.
+        let mut enc = image::codecs::gif::GifEncoder::new(reserved_staging_file);
         enc.set_repeat(image::codecs::gif::Repeat::Infinite)
             .map_err(|e| e.to_string())?;
         gif_encoder = Some(enc);
+    } else {
+        // FFmpeg reabre la reserva unica con -y; mantenerla cerrada evita
+        // diferencias de comparticion de archivos en Windows.
+        drop(reserved_staging_file);
     }
 
     // 4. Preparar Font
@@ -607,6 +1118,7 @@ async fn export_animation_video(
 
     // 5. Loop Procesamiento
     for (i, fpath) in files_to_process.iter().enumerate() {
+        animation_export_checkpoint(&job_token, "el procesamiento de frames")?;
         emit_progress(
             &app,
             "Procesando frame",
@@ -615,7 +1127,8 @@ async fn export_animation_video(
         );
 
         // A. Cargar Imagen y NormalizaciÃ³n Inicial
-        let mut img = image::open(fpath).map_err(|e| e.to_string())?;
+        let mut img = image::open(fpath)
+            .map_err(|error| format!("No se pudo abrir {}: {error}", fpath.display()))?;
         let mut is_high_depth = match img.color() {
             ColorType::Rgb16 | ColorType::Rgba16 | ColorType::L16 | ColorType::La16 => true,
             _ => false,
@@ -656,6 +1169,7 @@ async fn export_animation_video(
                 img = img.resize(nw, nh, image::imageops::FilterType::Lanczos3);
             }
         }
+        animation_export_checkpoint(&job_token, "la geometria de un frame")?;
 
         // D. Canonical Sync (Fixes "color snow/noise" by ensuring stream homogeneity)
         if i > 0 && is_video {
@@ -711,7 +1225,10 @@ async fn export_animation_video(
             let l_min = (levels_black * 65535.0).max(0.0);
             let l_max = (levels_white * 65535.0).min(65535.0);
             let l_range = (l_max - l_min).max(1.0);
-            for p in rgb.pixels_mut() {
+            for (pixel_index, p) in rgb.pixels_mut().enumerate() {
+                if pixel_index & 0xffff == 0 {
+                    animation_export_checkpoint(&job_token, "los filtros de 16 bits")?;
+                }
                 let mut r = p[0] as f32;
                 let mut g = p[1] as f32;
                 let mut b = p[2] as f32;
@@ -786,7 +1303,10 @@ async fn export_animation_video(
             let l_min = (levels_black * 255.0).max(0.0);
             let l_max = (levels_white * 255.0).min(255.0);
             let l_range = (l_max - l_min).max(1.0);
-            for p in rgb.pixels_mut() {
+            for (pixel_index, p) in rgb.pixels_mut().enumerate() {
+                if pixel_index & 0xffff == 0 {
+                    animation_export_checkpoint(&job_token, "los filtros de 8 bits")?;
+                }
                 let mut r = p[0] as f32;
                 let mut g = p[1] as f32;
                 let mut b = p[2] as f32;
@@ -947,6 +1467,7 @@ async fn export_animation_video(
                 }
             }
         }
+        animation_export_checkpoint(&job_token, "la composicion del frame")?;
 
         // G. Establish Canonical Format & Init FFmpeg (First Frame)
         if i == 0 && is_video {
@@ -1010,45 +1531,35 @@ async fn export_animation_video(
                 "-vf".to_string(),
                 "scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string(),
             ]);
-            args.push(clean_windows_path(out_file.clone()));
+            args.push(clean_windows_path(staged_export.temporary_path.clone()));
 
-            let child = {
-                let mut cmd = Command::new(&ffmpeg_cmd);
-                #[cfg(target_os = "windows")]
-                cmd.creation_flags(0x08000000);
-                cmd.args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-            };
-
-            match child {
-                Ok(child) => ffmpeg_child = Some(child),
-                Err(e) => return Err(format!("Error iniciando FFmpeg: {}", e)),
-            }
+            let mut command = Command::new(&ffmpeg_cmd);
+            #[cfg(target_os = "windows")]
+            command.creation_flags(0x08000000);
+            command.args(&args);
+            ffmpeg_process = Some(AnimationFfmpegProcess::spawn(command)?);
         }
 
         // H. Output (Pipe or GIF)
         if is_video {
-            if let Some(child) = &mut ffmpeg_child {
-                if let Some(stdin) = &mut child.stdin {
-                    // Send RAW pixels to FFmpeg
-                    if canonical_depth_16 {
-                        // rgb48be (16-bit Big-Endian RGB)
-                        let rgb = img.to_rgb16();
-                        let raw = rgb.as_raw();
-                        let mut be_bytes = Vec::with_capacity(raw.len() * 2);
-                        for &v in raw {
-                            be_bytes.extend_from_slice(&v.to_be_bytes());
-                        }
-                        let _ = stdin.write_all(&be_bytes);
-                    } else {
-                        // rgb24 (8-bit RGB)
-                        let rgb = img.to_rgb8();
-                        let _ = stdin.write_all(rgb.as_raw());
-                    }
+            let process = ffmpeg_process
+                .as_mut()
+                .ok_or_else(|| "FFmpeg no fue inicializado".to_string())?;
+            // Send RAW pixels to FFmpeg. Every broken-pipe/write failure is
+            // fatal; the process guard performs kill+wait during unwinding.
+            if canonical_depth_16 {
+                // rgb48be (16-bit Big-Endian RGB)
+                let rgb = img.to_rgb16();
+                let raw = rgb.as_raw();
+                let mut be_bytes = Vec::with_capacity(raw.len() * 2);
+                for &v in raw {
+                    be_bytes.extend_from_slice(&v.to_be_bytes());
                 }
+                process.write_frame(be_bytes, &job_token)?;
+            } else {
+                // rgb24 (8-bit RGB)
+                let rgb = img.to_rgb8();
+                process.write_frame(rgb.into_raw(), &job_token)?;
             }
         } else {
             if let Some(enc) = &mut gif_encoder {
@@ -1058,25 +1569,447 @@ async fn export_animation_video(
                     0,
                     Delay::from_numer_denom_ms(delay_ms as u32, 1),
                 );
-                let _ = enc.encode_frame(frame);
+                enc.encode_frame(frame)
+                    .map_err(|error| format!("Error codificando un frame GIF: {error}"))?;
+            } else {
+                return Err("El codificador GIF no fue inicializado".into());
             }
         }
+        animation_export_checkpoint(&job_token, "la escritura de frames")?;
     } // End Loop
 
-    // Finalize Video
+    animation_export_checkpoint(&job_token, "la finalizacion del codificador")?;
+
+    // Finalize encoder. FFmpeg's pipe must close before wait; GIF's trailer is
+    // emitted by Drop, whose I/O panic is translated into a command error.
     if is_video {
-        if let Some(mut child) = ffmpeg_child {
-            drop(child.stdin.take());
-            let output = child.wait_with_output().map_err(|e| e.to_string())?;
-            if !output.status.success() {
-                let err = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("FFmpeg Error: {}", err));
-            }
-        }
+        ffmpeg_process
+            .take()
+            .ok_or_else(|| "FFmpeg no produjo ningun frame".to_string())?
+            .finish(&job_token)?;
+    } else {
+        let encoder = gif_encoder
+            .take()
+            .ok_or_else(|| "El codificador GIF no produjo ningun frame".to_string())?;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(encoder)))
+            .map_err(|_| "Error finalizando el archivo GIF".to_string())?;
     }
+
+    animation_export_checkpoint(&job_token, "la sincronizacion de la salida")?;
+    staged_export.sync_payload()?;
+    with_current_planetary_job(
+        &state.planetary_generation_gate,
+        &job_token,
+        "la publicacion de la animacion",
+        || staged_export.publish(),
+    )??;
 
     emit_progress(&app, "ExportaciÃ³n Finalizada", 100.0, None);
     Ok(clean_windows_path(out_file))
+}
+
+#[cfg(test)]
+mod animation_export_atomic_tests {
+    use super::{
+        animation_export_checkpoint, drain_animation_ffmpeg_stderr, PlanetaryJobToken,
+        StagedAnimationExport, ANIMATION_FFMPEG_STDERR_LIMIT,
+    };
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn temporary_directory(label: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "zas_animation_export_{label}_{}_{}",
+            std::process::id(),
+            super::ANIMATION_EXPORT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn ffmpeg_stderr_drain_is_bounded_and_keeps_tail() {
+        let mut input = vec![b'a'; ANIMATION_FFMPEG_STDERR_LIMIT + 97];
+        let tail = input.len() - 4;
+        input[tail..].copy_from_slice(b"TAIL");
+        let retained = drain_animation_ffmpeg_stderr(std::io::Cursor::new(input));
+        assert_eq!(retained.len(), ANIMATION_FFMPEG_STDERR_LIMIT);
+        assert!(retained.ends_with(b"TAIL"));
+    }
+
+    #[test]
+    fn unpublished_animation_staging_rolls_back_on_drop() {
+        let directory = temporary_directory("rollback");
+        let (staged, mut file) = StagedAnimationExport::reserve(&directory, "gif").unwrap();
+        let temporary_path = staged.temporary_path.clone();
+        let final_path = staged.final_path.clone();
+        file.write_all(b"GIF89a;").unwrap();
+        drop(file);
+        drop(staged);
+        assert!(!temporary_path.exists());
+        assert!(!final_path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn animation_publication_is_a_single_rename() {
+        let directory = temporary_directory("publish");
+        let (mut staged, mut file) = StagedAnimationExport::reserve(&directory, "gif").unwrap();
+        let temporary_path = staged.temporary_path.clone();
+        let final_path = staged.final_path.clone();
+        file.write_all(b"GIF89a;").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        staged.sync_payload().unwrap();
+        staged.publish().unwrap();
+        assert!(!temporary_path.exists());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"GIF89a;");
+        drop(staged);
+        assert!(final_path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn incomplete_gif_is_never_publishable() {
+        let directory = temporary_directory("gif_trailer");
+        let (staged, mut file) = StagedAnimationExport::reserve(&directory, "gif").unwrap();
+        let temporary_path = staged.temporary_path.clone();
+        file.write_all(b"GIF89a").unwrap();
+        drop(file);
+        assert!(staged.sync_payload().is_err());
+        drop(staged);
+        assert!(!temporary_path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn superseded_animation_generation_cannot_reach_publication() {
+        let active = Arc::new(AtomicUsize::new(17));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let token = PlanetaryJobToken::for_test(17, active.clone(), cancelled);
+        assert!(animation_export_checkpoint(&token, "el test").is_ok());
+        active.store(18, Ordering::Release);
+        assert!(animation_export_checkpoint(&token, "la publicacion").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_animation_pipe_kills_and_reaps_encoder_promptly() {
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        let mut process = super::AnimationFfmpegProcess::spawn(command).unwrap();
+        let token = PlanetaryJobToken::for_test(
+            23,
+            Arc::new(AtomicUsize::new(23)),
+            Arc::new(AtomicBool::new(true)),
+        );
+        let started = std::time::Instant::now();
+        assert!(process.write_frame(vec![0u8; 4096], &token).is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "la cancelacion de una tuberia bloqueada no fue inmediata"
+        );
+    }
+}
+
+fn robust_image_peak_u16(image: &DynamicImage) -> f32 {
+    // Un histograma fijo sustituye el Vec<f32>+sort de todos los píxeles. La
+    // conversión temporal es de una sola imagen y el muestreo queda acotado a
+    // ~2 Mpx, por lo que una secuencia 8K no se precarga ni ordena en RAM.
+    let luma = image.to_luma16();
+    let total_pixels = luma.len().max(1);
+    let step = total_pixels.saturating_add(1_999_999) / 2_000_000;
+    let mut histogram = vec![0u32; 65_536];
+    let mut sampled = 0usize;
+    for sample in luma.as_raw().iter().step_by(step.max(1)) {
+        histogram[*sample as usize] += 1;
+        sampled += 1;
+    }
+    if sampled == 0 {
+        return 0.0;
+    }
+    let wanted = (sampled / 1000).max(1).min(1000).min(sampled);
+    let mut remaining = wanted;
+    let mut sum = 0u64;
+    for value in (0..histogram.len()).rev() {
+        let take = remaining.min(histogram[value] as usize);
+        sum = sum.saturating_add((value as u64).saturating_mul(take as u64));
+        remaining -= take;
+        if remaining == 0 {
+            break;
+        }
+    }
+    sum as f32 / wanted as f32
+}
+
+fn apply_image_gain_preserving_layout(image: &mut DynamicImage, gain: f32) {
+    let gain8 = |value: u8| (value as f32 * gain).round().clamp(0.0, 255.0) as u8;
+    let gain16 = |value: u16| (value as f32 * gain).round().clamp(0.0, 65_535.0) as u16;
+    match image {
+        DynamicImage::ImageLuma8(buffer) => buffer.as_mut().iter_mut().for_each(|v| *v = gain8(*v)),
+        DynamicImage::ImageLumaA8(buffer) => buffer
+            .as_mut()
+            .chunks_exact_mut(2)
+            .for_each(|px| px[0] = gain8(px[0])),
+        DynamicImage::ImageRgb8(buffer) => buffer
+            .as_mut()
+            .iter_mut()
+            .for_each(|v| *v = gain8(*v)),
+        DynamicImage::ImageBgr8(buffer) => buffer
+            .as_mut()
+            .iter_mut()
+            .for_each(|v| *v = gain8(*v)),
+        DynamicImage::ImageRgba8(buffer) => buffer
+            .as_mut()
+            .chunks_exact_mut(4)
+            .for_each(|px| px[..3].iter_mut().for_each(|v| *v = gain8(*v))),
+        DynamicImage::ImageBgra8(buffer) => buffer
+            .as_mut()
+            .chunks_exact_mut(4)
+            .for_each(|px| px[..3].iter_mut().for_each(|v| *v = gain8(*v))),
+        DynamicImage::ImageLuma16(buffer) => buffer.as_mut().iter_mut().for_each(|v| *v = gain16(*v)),
+        DynamicImage::ImageLumaA16(buffer) => buffer
+            .as_mut()
+            .chunks_exact_mut(2)
+            .for_each(|px| px[0] = gain16(px[0])),
+        DynamicImage::ImageRgb16(buffer) => buffer
+            .as_mut()
+            .iter_mut()
+            .for_each(|v| *v = gain16(*v)),
+        DynamicImage::ImageRgba16(buffer) => buffer
+            .as_mut()
+            .chunks_exact_mut(4)
+            .for_each(|px| px[..3].iter_mut().for_each(|v| *v = gain16(*v))),
+    }
+}
+
+/// Rename a directory only if the destination does not exist.  POSIX rename
+/// normally replaces an existing empty directory, which is unsafe for an
+/// output transaction even when names contain a random suffix.
+#[cfg(target_os = "linux")]
+fn rename_directory_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes())?;
+    let destination = CString::new(destination.as_os_str().as_bytes())?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_directory_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes())?;
+    let destination = CString::new(destination.as_os_str().as_bytes())?;
+    let result = unsafe {
+        libc::renamex_np(
+            source.as_ptr(),
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "windows", not(any(target_os = "linux", target_os = "macos"))))]
+fn rename_directory_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    if destination.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "el destino ya existe",
+        ));
+    }
+    // MoveFile/MoveFileEx without MOVEFILE_REPLACE_EXISTING is exclusive on
+    // Windows.  The preflight is retained for less common targets.
+    std::fs::rename(source, destination)
+}
+
+/// Multi-file outputs are encoded and fsynced below a hidden sibling
+/// directory.  One exclusive directory rename publishes the complete set;
+/// cancellation or any encode error removes the entire hidden tree.
+struct StagedPlanetaryDirectory {
+    temporary_dir: PathBuf,
+    final_dir: PathBuf,
+    published: bool,
+}
+
+impl StagedPlanetaryDirectory {
+    fn create(parent: &Path, tag: &str) -> Result<Self, String> {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        for _ in 0..64 {
+            let suffix = derot_unique_suffix();
+            let final_dir = parent.join(format!("{tag}_{suffix}"));
+            let temporary_dir = parent.join(format!(".{tag}_{suffix}.tmp"));
+            if final_dir.exists() {
+                continue;
+            }
+            match std::fs::create_dir(&temporary_dir) {
+                Ok(()) => {
+                    return Ok(Self {
+                        temporary_dir,
+                        final_dir,
+                        published: false,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err(format!("No se pudo reservar una carpeta de salida para {tag}"))
+    }
+
+    fn temporary_path(&self, file_name: &str) -> PathBuf {
+        self.temporary_dir.join(file_name)
+    }
+
+    fn final_path(&self, file_name: &str) -> PathBuf {
+        self.final_dir.join(file_name)
+    }
+
+    fn publish(&mut self) -> Result<(), String> {
+        if self.final_dir.exists() {
+            return Err(format!(
+                "La carpeta de salida ya existe y no se sobrescribira: {}",
+                self.final_dir.display()
+            ));
+        }
+        #[cfg(not(target_os = "windows"))]
+        File::open(&self.temporary_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("No se pudo sincronizar el lote temporal: {error}"))?;
+        rename_directory_no_replace(&self.temporary_dir, &self.final_dir)
+            .map_err(|error| format!("No se pudo publicar el lote completo: {error}"))?;
+        sync_parent_directory(&self.final_dir);
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedPlanetaryDirectory {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_dir_all(&self.temporary_dir);
+        }
+    }
+}
+
+#[cfg(test)]
+mod planetary_directory_transaction_tests {
+    use super::StagedPlanetaryDirectory;
+
+    fn test_parent(label: &str) -> std::path::PathBuf {
+        let parent = std::env::temp_dir().join(format!(
+            "zas_planetary_transaction_{label}_{}_{}",
+            std::process::id(),
+            super::ANIMATION_EXPORT_SEQUENCE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&parent).unwrap();
+        parent
+    }
+
+    #[test]
+    fn incomplete_multi_file_output_is_completely_rolled_back() {
+        let parent = test_parent("rollback");
+        let staged = StagedPlanetaryDirectory::create(&parent, "Mosaic_Result").unwrap();
+        let temporary = staged.temporary_dir.clone();
+        let final_dir = staged.final_dir.clone();
+        std::fs::write(staged.temporary_path("master.tiff"), b"master").unwrap();
+        drop(staged);
+        assert!(!temporary.exists());
+        assert!(!final_dir.exists());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn multi_file_output_appears_with_one_directory_commit() {
+        let parent = test_parent("publish");
+        let mut staged = StagedPlanetaryDirectory::create(&parent, "Mosaic_Result").unwrap();
+        let temporary = staged.temporary_dir.clone();
+        let final_dir = staged.final_dir.clone();
+        std::fs::write(staged.temporary_path("master.tiff"), b"master").unwrap();
+        std::fs::write(staged.temporary_path("preview.png"), b"preview").unwrap();
+        assert!(!final_dir.exists());
+        staged.publish().unwrap();
+        assert!(!temporary.exists());
+        assert_eq!(std::fs::read(final_dir.join("master.tiff")).unwrap(), b"master");
+        assert_eq!(std::fs::read(final_dir.join("preview.png")).unwrap(), b"preview");
+        drop(staged);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+}
+
+fn safe_sequence_stem(source: &Path) -> String {
+    let stem = source
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("frame");
+    let sanitized: String = stem
+        .chars()
+        .take(80)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "frame".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn encode_sequence_png(
+    directory: &Path,
+    source: &Path,
+    index: usize,
+    tag: &str,
+    image: &DynamicImage,
+) -> Result<String, String> {
+    // PNG conserva L/LA/RGB/RGBA y 8/16-bit sin cuantización JPEG.  El
+    // índice hace el nombre único aunque dos fuentes compartan stem.
+    let file_name = format!(
+        "{:06}_{}_{}.png",
+        index.saturating_add(1),
+        safe_sequence_stem(source),
+        tag
+    );
+    let path = directory.join(&file_name);
+    if path.exists() {
+        return Err(format!(
+            "El archivo temporal de secuencia ya existe: {}",
+            path.display()
+        ));
+    }
+    image.save(&path).map_err(|error| error.to_string())?;
+    File::open(&path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    Ok(file_name)
 }
 
 #[tauri::command]
@@ -1086,133 +2019,252 @@ async fn normalize_batch_brightness(
     paths: Vec<String>,
 ) -> Result<Vec<String>, String> {
     state.license_manager.check_access()?;
-    emit_progress(&app, "Cargando imÃ¡genes...", 0.0, None);
+    if paths.is_empty() {
+        return Err("No hay imagenes para normalizar".into());
+    }
+    let request_id = begin_planetary_user_job(&state);
+    let job_token = PlanetaryJobToken::for_app(&app, request_id, state.cancel_requested.clone());
+    emit_progress(&app, "Midiendo brillo...", 0.0, None);
 
-    let images: Vec<(String, DynamicImage)> = paths
-        .par_iter()
-        .map(|p| {
-            let img = image::open(p).ok();
-            (p.clone(), img)
-        })
-        .filter_map(|(p, img)| img.map(|i| (p, i)))
+    let mut brightness_values = Vec::with_capacity(paths.len());
+    for (index, path) in paths.iter().enumerate() {
+        planetary_derotation_checkpoint(&job_token, "la medicion de brillo")?;
+        let image = image::open(path)
+            .map_err(|error| format!("No se pudo abrir {}: {error}", path))?;
+        brightness_values.push(robust_image_peak_u16(&image));
+        emit_progress(
+            &app,
+            "Midiendo brillo...",
+            45.0 * (index + 1) as f32 / paths.len() as f32,
+            None,
+        );
+    }
+    let mut finite_peaks: Vec<f32> = brightness_values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value > 10.0)
         .collect();
+    if finite_peaks.is_empty() {
+        return Err("Las imagenes no contienen señal suficiente para normalizar".into());
+    }
+    let middle = finite_peaks.len() / 2;
+    finite_peaks.select_nth_unstable_by(middle, |a, b| {
+        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let target_peak = finite_peaks[middle];
 
-    if images.is_empty() {
-        return Err("Error al cargar imÃ¡genes".into());
+    let output_parent = Path::new(&paths[0])
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged_directory =
+        StagedPlanetaryDirectory::create(output_parent, "Zenith_Normalized")?;
+    let mut staged_names = Vec::with_capacity(paths.len());
+    for (index, (path, current_peak)) in paths.iter().zip(brightness_values).enumerate() {
+        planetary_derotation_checkpoint(&job_token, "el ajuste de brillo")?;
+        if !current_peak.is_finite() || current_peak <= 10.0 {
+            return Err(format!("{} no contiene señal suficiente", path));
+        }
+        let mut image = image::open(path)
+            .map_err(|error| format!("No se pudo reabrir {}: {error}", path))?;
+        let gain = (target_peak / current_peak).clamp(0.25, 4.0);
+        if (gain - 1.0).abs() > 0.005 {
+            apply_image_gain_preserving_layout(&mut image, gain);
+        }
+        staged_names.push(encode_sequence_png(
+            &staged_directory.temporary_dir,
+            Path::new(path),
+            index,
+            "Normalized",
+            &image,
+        )?);
+        emit_progress(
+            &app,
+            "Codificando copias normalizadas...",
+            45.0 + 50.0 * (index + 1) as f32 / paths.len() as f32,
+            None,
+        );
     }
 
-    // PHASE 39: Robust 16-bit Peak-based Normalization
-    // We calculate the average of the brightest pixels (top 0.1%) to ignore background noise
-    // and focus on the object brightness itself.
-    let brightness_values: Vec<f32> = images
-        .iter()
-        .map(|(_, dynamic_img)| {
-            // Convert to 16-bit internally for analysis if needed, or use directly
-            let pixels: Vec<f32> = if let Some(rgb16) = dynamic_img.as_rgb16() {
-                rgb16
-                    .pixels()
-                    .map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32)
-                    .collect()
-            } else {
-                dynamic_img
-                    .to_rgb8()
-                    .pixels()
-                    .map(|p| {
-                        (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) * 256.0
-                    })
-                    .collect()
-            };
-
-            if pixels.is_empty() {
-                return 0.0;
-            }
-
-            let mut sorted = pixels;
-            sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-
-            // Mean of top 0.1% (minimum 10 pixels, max 1000 pixels for speed)
-            let top_count = ((sorted.len() as f32 * 0.001) as usize).clamp(10, 1000);
-            let peak_sum: f32 = sorted.iter().take(top_count).sum();
-            peak_sum / top_count as f32
-        })
-        .collect();
-
-    let target_peak = brightness_values.iter().sum::<f32>() / brightness_values.len() as f32;
-    emit_progress(&app, "Ajustando exposiciÃ³n (16-bit)...", 50.0, None);
-
-    let results: Vec<String> = images
-        .into_par_iter()
-        .zip(brightness_values)
-        .map(|((path, mut dynamic_img), current_peak)| {
-            if current_peak > 10.0 {
-                let gain = target_peak / current_peak;
-                if (gain - 1.0).abs() > 0.005 {
-                    // Apply gain in 16-bit
-                    if let Some(rgb16) = dynamic_img.as_mut_rgb16() {
-                        for p in rgb16.pixels_mut() {
-                            p[0] = (p[0] as f32 * gain).clamp(0.0, 65535.0) as u16;
-                            p[1] = (p[1] as f32 * gain).clamp(0.0, 65535.0) as u16;
-                            p[2] = (p[2] as f32 * gain).clamp(0.0, 65535.0) as u16;
-                        }
-                    } else {
-                        // Fallback 8-bit
-                        let mut rgb8 = dynamic_img.to_rgb8();
-                        for p in rgb8.pixels_mut() {
-                            p[0] = (p[0] as f32 * gain).clamp(0.0, 255.0) as u8;
-                            p[1] = (p[1] as f32 * gain).clamp(0.0, 255.0) as u8;
-                            p[2] = (p[2] as f32 * gain).clamp(0.0, 255.0) as u8;
-                        }
-                        dynamic_img = DynamicImage::ImageRgb8(rgb8);
-                    }
-                    // Overwrite original preserving depth
-                    let _ = dynamic_img.save(&path);
-                }
-            }
-
-            // ASSET PROTOCOL: el archivo ya quedo sobrescrito en disco — la UI
-            // recarga la MISMA ruta via convertFileSrc (con cache-busting).
-            // Devolver base64 por IPC re-pinaba todos los frames en el heap
-            // del WebView (el mismo problema de RAM que se elimino del batch).
-            path
-        })
-        .collect();
-
-    emit_progress(&app, "NormalizaciÃ³n completa", 100.0, None);
+    let results = with_current_planetary_job(
+        &state.planetary_generation_gate,
+        &job_token,
+        "la publicacion del lote normalizado",
+        || -> Result<Vec<String>, String> {
+            let results = staged_names
+                .iter()
+                .map(|name| clean_windows_path(staged_directory.final_path(name)))
+                .collect();
+            staged_directory.publish()?;
+            Ok(results)
+        },
+    )??;
+    emit_progress(&app, "Normalizacion completa", 100.0, None);
     Ok(results)
 }
 
-#[tauri::command]
-async fn crop_animation_frames(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    paths: Vec<String>,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-) -> Result<Vec<String>, String> {
-    state.license_manager.check_access()?;
-    emit_progress(&app, "Recortando animacion...", 0.0, None);
-    let results: Result<Vec<String>, String> = paths
-        .par_iter()
-        .enumerate()
-        .map(|(_, p)| {
-            let path = Path::new(p);
-            let mut img = image::open(path).map_err(|e| e.to_string())?;
-            let cropped = img.crop(x, y, w, h);
-            cropped.save(path).map_err(|e| e.to_string())?;
-            let mut buf = Vec::new();
-            DynamicImage::ImageRgba8(cropped.to_rgba8())
-                .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
-                .map_err(|e| e.to_string())?;
-            Ok(format!(
-                "data:image/png;base64,{}",
-                general_purpose::STANDARD.encode(&buf)
-            ))
-        })
-        .collect();
-    emit_progress(&app, "Recorte finalizado", 100.0, None);
-    results
+#[cfg(test)]
+mod brightness_normalization_tests {
+    use super::{apply_image_gain_preserving_layout, robust_image_peak_u16};
+    use image::{DynamicImage, ImageBuffer, LumaA, Rgba};
+
+    #[test]
+    fn gain_preserves_16_bit_lumaa_and_alpha() {
+        let buffer = ImageBuffer::from_pixel(2, 1, LumaA([10_000u16, 42_000u16]));
+        let mut image = DynamicImage::ImageLumaA16(buffer);
+        apply_image_gain_preserving_layout(&mut image, 2.0);
+        let pixel = image.as_luma_alpha16().unwrap().get_pixel(0, 0);
+        assert_eq!(pixel.0, [20_000, 42_000]);
+    }
+
+    #[test]
+    fn gain_preserves_rgba16_and_alpha() {
+        let buffer = ImageBuffer::from_pixel(1, 1, Rgba([1_000u16, 2_000, 3_000, 55_000]));
+        let mut image = DynamicImage::ImageRgba16(buffer);
+        apply_image_gain_preserving_layout(&mut image, 1.5);
+        assert_eq!(image.as_rgba16().unwrap().get_pixel(0, 0).0, [1_500, 3_000, 4_500, 55_000]);
+    }
+
+    #[test]
+    fn histogram_peak_uses_bright_tail_without_pixel_sort() {
+        let mut buffer = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_pixel(
+            100,
+            100,
+            image::Luma([100u16]),
+        );
+        for x in 0..10 {
+            buffer.put_pixel(x, 0, image::Luma([50_000]));
+        }
+        assert_eq!(robust_image_peak_u16(&DynamicImage::ImageLuma16(buffer)), 50_000.0);
+    }
+}
+
+fn animation_alignment_mono_u16(image: &DynamicImage) -> Result<Vec<u16>, String> {
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    let pixels = width
+        .checked_mul(height)
+        .ok_or_else(|| "Frame de animacion demasiado grande".to_string())?;
+    let rgb = image.to_rgb16();
+    let mut mono = Vec::new();
+    mono.try_reserve_exact(pixels)
+        .map_err(|error| format!("Memoria insuficiente para alinear el frame: {error}"))?;
+    mono.extend(rgb.pixels().map(|pixel| {
+        let value = pixel[0] as u32 * 299 + pixel[1] as u32 * 587 + pixel[2] as u32 * 114;
+        ((value + 500) / 1000) as u16
+    }));
+    Ok(mono)
+}
+
+fn bilinear_shift_animation_frame(
+    image: &DynamicImage,
+    dx: f32,
+    dy: f32,
+    job_token: &PlanetaryJobToken,
+) -> Result<DynamicImage, String> {
+    let width = image.width();
+    let height = image.height();
+    let is_16bit = matches!(
+        image,
+        DynamicImage::ImageLuma16(_)
+            | DynamicImage::ImageLumaA16(_)
+            | DynamicImage::ImageRgb16(_)
+            | DynamicImage::ImageRgba16(_)
+    );
+
+    macro_rules! interpolate {
+        ($source:expr, $output:expr, $sample:ty, $max:expr) => {{
+            for y_out in 0..height {
+                if y_out % 32 == 0 {
+                    planetary_derotation_checkpoint(job_token, "el remuestreo de la animacion")?;
+                }
+                for x_out in 0..width {
+                    let src_x = x_out as f32 + dx;
+                    let src_y = y_out as f32 + dy;
+                    if src_x < 0.0
+                        || src_x >= width.saturating_sub(1) as f32
+                        || src_y < 0.0
+                        || src_y >= height.saturating_sub(1) as f32
+                    {
+                        continue;
+                    }
+                    let x0 = src_x.floor() as u32;
+                    let y0 = src_y.floor() as u32;
+                    let wx = src_x - x0 as f32;
+                    let wy = src_y - y0 as f32;
+                    let p00 = $source.get_pixel(x0, y0);
+                    let p10 = $source.get_pixel(x0 + 1, y0);
+                    let p01 = $source.get_pixel(x0, y0 + 1);
+                    let p11 = $source.get_pixel(x0 + 1, y0 + 1);
+                    let mut pixel = image::Rgb([0 as $sample; 3]);
+                    for channel in 0..3 {
+                        let top = p00[channel] as f32 * (1.0 - wx) + p10[channel] as f32 * wx;
+                        let bottom = p01[channel] as f32 * (1.0 - wx) + p11[channel] as f32 * wx;
+                        pixel[channel] = (top * (1.0 - wy) + bottom * wy)
+                            .round()
+                            .clamp(0.0, $max) as $sample;
+                    }
+                    $output.put_pixel(x_out, y_out, pixel);
+                }
+            }
+        }};
+    }
+
+    if is_16bit {
+        let source = image.to_rgb16();
+        let mut shifted = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::new(width, height);
+        interpolate!(source, shifted, u16, 65_535.0);
+        Ok(DynamicImage::ImageRgb16(shifted))
+    } else {
+        // Una sola conversión por frame. La implementación anterior ejecutaba
+        // to_rgb8() dentro del bucle de cada píxel (O(P²) copias de memoria).
+        let source = image.to_rgb8();
+        let mut shifted = image::RgbImage::new(width, height);
+        interpolate!(source, shifted, u8, 255.0);
+        Ok(DynamicImage::ImageRgb8(shifted))
+    }
+}
+
+#[cfg(test)]
+mod animation_realign_tests {
+    use super::{
+        animation_alignment_mono_u16, bilinear_shift_animation_frame, PlanetaryJobToken,
+    };
+    use image::{DynamicImage, ImageBuffer, Rgb};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Arc;
+
+    fn token(active_value: usize, request_id: usize) -> PlanetaryJobToken {
+        PlanetaryJobToken::for_test(
+            request_id,
+            Arc::new(AtomicUsize::new(active_value)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    #[test]
+    fn alignment_analysis_preserves_native_sixteen_bit_luminance() {
+        let image = DynamicImage::ImageRgb16(ImageBuffer::from_pixel(
+            2,
+            2,
+            Rgb([10_000u16, 20_000, 30_000]),
+        ));
+        let mono = animation_alignment_mono_u16(&image).unwrap();
+        assert_eq!(mono, vec![18_150u16; 4]);
+    }
+
+    #[test]
+    fn bilinear_realign_is_cancelable_and_keeps_sixteen_bit_samples() {
+        let mut source = ImageBuffer::<Rgb<u16>, Vec<u16>>::new(3, 3);
+        for y in 0..3 {
+            for x in 0..3 {
+                source.put_pixel(x, y, Rgb([1_000 + x as u16, 2_000 + y as u16, 3_000]));
+            }
+        }
+        let image = DynamicImage::ImageRgb16(source);
+        let aligned = bilinear_shift_animation_frame(&image, 0.0, 0.0, &token(4, 4)).unwrap();
+        assert_eq!(aligned.to_rgb16().get_pixel(1, 1).0, [1_001, 2_001, 3_000]);
+        assert!(bilinear_shift_animation_frame(&image, 0.0, 0.0, &token(5, 4)).is_err());
+    }
 }
 
 #[tauri::command]
@@ -1224,6 +2276,11 @@ async fn realign_animation_frames(
     custom_roi: Option<(usize, usize, usize, usize)>, // NEW: User selected ROI (x, y, w, h)
 ) -> Result<Vec<String>, String> {
     state.license_manager.check_access()?;
+    if !matches!(mode_type.as_str(), "planetary" | "surface") {
+        return Err(format!("Modo de alineacion no compatible: {mode_type}"));
+    }
+    let request_id = begin_planetary_user_job(&state);
+    let job_token = PlanetaryJobToken::for_app(&app, request_id, state.cancel_requested.clone());
 
     #[cfg(target_arch = "x86_64")]
     let use_avx2 = is_x86_feature_detected!("avx2");
@@ -1244,18 +2301,17 @@ async fn realign_animation_frames(
 
     // 1. Cargar Anchor (Primer Frame)
     let p0 = Path::new(&paths[0]);
-    let img0 = image::open(p0).map_err(|e| e.to_string())?.to_rgb8();
+    let img0 = image::open(p0).map_err(|e| e.to_string())?;
     let w = img0.width() as usize;
     let h = img0.height() as usize;
+    if w < 2 || h < 2 {
+        return Err("Los frames deben medir al menos 2x2 pixeles".into());
+    }
 
     // Convertir anchor a mono u16 para SAD
     // Convertir anchor a mono u16 para SAD
     let anchor_mono = {
-        let mut m = Vec::with_capacity(w * h);
-        for p in img0.pixels() {
-            let val = (p[0] as u32 + p[1] as u32 + p[2] as u32) / 3;
-            m.push(val as u16 * 256);
-        }
+        let m = animation_alignment_mono_u16(&img0)?;
         if mode_type == "surface" {
             enhance_solar_surface(&m, w, h)
         } else {
@@ -1287,20 +2343,58 @@ async fn realign_animation_frames(
     // Bounds check for safety
     let roi_w = roi_w.min(w);
     let roi_h = roi_h.min(h);
+    if roi_w == 0 || roi_h == 0 {
+        return Err("El ROI de alineacion esta vacio".into());
+    }
     let stab_x = roi_x.min(w - roi_w);
     let stab_y = roi_y.min(h - roi_h);
 
     emit_progress(&app, "Analizando movimientos...", 10.0, None);
 
-    // 2. Procesar todos los frames
-    let results: Result<Vec<String>, String> = paths
-        .par_iter()
-        .enumerate()
-        .map(|(i, p)| {
-            if i == 0 {
-                // Primer frame = anchor: no se toca en disco, devolver su ruta.
-                return Ok(p.clone());
-            }
+    // 2. Procesar con concurrencia acotada por la RAM disponible. Cada worker
+    // conserva fuente+mono+realzado+salida; evitar un worker por núcleo es vital
+    // con masters lunares de decenas o cientos de megapíxeles.
+    let pixels = w
+        .checked_mul(h)
+        .ok_or_else(|| "Frame de animacion demasiado grande".to_string())?;
+    // Peor caso 16-bit: DynamicImage (6-8 B/px), RGB16 de análisis (6),
+    // mono+realzado (4), pirámide, salida RGB16 (6) y margen del decoder.
+    let per_worker_bytes = (pixels as u64)
+        .saturating_mul(28)
+        .saturating_add(32 * 1024 * 1024);
+    let mut system = System::new();
+    system.refresh_memory();
+    let available = system.available_memory();
+    let reserve = (available / 5)
+        .clamp(256 * 1024 * 1024, 1024 * 1024 * 1024)
+        .min(available / 2);
+    let safe_workers = available
+        .saturating_sub(reserve)
+        .checked_div(per_worker_bytes.max(1))
+        .unwrap_or(1)
+        .max(1) as usize;
+    let worker_count = safe_workers
+        .min(paths.len())
+        .min(rayon::current_num_threads().max(1));
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_count)
+        .thread_name(|index| format!("planetary-animation-align-{index}"))
+        .build()
+        .map_err(|error| format!("No se pudo crear el pool de alineacion: {error}"))?;
+
+    let output_parent = Path::new(&paths[0])
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged_directory =
+        StagedPlanetaryDirectory::create(output_parent, "Zenith_Aligned")?;
+    let staging_temp = staged_directory.temporary_dir.clone();
+
+    let staged_result: Result<Vec<String>, String> = pool.install(|| {
+        paths
+            .par_iter()
+            .enumerate()
+            .map(|(i, p)| {
+                planetary_derotation_checkpoint(&job_token, "la alineacion de animacion")?;
 
             let path = Path::new(p);
             let img = image::open(path).map_err(|e| e.to_string())?;
@@ -1309,23 +2403,13 @@ async fn realign_animation_frames(
                 return Err("Dimensiones inconsistentes detectadas en los frames de la animaciÃ³n. AsegÃºrate de que todas las imÃ¡genes tengan el mismo tamaÃ±o o recÃ³rtalas.".to_string());
             }
 
+            if i == 0 {
+                return encode_sequence_png(&staging_temp, path, i, "Aligned", &img);
+            }
+
             // Convert to mono for alignment analysis only (doesn't change original img)
             let current_mono = {
-                let w_u32 = img.width();
-                let h_u32 = img.height();
-                let mut m = Vec::with_capacity((w_u32 * h_u32) as usize);
-
-                if let Some(rgb16) = img.as_rgb16() {
-                    for p in rgb16.pixels() {
-                        let luma = (p[0] as u32 + p[1] as u32 + p[2] as u32) / 3;
-                        m.push(luma as u16);
-                    }
-                } else {
-                    for p in img.to_rgb8().pixels() {
-                        let luma = (p[0] as u32 + p[1] as u32 + p[2] as u32) / 3;
-                        m.push(luma as u16 * 256);
-                    }
-                }
+                let m = animation_alignment_mono_u16(&img)?;
 
                 if mode_type == "surface" {
                     enhance_solar_surface(&m, w, h)
@@ -1359,87 +2443,28 @@ async fn realign_animation_frames(
                 fine_range,
             );
 
-            // PHASE 39: 16-bit aware Bilinear Shift
-            let mut shifted_16 = image::ImageBuffer::new(w as u32, h as u32);
-            let mut shifted_8 = image::ImageBuffer::new(w as u32, h as u32);
-            let is_16bit = img.as_rgb16().is_some();
-
-            for y_out in 0..h as u32 {
-                for x_out in 0..w as u32 {
-                    let src_x = x_out as f32 + dx;
-                    let src_y = y_out as f32 + dy;
-
-                    if src_x >= 0.0
-                        && src_x < (w as f32 - 1.0)
-                        && src_y >= 0.0
-                        && src_y < (h as f32 - 1.0)
-                    {
-                        let x0 = src_x.floor() as u32;
-                        let y0 = src_y.floor() as u32;
-                        let x1 = x0 + 1;
-                        let y1 = y0 + 1;
-                        let wx = src_x - x0 as f32;
-                        let wy = src_y - y0 as f32;
-
-                        if is_16bit {
-                            let rgb16 = img.as_rgb16().unwrap();
-                            let p00 = rgb16.get_pixel(x0, y0);
-                            let p10 = rgb16.get_pixel(x1, y0);
-                            let p01 = rgb16.get_pixel(x0, y1);
-                            let p11 = rgb16.get_pixel(x1, y1);
-
-                            let mut new_p = image::Rgb([0u16, 0u16, 0u16]);
-                            for c in 0..3 {
-                                let v00 = p00[c] as f32;
-                                let v10 = p10[c] as f32;
-                                let v01 = p01[c] as f32;
-                                let v11 = p11[c] as f32;
-                                let val = (v00 * (1.0 - wx) + v10 * wx) * (1.0 - wy)
-                                    + (v01 * (1.0 - wx) + v11 * wx) * wy;
-                                new_p[c] = val as u16;
-                            }
-                            shifted_16.put_pixel(x_out, y_out, new_p);
-                        } else {
-                            let rgb8 = img.to_rgb8();
-                            let p00 = rgb8.get_pixel(x0, y0);
-                            let p10 = rgb8.get_pixel(x1, y0);
-                            let p01 = rgb8.get_pixel(x0, y1);
-                            let p11 = rgb8.get_pixel(x1, y1);
-
-                            let mut new_p = image::Rgb([0u8, 0u8, 0u8]);
-                            for c in 0..3 {
-                                let v00 = p00[c] as f32;
-                                let v10 = p10[c] as f32;
-                                let v01 = p01[c] as f32;
-                                let v11 = p11[c] as f32;
-                                let val = (v00 * (1.0 - wx) + v10 * wx) * (1.0 - wy)
-                                    + (v01 * (1.0 - wx) + v11 * wx) * wy;
-                                new_p[c] = val as u8;
-                            }
-                            shifted_8.put_pixel(x_out, y_out, new_p);
-                        }
-                    }
-                }
-            }
-
-            // Save and Return base64
-            let final_img = if is_16bit {
-                DynamicImage::ImageRgb16(shifted_16)
-            } else {
-                DynamicImage::ImageRgb8(shifted_8)
-            };
-
-            final_img.save(path).map_err(|e| e.to_string())?;
-
-            // ASSET PROTOCOL: el frame realineado ya esta sobrescrito en disco;
-            // la UI lo recarga por ruta (cache-busting en el frontend). El
-            // base64 por IPC pinaba todos los frames en el heap del WebView.
-            Ok(p.clone())
+            let final_img = bilinear_shift_animation_frame(&img, dx, dy, &job_token)?;
+            encode_sequence_png(&staging_temp, path, i, "Aligned", &final_img)
         })
-        .collect();
-
+        .collect()
+    });
+    let staged_names = staged_result?;
+    emit_progress(&app, "Publicando alineacion...", 95.0, None);
+    let results = with_current_planetary_job(
+        &state.planetary_generation_gate,
+        &job_token,
+        "la publicacion de la animacion alineada",
+        || -> Result<Vec<String>, String> {
+            let results = staged_names
+                .iter()
+                .map(|name| clean_windows_path(staged_directory.final_path(name)))
+                .collect();
+            staged_directory.publish()?;
+            Ok(results)
+        },
+    )??;
     emit_progress(&app, "Alineacion completada", 100.0, None);
-    results
+    Ok(results)
 }
 
 /// Center-crop or zero-pad an interleaved RGB16 image to target dimensions.
@@ -1462,6 +2487,63 @@ fn center_crop_or_pad_rgb(src: &[u16], w: usize, h: usize, tw: usize, th: usize)
     out
 }
 
+/// Contrato único para los ajustes que dependen de las propiedades del máster.
+/// Preview, exportación y lote deben resolver exactamente lo mismo: un cero
+/// introducido por el usuario es identidad, nunca una orden implícita de aplicar
+/// un preset. El único ajuste automático es neutralizar WB en un máster mono,
+/// donde los multiplicadores R/B no tienen significado cromático.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ResolvedPostProcessingContract {
+    usm_amount: f32,
+    usm_radius: f32,
+    lce_amount: f32,
+    r_bal: f32,
+    b_bal: f32,
+}
+
+fn resolve_post_processing_contract(
+    is_mono: bool,
+    usm_amount: f32,
+    usm_radius: f32,
+    lce_amount: f32,
+    r_bal: f32,
+    b_bal: f32,
+) -> ResolvedPostProcessingContract {
+    let (r_bal, b_bal) = if is_mono { (0.0, 0.0) } else { (r_bal, b_bal) };
+    ResolvedPostProcessingContract {
+        usm_amount,
+        usm_radius,
+        lce_amount,
+        r_bal,
+        b_bal,
+    }
+}
+
+#[cfg(test)]
+mod wysiwyg_contract_tests {
+    use super::resolve_post_processing_contract;
+
+    #[test]
+    fn zero_sharpening_remains_zero_for_mono_surface() {
+        let resolved = resolve_post_processing_contract(true, 0.0, 0.0, 0.0, 0.35, -0.2);
+        assert_eq!(resolved.usm_amount, 0.0);
+        assert_eq!(resolved.usm_radius, 0.0);
+        assert_eq!(resolved.lce_amount, 0.0);
+        assert_eq!(resolved.r_bal, 0.0);
+        assert_eq!(resolved.b_bal, 0.0);
+    }
+
+    #[test]
+    fn color_master_preserves_the_user_recipe_exactly() {
+        let resolved = resolve_post_processing_contract(false, 0.65, 1.25, 12.0, 0.08, -0.04);
+        assert_eq!(resolved.usm_amount, 0.65);
+        assert_eq!(resolved.usm_radius, 1.25);
+        assert_eq!(resolved.lce_amount, 12.0);
+        assert_eq!(resolved.r_bal, 0.08);
+        assert_eq!(resolved.b_bal, -0.04);
+    }
+}
+
 #[tauri::command]
 async fn process_batch_entry(
     app: tauri::AppHandle,
@@ -1470,7 +2552,7 @@ async fn process_batch_entry(
     output_folder: String,
     stack_pct: f32,
     drizzle: f32,
-    _align_mode: String,
+    align_mode: String,
     u1: f32,
     u2: f32,
     u3: f32,
@@ -1504,7 +2586,7 @@ async fn process_batch_entry(
     deconv_sigma: f32,
     vc_iter: usize,
     vc_sigma: f32,
-    _usm_amount: f32,
+    usm_amount: f32,
     usm_radius: f32,
     lce_amount: f32,
     blend: f32,
@@ -1540,12 +2622,15 @@ async fn process_batch_entry(
     levels_gamma: Option<f32>,         // Niveles: gamma medios (0.1..5)
 ) -> Result<BatchEntryResult, String> {
     state.license_manager.check_access()?;
-    // Nueva entrada del lote: limpiar cancelaciones previas. Si el usuario
-    // cancela a mitad de este archivo, el analisis/apilado devuelve
-    // Err("Cancelado") y el frontend corta el bucle del lote.
-    state
+    // El flag se rearma una sola vez al iniciar la sesión mediante
+    // clear_app_memory. Nunca se limpia por entrada: así una cancelación
+    // solicitada entre dos vídeos no puede perderse antes del siguiente.
+    if state
         .cancel_requested
-        .store(false, std::sync::atomic::Ordering::Relaxed);
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err("Cancelado por el usuario".to_string());
+    }
     let target_type = target_type.unwrap_or_else(|| {
         if batch_mode.contains("surface") || batch_mode.contains("solar") {
             "surface".to_string()
@@ -1556,21 +2641,12 @@ async fn process_batch_entry(
     let is_surface_batch =
         batch_mode.contains("surface") || batch_mode.contains("solar") || is_surface_target(&target_type);
     let warping_analysis = zenith_should_warp(&target_type, is_surface_batch, warping_analysis);
-    let is_v3 = is_v3.unwrap_or_else(|| _align_mode.contains("v3") || batch_mode.contains("v3"));
+    let is_v3 = is_v3.unwrap_or_else(|| align_mode.contains("v3") || batch_mode.contains("v3"));
     // Removed: let _ = (deconv_iter, deconv_sigma, vc_iter, vc_sigma);
     // Now using these parameters to apply deconvolution in batch mode
     if drizzle > 1.0 && !state.license_manager.is_pro() {
         return Err("Drizzle > 1.0 requiere licencia PRO.".into());
     }
-
-    {
-        state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
-    {
-        state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
-    state.active_req_id.store(0, Ordering::Relaxed);
 
     let path_obj = Path::new(&file_path);
     let fname = path_obj
@@ -1580,21 +2656,10 @@ async fn process_batch_entry(
     // PR-1.9: sin colisiones de salida. El escaneo recursivo puede traer
     // vídeos homónimos de subcarpetas distintas (A/Mars.ser y B/Mars.ser);
     // nombrar solo por file_stem SOBRESCRIBÍA el primero en silencio.
-    let save_path = {
-        let base = Path::new(&output_folder).join(format!("{}.png", fname));
-        if !base.exists() {
-            base
-        } else {
-            let mut k = 2usize;
-            loop {
-                let candidate = Path::new(&output_folder).join(format!("{}_{}.png", fname, k));
-                if !candidate.exists() {
-                    break candidate;
-                }
-                k += 1;
-            }
-        }
-    };
+    // El sufijo de alta resolución elimina el check-then-create y mantiene
+    // resultados homónimos/solapados separados sin truncar al ganador.
+    let save_path = Path::new(&output_folder)
+        .join(format!("{}_{}.png", fname, derot_unique_suffix()));
 
     let prefix_str = progress_prefix.clone().unwrap_or_default();
     let get_msg = |msg: &str| {
@@ -1610,35 +2675,52 @@ async fn process_batch_entry(
     let w = r.width();
     let h = r.height();
     let bpp = r.bpp();
-    let cid = bayer_override.unwrap_or_else(|| r.color_id());
+    let cid = r.resolve_bayer_override(bayer_override)?;
 
     let ref_idx = select_signal_frame_index(&r, w, h, bpp, cid, total / 2);
 
     // --- CACHE & SCORE LOGIC ---
-    let suffix =
-        zenith_analysis_cache_suffix(&target_type, is_surface_batch, warping_analysis, anchor_override.is_some());
+    let requested_roi = requested_analysis_roi(
+        w,
+        h,
+        &target_type,
+        is_surface_batch,
+        warping_analysis,
+        anchor_override.as_deref(),
+    );
+    let suffix = zenith_analysis_cache_suffix(
+        &target_type,
+        is_surface_batch,
+        warping_analysis,
+        cid,
+        anchor_override.as_deref(),
+        requested_roi,
+    );
     let cache_path = get_analysis_cache_path(&file_path, &suffix);
     let source_fingerprint = planetary_source_fingerprint(&file_path)?;
-    let mut cached_opt: Option<CachedAnalysis> = if Path::new(&cache_path).exists() {
-        load_cached_analysis(&cache_path).filter(|cached| {
-            cached.path_hash == source_fingerprint
-                && cached.width == Some(w)
-                && cached.height == Some(h)
-                // Igual que el análisis interactivo: el total puede ser una
-                // estimación en vídeos comprimidos — el fingerprint manda.
-                && cached.frame_stats.as_ref().is_some_and(|stats| {
-                    !stats.is_empty()
-                        && stats.iter().all(|item| item.idx < total.max(stats.len()))
-                })
-        })
-    } else {
-        None
+    let cache_expectation = AnalysisCacheExpectation {
+        source_fingerprint,
+        resolved_color_id: cid,
+        target_type: normalized_analysis_target(&target_type),
+        is_surface: is_surface_batch,
+        warping_analysis,
+        anchor_override: anchor_override.clone(),
+        requested_roi,
+        width: w,
+        height: h,
+        declared_frame_count: total,
+        frame_count_exact: r.frame_count_is_exact(),
     };
+    let mut cached_opt: Option<CachedAnalysis> =
+        load_validated_analysis_cache(&cache_path, &cache_expectation)
+            .map(|(cached, _location)| cached);
 
     if cached_opt.is_none() {
+        let analysis_request_id = next_planetary_generation(&state);
         let _ = perform_standardized_analysis(
             &app,
             &state,
+            analysis_request_id,
             &file_path,
             is_surface_batch,
             target_type.clone(), // NEW
@@ -1650,7 +2732,8 @@ async fn process_batch_entry(
             // individual (antes forzaba Auto e ignoraba la elección).
             ComputePolicy::from_legacy(gpu_mode.as_deref()),
         )?; // PR-2.5: síncrona (el lote ya corre por entrada, sin .await)
-        cached_opt = load_cached_analysis(&cache_path);
+        cached_opt = load_validated_analysis_cache(&cache_path, &cache_expectation)
+            .map(|(cached, _location)| cached);
     }
 
     if cached_opt.is_none() {
@@ -1695,9 +2778,11 @@ async fn process_batch_entry(
     drop(r);
 
     let ap_size_px = ap_grid_size.unwrap_or(32).max(8);
+    let stack_request_id = next_planetary_generation(&state);
     let _engine_preview = stack_video_liquid_warping_impl(
         &app,
         &state,
+        stack_request_id,
         file_path.clone(),
         stack_pct,
         custom_points,
@@ -1721,19 +2806,42 @@ async fn process_batch_entry(
     )?; // PR-2.5: síncrona (el lote ya corre por entrada, sin .await)
 
     // 3. Recoger el resultado del motor (y liberar el slot compartido).
-    let engine_stack = state
-        .stacked_image
-        .lock()
-        .unwrap()
-        .take()
-        .ok_or("El motor Zenith no produjo resultado")?;
+    let engine_stack = {
+        let _generation_guard = state
+            .planetary_generation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.cancel_requested.load(Ordering::Acquire)
+            || state.active_req_id.load(Ordering::Acquire) != stack_request_id
+        {
+            return Err("Cancelado o sustituido por otro apilado".into());
+        }
+        state
+            .stacked_image
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .ok_or("El motor Zenith no produjo resultado")?
+    };
+    let engine_is_mono = engine_stack.is_mono;
     let stacked_data = engine_stack.data;
     let out_w = engine_stack.width;
     let out_h = engine_stack.height;
 
-    // El analisis in-band pudo mover active_req_id; el pipeline de filtros
-    // del batch compara contra 0 — re-sincronizar para no auto-cancelarse.
-    state.active_req_id.store(0, Ordering::Relaxed);
+    // El post del lote recibe una generación propia sin rearmar el flag: una
+    // cancelación entre apilado y filtros permanece sticky.
+    if state
+        .cancel_requested
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err("Cancelado por el usuario".to_string());
+    }
+    let batch_postprocess_request_id = next_planetary_generation(&state);
+    let batch_postprocess_token = PlanetaryJobToken::for_app(
+        &app,
+        batch_postprocess_request_id,
+        state.cancel_requested.clone(),
+    );
 
     // CONSISTENCIA CON EL FIX DE DISCO GRANDE (single-file): una Luna / fase
     // lunar grande se estabiliza por TEXTURA (SAD contra anchor), igual que
@@ -1772,16 +2880,51 @@ async fn process_batch_entry(
             }
         }
 
-        // Estabilizacion Solar usando el Anchor
-        let mut anchor_guard = state.batch_anchor.lock().unwrap_or_else(|e| e.into_inner());
-        let mut dims_guard = state.batch_anchor_dims.lock().unwrap_or_else(|e| e.into_inner());
+        // Snapshot coherente del anchor. El cálculo pesado queda fuera de los
+        // mutex y el commit vuelve a pasar por el gate generacional: un worker
+        // sustituido nunca puede repoblar la sesión después de clear_app_memory.
+        let (anchor_snapshot, anchor_dims) = with_current_planetary_job(
+            &state.planetary_generation_gate,
+            &batch_postprocess_token,
+            "la lectura del anchor batch",
+            || {
+                let anchor = state
+                    .batch_anchor
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                let dims = *state
+                    .batch_anchor_dims
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                (anchor, dims)
+            },
+        )?;
 
-        if anchor_guard.is_none() {
-            *anchor_guard = Some(solar_out.clone());
-            *dims_guard = (safe_w, safe_h);
+        if anchor_snapshot.is_none() {
+            with_current_planetary_job(
+                &state.planetary_generation_gate,
+                &batch_postprocess_token,
+                "la inicializacion del anchor batch",
+                || {
+                    let mut anchor = state
+                        .batch_anchor
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let mut dims = state
+                        .batch_anchor_dims
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    *anchor = Some(solar_out.clone());
+                    *dims = (safe_w, safe_h);
+                },
+            )?;
             (solar_out, safe_w, safe_h)
         } else {
-            let (aw, ah) = *dims_guard;
+            let (aw, ah) = anchor_dims;
+            if aw == 0 || ah == 0 {
+                return Err("El anchor batch tiene dimensiones invalidas".into());
+            }
             // R13: el auto-crop del motor Zenith puede variar las dimensiones
             // unos pixeles entre archivos. Ajustamos por recorte/padding
             // centrado a las dims del anchor en vez del reset silencioso
@@ -1792,98 +2935,101 @@ async fn process_batch_entry(
                 center_crop_or_pad_rgb(&solar_out, safe_w, safe_h, aw, ah)
             };
             let (safe_w, safe_h) = (aw, ah);
-            {
-                // Alineamos este resultado final contra el anchor usando el mismo SAD
-
-                // --- BLOCK 1: Calculo de Desplazamiento (Immutable Borrow) ---
-                let (dx, dy) = {
-                    let anchor = anchor_guard.as_ref().unwrap();
-                    let to_mono = |d: &[u16]| -> Vec<u16> {
-                        let mut m = Vec::with_capacity(safe_w * safe_h);
-                        for i in 0..(d.len() / 3) {
-                            let off = i * 3;
-                            // Usamos promedio simple para velocidad
-                            m.push(
-                                ((d[off] as u32 + d[off + 1] as u32 + d[off + 2] as u32) / 3)
-                                    as u16,
-                            );
-                        }
-                        m
-                    };
-                    let anchor_mono = to_mono(anchor);
-                    let current_mono = to_mono(&solar_out);
-
-                    // PYRAMID FOR STABILIZATION
-                    let anchor_pyramid = downscale_integer(&anchor_mono, safe_w, safe_h, 4);
-
-                    // Usamos un ROI central grande (85%) para capturar detalles solares
-                    let roi_w = (safe_w as f32 * 0.85) as usize;
-                    let roi_h = (safe_h as f32 * 0.85) as usize;
-                    let stab_x = safe_w.saturating_sub(roi_w) / 2;
-                    let stab_y = safe_h.saturating_sub(roi_h) / 2;
-
-                    find_best_match_sad_pyramid(
-                        &anchor_mono,
-                        &current_mono,
-                        &anchor_pyramid,
-                        safe_w,
-                        safe_h,
-                        safe_w / 4,
-                        safe_h / 4,
-                        stab_x,
-                        stab_y,
-                        roi_w,
-                        roi_h,
-                        120,
-                        4, // Scale Factor (Standard 4x)
-                        4, // Fine Range (Standard 4px)
-                    )
-                };
-
-                // --- BLOCK 2: Aplicar Shift y Actualizar Anchor (Mutable Borrow) ---
-                let mut shifted = vec![0u16; solar_out.len()];
-                for y in 0..safe_h {
-                    for x in 0..safe_w {
-                        let sx = x as f32 + dx;
-                        let sy = y as f32 + dy;
-                        if sx >= 0.0
-                            && sx < (safe_w - 1) as f32
-                            && sy >= 0.0
-                            && sy < (safe_h - 1) as f32
-                        {
-                            let x0 = sx.floor() as usize;
-                            let x1 = x0 + 1;
-                            let y0 = sy.floor() as usize;
-                            let y1 = y0 + 1;
-                            let wx = sx - x0 as f32;
-                            let wy = sy - y0 as f32;
-                            let idx_dst = (y * safe_w + x) * 3;
-                            for c in 0..3 {
-                                let v00 = solar_out[(y0 * safe_w + x0) * 3 + c] as f32;
-                                let v10 = solar_out[(y0 * safe_w + x1) * 3 + c] as f32;
-                                let v01 = solar_out[(y1 * safe_w + x0) * 3 + c] as f32;
-                                let v11 = solar_out[(y1 * safe_w + x1) * 3 + c] as f32;
-                                shifted[idx_dst + c] = ((v00 * (1.0 - wx) + v10 * wx) * (1.0 - wy)
-                                    + (v01 * (1.0 - wx) + v11 * wx) * wy)
-                                    as u16;
-                            }
-                        }
-                    }
-                }
-
-                if is_surface_batch || large_disc_batch {
-                    let anchor_mut = anchor_guard.as_mut().unwrap();
-                    // FIX: Reducir factor de actualizacion (Drift) del 5% al 0.5% para super-estabilidad
-                    // Esto evita que el ancla "persiga" la turbulencia
-                    for i in 0..anchor_mut.len() {
-                        let old = anchor_mut[i] as f32;
-                        let new = shifted[i] as f32;
-                        anchor_mut[i] = (old * 0.995 + new * 0.005) as u16;
-                    }
-                }
-
-                (shifted, safe_w, safe_h)
+            // Alineamos este resultado final contra el snapshot del anchor.
+            let anchor = anchor_snapshot.as_ref().expect("anchor comprobado");
+            if anchor.len() != solar_out.len() {
+                return Err("El anchor batch no coincide con sus dimensiones".into());
             }
+            let to_mono = |data: &[u16]| -> Vec<u16> {
+                data.chunks_exact(3)
+                    .map(|pixel| {
+                        ((pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32) / 3) as u16
+                    })
+                    .collect()
+            };
+            let anchor_mono = to_mono(anchor);
+            let current_mono = to_mono(&solar_out);
+            let anchor_pyramid = downscale_integer(&anchor_mono, safe_w, safe_h, 4);
+            let roi_w = (safe_w as f32 * 0.85) as usize;
+            let roi_h = (safe_h as f32 * 0.85) as usize;
+            let stab_x = safe_w.saturating_sub(roi_w) / 2;
+            let stab_y = safe_h.saturating_sub(roi_h) / 2;
+            let (dx, dy) = find_best_match_sad_pyramid(
+                &anchor_mono,
+                &current_mono,
+                &anchor_pyramid,
+                safe_w,
+                safe_h,
+                safe_w / 4,
+                safe_h / 4,
+                stab_x,
+                stab_y,
+                roi_w,
+                roi_h,
+                120,
+                4,
+                4,
+            );
+
+            let mut shifted = vec![0u16; solar_out.len()];
+            for y in 0..safe_h {
+                for x in 0..safe_w {
+                    let sx = x as f32 + dx;
+                    let sy = y as f32 + dy;
+                    if sx >= 0.0
+                        && sx < (safe_w - 1) as f32
+                        && sy >= 0.0
+                        && sy < (safe_h - 1) as f32
+                    {
+                        let x0 = sx.floor() as usize;
+                        let x1 = x0 + 1;
+                        let y0 = sy.floor() as usize;
+                        let y1 = y0 + 1;
+                        let wx = sx - x0 as f32;
+                        let wy = sy - y0 as f32;
+                        let idx_dst = (y * safe_w + x) * 3;
+                        for c in 0..3 {
+                            let v00 = solar_out[(y0 * safe_w + x0) * 3 + c] as f32;
+                            let v10 = solar_out[(y0 * safe_w + x1) * 3 + c] as f32;
+                            let v01 = solar_out[(y1 * safe_w + x0) * 3 + c] as f32;
+                            let v11 = solar_out[(y1 * safe_w + x1) * 3 + c] as f32;
+                            shifted[idx_dst + c] = ((v00 * (1.0 - wx) + v10 * wx)
+                                * (1.0 - wy)
+                                + (v01 * (1.0 - wx) + v11 * wx) * wy)
+                                as u16;
+                        }
+                    }
+                }
+            }
+
+            with_current_planetary_job(
+                &state.planetary_generation_gate,
+                &batch_postprocess_token,
+                "la actualizacion del anchor batch",
+                || -> Result<(), String> {
+                    let mut anchor_guard = state
+                        .batch_anchor
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let dims = *state
+                        .batch_anchor_dims
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let anchor_mut = anchor_guard
+                        .as_mut()
+                        .ok_or_else(|| "El anchor batch desaparecio antes del commit".to_string())?;
+                    if dims != (safe_w, safe_h) || anchor_mut.len() != shifted.len() {
+                        return Err("El anchor batch cambio antes del commit".into());
+                    }
+                    // Drift de 0.5%: estabiliza sin perseguir turbulencia.
+                    for (old, new) in anchor_mut.iter_mut().zip(&shifted) {
+                        *old = (*old as f32 * 0.995 + *new as f32 * 0.005) as u16;
+                    }
+                    Ok(())
+                },
+            )??;
+
+            (shifted, safe_w, safe_h)
         }
     } else {
         // R13: RE-CENTRADO CoG PLANETARIO (timelapse estable)
@@ -1891,13 +3037,21 @@ async fn process_batch_entry(
         // caiga en el centro del lienzo — posicion identica entre archivos
         // del lote. Dimensiones compartidas via batch_anchor_dims para que
         // todos los PNG salgan del mismo tamano aunque el auto-crop varie.
-        let (tw, th) = {
-            let mut dims_guard = state.batch_anchor_dims.lock().unwrap_or_else(|e| e.into_inner());
-            if dims_guard.0 == 0 || dims_guard.1 == 0 {
-                *dims_guard = (out_w, out_h);
-            }
-            *dims_guard
-        };
+        let (tw, th) = with_current_planetary_job(
+            &state.planetary_generation_gate,
+            &batch_postprocess_token,
+            "las dimensiones del lote planetario",
+            || {
+                let mut dims_guard = state
+                    .batch_anchor_dims
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if dims_guard.0 == 0 || dims_guard.1 == 0 {
+                    *dims_guard = (out_w, out_h);
+                }
+                *dims_guard
+            },
+        )?;
 
         let base = if tw == out_w && th == out_h {
             stacked_data.clone()
@@ -1960,14 +3114,12 @@ async fn process_batch_entry(
     // sharpening (doble aplicacion) y dependian del master legacy: eliminados.
     let pre_processed = centered_data;
     let (safe_w, safe_h) = (cw, ch);
-    let usm_amount = if is_surface_batch { 0.0 } else { _usm_amount.max(0.0) };
-
 
     let temp_res = StackResult {
         data: pre_processed, // NOW using the enhanced base
         width: safe_w,
         height: safe_h,
-        is_mono: cid == 0 || cid == 12,
+        is_mono: engine_is_mono,
         is_surface: is_surface_batch,
     };
 
@@ -1975,25 +3127,14 @@ async fn process_batch_entry(
     let (use_d_iter, use_d_sigma, use_v_iter, use_v_sigma) =
         (deconv_iter, deconv_sigma, vc_iter, vc_sigma);
 
-    // PHASE 36 FIX: Improved detection for Surface/Solar (including v2 variations)
-    // "Unbeatable" preset: Sharpen 0.5 + LCE 15.0
-    // Logic matching stack_video_liquid_warping
-    let (usm_amount, usm_radius, lce_amount) =
-        if is_surface_batch {
-            let (u_amt, u_rad) = if usm_amount <= 0.01 {
-                (0.5, 1.5)
-            } else {
-                (usm_amount, usm_radius)
-            };
-            let l_amt = if lce_amount <= 0.01 { 15.0 } else { lce_amount };
-            (u_amt, u_rad, l_amt)
-        } else {
-            (usm_amount, usm_radius, lce_amount)
-        };
-
-    // FIX: Force Neutral WB for Mono Purity
-    let is_mono = cid == 0 || cid == 12;
-    let (r_bal, b_bal) = if is_mono { (0.0, 0.0) } else { (r_bal, b_bal) };
+    let resolved_post = resolve_post_processing_contract(
+        temp_res.is_mono,
+        usm_amount,
+        usm_radius,
+        lce_amount,
+        r_bal,
+        b_bal,
+    );
 
     // Batch: la descomposición GPU interactiva no aplica aquí (el apilado ya usa
     // su propio motor GPU de acumulación); el post se re-aplica en CPU.
@@ -2001,7 +3142,7 @@ async fn process_batch_entry(
     let processed = run_processing_pipeline(
         &app,
         &state,
-        0,
+        batch_postprocess_request_id,
         &temp_res,
         safe_w,
         safe_h,
@@ -2024,14 +3165,14 @@ async fn process_batch_entry(
         use_d_sigma,
         use_v_iter,
         use_v_sigma,
-        usm_amount,
-        usm_radius,
-        lce_amount,
+        resolved_post.usm_amount,
+        resolved_post.usm_radius,
+        resolved_post.lce_amount,
         blend,
         contrast,
         brightness,
-        r_bal,
-        b_bal,
+        resolved_post.r_bal,
+        resolved_post.b_bal,
         master_denoise,     // PHASE 23
         master_denoise_detail,
         master_denoise_chroma,
@@ -2046,25 +3187,22 @@ async fn process_batch_entry(
         levels_gamma.unwrap_or(1.0),
     );
 
-    // --- FINAL EXPORT: High Quality 16-bit PNG (Matches save_final_image) ---
-    // Usamos el codificador de 16 bits para preservar todo el procesado del pipeline.
-    let mut raw_bytes_be = Vec::with_capacity(processed.len() * 2);
-    for v in &processed {
-        raw_bytes_be.extend_from_slice(&v.to_be_bytes()); // PNG standard (Big Endian)
+    if processed.is_empty() {
+        return Err("Cancelado por el usuario".to_string());
     }
-
-    let f = File::create(&save_path).map_err(|e| e.to_string())?;
-    let ref_writer = BufWriter::new(f);
-    let encoder = image::codecs::png::PngEncoder::new(ref_writer);
-
-    encoder
-        .encode(
-            &raw_bytes_be,
-            safe_w as u32,
-            safe_h as u32,
-            image::ColorType::Rgb16,
-        )
-        .map_err(|e| e.to_string())?;
+    planetary_derotation_checkpoint(&batch_postprocess_token, "el postprocesado batch")?;
+    let mut staged = StagedPlanetaryArtifact::encode_rgb16_png(
+        save_path.clone(),
+        &processed,
+        safe_w,
+        safe_h,
+    )?;
+    with_current_planetary_job(
+        &state.planetary_generation_gate,
+        &batch_postprocess_token,
+        "la publicacion batch",
+        || staged.publish(false),
+    )??;
 
     // ASSET PROTOCOL: la UI (batch y mosaico) carga `path` con convertFileSrc,
     // asi que ya no se genera el preview base64 por entrada. Antes cada archivo
@@ -2093,7 +3231,8 @@ fn apply_gaussian_blur_safe(data: &[f32], w: usize, h: usize, sigma: f32) -> Vec
 // Returns (Enhanced Image, Quality Score)
 // STRUCT FOR MEMORY REUSE
 struct AnalysisBufferSet {
-    pub raw_u16: Vec<u16>,   // Reuse for raw_to_u16 conversion (full res)
+    pub raw_u16: Vec<u16>,   // Verde/mono canónico a resolución completa
+    pub raw_decode_u16: Vec<u16>, // Scratch CFA/RGB decodificado; evita alloc por frame
     pub half_u16: Vec<u16>,  // 2× downscaled working image (analysis runs here)
     pub blur_temp: Vec<u16>, // Reuse for separable blur intermediate
     pub blur_out: Vec<u16>,  // Reuse for blur result
@@ -2105,6 +3244,7 @@ impl AnalysisBufferSet {
     fn new(size: usize) -> Self {
         Self {
             raw_u16: vec![0u16; size],
+            raw_decode_u16: Vec::new(), // lazy: mono no paga este buffer
             half_u16: vec![0u16; size / 4 + 4],
             blur_temp: vec![0u16; size],
             blur_out: vec![0u16; size],
@@ -2397,11 +3537,17 @@ async fn crop_stacked_image(
     h: usize,
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
+    let request_id = begin_planetary_user_job(&state);
+    let job_token = PlanetaryJobToken::for_app(
+        &app,
+        request_id,
+        state.cancel_requested.clone(),
+    );
 
     emit_progress(&app, "Recortando...", 0.0, None);
 
-    let (new_data, new_w, new_h) = {
-        let mut guard = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
+    let (new_data, new_w, new_h, is_mono, is_surface) = {
+        let guard = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
         let img = match &*guard {
             Some(i) => i,
             None => return Err("Sin imagen para recortar".into()),
@@ -2421,21 +3567,30 @@ async fn crop_stacked_image(
             cropped.extend_from_slice(&img.data[start..end]);
         }
 
-        *guard = Some(StackResult {
-            data: cropped.clone(),
-            width: w,
-            height: h,
-            is_mono: img.is_mono,
-            is_surface: img.is_surface,
-        });
-        (cropped, w, h)
+        (cropped, w, h, img.is_mono, img.is_surface)
     };
 
-    {
-        state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
+    let cropped_result = StackResult {
+        data: new_data.clone(),
+        width: new_w,
+        height: new_h,
+        is_mono,
+        is_surface,
+    };
+    with_current_planetary_job(
+        &state.planetary_generation_gate,
+        &job_token,
+        "publicar el recorte",
+        || {
+            *state
+                .stacked_image
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(cropped_result);
+            state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        },
+    )?;
 
     emit_progress(&app, "Actualizando vista...", 50.0, None);
 
@@ -2468,7 +3623,7 @@ async fn preview_video(
     let h = reader.height();
     let count = reader.frame_count();
     let bpp = reader.bpp();
-    let cid = bayer_override.unwrap_or_else(|| reader.color_id());
+    let cid = reader.resolve_bayer_override(bayer_override)?;
 
     let idx = select_signal_frame_index(&reader, w, h, bpp, cid, 0);
     if idx != 0 {
@@ -2500,7 +3655,7 @@ async fn preview_video(
     if cid >= 8 && cid <= 11 {
         auto_color_balance(&mut rgb, w, h);
     }
-    let is_color = reader.is_color() || ser::ser_color_is_color(cid);
+    let is_color = reader.is_color_for(cid);
     let vis = if is_color {
         to_8bit_preview_visual(&rgb)
     } else {
@@ -2528,7 +3683,7 @@ async fn preview_video(
             general_purpose::STANDARD.encode(&png)
         ),
         filename: fname,
-        is_color: reader.is_color(),
+        is_color,
         suggested_target,
     })
 }
@@ -2595,7 +3750,7 @@ async fn analyze_video(
     let w = reader.width();
     let h = reader.height();
     let bpp = reader.bpp();
-    let cid = bayer_override.unwrap_or_else(|| reader.color_id());
+    let cid = reader.resolve_bayer_override(bayer_override)?;
 
     // DEBUG YUY2/ColorID
     log_to_front(
@@ -2610,12 +3765,7 @@ async fn analyze_video(
             reader.is_color()
         ),
     );
-    // GENERIC REQ_ID (Timestamp based)
-    let req_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as usize;
-    state.active_req_id.store(req_id, Ordering::Relaxed);
+    let req_id = begin_planetary_user_job(&state);
 
     let _ctr = Arc::new(AtomicUsize::new(0));
     let tf = total as f32;
@@ -2654,7 +3804,7 @@ async fn analyze_video(
                 let pname = ser::ser_pattern_name(cid).to_string();
 
                 // CRITICAL: is_color MUST respect user override to avoid UI automation resetting to color mode
-                let final_is_color = reader.is_color() || ser::ser_color_is_color(cid);
+                let final_is_color = reader.is_color_for(cid);
 
                 let mut sorted_scores: Vec<u64> = cached.scores.iter().map(|&(_, s)| s).collect();
                 sorted_scores.sort_unstable_by(|a, b| b.cmp(a));
@@ -3009,6 +4159,7 @@ async fn analyze_video(
         height: None,
         best_frame_idx: None,
         ap_points: None,
+        contract: None,
     };
     if let Ok(file) = File::create(&cache_path) {
         let mut writer = BufWriter::new(file);
@@ -3125,7 +4276,7 @@ async fn analyze_video(
         &format!("DEBUG: analyze_video (fresh) Best Index = {}", best_idx),
     );
 
-    let final_is_color = reader.is_color() || ser::ser_color_is_color(cid);
+    let final_is_color = reader.is_color_for(cid);
 
     Ok(AnalysisResult {
         metadata: VideoMetadata {
@@ -3673,7 +4824,7 @@ fn upscale_rgb8_nearest(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) 
 async fn apply_wavelets(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-    req_id: usize,
+    _req_id: usize,
     u1: f32,
     u2: f32,
     u3: f32,
@@ -3730,7 +4881,7 @@ async fn apply_wavelets(
     levels_gamma: Option<f32>,         // Niveles: gamma medios (0.1..5)
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
-    state.active_req_id.store(req_id, Ordering::Relaxed);
+    let backend_request_id = begin_planetary_user_job(&state);
     let original = {
         let s = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
         match &*s {
@@ -3739,25 +4890,14 @@ async fn apply_wavelets(
         }
     };
 
-    // FIX: Apply Smart Defaults for Single Stacking View if unset (Unbeatable Surface)
-    let (usm_amount, usm_radius, lce_amount) = if original.is_mono && original.is_surface {
-        let (u_amt, u_rad) = if usm_amount <= 0.01 {
-            (0.5, 1.5)
-        } else {
-            (usm_amount, usm_radius)
-        };
-        let l_amt = if lce_amount <= 0.01 { 15.0 } else { lce_amount };
-        (u_amt, u_rad, l_amt)
-    } else {
-        (usm_amount, usm_radius, lce_amount)
-    };
-
-    // FIX: Force Neutral WB for Mono Purity. 0.0 is neutral.
-    let (r_bal, b_bal) = if original.is_mono {
-        (0.0, 0.0)
-    } else {
-        (r_bal, b_bal)
-    };
+    let resolved_post = resolve_post_processing_contract(
+        original.is_mono,
+        usm_amount,
+        usm_radius,
+        lce_amount,
+        r_bal,
+        b_bal,
+    );
 
     // PREVIEW EN VIVO (interactividad): durante el arrastre de sliders el front
     // pide un downscale (2/4). Procesamos a 1/N de resolucion (deconv/wavelets
@@ -3782,15 +4922,16 @@ async fn apply_wavelets(
         (&original, original.width, original.height)
     };
 
-    // GPU wavelets: permitido salvo modo "cpu"; run_processing_pipeline aún exige
-    // tamaño mínimo + paridad, y cae a CPU ante cualquier problema.
-    let gpu_allowed = gpu_mode.as_deref().map(|m| m != "cpu").unwrap_or(true)
+    // El preview rápido downscaled puede usar GPU; el render completo usa el
+    // mismo backend CPU que exportación/lote para que el WYSIWYG sea exacto.
+    let gpu_allowed = use_ds
+        && gpu_mode.as_deref().map(|m| m != "cpu").unwrap_or(true)
         && crate::gpu_stack::gpu_runtime().is_some();
 
     let final_u16 = run_processing_pipeline(
         &app,
         &state,
-        req_id,
+        backend_request_id,
         proc_ref,
         pw,
         ph,
@@ -3813,14 +4954,14 @@ async fn apply_wavelets(
         deconv_sigma,
         vc_iter,
         vc_sigma,
-        usm_amount,
-        usm_radius,
-        lce_amount,
+        resolved_post.usm_amount,
+        resolved_post.usm_radius,
+        resolved_post.lce_amount,
         blend,
         contrast,
         brightness,
-        r_bal,
-        b_bal,
+        resolved_post.r_bal,
+        resolved_post.b_bal,
         master_denoise,     // PHASE 23
         master_denoise_detail,
         master_denoise_chroma,
@@ -3836,6 +4977,9 @@ async fn apply_wavelets(
     );
 
     if final_u16.is_empty() {
+        return Err("Cancelled".into());
+    }
+    if check_cancel(&state, backend_request_id) {
         return Err("Cancelled".into());
     }
 
@@ -3856,6 +5000,9 @@ async fn apply_wavelets(
             image::ColorType::Rgb8,
         )
         .map_err(|e| e.to_string())?;
+    if check_cancel(&state, backend_request_id) {
+        return Err("Cancelled".into());
+    }
     emit_progress(&app, "Listo", 100.0, None);
     // PR-2.5: el lazo MÁS caliente de la app (arrastre de sliders) enviaba
     // un data-URL base64 a resolución completa por IPC en CADA render
@@ -3965,7 +5112,12 @@ async fn save_final_image(
     levels_gamma: Option<f32>,         // Niveles: gamma medios (0.1..5)
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
-    state.active_req_id.store(0, Ordering::Relaxed);
+    let export_request_id = begin_planetary_user_job(&state);
+    let export_token = PlanetaryJobToken::for_app(
+        &app,
+        export_request_id,
+        state.cancel_requested.clone(),
+    );
     if format_idx == 1 && !state.license_manager.is_pro() {
         return Err(
             "Guardar en TIFF 16-bit requiere licencia PRO o periodo de prueba activo.".into(),
@@ -3981,12 +5133,21 @@ async fn save_final_image(
     };
     emit_progress(&app, "Procesando final...", 0.0, None);
 
+    let resolved_post = resolve_post_processing_contract(
+        original.is_mono,
+        usm_amount,
+        usm_radius,
+        lce_amount,
+        r_bal,
+        b_bal,
+    );
+
     // Export: siempre CPU (render final exacto, sin dependencia de GPU).
     let gpu_allowed = false;
     let final_u16 = run_processing_pipeline(
         &app,
         &state,
-        0,
+        export_request_id,
         &original,
         original.width,
         original.height,
@@ -4012,14 +5173,14 @@ async fn save_final_image(
         deconv_sigma,
         vc_iter,
         vc_sigma,
-        usm_amount,
-        usm_radius,
-        lce_amount,
+        resolved_post.usm_amount,
+        resolved_post.usm_radius,
+        resolved_post.lce_amount,
         blend,
         contrast,
         brightness,
-        r_bal,
-        b_bal,
+        resolved_post.r_bal,
+        resolved_post.b_bal,
         master_denoise,     // PHASE 23
         master_denoise_detail,
         master_denoise_chroma,
@@ -4037,60 +5198,52 @@ async fn save_final_image(
     if final_u16.is_empty() {
         return Err("Error en el procesado (Cancelado)".into());
     }
+    if check_cancel(&state, export_request_id) {
+        return Err("Error en el procesado (Cancelado)".into());
+    }
 
     emit_progress(&app, "Guardando...", 97.0, None);
-
-    if format_idx == 2 {
-        // F3: FITS 16-bit de salida (WinJUPOS/derotación, fotometría).
-        let name = format!("{}_Final.fits", path);
-        write_rgb16_fits(&name, &final_u16, original.width, original.height)?;
-        emit_progress(&app, "Listo", 100.0, None);
-        return Ok(format!("FITS 16-bit Guardado: {}", name));
-    }
-    if format_idx == 0 {
-        // PNG 16-BIT EXPORT (Requested: "tal cual" 16-bit preservation)
-        let name = format!("{}_Final.png", path);
-        // PNG standard requires Big Endian for 16-bit
-        let mut raw_bytes_be = Vec::with_capacity(final_u16.len() * 2);
-        for v in &final_u16 {
-            raw_bytes_be.extend_from_slice(&v.to_be_bytes());
+    let (name, label, mut staged) = match format_idx {
+        2 => {
+            let name = format!("{}_Final.fits", path);
+            let staged = StagedPlanetaryArtifact::encode_rgb16_fits(
+                PathBuf::from(&name),
+                &final_u16,
+                original.width,
+                original.height,
+            )?;
+            (name, "FITS 16-bit", staged)
         }
-
-        let f = File::create(&name).map_err(|e| e.to_string())?;
-        let ref_writer = BufWriter::new(f);
-        let encoder = image::codecs::png::PngEncoder::new(ref_writer);
-
-        encoder
-            .encode(
-                &raw_bytes_be,
-                original.width as u32,
-                original.height as u32,
-                image::ColorType::Rgb16,
-            )
-            .map_err(|e| e.to_string())?;
-
-        emit_progress(&app, "Listo", 100.0, None);
-        return Ok(format!("PNG 16-bit Guardado: {}", name));
-    } else {
-        let name = format!("{}_Final_16bit.tiff", path);
-        let f = File::create(&name).map_err(|e| e.to_string())?;
-        let ref_writer = BufWriter::new(f);
-        let encoder = image::codecs::tiff::TiffEncoder::new(ref_writer);
-        let mut raw_bytes = Vec::with_capacity(final_u16.len() * 2);
-        for v in &final_u16 {
-            raw_bytes.extend_from_slice(&v.to_ne_bytes());
+        0 => {
+            let name = format!("{}_Final.png", path);
+            let staged = StagedPlanetaryArtifact::encode_rgb16_png(
+                PathBuf::from(&name),
+                &final_u16,
+                original.width,
+                original.height,
+            )?;
+            (name, "PNG 16-bit", staged)
         }
-        encoder
-            .encode(
-                &raw_bytes,
-                original.width as u32,
-                original.height as u32,
-                image::ColorType::Rgb16,
-            )
-            .map_err(|e| e.to_string())?;
-        emit_progress(&app, "Listo", 100.0, None);
-        return Ok(format!("TIFF 16-bit Guardado: {}", name));
-    }
+        _ => {
+            let name = format!("{}_Final_16bit.tiff", path);
+            let staged = StagedPlanetaryArtifact::encode_rgb16_tiff(
+                PathBuf::from(&name),
+                &final_u16,
+                original.width,
+                original.height,
+            )?;
+            (name, "TIFF 16-bit", staged)
+        }
+    };
+    planetary_derotation_checkpoint(&export_token, "la codificacion de la exportacion")?;
+    with_current_planetary_job(
+        &state.planetary_generation_gate,
+        &export_token,
+        "la publicacion de la exportacion",
+        || staged.publish(true),
+    )??;
+    emit_progress(&app, "Listo", 100.0, None);
+    Ok(format!("{} Guardado: {}", label, name))
 }
 
 #[tauri::command]
@@ -4101,6 +5254,12 @@ async fn export_mosaic_result(
     format_idx: i32,
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
+    let export_request_id = begin_planetary_user_job(&state);
+    let export_token = PlanetaryJobToken::for_app(
+        &app,
+        export_request_id,
+        state.cancel_requested.clone(),
+    );
     if format_idx == 1 && !state.license_manager.is_pro() {
         return Err(
             "Guardar en TIFF 16-bit requiere licencia PRO o periodo de prueba activo.".into(),
@@ -4132,55 +5291,38 @@ async fn export_mosaic_result(
         .filter(|s| !s.is_empty())
         .unwrap_or("Mosaic_Result");
 
-    if format_idx == 0 {
+    let (out_path, label, mut staged) = if format_idx == 0 {
         let out_path = parent_dir.join(format!("{}_Export_16bit.png", stem));
-        let mut raw_bytes_be = Vec::with_capacity(original.data.len() * 2);
-        for v in &original.data {
-            raw_bytes_be.extend_from_slice(&v.to_be_bytes());
-        }
-
-        let f = File::create(&out_path).map_err(|e| e.to_string())?;
-        let ref_writer = BufWriter::new(f);
-        let encoder = image::codecs::png::PngEncoder::new(ref_writer);
-        encoder
-            .encode(
-                &raw_bytes_be,
-                original.width as u32,
-                original.height as u32,
-                image::ColorType::Rgb16,
-            )
-            .map_err(|e| e.to_string())?;
-
-        emit_progress(&app, "Listo", 100.0, None);
-        Ok(format!(
-            "PNG 16-bit guardado: {}",
-            clean_windows_path(out_path)
-        ))
+        let staged = StagedPlanetaryArtifact::encode_rgb16_png(
+            out_path.clone(),
+            &original.data,
+            original.width,
+            original.height,
+        )?;
+        (out_path, "PNG 16-bit", staged)
     } else {
         let out_path = parent_dir.join(format!("{}_Export_16bit.tiff", stem));
-        let mut raw_bytes = Vec::with_capacity(original.data.len() * 2);
-        for v in &original.data {
-            raw_bytes.extend_from_slice(&v.to_ne_bytes());
-        }
-
-        let f = File::create(&out_path).map_err(|e| e.to_string())?;
-        let ref_writer = BufWriter::new(f);
-        let encoder = image::codecs::tiff::TiffEncoder::new(ref_writer);
-        encoder
-            .encode(
-                &raw_bytes,
-                original.width as u32,
-                original.height as u32,
-                image::ColorType::Rgb16,
-            )
-            .map_err(|e| e.to_string())?;
-
-        emit_progress(&app, "Listo", 100.0, None);
-        Ok(format!(
-            "TIFF 16-bit guardado: {}",
-            clean_windows_path(out_path)
-        ))
-    }
+        let staged = StagedPlanetaryArtifact::encode_rgb16_tiff(
+            out_path.clone(),
+            &original.data,
+            original.width,
+            original.height,
+        )?;
+        (out_path, "TIFF 16-bit", staged)
+    };
+    planetary_derotation_checkpoint(&export_token, "la codificacion del mosaico exportado")?;
+    with_current_planetary_job(
+        &state.planetary_generation_gate,
+        &export_token,
+        "la publicacion del mosaico exportado",
+        || staged.publish(true),
+    )??;
+    emit_progress(&app, "Listo", 100.0, None);
+    Ok(format!(
+        "{} guardado: {}",
+        label,
+        clean_windows_path(out_path)
+    ))
 }
 
 // --- ADVANCED BLIND STITCHING IMPLEMENTATION ---
@@ -4197,10 +5339,26 @@ struct FeaturePoint {
 impl FeaturePoint {
     // Hamming Distance for binary descriptors
     fn distance(&self, other: &FeaturePoint) -> u32 {
-        let mut d = 0;
-        // Assume same length
-        for (b1, b2) in self.descriptor.iter().zip(other.descriptor.iter()) {
-            d += (b1 ^ b2).count_ones();
+        let len = self.descriptor.len().min(other.descriptor.len());
+        let word_end = len & !7;
+        let mut d = 0u32;
+        // AKAZE suele entregar 61 bytes: procesar 8 por instrucción reduce
+        // drásticamente el hot loop N×M y conserva exactamente el Hamming.
+        for offset in (0..word_end).step_by(8) {
+            let a = u64::from_ne_bytes(
+                self.descriptor[offset..offset + 8]
+                    .try_into()
+                    .expect("chunk AKAZE de 8 bytes"),
+            );
+            let b = u64::from_ne_bytes(
+                other.descriptor[offset..offset + 8]
+                    .try_into()
+                    .expect("chunk AKAZE de 8 bytes"),
+            );
+            d += (a ^ b).count_ones();
+        }
+        for offset in word_end..len {
+            d += (self.descriptor[offset] ^ other.descriptor[offset]).count_ones();
         }
         d
     }
@@ -4215,10 +5373,12 @@ struct ImageNode {
     global_x: f32,
     global_y: f32,
     placed: bool,
-    img_gray: image::GrayImage,
     img_gray_stretched: image::GrayImage,
     features: Vec<FeaturePoint>,
-    original_path: String, // Store path to reload in 16-bit for final fusion
+    original_path: String,
+    // Índice en MosaicTileCache. La imagen 16-bit seleccionada se conserva
+    // entre AKAZE y la fusión: los vídeos no vuelven a escanear/decodificar.
+    cache_index: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4229,88 +5389,416 @@ struct MatchEdge {
     score: usize,
 }
 
-// === AKAZE HELPERS (No explicit helpers needed, using crate directly) ===
+const MOSAIC_ACCUMULATOR_BYTES_PER_PIXEL: u64 = 16; // 4 canales f32
+const MOSAIC_OUTPUT_BYTES_PER_PIXEL: u64 = 6; // RGB u16
+// Preview RGB16+RGB8 (≤2400²), buffers internos de encoder y allocator.
+const MOSAIC_FIXED_SCRATCH_BYTES: u64 = 96 * 1024 * 1024;
+const MOSAIC_DISK_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 
-// NUEVO: Helper robusto para cargar imagen o frame de video
-// NUEVO: Helper robusto para cargar y SELECCIONAR el mejor frame (logica Surface Mode)
-fn load_image_or_video_frame(
-    path_str: &str,
-    app: &tauri::AppHandle,
-) -> Result<DynamicImage, String> {
-    let path = Path::new(path_str);
+#[derive(Debug)]
+enum MosaicTileStorage {
+    Ram(Vec<u16>),
+    Spill(PathBuf),
+}
 
-    // 1. Intentar imagen directa
-    if let Ok(img) = image::open(path) {
-        return Ok(img);
+#[derive(Debug)]
+struct MosaicTileCacheEntry {
+    width: u32,
+    height: u32,
+    storage: MosaicTileStorage,
+}
+
+/// Caché 16-bit acotada. Mantiene en RAM lo que cabe en un presupuesto pequeño
+/// derivado de la memoria libre y derrama el resto como RGBA16 crudo. El spill
+/// evita una segunda decodificación (especialmente cara en MP4/MOV) y solo carga
+/// una tesela a la vez durante la fusión.
+#[derive(Debug)]
+struct MosaicTileCache {
+    entries: Vec<MosaicTileCacheEntry>,
+    ram_budget: u64,
+    ram_used: u64,
+    spill_dir: PathBuf,
+    max_spilled_tile_bytes: u64,
+}
+
+impl MosaicTileCache {
+    fn new(available_ram: u64) -> Self {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        // Como el tamaño final del lienzo aún no se conoce, el caché solo toma
+        // 1/8 de la RAM libre (máx. 1.5 GiB). El preflight posterior trabaja con
+        // la RAM que realmente queda después de conservar grises/features.
+        let ram_budget = (available_ram / 8).min(1536 * 1024 * 1024);
+        Self {
+            entries: Vec::new(),
+            ram_budget,
+            ram_used: 0,
+            spill_dir: std::env::temp_dir().join(format!(
+                "astro-stacker-mosaic-{}-{stamp}",
+                std::process::id()
+            )),
+            max_spilled_tile_bytes: 0,
+        }
     }
 
-    // 2. Intentar como Video con Seleccion Inteligente (Surface Mode Logic)
-    match VideoInput::open(path_str, app) {
-        Ok(reader) => {
-            let total = reader.frame_count();
-            if total == 0 {
-                return Err(format!("El video {} no tiene frames", path_str));
-            }
-
-            let w = reader.width();
-            let h = reader.height();
-            let bpp = reader.bpp();
-            let cid = reader.color_id();
-
-            // SURFACE MODE LOGIC: Safe ROI for quality check (Center 50%)
-            // Avoids edge artifacts or black borders affecting score
-            let safe_roi = Rect {
-                x: w / 4,
-                y: h / 4,
-                w: w / 2,
-                h: h / 2,
-            };
-
-            // Scan Strategy: Check up to 20 frames distributed across the video
-            // to find the sharpest/best one without reading the whole file.
-            let step = (total / 20).max(1);
-            let mut best_score = 0;
-            let mut best_idx = 0;
-
-            // First pass: Rapid scan
-            for i in (0..total).step_by(step) {
-                let raw = reader.get_frame(i, cid);
-                if raw.is_empty() {
-                    continue;
-                }
-
-                // Calculate score using Surface logic
-                let score = calculate_quality_metric(&raw, w, h, bpp, &safe_roi);
-
-                if score > best_score {
-                    best_score = score;
-                    best_idx = i;
+    fn insert(&mut self, width: u32, height: u32, data: Vec<u16>) -> Result<usize, String> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|v| v.checked_mul(4))
+            .ok_or("Dimensiones de tesela RGBA16 fuera de rango")?;
+        if data.len() != expected {
+            return Err(format!(
+                "Tesela RGBA16 inválida: {} muestras, se esperaban {expected}",
+                data.len()
+            ));
+        }
+        let bytes = (data.len() as u64)
+            .checked_mul(2)
+            .ok_or("Tamaño de tesela fuera de rango")?;
+        let index = self.entries.len();
+        let storage = if self.ram_used.saturating_add(bytes) <= self.ram_budget {
+            self.ram_used += bytes;
+            MosaicTileStorage::Ram(data)
+        } else {
+            fs::create_dir_all(&self.spill_dir)
+                .map_err(|e| format!("No se pudo crear el caché temporal del mosaico: {e}"))?;
+            if let Some(free) = available_disk_bytes(&self.spill_dir) {
+                if free < bytes.saturating_add(MOSAIC_DISK_RESERVE_BYTES) {
+                    return Err(format!(
+                        "Sin espacio para el caché temporal del mosaico: se necesitan {:.1} MB para la siguiente tesela y se preservan 512 MB de seguridad.",
+                        bytes as f64 / 1_048_576.0
+                    ));
                 }
             }
+            let path = self.spill_dir.join(format!("tile_{index:05}.rgba16"));
+            let file = File::create(&path)
+                .map_err(|e| format!("No se pudo crear {}: {e}", path.display()))?;
+            let mut writer = BufWriter::new(file);
+            writer
+                .write_all(bytemuck::cast_slice(&data))
+                .and_then(|_| writer.flush())
+                .map_err(|e| format!("No se pudo escribir el caché 16-bit: {e}"))?;
+            self.max_spilled_tile_bytes = self.max_spilled_tile_bytes.max(bytes);
+            MosaicTileStorage::Spill(path)
+        };
+        self.entries.push(MosaicTileCacheEntry {
+            width,
+            height,
+            storage,
+        });
+        Ok(index)
+    }
 
-            // Fallback: If score is 0 (broken video?), take middle frame
-            if best_score == 0 {
-                best_idx = total / 2;
-            }
-
-            // Load the Winner Frame
-            let raw = reader.get_frame(best_idx, cid);
-            let u16s = raw_to_u16_buffer(&raw, w, h, bpp);
-            let mut rgb = debayer_to_rgb(&u16s, w, h, cid);
-
-            if cid >= 8 && cid <= 11 {
-                auto_color_balance(&mut rgb, w, h);
-            }
-
-            let vis = to_8bit_visual(&rgb, 1.0);
-
-            match image::RgbImage::from_raw(w as u32, h as u32, vis) {
-                Some(buf) => Ok(DynamicImage::ImageRgb8(buf)),
-                None => Err(format!("Error buffer visual: {}", path_str)),
+    fn load(&self, index: usize) -> Result<Cow<'_, [u16]>, String> {
+        let entry = self
+            .entries
+            .get(index)
+            .ok_or_else(|| format!("Índice de caché de mosaico inválido: {index}"))?;
+        match &entry.storage {
+            MosaicTileStorage::Ram(data) => Ok(Cow::Borrowed(data)),
+            MosaicTileStorage::Spill(path) => {
+                let samples = (entry.width as usize)
+                    .checked_mul(entry.height as usize)
+                    .and_then(|v| v.checked_mul(4))
+                    .ok_or("Dimensiones del caché RGBA16 fuera de rango")?;
+                let mut data = try_zeroed_vec::<u16>(samples, "tesela 16-bit temporal")?;
+                let file = File::open(path)
+                    .map_err(|e| format!("No se pudo abrir el caché {}: {e}", path.display()))?;
+                let mut reader = BufReader::new(file);
+                reader
+                    .read_exact(bytemuck::cast_slice_mut(&mut data))
+                    .map_err(|e| format!("Caché 16-bit truncado {}: {e}", path.display()))?;
+                Ok(Cow::Owned(data))
             }
         }
-        Err(e) => Err(format!("Error cargando {}: {}", path_str, e)),
     }
+}
+
+impl Drop for MosaicTileCache {
+    fn drop(&mut self) {
+        if self.spill_dir.exists() {
+            let _ = fs::remove_dir_all(&self.spill_dir);
+        }
+    }
+}
+
+fn available_disk_bytes(path: &Path) -> Option<u64> {
+    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|disk| target.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .map(|disk| disk.available_space())
+}
+
+fn try_zeroed_vec<T: Default + Clone>(len: usize, label: &str) -> Result<Vec<T>, String> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).map_err(|_| {
+        format!(
+            "No se pudo reservar memoria para {label} ({:.1} millones de elementos)",
+            len as f64 / 1_000_000.0
+        )
+    })?;
+    out.resize(len, T::default());
+    Ok(out)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MosaicMemoryPlan {
+    pixels: u64,
+    peak_bytes: u64,
+    reserve_bytes: u64,
+}
+
+/// Preflight puro del lienzo. `available_ram` se consulta después de crear el
+/// caché y los mapas AKAZE, por lo que representa la memoria que queda de verdad.
+fn plan_mosaic_canvas_memory(
+    width: u32,
+    height: u32,
+    aggregate_tile_pixels: u64,
+    max_spilled_tile_bytes: u64,
+    largest_tile_pixels: u64,
+    available_ram: u64,
+) -> Result<MosaicMemoryPlan, String> {
+    let pixels = (width as u64)
+        .checked_mul(height as u64)
+        .ok_or("Dimensiones del lienzo fuera de rango")?;
+    if pixels == 0 {
+        return Err("El lienzo de mosaico está vacío".to_string());
+    }
+    // Un bounding-box con más de 8× el área agregada de las teselas contiene
+    // casi todo espacio vacío y suele indicar una correspondencia espuria.
+    if aggregate_tile_pixels > 0 && pixels > aggregate_tile_pixels.saturating_mul(8) {
+        return Err(format!(
+            "Lienzo geométricamente implausible ({width}x{height}): su área supera 8× el área de las teselas. Revisa las coincidencias/solapes."
+        ));
+    }
+
+    let accum_bytes = pixels
+        .checked_mul(MOSAIC_ACCUMULATOR_BYTES_PER_PIXEL)
+        .ok_or("Acumulador de mosaico fuera de rango")?;
+    let normalize_peak = pixels
+        .checked_mul(MOSAIC_ACCUMULATOR_BYTES_PER_PIXEL + MOSAIC_OUTPUT_BYTES_PER_PIXEL)
+        .ok_or("Salida de mosaico fuera de rango")?;
+    // Durante el blend solo una tesela derramada vuelve a RAM. La mediana de
+    // ganancia muestrea 1/16 de sus píxeles como f32 (0.25 B/píxel de tesela).
+    let ratio_scratch = largest_tile_pixels / 4;
+    let blend_peak = accum_bytes
+        .checked_add(max_spilled_tile_bytes)
+        .and_then(|v| v.checked_add(ratio_scratch))
+        .ok_or("Pico de memoria del mosaico fuera de rango")?;
+    let peak_bytes = normalize_peak
+        .max(blend_peak)
+        .saturating_add(MOSAIC_FIXED_SCRATCH_BYTES);
+    // Conserva entre 256 MiB y 1 GiB para SO/WebView/allocator, pero nunca más
+    // de la mitad de la RAM que queda en una máquina muy ajustada.
+    let reserve_bytes = (available_ram / 5)
+        .clamp(256 * 1024 * 1024, 1024 * 1024 * 1024)
+        .min(available_ram / 2);
+    let usable = available_ram.saturating_sub(reserve_bytes);
+    if peak_bytes > usable {
+        return Err(format!(
+            "RAM insuficiente para mosaico {width}x{height}: pico estimado {:.2} GB, disponibles de forma segura {:.2} GB (reserva del sistema {:.2} GB). Reduce paneles/drizzle, cierra otras aplicaciones o procesa por secciones.",
+            peak_bytes as f64 / 1_073_741_824.0,
+            usable as f64 / 1_073_741_824.0,
+            reserve_bytes as f64 / 1_073_741_824.0
+        ));
+    }
+    Ok(MosaicMemoryPlan {
+        pixels,
+        peak_bytes,
+        reserve_bytes,
+    })
+}
+
+#[inline]
+fn rgba16_at(data: &[u16], width: u32, x: u32, y: u32) -> [u16; 4] {
+    let i = (y as usize * width as usize + x as usize) * 4;
+    [data[i], data[i + 1], data[i + 2], data[i + 3]]
+}
+
+fn normalize_mosaic_accumulators(
+    acc_r: &[f32],
+    acc_g: &[f32],
+    acc_b: &[f32],
+    acc_w: &[f32],
+) -> Result<Vec<u16>, String> {
+    let len = acc_w.len();
+    if acc_r.len() != len || acc_g.len() != len || acc_b.len() != len {
+        return Err("Buffers de composición de mosaico inconsistentes".to_string());
+    }
+    let out_len = len
+        .checked_mul(3)
+        .ok_or("Salida RGB de mosaico fuera de rango")?;
+    let mut out = try_zeroed_vec::<u16>(out_len, "salida RGB16 del mosaico")?;
+    out.par_chunks_mut(3)
+        .enumerate()
+        .for_each(|(idx, pixel)| {
+            let wsum = acc_w[idx];
+            if wsum > 0.0 {
+                pixel[0] = (acc_r[idx] / wsum + 0.5).clamp(0.0, 65535.0) as u16;
+                pixel[1] = (acc_g[idx] / wsum + 0.5).clamp(0.0, 65535.0) as u16;
+                pixel[2] = (acc_b[idx] / wsum + 0.5).clamp(0.0, 65535.0) as u16;
+            }
+        });
+    Ok(out)
+}
+
+/// El mosaico siempre se almacena como RGB16, incluso cuando las tres bandas
+/// proceden de una captura mono. Comprobar todo el buffer evita clasificar una
+/// imagen de color por un único píxel neutro o por el fondo negro del lienzo.
+fn mosaic_rgb16_is_mono(rgb: &[u16]) -> bool {
+    !rgb.is_empty()
+        && rgb.len() % 3 == 0
+        && rgb
+            .par_chunks_exact(3)
+            .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2])
+}
+
+#[cfg(test)]
+mod mosaic_resource_tests {
+    use super::{
+        auto_stretch_luma16_to_gray, mosaic_rgb16_is_mono,
+        normalize_mosaic_accumulators, plan_mosaic_canvas_memory, FeaturePoint,
+    };
+
+    #[test]
+    fn word_hamming_matches_scalar_for_akaze_descriptor() {
+        let a: Vec<u8> = (0..61).map(|i| (i * 17 + 3) as u8).collect();
+        let b: Vec<u8> = (0..61).map(|i| (i * 29 + 11) as u8).collect();
+        let expected: u32 = a
+            .iter()
+            .zip(&b)
+            .map(|(&x, &y)| (x ^ y).count_ones())
+            .sum();
+        let fa = FeaturePoint {
+            x: 0.0,
+            y: 0.0,
+            descriptor: a,
+        };
+        let fb = FeaturePoint {
+            x: 0.0,
+            y: 0.0,
+            descriptor: b,
+        };
+        assert_eq!(fa.distance(&fb), expected);
+    }
+
+    #[test]
+    fn canvas_budget_uses_real_available_ram() {
+        let tiles = 4 * 4096_u64 * 4096;
+        let ok = plan_mosaic_canvas_memory(
+            8192,
+            8192,
+            tiles,
+            0,
+            4096 * 4096,
+            4 * 1024 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(ok.pixels, 8192 * 8192);
+        assert!(ok.peak_bytes > ok.pixels * 22);
+
+        let low_ram = plan_mosaic_canvas_memory(
+            8192,
+            8192,
+            tiles,
+            0,
+            4096 * 4096,
+            1024 * 1024 * 1024,
+        );
+        assert!(low_ram.unwrap_err().contains("RAM insuficiente"));
+    }
+
+    #[test]
+    fn canvas_budget_rejects_sparse_bad_match() {
+        let err = plan_mosaic_canvas_memory(
+            30_000,
+            30_000,
+            2 * 2048_u64 * 2048,
+            0,
+            2048 * 2048,
+            64 * 1024 * 1024 * 1024,
+        )
+        .unwrap_err();
+        assert!(err.contains("geométricamente implausible"));
+    }
+
+    #[test]
+    fn parallel_composition_is_bit_exact_with_reference() {
+        let r = [100.0, 40_000.0, 65_535.0, 10.0];
+        let g = [300.0, 20_000.0, 90_000.0, 20.0];
+        let b = [500.0, 10_000.0, -25.0, 30.0];
+        let w = [2.0, 0.5, 1.0, 0.0];
+        let optimized = normalize_mosaic_accumulators(&r, &g, &b, &w).unwrap();
+        let mut reference = vec![0u16; 12];
+        for i in 0..4 {
+            if w[i] > 0.0 {
+                reference[i * 3] = (r[i] / w[i] + 0.5).clamp(0.0, 65535.0) as u16;
+                reference[i * 3 + 1] =
+                    (g[i] / w[i] + 0.5).clamp(0.0, 65535.0) as u16;
+                reference[i * 3 + 2] =
+                    (b[i] / w[i] + 0.5).clamp(0.0, 65535.0) as u16;
+            }
+        }
+        assert_eq!(optimized, reference);
+    }
+
+    #[test]
+    fn feature_stretch_preserves_low_16_bit_signal() {
+        let mut source = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_pixel(
+            64,
+            64,
+            image::Luma([128]),
+        );
+        for y in 16..48 {
+            for x in 16..48 {
+                source.put_pixel(x, y, image::Luma([768]));
+            }
+        }
+        let stretched = auto_stretch_luma16_to_gray(&source);
+        assert!(stretched.get_pixel(32, 32)[0] > stretched.get_pixel(0, 0)[0] + 200);
+    }
+
+    #[test]
+    fn mosaic_mono_detection_scans_every_pixel() {
+        let mut rgb = vec![0u16; 128 * 3];
+        for (index, pixel) in rgb.chunks_exact_mut(3).enumerate() {
+            let value = index as u16 * 17;
+            pixel.copy_from_slice(&[value, value, value]);
+        }
+        assert!(mosaic_rgb16_is_mono(&rgb));
+
+        // El centro y el fondo siguen siendo neutros; un único píxel de color
+        // basta para demostrar que no es una señal mono duplicada.
+        rgb[7 * 3 + 1] = rgb[7 * 3 + 1].saturating_add(1);
+        assert!(!mosaic_rgb16_is_mono(&rgb));
+    }
+}
+
+// === AKAZE HELPERS (No explicit helpers needed, using crate directly) ===
+
+/// Un mosaico se construye con masters apilados, nunca con un frame elegido de
+/// una captura. Aceptar SER/AVI/MP4 aquí degradaba silenciosamente miles de
+/// frames lineales a una sola previsualización RGB8 estirada.
+fn load_mosaic_master_image(path_str: &str) -> Result<DynamicImage, String> {
+    let path = Path::new(path_str);
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "png" | "tif" | "tiff") {
+        return Err(format!(
+            "{} no es un master PNG/TIFF. Analiza y apila la captura antes de unirla al mosaico.",
+            path_str
+        ));
+    }
+    image::open(path).map_err(|error| format!("Error cargando master {}: {error}", path_str))
 }
 
 #[tauri::command]
@@ -4642,17 +6130,486 @@ fn derot_encode_preview(rgb: &[u16], width: usize, height: usize) -> Result<Stri
     ))
 }
 
-fn derot_save_rgb16_tiff(path: &Path, rgb: &[u16], width: usize, height: usize) -> Result<(), String> {
-    let mut raw_bytes = Vec::with_capacity(rgb.len() * 2);
+static DEROTATION_OUTPUT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+fn derot_write_rgb16_tiff(
+    file: File,
+    rgb: &[u16],
+    width: usize,
+    height: usize,
+) -> Result<(), String> {
+    let expected_samples = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| "Dimensiones TIFF de derotacion fuera de rango".to_string())?;
+    if rgb.len() != expected_samples {
+        return Err(format!(
+            "Buffer RGB16 de derotacion inconsistente: {} muestras para {}x{}",
+            rgb.len(),
+            width,
+            height
+        ));
+    }
+    let byte_len = rgb
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| "TIFF de derotacion demasiado grande".to_string())?;
+    let mut raw_bytes = Vec::new();
+    raw_bytes
+        .try_reserve_exact(byte_len)
+        .map_err(|error| format!("Memoria insuficiente para TIFF de derotacion: {error}"))?;
     for v in rgb {
         raw_bytes.extend_from_slice(&v.to_ne_bytes());
     }
 
-    let file = File::create(path).map_err(|e| e.to_string())?;
+    let mut writer = BufWriter::new(file);
+    image::codecs::tiff::TiffEncoder::new(&mut writer)
+        .encode(&raw_bytes, width as u32, height as u32, image::ColorType::Rgb16)
+        .map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())?;
+    writer.get_ref().sync_all().map_err(|e| e.to_string())
+}
+
+// Kept for the pre-existing non-planetary callers included later in the crate.
+// Planetary derotation never writes a final path through this helper anymore.
+fn derot_save_rgb16_tiff(
+    path: &Path,
+    rgb: &[u16],
+    width: usize,
+    height: usize,
+) -> Result<(), String> {
+    let mut raw_bytes = Vec::with_capacity(rgb.len() * 2);
+    for value in rgb {
+        raw_bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    let file = File::create(path).map_err(|error| error.to_string())?;
     let writer = BufWriter::new(file);
     image::codecs::tiff::TiffEncoder::new(writer)
-        .encode(&raw_bytes, width as u32, height as u32, image::ColorType::Rgb16)
-        .map_err(|e| e.to_string())
+        .encode(
+            &raw_bytes,
+            width as u32,
+            height as u32,
+            image::ColorType::Rgb16,
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn derot_unique_suffix() -> String {
+    let sequence = DEROTATION_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "{}_{}_p{}_{}",
+        chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f"),
+        nanos,
+        std::process::id(),
+        sequence
+    )
+}
+
+fn derot_bounded_file_component(value: &str, max_bytes: usize) -> String {
+    let mut bounded = String::new();
+    for ch in value.chars() {
+        if bounded.len().saturating_add(ch.len_utf8()) > max_bytes {
+            break;
+        }
+        bounded.push(ch);
+    }
+    if bounded.is_empty() {
+        "derotation".to_string()
+    } else {
+        bounded
+    }
+}
+
+fn derot_unique_tiff_path(parent: &Path, prefix: &str) -> PathBuf {
+    let prefix = derot_bounded_file_component(prefix, 120);
+    loop {
+        let candidate = parent.join(format!("{}_{}.tiff", prefix, derot_unique_suffix()));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+}
+
+fn sync_parent_directory(path: &Path) {
+    #[cfg(not(target_os = "windows"))]
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = File::open(parent) {
+            let _ = directory.sync_all();
+        }
+    }
+}
+
+/// A TIFF is fully encoded and synced before it becomes visible at its final
+/// path. The temporary file lives beside the destination so `rename` cannot
+/// cross filesystems. Drop is the rollback path for errors and cancellation.
+struct StagedDerotationTiff {
+    temporary_path: PathBuf,
+    final_path: PathBuf,
+    published: bool,
+}
+
+impl StagedDerotationTiff {
+    fn encode(
+        final_path: PathBuf,
+        rgb: &[u16],
+        width: usize,
+        height: usize,
+    ) -> Result<Self, String> {
+        let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        loop {
+            let temporary_path =
+                parent.join(format!(".derotation-{}.tmp", derot_unique_suffix()));
+            let file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary_path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+
+            if let Err(error) = derot_write_rgb16_tiff(file, rgb, width, height) {
+                let _ = std::fs::remove_file(&temporary_path);
+                return Err(error);
+            }
+            return Ok(Self {
+                temporary_path,
+                final_path,
+                published: false,
+            });
+        }
+    }
+
+    fn publish(&mut self) -> Result<(), String> {
+        if self.final_path.exists() {
+            return Err(format!(
+                "La salida de derotacion ya existe y no se sobrescribira: {}",
+                self.final_path.display()
+            ));
+        }
+        std::fs::rename(&self.temporary_path, &self.final_path)
+            .map_err(|error| error.to_string())?;
+        sync_parent_directory(&self.final_path);
+        self.published = true;
+        Ok(())
+    }
+}
+
+/// PNG planetario completamente codificado y sincronizado antes de aparecer
+/// bajo su nombre final. Se usa para previews que deben compartir el mismo
+/// commit generacional que el máster 16-bit.
+struct StagedPlanetaryPng {
+    temporary_path: PathBuf,
+    final_path: PathBuf,
+    published: bool,
+}
+
+/// Archivo RGB16/FITS de propósito general: encode+flush+fsync en un sibling
+/// oculto, seguido de publicación corta bajo el generation gate.
+struct StagedPlanetaryArtifact {
+    temporary_path: PathBuf,
+    final_path: PathBuf,
+    published: bool,
+}
+
+impl StagedPlanetaryArtifact {
+    fn create_paths(final_path: PathBuf) -> Result<(PathBuf, File), String> {
+        let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        loop {
+            let temporary_path =
+                parent.join(format!(".planetary-artifact-{}.tmp", derot_unique_suffix()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary_path)
+            {
+                Ok(file) => return Ok((temporary_path, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+
+    fn encode_rgb16_png(
+        final_path: PathBuf,
+        rgb: &[u16],
+        width: usize,
+        height: usize,
+    ) -> Result<Self, String> {
+        if rgb.len() != width.saturating_mul(height).saturating_mul(3) {
+            return Err("Buffer RGB16 invalido para PNG".into());
+        }
+        let (temporary_path, file) = Self::create_paths(final_path.clone())?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(rgb.len().saturating_mul(2))
+            .map_err(|error| format!("Memoria insuficiente para PNG16: {error}"))?;
+        for value in rgb {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        let mut writer = BufWriter::new(file);
+        if let Err(error) = image::codecs::png::PngEncoder::new(&mut writer).encode(
+            &bytes,
+            width as u32,
+            height as u32,
+            image::ColorType::Rgb16,
+        ) {
+            let _ = std::fs::remove_file(&temporary_path);
+            return Err(error.to_string());
+        }
+        if let Err(error) = writer.flush().and_then(|_| writer.get_ref().sync_all()) {
+            let _ = std::fs::remove_file(&temporary_path);
+            return Err(error.to_string());
+        }
+        Ok(Self {
+            temporary_path,
+            final_path,
+            published: false,
+        })
+    }
+
+    fn encode_rgb16_tiff(
+        final_path: PathBuf,
+        rgb: &[u16],
+        width: usize,
+        height: usize,
+    ) -> Result<Self, String> {
+        let (temporary_path, file) = Self::create_paths(final_path.clone())?;
+        if let Err(error) = derot_write_rgb16_tiff(file, rgb, width, height) {
+            let _ = std::fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+        Ok(Self {
+            temporary_path,
+            final_path,
+            published: false,
+        })
+    }
+
+    fn encode_rgb16_fits(
+        final_path: PathBuf,
+        rgb: &[u16],
+        width: usize,
+        height: usize,
+    ) -> Result<Self, String> {
+        let (temporary_path, file) = Self::create_paths(final_path.clone())?;
+        drop(file);
+        let temporary_string = temporary_path.to_string_lossy().into_owned();
+        if let Err(error) = write_rgb16_fits(&temporary_string, rgb, width, height) {
+            let _ = std::fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+        File::open(&temporary_path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            temporary_path,
+            final_path,
+            published: false,
+        })
+    }
+
+    fn publish(&mut self, replace_existing: bool) -> Result<(), String> {
+        if replace_existing {
+            atomic_replace_analysis_file(&self.temporary_path, &self.final_path)
+                .map_err(|error| error.to_string())?;
+        } else {
+            if self.final_path.exists() {
+                return Err(format!(
+                    "La salida planetaria ya existe y no se sobrescribira: {}",
+                    self.final_path.display()
+                ));
+            }
+            // Los nombres no destructivos incorporan PID+reloj+secuencia y la
+            // app es single-instance. rename mantiene compatibilidad con exFAT
+            // (habitual en discos de captura), donde hard_link no está soportado.
+            std::fs::rename(&self.temporary_path, &self.final_path)
+                .map_err(|error| error.to_string())?;
+        }
+        sync_parent_directory(&self.final_path);
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedPlanetaryArtifact {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.temporary_path);
+        }
+    }
+}
+
+impl StagedPlanetaryPng {
+    fn encode_rgb8(
+        final_path: PathBuf,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .ok_or_else(|| "Preview PNG demasiado grande".to_string())?;
+        if rgb.len() != expected {
+            return Err("Buffer RGB8 invalido para preview PNG".to_string());
+        }
+        let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        loop {
+            let temporary_path =
+                parent.join(format!(".planetary-preview-{}.tmp", derot_unique_suffix()));
+            let file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary_path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            let mut writer = BufWriter::new(file);
+            if let Err(error) = image::codecs::png::PngEncoder::new(&mut writer)
+                .encode(rgb, width, height, image::ColorType::Rgb8)
+            {
+                let _ = std::fs::remove_file(&temporary_path);
+                return Err(error.to_string());
+            }
+            if let Err(error) = writer.flush().and_then(|_| writer.get_ref().sync_all()) {
+                let _ = std::fs::remove_file(&temporary_path);
+                return Err(error.to_string());
+            }
+            return Ok(Self {
+                temporary_path,
+                final_path,
+                published: false,
+            });
+        }
+    }
+
+    fn publish(&mut self) -> Result<(), String> {
+        if self.final_path.exists() {
+            return Err(format!(
+                "La salida planetaria ya existe y no se sobrescribira: {}",
+                self.final_path.display()
+            ));
+        }
+        std::fs::rename(&self.temporary_path, &self.final_path)
+            .map_err(|error| error.to_string())?;
+        sync_parent_directory(&self.final_path);
+        self.published = true;
+        Ok(())
+    }
+
+}
+
+impl Drop for StagedPlanetaryPng {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.temporary_path);
+        }
+    }
+}
+
+impl Drop for StagedDerotationTiff {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.temporary_path);
+        }
+    }
+}
+
+/// A sequence is staged in a sibling directory and published with one atomic
+/// directory rename. This prevents a cancelled animation from exposing a
+/// half-written sequence.
+struct StagedDerotationSequence {
+    temporary_dir: PathBuf,
+    final_dir: PathBuf,
+    file_names: Vec<String>,
+    published: bool,
+}
+
+impl StagedDerotationSequence {
+    fn create(parent: &Path) -> Result<Self, String> {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        loop {
+            let suffix = derot_unique_suffix();
+            let final_dir = parent.join(format!("Derotated_Planetary_{}", suffix));
+            let temporary_dir = parent.join(format!(".Derotated_Planetary_{}.tmp", suffix));
+            if final_dir.exists() {
+                continue;
+            }
+            match std::fs::create_dir(&temporary_dir) {
+                Ok(()) => {
+                    return Ok(Self {
+                        temporary_dir,
+                        final_dir,
+                        file_names: Vec::new(),
+                        published: false,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+
+    fn stage_rgb16(
+        &mut self,
+        file_name: String,
+        rgb: &[u16],
+        width: usize,
+        height: usize,
+    ) -> Result<(), String> {
+        let path = self.temporary_dir.join(&file_name);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| error.to_string())?;
+        if let Err(error) = derot_write_rgb16_tiff(file, rgb, width, height) {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+        self.file_names.push(file_name);
+        Ok(())
+    }
+
+    fn output_paths(&self) -> Vec<PathBuf> {
+        self.file_names
+            .iter()
+            .map(|file_name| self.final_dir.join(file_name))
+            .collect()
+    }
+
+    fn publish(&mut self) -> Result<(), String> {
+        if self.final_dir.exists() {
+            return Err(format!(
+                "La carpeta de derotacion ya existe y no se sobrescribira: {}",
+                self.final_dir.display()
+            ));
+        }
+        std::fs::rename(&self.temporary_dir, &self.final_dir)
+            .map_err(|error| error.to_string())?;
+        sync_parent_directory(&self.final_dir);
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedDerotationSequence {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_dir_all(&self.temporary_dir);
+        }
+    }
 }
 
 fn derot_default_output_path(source_path: &str) -> PathBuf {
@@ -4663,18 +6620,17 @@ fn derot_default_output_path(source_path: &str) -> PathBuf {
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
         .unwrap_or("Planetary_Derotation");
-    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    parent.join(format!("{}_Derotated_{}.tiff", stem, stamp))
+    derot_unique_tiff_path(parent, &format!("{}_Derotated", stem))
 }
 
 fn derot_output_path_from_optional_source(source_path: Option<&str>, fallback_name: &str) -> PathBuf {
     if let Some(path) = source_path.filter(|p| !p.trim().is_empty()) {
         derot_default_output_path(path)
     } else {
-        let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(format!("{}_Derotated_{}.tiff", fallback_name, stamp))
+        derot_unique_tiff_path(
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            &format!("{}_Derotated", fallback_name),
+        )
     }
 }
 
@@ -5088,6 +7044,378 @@ async fn detect_planetary_derotation_disc(
     })
 }
 
+/// Cooperative checkpoint shared by the derotation commands.  The generation
+/// component is essential: a later command may legitimately clear the global
+/// cancellation flag, but it must never make an older worker current again.
+#[inline]
+fn planetary_derotation_checkpoint(
+    job_token: &PlanetaryJobToken,
+    stage: &str,
+) -> Result<(), String> {
+    if job_token.is_cancelled() {
+        Err(format!(
+            "Operacion planetaria cancelada o sustituida durante {stage}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Execute a small ownership transition while the planetary generation cannot
+/// change.  Heavy derotation work stays outside this critical section.
+fn with_current_planetary_job<T>(
+    generation_gate: &Mutex<()>,
+    job_token: &PlanetaryJobToken,
+    stage: &str,
+    action: impl FnOnce() -> T,
+) -> Result<T, String> {
+    let _generation_guard = generation_gate
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    planetary_derotation_checkpoint(job_token, stage)?;
+    Ok(action())
+}
+
+/// Commit a derotation result atomically with respect to cancellation and job
+/// supersession.  Derived caches belong to the published master, so they are
+/// invalidated in the same ownership transition.
+fn publish_planetary_derotation_if_current(
+    state: &AppState,
+    job_token: &PlanetaryJobToken,
+    mut staged_tiff: StagedDerotationTiff,
+    result: StackResult,
+    stage: &str,
+) -> Result<PathBuf, String> {
+    let final_path = staged_tiff.final_path.clone();
+    with_current_planetary_job(
+        &state.planetary_generation_gate,
+        job_token,
+        stage,
+        || -> Result<(), String> {
+            // The rename and the logical master transition share the same
+            // generation gate. A superseded worker can therefore publish
+            // neither the TIFF nor `stacked_image`.
+            staged_tiff.publish()?;
+            *state
+                .stacked_image
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(result);
+            state
+                .deconv_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+            state
+                .wavelet_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+            state
+                .filter_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+            Ok(())
+        },
+    )??;
+    Ok(final_path)
+}
+
+fn publish_planetary_derotation_sequence_if_current(
+    state: &AppState,
+    job_token: &PlanetaryJobToken,
+    mut staged_sequence: StagedDerotationSequence,
+    stage: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let output_paths = staged_sequence.output_paths();
+    with_current_planetary_job(
+        &state.planetary_generation_gate,
+        job_token,
+        stage,
+        || staged_sequence.publish(),
+    )??;
+    Ok(output_paths)
+}
+
+/// Start a clean session without exposing the old race where generation was
+/// advanced under the gate and `cancel_requested=false` was written after the
+/// gate had already been released. `while_locked` lets clear_app_memory erase
+/// the old published stack in the same transaction.
+fn advance_and_rearm_planetary_session(
+    generation_gate: &Mutex<()>,
+    active_request: &AtomicUsize,
+    cancel_requested: &std::sync::atomic::AtomicBool,
+    while_locked: impl FnOnce(),
+) -> usize {
+    let _generation_guard = generation_gate
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let generation = active_request
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    cancel_requested.store(false, Ordering::Release);
+    while_locked();
+    generation
+}
+
+/// Invalidate the current owner and mutate its published slot under one gate,
+/// while deliberately preserving the sticky cancellation flag used by batch
+/// processing between files.
+fn advance_planetary_generation_under_gate(
+    generation_gate: &Mutex<()>,
+    active_request: &AtomicUsize,
+    while_locked: impl FnOnce(),
+) -> usize {
+    let _generation_guard = generation_gate
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let generation = active_request
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    while_locked();
+    generation
+}
+
+#[cfg(test)]
+mod planetary_publication_tests {
+    use super::{
+        advance_and_rearm_planetary_session, advance_planetary_generation_under_gate,
+        derot_unique_suffix, derot_unique_tiff_path, with_current_planetary_job,
+        PlanetaryJobToken, StagedDerotationSequence, StagedDerotationTiff,
+    };
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn derotation_test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "zenith-derotation-{}-{}",
+            label,
+            derot_unique_suffix()
+        ));
+        std::fs::create_dir_all(&root).expect("crear carpeta temporal");
+        root
+    }
+
+    #[test]
+    fn generation_gate_commits_only_the_current_planetary_token() {
+        let gate = Mutex::new(());
+        let active = Arc::new(AtomicUsize::new(7));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let token = PlanetaryJobToken::for_test(7, active.clone(), cancelled.clone());
+        let published = AtomicUsize::new(0);
+
+        with_current_planetary_job(&gate, &token, "prueba", || {
+            assert!(gate.try_lock().is_err(), "el commit debe conservar el gate");
+            published.store(7, Ordering::Release);
+        })
+        .expect("el propietario vigente debe publicar");
+
+        active.store(8, Ordering::Release);
+        assert!(
+            with_current_planetary_job(&gate, &token, "prueba obsoleta", || {
+                published.store(99, Ordering::Release);
+            })
+            .is_err(),
+            "una generacion sustituida no debe ejecutar el commit"
+        );
+        assert_eq!(published.load(Ordering::Acquire), 7);
+
+        active.store(7, Ordering::Release);
+        cancelled.store(true, Ordering::Release);
+        assert!(
+            with_current_planetary_job(&gate, &token, "prueba cancelada", || {
+                published.store(100, Ordering::Release);
+            })
+            .is_err(),
+            "una cancelacion explicita tampoco debe ejecutar el commit"
+        );
+        assert_eq!(published.load(Ordering::Acquire), 7);
+    }
+
+    #[test]
+    fn session_rearm_advances_generation_and_clears_cancel_under_one_gate() {
+        let gate = Mutex::new(());
+        let active = Arc::new(AtomicUsize::new(41));
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let old_token = PlanetaryJobToken::for_test(41, active.clone(), cancelled.clone());
+        let reset_ran_under_gate = AtomicBool::new(false);
+
+        let generation = advance_and_rearm_planetary_session(
+            &gate,
+            active.as_ref(),
+            cancelled.as_ref(),
+            || reset_ran_under_gate.store(gate.try_lock().is_err(), Ordering::Release),
+        );
+
+        assert_eq!(generation, 42);
+        assert!(!cancelled.load(Ordering::Acquire));
+        assert!(reset_ran_under_gate.load(Ordering::Acquire));
+        assert!(old_token.is_cancelled(), "la generacion anterior sigue invalidada");
+    }
+
+    #[test]
+    fn per_file_clear_advances_under_gate_without_rearming_cancel() {
+        let gate = Mutex::new(());
+        let active = AtomicUsize::new(12);
+        let cancelled = AtomicBool::new(true);
+        let clear_ran_under_gate = AtomicBool::new(false);
+
+        let generation = advance_planetary_generation_under_gate(&gate, &active, || {
+            clear_ran_under_gate.store(gate.try_lock().is_err(), Ordering::Release);
+        });
+
+        assert_eq!(generation, 13);
+        assert!(cancelled.load(Ordering::Acquire), "la cancelacion debe seguir sticky");
+        assert!(clear_ran_under_gate.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn superseded_batch_worker_cannot_resurrect_cleared_anchor() {
+        let gate = Mutex::new(());
+        let active = Arc::new(AtomicUsize::new(21));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let old_token = PlanetaryJobToken::for_test(21, active.clone(), cancelled);
+        let anchor = Mutex::new(Some(vec![1u16, 2, 3]));
+        let dimensions = Mutex::new((1usize, 1usize));
+
+        advance_planetary_generation_under_gate(&gate, active.as_ref(), || {
+            *anchor.lock().unwrap() = None;
+            *dimensions.lock().unwrap() = (0, 0);
+        });
+
+        let stale_commit = with_current_planetary_job(&gate, &old_token, "anchor obsoleto", || {
+            *anchor.lock().unwrap() = Some(vec![9u16, 9, 9]);
+            *dimensions.lock().unwrap() = (1, 1);
+        });
+        assert!(stale_commit.is_err());
+        assert!(anchor.lock().unwrap().is_none());
+        assert_eq!(*dimensions.lock().unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn staged_tiff_is_published_only_by_the_current_generation() {
+        let root = derotation_test_root("single-success");
+        let final_path = derot_unique_tiff_path(&root, "result");
+        let mut staged = StagedDerotationTiff::encode(
+            final_path.clone(),
+            &[1024, 2048, 4096],
+            1,
+            1,
+        )
+        .expect("codificar TIFF temporal");
+        let temporary_path = staged.temporary_path.clone();
+        let gate = Mutex::new(());
+        let active = Arc::new(AtomicUsize::new(3));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let token = PlanetaryJobToken::for_test(3, active, cancelled);
+
+        with_current_planetary_job(&gate, &token, "publicacion TIFF", || staged.publish())
+            .expect("token vigente")
+            .expect("rename atomico");
+
+        assert!(final_path.is_file());
+        assert!(!temporary_path.exists());
+        drop(staged);
+        assert!(final_path.is_file(), "Drop no debe borrar una salida publicada");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn superseded_tiff_rolls_back_without_exposing_output() {
+        let root = derotation_test_root("single-cancel");
+        let final_path = derot_unique_tiff_path(&root, "result");
+        let mut staged = StagedDerotationTiff::encode(
+            final_path.clone(),
+            &[1024, 2048, 4096],
+            1,
+            1,
+        )
+        .expect("codificar TIFF temporal");
+        let temporary_path = staged.temporary_path.clone();
+        let gate = Mutex::new(());
+        let active = Arc::new(AtomicUsize::new(8));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let token = PlanetaryJobToken::for_test(8, active.clone(), cancelled);
+        active.store(9, Ordering::Release);
+
+        assert!(
+            with_current_planetary_job(&gate, &token, "publicacion obsoleta", || {
+                staged.publish()
+            })
+            .is_err()
+        );
+        drop(staged);
+
+        assert!(!temporary_path.exists());
+        assert!(!final_path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn animation_sequence_is_all_or_nothing_on_supersession() {
+        let root = derotation_test_root("sequence-cancel");
+        let mut staged = StagedDerotationSequence::create(&root)
+            .expect("crear staging de secuencia");
+        staged
+            .stage_rgb16("0001_a.tiff".to_string(), &[1, 2, 3], 1, 1)
+            .expect("primer frame");
+        staged
+            .stage_rgb16("0002_b.tiff".to_string(), &[4, 5, 6], 1, 1)
+            .expect("segundo frame");
+        let temporary_dir = staged.temporary_dir.clone();
+        let final_dir = staged.final_dir.clone();
+        let gate = Mutex::new(());
+        let active = Arc::new(AtomicUsize::new(21));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let token = PlanetaryJobToken::for_test(21, active.clone(), cancelled);
+        active.store(22, Ordering::Release);
+
+        assert!(
+            with_current_planetary_job(&gate, &token, "publicacion de secuencia", || {
+                staged.publish()
+            })
+            .is_err()
+        );
+        drop(staged);
+
+        assert!(!temporary_dir.exists());
+        assert!(!final_dir.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn animation_sequence_publishes_with_one_directory_rename() {
+        let root = derotation_test_root("sequence-success");
+        let mut staged = StagedDerotationSequence::create(&root)
+            .expect("crear staging de secuencia");
+        staged
+            .stage_rgb16("0001_a.tiff".to_string(), &[1, 2, 3], 1, 1)
+            .expect("primer frame");
+        staged
+            .stage_rgb16("0002_b.tiff".to_string(), &[4, 5, 6], 1, 1)
+            .expect("segundo frame");
+        let output_paths = staged.output_paths();
+        let temporary_dir = staged.temporary_dir.clone();
+        let final_dir = staged.final_dir.clone();
+        let gate = Mutex::new(());
+        let active = Arc::new(AtomicUsize::new(31));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let token = PlanetaryJobToken::for_test(31, active, cancelled);
+
+        with_current_planetary_job(&gate, &token, "publicacion de secuencia", || {
+            staged.publish()
+        })
+        .expect("token vigente")
+        .expect("rename de directorio");
+
+        assert!(!temporary_dir.exists());
+        assert!(final_dir.is_dir());
+        assert!(output_paths.iter().all(|path| path.is_file()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 #[tauri::command]
 async fn apply_planetary_derotation(
     app: tauri::AppHandle,
@@ -5102,6 +7430,10 @@ async fn apply_planetary_derotation(
     disc_override: Option<DerotationDiscDto>,
 ) -> Result<PlanetaryDerotationResult, String> {
     state.license_manager.check_access()?;
+    let request_id = begin_planetary_user_job(&state);
+    let job_token =
+        PlanetaryJobToken::for_app(&app, request_id, state.cancel_requested.clone());
+    planetary_derotation_checkpoint(&job_token, "el inicio de la derotacion")?;
     let planet_body = crate::derotation::get_planet(&planet)
         .ok_or_else(|| "Planeta no soportado para derotacion".to_string())?;
     let capture_jd = crate::derotation::parse_iso_to_jd(&capture_time)
@@ -5110,7 +7442,9 @@ async fn apply_planetary_derotation(
         .map_err(|e| format!("Tiempo de referencia invalido: {}", e))?;
 
     emit_progress(&app, "Cargando imagen para derotacion...", 5.0, None);
+    planetary_derotation_checkpoint(&job_token, "la carga de la imagen")?;
     let (rgb, width, height) = derot_load_rgb16_image(&image_path)?;
+    planetary_derotation_checkpoint(&job_token, "la carga de la imagen")?;
     let mono = derot_rgb_to_mono(&rgb);
     let raw_disc = match disc_override.as_ref() {
         Some(disc) => crate::derotation::PlanetDisc::from(disc),
@@ -5143,6 +7477,7 @@ async fn apply_planetary_derotation(
     if !diagnostics.can_apply {
         return Err("La geometria del disco no es suficientemente confiable. Ajusta centro/radio o carga una imagen planetaria con el disco completo visible.".to_string());
     }
+    planetary_derotation_checkpoint(&job_token, "el analisis de geometria")?;
 
     emit_progress(
         &app,
@@ -5153,10 +7488,12 @@ async fn apply_planetary_derotation(
 
     let planet_for_block = planet.clone();
     let disc_for_block = disc.clone();
+    let blocking_token = job_token.clone();
     let derotated = tauri::async_runtime::spawn_blocking(move || {
+        planetary_derotation_checkpoint(&blocking_token, "el calculo de derotacion")?;
         let planet_body = crate::derotation::get_planet(&planet_for_block)
             .ok_or_else(|| "Planeta no soportado para derotacion".to_string())?;
-        Ok::<Vec<u16>, String>(crate::derotation::derotate_single_advanced(
+        let result = crate::derotation::derotate_single_advanced_cancelable(
             &rgb,
             width,
             height,
@@ -5168,30 +7505,36 @@ async fn apply_planetary_derotation(
             cm_system.min(2),
             sub_earth_lat_deg.clamp(-35.0, 35.0),
             Some(&disc_for_block),
-        ))
+            || blocking_token.is_cancelled(),
+        )?;
+        planetary_derotation_checkpoint(&blocking_token, "el calculo de derotacion")?;
+        Ok::<Vec<u16>, String>(result)
     })
     .await
     .map_err(|e| e.to_string())??;
+    planetary_derotation_checkpoint(&job_token, "el calculo de derotacion")?;
 
-    let out_path = derot_default_output_path(&image_path);
+    let intended_out_path = derot_default_output_path(&image_path);
     emit_progress(&app, "Guardando TIFF derotado 16-bit...", 82.0, None);
-    derot_save_rgb16_tiff(&out_path, &derotated, width, height)?;
-
-    {
-        let mut stacked = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
-        *stacked = Some(StackResult {
-            data: derotated.clone(),
+    planetary_derotation_checkpoint(&job_token, "el guardado TIFF")?;
+    let staged_tiff =
+        StagedDerotationTiff::encode(intended_out_path, &derotated, width, height)?;
+    planetary_derotation_checkpoint(&job_token, "el guardado TIFF")?;
+    let preview_base64 = derot_encode_preview(&derotated, width, height)?;
+    planetary_derotation_checkpoint(&job_token, "la publicacion del resultado")?;
+    let out_path = publish_planetary_derotation_if_current(
+        &state,
+        &job_token,
+        staged_tiff,
+        StackResult {
+            data: derotated,
             width,
             height,
             is_mono: false,
             is_surface: false,
-        });
-    }
-    state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-
-    let preview_base64 = derot_encode_preview(&derotated, width, height)?;
+        },
+        "la publicacion del resultado",
+    )?;
     emit_progress(&app, "Derotacion completada", 100.0, None);
     log_to_front(
         &app,
@@ -5237,6 +7580,10 @@ async fn apply_current_stacked_planetary_derotation(
     disc_override: Option<DerotationDiscDto>,
 ) -> Result<PlanetaryDerotationResult, String> {
     state.license_manager.check_access()?;
+    let request_id = begin_planetary_user_job(&state);
+    let job_token =
+        PlanetaryJobToken::for_app(&app, request_id, state.cancel_requested.clone());
+    planetary_derotation_checkpoint(&job_token, "el inicio de la derotacion")?;
     let planet_body = crate::derotation::get_planet(&planet)
         .ok_or_else(|| "Planeta no soportado para derotacion".to_string())?;
     let capture_jd = crate::derotation::parse_iso_to_jd(&capture_time)
@@ -5250,6 +7597,7 @@ async fn apply_current_stacked_planetary_derotation(
             .clone()
             .ok_or_else(|| "No hay una imagen apilada activa para derotar.".to_string())?
     };
+    planetary_derotation_checkpoint(&job_token, "la lectura del apilado actual")?;
     let width = stack.width;
     let height = stack.height;
     let rgb = derot_stack_to_rgb16(&stack);
@@ -5285,6 +7633,7 @@ async fn apply_current_stacked_planetary_derotation(
     if !diagnostics.can_apply {
         return Err("La geometria del disco no es suficientemente confiable. Ajusta centro/radio o carga una imagen planetaria con el disco completo visible.".to_string());
     }
+    planetary_derotation_checkpoint(&job_token, "el analisis de geometria")?;
 
     emit_progress(
         &app,
@@ -5294,10 +7643,12 @@ async fn apply_current_stacked_planetary_derotation(
     );
     let planet_for_block = planet.clone();
     let disc_for_block = disc.clone();
+    let blocking_token = job_token.clone();
     let derotated = tauri::async_runtime::spawn_blocking(move || {
+        planetary_derotation_checkpoint(&blocking_token, "el calculo de derotacion")?;
         let planet_body = crate::derotation::get_planet(&planet_for_block)
             .ok_or_else(|| "Planeta no soportado para derotacion".to_string())?;
-        Ok::<Vec<u16>, String>(crate::derotation::derotate_single_advanced(
+        let result = crate::derotation::derotate_single_advanced_cancelable(
             &rgb,
             width,
             height,
@@ -5309,30 +7660,37 @@ async fn apply_current_stacked_planetary_derotation(
             cm_system.min(2),
             sub_earth_lat_deg.clamp(-35.0, 35.0),
             Some(&disc_for_block),
-        ))
+            || blocking_token.is_cancelled(),
+        )?;
+        planetary_derotation_checkpoint(&blocking_token, "el calculo de derotacion")?;
+        Ok::<Vec<u16>, String>(result)
     })
     .await
     .map_err(|e| e.to_string())??;
+    planetary_derotation_checkpoint(&job_token, "el calculo de derotacion")?;
 
-    let out_path = derot_output_path_from_optional_source(source_path.as_deref(), "Current_Stack");
+    let intended_out_path =
+        derot_output_path_from_optional_source(source_path.as_deref(), "Current_Stack");
     emit_progress(&app, "Guardando TIFF derotado 16-bit...", 82.0, None);
-    derot_save_rgb16_tiff(&out_path, &derotated, width, height)?;
-
-    {
-        let mut stacked = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
-        *stacked = Some(StackResult {
-            data: derotated.clone(),
+    planetary_derotation_checkpoint(&job_token, "el guardado TIFF")?;
+    let staged_tiff =
+        StagedDerotationTiff::encode(intended_out_path, &derotated, width, height)?;
+    planetary_derotation_checkpoint(&job_token, "el guardado TIFF")?;
+    let preview_base64 = derot_encode_preview(&derotated, width, height)?;
+    planetary_derotation_checkpoint(&job_token, "la publicacion del resultado")?;
+    let out_path = publish_planetary_derotation_if_current(
+        &state,
+        &job_token,
+        staged_tiff,
+        StackResult {
+            data: derotated,
             width,
             height,
             is_mono: false,
             is_surface: false,
-        });
-    }
-    state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-
-    let preview_base64 = derot_encode_preview(&derotated, width, height)?;
+        },
+        "la publicacion del resultado",
+    )?;
     emit_progress(&app, "Derotacion completada", 100.0, None);
     log_to_front(
         &app,
@@ -5376,17 +7734,23 @@ async fn derotate_animation_frames(
     if paths.is_empty() {
         return Err("No hay frames para derotar".to_string());
     }
-    state.active_req_id.store(1, Ordering::Relaxed);
+    let request_id = begin_planetary_user_job(&state);
+    let job_token =
+        PlanetaryJobToken::for_app(&app, request_id, state.cancel_requested.clone());
+    planetary_derotation_checkpoint(&job_token, "el inicio de la secuencia")?;
     let planet_body = crate::derotation::get_planet(&planet)
         .ok_or_else(|| "Planeta no soportado para derotacion".to_string())?;
 
     emit_progress(&app, "Preparando derotacion de secuencia...", 5.0, None);
-    let mut frames: Vec<(String, Vec<u16>, usize, usize, f64, String)> = Vec::with_capacity(paths.len());
+    // Sólo metadata en memoria. Los RGB16 se cargan, derotan, codifican y
+    // liberan uno por uno; RAM deja de crecer como N·W·H·6 bytes.
+    let mut frames: Vec<(String, usize, usize, f64, String)> = Vec::with_capacity(paths.len());
     for (idx, path) in paths.iter().enumerate() {
-        if state.active_req_id.load(Ordering::Relaxed) == 0 {
+        if check_cancel(&state, request_id) {
             return Err("Operacion cancelada por el usuario".to_string());
         }
-        let (rgb, width, height) = derot_load_rgb16_image(path)?;
+        let (width, height) = image::image_dimensions(path)
+            .map_err(|error| format!("No se pudo leer geometria de {}: {error}", path))?;
         let (meta, time_source) = derot_metadata_with_source(path, None);
         let pct = 5.0 + ((idx as f32 / paths.len() as f32) * 20.0);
         emit_progress(
@@ -5395,16 +7759,23 @@ async fn derotate_animation_frames(
             pct,
             Some(format!("{} / {}", idx + 1, paths.len())),
         );
-        frames.push((path.clone(), rgb, width, height, meta.mid_time_jd, time_source));
+        frames.push((
+            path.clone(),
+            width as usize,
+            height as usize,
+            meta.mid_time_jd,
+            time_source,
+        ));
     }
+    planetary_derotation_checkpoint(&job_token, "la lectura de la secuencia")?;
 
-    let (width, height) = (frames[0].2, frames[0].3);
-    if frames.iter().any(|(_, _, w, h, _, _)| *w != width || *h != height) {
+    let (width, height) = (frames[0].1, frames[0].2);
+    if frames.iter().any(|(_, w, h, _, _)| *w != width || *h != height) {
         return Err("Todos los frames deben tener la misma resolucion para derotacion planetaria".to_string());
     }
 
     let mut warnings = Vec::new();
-    let log_count = frames.iter().filter(|(_, _, _, _, _, source)| source == "log").count();
+    let log_count = frames.iter().filter(|(_, _, _, _, source)| source == "log").count();
     if log_count < frames.len() {
         warnings.push(format!(
             "{} de {} frames no tienen log de captura; valida el intervalo temporal.",
@@ -5414,20 +7785,20 @@ async fn derotate_animation_frames(
     }
     let min_jd = frames
         .iter()
-        .map(|(_, _, _, _, jd, _)| *jd)
+        .map(|(_, _, _, jd, _)| *jd)
         .fold(f64::INFINITY, f64::min);
     let max_jd = frames
         .iter()
-        .map(|(_, _, _, _, jd, _)| *jd)
+        .map(|(_, _, _, jd, _)| *jd)
         .fold(f64::NEG_INFINITY, f64::max);
     let mut time_span_sec = (max_jd - min_jd).abs() * 86400.0;
     let fallback_interval = fallback_interval_sec.unwrap_or(0.0).clamp(0.0, 86400.0);
     if time_span_sec < 1.0 && fallback_interval > 0.0 && frames.len() > 1 {
         let mid = frames.len() / 2;
-        let base_jd = frames[mid].4;
+        let base_jd = frames[mid].3;
         for (idx, frame) in frames.iter_mut().enumerate() {
             let offset = idx as isize - mid as isize;
-            frame.4 = base_jd + (offset as f64 * fallback_interval) / 86400.0;
+            frame.3 = base_jd + (offset as f64 * fallback_interval) / 86400.0;
         }
         time_span_sec = fallback_interval * (frames.len().saturating_sub(1)) as f64;
         warnings.push(format!(
@@ -5439,28 +7810,33 @@ async fn derotate_animation_frames(
     }
 
     let reference_frame = frames.len() / 2;
-    let reference_jd = frames[reference_frame].4;
+    let reference_jd = frames[reference_frame].3;
     let geometry = crate::derotation::calculate_observer_geometry(planet_body, reference_jd);
     let b0 = sub_earth_lat_deg
         .unwrap_or(geometry.sub_earth_lat_deg)
         .clamp(-35.0, 35.0);
-    let mono = derot_rgb_to_mono(&frames[0].1);
+    let (reference_rgb, reference_width, reference_height) =
+        derot_load_rgb16_image(&frames[0].0)?;
+    if reference_width != width || reference_height != height {
+        return Err("La geometria del primer frame cambio durante la lectura".into());
+    }
+    let mono = derot_rgb_to_mono(&reference_rgb);
+    drop(reference_rgb);
     let mut disc = crate::derotation::validate_disc_aspect(
         &crate::derotation::detect_planet_disc(&mono, width, height),
         planet_body,
     );
     disc.angle_deg = north_angle_deg.unwrap_or(geometry.north_pole_angle_deg);
-    let first_parent = Path::new(&frames[0].0)
+    let output_parent = Path::new(&frames[0].0)
         .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("Derotated_Planetary");
-    std::fs::create_dir_all(&first_parent).map_err(|e| e.to_string())?;
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged_sequence = StagedDerotationSequence::create(output_parent)?;
 
-    let mut output_paths = Vec::with_capacity(frames.len());
-    for (idx, (path, rgb, _, _, jd, _)) in frames.into_iter().enumerate() {
-        if state.active_req_id.load(Ordering::Relaxed) == 0 {
+    for (idx, (path, _, _, jd, _)) in frames.into_iter().enumerate() {
+        if check_cancel(&state, request_id) {
             return Err("Operacion cancelada por el usuario".to_string());
         }
+        planetary_derotation_checkpoint(&job_token, "la derotacion de la secuencia")?;
         let pct = 28.0 + ((idx as f32 / paths.len() as f32) * 66.0);
         emit_progress(
             &app,
@@ -5469,7 +7845,12 @@ async fn derotate_animation_frames(
             Some(format!("{} / {}", idx + 1, paths.len())),
         );
 
-        let derotated = crate::derotation::derotate_single_advanced(
+        let (rgb, frame_width, frame_height) = derot_load_rgb16_image(&path)?;
+        if frame_width != width || frame_height != height {
+            return Err(format!("{} cambio de resolucion durante la secuencia", path));
+        }
+
+        let derotated = crate::derotation::derotate_single_advanced_cancelable(
             &rgb,
             width,
             height,
@@ -5481,16 +7862,30 @@ async fn derotate_animation_frames(
             cm_system.min(2),
             b0,
             Some(&disc),
-        );
+            || job_token.is_cancelled(),
+        )?;
+        planetary_derotation_checkpoint(&job_token, "el calculo de un frame")?;
         let stem = Path::new(&path)
             .file_stem()
             .and_then(|s| s.to_str())
             .filter(|s| !s.is_empty())
             .unwrap_or("frame");
-        let out_path = first_parent.join(format!("{:04}_{}_derotated.tiff", idx + 1, stem));
-        derot_save_rgb16_tiff(&out_path, &derotated, width, height)?;
-        output_paths.push(clean_windows_path(out_path));
+        let stem = derot_bounded_file_component(stem, 160);
+        let file_name = format!("{:04}_{}_derotated.tiff", idx + 1, stem);
+        staged_sequence.stage_rgb16(file_name, &derotated, width, height)?;
+        planetary_derotation_checkpoint(&job_token, "el staging de un frame")?;
     }
+
+    planetary_derotation_checkpoint(&job_token, "la publicacion de la secuencia")?;
+    let output_paths = publish_planetary_derotation_sequence_if_current(
+        &state,
+        &job_token,
+        staged_sequence,
+        "la publicacion de la secuencia",
+    )?
+    .into_iter()
+    .map(clean_windows_path)
+    .collect::<Vec<_>>();
 
     emit_progress(&app, "Secuencia derotada", 100.0, None);
     log_to_front(
@@ -5524,7 +7919,10 @@ async fn fuse_planetary_derotation_stacks(
     if image_paths.len() < 2 {
         return Err("Selecciona al menos 2 stacks planetarios para fusionar.".to_string());
     }
-    state.active_req_id.store(1, Ordering::Relaxed);
+    let request_id = begin_planetary_user_job(&state);
+    let job_token =
+        PlanetaryJobToken::for_app(&app, request_id, state.cancel_requested.clone());
+    planetary_derotation_checkpoint(&job_token, "el inicio de la fusion multi-stack")?;
     let planet_body = crate::derotation::get_planet(&planet)
         .ok_or_else(|| "Planeta no soportado para derotacion".to_string())?;
 
@@ -5534,7 +7932,7 @@ async fn fuse_planetary_derotation_stacks(
     let mut warnings = Vec::new();
 
     for (idx, path) in image_paths.iter().enumerate() {
-        if state.active_req_id.load(Ordering::Relaxed) == 0 {
+        if check_cancel(&state, request_id) {
             return Err("Operacion cancelada por el usuario".to_string());
         }
         let (rgb, width, height) = derot_load_rgb16_image(path)?;
@@ -5580,6 +7978,7 @@ async fn fuse_planetary_derotation_stacks(
             diagnostics,
         ));
     }
+    planetary_derotation_checkpoint(&job_token, "la lectura de stacks")?;
 
     let (width, height) = (frames[0].1, frames[0].2);
     if frames.iter().any(|(_, w, h, _, _, _)| *w != width || *h != height) {
@@ -5649,7 +8048,7 @@ async fn fuse_planetary_derotation_stacks(
     reference_disc.angle_deg = north_angle_deg.unwrap_or(reference_geometry.north_pole_angle_deg);
 
     let pixel_count = width.saturating_mul(height);
-    let reference_derotated = crate::derotation::derotate_single_advanced(
+    let reference_derotated = crate::derotation::derotate_single_advanced_cancelable(
         &reference_rgb,
         width,
         height,
@@ -5661,7 +8060,9 @@ async fn fuse_planetary_derotation_stacks(
         cm_system.min(2),
         b0,
         Some(&reference_disc),
-    );
+        || job_token.is_cancelled(),
+    )?;
+    planetary_derotation_checkpoint(&job_token, "la referencia de fusion")?;
     let reference_means =
         derot_channel_means_inside_disc(&reference_derotated, width, height, &reference_disc, 0.72);
     let fusion_mask = derot_disc_mask(width, height, &reference_disc, 1.02);
@@ -5674,7 +8075,7 @@ async fn fuse_planetary_derotation_stacks(
     let mut final_diag = frames[reference_frame].5.clone();
 
     for (idx, (path, _, _, jd, source, diagnostics)) in frames.into_iter().enumerate() {
-        if state.active_req_id.load(Ordering::Relaxed) == 0 {
+        if check_cancel(&state, request_id) {
             return Err("Operacion cancelada por el usuario".to_string());
         }
         let (rgb, frame_width, frame_height) = derot_load_rgb16_image(&path)?;
@@ -5702,7 +8103,7 @@ async fn fuse_planetary_derotation_stacks(
         let derotated = if idx == reference_frame {
             reference_derotated.clone()
         } else {
-            crate::derotation::derotate_single_advanced(
+            crate::derotation::derotate_single_advanced_cancelable(
                 &rgb,
                 width,
                 height,
@@ -5714,13 +8115,17 @@ async fn fuse_planetary_derotation_stacks(
                 cm_system.min(2),
                 b0,
                 Some(&reference_disc),
-            )
+                || job_token.is_cancelled(),
+            )?
         };
         let frame_means =
             derot_channel_means_inside_disc(&derotated, width, height, &reference_disc, 0.72);
         let gains = derot_photometric_gains(reference_means, frame_means);
 
         for pix in 0..pixel_count {
+            if (pix & 0xffff) == 0 {
+                planetary_derotation_checkpoint(&job_token, "la fusion de pixeles")?;
+            }
             let base = pix * 3;
             let mut pixel_weight = quality_weight as f32;
             if fusion_mask.get(pix).copied().unwrap_or(0) != 0 {
@@ -5765,12 +8170,16 @@ async fn fuse_planetary_derotation_stacks(
             ),
         );
     }
+    planetary_derotation_checkpoint(&job_token, "la fusion de stacks")?;
 
     if accum_weight.iter().all(|w| *w <= 0.0) {
         return Err("No se pudo calcular peso valido para fusionar los stacks.".to_string());
     }
     let mut fused = Vec::with_capacity(pixel_count.saturating_mul(3));
     for pix in 0..pixel_count {
+        if (pix & 0xffff) == 0 {
+            planetary_derotation_checkpoint(&job_token, "la normalizacion de la fusion")?;
+        }
         let denom = accum_weight[pix].max(0.0001);
         let base = pix * 3;
         fused.push((accum[base] / denom).round().clamp(0.0, 65535.0) as u16);
@@ -5793,26 +8202,27 @@ async fn fuse_planetary_derotation_stacks(
     let parent = Path::new(&image_paths[0])
         .parent()
         .unwrap_or_else(|| Path::new("."));
-    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let out_path = parent.join(format!("Zenith_Derotated_Fusion_{}.tiff", stamp));
+    let intended_out_path = derot_unique_tiff_path(parent, "Zenith_Derotated_Fusion");
     emit_progress(&app, "Guardando fusion derotada 16-bit...", 92.0, None);
-    derot_save_rgb16_tiff(&out_path, &fused, width, height)?;
-
-    {
-        let mut stacked = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
-        *stacked = Some(StackResult {
-            data: fused.clone(),
+    planetary_derotation_checkpoint(&job_token, "el guardado de la fusion")?;
+    let staged_tiff =
+        StagedDerotationTiff::encode(intended_out_path, &fused, width, height)?;
+    planetary_derotation_checkpoint(&job_token, "el guardado de la fusion")?;
+    let preview_base64 = derot_encode_preview(&fused, width, height)?;
+    planetary_derotation_checkpoint(&job_token, "la publicacion de la fusion")?;
+    let out_path = publish_planetary_derotation_if_current(
+        &state,
+        &job_token,
+        staged_tiff,
+        StackResult {
+            data: fused,
             width,
             height,
             is_mono: false,
             is_surface: false,
-        });
-    }
-    state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-
-    let preview_base64 = derot_encode_preview(&fused, width, height)?;
+        },
+        "la publicacion de la fusion",
+    )?;
     let time_span_sec = (max_jd - min_jd).abs() * 86400.0;
     emit_progress(&app, "Fusion derotada completada", 100.0, None);
     log_to_front(
@@ -5870,7 +8280,10 @@ async fn fuse_planetary_derotation_rgb(
     disc_override: Option<DerotationDiscDto>,
 ) -> Result<PlanetaryDerotationFusionResult, String> {
     state.license_manager.check_access()?;
-    state.active_req_id.store(1, Ordering::Relaxed);
+    let request_id = begin_planetary_user_job(&state);
+    let job_token =
+        PlanetaryJobToken::for_app(&app, request_id, state.cancel_requested.clone());
+    planetary_derotation_checkpoint(&job_token, "el inicio de la derotacion RGB")?;
     let planet_body = crate::derotation::get_planet(&planet)
         .ok_or_else(|| "Planeta no soportado para derotacion".to_string())?;
 
@@ -5882,7 +8295,7 @@ async fn fuse_planetary_derotation_rgb(
     // Cargar los 3 canales + su tiempo de captura (log / archivo / reloj).
     let mut loaded: Vec<(Vec<u16>, usize, usize, f64, String)> = Vec::with_capacity(3);
     for (i, path) in channel_paths.iter().enumerate() {
-        if state.active_req_id.load(Ordering::Relaxed) == 0 {
+        if check_cancel(&state, request_id) {
             return Err("Operacion cancelada por el usuario".to_string());
         }
         let (rgb, w, h) = derot_load_rgb16_image(path)?;
@@ -5895,6 +8308,7 @@ async fn fuse_planetary_derotation_rgb(
         );
         loaded.push((rgb, w, h, meta.mid_time_jd, source));
     }
+    planetary_derotation_checkpoint(&job_token, "la lectura de canales RGB")?;
     let (width, height) = (loaded[0].1, loaded[0].2);
     if loaded.iter().any(|(_, w, h, _, _)| *w != width || *h != height) {
         return Err("Los 3 canales (R/G/B) deben tener la misma resolucion.".to_string());
@@ -5931,6 +8345,7 @@ async fn fuse_planetary_derotation_rgb(
         .unwrap_or(geometry.sub_earth_lat_deg)
         .clamp(-35.0, 35.0);
     disc.angle_deg = north_angle_deg.unwrap_or(geometry.north_pole_angle_deg);
+    planetary_derotation_checkpoint(&job_token, "la geometria RGB")?;
 
     let pixel_count = width.saturating_mul(height);
     let mut out = vec![0u16; pixel_count.saturating_mul(3)];
@@ -5939,7 +8354,7 @@ async fn fuse_planetary_derotation_rgb(
 
     // Derotar cada canal a reference_jd y colocar su LUMA en el plano de salida.
     for (ch, (rgb, _, _, jd, source)) in loaded.iter().enumerate() {
-        if state.active_req_id.load(Ordering::Relaxed) == 0 {
+        if check_cancel(&state, request_id) {
             return Err("Operacion cancelada por el usuario".to_string());
         }
         min_jd = min_jd.min(*jd);
@@ -5950,7 +8365,7 @@ async fn fuse_planetary_derotation_rgb(
             30.0 + ch as f32 * 20.0,
             None,
         );
-        let derotated = crate::derotation::derotate_single_advanced(
+        let derotated = crate::derotation::derotate_single_advanced_cancelable(
             rgb,
             width,
             height,
@@ -5962,9 +8377,13 @@ async fn fuse_planetary_derotation_rgb(
             cm_system.min(2),
             b0,
             Some(&disc),
-        );
+            || job_token.is_cancelled(),
+        )?;
         let mono = derot_rgb_to_mono(&derotated);
         for pix in 0..pixel_count {
+            if (pix & 0xffff) == 0 {
+                planetary_derotation_checkpoint(&job_token, "el ensamblado RGB")?;
+            }
             out[pix * 3 + ch] = mono[pix];
         }
         log_to_front(
@@ -5981,6 +8400,7 @@ async fn fuse_planetary_derotation_rgb(
             ),
         );
     }
+    planetary_derotation_checkpoint(&job_token, "la derotacion de canales RGB")?;
 
     let (g_meta, g_source) = derot_metadata_with_source(&channel_paths[1], None);
     let diagnostics = derot_disc_diagnostics(
@@ -6001,26 +8421,27 @@ async fn fuse_planetary_derotation_rgb(
     let parent = Path::new(&channel_paths[1])
         .parent()
         .unwrap_or_else(|| Path::new("."));
-    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let out_path = parent.join(format!("Zenith_Derotated_RGB_{}.tiff", stamp));
+    let intended_out_path = derot_unique_tiff_path(parent, "Zenith_Derotated_RGB");
     emit_progress(&app, "Guardando RGB derotado 16-bit...", 92.0, None);
-    derot_save_rgb16_tiff(&out_path, &out, width, height)?;
-
-    {
-        let mut stacked = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
-        *stacked = Some(StackResult {
-            data: out.clone(),
+    planetary_derotation_checkpoint(&job_token, "el guardado RGB")?;
+    let staged_tiff =
+        StagedDerotationTiff::encode(intended_out_path, &out, width, height)?;
+    planetary_derotation_checkpoint(&job_token, "el guardado RGB")?;
+    let preview_base64 = derot_encode_preview(&out, width, height)?;
+    planetary_derotation_checkpoint(&job_token, "la publicacion RGB")?;
+    let out_path = publish_planetary_derotation_if_current(
+        &state,
+        &job_token,
+        staged_tiff,
+        StackResult {
+            data: out,
             width,
             height,
             is_mono: false,
             is_surface: false,
-        });
-    }
-    state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-
-    let preview_base64 = derot_encode_preview(&out, width, height)?;
+        },
+        "la publicacion RGB",
+    )?;
     let time_span_sec = (max_jd - min_jd).abs() * 86400.0;
     emit_progress(&app, "Derotacion RGB completada", 100.0, None);
     log_to_front(
@@ -6058,28 +8479,33 @@ async fn fuse_planetary_derotation_rgb(
 // Helper: Auto-Stretch 16-bit/8-bit range to 0..255 for feature detection
 // This is critical for linear Astro data which often appears "black" in raw 8-bit conversion
 fn auto_stretch_gray(img: &image::GrayImage) -> image::GrayImage {
-    // IMPROVED ALGORITHM: Percentile-based stretch
-    // This is more robust for lunar images with varying amounts of black space
-
-    let mut pixels: Vec<u8> = img.pixels().map(|p| p[0]).collect();
-    pixels.sort_unstable();
-
-    let total = pixels.len();
+    let total = img.len();
     if total == 0 {
         return img.clone();
     }
-
-    // Find the 1.5th percentile (ignore noise/background) and 98.5th percentile
-    // This is safer for lunar images with varying amounts of black space.
-    let idx_min = (total as f32 * 0.015) as usize;
-    let idx_max = (total as f32 * 0.985) as usize;
-
-    let min_val = pixels[idx_min.min(total - 1)];
-    let max_val = pixels[idx_max.min(total - 1)];
+    let mut histogram = [0usize; 256];
+    for value in img.as_raw() {
+        histogram[*value as usize] += 1;
+    }
+    let percentile = |rank: usize| {
+        let mut cumulative = 0usize;
+        for (value, count) in histogram.iter().enumerate() {
+            cumulative += *count;
+            if cumulative > rank {
+                return value as u8;
+            }
+        }
+        255
+    };
+    let min_val = percentile(total.saturating_mul(15) / 1000);
+    let max_val = percentile(total.saturating_mul(985) / 1000);
 
     if max_val <= min_val {
         // Fallback for extremely flat/dark images: use absolute max
-        let absolute_max = pixels[total - 1];
+        let absolute_max = histogram
+            .iter()
+            .rposition(|count| *count > 0)
+            .unwrap_or(0) as u8;
         if absolute_max > 0 {
             let mut out = image::GrayImage::new(img.width(), img.height());
             let scale = 255.0 / absolute_max as f32;
@@ -6104,14 +8530,56 @@ fn auto_stretch_gray(img: &image::GrayImage) -> image::GrayImage {
     out
 }
 
+fn auto_stretch_luma16_to_gray(img: &image::ImageBuffer<image::Luma<u16>, Vec<u16>>) -> image::GrayImage {
+    let total = img.len();
+    if total == 0 {
+        return image::GrayImage::new(img.width(), img.height());
+    }
+    let mut histogram = vec![0u32; 65_536];
+    for value in img.as_raw() {
+        histogram[*value as usize] += 1;
+    }
+    let percentile = |rank: usize| {
+        let mut cumulative = 0usize;
+        for (value, count) in histogram.iter().enumerate() {
+            cumulative += *count as usize;
+            if cumulative > rank {
+                return value as u16;
+            }
+        }
+        65_535
+    };
+    let min_value = percentile(total.saturating_mul(15) / 1000);
+    let mut max_value = percentile(total.saturating_mul(985) / 1000);
+    if max_value <= min_value {
+        max_value = histogram
+            .iter()
+            .rposition(|count| *count > 0)
+            .unwrap_or(min_value as usize) as u16;
+    }
+    let span = max_value.saturating_sub(min_value).max(1) as f32;
+    image::GrayImage::from_fn(img.width(), img.height(), |x, y| {
+        let value = img.get_pixel(x, y)[0];
+        let mapped = ((value.saturating_sub(min_value) as f32 / span) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        image::Luma([mapped])
+    })
+}
+
 #[tauri::command]
 async fn stitch_mosaic(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     tiles: Vec<MosaicTileConfig>,
-    mode: String, // Ignored, always "blind" now
+    mode: String,
 ) -> Result<AnalysisResult, String> {
-    state.active_req_id.store(1, Ordering::Relaxed);
+    let request_id = begin_planetary_user_job(&state);
+    let job_token = PlanetaryJobToken::for_app(
+        &app,
+        request_id,
+        state.cancel_requested.clone(),
+    );
     if tiles.is_empty() {
         return Err("No hay teselas para unir".to_string());
     }
@@ -6134,9 +8602,12 @@ async fn stitch_mosaic(
     let work_scale = 0.75;
 
     let mut nodes: Vec<ImageNode> = Vec::with_capacity(tiles.len());
+    let mut memory = System::new();
+    memory.refresh_memory();
+    let mut tile_cache = MosaicTileCache::new(memory.available_memory());
 
     for (i, t) in tiles.iter().enumerate() {
-        if state.active_req_id.load(Ordering::Relaxed) == 0 {
+        if check_cancel(&state, request_id) {
             return Err("OperaciÃ³n cancelada por el usuario".into());
         }
         // Log frontend coords
@@ -6149,7 +8620,7 @@ async fn stitch_mosaic(
             ),
         );
 
-        let dyn_img = load_image_or_video_frame(&t.path, &app)
+        let dyn_img = load_mosaic_master_image(&t.path)
             .map_err(|e| format!("Error cargando {}: {}", t.path, e))?;
 
         // CRITICAL: Proper 16-bit to 8-bit conversion for AKAZE feature detection
@@ -6159,9 +8630,10 @@ async fn stitch_mosaic(
         // 2. Apply auto_stretch to bring out lunar details (craters, maria)
         // 3. Then pass to AKAZE for feature detection
 
-        let gray_full = dyn_img.to_luma8();
-        let gray_stretched = auto_stretch_gray(&gray_full);
-        let img_for_akaze = DynamicImage::ImageLuma8(gray_stretched.clone());
+        let gray_full = dyn_img.to_luma16();
+        let gray_stretched = auto_stretch_luma16_to_gray(&gray_full);
+        drop(gray_full);
+        let img_for_akaze = DynamicImage::ImageLuma8(gray_stretched);
 
         // Extract Features using Akaze on stretched image
         // Result is (Vec<KeyPoint>, Vec<BitVec>) or similar depending on version.
@@ -6185,6 +8657,8 @@ async fn stitch_mosaic(
                 descriptor: d_vec,
             });
         }
+        drop(kpts);
+        drop(descs);
 
         // Limit features if too many (sort by response/size?)
         if features.len() > 3000 {
@@ -6195,26 +8669,53 @@ async fn stitch_mosaic(
         // Create gray reference for alignment refinement (snapping)
         // IMPROVED: Use higher resolution (0.75 instead of 0.5) for better matching
         // and use the already-stretched image for SAD optimization
-        let work_scale = 0.75;
         let small = img_for_akaze.resize(
             (img_for_akaze.width() as f32 * work_scale) as u32,
             (img_for_akaze.height() as f32 * work_scale) as u32,
             image::imageops::FilterType::Lanczos3,
         );
-        let gray_small = small.to_luma8();
+        drop(img_for_akaze);
+        let gray_small = small.into_luma8();
         let gray_small_stretched = auto_stretch_gray(&gray_small);
+        drop(gray_small);
+
+        // Conservar exactamente el frame elegido y su precisión 16-bit. Para
+        // vídeo esto evita volver a escanear/decodificar durante la fusión.
+        // La conversión puede necesitar un segundo buffer completo: comprobar
+        // RAM antes evita que el allocator aborte el proceso con una tesela
+        // patológicamente grande. into_rgba16 reutiliza el buffer si ya es RGBA16.
+        if !matches!(&dyn_img, DynamicImage::ImageRgba16(_)) {
+            let rgba_bytes = (dyn_img.width() as u64)
+                .checked_mul(dyn_img.height() as u64)
+                .and_then(|v| v.checked_mul(8))
+                .ok_or("Tesela 16-bit fuera de rango")?;
+            memory.refresh_memory();
+            let free = memory.available_memory();
+            let conversion_reserve = (128 * 1024 * 1024).min(free / 2);
+            if rgba_bytes > free.saturating_sub(conversion_reserve) {
+                return Err(format!(
+                    "RAM insuficiente para convertir la tesela {} a RGBA16 ({:.1} MB adicionales).",
+                    i + 1,
+                    rgba_bytes as f64 / 1_048_576.0
+                ));
+            }
+        }
+        let rgba16 = dyn_img.into_rgba16();
+        let tile_width = rgba16.width();
+        let tile_height = rgba16.height();
+        let cache_index = tile_cache.insert(tile_width, tile_height, rgba16.into_raw())?;
 
         nodes.push(ImageNode {
             idx: i,
-            width: dyn_img.width(),
-            height: dyn_img.height(),
+            width: tile_width,
+            height: tile_height,
             global_x: 0.0,
             global_y: 0.0,
             placed: false,
-            img_gray: gray_small,
             img_gray_stretched: gray_small_stretched,
             features,
-            original_path: t.path.clone(), // Store for 16-bit reload during fusion
+            original_path: t.path.clone(),
+            cache_index,
         });
 
         emit_progress(
@@ -6234,7 +8735,7 @@ async fn stitch_mosaic(
     // Parallelize logic if possible? For now, sequential loop over pairs is safer for logic flow
     // O(N^2)
     for i in 0..nodes.len() {
-        if state.active_req_id.load(Ordering::Relaxed) == 0 {
+        if check_cancel(&state, request_id) {
             return Err("OperaciÃ³n cancelada por el usuario".into());
         }
         for j in (i + 1)..nodes.len() {
@@ -6269,11 +8770,8 @@ async fn stitch_mosaic(
             // 2. Find Best Match J->I
             // 3. Keep ONLY if they agree (Cross-Check / Reciprocal Match)
             //
-            // PR-2.6: PARALELO por feature. La fuerza bruta (hasta 3000×3000
-            // distancias Hamming de 61 bytes por par de teselas, más el
-            // cross-check) corría en UN solo hilo. par_iter preserva el orden
-            // de los matches → misma salida que el bucle secuencial.
-            let potential_matches: Vec<_> = feats_i
+            // Forward paralelo: hasta 3000×3000 distancias Hamming por par.
+            let forward_matches: Vec<(usize, usize)> = feats_i
                 .par_iter()
                 .enumerate()
                 .filter_map(|(fi_idx, fi)| {
@@ -6298,26 +8796,41 @@ async fn stitch_mosaic(
                     // Lowe's Ratio Test: 0.9 allows more valid matches for lunar surfaces.
                     // Hamming distance < 180 is also more relaxed for noisy data.
                     if best_dist1 < 180 && (best_dist1 as f32) < (best_dist2 as f32 * 0.9) {
-                        // 2. Backward Match J -> I (Cross Check for Safety)
-                        let fj_candidate = &feats_j[best_j];
-                        let mut best_back_dist = u32::MAX;
-                        let mut best_i_back = 0;
-
-                        for (fk_idx, fk) in feats_i.iter().enumerate() {
-                            let dist = fj_candidate.distance(fk);
-                            if dist < best_back_dist {
-                                best_back_dist = dist;
-                                best_i_back = fk_idx;
-                            }
-                        }
-
-                        // 3. Consistency Check (Mutual Best Match)
-                        if best_i_back == fi_idx {
-                            // IT'S A MATCH! Mutual agreement.
-                            return Some((fi, fj_candidate, fi_idx));
-                        }
+                        return Some((fi_idx, best_j));
                     }
                     None
+                })
+                .collect();
+
+            // Cross-check solo para los J que realmente pasaron Lowe. Antes se
+            // recorría todo I de nuevo por candidato; deduplicar J evita trabajo
+            // repetido y nunca hace más comparaciones que la versión anterior.
+            let mut candidate_js: Vec<usize> =
+                forward_matches.iter().map(|&(_, j_idx)| j_idx).collect();
+            candidate_js.sort_unstable();
+            candidate_js.dedup();
+            let reverse_best_i: Vec<usize> = candidate_js
+                .par_iter()
+                .map(|&j_idx| {
+                    let fj = &feats_j[j_idx];
+                    let mut best_dist = u32::MAX;
+                    let mut best_i = usize::MAX;
+                    for (i_idx, fi) in feats_i.iter().enumerate() {
+                        let dist = fj.distance(fi);
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best_i = i_idx;
+                        }
+                    }
+                    best_i
+                })
+                .collect();
+            let potential_matches: Vec<_> = forward_matches
+                .into_iter()
+                .filter_map(|(fi_idx, j_idx)| {
+                    let reverse_pos = candidate_js.binary_search(&j_idx).ok()?;
+                    (reverse_best_i[reverse_pos] == fi_idx)
+                        .then_some((&feats_i[fi_idx], &feats_j[j_idx], fi_idx))
                 })
                 .collect();
 
@@ -6337,36 +8850,36 @@ async fn stitch_mosaic(
                 shifts.push((dx, dy));
             }
 
-            // Consensus: Find cluster of shifts using Euclidean distance
-            for k in 0..shifts.len() {
-                let (ref_dx, ref_dy) = shifts[k]; // f32
-                let mut inliers = 0;
-
-                // Optimized inner loop
-                for (dx, dy) in &shifts {
-                    // Check Euclidean distance
-                    let dist = ((dx - ref_dx).powi(2) + (dy - ref_dy).powi(2)).sqrt();
-                    if dist <= match_tolerance {
-                        inliers += 1;
+            // Consensus O(M²), pero cada candidato se evalúa en paralelo y sin
+            // sqrt. collect() conserva el orden: en empates gana el mismo primer
+            // candidato que antes, de modo que la salida es determinista.
+            let tolerance2 = match_tolerance * match_tolerance;
+            let consensus: Vec<(usize, f32, f32)> = shifts
+                .par_iter()
+                .map(|(ref_dx, ref_dy)| {
+                    let mut inliers = 0usize;
+                    let mut sx = 0.0f32;
+                    let mut sy = 0.0f32;
+                    for (dx, dy) in &shifts {
+                        let ddx = dx - ref_dx;
+                        let ddy = dy - ref_dy;
+                        if ddx * ddx + ddy * ddy <= tolerance2 {
+                            inliers += 1;
+                            sx += dx;
+                            sy += dy;
+                        }
                     }
-                }
-
+                    (inliers, sx, sy)
+                })
+                .collect();
+            for (inliers, sx, sy) in consensus {
                 if inliers > max_inliers {
                     max_inliers = inliers;
                     // PR-1.8: MEDIA de los inliers del clúster (subpíxel).
                     // El round() al mejor sample individual metía hasta
                     // ±0.5 px de sesgo por costura.
-                    let (mut sx, mut sy, mut cnt) = (0.0f32, 0.0f32, 0.0f32);
-                    for (dx, dy) in &shifts {
-                        let dist = ((dx - ref_dx).powi(2) + (dy - ref_dy).powi(2)).sqrt();
-                        if dist <= match_tolerance {
-                            sx += dx;
-                            sy += dy;
-                            cnt += 1.0;
-                        }
-                    }
-                    best_dx = sx / cnt.max(1.0);
-                    best_dy = sy / cnt.max(1.0);
+                    best_dx = sx / inliers.max(1) as f32;
+                    best_dy = sy / inliers.max(1) as f32;
                 }
             }
 
@@ -6511,8 +9024,8 @@ async fn stitch_mosaic(
                 let guess_dy = (manual_dy_real as f32 * work_scale) as i32;
 
                 // Try Local Search (Snap)
-                let w_small = nodes[i].img_gray.width() as i32;
-                let h_small = nodes[i].img_gray.height() as i32;
+                let w_small = nodes[i].img_gray_stretched.width() as i32;
+                let h_small = nodes[i].img_gray_stretched.height() as i32;
 
                 let mut best_snap_dx = guess_dx;
                 let mut best_snap_dy = guess_dy;
@@ -6642,10 +9155,6 @@ async fn stitch_mosaic(
         &format!("Raiz del Mosaico: T{} ({} conexiones)", root_idx, max_deg),
     );
 
-    if max_deg == 0 && tiles.len() > 1 {
-        return Err("No se encontraron coincidencias suficientes. Intenta aumentar el solapamiento o brillo.".to_string());
-    }
-
     // BFS Priority Queue
     let mut queue = std::collections::BinaryHeap::new(); // Use PriorityQueue for Weighted BFS
 
@@ -6657,7 +9166,9 @@ async fn stitch_mosaic(
     }
     impl Ord for QueuedNode {
         fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            self.score.cmp(&other.score)
+            self.score
+                .cmp(&other.score)
+                .then_with(|| self.idx.cmp(&other.idx))
         }
     }
     impl PartialOrd for QueuedNode {
@@ -6669,14 +9180,14 @@ async fn stitch_mosaic(
     nodes[root_idx].placed = true;
     nodes[root_idx].global_x = 0.0;
     nodes[root_idx].global_y = 0.0; // Fix: was using uninitialized values if not 0
-                                  // Use img_gray to confirm root placed (debug)
+                                  // Use the work image to confirm root placed (debug)
     log_to_front(
         &app,
         "DEBUG",
         &format!(
             "Raiz colocada. Dim: {}x{}",
-            nodes[root_idx].img_gray.width(),
-            nodes[root_idx].img_gray.height()
+            nodes[root_idx].img_gray_stretched.width(),
+            nodes[root_idx].img_gray_stretched.height()
         ),
     );
 
@@ -6707,32 +9218,129 @@ async fn stitch_mosaic(
         }
     }
 
-    // PR-1.8: las teselas-isla se EXCLUYEN del mosaico — hacerlo visible con
-    // nombre y remedio, no un descarte silencioso (antes un panel de mare
-    // liso desaparecía del resultado sin más aviso que un WARN genérico).
-    let unplaced_names: Vec<String> = nodes
+    // Nunca descartar paneles-isla. Resolver cada componente desconectado con
+    // sus propios edges (si los tiene) y empacarlo a la derecha del componente
+    // principal. Así un panel de mare liso sigue visible y el usuario puede
+    // identificarlo/reubicarlo sin que desaparezca silenciosamente.
+    let island_indices: Vec<usize> = nodes
         .iter()
-        .filter(|n| !n.placed)
-        .map(|n| {
-            Path::new(&n.original_path)
+        .enumerate()
+        .filter_map(|(idx, n)| (!n.placed).then_some(idx))
+        .collect();
+    let island_names: Vec<String> = island_indices
+        .iter()
+        .map(|&idx| {
+            Path::new(&nodes[idx].original_path)
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| n.original_path.clone())
+                .unwrap_or_else(|| nodes[idx].original_path.clone())
         })
         .collect();
-    if !unplaced_names.is_empty() {
+
+    if !island_indices.is_empty() {
+        let main_min_y = nodes
+            .iter()
+            .filter(|n| n.placed)
+            .map(|n| n.global_y)
+            .fold(f32::MAX, f32::min);
+        let main_max_x = nodes
+            .iter()
+            .filter(|n| n.placed)
+            .map(|n| n.global_x + n.width as f32)
+            .fold(f32::MIN, f32::max);
+        let main_max_y = nodes
+            .iter()
+            .filter(|n| n.placed)
+            .map(|n| n.global_y + n.height as f32)
+            .fold(f32::MIN, f32::max);
+        let island_area: f32 = island_indices
+            .iter()
+            .map(|&idx| nodes[idx].width as f32 * nodes[idx].height as f32)
+            .sum();
+        let gap = 96.0f32;
+        let target_column_height = (main_max_y - main_min_y)
+            .max(island_area.sqrt() * 1.35)
+            .max(512.0);
+        let mut shelf_x = main_max_x + gap;
+        let mut shelf_y = main_min_y;
+        let mut column_width = 0.0f32;
+
+        for &seed in &island_indices {
+            if nodes[seed].placed {
+                continue;
+            }
+            nodes[seed].placed = true;
+            nodes[seed].global_x = 0.0;
+            nodes[seed].global_y = 0.0;
+            let mut component = vec![seed];
+            let mut component_queue = std::collections::BinaryHeap::new();
+            component_queue.push(QueuedNode {
+                idx: seed,
+                score: u64::MAX,
+            });
+            while let Some(qn) = component_queue.pop() {
+                let curr = qn.idx;
+                let (cx, cy) = (nodes[curr].global_x, nodes[curr].global_y);
+                for edge in &adjacency[curr] {
+                    let next = edge.target_idx;
+                    if !nodes[next].placed {
+                        nodes[next].placed = true;
+                        nodes[next].global_x = cx + edge.dx;
+                        nodes[next].global_y = cy + edge.dy;
+                        component.push(next);
+                        component_queue.push(QueuedNode {
+                            idx: next,
+                            score: edge.score as u64,
+                        });
+                    }
+                }
+            }
+
+            let comp_min_x = component
+                .iter()
+                .map(|&idx| nodes[idx].global_x)
+                .fold(f32::MAX, f32::min);
+            let comp_min_y = component
+                .iter()
+                .map(|&idx| nodes[idx].global_y)
+                .fold(f32::MAX, f32::min);
+            let comp_max_x = component
+                .iter()
+                .map(|&idx| nodes[idx].global_x + nodes[idx].width as f32)
+                .fold(f32::MIN, f32::max);
+            let comp_max_y = component
+                .iter()
+                .map(|&idx| nodes[idx].global_y + nodes[idx].height as f32)
+                .fold(f32::MIN, f32::max);
+            let comp_w = comp_max_x - comp_min_x;
+            let comp_h = comp_max_y - comp_min_y;
+            if shelf_y > main_min_y && shelf_y + comp_h > main_min_y + target_column_height {
+                shelf_x += column_width + gap;
+                shelf_y = main_min_y;
+                column_width = 0.0;
+            }
+            let shift_x = shelf_x - comp_min_x;
+            let shift_y = shelf_y - comp_min_y;
+            for idx in component {
+                nodes[idx].global_x += shift_x;
+                nodes[idx].global_y += shift_y;
+            }
+            shelf_y += comp_h + gap;
+            column_width = column_width.max(comp_w);
+        }
+
         log_to_front(
             &app,
             "WARN",
             &format!(
-                "{} tesela(s) SIN CONEXIÓN excluidas del mosaico: {}. Aumenta el solape (>20%) o revisa el contraste de esos paneles.",
-                unplaced_names.len(),
-                unplaced_names.join(", ")
+                "{} tesela(s) sin conexión con el componente principal se preservaron como paneles-isla: {}. No se descartó ninguna; aumenta el solape (>20%) para integrarlas.",
+                island_names.len(),
+                island_names.join(", ")
             ),
         );
         emit_progress(
             &app,
-            &format!("Aviso: {} panel(es) sin conexión quedarán fuera", unplaced_names.len()),
+            &format!("Aviso: {} panel(es)-isla preservados", island_names.len()),
             48.0,
             None,
         );
@@ -6747,9 +9355,6 @@ async fn stitch_mosaic(
     let mut max_y = f32::MIN;
 
     for n in &nodes {
-        if !n.placed {
-            continue;
-        } // Or render unplaced overlap root? skip.
         if n.global_x < min_x {
             min_x = n.global_x;
         }
@@ -6768,22 +9373,53 @@ async fn stitch_mosaic(
     }
 
     let padding = 50.0f32;
+    if !min_x.is_finite()
+        || !max_x.is_finite()
+        || !min_y.is_finite()
+        || !max_y.is_finite()
+        || max_x <= min_x
+        || max_y <= min_y
+    {
+        return Err("Posiciones de mosaico inválidas después del registro".to_string());
+    }
     let cv_w = (max_x - min_x).ceil() as u32 + (padding * 2.0) as u32;
     let cv_h = (max_y - min_y).ceil() as u32 + (padding * 2.0) as u32;
 
-    // PR-1.8: TOPE anti-OOM. Un match erróneo que coloque una tesela a
-    // decenas de miles de píxeles disparaba un lienzo gigante y un panic en
-    // la reserva (antes solo se logueaba a >15000 px). Los buffers cuestan
-    // ~22 bytes/px: 300 MP ≈ 6.6 GB, techo razonable para mosaicos reales.
-    let total_px = cv_w as u64 * cv_h as u64;
-    if cv_w.max(cv_h) > 30_000 || total_px > 300_000_000 {
-        return Err(format!(
-            "Lienzo de mosaico implausible ({cv_w}x{cv_h}, {} MP): casi siempre indica un \
-             emparejamiento erróneo entre paneles. Revisa que los paneles compartan solape \
-             real y reintenta; si el mosaico es genuinamente así de grande, únelo por partes.",
-            total_px / 1_000_000
-        ));
-    }
+    // Preflight con RAM REAL en este instante, después de AKAZE/cache. Sustituye
+    // el cap fijo de 300 MP que podía autorizar ~6.6 GB incluso en equipos sin
+    // memoria suficiente. A la vez permite mosaicos grandes en workstations que
+    // sí demuestran capacidad, siempre con reserva para SO/WebView.
+    memory.refresh_memory();
+    let aggregate_tile_pixels = nodes
+        .iter()
+        .try_fold(0u64, |sum, n| {
+            sum.checked_add(n.width as u64 * n.height as u64)
+        })
+        .ok_or("Área agregada de teselas fuera de rango")?;
+    let largest_tile_pixels = nodes
+        .iter()
+        .map(|n| n.width as u64 * n.height as u64)
+        .max()
+        .unwrap_or(0);
+    let memory_plan = plan_mosaic_canvas_memory(
+        cv_w,
+        cv_h,
+        aggregate_tile_pixels,
+        tile_cache.max_spilled_tile_bytes,
+        largest_tile_pixels,
+        memory.available_memory(),
+    )?;
+    log_to_front(
+        &app,
+        "INFO",
+        &format!(
+            "Preflight mosaico: {:.1} MP, pico RAM {:.2} GB, reserva {:.2} GB, caché 16-bit RAM {:.1} MB",
+            memory_plan.pixels as f64 / 1_000_000.0,
+            memory_plan.peak_bytes as f64 / 1_073_741_824.0,
+            memory_plan.reserve_bytes as f64 / 1_073_741_824.0,
+            tile_cache.ram_used as f64 / 1_048_576.0,
+        ),
+    );
     if cv_w.max(cv_h) > 15000 {
         log_to_front(
             &app,
@@ -6802,13 +9438,12 @@ async fn stitch_mosaic(
     // Using simple flat vector for buffers (Width * Height * Channels)
     // This can be huge. 10k x 10k x 3 x 4bytes = 1.2GB. Feasible on modern RAM.
 
-    // We process sequentially to save RAM or just allocate?
-    // Let's Allocate.
-    let len = (cv_w as usize) * (cv_h as usize);
-    let mut acc_r = vec![0.0f32; len];
-    let mut acc_g = vec![0.0f32; len];
-    let mut acc_b = vec![0.0f32; len];
-    let mut acc_w = vec![0.0f32; len];
+    let len = usize::try_from(memory_plan.pixels)
+        .map_err(|_| "El lienzo excede el espacio direccionable de esta plataforma")?;
+    let mut acc_r = try_zeroed_vec::<f32>(len, "acumulador rojo del mosaico")?;
+    let mut acc_g = try_zeroed_vec::<f32>(len, "acumulador verde del mosaico")?;
+    let mut acc_b = try_zeroed_vec::<f32>(len, "acumulador azul del mosaico")?;
+    let mut acc_w = try_zeroed_vec::<f32>(len, "pesos del mosaico")?;
 
     // PR-1.8: FEATHER REAL + IGUALACIÓN DE GANANCIA + SUBPÍXEL.
     // El "blending" anterior era winner-take-all por máxima luminosidad:
@@ -6820,6 +9455,9 @@ async fn stitch_mosaic(
     // subpíxel con muestreo bilineal.
     const FEATHER_PX: f32 = 64.0;
     for (i, n) in nodes.iter().enumerate() {
+        if check_cancel(&state, request_id) {
+            return Err("Operación cancelada por el usuario".into());
+        }
         if !n.placed {
             continue;
         }
@@ -6831,11 +9469,11 @@ async fn stitch_mosaic(
             None,
         );
 
-        // OPTIMIZED: Load from stored path to get full 16-bit image for fusion
-        // This avoids reloading from tiles array and ensures we use original quality
-        let dyn_img =
-            load_image_or_video_frame(&n.original_path, &app).map_err(|e| e.to_string())?;
-        let rgba = dyn_img.to_rgba16(); // Force 16-bit load for quality preservation
+        // RAM: préstamo sin copia. Spill: una sola lectura secuencial y la Vec
+        // se libera al terminar esta iteración. Nunca se reabre/decodifica la
+        // fuente original ni se vuelve a seleccionar otro frame del vídeo.
+        let rgba_storage = tile_cache.load(n.cache_index)?;
+        let rgba = rgba_storage.as_ref();
 
         let n_w = n.width;
         let n_h = n.height;
@@ -6855,8 +9493,11 @@ async fn stitch_mosaic(
         // principal del escalón visible en la costura.
         let mut ratios: Vec<f32> = Vec::new();
         for y in (0..n_h).step_by(4) {
+            if y % 64 == 0 && job_token.is_cancelled() {
+                return Err("Operacion de mosaico cancelada o sustituida".into());
+            }
             for x in (0..n_w).step_by(4) {
-                let px = rgba.get_pixel(x, y);
+                let px = rgba16_at(rgba, n_w, x, y);
                 if px[3] == 0 {
                     continue;
                 }
@@ -6897,6 +9538,9 @@ async fn stitch_mosaic(
         let ptr_w = acc_w.as_mut_ptr() as usize;
 
         (0..n_h).into_par_iter().for_each(|y| {
+            if y % 64 == 0 && job_token.is_cancelled() {
+                return;
+            }
             let p_r = ptr_r as *mut f32;
             let p_g = ptr_g as *mut f32;
             let p_b = ptr_b as *mut f32;
@@ -6915,10 +9559,10 @@ async fn stitch_mosaic(
                 if x0 + 1 >= n_w || y0 + 1 >= n_h {
                     continue;
                 }
-                let p00 = rgba.get_pixel(x0, y0);
-                let p10 = rgba.get_pixel(x0 + 1, y0);
-                let p01 = rgba.get_pixel(x0, y0 + 1);
-                let p11 = rgba.get_pixel(x0 + 1, y0 + 1);
+                let p00 = rgba16_at(rgba, n_w, x0, y0);
+                let p10 = rgba16_at(rgba, n_w, x0 + 1, y0);
+                let p01 = rgba16_at(rgba, n_w, x0, y0 + 1);
+                let p11 = rgba16_at(rgba, n_w, x0 + 1, y0 + 1);
                 if p00[3] == 0 || p10[3] == 0 || p01[3] == 0 || p11[3] == 0 {
                     continue;
                 }
@@ -6960,48 +9604,46 @@ async fn stitch_mosaic(
                 }
             }
         });
+        planetary_derotation_checkpoint(&job_token, "la fusion del mosaico")?;
     }
+
+    // Ya no se necesitan imágenes, grises, descriptores ni spills. Liberarlos
+    // antes de reservar RGB16 reduce todavía más el pico real de normalización.
+    drop(nodes);
+    drop(tile_cache);
 
     emit_progress(&app, "Finalizando...", 95.0, None);
 
-    // 6. Normalize & Output
-    // 16-bit output buffer
-    let mut out_u16: Vec<u16> = vec![0; len * 3]; // RGB
-
-    // Media ponderada por feather (PR-1.8): dividir por el peso acumulado.
-    out_u16.par_chunks_mut(3).enumerate().for_each(|(idx, pixel)| {
-        let wsum = acc_w[idx];
-        if wsum > 0.0 {
-            pixel[0] = (acc_r[idx] / wsum + 0.5).clamp(0.0, 65535.0) as u16;
-            pixel[1] = (acc_g[idx] / wsum + 0.5).clamp(0.0, 65535.0) as u16;
-            pixel[2] = (acc_b[idx] / wsum + 0.5).clamp(0.0, 65535.0) as u16;
-        }
-    });
-
-    // Optimization: Directly write to Rgb16 Image buffer
-    // Replaces: let mut result_img = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::new(cv_w, cv_h);
-    let result_img: image::ImageBuffer<image::Rgb<u16>, Vec<u16>> =
-        image::ImageBuffer::from_raw(cv_w, cv_h, out_u16).ok_or("Failed to create image buffer")?;
+    // 6. Normalizar bit-exact y soltar 16 B/píxel de acumuladores antes de
+    // codificar. Esto reduce el pico posterior de ~34 a 6 B/píxel.
+    let out_u16 = normalize_mosaic_accumulators(&acc_r, &acc_g, &acc_b, &acc_w)?;
+    drop(acc_r);
+    drop(acc_g);
+    drop(acc_b);
+    drop(acc_w);
 
     // 7. Save
-    // Create Filename
+    // Both artifacts live below one hidden sibling directory.  Only the
+    // directory rename makes them visible, so a crash/cancel can never expose
+    // just the preview or just the 16-bit master.
     let first_tile_path = Path::new(&tiles[0].path);
     let parent_dir = first_tile_path.parent().unwrap_or(Path::new("."));
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-
-    // Save Pro Result (TIFF 16-bit)
-    let filename_tiff = format!("Mosaic_Result_{}.tiff", now.as_secs());
-    let path_tiff = parent_dir.join(&filename_tiff);
-
-    let f = File::create(&path_tiff).map_err(|e| e.to_string())?;
-    let ref_writer = BufWriter::new(f);
-    let encoder = image::codecs::tiff::TiffEncoder::new(ref_writer);
+    let mut staged_mosaic = StagedPlanetaryDirectory::create(parent_dir, "Mosaic_Result")?;
+    let output_base = staged_mosaic
+        .final_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Mosaic_Result")
+        .to_string();
+    let filename_tiff = format!("{output_base}.tiff");
+    let filename_preview = format!("{output_base}_NativePreview.png");
+    let path_tiff = staged_mosaic.final_path(&filename_tiff);
+    let path_preview = staged_mosaic.final_path(&filename_preview);
+    let staged_path_tiff = staged_mosaic.temporary_path(&filename_tiff);
+    let staged_path_preview = staged_mosaic.temporary_path(&filename_preview);
 
     // Convert to byte slice for encoder
-    // Image buffer provides as_raw which is &[u16] ordered R,G,B
-    let raw_u16 = result_img.as_raw();
+    let raw_u16 = out_u16.as_slice();
     emit_progress(&app, "Generando PrevisualizaciÃ³n...", 98.0, None);
     // PR-2.6: preview ACOTADO. Un mosaico lunar de 200+ MP generaba un PNG
     // de "preview" a tamaño completo (estirado + codificado + decodificado
@@ -7012,7 +9654,7 @@ async fn stitch_mosaic(
         let factor = (cv_w.max(cv_h) as f32 / PREVIEW_MAX_SIDE as f32).ceil() as usize;
         let dw = (cv_w as usize / factor).max(1);
         let dh = (cv_h as usize / factor).max(1);
-        let mut small = vec![0u16; dw * dh * 3];
+        let mut small = try_zeroed_vec::<u16>(dw * dh * 3, "preview del mosaico")?;
         small
             .par_chunks_mut(dw * 3)
             .enumerate()
@@ -7048,49 +9690,54 @@ async fn stitch_mosaic(
         (to_8bit_preview_visual(raw_u16), cv_w, cv_h)
     };
 
-    let mut raw_bytes = Vec::with_capacity(raw_u16.len() * 2);
-    for s in raw_u16 {
-        raw_bytes.extend_from_slice(&s.to_ne_bytes());
-    }
+    planetary_derotation_checkpoint(&job_token, "la codificacion del mosaico")?;
+    let mut staged_tiff = StagedDerotationTiff::encode(
+        staged_path_tiff,
+        raw_u16,
+        cv_w as usize,
+        cv_h as usize,
+    )?;
 
-    encoder
-        .encode(&raw_bytes, cv_w, cv_h, image::ColorType::Rgb16)
-        .map_err(|e| e.to_string())?;
+    let mut staged_preview =
+        StagedPlanetaryPng::encode_rgb8(staged_path_preview, &preview_bytes, pv_w, pv_h)?;
+    // These per-file renames remain inside the hidden transaction directory.
+    // If either fails, StagedPlanetaryDirectory::drop deletes the whole tree.
+    staged_tiff.publish()?;
+    staged_preview.publish()?;
+    planetary_derotation_checkpoint(&job_token, "la publicacion del mosaico")?;
+
+    // Determine metadata before moving the master into AppState.
+    let is_mono_detected = mosaic_rgb16_is_mono(raw_u16);
+    let stack_result = StackResult {
+        data: out_u16,
+        width: cv_w as usize,
+        height: cv_h as usize,
+        is_mono: is_mono_detected,
+        is_surface: true,
+    };
+
+    with_current_planetary_job(
+        &state.planetary_generation_gate,
+        &job_token,
+        "la publicacion atomica del mosaico",
+        || -> Result<(), String> {
+            staged_mosaic.publish()?;
+            *state
+                .stacked_image
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(stack_result);
+            state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            Ok(())
+        },
+    )??;
 
     log_to_front(&app, "INFO", &format!("Mosaico Guardado: {:?}", path_tiff));
-
-    let filename_preview = format!("Mosaic_Result_{}_NativePreview.png", now.as_secs());
-    let path_preview = parent_dir.join(&filename_preview);
-    let f_preview = File::create(&path_preview).map_err(|e| e.to_string())?;
-    let preview_writer = BufWriter::new(f_preview);
-    let preview_encoder = image::codecs::png::PngEncoder::new(preview_writer);
-    preview_encoder
-        .encode(&preview_bytes, pv_w, pv_h, image::ColorType::Rgb8)
-        .map_err(|e| e.to_string())?;
     let path_preview_clean =
         clean_windows_path(dunce::canonicalize(&path_preview).unwrap_or(path_preview));
     let path_tiff_clean = clean_windows_path(dunce::canonicalize(&path_tiff).unwrap_or(path_tiff));
     let preview_ref = format!("file_path:{}", path_preview_clean);
-
-    // Update Global State StackResult (for Wavelets)
-    let is_mono_detected = if raw_u16.len() > 3 {
-        let mid = raw_u16.len() / 2;
-        let mid = mid - (mid % 3); // Align R
-        raw_u16[mid] == raw_u16[mid + 1] && raw_u16[mid + 1] == raw_u16[mid + 2]
-    } else {
-        false
-    };
-
-    {
-        let mut locked = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
-        *locked = Some(StackResult {
-            data: raw_u16.to_vec(),
-            width: cv_w as usize,
-            height: cv_h as usize,
-            is_mono: is_mono_detected,
-            is_surface: true,
-        });
-    }
 
     emit_progress(&app, "Listo", 100.0, None);
 
@@ -7100,10 +9747,14 @@ async fn stitch_mosaic(
             height: cv_h as usize,
             frame_count: tiles.len(),
             bpp: 16,
-            color_id: 0,
-            pattern_name: "Mosaic Blind".to_string(),
+            color_id: if is_mono_detected { 0 } else { 100 },
+            pattern_name: if island_names.is_empty() {
+                "Mosaic Blind".to_string()
+            } else {
+                format!("Mosaic Blind ({} paneles-isla preservados)", island_names.len())
+            },
             file_size_mb: 0.0,
-            is_color: true,
+            is_color: !is_mono_detected,
         },
         best_frame_idx: 0,
         stats: VideoStats {
@@ -7796,13 +10447,29 @@ fn apply_advanced_deringing(
 
 #[tauri::command]
 fn clear_app_memory(state: tauri::State<'_, AppState>) {
-    *state.stacked_image.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    *state.batch_anchor.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *state.batch_anchor_dims.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0);
-    state.active_req_id.store(0, std::sync::atomic::Ordering::Relaxed);
+    // Inicio explícito de una nueva sesión: este es el único punto del flujo
+    // planetario/lote que rearma la cancelación. `clear_stack_memory` no debe
+    // tocarla porque se ejecuta entre entradas del mismo lote.
+    // Generación, rearme y borrado del resultado forman una sola transición:
+    // ningún worker antiguo puede revivir al limpiar el flag, y ningún trabajo
+    // nuevo puede publicar entre el cambio de generación y este clear.
+    let _ = advance_and_rearm_planetary_session(
+        &state.planetary_generation_gate,
+        &state.active_req_id,
+        state.cancel_requested.as_ref(),
+        || {
+            *state
+                .stacked_image
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+            state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            // Mantener el orden de locks que usa el consumidor del lote.
+            *state.batch_anchor.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *state.batch_anchor_dims.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0);
+        },
+    );
 }
 
 /// R13: limpieza ligera POR ARCHIVO dentro de un lote. A diferencia de
@@ -7811,12 +10478,23 @@ fn clear_app_memory(state: tauri::State<'_, AppState>) {
 /// sobrevivia mas alla del primer video).
 #[tauri::command]
 fn clear_stack_memory(state: tauri::State<'_, AppState>) {
-    *state.stacked_image.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // Invalidación y clear son una sola transición de propietario. La bandera
+    // de cancelación NO se rearma: debe permanecer sticky entre entradas del
+    // mismo lote.
+    let _ = advance_planetary_generation_under_gate(
+        &state.planetary_generation_gate,
+        &state.active_req_id,
+        || {
+            *state
+                .stacked_image
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+            state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        },
+    );
     *state.deep_sky_result.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.active_req_id.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -7867,6 +10545,16 @@ async fn zas_stack_video_elite(
 
 fn main() {
     tauri::Builder::default()
+        // El decode-cache mantiene un presupuesto por proceso. Una única
+        // instancia convierte ese contrato en presupuesto por máquina y evita
+        // que dos ventanas publiquen sobre la misma sesión planetaria.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
@@ -7913,6 +10601,7 @@ fn main() {
                 filter_cache: Mutex::new(Vec::new()),
                 batch_anchor: Mutex::new(None),
                 batch_anchor_dims: Mutex::new((0, 0)),
+                planetary_generation_gate: Mutex::new(()),
                 active_req_id: AtomicUsize::new(0),
                 cancel_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 license_manager,
@@ -7930,13 +10619,11 @@ fn main() {
             analyze_psf,
             crop_stacked_image,
             scan_directory,
-            create_gif_animation,
             export_animation_video,
             process_batch_entry,
             get_ser_conversion_preflight,
             convert_video_to_ser_frontend,
             normalize_batch_brightness,
-            crop_animation_frames,
             realign_animation_frames,
             get_planetary_derotation_preflight,
             get_current_stacked_derotation_preflight,

@@ -8,7 +8,7 @@ pub fn compute_idw_map(
     width: usize,
     height: usize,
     custom_points: &[ApPoint],
-) -> (Vec<u16>, Vec<f32>) {
+) -> Result<(Vec<u16>, Vec<f32>), String> {
     compute_idw_map_with_power(width, height, custom_points, 1.5)
 }
 
@@ -22,8 +22,22 @@ pub fn compute_idw_map_with_power(
     height: usize,
     custom_points: &[ApPoint],
     idw_power: f32,
-) -> (Vec<u16>, Vec<f32>) {
+) -> Result<(Vec<u16>, Vec<f32>), String> {
     compute_idw_map_for_output(width, height, 1.0, 0.0, 0.0, custom_points, idw_power, 8)
+}
+
+fn try_idw_filled_vec<T: Clone>(len: usize, value: T, label: &str) -> Result<Vec<T>, String> {
+    let bytes = len
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| format!("La reserva de {label} excede el espacio direccionable"))?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|error| {
+        format!(
+            "No se pudieron reservar {bytes} bytes para {label}: {error}. Reduce drizzle/ROI o libera RAM."
+        )
+    })?;
+    values.resize(len, value);
+    Ok(values)
 }
 
 /// Pre-computes an IDW warp map for the actual output raster.
@@ -48,8 +62,13 @@ struct ApSpatialGrid {
     cells: Vec<Vec<u16>>,
 }
 
+#[inline]
+fn idw_neighbor_before(candidate: (f32, u16), current: (f32, u16)) -> bool {
+    candidate.0 < current.0 || (candidate.0 == current.0 && candidate.1 < current.1)
+}
+
 impl ApSpatialGrid {
-    fn build(points: &[ApPoint]) -> Self {
+    fn build(points: &[ApPoint]) -> Result<Self, String> {
         let mut min_x = f32::MAX;
         let mut min_y = f32::MAX;
         let mut max_x = f32::MIN;
@@ -66,34 +85,38 @@ impl ApSpatialGrid {
         let cell = ((span_x * span_y / points.len().max(1) as f32).sqrt() * 1.4).max(4.0);
         let gw = ((span_x / cell).ceil() as usize + 1).max(1);
         let gh = ((span_y / cell).ceil() as usize + 1).max(1);
-        let mut cells = vec![Vec::new(); gw * gh];
+        let cell_count = gw
+            .checked_mul(gh)
+            .ok_or("La rejilla espacial IDW excede el espacio direccionable")?;
+        let mut cells = try_idw_filled_vec(cell_count, Vec::new(), "rejilla espacial IDW")?;
         for (i, p) in points.iter().enumerate() {
             let cx = (((p.x - min_x) / cell) as usize).min(gw - 1);
             let cy = (((p.y - min_y) / cell) as usize).min(gh - 1);
+            cells[cy * gw + cx]
+                .try_reserve(1)
+                .map_err(|error| format!("No se pudo ampliar una celda IDW: {error}"))?;
             cells[cy * gw + cx].push(i as u16);
         }
-        Self { cell, gw, gh, min_x, min_y, cells }
+        Ok(Self {
+            cell,
+            gw,
+            gh,
+            min_x,
+            min_y,
+            cells,
+        })
     }
 
     /// Llena `top_k[..k]` con los k APs mas cercanos a (px, py), ordenados por
     /// distancia — MISMO resultado que el barrido lineal (insertion sort
     /// identico), solo que visitando celdas por anillos crecientes.
     #[inline]
-    fn top_k_into(
-        &self,
-        px: f32,
-        py: f32,
-        k: usize,
-        top_k: &mut [(f32, u16)],
-        points: &[ApPoint],
-    ) {
+    fn top_k_into(&self, px: f32, py: f32, k: usize, top_k: &mut [(f32, u16)], points: &[ApPoint]) {
         for slot in top_k.iter_mut() {
             *slot = (f32::MAX, 0u16);
         }
-        let cx = (((px - self.min_x) / self.cell).floor() as isize)
-            .clamp(0, self.gw as isize - 1);
-        let cy = (((py - self.min_y) / self.cell).floor() as isize)
-            .clamp(0, self.gh as isize - 1);
+        let cx = (((px - self.min_x) / self.cell).floor() as isize).clamp(0, self.gw as isize - 1);
+        let cy = (((py - self.min_y) / self.cell).floor() as isize).clamp(0, self.gh as isize - 1);
         let max_ring = (self.gw.max(self.gh)) as isize;
 
         let visit = |gx: isize, gy: isize, top_k: &mut [(f32, u16)]| {
@@ -102,13 +125,14 @@ impl ApSpatialGrid {
                 let dx = px - p.x;
                 let dy = py - p.y;
                 let d2 = dx * dx + dy * dy;
-                if d2 < top_k[k - 1].0 {
+                let candidate = (d2, pi);
+                if idw_neighbor_before(candidate, top_k[k - 1]) {
                     let mut ins = k - 1;
-                    while ins > 0 && d2 < top_k[ins - 1].0 {
+                    while ins > 0 && idw_neighbor_before(candidate, top_k[ins - 1]) {
                         top_k[ins] = top_k[ins - 1];
                         ins -= 1;
                     }
-                    top_k[ins] = (d2, pi);
+                    top_k[ins] = candidate;
                 }
             }
         };
@@ -120,7 +144,10 @@ impl ApSpatialGrid {
             // mejor en anillos posteriores.
             if top_k[k - 1].0 < f32::MAX {
                 let ring_min = ((r - 1).max(0) as f32) * self.cell;
-                if top_k[k - 1].0 <= ring_min * ring_min {
+                // Con igualdad todavía puede existir en el siguiente anillo un
+                // AP a la misma distancia pero con índice menor. Continuar en
+                // ese borde mantiene el mismo desempate que el barrido lineal.
+                if top_k[k - 1].0 < ring_min * ring_min {
                     return;
                 }
             }
@@ -155,7 +182,7 @@ pub fn compute_idw_map_for_output(
     custom_points: &[ApPoint],
     idw_power: f32,
     top_k: usize,
-) -> (Vec<u16>, Vec<f32>) {
+) -> Result<(Vec<u16>, Vec<f32>), String> {
     // --- OPT 1+B: PRE-COMPUTE TOP-K IDW WARP MAP ---
     // Instead of ALL n_points weights per pixel, store only the K nearest APs.
     // For p≥3 IDW, distant AP weights are negligible (<0.001), so Top-K loses no quality.
@@ -164,7 +191,16 @@ pub fn compute_idw_map_for_output(
     let n_points = custom_points.len();
 
     if n_points == 0 {
-        return (Vec::new(), Vec::new());
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if width == 0 || height == 0 {
+        return Err("No se puede construir un mapa IDW con geometría vacía".into());
+    }
+    if n_points > u16::MAX as usize {
+        return Err(format!(
+            "El mapa IDW admite como máximo {} puntos de alineación; recibió {n_points}",
+            u16::MAX
+        ));
     }
 
     let effective_k = top_k.clamp(1, WARP_K).min(n_points); // Handle cases with fewer than K APs
@@ -172,15 +208,20 @@ pub fn compute_idw_map_for_output(
     // Rejilla espacial solo para mallas densas: por debajo de ~96 APs el
     // barrido lineal es mas barato que el overhead de anillos por pixel.
     let grid = if n_points >= 96 {
-        Some(ApSpatialGrid::build(custom_points))
+        Some(ApSpatialGrid::build(custom_points)?)
     } else {
         None
     };
 
     // Flat arrays: warp_indices[pixel × K + k] = AP index, warp_weights[pixel × K + k] = normalized weight
-    let total_pixels = width * height;
-    let mut indices = vec![0u16; total_pixels * effective_k];
-    let mut weights = vec![0.0f32; total_pixels * effective_k];
+    let total_pixels = width
+        .checked_mul(height)
+        .ok_or("El mapa IDW excede el espacio direccionable")?;
+    let map_len = total_pixels
+        .checked_mul(effective_k)
+        .ok_or("Los vecinos del mapa IDW exceden el espacio direccionable")?;
+    let mut indices = try_idw_filled_vec(map_len, 0u16, "índices del mapa IDW")?;
+    let mut weights = try_idw_filled_vec(map_len, 0.0f32, "pesos del mapa IDW")?;
 
     // PARALLEL IDW: Compute indices and weights using all cores (AVX2 auto-vectorization friendly)
     // We chunk the flat arrays to allow parallel mutation.
@@ -224,16 +265,19 @@ pub fn compute_idw_map_for_output(
                         let dx = px - kp.x;
                         let dy = py - kp.y;
                         let dist_sq = dx * dx + dy * dy;
+                        let candidate = (dist_sq, kp_i as u16);
 
                         // If this point is closer than our FURTHEST point in the Top K list...
-                        if dist_sq < top_k[effective_k - 1].0 {
+                        if idw_neighbor_before(candidate, top_k[effective_k - 1]) {
                             // Find where to insert it (O(K), which is tiny, max 8)
                             let mut insert_idx = effective_k - 1;
-                            while insert_idx > 0 && dist_sq < top_k[insert_idx - 1].0 {
+                            while insert_idx > 0
+                                && idw_neighbor_before(candidate, top_k[insert_idx - 1])
+                            {
                                 top_k[insert_idx] = top_k[insert_idx - 1];
                                 insert_idx -= 1;
                             }
-                            top_k[insert_idx] = (dist_sq, kp_i as u16);
+                            top_k[insert_idx] = candidate;
                         }
                     }
                 }
@@ -264,7 +308,7 @@ pub fn compute_idw_map_for_output(
             }
         });
 
-    (indices, weights)
+    Ok((indices, weights))
 }
 
 /// Accumulates a single frame into the stack using Liquid Warping (Multipoint).
@@ -324,6 +368,71 @@ impl LanczosLUT {
 }
 
 static LANCZOS_LUT: OnceLock<LanczosLUT> = OnceLock::new();
+
+// El plan planetario limita la concurrencia de FRAMES por la RAM del scratch
+// (~600 MiB/frame en una captura RGB 3312x5888), pero el render de un frame no
+// necesita duplicar ese scratch: cada fila de salida es completamente
+// independiente. Un pool propio evita heredar el pool acotado de frames (que
+// puede tener sólo 1-2 workers) y ocupa los núcleos ociosos durante el hot path
+// Lanczos. Es persistente para no crear hilos en cada frame y se comparte entre
+// las dos llamadas que puedan llegar simultáneamente desde el pool exterior.
+//
+// Paridad: no existe reducción entre filas ni dos filas escriben el mismo
+// píxel. Cada píxel ejecuta exactamente la misma secuencia escalar/SIMD que en
+// el bucle secuencial; únicamente cambia qué worker posee la fila.
+const PARALLEL_WARP_MIN_PIXELS: usize = 1_000_000;
+static CPU_WARP_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+
+fn for_each_warp_row<F>(width: usize, height: usize, process: F)
+where
+    F: Fn(usize) + Send + Sync,
+{
+    let pixels = width.saturating_mul(height);
+    // Override de diagnóstico/benchmark; no cambia el valor por defecto.
+    let hardware_threads = std::env::var("ZAS_CPU_WARP_THREADS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1)
+        })
+        .clamp(1, 32);
+    if pixels < PARALLEL_WARP_MIN_PIXELS || hardware_threads <= 1 {
+        for y in 0..height {
+            process(y);
+        }
+        return;
+    }
+
+    // Si el plan por fases ya pudo conceder al pool exterior al menos la
+    // mitad de los núcleos, reutilizar ese pool evita crear 7+10 workers en
+    // una máquina de 10 cores. Rayon resuelve el paralelismo anidado por
+    // work-stealing: los workers que terminaron su frame ayudan con filas de
+    // los otros. El pool dedicado se reserva para el caso problemático real
+    // (1-2 frames concurrentes por un plan de RAM conservador).
+    if rayon::current_thread_index().is_some()
+        && rayon::current_num_threads() >= hardware_threads.div_ceil(2)
+    {
+        (0..height).into_par_iter().for_each(process);
+        return;
+    }
+
+    let pool = CPU_WARP_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(hardware_threads)
+            .thread_name(|index| format!("zas-liquid-warp-{index}"))
+            .build()
+            .ok()
+    });
+    if let Some(pool) = pool {
+        pool.install(|| (0..height).into_par_iter().for_each(process));
+    } else {
+        for y in 0..height {
+            process(y);
+        }
+    }
+}
 
 // ===========================================================================
 // DRIZZLE VERDADERO (kernel "drop" de solape de areas, estilo AS!4/HST).
@@ -537,7 +646,9 @@ unsafe fn fast_sample_rgb_avx2(
     drop_size: f32,
 ) -> (f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) {
     use std::arch::x86_64::*;
-    let wxs = _mm256_setr_ps(w_xs[0], w_xs[1], w_xs[2], w_xs[3], w_xs[4], w_xs[5], 0.0, 0.0);
+    let wxs = _mm256_setr_ps(
+        w_xs[0], w_xs[1], w_xs[2], w_xs[3], w_xs[4], w_xs[5], 0.0, 0.0,
+    );
     let pad_hi = _mm256_set1_ps(65535.0);
     let mut sum_r = _mm256_setzero_ps();
     let mut sum_g = _mm256_setzero_ps();
@@ -633,14 +744,29 @@ unsafe fn fast_sample_rgb_neon(
         let src_row = (sy0 + ky) as usize * w_in;
         // base..base+18 son las 6 columnas RGB; índices garantizados en rango
         // por el guard del fast-path (sx0>=2, sx0+3<w_in, sy0>=2, sy0+3<h_in).
+        //
+        // Los primeros cuatro píxeles se cargan directamente desde el RGB
+        // intercalado con LD3. La versión anterior hacía 12 gathers escalares,
+        // construía tres arrays f32 temporales y después volvía a cargarlos en
+        // NEON por CADA fila del kernel Lanczos. En un frame 3312x5888 eso se
+        // repite cientos de millones de veces. LD3 entrega exactamente las
+        // mismas lanes R/G/B; sólo elimina el de-interleave escalar y conserva
+        // intactos el orden de productos y reducciones (paridad numérica).
         let base = (src_row + (sx0 - 2) as usize) * 3;
         let g = |o: usize| *rgb_buf.get_unchecked(base + o) as f32;
-        let rv_lo = vld1q_f32([g(0), g(3), g(6), g(9)].as_ptr());
-        let rv_hi = vld1q_f32([g(12), g(15), 0.0f32, 0.0].as_ptr());
-        let gv_lo = vld1q_f32([g(1), g(4), g(7), g(10)].as_ptr());
-        let gv_hi = vld1q_f32([g(13), g(16), 0.0f32, 0.0].as_ptr());
-        let bv_lo = vld1q_f32([g(2), g(5), g(8), g(11)].as_ptr());
-        let bv_hi = vld1q_f32([g(14), g(17), 0.0f32, 0.0].as_ptr());
+        let rgb4 = vld3_u16(rgb_buf.as_ptr().add(base));
+        let rv_lo = vcvtq_f32_u32(vmovl_u16(rgb4.0));
+        let gv_lo = vcvtq_f32_u32(vmovl_u16(rgb4.1));
+        let bv_lo = vcvtq_f32_u32(vmovl_u16(rgb4.2));
+        let r4 = g(12);
+        let r5 = g(15);
+        let g4 = g(13);
+        let g5 = g(16);
+        let b4 = g(14);
+        let b5 = g(17);
+        let rv_hi = vld1q_f32([r4, r5, 0.0f32, 0.0].as_ptr());
+        let gv_hi = vld1q_f32([g4, g5, 0.0f32, 0.0].as_ptr());
+        let bv_hi = vld1q_f32([b4, b5, 0.0f32, 0.0].as_ptr());
         let wyv = vdupq_n_f32(wy);
         let wf_lo = vmulq_f32(wxs_lo, wyv);
         let wf_hi = vmulq_f32(wxs_hi, wyv);
@@ -654,11 +780,11 @@ unsafe fn fast_sample_rgb_neon(
         sum_w_hi = vaddq_f32(sum_w_hi, wf_hi);
         // Mínimo: lanes de relleno neutralizados a 65535.
         vmin_r = vminq_f32(vmin_r, rv_lo);
-        vmin_r = vminq_f32(vmin_r, vld1q_f32([g(12), g(15), 65535.0f32, 65535.0].as_ptr()));
+        vmin_r = vminq_f32(vmin_r, vld1q_f32([r4, r5, 65535.0f32, 65535.0].as_ptr()));
         vmin_g = vminq_f32(vmin_g, gv_lo);
-        vmin_g = vminq_f32(vmin_g, vld1q_f32([g(13), g(16), 65535.0f32, 65535.0].as_ptr()));
+        vmin_g = vminq_f32(vmin_g, vld1q_f32([g4, g5, 65535.0f32, 65535.0].as_ptr()));
         vmin_b = vminq_f32(vmin_b, bv_lo);
-        vmin_b = vminq_f32(vmin_b, vld1q_f32([g(14), g(17), 65535.0f32, 65535.0].as_ptr()));
+        vmin_b = vminq_f32(vmin_b, vld1q_f32([b4, b5, 65535.0f32, 65535.0].as_ptr()));
         vmax_r = vmaxq_f32(vmax_r, rv_lo);
         vmax_r = vmaxq_f32(vmax_r, rv_hi);
         vmax_g = vmaxq_f32(vmax_g, gv_lo);
@@ -748,13 +874,24 @@ pub fn accumulate_frame_liquid(
     let true_drizzle = drizzle > 1.01;
     let drz_h1 = 0.5 * inv_drizzle; // media huella del pixel de salida (coords fuente)
     let drz_h2 = 0.5 * drop_size.clamp(0.3, 1.0); // pixfrac/2
-    // Cobertura maxima del kernel (solape pleno en ambos ejes): normaliza cov a (0,1].
+                                                  // Cobertura maxima del kernel (solape pleno en ambos ejes): normaliza cov a (0,1].
     let drz_full_cov = {
         let m = 2.0 * drz_h1.min(drz_h2);
         (m * m).max(1e-9)
     };
 
-    for y_out in 0..h_out {
+    // Punteros enteros: `for_each_warp_row` reparte filas disjuntas. Las Vec
+    // pertenecen al scratch del frame y no se redimensionan durante el render.
+    let acc_r_ptr = acc_r.as_mut_ptr() as usize;
+    let acc_g_ptr = acc_g.as_mut_ptr() as usize;
+    let acc_b_ptr = acc_b.as_mut_ptr() as usize;
+    let acc_w_ptr = acc_w.as_mut_ptr() as usize;
+    let acc_len = acc_r
+        .len()
+        .min(acc_g.len())
+        .min(acc_b.len())
+        .min(acc_w.len());
+    for_each_warp_row(w_out, h_out, |y_out| {
         let row_off = y_out * w_out;
         for x_out in 0..w_out {
             let ref_x = (x_out as f32 * inv_drizzle) + roi_offset_x;
@@ -839,7 +976,7 @@ pub fn accumulate_frame_liquid(
                     drizzle_sample_rgb(rgb_buf, w_in, h_in, sx_in, sy_in, drz_h1, drz_h2);
                 if dw > 1e-6 {
                     let tidx = row_off + x_out;
-                    if tidx < acc_r.len() {
+                    if tidx < acc_len {
                         // PONDERACION POR COBERTURA (drizzle clasico): un frame
                         // cuyo drop apenas roza este pixel de salida aporta un
                         // estimado dominado por UN solo pixel fuente (mas
@@ -851,10 +988,10 @@ pub fn accumulate_frame_liquid(
                         let wq = pixel_weight * cov;
                         let inv = 1.0 / dw;
                         unsafe {
-                            *acc_r.get_unchecked_mut(tidx) += dr * inv * wq;
-                            *acc_g.get_unchecked_mut(tidx) += dg * inv * wq;
-                            *acc_b.get_unchecked_mut(tidx) += db * inv * wq;
-                            *acc_w.get_unchecked_mut(tidx) += wq;
+                            *(acc_r_ptr as *mut f32).add(tidx) += dr * inv * wq;
+                            *(acc_g_ptr as *mut f32).add(tidx) += dg * inv * wq;
+                            *(acc_b_ptr as *mut f32).add(tidx) += db * inv * wq;
+                            *(acc_w_ptr as *mut f32).add(tidx) += wq;
                         }
                     }
                 }
@@ -965,17 +1102,17 @@ pub fn accumulate_frame_liquid(
 
             if let Some((pr, pg, pb)) = sample_pixel(sx_in, sy_in) {
                 let tidx = row_off + x_out;
-                if tidx < acc_r.len() {
+                if tidx < acc_len {
                     unsafe {
-                        *acc_r.get_unchecked_mut(tidx) += pr * pixel_weight;
-                        *acc_g.get_unchecked_mut(tidx) += pg * pixel_weight;
-                        *acc_b.get_unchecked_mut(tidx) += pb * pixel_weight;
-                        *acc_w.get_unchecked_mut(tidx) += pixel_weight;
+                        *(acc_r_ptr as *mut f32).add(tidx) += pr * pixel_weight;
+                        *(acc_g_ptr as *mut f32).add(tidx) += pg * pixel_weight;
+                        *(acc_b_ptr as *mut f32).add(tidx) += pb * pixel_weight;
+                        *(acc_w_ptr as *mut f32).add(tidx) += pixel_weight;
                     }
                 }
             }
         }
-    }
+    });
 }
 
 // ===========================================================================
@@ -1075,7 +1212,9 @@ unsafe fn fast_sample_mono_avx2(
 ) -> (f32, f32, f32, f32) {
     use std::arch::x86_64::*;
     // Pesos en X con los 2 lanes de relleno a 0 (no contribuyen a las sumas).
-    let wxs = _mm256_setr_ps(w_xs[0], w_xs[1], w_xs[2], w_xs[3], w_xs[4], w_xs[5], 0.0, 0.0);
+    let wxs = _mm256_setr_ps(
+        w_xs[0], w_xs[1], w_xs[2], w_xs[3], w_xs[4], w_xs[5], 0.0, 0.0,
+    );
     let mut sum_v = _mm256_setzero_ps();
     let mut sum_w = _mm256_setzero_ps();
     let mut vmin = _mm256_set1_ps(65535.0);
@@ -1189,7 +1328,9 @@ fn fast_sample_mono(
     }
     #[cfg(target_arch = "aarch64")]
     {
-        return unsafe { fast_sample_mono_neon(mono_buf, w_in, sx0, sy0, w_xs, fy, lut, drop_size) };
+        return unsafe {
+            fast_sample_mono_neon(mono_buf, w_in, sx0, sy0, w_xs, fy, lut, drop_size)
+        };
     }
     #[cfg(not(target_arch = "aarch64"))]
     fast_sample_mono_scalar(mono_buf, w_in, sx0, sy0, w_xs, fy, lut, drop_size)
@@ -1235,13 +1376,16 @@ pub fn accumulate_frame_liquid_mono(
     let true_drizzle = drizzle > 1.01;
     let drz_h1 = 0.5 * inv_drizzle; // media huella del pixel de salida (coords fuente)
     let drz_h2 = 0.5 * drop_size.clamp(0.3, 1.0); // pixfrac/2
-    // Cobertura maxima del kernel (solape pleno en ambos ejes): normaliza cov a (0,1].
+                                                  // Cobertura maxima del kernel (solape pleno en ambos ejes): normaliza cov a (0,1].
     let drz_full_cov = {
         let m = 2.0 * drz_h1.min(drz_h2);
         (m * m).max(1e-9)
     };
 
-    for y_out in 0..h_out {
+    let acc_ptr = acc.as_mut_ptr() as usize;
+    let acc_w_ptr = acc_w.as_mut_ptr() as usize;
+    let acc_len = acc.len().min(acc_w.len());
+    for_each_warp_row(w_out, h_out, |y_out| {
         let row_off = y_out * w_out;
         for x_out in 0..w_out {
             let ref_x = (x_out as f32 * inv_drizzle) + roi_offset_x;
@@ -1322,12 +1466,12 @@ pub fn accumulate_frame_liquid_mono(
                     drizzle_sample_mono(mono_buf, w_in, h_in, sx_in, sy_in, drz_h1, drz_h2);
                 if dw > 1e-6 {
                     let tidx = row_off + x_out;
-                    if tidx < acc.len() {
+                    if tidx < acc_len {
                         let cov = (dw / drz_full_cov).min(1.0);
                         let wq = pixel_weight * cov;
                         unsafe {
-                            *acc.get_unchecked_mut(tidx) += (dv / dw) * wq;
-                            *acc_w.get_unchecked_mut(tidx) += wq;
+                            *(acc_ptr as *mut f32).add(tidx) += (dv / dw) * wq;
+                            *(acc_w_ptr as *mut f32).add(tidx) += wq;
                         }
                     }
                 }
@@ -1347,48 +1491,45 @@ pub fn accumulate_frame_liquid_mono(
                 w_xs[i] = lut.get(fx - kx as f32, drop_size);
             }
 
-            let (sum_v, sum_w, min_v, max_v) = if sx0 >= 2
-                && sx0 + 3 < w_in as isize
-                && sy0 >= 2
-                && sy0 + 3 < h_in as isize
-            {
-                // FAST PATH (Interior Pixels) — SIMD (AVX2) con fallback escalar
-                fast_sample_mono(mono_buf, w_in, sx0, sy0, &w_xs, fy, lut, drop_size)
-            } else {
-                // SLOW PATH (Boundary clipping) — escalar
-                let mut min_v = 65535.0f32;
-                let mut max_v = 0.0f32;
-                let mut sum_v = 0.0f32;
-                let mut sum_w = 0.0f32;
-                for ky in -2..=3 {
-                    let py = sy0 + ky;
-                    if py < 0 || py >= h_in as isize {
-                        continue;
-                    }
-                    let wy = lut.get(fy - ky as f32, drop_size);
-                    if wy.abs() < 0.001 {
-                        continue;
-                    }
-                    let src_row = py as usize * w_in;
-                    for (i, kx) in (-2..=3).enumerate() {
-                        let px = sx0 + kx;
-                        if px < 0 || px >= w_in as isize {
+            let (sum_v, sum_w, min_v, max_v) =
+                if sx0 >= 2 && sx0 + 3 < w_in as isize && sy0 >= 2 && sy0 + 3 < h_in as isize {
+                    // FAST PATH (Interior Pixels) — SIMD (AVX2) con fallback escalar
+                    fast_sample_mono(mono_buf, w_in, sx0, sy0, &w_xs, fy, lut, drop_size)
+                } else {
+                    // SLOW PATH (Boundary clipping) — escalar
+                    let mut min_v = 65535.0f32;
+                    let mut max_v = 0.0f32;
+                    let mut sum_v = 0.0f32;
+                    let mut sum_w = 0.0f32;
+                    for ky in -2..=3 {
+                        let py = sy0 + ky;
+                        if py < 0 || py >= h_in as isize {
                             continue;
                         }
-                        let w_final = w_xs[i] * wy;
-                        let pv = mono_buf[src_row + px as usize] as f32;
-                        if pv < min_v {
-                            min_v = pv;
+                        let wy = lut.get(fy - ky as f32, drop_size);
+                        if wy.abs() < 0.001 {
+                            continue;
                         }
-                        if pv > max_v {
-                            max_v = pv;
+                        let src_row = py as usize * w_in;
+                        for (i, kx) in (-2..=3).enumerate() {
+                            let px = sx0 + kx;
+                            if px < 0 || px >= w_in as isize {
+                                continue;
+                            }
+                            let w_final = w_xs[i] * wy;
+                            let pv = mono_buf[src_row + px as usize] as f32;
+                            if pv < min_v {
+                                min_v = pv;
+                            }
+                            if pv > max_v {
+                                max_v = pv;
+                            }
+                            sum_v += pv * w_final;
+                            sum_w += w_final;
                         }
-                        sum_v += pv * w_final;
-                        sum_w += w_final;
                     }
-                }
-                (sum_v, sum_w, min_v, max_v)
-            };
+                    (sum_v, sum_w, min_v, max_v)
+                };
 
             if sum_w.abs() > 0.00001 {
                 // Symmetric range-based anti-ringing clamp (same policy as RGB):
@@ -1397,15 +1538,15 @@ pub fn accumulate_frame_liquid_mono(
                 let val =
                     (sum_v / sum_w).clamp((min_v - band).max(0.0), (max_v + band).min(65535.0));
                 let tidx = row_off + x_out;
-                if tidx < acc.len() {
+                if tidx < acc_len {
                     unsafe {
-                        *acc.get_unchecked_mut(tidx) += val * pixel_weight;
-                        *acc_w.get_unchecked_mut(tidx) += pixel_weight;
+                        *(acc_ptr as *mut f32).add(tidx) += val * pixel_weight;
+                        *(acc_w_ptr as *mut f32).add(tidx) += pixel_weight;
                     }
                 }
             }
         }
-    }
+    });
 }
 
 /// Accumulates a single frame into the stack using Global (Rigid) alignment.
@@ -1789,8 +1930,9 @@ mod simd_validation {
                         for (i, kx) in (-2..=3).enumerate() {
                             w_xs[i] = lut.get(fx - kx as f32, drop_size);
                         }
-                        let sc =
-                            fast_sample_mono_scalar(&buf, w_in, sx0, sy0, &w_xs, fy, &lut, drop_size);
+                        let sc = fast_sample_mono_scalar(
+                            &buf, w_in, sx0, sy0, &w_xs, fy, &lut, drop_size,
+                        );
                         let si = unsafe {
                             fast_sample_mono_avx2(&buf, w_in, sx0, sy0, &w_xs, fy, &lut, drop_size)
                         };
@@ -1837,8 +1979,9 @@ mod simd_validation {
                         for (i, kx) in (-2..=3).enumerate() {
                             w_xs[i] = lut.get(fx - kx as f32, drop_size);
                         }
-                        let sc =
-                            fast_sample_rgb_scalar(&buf, w_in, sx0, sy0, &w_xs, fy, &lut, drop_size);
+                        let sc = fast_sample_rgb_scalar(
+                            &buf, w_in, sx0, sy0, &w_xs, fy, &lut, drop_size,
+                        );
                         let si = unsafe {
                             fast_sample_rgb_avx2(&buf, w_in, sx0, sy0, &w_xs, fy, &lut, drop_size)
                         };
@@ -1860,7 +2003,10 @@ mod simd_validation {
             }
         }
         eprintln!("RGB SIMD validado en {checked} casos. max_diff suma={max_diff_sum}");
-        assert!(max_diff_sum < 0.5, "suma RGB difiere demasiado: {max_diff_sum}");
+        assert!(
+            max_diff_sum < 0.5,
+            "suma RGB difiere demasiado: {max_diff_sum}"
+        );
     }
 }
 
@@ -1871,6 +2017,44 @@ mod simd_validation {
 #[cfg(test)]
 mod drizzle_tests {
     use super::*;
+
+    #[test]
+    fn parallel_warp_scheduler_visits_every_row_exactly_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let height = 1024usize;
+        let visits: Vec<AtomicUsize> = (0..height).map(|_| AtomicUsize::new(0)).collect();
+        // 1024² supera deliberadamente PARALLEL_WARP_MIN_PIXELS.
+        for_each_warp_row(1024, height, |y| {
+            visits[y].fetch_add(1, Ordering::Relaxed);
+        });
+        assert!(visits
+            .iter()
+            .all(|count| count.load(Ordering::Relaxed) == 1));
+    }
+
+    #[test]
+    fn idw_rejects_overflow_before_allocating_large_planes() {
+        let points = [ApPoint {
+            x: 0.0,
+            y: 0.0,
+            size: 16,
+        }];
+        let error =
+            compute_idw_map_for_output(usize::MAX, 2, 1.0, 0.0, 0.0, &points, 1.5, 1).unwrap_err();
+        assert!(error.contains("espacio direccionable"), "{error}");
+    }
+
+    #[test]
+    fn idw_rejects_empty_output_geometry() {
+        let points = [ApPoint {
+            x: 0.0,
+            y: 0.0,
+            size: 16,
+        }];
+        let error = compute_idw_map_for_output(0, 8, 1.0, 0.0, 0.0, &points, 1.5, 1).unwrap_err();
+        assert!(error.contains("geometría vacía"), "{error}");
+    }
 
     /// La rejilla espacial del builder IDW debe dar EXACTAMENTE el mismo
     /// Top-K que el barrido lineal (misma insertion sort, distinto orden de
@@ -1892,7 +2076,7 @@ mod drizzle_tests {
                 size: 32,
             })
             .collect();
-        let grid = ApSpatialGrid::build(&points);
+        let grid = ApSpatialGrid::build(&points).unwrap();
 
         for q in 0..500 {
             let px = rnd() * 700.0 - 30.0;
@@ -1907,13 +2091,14 @@ mod drizzle_tests {
                 let dx = px - p.x;
                 let dy = py - p.y;
                 let d2 = dx * dx + dy * dy;
-                if d2 < want[k - 1].0 {
+                let candidate = (d2, i as u16);
+                if idw_neighbor_before(candidate, want[k - 1]) {
                     let mut ins = k - 1;
-                    while ins > 0 && d2 < want[ins - 1].0 {
+                    while ins > 0 && idw_neighbor_before(candidate, want[ins - 1]) {
                         want[ins] = want[ins - 1];
                         ins -= 1;
                     }
-                    want[ins] = (d2, i as u16);
+                    want[ins] = candidate;
                 }
             }
             for j in 0..k {
@@ -1929,6 +2114,28 @@ mod drizzle_tests {
         }
     }
 
+    #[test]
+    fn idw_spatial_grid_ties_match_linear_index_order() {
+        // >96 activa la rejilla. Los primeros cuatro AP son perfectamente
+        // simétricos respecto al query; los restantes están lejos y fuerzan
+        // un recorrido de varias celdas en un orden distinto al de sus índices.
+        let mut points = vec![
+            ApPoint { x: 90.0, y: 100.0, size: 32 },
+            ApPoint { x: 110.0, y: 100.0, size: 32 },
+            ApPoint { x: 100.0, y: 90.0, size: 32 },
+            ApPoint { x: 100.0, y: 110.0, size: 32 },
+        ];
+        points.extend((0..100).map(|index| ApPoint {
+            x: 300.0 + (index % 10) as f32 * 20.0,
+            y: 300.0 + (index / 10) as f32 * 20.0,
+            size: 32,
+        }));
+        let grid = ApSpatialGrid::build(&points).unwrap();
+        let mut got = [(f32::MAX, 0u16); 8];
+        grid.top_k_into(100.0, 100.0, 4, &mut got, &points);
+        assert_eq!(got[..4].iter().map(|entry| entry.1).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+    }
+
     /// Campo constante → cada pixel de salida cubierto debe devolver EXACTAMENTE
     /// el valor del campo (la normalización sum/sum_w conserva la media local).
     #[test]
@@ -1941,8 +2148,25 @@ mod drizzle_tests {
         let mut acc_w = vec![0.0f32; w_out * h_out];
 
         accumulate_frame_liquid_mono(
-            &mut acc, &mut acc_w, &mono, w_in, h_in, w_out, h_out, drizzle,
-            0.0, 0.0, 0.0, 0.0, &[], &[], &[], &[], &[], 1.0, 0.75,
+            &mut acc,
+            &mut acc_w,
+            &mono,
+            w_in,
+            h_in,
+            w_out,
+            h_out,
+            drizzle,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            1.0,
+            0.75,
         );
 
         let mut covered = 0usize;
@@ -1990,9 +2214,15 @@ mod drizzle_tests {
         // patron desplazado -d_k (convencion del acumulador: la fuente se
         // muestrea en sx = ref + global_dx, y source(sx) = ref(sx - d_k)).
         let offsets: [(f32, f32); 9] = [
-            (0.0, 0.0), (1.0 / 3.0, 0.0), (2.0 / 3.0, 0.0),
-            (0.0, 1.0 / 3.0), (1.0 / 3.0, 1.0 / 3.0), (2.0 / 3.0, 1.0 / 3.0),
-            (0.0, 2.0 / 3.0), (1.0 / 3.0, 2.0 / 3.0), (2.0 / 3.0, 2.0 / 3.0),
+            (0.0, 0.0),
+            (1.0 / 3.0, 0.0),
+            (2.0 / 3.0, 0.0),
+            (0.0, 1.0 / 3.0),
+            (1.0 / 3.0, 1.0 / 3.0),
+            (2.0 / 3.0, 1.0 / 3.0),
+            (0.0, 2.0 / 3.0),
+            (1.0 / 3.0, 2.0 / 3.0),
+            (2.0 / 3.0, 2.0 / 3.0),
         ];
         let render_frame = |dx: f32, dy: f32| -> Vec<u16> {
             let mut buf = vec![0u16; w_in * h_in];
@@ -2022,8 +2252,25 @@ mod drizzle_tests {
         for &(dx, dy) in &offsets {
             let frame = render_frame(dx, dy);
             accumulate_frame_liquid_mono(
-                &mut acc, &mut acc_w, &frame, w_in, h_in, w_out, h_out, drizzle,
-                0.0, 0.0, dx, dy, &[], &[], &[], &[], &[], 1.0, 0.75,
+                &mut acc,
+                &mut acc_w,
+                &frame,
+                w_in,
+                h_in,
+                w_out,
+                h_out,
+                drizzle,
+                0.0,
+                0.0,
+                dx,
+                dy,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                1.0,
+                0.75,
             );
             for yo in 0..h_out {
                 for xo in 0..w_out {
@@ -2189,6 +2436,67 @@ mod simd_validation_neon {
             }
         }
         eprintln!("NEON RGB validado en {checked} casos. max_diff={max_diff_sum}");
-        assert!(max_diff_sum < 0.5, "sumas difieren demasiado: {max_diff_sum}");
+        assert!(
+            max_diff_sum < 0.5,
+            "sumas difieren demasiado: {max_diff_sum}"
+        );
+    }
+
+    /// Benchmark manual reproducible del caso reportado (19.5 Mpx RGB).
+    /// Ejecutar dos procesos separados para comparar el mismo binario:
+    /// `ZAS_CPU_WARP_THREADS=1 cargo test --release benchmark_surface_rgb_3312x5888 -- --ignored --nocapture`
+    /// y luego sin el override. Se ignora en CI por su pico aproximado de
+    /// 430 MiB; no incluye debayer/alineación, sólo el hot path warp Lanczos.
+    #[test]
+    #[ignore = "benchmark manual de 19.5 Mpx / ~430 MiB"]
+    fn benchmark_surface_rgb_3312x5888() {
+        let (w, h) = (3312usize, 5888usize);
+        let n = w * h;
+        let mut rgb = vec![0u16; n * 3];
+        for (i, pixel) in rgb.chunks_exact_mut(3).enumerate() {
+            let base = ((i as u64 * 1103 + (i / w) as u64 * 7919) & 0xffff) as u16;
+            pixel[0] = base;
+            pixel[1] = base.wrapping_add(733);
+            pixel[2] = base.wrapping_add(1901);
+        }
+        let mut r = vec![0.0f32; n];
+        let mut g = vec![0.0f32; n];
+        let mut b = vec![0.0f32; n];
+        let mut weights = vec![0.0f32; n];
+        let started = std::time::Instant::now();
+        accumulate_frame_liquid(
+            &mut r,
+            &mut g,
+            &mut b,
+            &mut weights,
+            &rgb,
+            w,
+            h,
+            w,
+            h,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            1.0,
+            1.0,
+        );
+        let elapsed = started.elapsed().as_secs_f64();
+        let checksum = r[n / 3] as f64 + g[n / 2] as f64 + b[n * 2 / 3] as f64;
+        eprintln!(
+            "warp RGB 3312x5888: {:.3}s, {:.2} Mpx/s, {:.2} fps, threads={}, checksum={checksum:.1}",
+            elapsed,
+            n as f64 / elapsed / 1.0e6,
+            1.0 / elapsed,
+            std::env::var("ZAS_CPU_WARP_THREADS").unwrap_or_else(|_| "auto".into()),
+        );
+        assert!(checksum.is_finite() && checksum > 0.0);
     }
 }

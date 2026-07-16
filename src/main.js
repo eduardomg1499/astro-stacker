@@ -1227,6 +1227,7 @@ window.currentFilePath = "";
 window.setCurrentFilePath = (path = "") => {
     currentFilePath = path || "";
     window.currentFilePath = currentFilePath;
+    updateBayerOverrideAvailability(currentFilePath);
 };
 window.getCurrentFilePath = () => currentFilePath;
 window.setMosaicViewportMode = (active = false) => {
@@ -1343,16 +1344,13 @@ const ZENITH_ULTIMATE_VALUE = "zenith_ultimate";
 const ZENITH_ULTIMATE_NAME = "Zenith Presicion Ultimate";
 
 function normalizeZenithCategory(category) {
-    // PARKED (2026-06-28): la categoría "Planeta / Fase Lunar" queda oculta y
-    // TODO se enruta al motor de Superficie. Prueba empírica del usuario:
-    // Superficie apila perfecto planetas, Luna y superficies (mono y RGB),
-    // mientras el camino planetario seguía produciendo apilados oscuros y
-    // borrosos en discos grandes pese a múltiples correcciones. El código
-    // planetario del backend sigue intacto (dormido) para una futura fase de
-    // depuración; para reactivarlo, restaurar esta función a:
-    //   return category === "planet_large" ? "planet_small" : (category || "surface");
-    // y quitar el atributo hidden de las opciones planet_small en index.html.
-    const _ = category; // firma intacta para todos los call sites
+    // Contrato canónico de categorías. `planet_large` existió en versiones
+    // anteriores como alias de Planeta/Fase Lunar; normalizarlo evita que una
+    // preferencia guardada seleccione un perfil distinto entre single y batch.
+    const key = String(category || "surface").trim().toLowerCase();
+    if (["planet_small", "planet_large", "planet", "planetary", "lunar_phase", "moon_phase"].includes(key)) {
+        return "planet_small";
+    }
     return "surface";
 }
 
@@ -1360,9 +1358,55 @@ function getSelectedTargetCategory() {
     return normalizeZenithCategory(document.getElementById("sel-target-category")?.value || "surface");
 }
 
-function getBayerOverrideValue() {
-    const value = document.getElementById("sel-bayer-override")?.value || "auto";
-    return value === "auto" ? null : parseInt(value);
+const BAYER_OVERRIDE_VALUES = new Set([0, 8, 9, 10, 11]);
+const DEMOSAICED_VIDEO_EXTENSIONS = new Set(["mp4", "mov", "mkv", "m4v", "wmv", "flv", "mts", "m2ts"]);
+
+function pathExtension(path) {
+    const clean = String(path || "").split(/[?#]/, 1)[0];
+    const dot = clean.lastIndexOf(".");
+    return dot >= 0 ? clean.slice(dot + 1).toLowerCase() : "";
+}
+
+function canOverrideBayerForPath(path = currentFilePath) {
+    // Los contenedores comprimidos comunes entregan RGB/YUV ya demosaiced.
+    // AVI queda permitido porque muchas cámaras planetarias guardan CFA/mono
+    // RAW dentro de AVI; SER/FITS son las rutas RAW preferidas.
+    return !DEMOSAICED_VIDEO_EXTENSIONS.has(pathExtension(path));
+}
+
+function updateBayerOverrideAvailability(path = currentFilePath) {
+    const selector = document.getElementById("sel-bayer-override");
+    const hint = document.getElementById("bayer-override-hint");
+    if (!selector) return true;
+
+    const allowed = canOverrideBayerForPath(path);
+    selector.disabled = !allowed;
+    selector.title = allowed
+        ? "Usar solo si conoces el patrón CFA RAW de la cámara."
+        : "No disponible: este contenedor entrega color RGB/YUV ya demosaiced.";
+    if (!allowed && selector.value !== "auto") selector.value = "auto";
+    if (hint) {
+        hint.textContent = allowed
+            ? "Solo para CFA/mono RAW (SER, AVI RAW o FITS). Automático es la opción segura."
+            : "MP4/MOV/H.26x ya contiene RGB/YUV demosaiced: se usará detección automática.";
+        hint.style.color = allowed ? "#94a3b8" : "#fbbf24";
+    }
+    return allowed;
+}
+
+function getBayerOverrideValue(path = currentFilePath) {
+    const selector = document.getElementById("sel-bayer-override");
+    const value = selector?.value || "auto";
+    if (value === "auto") return null;
+
+    const parsed = Number.parseInt(value, 10);
+    if (!BAYER_OVERRIDE_VALUES.has(parsed) || !canOverrideBayerForPath(path)) {
+        if (selector) selector.value = "auto";
+        updateBayerOverrideAvailability(path);
+        log("WARN", "Override Bayer ignorado: el archivo no es CFA RAW compatible. Se usará detección automática.");
+        return null;
+    }
+    return parsed;
 }
 
 function getAnalysisModeValue(flow) {
@@ -1473,7 +1517,7 @@ function applySuggestedTargetCategory(suggestedTarget) {
 
     const flow = getZenithUltimateFlow(category);
     currentAnalysisMode = flow.analysisMode;
-    log("INFO", `Objetivo detectado: ${category === "planet_small" ? "Planeta / Fase Lunar" : "General (Planetas / Superficies)"}.`);
+    log("INFO", `Objetivo detectado: ${category === "planet_small" ? "Disco planetario / fase lunar" : "Superficie solar / lunar"}.`);
 }
 
 // Estado del Reproductor de Animacion
@@ -3387,12 +3431,11 @@ linkTintControl("#sl-anim-tint-b", "#num-anim-tint-b", "b");
         showProcessing(tr("animation.normalize_processing", "NORMALIZANDO BRILLO..."));
 
         try {
-            // ASSET PROTOCOL: el backend sobrescribe los archivos y devuelve sus
-            // RUTAS (ya no base64 — retener todos los frames en base64 era el
-            // pico de RAM del WebView). Bump del cache-buster: mismo path,
-            // contenido nuevo en disco.
+            // El backend publica copias PNG no destructivas y devuelve rutas
+            // (no base64, para no retener toda la secuencia en el WebView).
             const normalizedPaths = await invoke("normalize_batch_brightness", { paths: batchResultPaths });
             if (normalizedPaths && normalizedPaths.length > 0) {
+                batchResultPaths = normalizedPaths;
                 animAssetVersion = Date.now();
                 batchGeneratedImages = normalizedPaths;
                 refreshAnimationFromFullFrames(batchGeneratedImages, true);
@@ -4919,6 +4962,7 @@ function resetDataAcquisitionUI() {
     if (ui.apCount) ui.apCount.textContent = "0";
     isBatchMode = false;
     if (ui.selBayerOverride) ui.selBayerOverride.value = "auto";
+    updateBayerOverrideAvailability("");
     if (ui.statusText) ui.statusText.textContent = "Esperando accion.";
 
     // Reset Transforms
@@ -5914,6 +5958,7 @@ if (ui.btnBatchTune) {
     ui.btnBatchTune.addEventListener("click", async () => {
         if (batchFiles.length === 0) return;
         currentFilePath = batchFiles[0];
+        updateBayerOverrideAvailability(currentFilePath);
 
         // Hide batch control during calibration
         if (ui.panelBatch) ui.panelBatch.style.display = "none";
@@ -6017,10 +6062,15 @@ if (ui.btnBatchRun) {
         ui.btnBatchRun.disabled = true;
         ui.btnBatchTune.disabled = true;
         setBatchModeUI(true);
+        // Nueva sesión de lote. El backend se rearma una sola vez abajo;
+        // ninguna entrada individual puede borrar una cancelación posterior.
+        isCancellationRequested = false;
         const btnBatchCancel = document.getElementById("btn-batch-cancel");
         if (btnBatchCancel) {
-            btnBatchCancel.style.display = "block";
-            btnBatchCancel.disabled = false;
+            // No permitir cancelar durante el reset de sesión: dos invokes
+            // concurrentes (clear/cancel) no tienen un orden garantizado.
+            btnBatchCancel.style.display = "none";
+            btnBatchCancel.disabled = true;
         }
 
         try {
@@ -6032,7 +6082,11 @@ if (ui.btnBatchRun) {
             const align = batchFlow.alignMode;
 
             // Reset the shared batch anchor once, then keep it alive for all entries.
-            await invoke("clear_app_memory").catch(() => {});
+            await invoke("clear_app_memory");
+            if (btnBatchCancel) {
+                btnBatchCancel.style.display = "block";
+                btnBatchCancel.disabled = false;
+            }
 
             // Obtener la categoría del objetivo desde el nuevo selector o un default seguro
             const actualBatchMode = batchFlow.batchMode;
@@ -6064,7 +6118,7 @@ if (ui.btnBatchRun) {
                 }, `[Batch ${displayIdx}/${batchFiles.length}] Procesando: ${fileName}...`));
 
                 try {
-                    const bOverride = getBayerOverrideValue();
+                    const bOverride = getBayerOverrideValue(file);
                     const result = await invoke("process_batch_entry", {
                         filePath: file,
                         outputFolder: batchOutputFolder,
@@ -6112,7 +6166,7 @@ if (ui.btnBatchRun) {
                         sharpenIntensity: parseFloat(ui.selSharpenIntensity?.value || "0.5"),
                         doublePass: document.getElementById("chk-double-pass").checked,
                         warpingAnalysis: batchFlow.warpingAnalysis,
-                        normalizeColors: document.getElementById("chk-normalize-colors") ? document.getElementById("chk-normalize-colors").checked : true,
+                        normalizeColors: document.getElementById("chk-normalize-colors")?.checked || false,
                         isV3: batchFlow.isV3,
                         apGridSize: batchFlow.apSize,
                         apThreshold: batchFlow.apThreshold,
@@ -6187,8 +6241,12 @@ if (ui.btnBatchRun) {
             setBatchModeUI(false);
             ui.btnBatchRun.disabled = false;
             ui.btnBatchTune.disabled = false;
+            isCancellationRequested = false;
             const btnBatchCancelEnd = document.getElementById("btn-batch-cancel");
-            if (btnBatchCancelEnd) btnBatchCancelEnd.style.display = "none";
+            if (btnBatchCancelEnd) {
+                btnBatchCancelEnd.style.display = "none";
+                btnBatchCancelEnd.disabled = true;
+            }
         }
     });
 }
@@ -6247,6 +6305,7 @@ if (ui.btnAnalyze) {
         // CLEANUP (Keep file reference, but clean UI)
         resetDataAcquisitionUI();
         currentFilePath = file.path || file;
+        updateBayerOverrideAvailability(currentFilePath);
         // Nuevo archivo ⇒ el análisis anterior ya no es válido: bloquear Apilar
         // hasta que el nuevo análisis termine (evita errores de usuario).
         currentFileMetadata = null;
@@ -6363,6 +6422,7 @@ if (btnAnalyzeFits) {
         // CLEANUP (Keep file reference, but clean UI)
         resetDataAcquisitionUI();
         currentFilePath = folder;
+        updateBayerOverrideAvailability(currentFilePath);
 
         const modeChoice = await showCustomChoice(
             "Modo de Analisis (FITS)",
@@ -6565,7 +6625,9 @@ if (ui.btnRunAnalysis) {
                 const chkNorm = document.getElementById("chk-normalize-colors");
                 if (chkNorm) {
                     chkNorm.disabled = !res.metadata.is_color;
-                    chkNorm.checked = !!res.metadata.is_color;
+                    // El balance automático altera la fotometría/color físico:
+                    // es opt-in. En mono se apaga porque no tiene significado.
+                    if (!res.metadata.is_color) chkNorm.checked = false;
                 }
 
                 const shouldAdvanceAfterAnalysis =
@@ -6676,6 +6738,18 @@ function resetWorkflowForSettingsChange() {
     const el = document.querySelector(selector);
     if (el) {
         el.addEventListener("change", () => {
+            if (selector === "#sel-bayer-override") {
+                const requested = el.value;
+                if (requested !== "auto" && !canOverrideBayerForPath(currentFilePath)) {
+                    el.value = "auto";
+                    updateBayerOverrideAvailability(currentFilePath);
+                    showCustomAlert(
+                        tr("general.warning", "Aviso"),
+                        "El override Bayer solo es válido para CFA/mono RAW. MP4, MOV y codecs de vídeo comunes ya contienen RGB/YUV demosaiced; se usará Automático."
+                    );
+                    return;
+                }
+            }
             // Special case: sel-quality-method might already be synced via other logic, 
             // but we ensure workflow reset here.
             if (selector === "#sel-batch-target-category") {
@@ -7024,7 +7098,7 @@ if (ui.btnStack) {
                         warpingAnalysis, // NEW
                         anchorOverride: getManualAnchorOverrideValue(),
                         stackingRoi: getStackingRoiOverrideValue(),
-                        normalizeColors: document.getElementById("chk-normalize-colors") ? document.getElementById("chk-normalize-colors").checked : true,
+                        normalizeColors: document.getElementById("chk-normalize-colors")?.checked || false,
                         isV3: flow.isV3 || (alignModeStr === "liquid_v3") || (alignModeStr === "zenith_v3"), // V3 flag for all these modes
                         keepFullFrame: document.getElementById("chk-keep-full-frame") ? document.getElementById("chk-keep-full-frame").checked : false,
                         targetType: flow.category,
@@ -7048,7 +7122,7 @@ if (ui.btnStack) {
                         warpingAnalysis, // NEW
                         anchorOverride: getManualAnchorOverrideValue(),
                         stackingRoi: getStackingRoiOverrideValue(),
-                        normalizeColors: document.getElementById("chk-normalize-colors") ? document.getElementById("chk-normalize-colors").checked : true,
+                        normalizeColors: document.getElementById("chk-normalize-colors")?.checked || false,
                         isV3: flow.isV3 || (alignModeStr === "zenith_v3"), // NEW FLAG
                         keepFullFrame: document.getElementById("chk-keep-full-frame") ? document.getElementById("chk-keep-full-frame").checked : false,
                         targetType: flow.category,
@@ -8021,6 +8095,9 @@ window.drawGrid = function (points, imgW, imgH) {
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
 
+    const getX = (p) => (typeof p.x !== 'undefined') ? p.x : p[0];
+    const getY = (p) => (typeof p.y !== 'undefined') ? p.y : p[1];
+
     // 1. MESH CONNECTIONS (The Energy Net)
     if (points.length > 0) {
         // Handle size from object or array
@@ -8040,27 +8117,43 @@ window.drawGrid = function (points, imgW, imgH) {
         ctx.shadowBlur = 15;
         ctx.shadowColor = "rgba(0, 100, 255, 0.8)";
 
-        // Performance Limit
+        // Performance limit. La implementación anterior comparaba cada punto
+        // con todos los siguientes (O(N²)); una malla de 4 000 AP hacía casi
+        // ocho millones de comparaciones en el hilo de la UI y parecía que la
+        // generación seguía bloqueada. Una rejilla espacial conserva
+        // exactamente las mismas aristas dentro de connectDist en O(N·k).
         if (points.length < 5000) {
+            const cellSize = Math.max(1, connectDist);
+            const buckets = new Map();
+            const bucketKey = (cx, cy) => `${cx},${cy}`;
             for (let i = 0; i < points.length; i++) {
-                const p1 = points[i];
-                const x1 = (typeof p1.x !== 'undefined') ? p1.x : p1[0];
-                const y1 = (typeof p1.y !== 'undefined') ? p1.y : p1[1];
-
-                // Check forward only
-                for (let j = i + 1; j < points.length; j++) {
-                    const p2 = points[j];
-                    const x2 = (typeof p2.x !== 'undefined') ? p2.x : p2[0];
-                    const y2 = (typeof p2.y !== 'undefined') ? p2.y : p2[1];
-
-                    const dx = x1 - x2;
-                    const dy = y1 - y2;
-
-                    if (Math.abs(dx) > connectDist || Math.abs(dy) > connectDist) continue;
-
-                    if ((dx * dx + dy * dy) < connectDistSq) {
-                        ctx.moveTo(x1, y1);
-                        ctx.lineTo(x2, y2);
+                const cx = Math.floor(getX(points[i]) / cellSize);
+                const cy = Math.floor(getY(points[i]) / cellSize);
+                const key = bucketKey(cx, cy);
+                const bucket = buckets.get(key);
+                if (bucket) bucket.push(i);
+                else buckets.set(key, [i]);
+            }
+            for (let i = 0; i < points.length; i++) {
+                const x1 = getX(points[i]);
+                const y1 = getY(points[i]);
+                const cx = Math.floor(x1 / cellSize);
+                const cy = Math.floor(y1 / cellSize);
+                for (let by = cy - 1; by <= cy + 1; by++) {
+                    for (let bx = cx - 1; bx <= cx + 1; bx++) {
+                        const bucket = buckets.get(bucketKey(bx, by));
+                        if (!bucket) continue;
+                        for (const j of bucket) {
+                            if (j <= i) continue;
+                            const x2 = getX(points[j]);
+                            const y2 = getY(points[j]);
+                            const dx = x1 - x2;
+                            const dy = y1 - y2;
+                            if ((dx * dx + dy * dy) < connectDistSq) {
+                                ctx.moveTo(x1, y1);
+                                ctx.lineTo(x2, y2);
+                            }
+                        }
                     }
                 }
             }
@@ -8075,10 +8168,6 @@ window.drawGrid = function (points, imgW, imgH) {
     ctx.shadowBlur = 8;
     ctx.shadowColor = "#00ffff"; // Cyan Glow
     ctx.fillStyle = "rgba(0, 180, 255, 0.6)";
-
-    // Helper to get coords
-    const getX = (p) => (typeof p.x !== 'undefined') ? p.x : p[0];
-    const getY = (p) => (typeof p.y !== 'undefined') ? p.y : p[1];
 
     ctx.beginPath();
     // 2. NODES (The Data Points)
@@ -9009,12 +9098,15 @@ function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
         computePolicy: value("sel-ds-compute", "hybrid"),
         profile,
         rejection,
-        ...(dsMethod === "nebula_fusion" || dsMethod === "nebula_fusion_full"
+        ...(dsMethod === "nebula_fusion" || dsMethod === "nebula_fusion_full" || dsMethod === "nebula_fusion_struct"
             ? {
                 integrationMethod: {
                     method: "nebula_fusion",
-                    // F6: el modo Full recombina por frecuencia con PSF objetivo.
-                    mode: dsMethod === "nebula_fusion_full" ? "full" : "lite",
+                    // F6: Full recombina por frecuencia; F7: +STRUCT valida
+                    // las estructuras por mitades (requiere >=16 tomas).
+                    mode: dsMethod === "nebula_fusion_struct"
+                        ? "fullWithStruct"
+                        : dsMethod === "nebula_fusion_full" ? "full" : "lite",
                     // F4: CFA directo y super-binning de salida (solo viajan con
                     // NebulaFusion; el preflight valida cfaDirect sin lights CFA
                     // y Full+cfaDirect).
@@ -10249,7 +10341,9 @@ function dsShowStretchBar() {
             <option value="background_model">${tr("deepsky.view_background_model", "Modelo de fondo (CL)")}</option>
             <option value="variance">${tr("deepsky.view_variance", "Varianza (NF)")}</option>
             <option value="neff">${tr("deepsky.view_neff", "NEFF — tomas efectivas (NF)")}</option>
-            <option value="dq">${tr("deepsky.view_dq", "Calidad de datos DQ (NF)")}</option>`;
+            <option value="dq">${tr("deepsky.view_dq", "Calidad de datos DQ (NF)")}</option>
+            <option value="struct">${tr("deepsky.view_struct", "STRUCT (evidencia A/B)")}</option>
+            <option value="struct_residual">${tr("deepsky.view_struct_residual", "Residual de STRUCT")}</option>`;
         view.addEventListener("change", () => dsShowResultView(view.value));
         const modes = [
             { m: "linked", label: tr("deepsky.stf_auto", "Auto (color)") },
@@ -10598,7 +10692,9 @@ function dsLoadUxFixtureIfRequested(modal) {
     const dsMethodSel = document.getElementById("sel-ds-method");
     const dsSyncNebulaFusionControls = () => {
         const nfActive =
-            dsMethodSel?.value === "nebula_fusion" || dsMethodSel?.value === "nebula_fusion_full";
+            dsMethodSel?.value === "nebula_fusion" ||
+            dsMethodSel?.value === "nebula_fusion_full" ||
+            dsMethodSel?.value === "nebula_fusion_struct";
         [["chk-ds-cfadirect", "lbl-ds-cfadirect"], ["sel-ds-outputbin", "lbl-ds-outputbin"]].forEach(([inputId, labelId]) => {
             const input = document.getElementById(inputId);
             if (input) input.disabled = !nfActive;
@@ -11287,17 +11383,26 @@ is commented out in index.html and this handler remains commented for reference.
 
     const profileCard = (preflight, profile, title, tag, desc, toneClass) => {
         const estimate = estimateForProfile(preflight, profile);
+        const isSupported = estimate.supported !== false;
         const isRecommended = Boolean(estimate.recommended);
         const bitDepth = estimate.bit_depth || "-";
-        const colorMode = estimate.is_color ? "RGB" : "Mono";
+        const colorMode = estimate.color_label || (estimate.is_color ? "RGB" : "Mono");
         const size = formatBytes(estimate.estimated_size_bytes);
         const perFrame = formatBytes(estimate.bytes_per_frame);
-        const badge = isRecommended
+        const badge = !isSupported
+            ? `<span class="ser-profile-badge">${tr("converter.unsupported_badge", "No compatible")}</span>`
+            : isRecommended
             ? `<span class="ser-profile-badge">${tr("converter.recommended_badge", "Recomendado")}</span>`
             : "";
+        const reason = !isSupported && estimate.reason
+            ? `<span class="ser-profile-desc" style="color:#fbbf24;">${escapeHtml(estimate.reason)}</span>`
+            : "";
+        const action = isSupported
+            ? `data-modal-result="${profile}"`
+            : `disabled aria-disabled="true" style="opacity:.52; cursor:not-allowed;"`;
 
         return `
-            <button class="ser-profile-card ${toneClass}" data-modal-result="${profile}">
+            <button class="ser-profile-card ${toneClass}" ${action}>
                 <span class="ser-profile-card-top">
                     <span>
                         <strong>${title}</strong>
@@ -11306,6 +11411,7 @@ is commented out in index.html and this handler remains commented for reference.
                     ${badge}
                 </span>
                 <span class="ser-profile-desc">${desc}</span>
+                ${reason}
                 <span class="ser-profile-metrics">
                     <span><b>${tr("converter.estimate_label", "SER estimado")}</b>${size}</span>
                     <span><b>${tr("converter.report_depth", "Profundidad")}</b>${colorMode} ${bitDepth}-bit</span>
@@ -11316,7 +11422,7 @@ is commented out in index.html and this handler remains commented for reference.
     };
 
     async function chooseSerConversionProfile(preflight) {
-        const sourceType = preflight?.source_is_color ? "Color" : "Mono";
+        const sourceType = preflight?.source_color_pattern || (preflight?.source_is_color ? "Color" : "Mono");
         const html = `
             <div class="ser-converter-modal">
                 <div class="ser-converter-layout">
@@ -11347,6 +11453,7 @@ is commented out in index.html and this handler remains commented for reference.
                             ${tr("converter.profile_intro", "Elige cómo crear el SER de trabajo. Para MP4/MOV el video se decodifica a frames útiles para apilado; no se aplica sharpening ni filtros destructivos.")}
                         </p>
                         <p class="ser-profile-note">${tr("converter.size_note", "SER no usa compresión: por eso el tamaño final puede ser mucho mayor que el video original.")}</p>
+                        <p class="ser-profile-note">${escapeHtml(preflight?.conversion_policy || "")}</p>
                     </div>
                     <div class="ser-profile-grid">
                         ${profileCard(
@@ -11430,7 +11537,6 @@ is commented out in index.html and this handler remains commented for reference.
             cancelBtn = document.getElementById("btn-cancel-process");
             if (cancelBtn) {
                 previousCancelDisplay = cancelBtn.style.display;
-                cancelBtn.style.display = "none";
             }
 
             // Setup Progress Listener
@@ -11542,9 +11648,13 @@ is commented out in index.html and this handler remains commented for reference.
 
         } catch (e) {
             const errStr = typeof e === 'string' ? e : JSON.stringify(e);
-            log("ERROR", "Convert: " + errStr);
-            console.error(e);
-            showCustomAlert(tr("converter.error_title", "Error de conversión"), errStr);
+            if (isCancellationError(errStr)) {
+                log("WARN", tr("converter.cancelled", "Conversión SER cancelada; no se publicó ningún archivo parcial."));
+            } else {
+                log("ERROR", "Convert: " + errStr);
+                console.error(e);
+                showCustomAlert(tr("converter.error_title", "Error de conversión"), errStr);
+            }
         } finally {
             if (unlisten) unlisten();
             hideProcessing();

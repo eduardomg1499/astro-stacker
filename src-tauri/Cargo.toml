@@ -31,6 +31,7 @@ tauri-plugin-fs = "2"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2.9.0"
 tauri-plugin-shell = "2"
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rayon = "1.10"
@@ -58,6 +59,7 @@ rand = "0.8"
 akaze = { git = "https://github.com/rust-cv/akaze" }
 num_cpus = "1.16.0"
 crossbeam-channel = "0.5"
+crc32fast = "1.4"
 fitrs = "0.5.0"
 lz4_flex = "0.11.1"
 # GPU COMPUTE (etapa de acumulacion del apilado): wgpu = Metal en macOS,

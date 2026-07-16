@@ -462,12 +462,12 @@
     "mode_label": "Calidad / Tipo de Análisis",
     "targets": {
       "title": "Categoría de Objetivo",
-      "surface": "General (Planetas / Superficies)",
-      "surface_desc": "Planetas, Luna, Sol y superficies — motor universal de apilado.",
-      "planet_large": "Planeta / Fase Lunar",
-      "planet_large_desc": "Alias heredado del flujo planetario universal.",
-      "planet_small": "Planeta / Fase Lunar",
-      "planet_small_desc": "Jupiter, Saturno, Marte, Venus, lunas y transitos con AP local."
+      "surface": "Superficie solar / lunar",
+      "surface_desc": "Primeros planos, mosaicos y discos solar/lunar dominados por textura.",
+      "planet_large": "Disco planetario / fase lunar",
+      "planet_large_desc": "Disco grande con alineación local adaptativa.",
+      "planet_small": "Disco planetario / fase lunar",
+      "planet_small_desc": "Planeta completo, Luna completa o por fases, lunas y tránsitos."
     },
     "modes": {
       "zenith_ultimate": "Zenith Presicion Ultimate",
@@ -1016,6 +1016,9 @@
     "method_classic": "Clásico (κσ/Winsorized)",
     "method_nebula_fusion": "NebulaFusion Lite (beta)",
     "method_nebula_fusion_full": "NebulaFusion Full (beta)",
+    "method_nebula_fusion_struct": "NebulaFusion Full + STRUCT (beta)",
+    "view_struct": "STRUCT",
+    "view_struct_residual": "STRUCT residual",
     "method_eidr": "EIDR super-res (próximamente)",
     "method_hint_nf": "NebulaFusion: media ponderada por el ruido de cada toma + máscaras de rechazo congeladas + mapas científicos VAR/NEFF/DQ junto al máster.",
     "cfa_direct_label": "Modo CFA directo (sin debayer)",

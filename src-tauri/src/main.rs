@@ -19,10 +19,12 @@ mod deepsky_masks; // F3: máscaras de outlier congeladas por cross-fit
 mod deepsky_psf; // F5: PSF Moffat elíptica + campo espacial con holdout
 mod deepsky_variance; // contrato lineal F1: VAR/NEFF/DQ (motores científicos)
 mod nebula_fusion; // F3: motor NF-Lite (pesos 1/σ² + máscaras congeladas)
+mod deepsky_struct; // F7: STRUCT — starlet B3 + validación split-half con FDR
 mod nebula_fusion_full; // F6: coadición GLS por frecuencia con PSF objetivo
 #[cfg(any(test, feature = "deepsky-sim"))]
 mod deepsky_sim; // simulador de verdad conocida (solo tests/benchmarks)
 mod benchmark_quality; // métricas de artefactos planetarios (arnés A/B F0)
+mod planetary_quality; // contratos científicos/perf compartidos del stack planetario
 #[cfg(any(test, feature = "planetary-sim"))]
 mod planetary_sim; // simulador planetario de verdad conocida (solo tests/benchmarks)
 mod integral_image;

@@ -158,6 +158,72 @@ fn read_ffmpeg_batch_exact(
     if frame_size == 0 {
         return Err("FrameSource FFmpeg con geometría vacía".into());
     }
+
+    // La referencia robusta pide normalmente 12–20 posiciones dispersas. El
+    // camino anterior recorría desde cero y, aunque sólo conservaba esas
+    // posiciones, FFmpeg convertía/reescalaba/enviaba TODOS los frames previos
+    // como gray16/rgb48. En 4K eso significa cientos de GiB por el pipe. `n`
+    // del filtro select es la posición absoluta de decode, así que conserva la
+    // exactitud con GOP/B-frames/VFR y sólo materializa los cuadros solicitados.
+    let mut selected_indices = indices.to_vec();
+    selected_indices.sort_unstable();
+    selected_indices.dedup();
+    if crate::ffmpeg_exact_frame_select_filter(&selected_indices).is_ok() {
+        let mut stream = crate::FfmpegStreamIterator::new_selected(
+            &reader.path,
+            reader.width,
+            reader.height,
+            region.x,
+            region.y,
+            region.width,
+            region.height,
+            color_id,
+            &reader.ffmpeg_path,
+            None,
+            &reader.codec_name,
+            reader.rotation,
+            &selected_indices,
+        )?;
+        let mut decoded = std::collections::HashMap::with_capacity(selected_indices.len());
+        let mut buffer = vec![0u8; frame_size];
+        for &index in &selected_indices {
+            if !stream.read_frame_into(&mut buffer) {
+                return Err(format!(
+                    "FFmpeg terminó antes de materializar el frame exacto {index}"
+                ));
+            }
+            decoded.insert(index, buffer.clone());
+        }
+        // Mover cada frame al resultado, no clonarlo. En RGB48 3312x5888 una
+        // copia son ~111.6 MiB; el `get().cloned()` anterior duplicaba el top-N
+        // completo justo en el pico de la referencia robusta (hasta 2.23 GiB
+        // extra para 20 frames). Sólo duplicamos si el caller pidió de forma
+        // explícita el mismo índice más de una vez.
+        let mut remaining_uses = std::collections::HashMap::new();
+        for &index in indices {
+            *remaining_uses.entry(index).or_insert(0usize) += 1;
+        }
+        let mut ordered = Vec::with_capacity(indices.len());
+        for &index in indices {
+            let uses = remaining_uses
+                .get_mut(&index)
+                .ok_or_else(|| format!("FFmpeg perdió el contador del frame {index}"))?;
+            let frame = if *uses == 1 {
+                decoded
+                    .remove(&index)
+                    .ok_or_else(|| format!("FFmpeg no entregó el frame exacto {index}"))?
+            } else {
+                decoded
+                    .get(&index)
+                    .cloned()
+                    .ok_or_else(|| format!("FFmpeg no entregó el frame exacto {index}"))?
+            };
+            *uses -= 1;
+            ordered.push(frame);
+        }
+        return Ok(ordered);
+    }
+
     // Esta ruta es el fallback contractual de FrameSource. La selección
     // hardware/CPU cronometrada vive en los coordinadores de análisis/apilado;
     // aquí CPU evita etiquetar `-hwaccel auto` como aceleración confirmada.
@@ -172,7 +238,7 @@ fn read_ffmpeg_batch_exact(
         color_id,
         &reader.ffmpeg_path,
         None,
-        false,
+        None,
         &reader.codec_name,
         reader.rotation,
     )?;
@@ -248,6 +314,7 @@ mod tests {
             width: 64,
             height: 48,
             frame_count: frames,
+            frame_count_exact: true,
             bytes_per_pixel: 2,
             sample_bits: 8,
             color_id: 0,
@@ -292,6 +359,139 @@ mod tests {
 
     #[test]
     #[ignore = "requiere ffmpeg/ffprobe del sistema"]
+    fn ffmpeg_analysis_green_is_bit_exact_to_rgb48_green_channel() {
+        let Some(path) = synthetic_mp4("green-plane", 8, false) else {
+            eprintln!("ffmpeg no disponible; test omitido");
+            return;
+        };
+        let mut rgb = crate::FfmpegStreamIterator::new(
+            &path.to_string_lossy(),
+            64,
+            48,
+            0,
+            0,
+            64,
+            48,
+            100,
+            "ffmpeg",
+            None,
+            None,
+            "h264",
+            0,
+        )
+        .unwrap();
+        let never_cancel: crate::FfmpegCancelCheck = std::sync::Arc::new(|| false);
+        let mut green = crate::FfmpegStreamIterator::new_cancelable_analysis_green(
+            &path.to_string_lossy(),
+            64,
+            48,
+            0,
+            0,
+            64,
+            48,
+            100,
+            "ffmpeg",
+            None,
+            None,
+            "h264",
+            0,
+            never_cancel,
+        )
+        .unwrap();
+        let mut rgb_frame = vec![0u8; 64 * 48 * 6];
+        let mut green_frame = vec![0u8; 64 * 48 * 2];
+        assert!(rgb.read_frame_into(&mut rgb_frame));
+        assert!(green.read_frame_into(&mut green_frame));
+        for (pixel, actual_green) in rgb_frame
+            .chunks_exact(6)
+            .zip(green_frame.chunks_exact(2))
+        {
+            assert_eq!(actual_green, &pixel[2..4]);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[ignore = "requiere ffmpeg/ffprobe del sistema"]
+    fn ffmpeg_cancelable_select_handles_more_than_256_exact_rgb_frames() {
+        let Some(path) = synthetic_mp4("selected-stack", 2056, false) else {
+            eprintln!("ffmpeg no disponible; test omitido");
+            return;
+        };
+        let selected: Vec<usize> = (0..2056).step_by(2).collect();
+        assert_eq!(selected.len(), 1028);
+        let never_cancel: crate::FfmpegCancelCheck = std::sync::Arc::new(|| false);
+        let mut stream = crate::FfmpegStreamIterator::new_cancelable_selected(
+            &path.to_string_lossy(),
+            64,
+            48,
+            0,
+            0,
+            64,
+            48,
+            100,
+            "ffmpeg",
+            None,
+            "h264",
+            0,
+            &selected,
+            never_cancel,
+        )
+        .unwrap();
+        // Contrato de exactitud: comparar los 1028 outputs contra un decode
+        // secuencial del mismo H.264 (incluye B-frames), no sólo comprobar que
+        // FFmpeg produjo la cantidad esperada.
+        let mut sequential = crate::FfmpegStreamIterator::new(
+            &path.to_string_lossy(),
+            64,
+            48,
+            0,
+            0,
+            64,
+            48,
+            100,
+            "ffmpeg",
+            None,
+            None,
+            "h264",
+            0,
+        )
+        .unwrap();
+        let mut selected_frame = vec![0u8; 64 * 48 * 6];
+        let mut sequential_frame = vec![0u8; 64 * 48 * 6];
+        let mut sequential_index = 0usize;
+        let mut first = Vec::new();
+        let mut last = Vec::new();
+        for (position, &expected_index) in selected.iter().enumerate() {
+            while sequential_index <= expected_index {
+                assert!(
+                    sequential.read_frame_into(&mut sequential_frame),
+                    "secuencial terminó en {sequential_index}"
+                );
+                sequential_index += 1;
+            }
+            assert!(
+                stream.read_frame_into(&mut selected_frame),
+                "salida #{position} (índice {expected_index})"
+            );
+            assert_eq!(
+                selected_frame, sequential_frame,
+                "select reasignó o alteró el frame absoluto {expected_index}"
+            );
+            if position == 0 {
+                first.clone_from(&selected_frame);
+            }
+            if position + 1 == selected.len() {
+                last.clone_from(&selected_frame);
+            }
+        }
+        assert!(first.iter().any(|&value| value != 0));
+        assert_ne!(first, last, "testsrc2 debe cambiar entre frames 0 y 2054");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[ignore = "requiere ffmpeg/ffprobe del sistema"]
     fn fragmented_mp4_needs_and_gets_packet_count() {
         let Some(path) = synthetic_mp4("fragmented", 40, true) else {
             eprintln!("ffmpeg no disponible; test omitido");
@@ -327,22 +527,25 @@ mod tests {
 
     #[test]
     #[ignore = "requiere ffmpeg/ffprobe del sistema"]
-    fn ffmpeg_get_frame_never_returns_black_for_reachable_video() {
+    fn ffmpeg_get_frame_is_exact_even_with_wrong_fps_metadata() {
         let Some(path) = synthetic_mp4("ladder", 40, false) else {
             eprintln!("ffmpeg no disponible; test omitido");
             return;
         };
         // fps deliberadamente FALSO (10 en vez de 30): el seek por timestamp
         // estimado del frame 35 (3.5 s) cae más allá del final real (~1.33 s).
-        // Antes: frame NEGRO silencioso. Ahora la escalera A→B→C debe entregar
-        // datos reales (en el peor caso, el frame 0).
+        // Antes: el seek temporal podía devolver negro o un frame cercano.
+        // Ahora el índice se recorre desde cero y debe coincidir byte por byte
+        // con el contrato exacto de UnifiedFrameSource.
         let reader = ffmpeg_reader_for(&path, 40, 10.0);
+        let exact_source = UnifiedFrameSource::from_input(
+            crate::VideoInput::Ffmpeg(reader.clone()),
+            0,
+        );
+        let expected = exact_source.read_batch(&[35], None).unwrap().frames.remove(0);
         let frame = reader.get_frame(35, 0);
         assert_eq!(frame.len(), 64 * 48 * 2);
-        assert!(
-            frame.iter().any(|&b| b != 0),
-            "la escalera de reintentos no debe devolver negro en un vídeo legible"
-        );
+        assert_eq!(frame, expected, "get_frame debe preservar el índice absoluto");
         let _ = std::fs::remove_file(path);
     }
 

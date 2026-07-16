@@ -13,13 +13,16 @@ reproducible and never depends on the current working directory.
    was done but never pretends it can purge the OS cache itself.
 3. In Zenith call `get_benchmark_dataset_matrix` to obtain the exact matrix
    embedded in the executable, then call `validate_benchmark_manifest` before
-   running comparisons. The validator binds every required scenario ID to its
-   declared planetary/deep-sky domain; a copied manifest cannot silently drift
+   running comparisons. Matrix v3 binds every scenario ID, domain, claim
+   threshold and evidence requirement; a copied manifest cannot silently drift
    from `dataset-matrix.json`.
 4. Call `compare_linear_masters` only after output geometry, channels, crop and
    drizzle scale are identical. An incompatible comparison is rejected.
-5. Record the exact engine version, non-empty parameter object, output contract,
-   baseline log and comparator log beside the report. Paths must be absolute.
+5. Record the exact engine identity, vendor, version, distribution, executable,
+   invocation, timing boundary, non-empty parameter object, output contract and
+   logs. Add every file to `evidence.artifacts` with absolute path, byte length
+   and verified SHA-256. A product name in `comparator.engine` is not
+   provenance.
 6. After the linear master and recipe have been written, call
    `finish_benchmark_run` with the exact analysis/stack `jobIds`, output
    contract and non-empty parameters. The command stops the clock at entry,
@@ -28,9 +31,13 @@ reproducible and never depends on the current working directory.
    `zenith-run.json`; `zenithRun` in that record is ready to insert into the
    manifest. Planetary runs normally pass two job IDs, while deep sky passes
    its result/job ID and the exported recipe. Invalid evidence leaves the
-   session active for inspection. Use `abort_benchmark_run` to discard it.
-7. Call `generate_benchmark_report` to calculate medians, the 10% regression
-   guard, quality pass rate and whether a competitive claim is publishable.
+   session active for inspection. Run artifact v2 also returns the hashed
+   output, telemetry, recipe and executable plus canonical configuration hash,
+   ready to merge into `manifest.evidence`. Use `abort_benchmark_run` to
+   discard it.
+7. Call `generate_benchmark_report` to calculate own-CPU speedups, the
+   per-dataset competitor gates, quality limits and whether a competitive claim
+   is publishable.
 8. Instantiate every scenario in `dataset-matrix.json`. The matrix covers SER
    mono/Bayer, H.264/HEVC, surface/small planet, OSC calibration+CFA drizzle,
    mono multisession, gradients, distortion, satellite rejection and the
@@ -38,9 +45,13 @@ reproducible and never depends on the current working directory.
 
 Validation is intentionally strict: every scenario needs cold and warm Zenith
 runs, telemetry v2 with terminal jobs and all required phases, the current
-Zenith CPU baseline and at least one comparable rival. A report generated from
-partial or malformed evidence sets `publishableClaim=false`, and embeds all
-validation errors. A path merely present in JSON is never considered evidence.
+Zenith CPU baseline and at least one comparable rival. Every string listed in
+that scenario's `acceptance` and `requiredEvidence` needs exactly one
+`evidence.requirements` record with `passed=true`, `evaluator=automated`, a
+reproducible method and one or more content-addressed artifacts. A partial,
+manual, failed, unhashed or tampered record sets `publishableClaim=false` and
+is included in validation errors. A path merely present in JSON is never
+considered evidence.
 
 Every suite must include cold-cache and warm-cache timings plus a concrete
 `cachePreparation` description. Publish claims only for the hardware, engine
@@ -52,9 +63,38 @@ background telemetry cannot leak into a run. The legacy
 available for diagnostics, but a benchmark session avoids manually copying its
 elapsed time or telemetry paths.
 
+## Evidence ledger and provenance
+
+`manifest.evidence` has three linked collections:
+
+- `artifacts`: source recordings, outputs, logs, telemetry, recipes, test
+  reports and executables. The validator re-reads each file and verifies both
+  SHA-256 and `sizeBytes`; changing one byte invalidates the suite.
+- `executions`: one `baseline-cpu`, `zenith` or `competitor` record per declared
+  run. It references executable/output/log artifacts and binds the exact
+  `parameters` object through SHA-256 of canonical JSON (sorted keys, UTF-8,
+  no whitespace). `runKey` is `baseline-cpu`,
+  `zenith:<mode>:cold|warm`, or
+  `competitor:<normalized-engine>:<exact-version>`.
+- `requirements`: one automated result for every matrix acceptance and
+  required-evidence ID. Artifact IDs make the result auditable instead of
+  self-certified text.
+
+Planetary datasets require structured AutoStakkert!4 provenance: product,
+vendor, exact version, distribution identity, hashed executable, hashed
+configuration, hashed output/log, invocation and timing method. Merely naming
+AutoStakkert in `engine` cannot satisfy the gate. `manifest.example.json` is
+deliberately incomplete and uses replacement markers; copy the shape, replace
+every marker, and instantiate all matrix scenarios.
+
 `zenithRuns` distinguishes cold and warm cache explicitly. `baselineCpuSeconds`
 is the same dataset on the previous Zenith CPU engine; it is required for the
-2× target and regression guard. Baseline, Zenith and comparator outputs must
+own-CPU targets and regression guard. Matrix v3 defines 2× overall and
+compressed-video targets plus 1.5× for SER, all against Zenith's own CPU
+reference. The global competitor median is informational only: every cold/warm
+run of every dataset must beat the fastest declared competitor by at least the
+matrix ratio (currently 1.05×), so a fast dataset cannot hide a slow one.
+Baseline, Zenith and comparator outputs must
 declare the same geometry, crop, channels and drizzle scale. Deep-sky contracts
 require float32; planetary contracts require uint16. Validation also opens the
 actual FITS/TIFF files and rejects a declaration whose dimensions, channel
@@ -65,7 +105,7 @@ checks `linearFloat32`, source fingerprint, geometry, exact parameters and that
 `optionalAbeScnr=false`. ABE, SCNR, sharpening and stretching belong to optional
 finishing and invalidate a linear-master benchmark.
 
-`zenith-benchmark-report-v3` embeds per-run phase evidence: observed duration,
+`zenith-benchmark-report-v5` embeds per-run phase evidence: observed duration,
 effective engines, throughput, CPU/GPU counters when available, peak RAM/VRAM,
 I/O, cache hits/misses and fallback reasons. Portable `wgpu` does not expose a
 reliable utilization percentage on every backend; in that case GPU use is
@@ -73,11 +113,21 @@ proven by the effective engine, backend and allocated VRAM rather than a made-up
 percentage.
 
 Quality comparison reports registered correlation, FWHM, background noise,
-photometric flux and residual registration. Each cold/warm Zenith run is one
+photometric flux, robust-range-normalized RMSE, fitted scale error, normalized
+offset, residual registration and total registration correction. Matrix v3
+caps these values (3% flux/scale/offset/RMSE, 0.5 px residual and 1.0 px total
+correction with the current policy). Each cold/warm Zenith run is one
 quality case and must pass against every comparator declared for that run. The
 80% aggregate target therefore cannot hide a single competitive regression
 above 3%; CPU/GPU kernel parity remains the stricter RMSE ≤1 ADU16
 (planetary) / ≤0.5 ADU (deep sky) test gate.
+
+Parity and a 1.05× speed ratio are not enough to claim better quality. Each
+planetary scenario also has a binding `quality-superiority` acceptance record.
+Its automated evaluator must link hashed outputs and an independent reference,
+report at least one objective win, zero objective losses, and a Zenith composite
+score strictly above the comparator. Missing those metrics keeps
+`publishableClaim=false` even when every non-regression gate is green.
 
 ## Release verification gate
 
@@ -97,7 +147,9 @@ The normal suite includes
 `complete_synthetic_matrix_exercises_every_report_gate`: it generates small
 deterministic float32 FITS and uint16 TIFF masters, terminal telemetry, a deep
 recipe and a satellite mask, instantiates all required scenarios, serializes
-the manifest and verifies report v3 end to end. This proves that CI exercises
+the manifest and verifies report v5 end to end, including real SHA-256
+recomputation, structured execution provenance and every scenario requirement.
+This proves that CI exercises
 the report machinery; synthetic data still cannot substantiate a claim against
 PixInsight, DSS, Siril or another external engine.
 

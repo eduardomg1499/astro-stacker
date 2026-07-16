@@ -3610,6 +3610,24 @@ fn deepsky_result_view(state: State<'_, AppState>, kind: String) -> Result<Strin
             bg_owned = dq.iter().map(|&b| b as f32).collect();
             &bg_owned
         }
+        // STRUCT/RESIDUAL (F7): desplazados al rango positivo para el colormap.
+        "struct" | "struct_residual" => {
+            let plane_src = if kind == "struct" {
+                result.struct_map.as_ref()
+            } else {
+                result.struct_residual.as_ref()
+            }
+            .ok_or("STRUCT requiere el modo NebulaFusion Full + STRUCT")?;
+            let mut shifted = plane_src.clone();
+            let minv = shifted.iter().copied().fold(f32::INFINITY, f32::min);
+            if minv.is_finite() && minv < 0.0 {
+                for v in shifted.iter_mut() {
+                    *v -= minv;
+                }
+            }
+            bg_owned = shifted;
+            &bg_owned
+        }
         // Modelo de fondo/contaminación lumínica (F2): se ajusta bajo demanda
         // sobre el máster (grado 2 robusto, no destructivo) y se muestra como
         // luma desplazada al rango positivo.
@@ -4113,6 +4131,31 @@ fn deepsky_export_float32(
                     &[
                         ("EXTNAME", format!("'{}'", name.to_uppercase())),
                         ("ZASJOB", format!("'{}'", result.id)),
+                    ],
+                    Some(cancel.as_ref()),
+                )?;
+                diagnostics.push(path.display().to_string());
+            }
+        }
+        // STRUCT/RESIDUAL (F7): planos luma; el header declara que STRUCT es
+        // un mapa de evidencia (soporte seleccionado), no el máster.
+        for (name, plane) in [
+            ("struct", result.struct_map.as_deref()),
+            ("struct_residual", result.struct_residual.as_deref()),
+        ] {
+            if let Some(plane) = plane {
+                cancellation_checkpoint(cancel.as_ref(), "exportación de STRUCT")?;
+                let path = parent.join(format!("{stem}_{name}.fits"));
+                ds_save_float32_fits_cancellable(
+                    &path,
+                    plane,
+                    result.width,
+                    result.height,
+                    1,
+                    &[
+                        ("EXTNAME", format!("'{}'", name.to_uppercase())),
+                        ("ZASJOB", format!("'{}'", result.id)),
+                        ("ZASEVID", "T".to_string()),
                     ],
                     Some(cancel.as_ref()),
                 )?;
@@ -5430,12 +5473,19 @@ fn prepare_deepsky_stack_impl(request: DeepSkyStackRequest, with_advisor: bool) 
     match request.resolved_integration_method() {
         pipeline::DeepSkyIntegrationMethod::Classic(_) => {}
         pipeline::DeepSkyIntegrationMethod::NebulaFusion(nf_cfg) => {
-            if matches!(nf_cfg.mode, pipeline::NebulaFusionMode::FullWithStruct) {
-                errors.push(
-                    "NebulaFusion STRUCT aún no está disponible; usa Lite o Full".into(),
-                );
+            if matches!(nf_cfg.mode, pipeline::NebulaFusionMode::FullWithStruct)
+                && request.lights.len() < 16
+            {
+                errors.push(format!(
+                    "STRUCT requiere al menos 16 tomas (división 8/8 mínima para validar por mitades); hay {}",
+                    request.lights.len()
+                ));
             }
-            if matches!(nf_cfg.mode, pipeline::NebulaFusionMode::Full) && nf_cfg.cfa_direct {
+            if matches!(
+                nf_cfg.mode,
+                pipeline::NebulaFusionMode::Full | pipeline::NebulaFusionMode::FullWithStruct
+            ) && nf_cfg.cfa_direct
+            {
                 errors.push(
                     "NebulaFusion Full requiere la ruta demosaiced en esta fase: desactiva el modo CFA directo".into(),
                 );
@@ -7470,10 +7520,18 @@ async fn stack_deepsky(
                 pipeline::OutputBinning::Bin0_75 => Some((3usize, 4usize)),
                 pipeline::OutputBinning::Bin0_5 => Some((1usize, 2usize)),
             },
-            matches!(cfg.mode, pipeline::NebulaFusionMode::Full),
+            matches!(
+                cfg.mode,
+                pipeline::NebulaFusionMode::Full | pipeline::NebulaFusionMode::FullWithStruct
+            ),
         ),
         _ => (false, None, false),
     };
+    let nf_struct_mode = matches!(
+        &integration_method,
+        Some(pipeline::DeepSkyIntegrationMethod::NebulaFusion(cfg))
+            if matches!(cfg.mode, pipeline::NebulaFusionMode::FullWithStruct)
+    );
     let mut lights_were_cfa = false;
     // Carpeta de trabajo: los cachés multi-GB van al disco que elija el
     // usuario (p.ej. externo) en vez de al temp del sistema.
@@ -8929,6 +8987,8 @@ async fn stack_deepsky(
     let mut nf_products: Option<crate::nebula_fusion::NfLiteProducts> = None;
     let mut nf_full_report: Option<(f32, usize, usize)> = None;
     let mut nf_full_fallback: Option<String> = None;
+    let mut nf_struct: Option<(Vec<f32>, Vec<f32>)> = None;
+    let mut nf_struct_accepted: Option<Vec<(usize, usize)>> = None;
     let (final_data, wgt1, weight_map, rejection_low, rejection_high, rej_pct, mean_cov):
         (Vec<f32>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, f64, f64) = if nf_lite_active {
         // --- Motor NebulaFusion Lite (F3): pesos inverso-varianza + máscaras
@@ -8957,6 +9017,7 @@ async fn stack_deepsky(
             cfa: cfa_drizzle_pattern.filter(|_| nf_cfa_direct),
             full: nf_full_mode,
             stars: &star_catalogs,
+            struct_mode: nf_struct_mode,
         };
         let mut nf_progress = |phase: &str, k: usize, n: usize| {
             emit_progress(
@@ -8966,9 +9027,13 @@ async fn stack_deepsky(
                 None,
             );
         };
-        let out = crate::nebula_fusion::run_lite(&nf_ctx, &load_cached, &mut nf_progress)?;
+        let mut out = crate::nebula_fusion::run_lite(&nf_ctx, &load_cached, &mut nf_progress)?;
         nf_full_report = out.full_report;
         nf_full_fallback = out.full_fallback.clone();
+        if let (Some(sm), Some(sr)) = (out.struct_map.take(), out.struct_residual.take()) {
+            nf_struct = Some((sm, sr));
+        }
+        nf_struct_accepted = out.struct_accepted.take();
         if let Some((fwhm, fb, total)) = out.full_report {
             log_to_front(
                 &app,
@@ -9323,6 +9388,21 @@ async fn stack_deepsky(
             }
         }
     });
+    // STRUCT comparte recorte y binning del máster (planos luma).
+    let nf_struct = nf_struct.map(|(sm, sr)| {
+        (
+            ds_crop_plane(&sm, original_w, original_h, crop_x, crop_y, w_out, h_out),
+            ds_crop_plane(&sr, original_w, original_h, crop_x, crop_y, w_out, h_out),
+        )
+    });
+    let nf_struct = match (nf_output_bin, nf_struct, nf_products.is_some()) {
+        (Some((num, den)), Some((sm, sr)), true) => Some((
+            crate::nebula_fusion::bin_area_f32(&sm, w_out, h_out, 1, num, den, false).0,
+            crate::nebula_fusion::bin_area_f32(&sr, w_out, h_out, 1, num, den, false).0,
+        )),
+        (_, s, _) => s,
+    };
+
     // --- Super-binning NF (F4): salida 0.75x/0.5x para sobremuestreo ---
     // Área ponderada tras el auto-crop: SCI conserva la fotometría de
     // superficie; VAR se propaga con Σa²·VAR/(Σa)²; NEFF media ponderada;
@@ -9585,6 +9665,12 @@ async fn stack_deepsky(
             _ => "1x",
         },
         "crossfitMaskedSamples": nf_products.as_ref().map(|p| p.masked_samples),
+        // STRUCT (F7): refit PCG pospuesto (los umbrales sesgan levemente las
+        // amplitudes aceptadas — documentado); conteo por nivel starlet.
+        "structRefit": if nf_struct_accepted.is_some() { Some(false) } else { None },
+        "structAcceptedPerLevel": nf_struct_accepted
+            .as_ref()
+            .map(|v| v.iter().map(|&(a, t)| serde_json::json!([a, t])).collect::<Vec<_>>()),
         "inputs": {
             "lights": lights,
             "darks": darks,
@@ -9659,6 +9745,8 @@ async fn stack_deepsky(
             variance: nf_products.as_ref().map(|p| p.variance.clone()),
             neff: nf_products.as_ref().map(|p| p.neff.clone()),
             dq: nf_products.as_ref().map(|p| p.dq.clone()),
+            struct_map: nf_struct.as_ref().map(|(sm, _)| sm.clone()),
+            struct_residual: nf_struct.as_ref().map(|(_, sr)| sr.clone()),
         });
     }
 
@@ -11030,6 +11118,8 @@ mod ds_tests {
             variance: None,
             neff: None,
             dq: None,
+            struct_map: None,
+            struct_residual: None,
         };
         ds_write_recipe(&path, &result).unwrap();
         let recipe: serde_json::Value =

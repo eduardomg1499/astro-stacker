@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +30,10 @@ pub struct BenchmarkManifest {
     #[serde(default)]
     pub environment: Option<BenchmarkEnvironment>,
     pub datasets: Vec<BenchmarkDataset>,
+    /// Libro mayor content-addressed. Se mantiene opcional al deserializar
+    /// manifests v1-v3, pero su ausencia invalida cualquier claim publicable.
+    #[serde(default)]
+    pub evidence: Option<BenchmarkManifestEvidence>,
 }
 
 /// Matriz de escenarios que comparte la aplicación, la documentación y los
@@ -37,7 +43,68 @@ pub struct BenchmarkManifest {
 #[serde(rename_all = "camelCase")]
 pub struct BenchmarkDatasetMatrix {
     pub schema_version: String,
+    pub claim_policy: BenchmarkClaimPolicy,
     pub required_scenarios: Vec<BenchmarkScenarioSpec>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkClaimPolicy {
+    pub own_cpu: BenchmarkOwnCpuPolicy,
+    pub competitor: BenchmarkCompetitorPolicy,
+    pub quality: BenchmarkQualityLimits,
+    pub quality_superiority: BenchmarkQualitySuperiorityPolicy,
+    pub evidence: BenchmarkEvidencePolicy,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkQualitySuperiorityPolicy {
+    /// Al menos una mejora objetiva frente al rival por dataset, medida contra
+    /// una referencia independiente (truth chart, ranking humano ciego o
+    /// ground truth), y ninguna pérdida objetiva.
+    pub minimum_objective_wins_per_dataset: usize,
+    pub maximum_objective_losses_per_dataset: usize,
+    pub require_independent_reference: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkOwnCpuPolicy {
+    pub overall_median_min_speedup: f64,
+    pub planetary_compressed_median_min_speedup: f64,
+    pub planetary_ser_median_min_speedup: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkCompetitorPolicy {
+    /// competitor_seconds / zenith_seconds frente al rival más rápido. Se
+    /// exige a cada corrida cold/warm de cada dataset, no sólo a la mediana.
+    pub minimum_speed_ratio_per_dataset: f64,
+    pub require_every_run: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkQualityLimits {
+    pub max_fwhm_regression_percent: f64,
+    pub max_noise_regression_percent: f64,
+    pub max_flux_error_percent: f64,
+    pub max_normalized_rmse: f64,
+    pub max_scale_error_percent: f64,
+    pub max_normalized_offset: f64,
+    pub max_registration_residual_px: f64,
+    pub max_registration_correction_px: f64,
+    pub min_correlation: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkEvidencePolicy {
+    pub sha256_required: bool,
+    pub acceptance_evidence_required: bool,
+    pub automated_evaluator_required: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -49,6 +116,77 @@ pub struct BenchmarkScenarioSpec {
     pub acceptance: Vec<String>,
     #[serde(default)]
     pub required_evidence: Vec<String>,
+}
+
+/// Archivo físico identificado por SHA-256. `sizeBytes` evita aceptar por
+/// accidente el hash de una representación distinta del mismo artefacto.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkEvidenceArtifact {
+    pub id: String,
+    pub dataset_id: String,
+    pub kind: String,
+    pub path: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+/// Procedencia explícita de una ejecución. El hash de configuración se
+/// calcula sobre JSON canónico (claves ordenadas, UTF-8, sin whitespace).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkExecutionProvenance {
+    pub id: String,
+    pub dataset_id: String,
+    /// `baseline-cpu`, `zenith` o `competitor`.
+    pub role: String,
+    /// Clave determinista que enlaza esta procedencia con la corrida declarada.
+    pub run_key: String,
+    pub product: String,
+    pub vendor: String,
+    pub version: String,
+    pub distribution: String,
+    pub executable_artifact_id: String,
+    pub output_artifact_id: String,
+    #[serde(default)]
+    pub log_artifact_ids: Vec<String>,
+    #[serde(default)]
+    pub telemetry_artifact_ids: Vec<String>,
+    #[serde(default)]
+    pub supporting_artifact_ids: Vec<String>,
+    pub configuration_sha256: String,
+    pub configuration_bytes: u64,
+    pub invocation: Vec<String>,
+    pub timing_method: String,
+}
+
+/// Resultado auditable para una entrada exacta de `acceptance` o
+/// `requiredEvidence` de la matriz. Sólo evaluadores automatizados con
+/// artefactos hashados autorizan publicación.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkRequirementEvidence {
+    pub dataset_id: String,
+    /// `acceptance` o `requiredEvidence`.
+    pub category: String,
+    pub requirement_id: String,
+    pub passed: bool,
+    pub evaluator: String,
+    pub method: String,
+    pub artifact_ids: Vec<String>,
+    #[serde(default)]
+    pub metrics: BTreeMap<String, f64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkManifestEvidence {
+    #[serde(default)]
+    pub artifacts: Vec<BenchmarkEvidenceArtifact>,
+    #[serde(default)]
+    pub executions: Vec<BenchmarkExecutionProvenance>,
+    #[serde(default)]
+    pub requirements: Vec<BenchmarkRequirementEvidence>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -167,6 +305,9 @@ pub struct BenchmarkManifestValidation {
     pub valid: bool,
     pub dataset_count: usize,
     pub comparator_count: usize,
+    pub artifact_hashes_verified: bool,
+    pub execution_provenance_complete: bool,
+    pub scenario_evidence_complete: bool,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -194,6 +335,9 @@ pub struct LinearImageComparison {
     pub correlation: f64,
     pub fitted_scale: f64,
     pub fitted_offset: f64,
+    pub reference_dynamic_range_adu: f64,
+    pub fitted_scale_error_percent: f64,
+    pub fitted_offset_normalized: f64,
     pub reason: Option<String>,
 }
 
@@ -283,6 +427,10 @@ pub struct BenchmarkRunArtifact {
     pub finished_at_utc: String,
     pub job_ids: Vec<String>,
     pub phases: BTreeMap<String, PhaseTelemetrySummary>,
+    /// Bloque listo para incorporarse en `manifest.evidence.artifacts`.
+    pub evidence_artifacts: Vec<BenchmarkEvidenceArtifact>,
+    /// Bloque listo para incorporarse en `manifest.evidence.executions`.
+    pub execution_provenance: BenchmarkExecutionProvenance,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -336,6 +484,7 @@ pub struct BenchmarkDatasetReport {
     pub baseline_speedups: Vec<f64>,
     pub comparisons: Vec<BenchmarkComparisonResult>,
     pub baseline_quality: Vec<BaselineQualityResult>,
+    pub competitor_gate: BenchmarkDatasetCompetitorGate,
     pub warnings: Vec<String>,
 }
 
@@ -385,7 +534,50 @@ pub struct ArtifactRejectionComparison {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BenchmarkDatasetCompetitorGate {
+    pub dataset_id: String,
+    pub required_minimum_speed_ratio: f64,
+    pub minimum_observed_speed_ratio: Option<f64>,
+    pub measured_runs: usize,
+    pub expected_runs: usize,
+    pub every_run_covered: bool,
+    pub speed_pass: bool,
+    pub quality_pass: bool,
+    pub pass: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkOwnCpuAcceptance {
+    pub overall_median_speedup: Option<f64>,
+    pub overall_required_speedup: f64,
+    pub overall_pass: bool,
+    pub planetary_compressed_median_speedup: Option<f64>,
+    pub planetary_compressed_required_speedup: f64,
+    pub planetary_compressed_pass: bool,
+    pub planetary_ser_median_speedup: Option<f64>,
+    pub planetary_ser_required_speedup: f64,
+    pub planetary_ser_pass: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkCompetitorAcceptance {
+    /// Sólo informativa: nunca autoriza por sí sola un claim.
+    pub overall_median_speed_ratio: Option<f64>,
+    pub required_minimum_speed_ratio_per_dataset: f64,
+    pub datasets: Vec<BenchmarkDatasetCompetitorGate>,
+    pub all_datasets_pass: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BenchmarkAcceptance {
+    /// Gates autoritativos. Los objetivos 2x y 1.5x son exclusivamente contra
+    /// la implementación CPU propia; la ventaja competitiva vive por dataset.
+    pub own_cpu: BenchmarkOwnCpuAcceptance,
+    pub competitor: BenchmarkCompetitorAcceptance,
+    pub quality_limits: BenchmarkQualityLimits,
     pub median_vs_zenith_cpu: Option<f64>,
     pub median_vs_fastest_competitor: Option<f64>,
     pub quality_pass_rate_percent: f64,
@@ -393,11 +585,25 @@ pub struct BenchmarkAcceptance {
     pub target_2x_pass: bool,
     pub target_1_5x_pass: bool,
     pub target_quality_80pct_pass: bool,
+    /// Gates planetarios por clase de entrada: evitan que una mediana global
+    /// o datasets de cielo profundo oculten un decode comprimido lento.
+    pub planetary_compressed_2x_pass: bool,
+    pub planetary_ser_1_5x_pass: bool,
+    pub planetary_no_dataset_over_10pct_slower: bool,
     /// Ninguna comparación contra los rivales declarados puede esconder una
     /// regresión científica mayor que los límites del contrato.
     pub competitive_regression_guard_pass: bool,
     pub matrix_complete: bool,
     pub evidence_complete: bool,
+    pub artifact_hashes_verified: bool,
+    pub execution_provenance_complete: bool,
+    pub scenario_evidence_complete: bool,
+    /// Evidencia automatizada y hashada de ventaja positiva, no sólo paridad.
+    pub quality_superiority_evidence_pass: bool,
+    pub competitor_per_dataset_pass: bool,
+    /// Un arnés sintético puede probar la maquinaria del reporte, pero nunca
+    /// autoriza publicidad comparativa contra un producto real.
+    pub competitive_evidence_non_synthetic: bool,
     pub publishable_claim: bool,
 }
 
@@ -418,11 +624,43 @@ const DATASET_MATRIX_JSON: &str = include_str!("../../benchmarks/dataset-matrix.
 fn parse_dataset_matrix() -> Result<BenchmarkDatasetMatrix, String> {
     let matrix: BenchmarkDatasetMatrix = serde_json::from_str(DATASET_MATRIX_JSON)
         .map_err(|error| format!("dataset-matrix.json inválido: {error}"))?;
-    if matrix.schema_version != "zenith-dataset-matrix-v1" {
+    if matrix.schema_version != "zenith-dataset-matrix-v3" {
         return Err(format!(
             "schemaVersion de dataset-matrix.json no soportado: {}",
             matrix.schema_version
         ));
+    }
+    let policy = &matrix.claim_policy;
+    let positive = [
+        policy.own_cpu.overall_median_min_speedup,
+        policy.own_cpu.planetary_compressed_median_min_speedup,
+        policy.own_cpu.planetary_ser_median_min_speedup,
+        policy.competitor.minimum_speed_ratio_per_dataset,
+        policy.quality.max_fwhm_regression_percent,
+        policy.quality.max_noise_regression_percent,
+        policy.quality.max_flux_error_percent,
+        policy.quality.max_normalized_rmse,
+        policy.quality.max_scale_error_percent,
+        policy.quality.max_normalized_offset,
+        policy.quality.max_registration_residual_px,
+        policy.quality.max_registration_correction_px,
+        policy.quality.min_correlation,
+    ];
+    if positive
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+        || policy.quality.min_correlation > 1.0
+        || !policy.competitor.require_every_run
+        || policy.quality_superiority.minimum_objective_wins_per_dataset == 0
+        || !policy.quality_superiority.require_independent_reference
+        || !policy.evidence.sha256_required
+        || !policy.evidence.acceptance_evidence_required
+        || !policy.evidence.automated_evaluator_required
+    {
+        return Err(
+            "dataset-matrix.json: claimPolicy debe usar umbrales positivos y todos los gates vinculantes"
+                .into(),
+        );
     }
     if matrix.required_scenarios.is_empty() {
         return Err("dataset-matrix.json no contiene escenarios".into());
@@ -444,6 +682,20 @@ fn parse_dataset_matrix() -> Result<BenchmarkDatasetMatrix, String> {
         if scenario.required_tags.is_empty() || scenario.acceptance.is_empty() {
             return Err(format!(
                 "{}: requiredTags y acceptance no pueden estar vacíos",
+                scenario.id
+            ));
+        }
+        let mut requirements = std::collections::HashSet::new();
+        if scenario
+            .acceptance
+            .iter()
+            .chain(&scenario.required_evidence)
+            .any(|requirement| {
+                requirement.trim().is_empty() || !requirements.insert(requirement.as_str())
+            })
+        {
+            return Err(format!(
+                "{}: acceptance/requiredEvidence contiene ids vacíos o duplicados",
                 scenario.id
             ));
         }
@@ -760,6 +1012,710 @@ fn validate_required_path(label: &str, path: &str, errors: &mut Vec<String>) -> 
         false
     } else {
         true
+    }
+}
+
+fn write_canonical_json(value: &serde_json::Value, output: &mut Vec<u8>) {
+    match value {
+        serde_json::Value::Null => output.extend_from_slice(b"null"),
+        serde_json::Value::Bool(value) => {
+            output.extend_from_slice(if *value { b"true" } else { b"false" })
+        }
+        serde_json::Value::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
+        serde_json::Value::String(value) => output.extend_from_slice(
+            serde_json::to_string(value)
+                .expect("serializar string JSON")
+                .as_bytes(),
+        ),
+        serde_json::Value::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                write_canonical_json(value, output);
+            }
+            output.push(b']');
+        }
+        serde_json::Value::Object(values) => {
+            output.push(b'{');
+            let mut keys: Vec<&str> = values.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                output.extend_from_slice(
+                    serde_json::to_string(key)
+                        .expect("serializar clave JSON")
+                        .as_bytes(),
+                );
+                output.push(b':');
+                write_canonical_json(&values[key], output);
+            }
+            output.push(b'}');
+        }
+    }
+}
+
+fn canonical_json_bytes(value: &serde_json::Value) -> Vec<u8> {
+    let mut output = Vec::new();
+    write_canonical_json(value, &mut output);
+    output
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn sha256_file(path: &Path) -> Result<(String, u64), String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("abrir '{}' para SHA-256: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("leer '{}' para SHA-256: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size = size.saturating_add(read as u64);
+    }
+    let digest = hasher.finalize();
+    Ok((
+        digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+        size,
+    ))
+}
+
+fn build_evidence_artifact(
+    id: String,
+    dataset_id: String,
+    kind: &str,
+    path: &str,
+) -> Result<BenchmarkEvidenceArtifact, String> {
+    let path = absolute_existing_file(path, &format!("Artefacto {id}"))?;
+    let (sha256, size_bytes) = sha256_file(Path::new(&path))?;
+    Ok(BenchmarkEvidenceArtifact {
+        id,
+        dataset_id,
+        kind: kind.into(),
+        path,
+        sha256,
+        size_bytes,
+    })
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn paths_refer_to_same_file(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    match (
+        Path::new(left).canonicalize(),
+        Path::new(right).canonicalize(),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn normalize_engine_identity(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn autostakkert4_identity(product: &str, version: &str) -> bool {
+    let product = normalize_engine_identity(product);
+    product.contains("autostakkert4")
+        || (product.contains("autostakkert") && version.trim_start().starts_with('4'))
+}
+
+fn placeholder_provenance(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    [
+        "user-supplied",
+        "placeholder",
+        "document exact",
+        "replace-with",
+        "unknown",
+        "desconocido",
+        "todo",
+        "tbd",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
+}
+
+fn zenith_run_key(run: &ZenithBenchmarkRun) -> String {
+    format!(
+        "zenith:{}:{}",
+        run.mode,
+        if run.cold_cache { "cold" } else { "warm" }
+    )
+}
+
+fn comparator_run_key(comparator: &ComparatorRun) -> String {
+    format!(
+        "competitor:{}:{}",
+        normalize_engine_identity(&comparator.engine),
+        comparator.version.trim()
+    )
+}
+
+fn validate_execution_binding(
+    label: &str,
+    execution: &BenchmarkExecutionProvenance,
+    parameters: &Option<serde_json::Value>,
+    output_path: Option<&str>,
+    log_paths: &[&str],
+    telemetry_paths: &[&str],
+    supporting_paths: &[&str],
+    artifacts: &std::collections::HashMap<&str, &BenchmarkEvidenceArtifact>,
+    errors: &mut Vec<String>,
+) {
+    if let Some(parameters) = parameters.as_ref() {
+        let bytes = canonical_json_bytes(parameters);
+        let digest = sha256_bytes(&bytes);
+        if !execution.configuration_sha256.eq_ignore_ascii_case(&digest)
+            || execution.configuration_bytes != bytes.len() as u64
+        {
+            errors.push(format!(
+                "{label}: configurationSha256/configurationBytes no corresponden a parameters canónico"
+            ));
+        }
+    } else {
+        errors.push(format!("{label}: no existe configuración que hashear"));
+    }
+
+    let artifact_path = |id: &str| artifacts.get(id).map(|artifact| artifact.path.as_str());
+    match output_path {
+        Some(expected)
+            if artifact_path(&execution.output_artifact_id)
+                .is_some_and(|actual| paths_refer_to_same_file(actual, expected)) => {}
+        Some(_) => errors.push(format!(
+            "{label}: outputArtifactId no enlaza la salida declarada"
+        )),
+        None => errors.push(format!("{label}: falta salida declarada")),
+    }
+    for expected in log_paths {
+        if !execution.log_artifact_ids.iter().any(|id| {
+            artifact_path(id).is_some_and(|actual| paths_refer_to_same_file(actual, expected))
+        }) {
+            errors.push(format!("{label}: falta SHA-256 del log '{expected}'"));
+        }
+    }
+    for expected in telemetry_paths {
+        if !execution.telemetry_artifact_ids.iter().any(|id| {
+            artifact_path(id).is_some_and(|actual| paths_refer_to_same_file(actual, expected))
+        }) {
+            errors.push(format!("{label}: falta SHA-256 de telemetría '{expected}'"));
+        }
+    }
+    for expected in supporting_paths {
+        if !execution.supporting_artifact_ids.iter().any(|id| {
+            artifact_path(id).is_some_and(|actual| paths_refer_to_same_file(actual, expected))
+        }) {
+            errors.push(format!(
+                "{label}: falta SHA-256 del artefacto de soporte '{expected}'"
+            ));
+        }
+    }
+}
+
+fn quality_superiority_metrics_pass(
+    requirement: &BenchmarkRequirementEvidence,
+    policy: &BenchmarkQualitySuperiorityPolicy,
+) -> bool {
+    let metric = |name: &str| requirement.metrics.get(name).copied();
+    let wins = metric("objectiveWins").unwrap_or(0.0);
+    let losses = metric("objectiveLosses").unwrap_or(f64::INFINITY);
+    let independent = metric("independentReferenceCount").unwrap_or(0.0);
+    let zenith_score = metric("zenithCompositeScore");
+    let competitor_score = metric("competitorCompositeScore");
+    wins >= policy.minimum_objective_wins_per_dataset as f64
+        && losses <= policy.maximum_objective_losses_per_dataset as f64
+        && (!policy.require_independent_reference || independent >= 1.0)
+        && zenith_score
+            .zip(competitor_score)
+            .is_some_and(|(zenith, competitor)| zenith > competitor)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BenchmarkEvidenceAudit {
+    artifact_hashes_verified: bool,
+    execution_provenance_complete: bool,
+    scenario_evidence_complete: bool,
+}
+
+fn validate_manifest_evidence(
+    manifest: &BenchmarkManifest,
+    matrix: Option<&BenchmarkDatasetMatrix>,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> BenchmarkEvidenceAudit {
+    let Some(evidence) = manifest.evidence.as_ref() else {
+        errors.push(
+            "Falta evidence: hashes SHA-256, procedencia y resultados por requisito son obligatorios para publicar"
+                .into(),
+        );
+        return BenchmarkEvidenceAudit::default();
+    };
+    let dataset_ids: std::collections::HashSet<&str> = manifest
+        .datasets
+        .iter()
+        .map(|dataset| dataset.id.as_str())
+        .collect();
+
+    let hash_errors = errors.len();
+    let mut artifact_ids = std::collections::HashSet::new();
+    let known_kinds = std::collections::HashSet::from([
+        "source",
+        "output",
+        "log",
+        "telemetry",
+        "recipe",
+        "executable",
+        "reference",
+        "mask",
+        "test-report",
+    ]);
+    for artifact in &evidence.artifacts {
+        let label = format!("evidence.artifacts[{}]", artifact.id);
+        if artifact.id.trim().is_empty() || !artifact_ids.insert(artifact.id.as_str()) {
+            errors.push(format!("{label}: id vacío o duplicado"));
+        }
+        if !dataset_ids.contains(artifact.dataset_id.as_str())
+            && !(artifact.dataset_id == "suite" && artifact.kind == "executable")
+        {
+            errors.push(format!("{label}: datasetId desconocido"));
+        }
+        if !known_kinds.contains(artifact.kind.as_str()) {
+            errors.push(format!("{label}: kind '{}' no soportado", artifact.kind));
+        }
+        if !valid_sha256(&artifact.sha256) {
+            errors.push(format!(
+                "{label}: sha256 debe contener 64 dígitos hexadecimales"
+            ));
+            continue;
+        }
+        if !validate_required_path(&label, &artifact.path, errors) {
+            continue;
+        }
+        match sha256_file(Path::new(&artifact.path)) {
+            Ok((actual_hash, actual_size)) => {
+                if !artifact.sha256.eq_ignore_ascii_case(&actual_hash) {
+                    errors.push(format!("{label}: SHA-256 no coincide con el archivo"));
+                }
+                if artifact.size_bytes != actual_size {
+                    errors.push(format!(
+                        "{label}: sizeBytes {} no coincide con {}",
+                        artifact.size_bytes, actual_size
+                    ));
+                }
+            }
+            Err(error) => errors.push(format!("{label}: {error}")),
+        }
+    }
+    for dataset in &manifest.datasets {
+        for source in &dataset.sources {
+            if !evidence.artifacts.iter().any(|artifact| {
+                artifact.dataset_id == dataset.id
+                    && artifact.kind == "source"
+                    && paths_refer_to_same_file(&artifact.path, source)
+            }) {
+                errors.push(format!(
+                    "{}: falta artefacto source con SHA-256 para '{}'",
+                    dataset.id, source
+                ));
+            }
+        }
+    }
+    let artifact_hashes_verified = errors.len() == hash_errors;
+    let artifacts: std::collections::HashMap<&str, &BenchmarkEvidenceArtifact> = evidence
+        .artifacts
+        .iter()
+        .map(|artifact| (artifact.id.as_str(), artifact))
+        .collect();
+
+    let provenance_errors = errors.len();
+    let mut execution_ids = std::collections::HashSet::new();
+    let mut execution_keys = std::collections::HashSet::new();
+    for execution in &evidence.executions {
+        let label = format!("evidence.executions[{}]", execution.id);
+        if execution.id.trim().is_empty() || !execution_ids.insert(execution.id.as_str()) {
+            errors.push(format!("{label}: id vacío o duplicado"));
+        }
+        if !execution_keys.insert((
+            execution.dataset_id.as_str(),
+            execution.role.as_str(),
+            execution.run_key.as_str(),
+        )) {
+            errors.push(format!("{label}: datasetId/role/runKey duplicado"));
+        }
+        if !dataset_ids.contains(execution.dataset_id.as_str()) {
+            errors.push(format!("{label}: datasetId desconocido"));
+        }
+        if !matches!(
+            execution.role.as_str(),
+            "baseline-cpu" | "zenith" | "competitor"
+        ) {
+            errors.push(format!("{label}: role no soportado"));
+        }
+        if execution.run_key.trim().is_empty()
+            || execution.product.trim().is_empty()
+            || execution.vendor.trim().is_empty()
+            || execution.version.trim().is_empty()
+            || execution.distribution.trim().is_empty()
+            || execution.invocation.is_empty()
+            || execution
+                .invocation
+                .iter()
+                .any(|item| item.trim().is_empty())
+            || execution.timing_method.trim().is_empty()
+        {
+            errors.push(format!(
+                "{label}: identidad, distribución, invocation y timingMethod deben ser explícitos"
+            ));
+        }
+        if placeholder_provenance(&execution.version)
+            || placeholder_provenance(&execution.distribution)
+        {
+            errors.push(format!(
+                "{label}: version/distribution contiene texto de marcador, no procedencia exacta"
+            ));
+        }
+        if !valid_sha256(&execution.configuration_sha256) || execution.configuration_bytes == 0 {
+            errors.push(format!(
+                "{label}: configuración canónica sin SHA-256/longitud válidos"
+            ));
+        }
+        let mut check_reference = |id: &str, expected_kind: &str| match artifacts.get(id) {
+            Some(artifact) => {
+                if artifact.dataset_id != execution.dataset_id
+                    && !(artifact.dataset_id == "suite" && artifact.kind == "executable")
+                {
+                    errors.push(format!(
+                        "{label}: artefacto '{id}' pertenece a otro dataset"
+                    ));
+                }
+                if artifact.kind != expected_kind {
+                    errors.push(format!(
+                        "{label}: artefacto '{id}' debe ser kind={expected_kind}"
+                    ));
+                }
+            }
+            None => errors.push(format!("{label}: referencia artefacto inexistente '{id}'")),
+        };
+        check_reference(&execution.executable_artifact_id, "executable");
+        check_reference(&execution.output_artifact_id, "output");
+        for id in &execution.log_artifact_ids {
+            check_reference(id, "log");
+        }
+        for id in &execution.telemetry_artifact_ids {
+            check_reference(id, "telemetry");
+        }
+        for id in &execution.supporting_artifact_ids {
+            if !artifacts.contains_key(id.as_str()) {
+                errors.push(format!("{label}: artefacto de soporte inexistente '{id}'"));
+            }
+        }
+    }
+
+    for dataset in &manifest.datasets {
+        let baseline: Vec<_> = evidence
+            .executions
+            .iter()
+            .filter(|execution| {
+                execution.dataset_id == dataset.id
+                    && execution.role == "baseline-cpu"
+                    && execution.run_key == "baseline-cpu"
+            })
+            .collect();
+        if baseline.len() != 1 {
+            errors.push(format!(
+                "{}: se requiere exactamente una procedencia baseline-cpu/runKey=baseline-cpu",
+                dataset.id
+            ));
+        } else {
+            validate_execution_binding(
+                &format!("{} / procedencia baseline CPU", dataset.id),
+                baseline[0],
+                &dataset.baseline_cpu_parameters,
+                dataset.baseline_cpu_output.as_deref(),
+                &dataset
+                    .baseline_cpu_log
+                    .as_deref()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                &[],
+                &[],
+                &artifacts,
+                errors,
+            );
+        }
+
+        for run in &dataset.zenith_runs {
+            let run_key = zenith_run_key(run);
+            let executions: Vec<_> = evidence
+                .executions
+                .iter()
+                .filter(|execution| {
+                    execution.dataset_id == dataset.id
+                        && execution.role == "zenith"
+                        && execution.run_key == run_key
+                })
+                .collect();
+            let label = format!("{} / procedencia {run_key}", dataset.id);
+            if executions.len() != 1 {
+                errors.push(format!("{label}: se requiere exactamente una ejecución"));
+                continue;
+            }
+            let execution = executions[0];
+            if !normalize_engine_identity(&execution.product).contains("zenithastrostacker") {
+                errors.push(format!(
+                    "{label}: product no identifica Zenith Astro Stacker"
+                ));
+            }
+            if manifest
+                .environment
+                .as_ref()
+                .is_some_and(|environment| execution.version != environment.app_version)
+            {
+                errors.push(format!(
+                    "{label}: version no coincide con environment.appVersion"
+                ));
+            }
+            let telemetry: Vec<&str> = run.telemetry.iter().map(String::as_str).collect();
+            let supporting: Vec<&str> = run.recipe.as_deref().into_iter().collect();
+            validate_execution_binding(
+                &label,
+                execution,
+                &run.parameters,
+                Some(&run.output),
+                &[],
+                &telemetry,
+                &supporting,
+                &artifacts,
+                errors,
+            );
+        }
+
+        let mut has_explicit_autostakkert4 = false;
+        let mut comparator_keys = std::collections::HashSet::new();
+        for comparator in &dataset.comparators {
+            let run_key = comparator_run_key(comparator);
+            if !comparator_keys.insert(run_key.clone()) {
+                errors.push(format!(
+                    "{}: comparator engine/version duplicado: {} {}",
+                    dataset.id, comparator.engine, comparator.version
+                ));
+            }
+            let executions: Vec<_> = evidence
+                .executions
+                .iter()
+                .filter(|execution| {
+                    execution.dataset_id == dataset.id
+                        && execution.role == "competitor"
+                        && execution.run_key == run_key
+                })
+                .collect();
+            let label = format!("{} / procedencia {run_key}", dataset.id);
+            if executions.len() != 1 {
+                errors.push(format!("{label}: se requiere exactamente una ejecución"));
+                continue;
+            }
+            let execution = executions[0];
+            if execution.version != comparator.version {
+                errors.push(format!(
+                    "{label}: version estructurada no coincide con comparator.version"
+                ));
+            }
+            let engine = normalize_engine_identity(&comparator.engine);
+            let product = normalize_engine_identity(&execution.product);
+            if engine.contains("autostakkert") {
+                if !autostakkert4_identity(&execution.product, &execution.version) {
+                    errors.push(format!(
+                        "{label}: product/version no acreditan explícitamente AutoStakkert!4"
+                    ));
+                } else {
+                    has_explicit_autostakkert4 = true;
+                }
+            } else if !engine.contains(&product) && !product.contains(&engine) {
+                errors.push(format!(
+                    "{label}: product estructurado no corresponde a comparator.engine"
+                ));
+            }
+            let logs: Vec<&str> = comparator.log.as_deref().into_iter().collect();
+            validate_execution_binding(
+                &label,
+                execution,
+                &comparator.parameters,
+                Some(&comparator.output),
+                &logs,
+                &[],
+                &[],
+                &artifacts,
+                errors,
+            );
+        }
+        if dataset.domain == "planetary" && !has_explicit_autostakkert4 {
+            errors.push(format!(
+                "{}: falta procedencia estructurada product/vendor/version/distribution/executable de AutoStakkert!4",
+                dataset.id
+            ));
+        }
+    }
+    let execution_provenance_complete =
+        artifact_hashes_verified && errors.len() == provenance_errors;
+
+    let requirement_errors = errors.len();
+    let mut requirement_keys = std::collections::HashSet::new();
+    for requirement in &evidence.requirements {
+        let label = format!(
+            "evidence.requirements[{}:{}:{}]",
+            requirement.dataset_id, requirement.category, requirement.requirement_id
+        );
+        if !requirement_keys.insert((
+            requirement.dataset_id.as_str(),
+            requirement.category.as_str(),
+            requirement.requirement_id.as_str(),
+        )) {
+            errors.push(format!("{label}: requisito duplicado"));
+        }
+        if !dataset_ids.contains(requirement.dataset_id.as_str()) {
+            errors.push(format!("{label}: datasetId desconocido"));
+        }
+        if !matches!(
+            requirement.category.as_str(),
+            "acceptance" | "requiredEvidence"
+        ) {
+            errors.push(format!("{label}: category no soportada"));
+        }
+        if !requirement.passed {
+            errors.push(format!("{label}: resultado no aprobado"));
+        }
+        if requirement.evaluator != "automated" || requirement.method.trim().is_empty() {
+            errors.push(format!(
+                "{label}: se requiere evaluator=automated y method reproducible"
+            ));
+        }
+        if requirement.artifact_ids.is_empty() {
+            errors.push(format!("{label}: falta evidencia content-addressed"));
+        }
+        for id in &requirement.artifact_ids {
+            match artifacts.get(id.as_str()) {
+                Some(artifact) if artifact.dataset_id == requirement.dataset_id => {}
+                Some(_) => errors.push(format!(
+                    "{label}: artefacto '{id}' pertenece a otro dataset"
+                )),
+                None => errors.push(format!("{label}: artefacto inexistente '{id}'")),
+            }
+        }
+        if requirement.metrics.values().any(|value| !value.is_finite()) {
+            errors.push(format!("{label}: contiene métricas no finitas"));
+        }
+        if requirement.category == "acceptance"
+            && requirement.requirement_id == "quality-superiority"
+            && matrix.is_none_or(|matrix| {
+                !quality_superiority_metrics_pass(
+                    requirement,
+                    &matrix.claim_policy.quality_superiority,
+                )
+            })
+        {
+            errors.push(format!(
+                "{label}: debe demostrar una ventaja positiva contra referencia independiente (objectiveWins/objectiveLosses/independentReferenceCount/zenithCompositeScore/competitorCompositeScore)"
+            ));
+        }
+    }
+    if let Some(matrix) = matrix {
+        for scenario in &matrix.required_scenarios {
+            for (category, requirement_ids) in [
+                ("acceptance", &scenario.acceptance),
+                ("requiredEvidence", &scenario.required_evidence),
+            ] {
+                for requirement_id in requirement_ids {
+                    let matches: Vec<_> = evidence
+                        .requirements
+                        .iter()
+                        .filter(|requirement| {
+                            requirement.dataset_id == scenario.id
+                                && requirement.category == category
+                                && requirement.requirement_id == *requirement_id
+                        })
+                        .collect();
+                    if matches.len() != 1 {
+                        errors.push(format!(
+                            "{}: falta evidencia única para {} '{}'",
+                            scenario.id, category, requirement_id
+                        ));
+                        continue;
+                    }
+                    if category == "requiredEvidence" {
+                        let expected_path = manifest
+                            .datasets
+                            .iter()
+                            .find(|dataset| dataset.id == scenario.id)
+                            .and_then(|dataset| match requirement_id.as_str() {
+                                "artifactFreeReference" => {
+                                    dataset.artifact_free_reference.as_deref()
+                                }
+                                "artifactMask" => dataset.artifact_mask.as_deref(),
+                                _ => None,
+                            });
+                        if let Some(expected_path) = expected_path {
+                            let linked = matches[0].artifact_ids.iter().any(|id| {
+                                artifacts.get(id.as_str()).is_some_and(|artifact| {
+                                    paths_refer_to_same_file(&artifact.path, expected_path)
+                                })
+                            });
+                            if !linked {
+                                errors.push(format!(
+                                    "{}: requiredEvidence '{}' no enlaza el archivo declarado",
+                                    scenario.id, requirement_id
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for requirement in &evidence.requirements {
+        let known = matrix.is_some_and(|matrix| {
+            matrix.required_scenarios.iter().any(|scenario| {
+                scenario.id == requirement.dataset_id
+                    && match requirement.category.as_str() {
+                        "acceptance" => scenario.acceptance.contains(&requirement.requirement_id),
+                        "requiredEvidence" => scenario
+                            .required_evidence
+                            .contains(&requirement.requirement_id),
+                        _ => false,
+                    }
+            })
+        });
+        if !known {
+            warnings.push(format!(
+                "Evidencia no vinculada a la matriz: {} / {} / {}",
+                requirement.dataset_id, requirement.category, requirement.requirement_id
+            ));
+        }
+    }
+    BenchmarkEvidenceAudit {
+        artifact_hashes_verified,
+        execution_provenance_complete,
+        scenario_evidence_complete: artifact_hashes_verified && errors.len() == requirement_errors,
     }
 }
 
@@ -1284,10 +2240,15 @@ fn validate_benchmark_manifest_data(manifest: &BenchmarkManifest) -> BenchmarkMa
             missing.join(", ")
         ));
     }
+    let evidence_audit =
+        validate_manifest_evidence(manifest, matrix.as_ref(), &mut errors, &mut warnings);
     BenchmarkManifestValidation {
         valid: errors.is_empty(),
         dataset_count: manifest.datasets.len(),
         comparator_count,
+        artifact_hashes_verified: evidence_audit.artifact_hashes_verified,
+        execution_provenance_complete: evidence_audit.execution_provenance_complete,
+        scenario_evidence_complete: evidence_audit.scenario_evidence_complete,
         errors,
         warnings,
     }
@@ -1296,7 +2257,7 @@ fn validate_benchmark_manifest_data(manifest: &BenchmarkManifest) -> BenchmarkMa
 #[tauri::command]
 pub fn get_benchmark_environment() -> BenchmarkEnvironment {
     use sysinfo::System;
-    let mut sys = System::new_all();
+    let mut sys = System::new();
     sys.refresh_memory();
     let gpu = crate::gpu_stack::gpu_info();
     BenchmarkEnvironment {
@@ -1617,8 +2578,89 @@ pub fn finish_benchmark_run(
         ));
     }
 
+    // La telemetría se publica antes de calcular su digest. Si cualquier hash
+    // falla, la sesión permanece activa y no se emite un record incompleto.
+    write_json_atomic(&telemetry_path, &telemetry)?;
+    let artifact_prefix = active.handle.session_id.clone();
+    let output_artifact_id = format!("{artifact_prefix}:output");
+    let telemetry_artifact_id = format!("{artifact_prefix}:telemetry");
+    let executable_artifact_id = format!("{artifact_prefix}:executable");
+    let mut evidence_artifacts = vec![
+        build_evidence_artifact(
+            output_artifact_id.clone(),
+            active.handle.dataset_id.clone(),
+            "output",
+            &zenith_run.output,
+        )?,
+        build_evidence_artifact(
+            telemetry_artifact_id.clone(),
+            active.handle.dataset_id.clone(),
+            "telemetry",
+            telemetry_path
+                .to_str()
+                .ok_or_else(|| "Ruta de telemetría no es UTF-8".to_string())?,
+        )?,
+    ];
+    let current_executable = std::env::current_exe()
+        .map_err(|error| format!("Resolver ejecutable Zenith: {error}"))?
+        .canonicalize()
+        .map_err(|error| format!("Normalizar ejecutable Zenith: {error}"))?;
+    evidence_artifacts.push(build_evidence_artifact(
+        executable_artifact_id.clone(),
+        active.handle.dataset_id.clone(),
+        "executable",
+        current_executable
+            .to_str()
+            .ok_or_else(|| "Ruta del ejecutable no es UTF-8".to_string())?,
+    )?);
+    let mut supporting_artifact_ids = Vec::new();
+    if let Some(recipe) = zenith_run.recipe.as_deref() {
+        let id = format!("{artifact_prefix}:recipe");
+        evidence_artifacts.push(build_evidence_artifact(
+            id.clone(),
+            active.handle.dataset_id.clone(),
+            "recipe",
+            recipe,
+        )?);
+        supporting_artifact_ids.push(id);
+    }
+    let configuration = canonical_json_bytes(
+        zenith_run
+            .parameters
+            .as_ref()
+            .expect("parameters validado antes de cerrar benchmark"),
+    );
+    let execution_provenance = BenchmarkExecutionProvenance {
+        id: format!("{artifact_prefix}:execution"),
+        dataset_id: active.handle.dataset_id.clone(),
+        role: "zenith".into(),
+        run_key: zenith_run_key(&zenith_run),
+        product: "Zenith Astro Stacker".into(),
+        vendor: "EMG".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        distribution: format!("local-build:{}", env!("CARGO_PKG_VERSION")),
+        executable_artifact_id,
+        output_artifact_id,
+        log_artifact_ids: Vec::new(),
+        telemetry_artifact_ids: vec![telemetry_artifact_id],
+        supporting_artifact_ids,
+        configuration_sha256: sha256_bytes(&configuration),
+        configuration_bytes: configuration.len() as u64,
+        invocation: vec![
+            "begin_benchmark_run".into(),
+            active.handle.mode.clone(),
+            if active.handle.cold_cache {
+                "cold-cache".into()
+            } else {
+                "warm-cache".into()
+            },
+            "finish_benchmark_run".into(),
+        ],
+        timing_method:
+            "steady-clock end-to-end from begin_benchmark_run to finish_benchmark_run entry".into(),
+    };
     let artifact = BenchmarkRunArtifact {
-        schema_version: "zenith-benchmark-run-v1".into(),
+        schema_version: "zenith-benchmark-run-v2".into(),
         session: active.handle.clone(),
         environment: active.environment,
         zenith_run,
@@ -1627,8 +2669,9 @@ pub fn finish_benchmark_run(
         finished_at_utc,
         job_ids: requested_jobs.clone(),
         phases,
+        evidence_artifacts,
+        execution_provenance,
     };
-    write_json_atomic(&telemetry_path, &telemetry)?;
     write_json_atomic(&record_path, &artifact)?;
     *active_guard = None;
     drop(active_guard);
@@ -1844,13 +2887,49 @@ fn compare_artifact_rejection(
     }
 }
 
-fn benchmark_quality_pass(metrics: &LinearImageComparison) -> bool {
+fn benchmark_quality_pass(
+    metrics: &LinearImageComparison,
+    limits: &BenchmarkQualityLimits,
+) -> bool {
     metrics.compatible
-        && metrics.fwhm_regression_percent <= 3.0
-        && metrics.noise_regression_percent <= 3.0
-        && metrics.flux_error_percent <= 3.0
-        && metrics.registration_error_px <= 0.5
-        && metrics.correlation >= 0.8
+        && metrics.fwhm_regression_percent <= limits.max_fwhm_regression_percent
+        && metrics.noise_regression_percent <= limits.max_noise_regression_percent
+        && metrics.flux_error_percent <= limits.max_flux_error_percent
+        && metrics.normalized_rmse <= limits.max_normalized_rmse
+        && metrics.fitted_scale_error_percent <= limits.max_scale_error_percent
+        && metrics.fitted_offset_normalized <= limits.max_normalized_offset
+        && metrics.registration_error_px <= limits.max_registration_residual_px
+        && metrics.registration_correction_px <= limits.max_registration_correction_px
+        && metrics.correlation >= limits.min_correlation
+}
+
+fn build_dataset_competitor_gate(
+    dataset_id: &str,
+    fastest_ratios: &[f64],
+    expected_runs: usize,
+    quality_cases: usize,
+    all_quality_pass: bool,
+    policy: &BenchmarkCompetitorPolicy,
+) -> BenchmarkDatasetCompetitorGate {
+    let minimum_observed_speed_ratio = fastest_ratios.iter().copied().reduce(f64::min);
+    let every_run_covered = expected_runs > 0
+        && fastest_ratios.len() == expected_runs
+        && quality_cases == expected_runs;
+    let speed_pass = minimum_observed_speed_ratio
+        .is_some_and(|ratio| ratio >= policy.minimum_speed_ratio_per_dataset)
+        && (!policy.require_every_run || every_run_covered);
+    let quality_pass = every_run_covered && all_quality_pass;
+    BenchmarkDatasetCompetitorGate {
+        dataset_id: dataset_id.into(),
+        required_minimum_speed_ratio: policy.minimum_speed_ratio_per_dataset,
+        minimum_observed_speed_ratio,
+        measured_runs: fastest_ratios.len(),
+        expected_runs,
+        every_run_covered,
+        speed_pass,
+        quality_pass,
+        pass: speed_pass && quality_pass,
+    }
 }
 
 fn build_run_evidence(run: &ZenithBenchmarkRun) -> BenchmarkRunEvidence {
@@ -1884,10 +2963,85 @@ pub fn generate_benchmark_report(
     let raw = std::fs::read_to_string(&manifest_path).map_err(|e| format!("Manifest: {e}"))?;
     let manifest: BenchmarkManifest =
         serde_json::from_str(&raw).map_err(|e| format!("Manifest JSON inválido: {e}"))?;
+    let synthetic_marker = |value: &str| {
+        let value = value.to_lowercase();
+        [
+            "synthetic",
+            "sintético",
+            "sintetico",
+            "fixture",
+            "mock",
+            "dummy",
+        ]
+        .iter()
+        .any(|marker| value.contains(marker))
+    };
+    let competitive_evidence_non_synthetic = !synthetic_marker(&manifest.suite_version)
+        && manifest.datasets.iter().all(|dataset| {
+            dataset
+                .sources
+                .iter()
+                .all(|source| !synthetic_marker(source))
+                && dataset.comparators.iter().all(|competitor| {
+                    !synthetic_marker(&competitor.engine) && !synthetic_marker(&competitor.version)
+                })
+        })
+        && manifest.evidence.as_ref().is_some_and(|evidence| {
+            evidence
+                .artifacts
+                .iter()
+                .all(|artifact| !synthetic_marker(&artifact.path))
+                && evidence.executions.iter().all(|execution| {
+                    !synthetic_marker(&execution.product)
+                        && !synthetic_marker(&execution.vendor)
+                        && !synthetic_marker(&execution.version)
+                        && !synthetic_marker(&execution.distribution)
+                        && !synthetic_marker(&execution.timing_method)
+                        && execution
+                            .invocation
+                            .iter()
+                            .all(|item| !synthetic_marker(item))
+                })
+                && evidence.requirements.iter().all(|requirement| {
+                    !synthetic_marker(&requirement.method)
+                        && !synthetic_marker(&requirement.evaluator)
+                })
+        });
     let validation = validate_benchmark_manifest_data(&manifest);
     let mut reports = Vec::new();
     let mut all_baseline = Vec::new();
+    let matrix = parse_dataset_matrix()?;
+    let own_cpu_policy = matrix.claim_policy.own_cpu.clone();
+    let competitor_policy = matrix.claim_policy.competitor.clone();
+    let quality_limits = matrix.claim_policy.quality.clone();
+    let compressed_planetary_ids: std::collections::HashSet<&str> = matrix
+        .required_scenarios
+        .iter()
+        .filter(|scenario| {
+            scenario.domain == "planetary"
+                && scenario.required_tags.iter().any(|tag| {
+                    matches!(
+                        tag.as_str(),
+                        "ffmpeg" | "mp4" | "mov" | "h264" | "hevc" | "prores"
+                    )
+                })
+        })
+        .map(|scenario| scenario.id.as_str())
+        .collect();
+    let ser_planetary_ids: std::collections::HashSet<&str> = matrix
+        .required_scenarios
+        .iter()
+        .filter(|scenario| {
+            scenario.domain == "planetary" && scenario.required_tags.iter().any(|tag| tag == "ser")
+        })
+        .map(|scenario| scenario.id.as_str())
+        .collect();
+    let mut compressed_planetary_baseline = Vec::new();
+    let mut ser_planetary_baseline = Vec::new();
+    let mut planetary_competitor_speed_seen = false;
+    let mut planetary_no_dataset_over_10pct_slower = true;
     let mut fastest_ratios = Vec::new();
+    let mut dataset_competitor_gates = Vec::new();
     let mut competitive_quality_cases: Vec<Vec<bool>> = Vec::new();
     let mut regression_guard = true;
     let (matrix_complete, missing) = benchmark_matrix_status(&manifest);
@@ -1903,11 +3057,20 @@ pub fn generate_benchmark_report(
         let mut baseline_quality = Vec::new();
         let mut baseline_speedups = Vec::new();
         let mut warnings = Vec::new();
+        let mut dataset_fastest_ratios = Vec::new();
+        let mut dataset_competitor_quality_pass = true;
+        let mut dataset_quality_cases = 0usize;
         for run in &ds.zenith_runs {
             if let Some(base) = ds.baseline_cpu_seconds.filter(|v| *v > 0.0) {
                 let speedup = base / run.elapsed_seconds;
                 baseline_speedups.push(speedup);
                 all_baseline.push(speedup);
+                if compressed_planetary_ids.contains(ds.id.as_str()) {
+                    compressed_planetary_baseline.push(speedup);
+                }
+                if ser_planetary_ids.contains(ds.id.as_str()) {
+                    ser_planetary_baseline.push(speedup);
+                }
                 if speedup < 1.0 / 1.10 {
                     regression_guard = false;
                 }
@@ -1922,7 +3085,7 @@ pub fn generate_benchmark_report(
                 } else {
                     None
                 };
-                let quality_pass = benchmark_quality_pass(&metrics)
+                let quality_pass = benchmark_quality_pass(&metrics, &quality_limits)
                     && rejection_quality
                         .as_ref()
                         .is_none_or(|quality| quality.pass);
@@ -1948,12 +3111,18 @@ pub fn generate_benchmark_report(
                 } else {
                     None
                 };
-                let quality_pass = benchmark_quality_pass(&metrics)
+                let quality_pass = benchmark_quality_pass(&metrics, &quality_limits)
                     && rejection_quality
                         .as_ref()
                         .is_none_or(|quality| quality.pass);
                 per_run_quality.push(quality_pass);
                 let speed_ratio = competitor.elapsed_seconds / run.elapsed_seconds;
+                if ds.domain == "planetary" {
+                    planetary_competitor_speed_seen = true;
+                    if speed_ratio < 1.0 / 1.10 {
+                        planetary_no_dataset_over_10pct_slower = false;
+                    }
+                }
                 per_run_ratios.push(speed_ratio);
                 comparisons.push(BenchmarkComparisonResult {
                     zenith_mode: run.mode.clone(),
@@ -1968,8 +3137,11 @@ pub fn generate_benchmark_report(
             }
             if let Some(fastest) = per_run_ratios.into_iter().reduce(f64::min) {
                 fastest_ratios.push(fastest);
+                dataset_fastest_ratios.push(fastest);
             }
             if !per_run_quality.is_empty() {
+                dataset_quality_cases += 1;
+                dataset_competitor_quality_pass &= per_run_quality.iter().all(|pass| *pass);
                 competitive_quality_cases.push(per_run_quality);
             }
         }
@@ -1982,6 +3154,15 @@ pub fn generate_benchmark_report(
         if !ds.zenith_runs.iter().any(|r| !r.cold_cache) {
             warnings.push("Falta medición de caché caliente".into());
         }
+        let competitor_gate = build_dataset_competitor_gate(
+            &ds.id,
+            &dataset_fastest_ratios,
+            ds.zenith_runs.len(),
+            dataset_quality_cases,
+            dataset_competitor_quality_pass,
+            &competitor_policy,
+        );
+        dataset_competitor_gates.push(competitor_gate.clone());
         reports.push(BenchmarkDatasetReport {
             id: ds.id.clone(),
             domain: ds.domain.clone(),
@@ -1989,6 +3170,7 @@ pub fn generate_benchmark_report(
             baseline_speedups,
             comparisons,
             baseline_quality,
+            competitor_gate,
             warnings,
         });
     }
@@ -1996,22 +3178,81 @@ pub fn generate_benchmark_report(
     let med_comp = median(fastest_ratios);
     let (quality_total, _quality_passed, quality_rate, competitive_regression_guard) =
         competitive_quality_summary(&competitive_quality_cases);
-    let target_2x = med_base.is_some_and(|v| v >= 2.0);
-    let target_1_5x = med_comp.is_some_and(|v| v >= 1.5);
+    let target_2x =
+        med_base.is_some_and(|value| value >= own_cpu_policy.overall_median_min_speedup);
     let target_quality = quality_total > 0 && quality_rate >= 80.0;
+    let compressed_median = median(compressed_planetary_baseline);
+    let ser_median = median(ser_planetary_baseline);
+    let planetary_compressed_2x = compressed_median
+        .is_some_and(|value| value >= own_cpu_policy.planetary_compressed_median_min_speedup);
+    let planetary_ser_1_5x =
+        ser_median.is_some_and(|value| value >= own_cpu_policy.planetary_ser_median_min_speedup);
+    // Alias legado de report-v1..v3: desde v4 el 1.5x corresponde a CPU
+    // propio en SER. La mediana competitiva queda sólo como dato informativo.
+    let target_1_5x = planetary_ser_1_5x;
+    let competitor_per_dataset_pass = matrix.required_scenarios.iter().all(|scenario| {
+        dataset_competitor_gates
+            .iter()
+            .find(|gate| gate.dataset_id == scenario.id)
+            .is_some_and(|gate| gate.pass)
+    });
+    let planetary_speed_guard =
+        planetary_competitor_speed_seen && planetary_no_dataset_over_10pct_slower;
     let combined_regression_guard = regression_guard && competitive_regression_guard;
+    let own_cpu_acceptance = BenchmarkOwnCpuAcceptance {
+        overall_median_speedup: med_base,
+        overall_required_speedup: own_cpu_policy.overall_median_min_speedup,
+        overall_pass: target_2x,
+        planetary_compressed_median_speedup: compressed_median,
+        planetary_compressed_required_speedup: own_cpu_policy
+            .planetary_compressed_median_min_speedup,
+        planetary_compressed_pass: planetary_compressed_2x,
+        planetary_ser_median_speedup: ser_median,
+        planetary_ser_required_speedup: own_cpu_policy.planetary_ser_median_min_speedup,
+        planetary_ser_pass: planetary_ser_1_5x,
+    };
+    let competitor_acceptance = BenchmarkCompetitorAcceptance {
+        overall_median_speed_ratio: med_comp,
+        required_minimum_speed_ratio_per_dataset: competitor_policy.minimum_speed_ratio_per_dataset,
+        datasets: dataset_competitor_gates,
+        all_datasets_pass: competitor_per_dataset_pass,
+    };
+    let artifact_hashes_verified = validation.artifact_hashes_verified;
+    let execution_provenance_complete = validation.execution_provenance_complete;
+    let scenario_evidence_complete = validation.scenario_evidence_complete;
+    let quality_superiority_evidence_pass = manifest.evidence.as_ref().is_some_and(|evidence| {
+        matrix
+            .required_scenarios
+            .iter()
+            .filter(|scenario| scenario.domain == "planetary")
+            .all(|scenario| {
+                evidence.requirements.iter().any(|requirement| {
+                    requirement.dataset_id == scenario.id
+                        && requirement.category == "acceptance"
+                        && requirement.requirement_id == "quality-superiority"
+                        && requirement.passed
+                        && quality_superiority_metrics_pass(
+                            requirement,
+                            &matrix.claim_policy.quality_superiority,
+                        )
+                })
+            })
+    });
     let environment = manifest
         .environment
         .clone()
         .unwrap_or_else(get_benchmark_environment);
     let report = BenchmarkSuiteReport {
-        schema_version: "zenith-benchmark-report-v3".into(),
+        schema_version: "zenith-benchmark-report-v5".into(),
         suite_version: manifest.suite_version,
         generated_at_utc: chrono::Utc::now().to_rfc3339(),
         environment,
         validation,
         datasets: reports,
         acceptance: BenchmarkAcceptance {
+            own_cpu: own_cpu_acceptance,
+            competitor: competitor_acceptance,
+            quality_limits,
             median_vs_zenith_cpu: med_base,
             median_vs_fastest_competitor: med_comp,
             quality_pass_rate_percent: quality_rate,
@@ -2019,15 +3260,29 @@ pub fn generate_benchmark_report(
             target_2x_pass: target_2x,
             target_1_5x_pass: target_1_5x,
             target_quality_80pct_pass: target_quality,
+            planetary_compressed_2x_pass: planetary_compressed_2x,
+            planetary_ser_1_5x_pass: planetary_ser_1_5x,
+            planetary_no_dataset_over_10pct_slower: planetary_speed_guard,
             competitive_regression_guard_pass: competitive_regression_guard,
             matrix_complete,
             evidence_complete,
+            artifact_hashes_verified,
+            execution_provenance_complete,
+            scenario_evidence_complete,
+            quality_superiority_evidence_pass,
+            competitor_per_dataset_pass,
+            competitive_evidence_non_synthetic,
             publishable_claim: target_2x
                 && target_1_5x
                 && target_quality
+                && planetary_compressed_2x
+                && planetary_ser_1_5x
+                && competitor_per_dataset_pass
                 && combined_regression_guard
                 && matrix_complete
-                && evidence_complete,
+                && evidence_complete
+                && quality_superiority_evidence_pass
+                && competitive_evidence_non_synthetic,
         },
     };
     debug_assert_eq!(report.acceptance.matrix_complete, missing.is_empty());
@@ -2072,6 +3327,9 @@ pub fn compare_linear_masters(
             correlation,
             fitted_scale: 1.0,
             fitted_offset: 0.0,
+            reference_dynamic_range_adu: 0.0,
+            fitted_scale_error_percent: 0.0,
+            fitted_offset_normalized: 0.0,
             reason: Some(reason),
         };
     if reference.w != candidate.w || reference.h != candidate.h || reference.ch != candidate.ch {
@@ -2181,7 +3439,7 @@ pub fn compare_linear_masters(
         return Ok(incompatible(
             "Contenido, escala o estirado incompatible: correlación lineal insuficiente".into(),
             correlation.max(0.0),
-            registration_error,
+            registration_correction,
         ));
     }
 
@@ -2230,6 +3488,26 @@ pub fn compare_linear_masters(
         maxe = maxe.max(e.abs());
     }
     let rmse = (se / nf).sqrt();
+    let mut reference_samples: Vec<f64> = aligned
+        .iter()
+        .map(|(_, reference)| *reference)
+        .filter(|value| value.is_finite())
+        .collect();
+    reference_samples.sort_by(|a, b| a.total_cmp(b));
+    let percentile = |fraction: f64| -> f64 {
+        if reference_samples.is_empty() {
+            return 0.0;
+        }
+        let index = ((reference_samples.len() - 1) as f64 * fraction)
+            .round()
+            .clamp(0.0, (reference_samples.len() - 1) as f64) as usize;
+        reference_samples[index]
+    };
+    let robust_range = (percentile(0.995) - percentile(0.005)).abs();
+    let mean_reference_abs = sy.abs() / nf.max(1.0);
+    // Para una imagen casi constante, 1% de su nivel medio evita divisiones
+    // arbitrarias sin esconder un offset fotométrico material.
+    let photometric_scale = robust_range.max(mean_reference_abs * 0.01).max(1e-9);
     let (ref_bg, ref_noise) = crate::ds_bg_noise(&ref_luma);
     let (cand_bg, cand_noise) = crate::ds_bg_noise(&cand_luma);
     let ref_flux: f64 = ref_luma.iter().map(|&v| (v - ref_bg).max(0.0) as f64).sum();
@@ -2247,7 +3525,7 @@ pub fn compare_linear_masters(
         height: reference.h,
         channels: reference.ch,
         rmse_adu: rmse,
-        normalized_rmse: rmse / 65535.0,
+        normalized_rmse: rmse / photometric_scale,
         mean_absolute_error_adu: sae / nf,
         max_absolute_error_adu: maxe,
         flux_error_percent: if ref_flux.abs() > 1e-9 {
@@ -2274,6 +3552,9 @@ pub fn compare_linear_masters(
         correlation,
         fitted_scale: scale,
         fitted_offset: offset,
+        reference_dynamic_range_adu: photometric_scale,
+        fitted_scale_error_percent: 100.0 * (scale - 1.0).abs(),
+        fitted_offset_normalized: offset.abs() / photometric_scale,
         reason: None,
     })
 }
@@ -2420,22 +3701,89 @@ mod tests {
                 artifact_mask: None,
                 comparators: Vec::new(),
             }],
+            evidence: None,
         };
         let (matrix, missing) = benchmark_matrix_status(&partial);
         let evidence = matrix && validate_benchmark_manifest_data(&partial).valid;
         assert!(
             !matrix && !evidence && missing.len() == matrix_contract.required_scenarios.len() - 1
         );
+        let root = std::env::temp_dir().join(format!(
+            "zas-benchmark-missing-evidence-{}-{}",
+            std::process::id(),
+            BENCHMARK_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join("manifest.json");
+        let report_path = root.join("report.json");
+        write_json_atomic(&manifest_path, &partial).unwrap();
+        let report = generate_benchmark_report(
+            manifest_path.display().to_string(),
+            report_path.display().to_string(),
+        )
+        .unwrap();
+        assert!(!report.acceptance.publishable_claim);
+        assert!(!report.acceptance.artifact_hashes_verified);
+        assert!(!report.acceptance.execution_provenance_complete);
+        assert!(!report.acceptance.scenario_evidence_complete);
+        let mut name_only = partial.clone();
+        name_only.evidence = Some(BenchmarkManifestEvidence::default());
+        name_only.datasets[0].comparators.push(ComparatorRun {
+            engine: "AutoStakkert!4".into(),
+            version: "4.0.0".into(),
+            output: "/tmp/as4-output.tiff".into(),
+            elapsed_seconds: 1.0,
+            log: Some("/tmp/as4.log".into()),
+            processing: None,
+            parameters: Some(serde_json::json!({"stackPercent": 10})),
+        });
+        let name_only_validation = validate_benchmark_manifest_data(&name_only);
+        assert!(name_only_validation.errors.iter().any(|error| {
+            error.contains("falta procedencia estructurada") && error.contains("AutoStakkert!4")
+        }));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn embedded_dataset_matrix_is_authoritative_and_binds_domains() {
         let matrix = get_benchmark_dataset_matrix().unwrap();
-        assert_eq!(matrix.schema_version, "zenith-dataset-matrix-v1");
-        assert_eq!(matrix.required_scenarios.len(), 10);
+        assert_eq!(matrix.schema_version, "zenith-dataset-matrix-v3");
+        assert_eq!(
+            matrix
+                .claim_policy
+                .competitor
+                .minimum_speed_ratio_per_dataset,
+            1.05
+        );
+        assert_eq!(matrix.required_scenarios.len(), 20);
         assert!(matrix.required_scenarios.iter().all(|scenario| {
             !scenario.required_tags.is_empty() && !scenario.acceptance.is_empty()
         }));
+        assert!(matrix
+            .required_scenarios
+            .iter()
+            .filter(|scenario| scenario.domain == "planetary")
+            .all(|scenario| scenario.acceptance.iter().any(|id| id == "quality-superiority")));
+        for required_planetary_case in [
+            "planetary-ser-raw-format-matrix",
+            "planetary-ser-mono-solar-halpha",
+            "planetary-ser-mono-full-moon",
+            "planetary-ser-bayer-lunar-phase",
+            "planetary-ser-bayer-saturn-rings",
+            "planetary-avi-rgb-mono",
+            "planetary-mov-prores10-vfr",
+            "planetary-mp4-h264-vfr-bframes",
+            "planetary-lunar-mosaic-four-panel",
+            "planetary-batch-mixed-codecs",
+        ] {
+            assert!(
+                matrix
+                    .required_scenarios
+                    .iter()
+                    .any(|scenario| scenario.id == required_planetary_case),
+                "falta el caso competitivo {required_planetary_case}"
+            );
+        }
         let satellite = matrix
             .required_scenarios
             .iter()
@@ -2465,6 +3813,7 @@ mod tests {
                 artifact_mask: None,
                 comparators: Vec::new(),
             }],
+            evidence: None,
         };
         let validation = validate_benchmark_manifest_data(&wrong_domain);
         assert!(validation
@@ -2494,6 +3843,180 @@ mod tests {
         let (_, _, rate, no_regression) = competitive_quality_summary(&all_good);
         assert_eq!(rate, 100.0);
         assert!(no_regression);
+    }
+
+    #[test]
+    fn canonical_configuration_hash_is_order_independent() {
+        let left = serde_json::json!({
+            "z": [3, {"beta": true, "alpha": "x"}],
+            "a": 1
+        });
+        let right = serde_json::json!({
+            "a": 1,
+            "z": [3, {"alpha": "x", "beta": true}]
+        });
+        let left = canonical_json_bytes(&left);
+        let right = canonical_json_bytes(&right);
+        assert_eq!(left, right);
+        assert_eq!(sha256_bytes(&left), sha256_bytes(&right));
+        assert_eq!(sha256_bytes(&left).len(), 64);
+    }
+
+    #[test]
+    fn tampered_artifact_hash_invalidates_manifest_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "zas-benchmark-hash-tamper-{}-{}",
+            std::process::id(),
+            BENCHMARK_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.ser");
+        std::fs::write(&source, b"original benchmark bytes").unwrap();
+        let artifact = build_evidence_artifact(
+            "source".into(),
+            "planetary-ser-mono-surface".into(),
+            "source",
+            source.to_str().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&source, b"tampered benchmark bytes").unwrap();
+        let manifest = BenchmarkManifest {
+            suite_version: "hash-tamper-test".into(),
+            environment: Some(test_environment()),
+            datasets: vec![BenchmarkDataset {
+                id: "planetary-ser-mono-surface".into(),
+                domain: "planetary".into(),
+                sources: vec![source.display().to_string()],
+                zenith_output: None,
+                zenith_runs: Vec::new(),
+                baseline_cpu_seconds: None,
+                baseline_cpu_output: None,
+                baseline_cpu_processing: None,
+                baseline_cpu_parameters: None,
+                baseline_cpu_log: None,
+                artifact_free_reference: None,
+                artifact_mask: None,
+                comparators: Vec::new(),
+            }],
+            evidence: Some(BenchmarkManifestEvidence {
+                artifacts: vec![artifact],
+                executions: Vec::new(),
+                requirements: Vec::new(),
+            }),
+        };
+        let validation = validate_benchmark_manifest_data(&manifest);
+        assert!(!validation.valid);
+        assert!(!validation.artifact_hashes_verified);
+        assert!(validation
+            .errors
+            .iter()
+            .any(|error| error.contains("SHA-256 no coincide")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn photometric_and_total_registration_limits_are_binding() {
+        let limits = parse_dataset_matrix().unwrap().claim_policy.quality;
+        let passing = LinearImageComparison {
+            compatible: true,
+            width: 32,
+            height: 24,
+            channels: 1,
+            rmse_adu: 1.0,
+            normalized_rmse: 0.01,
+            mean_absolute_error_adu: 0.5,
+            max_absolute_error_adu: 2.0,
+            flux_error_percent: 1.0,
+            reference_noise_adu: 2.0,
+            candidate_noise_adu: 2.0,
+            noise_regression_percent: 0.0,
+            reference_fwhm_px: 3.0,
+            candidate_fwhm_px: 3.0,
+            fwhm_regression_percent: 0.0,
+            registration_error_px: 0.1,
+            registration_correction_px: 0.2,
+            correlation: 0.99,
+            fitted_scale: 1.0,
+            fitted_offset: 0.0,
+            reference_dynamic_range_adu: 100.0,
+            fitted_scale_error_percent: 0.0,
+            fitted_offset_normalized: 0.0,
+            reason: None,
+        };
+        assert!(benchmark_quality_pass(&passing, &limits));
+        for failing in [
+            LinearImageComparison {
+                normalized_rmse: limits.max_normalized_rmse + 0.001,
+                ..passing.clone()
+            },
+            LinearImageComparison {
+                fitted_scale_error_percent: limits.max_scale_error_percent + 0.01,
+                ..passing.clone()
+            },
+            LinearImageComparison {
+                fitted_offset_normalized: limits.max_normalized_offset + 0.001,
+                ..passing.clone()
+            },
+            LinearImageComparison {
+                registration_correction_px: limits.max_registration_correction_px + 0.01,
+                ..passing.clone()
+            },
+        ] {
+            assert!(!benchmark_quality_pass(&failing, &limits));
+        }
+    }
+
+    #[test]
+    fn competitor_advantage_is_required_for_every_dataset_run() {
+        let policy = parse_dataset_matrix().unwrap().claim_policy.competitor;
+        let ratios = [4.0, 1.04];
+        assert!(median(ratios.to_vec()).unwrap() >= 1.5);
+        let gate = build_dataset_competitor_gate("dataset", &ratios, 2, 2, true, &policy);
+        assert!(!gate.speed_pass && !gate.pass);
+        assert_eq!(gate.minimum_observed_speed_ratio, Some(1.04));
+
+        let passing = build_dataset_competitor_gate(
+            "dataset",
+            &[policy.minimum_speed_ratio_per_dataset, 1.2],
+            2,
+            2,
+            true,
+            &policy,
+        );
+        assert!(passing.every_run_covered && passing.pass);
+        let missing_run = build_dataset_competitor_gate("dataset", &[2.0], 2, 1, true, &policy);
+        assert!(!missing_run.every_run_covered && !missing_run.pass);
+    }
+
+    #[test]
+    fn publishable_quality_requires_positive_independent_advantage() {
+        let policy = parse_dataset_matrix()
+            .unwrap()
+            .claim_policy
+            .quality_superiority;
+        let requirement = |metrics: BTreeMap<String, f64>| BenchmarkRequirementEvidence {
+            dataset_id: "planetary-ser-mono-surface".into(),
+            category: "acceptance".into(),
+            requirement_id: "quality-superiority".into(),
+            passed: true,
+            evaluator: "automated".into(),
+            method: "independent-reference-v1".into(),
+            artifact_ids: vec!["truth".into()],
+            metrics,
+        };
+        let mut passing = BTreeMap::from([
+            ("objectiveWins".into(), 2.0),
+            ("objectiveLosses".into(), 0.0),
+            ("independentReferenceCount".into(), 1.0),
+            ("zenithCompositeScore".into(), 0.91),
+            ("competitorCompositeScore".into(), 0.88),
+        ]);
+        assert!(quality_superiority_metrics_pass(&requirement(passing.clone()), &policy));
+        passing.insert("objectiveWins".into(), 0.0);
+        assert!(!quality_superiority_metrics_pass(&requirement(passing.clone()), &policy));
+        passing.insert("objectiveWins".into(), 2.0);
+        passing.insert("objectiveLosses".into(), 1.0);
+        assert!(!quality_superiority_metrics_pass(&requirement(passing), &policy));
     }
 
     #[test]
@@ -2938,8 +4461,8 @@ mod tests {
                     artifact_mask: (scenario.id == "deep-sky-satellite-trails")
                         .then(|| mask_path.display().to_string()),
                     comparators: vec![ComparatorRun {
-                        engine: "synthetic-comparator".into(),
-                        version: "1.0-test".into(),
+                        engine: "AutoStakkert!4 (synthetic fixture)".into(),
+                        version: "4.x-test".into(),
                         output: output.display().to_string(),
                         elapsed_seconds: 1.6,
                         log: Some(log.display().to_string()),
@@ -2952,10 +4475,193 @@ mod tests {
                 }
             })
             .collect();
+        let executable = std::env::current_exe().unwrap();
+        let executable_artifact = build_evidence_artifact(
+            "suite:test-executable".into(),
+            "suite".into(),
+            "executable",
+            executable.to_str().unwrap(),
+        )
+        .unwrap();
+        let mut evidence = BenchmarkManifestEvidence {
+            artifacts: vec![executable_artifact],
+            executions: Vec::new(),
+            requirements: Vec::new(),
+        };
+        let config = |parameters: &Option<serde_json::Value>| {
+            let bytes = canonical_json_bytes(parameters.as_ref().unwrap());
+            (sha256_bytes(&bytes), bytes.len() as u64)
+        };
+        for dataset in &datasets {
+            let prefix = dataset.id.clone();
+            let source_id = format!("{prefix}:source");
+            let output_id = format!("{prefix}:output");
+            let log_id = format!("{prefix}:log");
+            let telemetry_id = format!("{prefix}:telemetry");
+            evidence.artifacts.push(
+                build_evidence_artifact(source_id, prefix.clone(), "source", &dataset.sources[0])
+                    .unwrap(),
+            );
+            evidence.artifacts.push(
+                build_evidence_artifact(
+                    output_id.clone(),
+                    prefix.clone(),
+                    "output",
+                    dataset.baseline_cpu_output.as_deref().unwrap(),
+                )
+                .unwrap(),
+            );
+            evidence.artifacts.push(
+                build_evidence_artifact(
+                    log_id.clone(),
+                    prefix.clone(),
+                    "log",
+                    dataset.baseline_cpu_log.as_deref().unwrap(),
+                )
+                .unwrap(),
+            );
+            evidence.artifacts.push(
+                build_evidence_artifact(
+                    telemetry_id.clone(),
+                    prefix.clone(),
+                    "telemetry",
+                    &dataset.zenith_runs[0].telemetry[0],
+                )
+                .unwrap(),
+            );
+            let mut recipe_artifact_ids = Vec::new();
+            if let Some(recipe) = dataset.zenith_runs[0].recipe.as_deref() {
+                let id = format!("{prefix}:recipe");
+                evidence.artifacts.push(
+                    build_evidence_artifact(id.clone(), prefix.clone(), "recipe", recipe).unwrap(),
+                );
+                recipe_artifact_ids.push(id);
+            }
+            let (baseline_hash, baseline_bytes) = config(&dataset.baseline_cpu_parameters);
+            evidence.executions.push(BenchmarkExecutionProvenance {
+                id: format!("{prefix}:baseline-execution"),
+                dataset_id: prefix.clone(),
+                role: "baseline-cpu".into(),
+                run_key: "baseline-cpu".into(),
+                product: "Zenith CPU Reference".into(),
+                vendor: "EMG".into(),
+                version: "test".into(),
+                distribution: "synthetic-test-binary".into(),
+                executable_artifact_id: "suite:test-executable".into(),
+                output_artifact_id: output_id.clone(),
+                log_artifact_ids: vec![log_id.clone()],
+                telemetry_artifact_ids: Vec::new(),
+                supporting_artifact_ids: Vec::new(),
+                configuration_sha256: baseline_hash,
+                configuration_bytes: baseline_bytes,
+                invocation: vec!["synthetic-baseline".into()],
+                timing_method: "synthetic steady clock".into(),
+            });
+            for run in &dataset.zenith_runs {
+                let (configuration_sha256, configuration_bytes) = config(&run.parameters);
+                evidence.executions.push(BenchmarkExecutionProvenance {
+                    id: format!("{prefix}:{}", zenith_run_key(run)),
+                    dataset_id: prefix.clone(),
+                    role: "zenith".into(),
+                    run_key: zenith_run_key(run),
+                    product: "Zenith Astro Stacker".into(),
+                    vendor: "EMG".into(),
+                    version: "test".into(),
+                    distribution: "synthetic-test-binary".into(),
+                    executable_artifact_id: "suite:test-executable".into(),
+                    output_artifact_id: output_id.clone(),
+                    log_artifact_ids: Vec::new(),
+                    telemetry_artifact_ids: vec![telemetry_id.clone()],
+                    supporting_artifact_ids: recipe_artifact_ids.clone(),
+                    configuration_sha256,
+                    configuration_bytes,
+                    invocation: vec!["synthetic-zenith".into()],
+                    timing_method: "synthetic steady clock".into(),
+                });
+            }
+            let comparator = &dataset.comparators[0];
+            let (configuration_sha256, configuration_bytes) = config(&comparator.parameters);
+            evidence.executions.push(BenchmarkExecutionProvenance {
+                id: format!("{prefix}:competitor-execution"),
+                dataset_id: prefix.clone(),
+                role: "competitor".into(),
+                run_key: comparator_run_key(comparator),
+                product: "AutoStakkert!4".into(),
+                vendor: "Emil Kraaikamp".into(),
+                version: comparator.version.clone(),
+                distribution: "synthetic-test-binary".into(),
+                executable_artifact_id: "suite:test-executable".into(),
+                output_artifact_id: output_id.clone(),
+                log_artifact_ids: vec![log_id.clone()],
+                telemetry_artifact_ids: Vec::new(),
+                supporting_artifact_ids: Vec::new(),
+                configuration_sha256,
+                configuration_bytes,
+                invocation: vec!["synthetic-autostakkert4".into()],
+                timing_method: "synthetic steady clock".into(),
+            });
+            let scenario = matrix
+                .required_scenarios
+                .iter()
+                .find(|scenario| scenario.id == dataset.id)
+                .unwrap();
+            for requirement_id in &scenario.acceptance {
+                let metrics = if requirement_id == "quality-superiority" {
+                    BTreeMap::from([
+                        ("objectiveWins".into(), 1.0),
+                        ("objectiveLosses".into(), 0.0),
+                        ("independentReferenceCount".into(), 1.0),
+                        ("zenithCompositeScore".into(), 0.91),
+                        ("competitorCompositeScore".into(), 0.90),
+                    ])
+                } else {
+                    BTreeMap::from([("assertions".into(), 1.0)])
+                };
+                evidence.requirements.push(BenchmarkRequirementEvidence {
+                    dataset_id: prefix.clone(),
+                    category: "acceptance".into(),
+                    requirement_id: requirement_id.clone(),
+                    passed: true,
+                    evaluator: "automated".into(),
+                    method: "synthetic automated test".into(),
+                    artifact_ids: vec![telemetry_id.clone(), output_id.clone()],
+                    metrics,
+                });
+            }
+            for requirement_id in &scenario.required_evidence {
+                let (id, kind, path) = match requirement_id.as_str() {
+                    "artifactFreeReference" => (
+                        format!("{prefix}:artifact-free-reference"),
+                        "reference",
+                        dataset.artifact_free_reference.as_deref().unwrap(),
+                    ),
+                    "artifactMask" => (
+                        format!("{prefix}:artifact-mask"),
+                        "mask",
+                        dataset.artifact_mask.as_deref().unwrap(),
+                    ),
+                    other => panic!("requiredEvidence sintético no implementado: {other}"),
+                };
+                evidence
+                    .artifacts
+                    .push(build_evidence_artifact(id.clone(), prefix.clone(), kind, path).unwrap());
+                evidence.requirements.push(BenchmarkRequirementEvidence {
+                    dataset_id: prefix.clone(),
+                    category: "requiredEvidence".into(),
+                    requirement_id: requirement_id.clone(),
+                    passed: true,
+                    evaluator: "automated".into(),
+                    method: "synthetic automated test".into(),
+                    artifact_ids: vec![id],
+                    metrics: BTreeMap::new(),
+                });
+            }
+        }
         let manifest = BenchmarkManifest {
             suite_version: "synthetic-matrix-v1".into(),
             environment: Some(test_environment()),
             datasets,
+            evidence: Some(evidence),
         };
         let manifest_path = root.join("manifest.json");
         let report_path = root.join("report.json");
@@ -2966,13 +4672,36 @@ mod tests {
         )
         .unwrap();
         assert!(report.validation.valid, "{:?}", report.validation.errors);
+        assert_eq!(report.schema_version, "zenith-benchmark-report-v5");
+        assert!(report.validation.artifact_hashes_verified);
+        assert!(report.validation.execution_provenance_complete);
+        assert!(report.validation.scenario_evidence_complete);
         assert!(report.acceptance.matrix_complete);
         assert!(report.acceptance.evidence_complete);
         assert_eq!(report.acceptance.median_vs_zenith_cpu, Some(2.2));
         assert_eq!(report.acceptance.median_vs_fastest_competitor, Some(1.6));
         assert_eq!(report.acceptance.quality_pass_rate_percent, 100.0);
         assert!(report.acceptance.competitive_regression_guard_pass);
-        assert!(report.acceptance.publishable_claim);
+        assert!(report.acceptance.planetary_compressed_2x_pass);
+        assert!(report.acceptance.planetary_ser_1_5x_pass);
+        assert!(report.acceptance.planetary_no_dataset_over_10pct_slower);
+        assert!(report.acceptance.competitor_per_dataset_pass);
+        assert!(report.acceptance.competitor.all_datasets_pass);
+        assert!(report
+            .acceptance
+            .competitor
+            .datasets
+            .iter()
+            .all(|gate| gate.pass && gate.every_run_covered));
+        assert_eq!(
+            report.acceptance.target_1_5x_pass,
+            report.acceptance.own_cpu.planetary_ser_pass
+        );
+        assert!(!report.acceptance.competitive_evidence_non_synthetic);
+        assert!(
+            !report.acceptance.publishable_claim,
+            "una fixture sintética jamás debe habilitar una afirmación pública"
+        );
         assert!(report_path.is_file());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3076,6 +4805,16 @@ mod tests {
         assert!(Path::new(&artifact.record_path).is_file());
         assert!(artifact.phases.contains_key("analysis"));
         assert!(artifact.phases.contains_key("stacking"));
+        assert_eq!(artifact.schema_version, "zenith-benchmark-run-v2");
+        assert_eq!(artifact.evidence_artifacts.len(), 3);
+        assert_eq!(artifact.execution_provenance.role, "zenith");
+        assert_eq!(artifact.execution_provenance.configuration_sha256.len(), 64);
+        assert!(artifact.evidence_artifacts.iter().all(|evidence| {
+            valid_sha256(&evidence.sha256)
+                && sha256_file(Path::new(&evidence.path)).is_ok_and(|(hash, size)| {
+                    hash == evidence.sha256 && size == evidence.size_bytes
+                })
+        }));
         assert!(get_active_benchmark_run().unwrap().is_none());
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&artifact.record_path).unwrap()).unwrap();

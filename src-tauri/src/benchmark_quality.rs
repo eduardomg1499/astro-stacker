@@ -65,7 +65,12 @@ fn sample_bilinear(img: &[f64], w: usize, h: usize, x: f64, y: f64) -> Option<f6
     let p10 = img[y0 * w + x0 + 1];
     let p01 = img[(y0 + 1) * w + x0];
     let p11 = img[(y0 + 1) * w + x0 + 1];
-    Some(p00 * (1.0 - fx) * (1.0 - fy) + p10 * fx * (1.0 - fy) + p01 * (1.0 - fx) * fy + p11 * fx * fy)
+    Some(
+        p00 * (1.0 - fx) * (1.0 - fy)
+            + p10 * fx * (1.0 - fy)
+            + p01 * (1.0 - fx) * fy
+            + p11 * fx * fy,
+    )
 }
 
 fn median_f64(values: &mut [f64]) -> f64 {
@@ -110,9 +115,17 @@ pub struct DiscGeometry {
 
 /// Estima centro y radio del disco por umbral medio entre las mesetas de
 /// fondo y disco (p5/p99), centroide y área. None si no hay disco plausible.
-pub fn estimate_disc_geometry(img: &[u16], w: usize, h: usize, channels: usize) -> Option<DiscGeometry> {
+pub fn estimate_disc_geometry(
+    img: &[u16],
+    w: usize,
+    h: usize,
+    channels: usize,
+) -> Option<DiscGeometry> {
     let luma = to_luma_f64(img, channels);
-    let luma_u16: Vec<u16> = luma.iter().map(|&v| v.round().clamp(0.0, 65535.0) as u16).collect();
+    let luma_u16: Vec<u16> = luma
+        .iter()
+        .map(|&v| v.round().clamp(0.0, 65535.0) as u16)
+        .collect();
     let lo = percentile_u16(&luma_u16, 0.05) as f64;
     let hi = percentile_u16(&luma_u16, 0.99) as f64;
     if hi - lo < 500.0 {
@@ -224,7 +237,11 @@ fn lsf_fwhm(t: &[f64]) -> Option<(usize, f64)> {
     for i in (1..=peak_i).rev() {
         if lsf[i - 1] <= half && lsf[i] >= half {
             let denom = lsf[i] - lsf[i - 1];
-            let frac = if denom.abs() > 1e-12 { (lsf[i] - half) / denom } else { 0.0 };
+            let frac = if denom.abs() > 1e-12 {
+                (lsf[i] - half) / denom
+            } else {
+                0.0
+            };
             left = Some(i as f64 - frac.clamp(0.0, 1.0));
             break;
         }
@@ -234,7 +251,11 @@ fn lsf_fwhm(t: &[f64]) -> Option<(usize, f64)> {
     for i in peak_i..n - 1 {
         if lsf[i] >= half && lsf[i + 1] <= half {
             let denom = lsf[i] - lsf[i + 1];
-            let frac = if denom.abs() > 1e-12 { (lsf[i] - half) / denom } else { 0.0 };
+            let frac = if denom.abs() > 1e-12 {
+                (lsf[i] - half) / denom
+            } else {
+                0.0
+            };
             right = Some(i as f64 + frac.clamp(0.0, 1.0));
             break;
         }
@@ -294,10 +315,16 @@ pub fn limb_metrics(
     let mut ring_sectors = 0usize;
     for s in 0..n_sectors {
         let angle = s as f64 / n_sectors as f64 * std::f64::consts::TAU;
-        let Some(profile) = radial_profile(&luma, w, h, geo, angle) else { continue };
-        let Some((_inner, outer, step)) = profile_plateaus(&profile) else { continue };
+        let Some(profile) = radial_profile(&luma, w, h, geo, angle) else {
+            continue;
+        };
+        let Some((_inner, outer, step)) = profile_plateaus(&profile) else {
+            continue;
+        };
         let t: Vec<f64> = profile.iter().map(|&v| (v - outer) / step).collect();
-        let Some((peak_i, fwhm_samples)) = lsf_fwhm(&t) else { continue };
+        let Some((peak_i, fwhm_samples)) = lsf_fwhm(&t) else {
+            continue;
+        };
         fwhms.push(fwhm_samples * PROFILE_STEP_PX);
         // Ringing = no-monotonicidad del perfil a cada lado del flanco:
         // hacia fuera, cuánto REMONTA t tras el descenso (lóbulo positivo
@@ -385,9 +412,8 @@ pub fn ap_seam_metric(
     // 4–6 px de distancia, sobre las MISMAS filas/columnas: así el disco se
     // compara con disco y el cielo con cielo, y el ratio no se sesga porque
     // una frontera cruce zonas con más estructura que la media global.
-    let grad_x_at = |x: usize, y: usize| -> f64 {
-        ((luma[y * w + x + 1] - luma[y * w + x - 1]) * 0.5).abs()
-    };
+    let grad_x_at =
+        |x: usize, y: usize| -> f64 { ((luma[y * w + x + 1] - luma[y * w + x - 1]) * 0.5).abs() };
     let grad_y_at = |x: usize, y: usize| -> f64 {
         ((luma[(y + 1) * w + x] - luma[(y - 1) * w + x]) * 0.5).abs()
     };
@@ -546,7 +572,10 @@ pub fn psnr_ssim(a: &[u16], b: &[u16], w: usize, h: usize) -> Option<PsnrSsim> {
     if blocks < 1.0 {
         return None;
     }
-    Some(PsnrSsim { psnr_db: psnr, ssim: ssim_sum / blocks })
+    Some(PsnrSsim {
+        psnr_db: psnr,
+        ssim: ssim_sum / blocks,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -719,9 +748,7 @@ pub fn quality_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::planetary_sim::{
-        make_frame_mono16, make_gain_panels, FrameSpec, PlanetScene,
-    };
+    use crate::planetary_sim::{make_frame_mono16, make_gain_panels, FrameSpec, PlanetScene};
 
     #[test]
     fn q_spearman_basics() {
@@ -734,11 +761,29 @@ mod tests {
     #[test]
     fn q_psnr_ssim_identity_and_noise() {
         let scene = PlanetScene::jupiter_like(96, 96);
-        let a = make_frame_mono16(&scene, &FrameSpec { dx: 0.0, dy: 0.0, blur_sigma: 0.5, noise_adu: 0.0, seed: 1 });
+        let a = make_frame_mono16(
+            &scene,
+            &FrameSpec {
+                dx: 0.0,
+                dy: 0.0,
+                blur_sigma: 0.5,
+                noise_adu: 0.0,
+                seed: 1,
+            },
+        );
         let same = psnr_ssim(&a, &a, 96, 96).unwrap();
         assert_eq!(same.psnr_db, 99.0);
         assert!((same.ssim - 1.0).abs() < 1e-9);
-        let b = make_frame_mono16(&scene, &FrameSpec { dx: 0.0, dy: 0.0, blur_sigma: 0.5, noise_adu: 400.0, seed: 2 });
+        let b = make_frame_mono16(
+            &scene,
+            &FrameSpec {
+                dx: 0.0,
+                dy: 0.0,
+                blur_sigma: 0.5,
+                noise_adu: 400.0,
+                seed: 2,
+            },
+        );
         let diff = psnr_ssim(&a, &b, 96, 96).unwrap();
         assert!(diff.psnr_db < 99.0 && diff.ssim < 0.9999);
     }
@@ -746,7 +791,16 @@ mod tests {
     #[test]
     fn q_disc_geometry_matches_scene() {
         let scene = PlanetScene::jupiter_like(160, 160);
-        let img = make_frame_mono16(&scene, &FrameSpec { dx: 3.0, dy: -2.0, blur_sigma: 0.6, noise_adu: 80.0, seed: 4 });
+        let img = make_frame_mono16(
+            &scene,
+            &FrameSpec {
+                dx: 3.0,
+                dy: -2.0,
+                blur_sigma: 0.6,
+                noise_adu: 80.0,
+                seed: 4,
+            },
+        );
         let geo = estimate_disc_geometry(&img, 160, 160, 1).expect("disco detectable");
         assert!((geo.cx - (scene.cx + 3.0)).abs() < 1.5, "cx: {}", geo.cx);
         assert!((geo.cy - (scene.cy - 2.0)).abs() < 1.5, "cy: {}", geo.cy);
@@ -757,9 +811,21 @@ mod tests {
     fn q_limb_sharpness_orders_blur() {
         let scene = PlanetScene::jupiter_like(192, 192);
         let fwhm_of = |sigma: f64| -> f64 {
-            let img = make_frame_mono16(&scene, &FrameSpec { dx: 0.0, dy: 0.0, blur_sigma: sigma, noise_adu: 0.0, seed: 1 });
+            let img = make_frame_mono16(
+                &scene,
+                &FrameSpec {
+                    dx: 0.0,
+                    dy: 0.0,
+                    blur_sigma: sigma,
+                    noise_adu: 0.0,
+                    seed: 1,
+                },
+            );
             let geo = estimate_disc_geometry(&img, 192, 192, 1).unwrap();
-            limb_metrics(&img, 192, 192, 1, &geo, 48).0.expect("nitidez medible").lsf_fwhm_px_median
+            limb_metrics(&img, 192, 192, 1, &geo, 48)
+                .0
+                .expect("nitidez medible")
+                .lsf_fwhm_px_median
         };
         let sharp = fwhm_of(0.4);
         let soft = fwhm_of(2.5);
@@ -812,7 +878,16 @@ mod tests {
     #[test]
     fn q_ap_seam_metric_flags_injected_seams() {
         let scene = PlanetScene::jupiter_like(192, 192);
-        let img = make_frame_mono16(&scene, &FrameSpec { dx: 0.0, dy: 0.0, blur_sigma: 0.8, noise_adu: 60.0, seed: 9 });
+        let img = make_frame_mono16(
+            &scene,
+            &FrameSpec {
+                dx: 0.0,
+                dy: 0.0,
+                blur_sigma: 0.8,
+                noise_adu: 60.0,
+                seed: 9,
+            },
+        );
         // Rejilla de APs 5×5 con paso 32 px empezando en 32.
         let mut xs = Vec::new();
         let mut ys = Vec::new();
@@ -869,7 +944,11 @@ mod tests {
         for y in 0..ch {
             for x in 0..cw {
                 canvas[y * cw + x] = if x < 100 {
-                    if x < 120 { a[y * 120 + x] } else { 0 }
+                    if x < 120 {
+                        a[y * 120 + x]
+                    } else {
+                        0
+                    }
                 } else if x >= 80 {
                     b[y * 120 + (x - 80)]
                 } else {
@@ -910,7 +989,13 @@ mod tests {
         for (i, &sigma) in sigmas.iter().enumerate() {
             let frame = make_frame_mono16(
                 &scene,
-                &FrameSpec { dx: 0.0, dy: 0.0, blur_sigma: sigma, noise_adu: 80.0, seed: 100 + i as u64 },
+                &FrameSpec {
+                    dx: 0.0,
+                    dy: 0.0,
+                    blur_sigma: sigma,
+                    noise_adu: 80.0,
+                    seed: 100 + i as u64,
+                },
             );
             // Secuencia EXACTA de producción (process_analysis_frame, camino
             // CPU): downscale 2x -> enhance_and_lap_raw (lap CRUDO) ->
@@ -922,11 +1007,15 @@ mod tests {
             let mut blur_out = Vec::new();
             let mut lap_out = Vec::new();
             let _legacy = crate::enhance_and_lap_raw(
-                &half, hw, hh, &mut blur_temp, &mut blur_out, &mut lap_out,
+                &half,
+                hw,
+                hh,
+                &mut blur_temp,
+                &mut blur_out,
+                &mut lap_out,
             );
             let mut quarter: Vec<u16> = Vec::new();
-            let score =
-                crate::score_frame_quality_v2(&blur_out, &lap_out, hw, hh, &mut quarter);
+            let score = crate::score_frame_quality_v2(&blur_out, &lap_out, hw, hh, &mut quarter);
             v2_scores.push(score as f64);
         }
         let truth: Vec<f64> = sigmas.iter().map(|&s| -s).collect();
@@ -982,7 +1071,9 @@ mod tests {
             h,
             3,
             65535,
-            reference.as_ref().map(|(r, rw, rh)| (r.as_slice(), *rw, *rh)),
+            reference
+                .as_ref()
+                .map(|(r, rw, rh)| (r.as_slice(), *rw, *rh)),
         );
         let json = serde_json::to_string_pretty(&report).unwrap();
         println!("{json}");

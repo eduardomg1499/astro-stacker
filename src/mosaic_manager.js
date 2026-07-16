@@ -208,6 +208,7 @@ export class MosaicManager {
 
         const hasTiles = this.tiles.length > 0;
         const hasVideo = this.tiles.some(t => t.type === 'video');
+        const allReady = hasTiles && this.tiles.every(t => t.type === 'image' && t.status === 'ready');
         window.__mosaicTutorialHasVideo = hasVideo;
 
         const labelEl = document.querySelector('#mosaic-workflow-controls > label');
@@ -225,7 +226,7 @@ export class MosaicManager {
             // DIRECT IMAGE WORKFLOW
             // All tiles are static images (or stacked results).
             this.setStepVisibility('generate');
-            this.ui.btnGenerate.disabled = false;
+            this.ui.btnGenerate.disabled = !allReady;
             if (labelEl) {
                 labelEl.innerHTML = '2. Proceso de Apilado <span style="color:#10b981; margin-left:8px; font-weight:bold;">✔ Completado</span>';
                 labelEl.style.color = '#10b981';
@@ -244,8 +245,11 @@ export class MosaicManager {
                 this.setStepVisibility('analyze');
             } else if (needsStacking) {
                 this.setStepVisibility('stack');
-            } else {
+            } else if (allReady) {
                 this.setStepVisibility('generate');
+                this.ui.btnGenerate.disabled = false;
+            } else {
+                this.setStepVisibility('none');
             }
         }
     }
@@ -265,7 +269,7 @@ export class MosaicManager {
     async openFileDialog() {
         const files = await openDialog({
             multiple: true,
-            filters: [{ name: 'Media', extensions: ['ser', 'avi', 'png', 'tif', 'tiff', 'jpg'] }]
+            filters: [{ name: 'Capturas o masters 16-bit', extensions: ['ser', 'avi', 'mp4', 'mov', 'mkv', 'm4v', 'png', 'tif', 'tiff'] }]
         });
         if (files) {
             this.handleFiles(Array.isArray(files) ? files : [files]);
@@ -371,7 +375,18 @@ export class MosaicManager {
         }
 
         const ext = path.split('.').pop().toLowerCase();
-        const isVideo = ['ser', 'avi'].includes(ext);
+        const isVideo = ['ser', 'avi', 'mp4', 'mov', 'mkv', 'm4v'].includes(ext);
+        const isLinearMaster = ['png', 'tif', 'tiff'].includes(ext);
+        if (!isVideo && !isLinearMaster) {
+            console.error(`Unsupported mosaic source: ${path}`);
+            if (window.showCustomAlert) {
+                window.showCustomAlert(
+                    t("general.error", "Error"),
+                    t("mosaic.errors.master_format", "El mosaico sólo acepta capturas para apilar o masters PNG/TIFF de 16 bits.")
+                );
+            }
+            return;
+        }
         const id = 'tile_' + Date.now() + Math.random().toString(36).substr(2, 5);
 
         const tile = {
@@ -931,6 +946,16 @@ export class MosaicManager {
 
     async generatePanorama() {
         if (this.tiles.length < 1) {
+            return;
+        }
+        const invalid = this.tiles.filter(t => t.type !== 'image' || t.status !== 'ready');
+        if (invalid.length > 0) {
+            if (window.showCustomAlert) {
+                window.showCustomAlert(
+                    t("general.error", "Error"),
+                    t("mosaic.errors.stack_first", "Todas las capturas deben analizarse y apilarse correctamente antes de generar el mosaico.")
+                );
+            }
             return;
         }
 

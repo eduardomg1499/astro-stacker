@@ -225,7 +225,220 @@ fn default_sharpen_intensity() -> f32 {
     0.5
 }
 
+/// Límites del contrato planetario expuesto por la UI. Mantenerlos aquí evita
+/// que los comandos tipados, los wrappers legados y el modo batch acepten
+/// combinaciones distintas (o valores JSON no finitos).
+pub(crate) const PLANETARY_MIN_AP_SIZE: usize = 8;
+pub(crate) const PLANETARY_MAX_AP_SIZE: usize = 104;
+pub(crate) const PLANETARY_MAX_CUSTOM_AP_POINTS: usize = 20_000;
+const PLANETARY_DRIZZLE_FACTORS: [f32; 5] = [1.0, 1.5, 2.0, 3.0, 4.0];
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_planetary_stack_parameters(
+    path: &str,
+    percent: f32,
+    custom_points: &[crate::smart_grid::ApPoint],
+    drizzle: f32,
+    ap_size: u32,
+    sharpen_intensity: f32,
+    anchor_override: Option<&[i32]>,
+    stacking_roi: Option<&[u32]>,
+) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("La ruta del origen planetario no puede estar vacía".into());
+    }
+    if !percent.is_finite() || !(0.0..=100.0).contains(&percent) || percent == 0.0 {
+        return Err(format!(
+            "El porcentaje a apilar debe ser finito y estar en (0, 100]; recibido {percent}"
+        ));
+    }
+    if !drizzle.is_finite()
+        || !PLANETARY_DRIZZLE_FACTORS
+            .iter()
+            .any(|&supported| (drizzle - supported).abs() <= 1.0e-6)
+    {
+        return Err(format!(
+            "Drizzle {drizzle} no soportado; usa únicamente 1x, 1.5x, 2x, 3x o 4x"
+        ));
+    }
+    if !(PLANETARY_MIN_AP_SIZE..=PLANETARY_MAX_AP_SIZE).contains(&(ap_size as usize)) {
+        return Err(format!(
+            "AP size debe estar entre {PLANETARY_MIN_AP_SIZE} y {PLANETARY_MAX_AP_SIZE} píxeles; recibido {ap_size}"
+        ));
+    }
+    if !sharpen_intensity.is_finite() || !(0.0..=1.0).contains(&sharpen_intensity) {
+        return Err(format!(
+            "La intensidad de sharpening debe ser finita y estar entre 0 y 1; recibido {sharpen_intensity}"
+        ));
+    }
+    if custom_points.len() > PLANETARY_MAX_CUSTOM_AP_POINTS {
+        return Err(format!(
+            "La malla contiene {} puntos AP; el máximo seguro es {PLANETARY_MAX_CUSTOM_AP_POINTS}",
+            custom_points.len()
+        ));
+    }
+    for (index, point) in custom_points.iter().enumerate() {
+        if !point.x.is_finite() || !point.y.is_finite() {
+            return Err(format!("El punto AP #{index} contiene coordenadas no finitas"));
+        }
+        if !(PLANETARY_MIN_AP_SIZE..=PLANETARY_MAX_AP_SIZE).contains(&point.size) {
+            return Err(format!(
+                "El punto AP #{index} tiene tamaño {}; debe estar entre {PLANETARY_MIN_AP_SIZE} y {PLANETARY_MAX_AP_SIZE}",
+                point.size
+            ));
+        }
+    }
+    if let Some(anchor) = anchor_override {
+        if anchor.len() != 2 {
+            return Err(format!(
+                "El ancla manual debe contener exactamente [x, y]; recibió {} valores",
+                anchor.len()
+            ));
+        }
+    }
+    if let Some(roi) = stacking_roi {
+        if roi.len() != 4 {
+            return Err(format!(
+                "La ROI de apilado debe contener exactamente [x, y, ancho, alto]; recibió {} valores",
+                roi.len()
+            ));
+        }
+        if roi[2] == 0 || roi[3] == 0 {
+            return Err("La ROI de apilado debe tener ancho y alto mayores que cero".into());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_planetary_stack_geometry(
+    width: usize,
+    height: usize,
+    custom_points: &[crate::smart_grid::ApPoint],
+    anchor_override: Option<&[i32]>,
+    stacking_roi: Option<&[u32]>,
+) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err(format!(
+            "El origen planetario declaró dimensiones inválidas: {width}x{height}"
+        ));
+    }
+    if let Some(anchor) = anchor_override {
+        // La longitud ya se valida en el contrato estático, pero se repite el
+        // guard antes de indexar para que esta función también sea segura sola.
+        if anchor.len() != 2 {
+            return Err("El ancla manual debe contener exactamente [x, y]".into());
+        }
+        if anchor[0] < 0
+            || anchor[1] < 0
+            || anchor[0] as usize >= width
+            || anchor[1] as usize >= height
+        {
+            return Err(format!(
+                "El ancla manual ({}, {}) queda fuera del origen {width}x{height}",
+                anchor[0], anchor[1]
+            ));
+        }
+    }
+    if let Some(roi) = stacking_roi {
+        if roi.len() != 4 {
+            return Err("La ROI de apilado debe contener exactamente [x, y, ancho, alto]".into());
+        }
+        let (x, y, roi_w, roi_h) = (roi[0] as u64, roi[1] as u64, roi[2] as u64, roi[3] as u64);
+        if roi_w == 0 || roi_h == 0 {
+            return Err("La ROI de apilado debe tener ancho y alto mayores que cero".into());
+        }
+        let right = x
+            .checked_add(roi_w)
+            .ok_or("La coordenada horizontal de la ROI se desbordó")?;
+        let bottom = y
+            .checked_add(roi_h)
+            .ok_or("La coordenada vertical de la ROI se desbordó")?;
+        if right > width as u64 || bottom > height as u64 {
+            return Err(format!(
+                "La ROI [{x}, {y}, {roi_w}, {roi_h}] queda fuera del origen {width}x{height}"
+            ));
+        }
+    }
+    for (index, point) in custom_points.iter().enumerate() {
+        if !point.x.is_finite()
+            || !point.y.is_finite()
+            || point.x < 0.0
+            || point.y < 0.0
+            || point.x >= width as f32
+            || point.y >= height as f32
+        {
+            return Err(format!(
+                "El punto AP #{index} ({}, {}) queda fuera del origen {width}x{height}",
+                point.x, point.y
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn planetary_output_dimensions(
+    width: usize,
+    height: usize,
+    stacking_roi: Option<&[u32]>,
+    drizzle: f32,
+) -> Result<(usize, usize), String> {
+    if !drizzle.is_finite()
+        || !PLANETARY_DRIZZLE_FACTORS
+            .iter()
+            .any(|&supported| (drizzle - supported).abs() <= 1.0e-6)
+    {
+        return Err("No se pueden calcular dimensiones con un drizzle no soportado".into());
+    }
+    let (base_w, base_h) = if let Some(roi) = stacking_roi {
+        if roi.len() != 4 || roi[2] == 0 || roi[3] == 0 {
+            return Err("La ROI de apilado no tiene el contrato [x, y, ancho, alto] válido".into());
+        }
+        (roi[2] as usize, roi[3] as usize)
+    } else {
+        (width, height)
+    };
+    let output_w = (base_w as f64 * drizzle as f64).floor();
+    let output_h = (base_h as f64 * drizzle as f64).floor();
+    if output_w < 1.0
+        || output_h < 1.0
+        || output_w > usize::MAX as f64
+        || output_h > usize::MAX as f64
+    {
+        return Err("Las dimensiones de salida planetaria se desbordaron".into());
+    }
+    let output = (output_w as usize, output_h as usize);
+    output
+        .0
+        .checked_mul(output.1)
+        .ok_or("La cantidad de píxeles de salida planetaria se desbordó")?;
+    Ok(output)
+}
+
 impl PlanetaryStackRequest {
+    pub fn validate_static(&self) -> Result<(), String> {
+        validate_planetary_stack_parameters(
+            &self.path,
+            self.percent,
+            &self.custom_points,
+            self.drizzle,
+            self.ap_size,
+            self.sharpen_intensity,
+            self.anchor_override.as_deref(),
+            self.stacking_roi.as_deref(),
+        )
+    }
+
+    pub fn validate_for_source(&self, width: usize, height: usize) -> Result<(), String> {
+        self.validate_static()?;
+        validate_planetary_stack_geometry(
+            width,
+            height,
+            &self.custom_points,
+            self.anchor_override.as_deref(),
+            self.stacking_roi.as_deref(),
+        )
+    }
+
     pub fn resolved_profile(mut self) -> Self {
         match self.profile {
             PipelineProfile::Fast => {
@@ -904,6 +1117,10 @@ pub struct DeepSkyResult {
     pub variance: Option<Vec<f32>>,
     pub neff: Option<Vec<f32>>,
     pub dq: Option<Vec<u32>>,
+    /// STRUCT (F7): mapa de evidencia multiescala validado A/B y su residual
+    /// (planos LUMA de w*h; None fuera del modo FullWithStruct).
+    pub struct_map: Option<Vec<f32>>,
+    pub struct_residual: Option<Vec<f32>>,
 }
 
 /// Alias transitorio para los módulos internos previos a la API tipada v2.
@@ -924,6 +1141,98 @@ pub fn new_job_id(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_planetary_stack_request() -> PlanetaryStackRequest {
+        PlanetaryStackRequest {
+            path: "/tmp/capture.ser".into(),
+            percent: 15.0,
+            custom_points: vec![crate::smart_grid::ApPoint {
+                x: 320.0,
+                y: 240.0,
+                size: 32,
+            }],
+            drizzle: 1.5,
+            ap_size: 32,
+            sharpen_intensity: 0.5,
+            anchor_override: Some(vec![320, 240]),
+            stacking_roi: Some(vec![100, 80, 400, 300]),
+            is_surface: false,
+            bayer_override: None,
+            sharpened: false,
+            double_pass: true,
+            warping_analysis: true,
+            normalize_colors: true,
+            is_v3: true,
+            target_type: "planet_small".into(),
+            keep_full_frame: None,
+            align_rgb: None,
+            compute_policy: ComputePolicy::default(),
+            profile: PipelineProfile::Custom,
+        }
+    }
+
+    #[test]
+    fn planetary_stack_validation_rejects_non_finite_and_unsupported_scalars() {
+        let mut request = valid_planetary_stack_request();
+        assert!(request.validate_static().is_ok());
+
+        request.percent = f32::NAN;
+        assert!(request.validate_static().unwrap_err().contains("porcentaje"));
+        request.percent = 15.0;
+        request.drizzle = 2.5;
+        assert!(request.validate_static().unwrap_err().contains("Drizzle"));
+        request.drizzle = 2.0;
+        request.sharpen_intensity = f32::INFINITY;
+        assert!(request.validate_static().unwrap_err().contains("sharpening"));
+        request.sharpen_intensity = 0.5;
+        request.ap_size = 0;
+        assert!(request.validate_static().unwrap_err().contains("AP size"));
+    }
+
+    #[test]
+    fn planetary_stack_validation_guards_vectors_before_indexing() {
+        let mut request = valid_planetary_stack_request();
+        request.anchor_override = Some(vec![1]);
+        assert!(request.validate_static().unwrap_err().contains("exactamente"));
+
+        request.anchor_override = Some(vec![640, 10]);
+        request.stacking_roi = Some(vec![0, 0, 640]);
+        assert!(request.validate_static().unwrap_err().contains("ROI"));
+
+        request.stacking_roi = Some(vec![600, 470, 80, 20]);
+        assert!(request
+            .validate_for_source(640, 480)
+            .unwrap_err()
+            .contains("fuera"));
+
+        request.stacking_roi = Some(vec![0, 0, 640, 480]);
+        assert!(request
+            .validate_for_source(640, 480)
+            .unwrap_err()
+            .contains("ancla"));
+    }
+
+    #[test]
+    fn planetary_stack_validation_bounds_custom_points_and_output_geometry() {
+        let mut request = valid_planetary_stack_request();
+        request.custom_points[0].x = f32::NAN;
+        assert!(request.validate_static().unwrap_err().contains("no finitas"));
+        request.custom_points[0].x = 640.0;
+        assert!(request
+            .validate_for_source(640, 480)
+            .unwrap_err()
+            .contains("punto AP"));
+
+        request.custom_points[0].x = 320.0;
+        request.anchor_override = Some(vec![320, 240]);
+        request.stacking_roi = Some(vec![100, 80, 400, 300]);
+        assert_eq!(
+            planetary_output_dimensions(640, 480, request.stacking_roi.as_deref(), 1.5)
+                .unwrap(),
+            (600, 450)
+        );
+        assert!(request.validate_for_source(640, 480).is_ok());
+    }
 
     #[test]
     fn job_ids_remain_unique_within_the_same_clock_tick() {
