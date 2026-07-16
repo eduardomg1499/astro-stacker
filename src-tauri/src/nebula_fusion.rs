@@ -1711,6 +1711,91 @@ mod tests {
         );
     }
 
+    /// Gate F7 end-to-end: run_lite con struct_mode — una "nebulosa" (blob
+    /// gaussiano) presente en TODOS los frames aparece en STRUCT; los mapas
+    /// existen y el residual sobre el blob es pequeño frente a su señal.
+    #[test]
+    fn gate_f7_struct_mode_end_to_end() {
+        let (w, h) = (96, 96);
+        let n = 16usize; // mínimo operativo del preflight (división 8/8)
+        let scene = crate::deepsky_sim::SimScene {
+            width: w,
+            height: h,
+            background_adu: 250.0,
+            gradient_adu_per_px: (0.0, 0.0),
+            color: [1.0, 1.0, 1.0],
+            stars: vec![crate::deepsky_sim::SimStar {
+                x: 48.0,
+                y: 48.0,
+                flux_adu: 30_000.0,
+                fwhm_px: 8.0,
+                moffat_beta: None,
+            }],
+        };
+        let sensor = flat_sensor(3.0);
+        let mut frames = Vec::new();
+        for k in 0..n {
+            let exp = crate::deepsky_sim::SimExposure {
+                exposure_s: 60.0,
+                dx: 0.0,
+                dy: 0.0,
+                seed: 71_000 + k as u64,
+            };
+            frames.push(crate::deepsky_sim::render_light(&scene, &sensor, &exp).0);
+        }
+        let registered = identity_registered(n);
+        let norms = neutral_norms(n);
+        let loc: Vec<Option<Vec<f32>>> = vec![None; n];
+        let cancel = no_cancel();
+        let ctx = NfLiteContext {
+            registered: &registered,
+            norms: &norms,
+            loc_fields: &loc,
+            loc_grid: 24,
+            w_out: w,
+            h_out: h,
+            ch: 1,
+            use_lanczos: false,
+            cancel: &cancel,
+            cfa: None,
+            full: false,
+            stars: &[],
+            struct_mode: true,
+        };
+        let frames_ref = &frames;
+        let load = |i: usize| -> Result<crate::DsImage, String> {
+            Ok(crate::DsImage {
+                data: frames_ref[i].clone(),
+                w,
+                h,
+                ch: 1,
+                bayer: None,
+            })
+        };
+        let out = run_lite(&ctx, &load, &mut |_, _, _| {}).expect("run_lite struct");
+        let sm = out.struct_map.as_ref().expect("struct_map");
+        let sr = out.struct_residual.as_ref().expect("struct_residual");
+        let acc = out.struct_accepted.as_ref().expect("accepted");
+        let total_accepted: usize = acc.iter().map(|&(a, _)| a).sum();
+        assert!(total_accepted > 0, "STRUCT no aceptó ningún coeficiente");
+        // El blob aparece en STRUCT: su señal sobre el coarse en el centro es
+        // una fracción sustancial de la señal real (~413 ADU de pico).
+        let center = 48 * w + 48;
+        let signal = out.final_data[center] - 250.0;
+        assert!(
+            sm[center] - 250.0 > 0.5 * signal,
+            "STRUCT no retiene el blob: {} vs señal {}",
+            sm[center] - 250.0,
+            signal
+        );
+        // Residual pequeño sobre el blob (la estructura fue aceptada).
+        assert!(
+            sr[center].abs() < 0.5 * signal,
+            "residual retiene el blob: {}",
+            sr[center]
+        );
+    }
+
     /// VAR y NEFF con frames idénticos en ruido: VAR≈σ²/N (±10%), NEFF≈N.
     #[test]
     fn test_var_and_neff_for_equal_frames() {

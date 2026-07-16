@@ -10604,6 +10604,7 @@ fn main() {
                 planetary_generation_gate: Mutex::new(()),
                 active_req_id: AtomicUsize::new(0),
                 cancel_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                job_registry: pipeline::JobRegistry::new(),
                 license_manager,
             });
             Ok(())
@@ -10652,6 +10653,7 @@ fn main() {
             benchmark::compare_linear_masters,
             prepare_deepsky_stack,
             run_deepsky_stack,
+            deepsky_cancel_job,
             prepare_deepsky_session,
             run_deepsky_session,
             stack_deepsky,

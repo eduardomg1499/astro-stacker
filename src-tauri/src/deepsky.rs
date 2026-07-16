@@ -4162,6 +4162,56 @@ fn deepsky_export_float32(
                 diagnostics.push(path.display().to_string());
             }
         }
+        // Nebula Contrast (F7): export estético DECLARADAMENTE NO LINEAL —
+        // el SCI con las estructuras VALIDADAS realzadas (ganancia
+        // proporcional a la luma) y stretch STF. Nunca sustituye al máster:
+        // el nombre del archivo y los headers lo rotulan sin ambigüedad.
+        if let Some(struct_map) = result.struct_map.as_ref() {
+            cancellation_checkpoint(cancel.as_ref(), "exportación de Nebula Contrast")?;
+            let (w, h, chn) = (result.width, result.height, result.channels);
+            let npx = w * h;
+            let levels = crate::deepsky_struct::recommended_levels(w, h);
+            let (_details, coarse) =
+                crate::deepsky_struct::starlet_decompose(struct_map, w, h, levels);
+            const CONTRAST_BOOST: f32 = 0.8;
+            let mut rgb16 = vec![0u16; npx * 3];
+            for p in 0..npx {
+                let detail = struct_map[p] - coarse[p];
+                let mut luma = 0.0f32;
+                for c in 0..chn {
+                    luma += result.data[p * chn + c];
+                }
+                luma /= chn as f32;
+                let gain = (1.0 + CONTRAST_BOOST * detail / luma.max(50.0)).clamp(0.2, 5.0);
+                for c in 0..3 {
+                    let v = result.data[p * chn + c.min(chn - 1)] * gain;
+                    rgb16[p * 3 + c] = v.clamp(0.0, 65535.0) as u16;
+                }
+            }
+            let stretched = ds_stretch16(&rgb16, w, h, "linked", 0.55);
+            let out_ch = if chn == 1 { 1 } else { 3 };
+            let contrast_f32: Vec<f32> = if out_ch == 1 {
+                (0..npx).map(|p| stretched[p * 3] as f32).collect()
+            } else {
+                stretched.iter().map(|&v| v as f32).collect()
+            };
+            let path = parent.join(format!("{stem}_contrast_NONLINEAR.fits"));
+            ds_save_float32_fits_cancellable(
+                &path,
+                &contrast_f32,
+                w,
+                h,
+                out_ch,
+                &[
+                    ("EXTNAME", "'CONTRAST'".to_string()),
+                    ("ZASJOB", format!("'{}'", result.id)),
+                    ("ZASNONLI", "T".to_string()),
+                    ("ZASBOOST", format!("{CONTRAST_BOOST:.2}")),
+                ],
+                Some(cancel.as_ref()),
+            )?;
+            diagnostics.push(path.display().to_string());
+        }
         if let Some(dq) = result.dq.as_ref() {
             cancellation_checkpoint(cancel.as_ref(), "exportación de DQ")?;
             let dq_f32: Vec<f32> = dq.iter().map(|&b| b as f32).collect();
@@ -6053,6 +6103,14 @@ fn prepare_deepsky_stack_impl(request: DeepSkyStackRequest, with_advisor: bool) 
     }
 }
 
+/// F8: cancela UN stack deep-sky por su id de trabajo (el `resultId` que la
+/// UI recibe). Devuelve false si el trabajo ya terminó o no existe. El botón
+/// Cancelar global sigue funcionando (barre todos los trabajos).
+#[tauri::command]
+fn deepsky_cancel_job(state: State<'_, AppState>, job_id: String) -> bool {
+    state.job_registry.cancel(&job_id)
+}
+
 #[tauri::command]
 async fn run_deepsky_stack(
     app: tauri::AppHandle,
@@ -7497,7 +7555,12 @@ async fn stack_deepsky(
     state
         .cancel_requested
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    let cancel = state.cancel_requested.clone();
+    // F8: flag de cancelación POR TRABAJO. El botón global barre el registro
+    // (cancel_planetary_jobs → cancel_all), así que ambos caminos cortan este
+    // stack; el guard da de baja el id incluso ante error temprano o pánico.
+    let cancel = state.job_registry.register(&ds_result_id);
+    let _job_guard =
+        pipeline::JobGuard::new(state.job_registry.clone(), ds_result_id.clone());
     let compute_policy = compute_policy.unwrap_or_default();
     // RESCATE DE DETALLE (v1): ponderación local por FWHM de estrellas. Solo
     // el motor streaming κσ CPU la aplica en esta fase; se anuncia cuando se

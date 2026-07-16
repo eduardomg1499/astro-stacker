@@ -109,6 +109,123 @@ pub fn cancellation_checkpoint(
     }
 }
 
+/// Registro de trabajos (F8): cancelación POR TRABAJO además del botón
+/// global. Los motores largos (NF-Full hoy, EIDR mañana) registran su id al
+/// arrancar y consultan SU flag en cada checkpoint; el cancel global barre
+/// todos los registrados (compatibilidad con el botón Cancelar actual).
+/// Clonable (Arc interno) para que un guard pueda dar de baja el trabajo en
+/// Drop incluso ante errores tempranos o pánicos.
+#[derive(Clone, Default)]
+pub struct JobRegistry {
+    jobs: std::sync::Arc<
+        Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+    >,
+}
+
+impl JobRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registra un trabajo y devuelve SU flag de cancelación (en false).
+    /// Un id repetido reutiliza el flag existente (reintentos idempotentes).
+    pub fn register(&self, id: &str) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let mut jobs = self.jobs.lock().unwrap();
+        jobs.entry(id.to_string())
+            .or_insert_with(|| {
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+            })
+            .clone()
+    }
+
+    /// Cancela un trabajo por id. Devuelve false si no está registrado.
+    pub fn cancel(&self, id: &str) -> bool {
+        let jobs = self.jobs.lock().unwrap();
+        match jobs.get(id) {
+            Some(flag) => {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Da de baja un trabajo terminado (su flag deja de ser alcanzable).
+    pub fn finish(&self, id: &str) {
+        self.jobs.lock().unwrap().remove(id);
+    }
+
+    /// Cancela TODOS los trabajos activos (botón Cancelar global).
+    pub fn cancel_all(&self) {
+        for flag in self.jobs.lock().unwrap().values() {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn active(&self) -> usize {
+        self.jobs.lock().unwrap().len()
+    }
+}
+
+/// Da de baja el trabajo al salir del scope — también en errores tempranos
+/// (`?`) y pánicos, para que el registro no acumule ids muertos.
+pub struct JobGuard {
+    registry: JobRegistry,
+    id: String,
+}
+
+impl JobGuard {
+    pub fn new(registry: JobRegistry, id: String) -> Self {
+        Self { registry, id }
+    }
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        self.registry.finish(&self.id);
+    }
+}
+
+#[cfg(test)]
+mod job_registry_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn test_job_registry_cancel_by_id_and_global() {
+        let reg = JobRegistry::new();
+        let a = reg.register("job-a");
+        let b = reg.register("job-b");
+        assert_eq!(reg.active(), 2);
+        // Cancelación individual: solo afecta a su trabajo.
+        assert!(reg.cancel("job-a"));
+        assert!(a.load(Ordering::Relaxed));
+        assert!(!b.load(Ordering::Relaxed));
+        assert!(!reg.cancel("job-x"));
+        // Global: barre lo que quede activo.
+        reg.cancel_all();
+        assert!(b.load(Ordering::Relaxed));
+        // El checkpoint corta con el mensaje esperado.
+        let err = cancellation_checkpoint(&b, "prueba").unwrap_err();
+        assert!(err.contains("Cancelado"));
+    }
+
+    #[test]
+    fn test_job_guard_deregisters_on_drop_and_reuse_is_fresh() {
+        let reg = JobRegistry::new();
+        {
+            let flag = reg.register("job-g");
+            let _guard = JobGuard::new(reg.clone(), "job-g".into());
+            flag.store(true, Ordering::Relaxed);
+            assert_eq!(reg.active(), 1);
+        }
+        assert_eq!(reg.active(), 0);
+        // Re-registrar tras finish parte con flag limpio.
+        let fresh = reg.register("job-g");
+        assert!(!fresh.load(Ordering::Relaxed));
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PipelineProfile {

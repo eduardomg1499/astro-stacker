@@ -2915,6 +2915,10 @@ struct AppState {
     // scope del comando. Se resetea al INICIAR una operacion de usuario, y lo
     // consultan los bucles pesados para abortar limpio con Err("Cancelado").
     cancel_requested: Arc<std::sync::atomic::AtomicBool>,
+    // F8: cancelación POR TRABAJO (NF-Full/EIDR). El cancel global de arriba
+    // sigue funcionando; el registro permite cortar un stack concreto sin
+    // tumbar los demás y limpia su flag al terminar (JobGuard).
+    job_registry: pipeline::JobRegistry,
     license_manager: Arc<LicenseManager>,
 }
 

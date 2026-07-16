@@ -89,6 +89,9 @@ fn cancel_planetary_jobs(state: &AppState) {
         .unwrap_or_else(|error| error.into_inner());
     let _ = state.active_req_id.fetch_add(1, Ordering::AcqRel);
     state.cancel_requested.store(true, Ordering::Release);
+    // F8: el cancel global también barre los trabajos registrados por id
+    // (stacks deep-sky NF; en el futuro, solvers EIDR).
+    state.job_registry.cancel_all();
     state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
