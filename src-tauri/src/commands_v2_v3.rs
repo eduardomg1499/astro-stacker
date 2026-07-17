@@ -7767,6 +7767,16 @@ fn stack_video_liquid_warping_impl(
     };
 
     let stack_peak_vram = std::sync::atomic::AtomicU64::new(0);
+    // PR-23 (cambio de flujo aprobado 2026-07-16): conservar los shifts por
+    // (frame, AP) de la pasada 1 para que la pasada 2 haga solo un re-SAD
+    // local (radio 4) + LK contra la referencia reconstruida, en vez de la
+    // búsqueda piramidal completa. ~30 MB para 1028 frames × 2597 APs.
+    // ZAS_FULL_PASS2=1 restaura la búsqueda completa en la pasada 2.
+    let reuse_pass1_seeds =
+        total_passes > 1 && std::env::var("ZAS_FULL_PASS2").ok().as_deref() != Some("1");
+    let pass1_seed_store: std::sync::Mutex<
+        std::collections::HashMap<usize, (f32, f32, Vec<(f32, f32, f32)>)>,
+    > = std::sync::Mutex::new(std::collections::HashMap::new());
     for pass in 0..total_passes {
     let pass_label = if total_passes > 1 {
         format!("[Pasada {}/{}] ", pass + 1, total_passes)
@@ -8351,7 +8361,10 @@ fn stack_video_liquid_warping_impl(
                         // mapas 4× y un dispatch para toda la malla. Los AP sin
                         // señal/textura se desactivan antes del kernel. Ante
                         // device-loss/OOM el pase completo se reintenta en CPU.
+                        // PR-23: con semillas de la pasada 1 el SAD grueso GPU
+                        // sobra (y su readback síncrono serializaba el worker).
                         let gpu_coarse_shifts = if gpu_sad_enabled.load(Ordering::Relaxed)
+                            && !(reuse_pass1_seeds && pass > 0)
                             && search_r > 3
                             && master_ds_w > 0
                             && !custom_points.is_empty()
@@ -8404,6 +8417,17 @@ fn stack_video_liquid_warping_impl(
                         };
 
                         let t_ls = std::time::Instant::now();
+                        // PR-23: semilla de la pasada 1 para este frame (solo
+                        // en pasadas >0 y con el modo activo).
+                        let pass1_seed = if reuse_pass1_seeds && pass > 0 {
+                            pass1_seed_store
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .get(&frame_data.idx)
+                                .cloned()
+                        } else {
+                            None
+                        };
                         let local_shifts = compute_frame_local_shifts(
                             &master_edges,
                             ap_mc_ref,
@@ -8432,7 +8456,19 @@ fn stack_video_liquid_warping_impl(
                             ap_lap_floor,
                             chunk.len() < stack_threads && custom_points.len() >= 128,
                             gpu_coarse_shifts.as_deref(),
+                            pass1_seed
+                                .as_ref()
+                                .map(|(rdx1, rdy1, shifts1)| (*rdx1, *rdy1, shifts1.as_slice())),
                         );
+                        if reuse_pass1_seeds && pass == 0 {
+                            pass1_seed_store
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .insert(
+                                    frame_data.idx,
+                                    (render_dx, render_dy, local_shifts.clone()),
+                                );
+                        }
                         crate::perf_trace::add_ns(pt, ptag, "local_shifts", t_ls.elapsed().as_nanos(), 1);
 
                         let combined_ap_mask: Vec<bool> = (0..custom_points.len())
@@ -9170,6 +9206,12 @@ fn compute_frame_local_shifts(
     // Semillas gruesas 4× calculadas por wgpu. None conserva la ruta CPU
     // completa; cada entrada None cae localmente al matcher piramidal CPU.
     gpu_coarse: Option<&[Option<crate::gpu_analysis::SadMatch>]>,
+    // PR-23 (cambio de flujo aprobado): en la pasada 2, el shift TOTAL por AP
+    // medido en la pasada 1 (render1_dx, render1_dy, shifts1) siembra un
+    // re-SAD LOCAL (radio 4) en vez de la búsqueda piramidal completa; el LK
+    // se re-ejecuta igual contra la referencia reconstruida. q==0 en la
+    // pasada 1 → búsqueda normal para ese AP.
+    pass1_prior: Option<(f32, f32, &[(f32, f32, f32)])>,
 ) -> Vec<(f32, f32, f32)> {
     // En lotes normales se paraleliza sólo por frame. En capturas muy cortas,
     // el caller puede repartir los APs entre los workers ociosos; el lease es
@@ -9199,7 +9241,33 @@ fn compute_frame_local_shifts(
             && fy_i >= half_box
             && fy_i < (h_in as i32 - half_box)
         {
-            let (dx, dy, sad) = if let Some(seed) = gpu_coarse
+            // PR-23: la semilla de la pasada 1 tiene prioridad — re-expresa el
+            // shift total master→frame de P1 en las coordenadas del centro de
+            // búsqueda de ESTA pasada (render2 puede diferir tras el rebuild).
+            let prior_seed = pass1_prior.and_then(|(rdx1, rdy1, shifts1)| {
+                shifts1.get(ap_i).and_then(|&(pdx, pdy, pq)| {
+                    (pq > 0.0).then_some((
+                        rdx1 + pdx + ax - fx_i as f32,
+                        rdy1 + pdy + ay - fy_i as f32,
+                    ))
+                })
+            });
+            let (dx, dy, sad) = if let Some((sdx, sdy)) = prior_seed {
+                crate::alignment::refine_best_match_sad_from_coarse(
+                    master_edges,
+                    f_edges,
+                    w_in,
+                    h_in,
+                    ax as usize,
+                    ay as usize,
+                    fx_i as usize,
+                    fy_i as usize,
+                    box_size,
+                    sdx,
+                    sdy,
+                    4.0,
+                )
+            } else if let Some(seed) = gpu_coarse
                 .and_then(|v| v.get(ap_i))
                 .copied()
                 .flatten()
@@ -14486,6 +14554,86 @@ mod zas_v3_tests {
             + 900.0 * (x * 0.71 + 1.3).sin() * (y * 0.63).cos()
     }
 
+    /// PR-23: la pasada sembrada (re-SAD local radio 4 + LK) debe reproducir
+    /// los shifts de la búsqueda completa cuando la semilla es el resultado
+    /// de la propia pasada 1 contra la misma referencia: el mínimo discreto
+    /// es el mismo y el LK converge al mismo subpíxel.
+    #[test]
+    fn pass2_seeded_shifts_match_full_search() {
+        let w = 320usize;
+        let h = 320usize;
+        let ap_size = 32usize;
+        let mut master = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                master[y * w + x] = truth_at(x as f32, y as f32) as u16;
+            }
+        }
+        let mut points = Vec::new();
+        let mut yy = 24usize;
+        while yy < h - 24 {
+            let mut xx = 24usize;
+            while xx < w - 24 {
+                points.push(ApPoint { x: xx as f32, y: yy as f32, size: ap_size });
+                xx += 21;
+            }
+            yy += 21;
+        }
+        let n_aps = points.len();
+        let all_valid = vec![true; n_aps];
+        let no_dark = vec![0.0f32; n_aps];
+        let no_normals: Vec<Option<(f32, f32)>> = vec![None; n_aps];
+        let master_edges = enhance_for_alignment_with_amount(&master, w, h, 4.0);
+        let mut master_ds = Vec::new();
+        let (mds_w, _) = downscale_4x(&master_edges, w, h, &mut master_ds);
+        let (ap_mc, ap_ml) =
+            precompute_ap_master_stats(&master_edges, &master, w, h, &points, ap_size);
+
+        let mut rng: u64 = 0xC0FF_EE00;
+        let gx = 2.4f32;
+        let gy = -1.6f32;
+        let sxf = |x: f32, y: f32| 1.5 * ((y / 150.0 * 6.283).sin() * (x / 170.0 * 6.283).cos());
+        let syf = |x: f32, y: f32| 1.5 * ((x / 160.0 * 6.283).sin() * (y / 145.0 * 6.283).cos());
+        let mut frame = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let xf = x as f32;
+                let yf = y as f32;
+                let v = truth_at(xf - gx - sxf(xf, yf), yf - gy - syf(xf, yf))
+                    + (lcg_next(&mut rng) * 2.0 - 1.0) * 120.0;
+                frame[y * w + x] = v.clamp(0.0, 65535.0) as u16;
+            }
+        }
+        let f_edges = enhance_for_alignment_with_amount(&frame, w, h, 4.0);
+        let mut f_ds = Vec::new();
+        let _ = downscale_4x(&f_edges, w, h, &mut f_ds);
+
+        let full = compute_frame_local_shifts(
+            &master_edges, &ap_mc, &ap_ml, &master_ds, mds_w,
+            &f_edges, &frame, &f_ds, w, h,
+            &points, &all_valid, &no_dark, &no_normals,
+            gx, gy, ap_size, 12, true, true, 0.0, false, None, None,
+        );
+        let seeded = compute_frame_local_shifts(
+            &master_edges, &ap_mc, &ap_ml, &master_ds, mds_w,
+            &f_edges, &frame, &f_ds, w, h,
+            &points, &all_valid, &no_dark, &no_normals,
+            gx, gy, ap_size, 12, true, true, 0.0, false, None,
+            Some((gx, gy, full.as_slice())),
+        );
+        let mut worst = 0.0f32;
+        for (a, b) in full.iter().zip(seeded.iter()) {
+            if a.2 <= 0.0 && b.2 <= 0.0 {
+                continue;
+            }
+            worst = worst.max((a.0 - b.0).abs()).max((a.1 - b.1).abs());
+        }
+        assert!(
+            worst <= 0.05,
+            "shifts sembrados divergen {worst} px de la búsqueda completa"
+        );
+    }
+
     #[test]
     fn test_end_to_end_synthetic_stack_recovers_ground_truth() {
         let w = 320usize;
@@ -14582,6 +14730,7 @@ mod zas_v3_tests {
                 0.0, // gate de textura apagado: el harness mide TODOS los APs
                 false,
                 None,
+                None, // PR-23: sin semillas de pasada previa en el harness
             );
 
             // Milimetric per-AP accuracy vs the injected warp field
