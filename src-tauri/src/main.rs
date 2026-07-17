@@ -26,6 +26,7 @@ mod eidr; // F9: reconstrucción forward-model sucesora de Drizzle
 mod deepsky_sim; // simulador de verdad conocida (solo tests/benchmarks)
 mod benchmark_quality; // métricas de artefactos planetarios (arnés A/B F0)
 mod planetary_quality; // contratos científicos/perf compartidos del stack planetario
+mod perf_trace; // cronómetros por fase del pipeline planetario (volcado JSON)
 #[cfg(any(test, feature = "planetary-sim"))]
 mod planetary_sim; // simulador planetario de verdad conocida (solo tests/benchmarks)
 mod integral_image;

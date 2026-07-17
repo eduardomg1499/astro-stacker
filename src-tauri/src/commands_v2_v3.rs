@@ -1981,6 +1981,10 @@ fn perform_standardized_analysis(
         PlanetaryJobToken::for_app(app, request_id, state.cancel_requested.clone());
     let pipeline_job_id = new_job_id("planetary-analysis");
     let pipeline_started = std::time::Instant::now();
+    // perf_trace: desglose por fase del análisis (volcado JSON al terminar;
+    // el guard vuelca también en errores/cancelaciones con completed=false).
+    let pt = crate::perf_trace::job_start("analysis", path);
+    let pt_guard = crate::perf_trace::JobGuard::new(pt);
 
     let prefix_str = progress_prefix.clone().unwrap_or_default();
     let get_msg = |msg: &str| {
@@ -2004,8 +2008,14 @@ fn perform_standardized_analysis(
         let token = job_token.clone();
         Arc::new(move || token.is_cancelled()) as FfmpegCancelCheck
     };
-    let r = VideoInput::open_cancelable(path, app, open_cancel)?;
+    let r = {
+        let _s = crate::perf_trace::span(pt, "open");
+        VideoInput::open_cancelable(path, app, open_cancel)?
+    };
     let (tw, th, tf, tbp) = (r.width(), r.height(), r.frame_count(), r.bpp());
+    crate::perf_trace::job_meta(pt, "geometry", format!("{tw}x{th}"));
+    crate::perf_trace::job_meta(pt, "frames", tf);
+    crate::perf_trace::job_meta(pt, "reader", if r.is_ffmpeg() { "ffmpeg" } else { "native" });
     let source_fingerprint = planetary_source_fingerprint(path)?;
     if matches!(compute_policy, ComputePolicy::GpuOnly) {
         match crate::gpu_stack::gpu_runtime() {
@@ -2186,6 +2196,8 @@ fn perform_standardized_analysis(
                             fallback_reason: None,
                         },
                     );
+                    crate::perf_trace::job_meta(pt, "cache", "hit");
+                    let _ = pt_guard.finish_ok();
                     return Ok(AnalysisResult {
                         metadata: VideoMetadata {
                             width: tw,
@@ -2242,11 +2254,14 @@ fn perform_standardized_analysis(
     // centroid delta pre-centers each frame's SAD search → unbounded motion.
     let cog_assist;
 
-    let (_analysis_ref_idx, analysis_ref_raw) = if r.is_ffmpeg() {
-        select_signal_frame_from_source(&unified_source, tw, th, tbp, tf / 2)?
-    } else {
-        let index = select_signal_frame_index(&r, tw, th, tbp, cid, tf / 2);
-        (index, read_exact_source_frame(&unified_source, index)?)
+    let (_analysis_ref_idx, analysis_ref_raw) = {
+        let _s = crate::perf_trace::span(pt, "ref_select");
+        if r.is_ffmpeg() {
+            select_signal_frame_from_source(&unified_source, tw, th, tbp, tf / 2)?
+        } else {
+            let index = select_signal_frame_index(&r, tw, th, tbp, cid, tf / 2);
+            (index, read_exact_source_frame(&unified_source, index)?)
+        }
     };
     emit_progress(app, &get_msg("Preparando referencia..."), 4.0, None);
 
@@ -2495,7 +2510,10 @@ fn perform_standardized_analysis(
                     }
                     Ok(())
                 };
-                let warm = run_gpu_probe();
+                let warm = {
+                    let _s = crate::perf_trace::span(pt, "gpu_probe");
+                    run_gpu_probe()
+                };
                 // MEDICIÓN JUSTA para Auto: el camino real procesa LOTES
                 // (recommended_batch_len frames por submit/readback). Antes se
                 // cronometraba UN solo frame — todo el overhead de submit+map
@@ -2755,16 +2773,19 @@ fn perform_standardized_analysis(
             4.0,
             None,
         );
-        let decode_probe = benchmark_ffmpeg_decode_route(
-            bin,
-            path,
-            rt.codec_name(),
-            cid,
-            tw,
-            th,
-            rt.rotation(),
-            Some(&job_token),
-        );
+        let decode_probe = {
+            let _s = crate::perf_trace::span(pt, "decode_probe");
+            benchmark_ffmpeg_decode_route(
+                bin,
+                path,
+                rt.codec_name(),
+                cid,
+                tw,
+                th,
+                rt.rotation(),
+                Some(&job_token),
+            )
+        };
         let fmt_probe = |v: Option<f32>| v.map(|s| format!("{:.2}s", s)).unwrap_or_else(|| "falló".into());
         if decode_probe.prefer_hardware {
             log_to_front(
@@ -2936,6 +2957,9 @@ fn perform_standardized_analysis(
 
                 let producer_token = job_token.clone();
                 let producer = std::thread::spawn(move || {
+                    // perf_trace: tiempo de pared del hilo decodificador completo
+                    // (incluye esperas de backpressure del ring).
+                    let _s = crate::perf_trace::span(pt, "decode_thread");
                     let mut frame_idx = 0;
                     loop {
                         // recv con timeout: si el consumidor está dentro de un
@@ -3021,8 +3045,16 @@ fn perform_standardized_analysis(
                         // latencia, VRAM y amortización del submit. El productor
                         // continúa decodificando en los 32 buffers del ring
                         // mientras este lote está en GPU.
+                        let dw_t0 = std::time::Instant::now();
                         let items: Vec<(usize, Vec<u8>)> =
                             stream.by_ref().take(gpu_batch_len).collect();
+                        crate::perf_trace::add_ns(
+                            pt,
+                            crate::perf_trace::GLOBAL_PASS,
+                            "decode_wait",
+                            dw_t0.elapsed().as_nanos(),
+                            items.len() as u64,
+                        );
                         if items.is_empty() { break; }
                         // Cancelación a nivel de lote: evita mandar trabajo a la
                         // GPU cuando el usuario ya canceló (los workers CPU de
@@ -3032,6 +3064,8 @@ fn perform_standardized_analysis(
                             if gpu_analysis_failed.load(Ordering::Relaxed) {
                                 (0..items.len()).map(|_| None).collect()
                             } else {
+                                let _s = crate::perf_trace::span(pt, "gpu_preprocess")
+                                    .items(items.len() as u64);
                                 match preprocess_gpu_batch(&items) {
                                     Ok(outputs) => outputs.into_iter().map(Some).collect(),
                                     Err(e) => {
@@ -3045,6 +3079,8 @@ fn perform_standardized_analysis(
                                     }
                                 }
                             };
+                        let score_n = items.len() as u64;
+                        let score_t0 = std::time::Instant::now();
                         let analyzed: Vec<(FrameAlignmentData, Vec<u8>)> = analysis_pool.install(|| {
                             items
                                 .into_par_iter()
@@ -3093,6 +3129,13 @@ fn perform_standardized_analysis(
                                 )
                                 .collect()
                         });
+                        crate::perf_trace::add_ns(
+                            pt,
+                            crate::perf_trace::GLOBAL_PASS,
+                            "score",
+                            score_t0.elapsed().as_nanos(),
+                            score_n,
+                        );
                         for (result, raw) in analyzed {
                             collected.push(result);
                             let _ = tx_empty.send(raw);
@@ -3100,6 +3143,10 @@ fn perform_standardized_analysis(
                     }
                     collected
                 } else {
+                    // perf_trace: en la rama CPU decode y scoring van entrelazados
+                    // (par_bridge); "cpu_pass" mide el conjunto y "decode_thread"
+                    // el decodificador — la resta aproxima el coste de scoring.
+                    let _s = crate::perf_trace::span(pt, "cpu_pass");
                     analysis_pool.install(|| rx_full
                         .into_iter()
                         .par_bridge()
@@ -3281,6 +3328,8 @@ fn perform_standardized_analysis(
                     if gpu_analysis_failed.load(Ordering::Relaxed) {
                         (0..items.len()).map(|_| None).collect()
                     } else {
+                        let _s = crate::perf_trace::span(pt, "gpu_preprocess")
+                            .items(items.len() as u64);
                         match preprocess_gpu_batch(&items) {
                             Ok(outputs) => outputs.into_iter().map(Some).collect(),
                             Err(e) => {
@@ -3294,6 +3343,8 @@ fn perform_standardized_analysis(
                             }
                         }
                     };
+                let score_n = items.len() as u64;
+                let score_t0 = std::time::Instant::now();
                 let batch_stats: Vec<FrameAlignmentData> = pool.install(|| {
                     items
                         .into_par_iter()
@@ -3333,6 +3384,13 @@ fn perform_standardized_analysis(
                         )
                         .collect()
                 });
+                crate::perf_trace::add_ns(
+                    pt,
+                    crate::perf_trace::GLOBAL_PASS,
+                    "score",
+                    score_t0.elapsed().as_nanos(),
+                    score_n,
+                );
                 collected.extend(batch_stats);
                 if sc.is_cancelled() { break; }
             }
@@ -3340,6 +3398,7 @@ fn perform_standardized_analysis(
             let _ = producer.join();
             collected
         } else {
+            let _s = crate::perf_trace::span(pt, "cpu_pass").items(tf as u64);
             let native_stats: Result<Vec<FrameAlignmentData>, String> = pool.install(|| {
                 (0..tf)
                     .into_par_iter()
@@ -3464,7 +3523,10 @@ fn perform_standardized_analysis(
     )?;
     emit_progress(app, "Finalizando...", 100.0, None);
     let mut buf = Vec::new();
-    let raw = read_exact_source_frame(&unified_source, best_frame_idx)?;
+    let raw = {
+        let _s = crate::perf_trace::span(pt, "preview_decode");
+        read_exact_source_frame(&unified_source, best_frame_idx)?
+    };
     let u16_raw = raw_to_u16_buffer(&raw, tw, th, tbp);
     drop(raw);
     if let Err(error) =
@@ -3532,6 +3594,7 @@ fn perform_standardized_analysis(
                 .then_some("Fallback CPU tras fallo de preprocesado GPU".into()),
         },
     );
+    let _ = pt_guard.finish_ok();
     Ok(AnalysisResult {
         metadata: VideoMetadata {
             width: tw,
@@ -5565,6 +5628,12 @@ fn stack_video_liquid_warping_impl(
     }
     let pipeline_job_id = new_job_id("planetary-stack");
     let pipeline_started = std::time::Instant::now();
+    // perf_trace: desglose por fase del apilado (JSON al terminar; el guard
+    // vuelca también en errores/cancelaciones con completed=false).
+    let pt = crate::perf_trace::job_start("stack", &path);
+    let pt_guard = crate::perf_trace::JobGuard::new(pt);
+    crate::perf_trace::job_meta(pt, "double_pass", double_pass);
+    crate::perf_trace::job_meta(pt, "drizzle", drizzle);
     let is_surface = is_surface || is_surface_target(&target_type);
     let warping_analysis = zenith_should_warp(&target_type, is_surface, warping_analysis);
     let target_category = if is_surface {
@@ -6198,7 +6267,11 @@ fn stack_video_liquid_warping_impl(
         drop(master_raw);
         (master, None)
     } else {
-        let batch = master_source.read_batch(&prepared_ref_indices, None)?;
+        let batch = {
+            let _s = crate::perf_trace::span(pt, "ref_decode")
+                .items(prepared_ref_indices.len() as u64);
+            master_source.read_batch(&prepared_ref_indices, None)?
+        };
         let best_position = batch
             .indices
             .iter()
@@ -7233,6 +7306,9 @@ fn stack_video_liquid_warping_impl(
     'pass_attempt: loop {
     let use_gpu_pass = gpu_rt.is_some() && !gpu_disabled_this_stack;
     let rx = spawn_prefetcher(pass_label.clone());
+    // perf_trace: pase 1-based; el span "total" cubre el intento completo.
+    let ptag = (pass + 1) as u8;
+    let _pass_span = crate::perf_trace::span_pass(pt, ptag, "total");
     global_align_counter.store(0, std::sync::atomic::Ordering::Relaxed);
 
     // ===== TELEMETRIA EN VIVO del pase (evento "stack_telemetry") =====
@@ -7399,6 +7475,7 @@ fn stack_video_liquid_warping_impl(
                                     t0.elapsed().as_nanos() as u64,
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
+                                crate::perf_trace::add_ns(pt, ptag, "gpu_accum", t0.elapsed().as_nanos(), 1);
                                 t_upload
                                     .fetch_add(job_bytes, std::sync::atomic::Ordering::Relaxed);
                                 // devolver el buffer de pixeles al pool
@@ -7415,14 +7492,17 @@ fn stack_video_liquid_warping_impl(
                     {
                         return None;
                     }
-                    match acc.finish() {
+                    let t_fin = std::time::Instant::now();
+                    let out = match acc.finish() {
                         Ok(d) => Some(d),
                         Err(e) => {
                             eprintln!("[gpu] fallo la descarga del pase: {e}");
                             fail.store(true, std::sync::atomic::Ordering::Relaxed);
                             None
                         }
-                    }
+                    };
+                    crate::perf_trace::add_ns(pt, ptag, "gpu_finish", t_fin.elapsed().as_nanos(), 1);
+                    out
                 });
                 (Some(tx), Some(handle))
             }
@@ -7444,14 +7524,17 @@ fn stack_video_liquid_warping_impl(
     // PERF: master-side AP statistics are constant within a pass — compute
     // once instead of per frame × AP (recomputed per pass: the double-pass
     // rebuilds the master from the pass-1 stack).
-    let (ap_master_contrast, ap_master_lap) = precompute_ap_master_stats(
-        &master_edges,
-        &master_mono,
-        w_in,
-        h_in,
-        &custom_points,
-        ap_size as usize,
-    );
+    let (ap_master_contrast, ap_master_lap) = {
+        let _s = crate::perf_trace::span_pass(pt, (pass + 1) as u8, "ap_master_stats");
+        precompute_ap_master_stats(
+            &master_edges,
+            &master_mono,
+            w_in,
+            h_in,
+            &custom_points,
+            ap_size as usize,
+        )
+    };
 
     // TEXTURE-TRUST GATE (solo limb_protect: superficie / disco lunar grande):
     // con mallas finas (24px) y umbral bajo, el generador pone APs en zonas SIN
@@ -7480,6 +7563,7 @@ fn stack_video_liquid_warping_impl(
         // recv con timeout: CANCELAR debe despertar al apilador aunque el hilo
         // cargador esté a mitad de un lote grande (antes esperaba el recv()
         // bloqueante hasta que el lote entero terminara de decodificarse).
+        let dw_t0 = std::time::Instant::now();
         let frame_map = loop {
             match rx.recv_timeout(std::time::Duration::from_millis(250)) {
                 Ok(Ok(m)) => break Some(m),
@@ -7503,6 +7587,7 @@ fn stack_video_liquid_warping_impl(
                 }
             }
         };
+        crate::perf_trace::add_ns(pt, ptag, "decode_wait", dw_t0.elapsed().as_nanos(), 1);
         let Some(frame_map) = frame_map else { break };
         if frame_map.is_empty() {
             prefetch_error = Some("El cargador publicó un lote de frames vacío".to_string());
@@ -7659,7 +7744,9 @@ fn stack_video_liquid_warping_impl(
                             normalize_planetary_frame_exposure_mono_inplace(&mut sc.mono_buf, surface_ref_p90);
                         }
                     } else {
+                        let t_deb = std::time::Instant::now();
                         debayer_into_buffer(u16_data, w_in, h_in, color_id, &mut sc.rgb_buf);
+                        crate::perf_trace::add_ns(pt, ptag, "debayer", t_deb.elapsed().as_nanos(), 1);
                         if is_surface_logic || large_disc {
                             normalize_surface_frame_exposure_inplace(&mut sc.rgb_buf, surface_ref_p90, false);
                         } else {
@@ -7724,8 +7811,10 @@ fn stack_video_liquid_warping_impl(
                             10
                         };
 
+                        let t_enh = std::time::Instant::now();
                         enhance_for_alignment_into_amount(&sc.mono_buf, w_in, h_in, &mut sc.f_s1, &mut sc.f_s2, &mut sc.f_edges, align_amount);
                         downscale_4x(&sc.f_edges, w_in, h_in, &mut sc.f_ds);
+                        crate::perf_trace::add_ns(pt, ptag, "enhance", t_enh.elapsed().as_nanos(), 1);
 
                         // FRAME-LEVEL ALIGNMENT VERIFICATION: the cached analysis
                         // shift can be wrong for individual frames (clouds, seeing
@@ -7750,6 +7839,7 @@ fn stack_video_liquid_warping_impl(
                                 && (est_x as usize) < w_ds
                                 && (est_y as usize) < h_ds
                             {
+                                let t_sg = std::time::Instant::now();
                                 let (cdx, cdy, _) = crate::alignment::find_best_match_sad(
                                     &master_ds_buf,
                                     &sc.f_ds,
@@ -7761,6 +7851,7 @@ fn stack_video_liquid_warping_impl(
                                     vbox,
                                     16,
                                 );
+                                crate::perf_trace::add_ns(pt, ptag, "sad_global", t_sg.elapsed().as_nanos(), 1);
                                 let measured_dx = (est_x as f32 - cx as f32 + cdx) * 4.0;
                                 let measured_dy = (est_y as f32 - cy as f32 + cdy) * 4.0;
                                 if (measured_dx - render_dx).abs() > 6.0
@@ -7804,7 +7895,8 @@ fn stack_video_liquid_warping_impl(
                                     )
                                 })
                                 .collect();
-                            match crate::gpu_analysis::search_sad_points(
+                            let t_sap = std::time::Instant::now();
+                            let sap = match crate::gpu_analysis::search_sad_points(
                                 &master_ds_buf,
                                 &sc.f_ds,
                                 master_ds_w,
@@ -7820,11 +7912,14 @@ fn stack_video_liquid_warping_impl(
                                     }
                                     None
                                 }
-                            }
+                            };
+                            crate::perf_trace::add_ns(pt, ptag, "sad_ap_gpu", t_sap.elapsed().as_nanos(), 1);
+                            sap
                         } else {
                             None
                         };
 
+                        let t_ls = std::time::Instant::now();
                         let local_shifts = compute_frame_local_shifts(
                             &master_edges,
                             ap_mc_ref,
@@ -7854,6 +7949,7 @@ fn stack_video_liquid_warping_impl(
                             chunk.len() < stack_threads && custom_points.len() >= 128,
                             gpu_coarse_shifts.as_deref(),
                         );
+                        crate::perf_trace::add_ns(pt, ptag, "local_shifts", t_ls.elapsed().as_nanos(), 1);
 
                         let combined_ap_mask: Vec<bool> = (0..custom_points.len())
                             .map(|i| {
@@ -7923,6 +8019,7 @@ fn stack_video_liquid_warping_impl(
                                 .collect();
                             // send() con canal cerrado = submitter caido: el pase
                             // se reintentara en CPU, no hay nada que hacer aqui.
+                            let t_sub = std::time::Instant::now();
                             let _ = gtx.send(crate::gpu_stack::GpuFrameJob {
                                 pixels: px_buf,
                                 apq,
@@ -7933,9 +8030,11 @@ fn stack_video_liquid_warping_impl(
                                 q_off_x,
                                 q_off_y,
                             });
+                            crate::perf_trace::add_ns(pt, ptag, "gpu_submit_wait", t_sub.elapsed().as_nanos(), 1);
                             return;
                         }
 
+                        let t_acc = std::time::Instant::now();
                         if is_mono_stack {
                             sc.wg.fill(0.0);
                             sc.ww.fill(0.0);
@@ -7991,6 +8090,7 @@ fn stack_video_liquid_warping_impl(
                             acc_g_sh.accumulate(&sc.wg, &sc.ww, d_quality, dq_w, dq_h, q_off_x, q_off_y, q_weight, frame_data.idx, coverage_weighting);
                             acc_b_sh.accumulate(&sc.wb, &sc.ww, d_quality, dq_w, dq_h, q_off_x, q_off_y, q_weight, frame_data.idx, coverage_weighting);
                         }
+                        crate::perf_trace::add_ns(pt, ptag, "warp_accum_cpu", t_acc.elapsed().as_nanos(), 1);
                     }
                 }
             }
@@ -8113,6 +8213,7 @@ fn stack_video_liquid_warping_impl(
         {
             break;
         }
+        let _s = crate::perf_trace::span(pt, "rebuild_ref");
         // KAPPA-SIGMA: freeze the pass-1 per-pixel statistics into winsorization
         // bounds for pass 2. Built BEFORE the accumulators are recreated; the
         // m2 planes are released with the pass-1 stackers right after.
@@ -8372,6 +8473,7 @@ fn stack_video_liquid_warping_impl(
     // Apply stack sharpening if enabled via UI toggle ("Sharpened" checkbox)
     if sharpened {
         emit_progress(&app, "Aplicando Sharpening (Wavelet Multi-Band)...", 96.0, None);
+        let _s = crate::perf_trace::span(pt, "sharpen");
         apply_autostakkert_sharpening(&mut final_u16, w_out, h_out, sharpen_intensity, &target_type);
     }
 
@@ -8515,6 +8617,7 @@ fn stack_video_liquid_warping_impl(
         },
     );
 
+    let _ = pt_guard.finish_ok();
     Ok(preview_src)
 }
 
