@@ -779,12 +779,21 @@ fn available_planetary_frame_budget_bytes() -> usize {
     let mut system = System::new();
     system.refresh_memory();
     let available = usize::try_from(system.available_memory()).unwrap_or(usize::MAX);
+    let total = usize::try_from(system.total_memory()).unwrap_or(usize::MAX);
     if available == 0 {
         return 512 * 1024 * 1024;
     }
-    // El pipe, el ring y los scratch de análisis coexisten. Un solo frame no
-    // puede consumir más de 1/4 de la RAM actualmente libre ni más de 4 GiB.
-    (available / 4).min(4usize.saturating_mul(1024 * 1024 * 1024))
+    // El pipe, el ring y los scratch de análisis coexisten: un solo frame no
+    // puede consumir más de 1/4 de la RAM disponible ni más de 4 GiB. PERO en
+    // macOS la "disponible" instantánea puede caer a cientos de MB con las
+    // cachés del sistema llenas (se reclaman bajo presión) — eso NO es un OOM
+    // real, y abortaba un frame 20MP RGB48 legítimo (111.6 MiB) en una
+    // máquina de 24 GB (baseline 2026-07-17). Suelo: 1/32 de la RAM TOTAL,
+    // que el OS siempre puede liberar para una asignación puntual.
+    let floor = total / 32;
+    (available / 4)
+        .max(floor)
+        .min(4usize.saturating_mul(1024 * 1024 * 1024))
 }
 
 fn validate_planetary_frame_geometry_with_budget(
