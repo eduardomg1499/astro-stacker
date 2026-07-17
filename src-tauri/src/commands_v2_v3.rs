@@ -2120,7 +2120,26 @@ fn perform_standardized_analysis(
                         );
                         preview
                     } else {
-                        let raw = read_exact_source_frame(&unified_source, bi)?;
+                        // PR-10: caché de decode primero — la preview del
+                        // caché de análisis ya no re-decodifica 0..best_idx.
+                        let raw = match (if let VideoInput::Ffmpeg(ref fr) = r {
+                            read_selected_from_decode_cache(
+                                path,
+                                &fr.ffmpeg_path,
+                                &fr.codec_name,
+                                fr.rotation,
+                                tw,
+                                th,
+                                tbp,
+                                cid,
+                                &[bi],
+                            )
+                        } else {
+                            None
+                        }) {
+                            Some(mut frames) => frames.pop().unwrap_or_default(),
+                            None => read_exact_source_frame(&unified_source, bi)?,
+                        };
                         let u16_raw = raw_to_u16_buffer(&raw, tw, th, tbp);
                         drop(raw);
                         if let Err(error) =
@@ -3525,7 +3544,27 @@ fn perform_standardized_analysis(
     let mut buf = Vec::new();
     let raw = {
         let _s = crate::perf_trace::span(pt, "preview_decode");
-        read_exact_source_frame(&unified_source, best_frame_idx)?
+        // PR-10: caché de decode primero — evita re-decodificar 0..best_idx
+        // cuando el análisis sembró el caché (o una pasada anterior lo dejó).
+        let cached = if let VideoInput::Ffmpeg(ref fr) = r {
+            read_selected_from_decode_cache(
+                path,
+                &fr.ffmpeg_path,
+                &fr.codec_name,
+                fr.rotation,
+                tw,
+                th,
+                tbp,
+                cid,
+                &[best_frame_idx],
+            )
+        } else {
+            None
+        };
+        match cached {
+            Some(mut frames) => frames.pop().unwrap_or_default(),
+            None => read_exact_source_frame(&unified_source, best_frame_idx)?,
+        }
     };
     let u16_raw = raw_to_u16_buffer(&raw, tw, th, tbp);
     drop(raw);
@@ -4099,6 +4138,72 @@ fn decode_cache_expected_set(
     } else {
         Vec::new()
     }
+}
+
+/// PR-10: sirve índices exactos desde el caché de decode por-frame (sembrado
+/// por el análisis o por una pasada anterior) SIN tocar el códec. La clave
+/// incluye la ruta de decode con la que se sembró; se prueban la CPU y los
+/// backends HW plausibles de la plataforma (stats fallidos ≈ gratis).
+/// Todo-o-nada: cualquier índice ausente/corrupto devuelve None y el caller
+/// decodifica como siempre. Frames en bytes LE (contrato de read_batch).
+fn read_selected_from_decode_cache(
+    path: &str,
+    ffmpeg_path: &str,
+    codec_name: &str,
+    rotation: i32,
+    width: usize,
+    height: usize,
+    bpp: usize,
+    color_id: i32,
+    indices: &[usize],
+) -> Option<Vec<Vec<u8>>> {
+    if indices.is_empty() {
+        return None;
+    }
+    let cache_dir = std::env::temp_dir().join("astro_stacker_cache");
+    let is_color_stream = ffmpeg_stream_is_color(color_id);
+    let cached_frame_len = width * height * (if is_color_stream { 3 } else { 1 });
+    let mut routes: Vec<String> = vec![ffmpeg_decode_route_label(ffmpeg_path, None)];
+    let hw_candidates: &[&str] = if cfg!(target_os = "macos") {
+        &["videotoolbox"]
+    } else if cfg!(target_os = "windows") {
+        &["d3d11va", "dxva2", "cuda", "qsv"]
+    } else {
+        &["vaapi", "cuda"]
+    };
+    for backend in hw_candidates {
+        routes.push(ffmpeg_decode_route_label(ffmpeg_path, Some(backend)));
+    }
+    for route in routes {
+        let key = ffmpeg_decode_cache_key(
+            path, width, height, bpp, color_id, rotation, codec_name, &route,
+        );
+        // Sonda barata antes de leer todo: el primer índice debe existir.
+        let first = decode_cache_frame_path(&cache_dir, key, indices[0]);
+        if !first.exists() {
+            continue;
+        }
+        let frames: Option<Vec<Vec<u8>>> = indices
+            .par_iter()
+            .map(|&idx| {
+                read_cached_frame(
+                    &decode_cache_frame_path(&cache_dir, key, idx),
+                    cached_frame_len,
+                )
+                .map(|frame| {
+                    let mut raw = Vec::with_capacity(frame.len() * 2);
+                    for value in frame {
+                        raw.extend_from_slice(&value.to_le_bytes());
+                    }
+                    raw
+                })
+            })
+            .collect();
+        if let Some(frames) = frames {
+            return Some(frames);
+        }
+    }
+    None
 }
 
 fn decode_cache_budget_bytes(dir: &Path) -> u64 {
@@ -6438,7 +6543,39 @@ fn stack_video_liquid_warping_impl(
         let batch = {
             let _s = crate::perf_trace::span(pt, "ref_decode")
                 .items(prepared_ref_indices.len() as u64);
-            master_source.read_batch(&prepared_ref_indices, None)?
+            // PR-10: caché de decode por-frame PRIMERO — en re-ejecuciones y
+            // cachés admitidos la referencia deja de recorrer el códec.
+            let cached = if let VideoInput::Ffmpeg(ref fr) = r {
+                read_selected_from_decode_cache(
+                    &path,
+                    &fr.ffmpeg_path,
+                    &fr.codec_name,
+                    fr.rotation,
+                    w_in,
+                    h_in,
+                    bpp,
+                    color_id,
+                    &prepared_ref_indices,
+                )
+            } else {
+                None
+            };
+            match cached {
+                Some(frames) => {
+                    log_to_front(
+                        &app,
+                        "SUCCESS",
+                        "Referencia robusta servida desde caché NVMe (sin decode).",
+                    );
+                    crate::frame_source::FrameBatch {
+                        descriptor: master_source.descriptor(),
+                        roi: None,
+                        indices: prepared_ref_indices.clone(),
+                        frames,
+                    }
+                }
+                None => master_source.read_batch(&prepared_ref_indices, None)?,
+            }
         };
         let best_position = batch
             .indices
