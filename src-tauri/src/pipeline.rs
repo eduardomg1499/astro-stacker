@@ -127,10 +127,26 @@ impl JobRegistry {
         Self::default()
     }
 
+    /// Lock poison-healed: el registro es la infraestructura de cancelación —
+    /// si un hilo cayó en pánico con el mutex tomado, envenenarlo en cascada
+    /// dejaría el botón Cancelar (y todo register/finish posterior) roto. El
+    /// estado interno (HashMap de flags atómicos) es válido en cualquier
+    /// punto de interrupción, así que recuperar el guard es seguro.
+    fn jobs_guard(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    > {
+        self.jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Registra un trabajo y devuelve SU flag de cancelación (en false).
     /// Un id repetido reutiliza el flag existente (reintentos idempotentes).
     pub fn register(&self, id: &str) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        let mut jobs = self.jobs.lock().unwrap();
+        let mut jobs = self.jobs_guard();
         jobs.entry(id.to_string())
             .or_insert_with(|| {
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
@@ -140,7 +156,7 @@ impl JobRegistry {
 
     /// Cancela un trabajo por id. Devuelve false si no está registrado.
     pub fn cancel(&self, id: &str) -> bool {
-        let jobs = self.jobs.lock().unwrap();
+        let jobs = self.jobs_guard();
         match jobs.get(id) {
             Some(flag) => {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -152,18 +168,18 @@ impl JobRegistry {
 
     /// Da de baja un trabajo terminado (su flag deja de ser alcanzable).
     pub fn finish(&self, id: &str) {
-        self.jobs.lock().unwrap().remove(id);
+        self.jobs_guard().remove(id);
     }
 
     /// Cancela TODOS los trabajos activos (botón Cancelar global).
     pub fn cancel_all(&self) {
-        for flag in self.jobs.lock().unwrap().values() {
+        for flag in self.jobs_guard().values() {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     pub fn active(&self) -> usize {
-        self.jobs.lock().unwrap().len()
+        self.jobs_guard().len()
     }
 }
 
@@ -1265,6 +1281,31 @@ pub fn new_job_id(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_registry_survives_a_poisoned_lock() {
+        let registry = JobRegistry::new();
+        let flag = registry.register("stack-1");
+        // Envenenar el mutex: un hilo hace panic con el lock tomado.
+        {
+            let reg = registry.clone();
+            let _ = std::thread::spawn(move || {
+                let _guard = reg.jobs_guard();
+                panic!("panic con el lock tomado (simulado)");
+            })
+            .join();
+        }
+        // Toda la API sigue funcionando (poison-healed): la cancelación no
+        // puede romperse en cascada por un panic ajeno.
+        assert!(registry.cancel("stack-1"));
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        let _ = registry.register("stack-2");
+        assert_eq!(registry.active(), 2);
+        registry.cancel_all();
+        registry.finish("stack-1");
+        registry.finish("stack-2");
+        assert_eq!(registry.active(), 0);
+    }
 
     fn valid_planetary_stack_request() -> PlanetaryStackRequest {
         PlanetaryStackRequest {
