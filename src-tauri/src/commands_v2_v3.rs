@@ -9253,20 +9253,40 @@ fn compute_frame_local_shifts(
                 })
             });
             let (dx, dy, sad) = if let Some((sdx, sdy)) = prior_seed {
-                crate::alignment::refine_best_match_sad_from_coarse(
-                    master_edges,
-                    f_edges,
-                    w_in,
-                    h_in,
-                    ax as usize,
-                    ay as usize,
-                    fx_i as usize,
-                    fy_i as usize,
-                    box_size,
-                    sdx,
-                    sdy,
-                    4.0,
-                )
+                // PR-23 FIX: la semilla (sdx, sdy) ya está en píxeles de
+                // resolución COMPLETA (posición del match de la pasada 1
+                // re-expresada respecto al centro de esta pasada), así que
+                // coarse_scale = 1.0 — NO 4.0 (eso la multiplicaba ×4 y
+                // colocaba la ventana de refino 4× demasiado lejos → banda de
+                // warp erróneo en el limbo). Guarda de calidad: si el refino
+                // local se satura (el mínimo verdadero cae fuera de ±6 —
+                // corrección legítima que la referencia reconstruida revela),
+                // caer a la búsqueda piramidal completa para ESE AP.
+                let (rdx, rdy, rsad, saturated) =
+                    crate::alignment::refine_best_match_sad_from_coarse_checked(
+                        master_edges,
+                        f_edges,
+                        w_in,
+                        h_in,
+                        ax as usize,
+                        ay as usize,
+                        fx_i as usize,
+                        fy_i as usize,
+                        box_size,
+                        sdx,
+                        sdy,
+                        1.0,
+                    );
+                if saturated {
+                    find_best_match_sad_pyramid_fast(
+                        master_edges, f_edges, w_in, h_in,
+                        ax as usize, ay as usize, fx_i as usize, fy_i as usize,
+                        box_size, search_r,
+                        master_ds, f_ds, master_ds_w,
+                    )
+                } else {
+                    (rdx, rdy, rsad)
+                }
             } else if let Some(seed) = gpu_coarse
                 .and_then(|v| v.get(ap_i))
                 .copied()

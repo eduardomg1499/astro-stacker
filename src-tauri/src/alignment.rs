@@ -1888,6 +1888,35 @@ pub fn refine_best_match_sad_from_coarse(
     coarse_dy: f32,
     coarse_scale: f32,
 ) -> (f32, f32, u64) {
+    let (dx, dy, sad, _saturated) = refine_best_match_sad_from_coarse_checked(
+        ref_edges, tgt_edges, w, h, ax, ay, fx_est, fy_est, box_size, coarse_dx, coarse_dy,
+        coarse_scale,
+    );
+    (dx, dy, sad)
+}
+
+/// Igual que `refine_best_match_sad_from_coarse`, pero devuelve además un flag
+/// `saturated`: el refino fino tocó el BORDE de su ventana ±6, señal de que el
+/// mínimo verdadero cae fuera del alcance de la búsqueda local (la semilla
+/// estaba demasiado lejos, o la referencia reconstruida revela una corrección
+/// mayor). El caller puede entonces caer a la búsqueda piramidal completa para
+/// ESE punto. Sin el flag, un match saturado devolvería un shift erróneo
+/// pegado al borde de la ventana (artefacto de warp local).
+#[allow(clippy::too_many_arguments)]
+pub fn refine_best_match_sad_from_coarse_checked(
+    ref_edges: &[u16],
+    tgt_edges: &[u16],
+    w: usize,
+    h: usize,
+    ax: usize,
+    ay: usize,
+    fx_est: usize,
+    fy_est: usize,
+    box_size: usize,
+    coarse_dx: f32,
+    coarse_dy: f32,
+    coarse_scale: f32,
+) -> (f32, f32, u64, bool) {
     let fine_fx = ((fx_est as f32) + coarse_dx * coarse_scale).max(0.0) as usize;
     let fine_fy = ((fy_est as f32) + coarse_dy * coarse_scale).max(0.0) as usize;
 
@@ -1905,16 +1934,19 @@ pub fn refine_best_match_sad_from_coarse(
     // ventana reducida (señal de que el residuo real era mayor), se repite
     // con la ventana completa ±6 — solo pagan el doble los pocos casos que
     // de verdad lo necesitan.
-    let (fdx, fdy, fsad) = {
+    let (fdx, fdy, fsad, saturated) = {
         let (dx3, dy3, sad3) = find_best_match_sad(
             ref_edges, tgt_edges, w, ax, ay, fine_fx, fine_fy, box_size, 3,
         );
         if dx3.abs() >= 2.5 || dy3.abs() >= 2.5 {
-            find_best_match_sad(
+            let (dx6, dy6, sad6) = find_best_match_sad(
                 ref_edges, tgt_edges, w, ax, ay, fine_fx, fine_fy, box_size, 6,
-            )
+            );
+            // Saturación: el óptimo quedó pegado al borde ±6 en algún eje.
+            let sat = dx6.abs() >= 6.0 || dy6.abs() >= 6.0;
+            (dx6, dy6, sad6, sat)
         } else {
-            (dx3, dy3, sad3)
+            (dx3, dy3, sad3, false)
         }
     };
 
@@ -1927,7 +1959,7 @@ pub fn refine_best_match_sad_from_coarse(
         ref_edges, tgt_edges, w, ax, ay, fine_fx, fine_fy, box_size, fdx, fdy, fsad,
     );
 
-    (total_dx + sdx, total_dy + sdy, fsad)
+    (total_dx + sdx, total_dy + sdy, fsad, saturated)
 }
 
 /// Fast 2× downscale of a u16 image using 2×2 box average (analysis half-res)
@@ -2198,6 +2230,67 @@ pub fn enhance_solar_surface(input: &[u16], width: usize, height: usize) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PR-23 FIX: una semilla en píxeles FULL-RES debe usarse con
+    /// coarse_scale=1.0. Este test habría cazado el bug de escala ×4:
+    /// (1) con la semilla correcta a escala 1.0 el refino encuentra el shift
+    /// verdadero; (2) con la MISMA semilla a escala 4.0 (el bug) el resultado
+    /// diverge y/o satura; (3) una semilla deliberadamente lejana satura y
+    /// activa el flag para caer a búsqueda completa.
+    #[test]
+    fn coarse_refine_seed_scale_and_saturation() {
+        let w = 160usize;
+        let h = 120usize;
+        // Textura con gradiente en ambos ejes para un mínimo SAD bien definido.
+        let mut master = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let v = 6000.0
+                    + 5000.0 * ((x as f32) * 0.21).sin() * ((y as f32) * 0.19).cos()
+                    + 40.0 * ((x * 7 + y * 13) % 97) as f32;
+                master[y * w + x] = v as u16;
+            }
+        }
+        // target = master desplazado por un shift real de (4, -3) px (mayor que
+        // el residuo ±2 del coarse: con el bug ×4 la ventana lo pierde).
+        let (tdx, tdy) = (4i32, -3i32);
+        let mut target = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let sx = (x as i32 - tdx).clamp(0, w as i32 - 1) as usize;
+                let sy = (y as i32 - tdy).clamp(0, h as i32 - 1) as usize;
+                target[y * w + x] = master[sy * w + sx];
+            }
+        }
+        // Centro de búsqueda = el propio AP (sin prior); la semilla es el
+        // OFFSET desde ese centro hasta el match verdadero (tdx, tdy).
+        let (ax, ay) = (80usize, 60usize);
+        // Semilla FULL-RES perfecta como OFFSET (4, -3). A escala 1.0 el refino
+        // centra la ventana en ax+4/ay-3 = el match real → shift verdadero.
+        let (dx1, dy1, _s, sat1) = refine_best_match_sad_from_coarse_checked(
+            &master, &target, w, h, ax, ay, ax, ay, 32, tdx as f32, tdy as f32, 1.0,
+        );
+        assert!(
+            (dx1 - tdx as f32).abs() < 0.6 && (dy1 - tdy as f32).abs() < 0.6 && !sat1,
+            "escala 1.0 debe encontrar el shift ({dx1},{dy1}) sat={sat1}"
+        );
+        // La MISMA semilla a escala 4.0 (el bug): centra la ventana en
+        // ax + 4*4 = ax+16 → el mínimo real (ax+4) queda a 12px, fuera de ±6 →
+        // diverge.
+        let (dx4, dy4, _s4, _sat4) = refine_best_match_sad_from_coarse_checked(
+            &master, &target, w, h, ax, ay, ax, ay, 32, tdx as f32, tdy as f32, 4.0,
+        );
+        assert!(
+            (dx4 - tdx as f32).abs() > 1.0 || (dy4 - tdy as f32).abs() > 1.0,
+            "escala 4.0 (bug) debe divergir del shift real, dio ({dx4},{dy4})"
+        );
+        // Semilla lejana (12, 12) a escala 1.0: el mínimo real (4,-3) está a
+        // 8-15px → fuera de ±6 → satura → el caller cae a búsqueda completa.
+        let (_dxf, _dyf, _sf, sat_far) = refine_best_match_sad_from_coarse_checked(
+            &master, &target, w, h, ax, ay, ax, ay, 32, 12.0, 12.0, 1.0,
+        );
+        assert!(sat_far, "una semilla lejana debe marcar saturación");
+    }
 
     /// PR-21b: el LK unchecked debe ser BIT-EXACTO contra la copia checked
     /// (misma aritmética f64 en el mismo orden; solo difiere la comprobación
