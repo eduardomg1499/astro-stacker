@@ -5291,7 +5291,14 @@ fn resolve_planetary_available_memory(reported: u64, total: u64, used: u64) -> u
     } else {
         0
     };
-    let resolved = reported.max(accounted_available);
+    // PERF (hilos del apilado): en macOS "used" incluye GB de caché de
+    // ficheros PURGABLE que el sistema recupera bajo presión — el snapshot
+    // instantáneo infra-reporta lo utilizable y el plan elegía 4/10 hilos en
+    // un M5 de 24GB (medido). Suelo: 45% de la RAM total. Es seguro porque
+    // todas las asignaciones grandes pasan por try_reserve/presupuestos con
+    // Err limpio, y el pico planificado sigue auditado contra working_budget.
+    let purgeable_floor = if total > 0 { (total / 20) * 9 } else { 0 };
+    let resolved = reported.max(accounted_available).max(purgeable_floor);
     if total > 0 {
         resolved.min(total)
     } else {
@@ -12487,13 +12494,23 @@ mod zas_v3_tests {
     #[test]
     fn macos_zero_available_snapshot_recovers_accounted_reclaimable_ram() {
         let gib = 1024 * 1024 * 1024u64;
-        assert_eq!(resolve_planetary_available_memory(0, 16 * gib, 9 * gib), 7 * gib);
+        // Suelo purgable = 45% del total: en macOS "used" incluye caché de
+        // ficheros reclamable y el snapshot instantáneo infra-reporta (el plan
+        // elegía 4/10 hilos en un M5 de 24GB). 45% de 16GiB = 7.2GiB.
+        let floor_16 = (16 * gib / 20) * 9;
+        assert_eq!(
+            resolve_planetary_available_memory(0, 16 * gib, 9 * gib),
+            (7 * gib).max(floor_16)
+        );
         assert_eq!(
             resolve_planetary_available_memory(5 * gib, 16 * gib, 9 * gib),
-            7 * gib
+            (7 * gib).max(floor_16)
         );
         assert_eq!(resolve_planetary_available_memory(3 * gib, 0, 0), 3 * gib);
-        assert_eq!(resolve_planetary_available_memory(0, 16 * gib, 0), 0);
+        // used==0 (host_statistics roto): NUNCA asumir toda la RAM libre —
+        // pero el suelo del 45% sí es presupuestable (try_reserve guarda el
+        // resto del camino).
+        assert_eq!(resolve_planetary_available_memory(0, 16 * gib, 0), floor_16);
     }
 
     #[test]

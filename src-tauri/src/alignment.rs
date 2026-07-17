@@ -1942,9 +1942,21 @@ pub fn refine_best_match_sad_from_coarse_checked(
             let (dx6, dy6, sad6) = find_best_match_sad(
                 ref_edges, tgt_edges, w, ax, ay, fine_fx, fine_fy, box_size, 6,
             );
-            // Saturación: el óptimo quedó pegado al borde ±6 en algún eje.
-            let sat = dx6.abs() >= 6.0 || dy6.abs() >= 6.0;
-            (dx6, dy6, sad6, sat)
+            if dx6.abs() >= 6.0 || dy6.abs() >= 6.0 {
+                // PERF: antes se reportaba saturación aquí y el caller caía al
+                // piramidal COMPLETO — medido, disparaba p2/local_shifts a
+                // ~196 s (los APs de limbo saturan a menudo). Una etapa ±12
+                // (625 evals, ~25× más barata que el piramidal) resuelve la
+                // gran mayoría; solo si TAMBIÉN toca el borde ±12 se declara
+                // saturación real y el caller escala a la búsqueda completa.
+                let (dx12, dy12, sad12) = find_best_match_sad(
+                    ref_edges, tgt_edges, w, ax, ay, fine_fx, fine_fy, box_size, 12,
+                );
+                let sat = dx12.abs() >= 12.0 || dy12.abs() >= 12.0;
+                (dx12, dy12, sad12, sat)
+            } else {
+                (dx6, dy6, sad6, false)
+            }
         } else {
             (dx3, dy3, sad3, false)
         }
@@ -2241,19 +2253,26 @@ mod tests {
     fn coarse_refine_seed_scale_and_saturation() {
         let w = 160usize;
         let h = 120usize;
-        // Textura con gradiente en ambos ejes para un mínimo SAD bien definido.
+        // Textura APERIÓDICA (componente pseudoaleatoria dominante): una
+        // senoidal pura crea mínimos SAD falsos a ~1 periodo que impiden que
+        // la ventana local escale (±3 encuentra un dip espurio y no satura).
+        // Con ruido determinista dominante solo el alineamiento exacto
+        // correlaciona y el test discrimina de verdad escala/saturación.
         let mut master = vec![0u16; w * h];
         for y in 0..h {
             for x in 0..w {
                 let v = 6000.0
-                    + 5000.0 * ((x as f32) * 0.21).sin() * ((y as f32) * 0.19).cos()
-                    + 40.0 * ((x * 7 + y * 13) % 97) as f32;
+                    + 2500.0 * ((x as f32) * 0.21).sin() * ((y as f32) * 0.19).cos()
+                    + 30.0 * ((x * 31 + y * 57) % 101) as f32
+                    + 25.0 * ((x * 13 + y * 7) % 89) as f32;
                 master[y * w + x] = v as u16;
             }
         }
-        // target = master desplazado por un shift real de (4, -3) px (mayor que
-        // el residuo ±2 del coarse: con el bug ×4 la ventana lo pierde).
-        let (tdx, tdy) = (4i32, -3i32);
+        // target = master desplazado por un shift real de (6, -5) px: con el
+        // bug de escala ×4 la semilla queda a (−18, +15) del mínimo — fuera
+        // incluso de la etapa de rescate ±12 (con (4,−3) el rescate ±12 la
+        // recuperaba y el caso no discriminaba).
+        let (tdx, tdy) = (6i32, -5i32);
         let mut target = vec![0u16; w * h];
         for y in 0..h {
             for x in 0..w {
@@ -2284,12 +2303,29 @@ mod tests {
             (dx4 - tdx as f32).abs() > 1.0 || (dy4 - tdy as f32).abs() > 1.0,
             "escala 4.0 (bug) debe divergir del shift real, dio ({dx4},{dy4})"
         );
-        // Semilla lejana (12, 12) a escala 1.0: el mínimo real (4,-3) está a
-        // 8-15px → fuera de ±6 → satura → el caller cae a búsqueda completa.
+        // Saturación: sobre textura aleatoria una ventana perdida cae en una
+        // MESETA de SAD (argmin arbitrario, sin anclarse al borde), así que el
+        // sub-caso usa una RAMPA: el SAD es monótono con la distancia y el
+        // argmin de una ventana desplazada SIEMPRE cabalga el borde ±12 →
+        // sat=true → el caller cae a la búsqueda piramidal completa.
+        let mut ramp_master = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                ramp_master[y * w + x] = (2000 + x * 90 + y * 70) as u16;
+            }
+        }
+        let mut ramp_target = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let sx = (x as i32 - tdx).clamp(0, w as i32 - 1) as usize;
+                let sy = (y as i32 - tdy).clamp(0, h as i32 - 1) as usize;
+                ramp_target[y * w + x] = ramp_master[sy * w + sx];
+            }
+        }
         let (_dxf, _dyf, _sf, sat_far) = refine_best_match_sad_from_coarse_checked(
-            &master, &target, w, h, ax, ay, ax, ay, 32, 12.0, 12.0, 1.0,
+            &ramp_master, &ramp_target, w, h, ax, ay, ax, ay, 32, 20.0, 20.0, 1.0,
         );
-        assert!(sat_far, "una semilla lejana debe marcar saturación");
+        assert!(sat_far, "una semilla lejana sobre estructura debe saturar");
     }
 
     /// PR-21b: el LK unchecked debe ser BIT-EXACTO contra la copia checked

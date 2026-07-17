@@ -15,6 +15,17 @@ import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 window.mkdir = mkdir;
 
 let appWindow = null;
+// Persistencia de la categoría de objetivo: true mientras un cambio es
+// PROGRAMÁTICO (restore/auto-detección) para no confundirlo con una elección
+// manual del usuario.
+let zasCategoryProgrammatic = false;
+
+function persistZenithTargetCategory(value, manual) {
+    try {
+        localStorage.setItem("zas_target_category", value);
+        if (manual) localStorage.setItem("zas_target_category_manual", "1");
+    } catch (_) {}
+}
 try {
     appWindow = getCurrentWindow();
 } catch (err) {
@@ -255,6 +266,25 @@ function initCustomSelect() {
     initCustomSelectBox('sel-quality-method', 'custom-quality-trigger', 'custom-quality-options', 'custom-quality-text');
     initCustomSelectBox('settings-lang-select', 'custom-language-trigger', 'custom-language-options', 'custom-language-text');
     initCustomSelectBox('sel-target-category', 'trigger-target-category', 'options-target-category', 'text-target-category');
+    // FIX UX: la categoría elegida se pierde al reiniciar y la auto-detección
+    // del análisis la pisaba. Restaurar la guardada al arrancar y marcar como
+    // MANUAL todo cambio hecho por el usuario (los programáticos no marcan).
+    (function initTargetCategoryPersistence() {
+        const sel = document.getElementById('sel-target-category');
+        if (!sel) return;
+        const saved = localStorage.getItem('zas_target_category');
+        if (saved && sel.value !== saved && sel.querySelector(`option[value="${saved}"]`)) {
+            zasCategoryProgrammatic = true;
+            sel.value = saved;
+            sel.dispatchEvent(new Event('change'));
+            zasCategoryProgrammatic = false;
+            applyZenithUltimateFlow();
+        }
+        sel.addEventListener('change', () => {
+            if (zasCategoryProgrammatic) return;
+            persistZenithTargetCategory(sel.value, true);
+        });
+    })();
 }
 
 function normalizeLanguageCode(lang) {
@@ -1511,8 +1541,22 @@ function applySuggestedTargetCategory(suggestedTarget) {
     const selTargetCategory = document.getElementById("sel-target-category");
     if (!selTargetCategory || selTargetCategory.value === category) return;
 
+    // FIX UX: la elección MANUAL del usuario manda — la auto-detección ya no
+    // la pisa (antes cada análisis reseteaba la categoría elegida). Solo se
+    // registra la sugerencia en el log.
+    if (localStorage.getItem("zas_target_category_manual") === "1") {
+        log(
+            "INFO",
+            `Detección sugiere: ${category === "planet_small" ? "Disco planetario / fase lunar" : "Superficie solar / lunar"} — se conserva tu categoría elegida.`
+        );
+        return;
+    }
+
+    zasCategoryProgrammatic = true;
     selTargetCategory.value = category;
     selTargetCategory.dispatchEvent(new Event("change"));
+    zasCategoryProgrammatic = false;
+    persistZenithTargetCategory(category, false);
     applyZenithUltimateFlow();
 
     const flow = getZenithUltimateFlow(category);

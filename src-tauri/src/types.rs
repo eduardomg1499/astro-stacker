@@ -2057,7 +2057,12 @@ impl FfmpegStreamIterator {
         // - Análisis/lotes/referencia (sin select): normalmente decode-bound
         //   (el scoring va por lotes GPU o es barato) → conservar cpus-2.
         let num_cpus = num_cpus::get(); // Use the standard `num_cpus` crate already in use for rayon
-        let stacking_overlap = selected_indices.is_some();
+        // Solo las selecciones GRANDES (pasadas de apilado) solapan con
+        // cómputo pesado y deben ceder núcleos. Los lotes pequeños (los 12-20
+        // frames de la referencia robusta, previews) corren ANTES del pase,
+        // sin nada con qué solapar — capar ahí duplicaba el tiempo del
+        // ref_decode (107 s vs 57 s medidos a 20MP).
+        let stacking_overlap = selected_indices.is_some_and(|indices| indices.len() > 64);
         let ffmpeg_threads = if expected_hardware_backend.is_some() {
             2
         } else if num_cpus <= 4 {
