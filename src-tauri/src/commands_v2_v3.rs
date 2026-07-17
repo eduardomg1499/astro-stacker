@@ -5081,7 +5081,9 @@ fn robust_ref_combine(vals: &mut [f32]) -> f32 {
     if n < 5 {
         return vals.iter().sum::<f32>() / n as f32;
     }
-    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // NaN-safe: total_cmp es idéntico a partial_cmp para floats normales y no
+    // puede hacer panic si un píxel degenerado (0/0) cuela un NaN.
+    vals.sort_by(f32::total_cmp);
     let med = if n % 2 == 1 {
         vals[n / 2]
     } else {
@@ -9238,7 +9240,7 @@ fn reject_spatial_outliers_u16(img: &mut [u16], w: usize, h: usize) {
                 let std = ((sum_sq / 8.0) - (mean * mean)).max(0.0).sqrt();
                 let threshold = (std * 2.5).max(200.0);
                 if (center - mean).abs() > threshold {
-                    neighbors.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+                    neighbors.sort_unstable_by(f32::total_cmp);
                     let median = (neighbors[3] + neighbors[4]) / 2.0;
                     fixes.push((center_idx, median.clamp(0.0, 65535.0) as u16));
                 }
@@ -9537,7 +9539,7 @@ fn apply_edge_aware_usm_u16(img: &[u16], w: usize, h: usize, radius: f32, amount
     let mut edge_values: Vec<f32> = edge_map.iter().copied().filter(|&v| v > 0.0).collect();
     let p95 = if edge_values.len() > 10 {
         let idx_95 = edge_values.len() * 95 / 100;
-        edge_values.select_nth_unstable_by(idx_95, |a, b| a.partial_cmp(b).unwrap());
+        edge_values.select_nth_unstable_by(idx_95, f32::total_cmp);
         edge_values[idx_95]
     } else {
         1000.0
@@ -11024,7 +11026,7 @@ impl PsfEstimator {
         let mut limb_grads: Vec<f32> = gradient_mag.iter().zip(limb_mask.iter())
             .filter(|(_, &m)| m > 0.5)
             .map(|(&g, _)| g).collect();
-        limb_grads.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        limb_grads.sort_unstable_by(f32::total_cmp);
         let grad_thresh = limb_grads.get((limb_grads.len() as f32 * gradient_threshold) as usize)
             .copied().unwrap_or(0.0);
 
@@ -11605,6 +11607,18 @@ mod zas_v3_tests {
     use super::*;
 
     #[test]
+    fn robust_ref_combine_survives_nan_and_keeps_median_semantics() {
+        // Un NaN colado (p.ej. 0/0 en un píxel sin cobertura) NO debe hacer
+        // panic; total_cmp lo ordena al final y la mediana sigue siendo sana.
+        let mut with_nan = vec![3.0f32, f32::NAN, 1.0, 2.0, 5.0, 4.0, 6.0];
+        let med = robust_ref_combine(&mut with_nan);
+        assert!(med.is_finite(), "la mediana no debe ser NaN: {med}");
+        // Sin NaN: semántica idéntica a la anterior (mediana centrada).
+        let mut clean = vec![9.0f32, 1.0, 5.0, 3.0, 7.0];
+        assert_eq!(robust_ref_combine(&mut clean), 5.0);
+    }
+
+    #[test]
     fn ap_selection_workload_guard_accepts_boundary_and_rejects_excess() {
         let ram = 16 * 1024 * 1024 * 1024u64;
         let budget = ap_selection_memory_budget(20_000, 20_000, 1, ram).unwrap();
@@ -11874,14 +11888,14 @@ mod zas_v3_tests {
             if n < 5 {
                 return vals.iter().sum::<f32>() / n as f32;
             }
-            vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            vals.sort_by(f32::total_cmp);
             let med = if n % 2 == 1 {
                 vals[n / 2]
             } else {
                 0.5 * (vals[n / 2 - 1] + vals[n / 2])
             };
             let mut devs: Vec<f32> = vals.iter().map(|&v| (v - med).abs()).collect();
-            devs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            devs.sort_by(f32::total_cmp);
             let mad = if n % 2 == 1 {
                 devs[n / 2]
             } else {
@@ -14089,7 +14103,7 @@ mod zas_v3_tests {
             acc_n += 1.0;
         }
 
-        shift_errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        shift_errs.sort_by(f32::total_cmp);
         let median_err = shift_errs[shift_errs.len() / 2];
         let p90_err = shift_errs[shift_errs.len() * 9 / 10];
 
