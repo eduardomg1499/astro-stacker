@@ -5214,7 +5214,10 @@ fn stream_frames_ffmpeg_chunked(
 
 const PLANETARY_OS_RAM_RESERVE_BYTES: u64 = 768 * 1024 * 1024;
 const PLANETARY_MIN_OPERATION_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
-const PLANETARY_IN_FLIGHT_BATCHES: u64 = 3;
+// Lotes de frames materializados a la vez. El prefetcher usa sync_channel(1),
+// así que a lo sumo coexisten 2 lotes (uno en el canal + uno procesándose);
+// 3 sobre-reservaba RAM y estrangulaba frames_per_batch (PERF: era 3).
+const PLANETARY_IN_FLIGHT_BATCHES: u64 = 2;
 const MAX_ROBUST_REFERENCE_FRAMES: usize = 20;
 
 #[derive(Clone, Copy, Debug)]
@@ -5819,18 +5822,37 @@ fn plan_planetary_ram(input: PlanetaryRamInputs) -> Result<PlanetaryRamPlan, Str
             working_budget / (1024 * 1024)
         ));
     }
-    let thread_room = working_budget - fixed_plus_minimum;
-    let max_threads_by_ram = thread_room / per_thread_scratch_bytes;
+    // PERF (saturación de núcleos): el plan antiguo cogía hilos con avidez
+    // (`thread_room / scratch` → 10) y DESPUÉS calculaba frames_per_batch con
+    // lo que sobraba, que colapsaba a 1 → `chunk.par_iter()` con un solo
+    // elemento = 1 worker activo, 9 ociosos. Ahora se dimensionan JUNTOS:
+    // se elige el mayor nº de hilos T tal que quepan T scratches MÁS al menos
+    // un frame por hilo en vuelo (frames_per_batch ≥ T). Así cada worker
+    // siempre recibe trabajo a nivel de frame y se llenan los núcleos.
+    let avail_after_fixed = working_budget
+        .checked_sub(stack_fixed_bytes)
+        .ok_or("RAM insuficiente tras reservar el lienzo fijo del apilado")?;
+    // Coste marginal por hilo garantizando ≥1 frame/worker: su scratch + el
+    // frame que consume, materializado en los lotes en vuelo.
+    let per_thread_cost = checked_ram_add(
+        per_thread_scratch_bytes,
+        checked_ram_mul(
+            bytes_per_frame,
+            PLANETARY_IN_FLIGHT_BATCHES,
+            "frame por hilo en vuelo",
+        )?,
+        "coste por hilo",
+    )?;
+    let max_threads_by_ram = avail_after_fixed / per_thread_cost;
     if max_threads_by_ram == 0 {
         return Err(format!(
-            "RAM insuficiente: no cabe ni un scratch de apilado ({} MB) después de reservar lienzo y prefetch.",
-            per_thread_scratch_bytes / (1024 * 1024)
+            "RAM insuficiente: no cabe ni un hilo de apilado (scratch {} MB + su frame) tras el lienzo de {} MB en {} MB seguros.",
+            per_thread_scratch_bytes / (1024 * 1024),
+            stack_fixed_bytes / (1024 * 1024),
+            working_budget / (1024 * 1024)
         ));
     }
-    let stack_threads = input.hardware_threads.min(max_threads_by_ram as usize);
-    if stack_threads == 0 {
-        return Err("RAM insuficiente: el plan produjo cero hilos seguros".into());
-    }
+    let stack_threads = input.hardware_threads.min(max_threads_by_ram as usize).max(1);
     let scratch_total = checked_ram_mul(
         per_thread_scratch_bytes,
         stack_threads as u64,
@@ -5852,7 +5874,11 @@ fn plan_planetary_ram(input: PlanetaryRamInputs) -> Result<PlanetaryRamPlan, Str
     } else {
         3000
     };
-    frames_per_batch = frames_per_batch.min(batch_cap).max(1);
+    // Suelo = stack_threads: garantiza ≥1 frame por worker (satisfecho por el
+    // sizing anterior; explícito para que `par_iter` nunca reciba menos
+    // elementos que hilos y deje núcleos ociosos). El techo batch_cap acota el
+    // pico de RAM; nunca sube por debajo del suelo porque batch_cap ≫ hilos.
+    frames_per_batch = frames_per_batch.min(batch_cap).max(stack_threads);
     let frame_batches_peak = checked_ram_mul(
         checked_ram_mul(bytes_per_frame, frames_per_batch as u64, "lote de frames")?,
         PLANETARY_IN_FLIGHT_BATCHES,
@@ -12284,6 +12310,38 @@ mod zas_v3_tests {
         assert!(plan.frames_per_batch >= 1);
         assert!(plan.estimated_stack_peak_bytes <= plan.working_budget);
         assert!(plan.robust_reference_peak_bytes <= plan.working_budget);
+    }
+
+    #[test]
+    fn planetary_ram_plan_feeds_every_worker_a_frame() {
+        // PERF: el bug de serialización daba frames_per_batch=1 con
+        // stack_threads=10 → 1 núcleo activo. El plan debe garantizar
+        // frames_per_batch >= stack_threads (cada worker recibe >=1 frame) y
+        // no dejar el pico por encima del presupuesto. Caso 20MP color en un
+        // Mac de 24GB (el del usuario) con lo típico libre (~14GB).
+        let input = PlanetaryRamInputs {
+            available_ram: 14 * 1024 * 1024 * 1024,
+            width_in: 3312,
+            height_in: 5888,
+            width_out: 3312,
+            height_out: 5888,
+            source_bytes_per_pixel: 6,
+            is_color: true,
+            double_pass: true,
+            use_warp_map: true,
+            surface_or_large_disc: true,
+            robust_reference_frames: 20,
+            hardware_threads: 10,
+        };
+        let plan = plan_planetary_ram(input).unwrap();
+        assert!(
+            plan.frames_per_batch >= plan.stack_threads,
+            "frames_per_batch ({}) debe alimentar a todos los hilos ({})",
+            plan.frames_per_batch,
+            plan.stack_threads
+        );
+        assert!(plan.stack_threads >= 4, "hilos={}", plan.stack_threads);
+        assert!(plan.estimated_stack_peak_bytes <= plan.working_budget);
     }
 
     #[test]
