@@ -7816,6 +7816,7 @@ fn ds_run_eidr(
             lut,
             inv_var,
             mask: masks[k].clone(),
+            robust_w: None,
             w,
             h,
         };

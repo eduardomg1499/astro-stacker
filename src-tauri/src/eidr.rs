@@ -534,6 +534,11 @@ pub(crate) struct EidrFrameOp {
     /// Bitset w·h: bit=1 ⇒ píxel INVÁLIDO (no finito / marcado). La fila
     /// desaparece del sistema: apply lo deja a 0 y adjoint/diag lo saltan.
     pub mask: Vec<u64>,
+    /// Pesos robustos por fotosito (IRLS Huber, F10): W diagonal del término
+    /// de datos — min ‖W^½Σ^{-½}(y−Az)‖². None ⇒ 1.0 (cuadrático puro). La
+    /// adjunción se preserva (W diagonal simétrica): adjoint/diag la leen,
+    /// apply NO (A no cambia).
+    pub robust_w: Option<Vec<f32>>,
     pub w: usize,
     pub h: usize,
 }
@@ -664,6 +669,7 @@ impl EidrOperator {
                         continue;
                     }
                     let (p1x, p1y) = (p1x as usize, p1y as usize);
+                    let rw = f.robust_w.as_deref();
                     let mut acc = 0.0f64;
                     match &pars {
                         None => {
@@ -678,7 +684,8 @@ impl EidrOperator {
                                         (py as f64 - fyq) as f32,
                                     );
                                     if k != 0.0 {
-                                        acc += k as f64 * r[base + px] as f64;
+                                        let wv = rw.map(|w| w[base + px]).unwrap_or(1.0);
+                                        acc += k as f64 * (r[base + px] * wv) as f64;
                                     }
                                 }
                             }
@@ -698,7 +705,9 @@ impl EidrOperator {
                                                 (py as f64 - fyq) as f32,
                                             );
                                             if k != 0.0 {
-                                                acc += k as f64 * r[base + px] as f64;
+                                                let wv =
+                                                    rw.map(|w| w[base + px]).unwrap_or(1.0);
+                                                acc += k as f64 * (r[base + px] * wv) as f64;
                                             }
                                         }
                                         px += 2;
@@ -739,14 +748,16 @@ impl EidrOperator {
                         continue;
                     }
                     let (p1x, p1y) = (p1x as usize, p1y as usize);
+                    let rw = f.robust_w.as_deref();
                     let mut acc = 0.0f64;
                     let mut visit = |px: usize, py: usize| {
-                        if !bit(&f.mask, py * fw + px) {
+                        let idx = py * fw + px;
+                        if !bit(&f.mask, idx) {
                             let k = f.lut.eval(
                                 (px as f64 - fxq) as f32,
                                 (py as f64 - fyq) as f32,
                             ) as f64;
-                            acc += k * k;
+                            acc += k * k * rw.map(|w| w[idx] as f64).unwrap_or(1.0);
                         }
                     };
                     match &pars {
@@ -1444,6 +1455,123 @@ pub(crate) fn frc_cutoff(
 }
 
 // ---------------------------------------------------------------------------
+// F10: pesos robustos Huber (IRLS) y microregistro ±0.2 px (§7.3/§7.5)
+// ---------------------------------------------------------------------------
+
+/// Pesos IRLS de Huber para un frame: w = min(1, δ/|r̃|) con r̃ el residual
+/// normalizado (y − Az)·√(ivar). SOLO se calculan contra el modelo directo
+/// (§7.5: "nunca sigma-clip sobre valores sin forward model"). Los píxeles
+/// enmascarados o sin predicción conservan w=1 (no participan igualmente).
+pub(crate) fn eidr_irls_weights(
+    op: &EidrOperator,
+    fi: usize,
+    c: usize,
+    z: &[f32],
+    plane: &[f32],
+    delta: f32,
+) -> Vec<f32> {
+    let f = &op.frames[fi];
+    let mut pred = vec![0.0f32; f.w * f.h];
+    op.apply(fi, c, z, &mut pred);
+    let sqrt_ivar = (f.inv_var[c.min(2)] as f64).sqrt() as f32;
+    let delta = delta.max(0.5);
+    let mut w = vec![1.0f32; f.w * f.h];
+    for idx in 0..f.w * f.h {
+        if bit(&f.mask, idx) || pred[idx] == 0.0 {
+            continue;
+        }
+        let r = ((plane[idx] - pred[idx]) * sqrt_ivar).abs();
+        if r > delta {
+            w[idx] = delta / r;
+        }
+    }
+    w
+}
+
+/// Microregistro por frame (F10, §7.5 paso 5): Gauss-Newton de UNA iteración
+/// sobre la traslación, con el residual contra el modelo directo y los
+/// gradientes de la predicción. Devuelve (dx, dy) en px de frame, acotado a
+/// ±max_shift; None si el sistema es degenerado o hay pocos píxeles.
+pub(crate) fn eidr_refine_translation(
+    op: &EidrOperator,
+    fi: usize,
+    c: usize,
+    z: &[f32],
+    plane: &[f32],
+    max_shift: f64,
+) -> Option<(f64, f64)> {
+    let f = &op.frames[fi];
+    let (fw, fh) = (f.w, f.h);
+    let mut pred = vec![0.0f32; fw * fh];
+    op.apply(fi, c, z, &mut pred);
+    let rw = f.robust_w.as_deref();
+    let (mut sxx, mut sxy, mut syy, mut sxr, mut syr) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let mut used = 0usize;
+    for py in 1..fh - 1 {
+        for px in 1..fw - 1 {
+            let idx = py * fw + px;
+            if bit(&f.mask, idx) || pred[idx] == 0.0 {
+                continue;
+            }
+            // Vecinos válidos para el gradiente central.
+            let (l, r_, u, d) = (
+                pred[idx - 1],
+                pred[idx + 1],
+                pred[idx - fw],
+                pred[idx + fw],
+            );
+            if l == 0.0 || r_ == 0.0 || u == 0.0 || d == 0.0 {
+                continue;
+            }
+            // d(pred)/d(desplazamiento del frame +δ) = −∇pred… con el
+            // convenio f(q)+δ ⇒ la predicción se muestrea δ antes: el
+            // Jacobiano respecto a δ es +∇pred evaluado en el frame.
+            let gx = 0.5 * (r_ - l) as f64;
+            let gy = 0.5 * (d - u) as f64;
+            let res = (plane[idx] - pred[idx]) as f64;
+            let wv = rw.map(|w| w[idx] as f64).unwrap_or(1.0);
+            sxx += wv * gx * gx;
+            sxy += wv * gx * gy;
+            syy += wv * gy * gy;
+            sxr += wv * gx * res;
+            syr += wv * gy * res;
+            used += 1;
+        }
+    }
+    if used < 256 {
+        return None;
+    }
+    let det = sxx * syy - sxy * sxy;
+    if det.abs() < 1e-6 * (sxx * syy).max(1e-12) {
+        return None;
+    }
+    let dx = (syy * sxr - sxy * syr) / det;
+    let dy = (sxx * syr - sxy * sxr) / det;
+    if !dx.is_finite() || !dy.is_finite() {
+        return None;
+    }
+    // El GN estima δ con data ≈ pred(p−ε): δ = −ε. Se devuelve ε (la
+    // corrección que se SUMA a f0 vía eidr_shift_geom); verificado por test.
+    Some((
+        (-dx).clamp(-max_shift, max_shift),
+        (-dy).clamp(-max_shift, max_shift),
+    ))
+}
+
+/// Aplica un desplazamiento (dx, dy) en px de FRAME a la geometría: la
+/// posición del frame respecto al cielo se corrige ⇒ f(q) += δ y la inversa
+/// g se re-deriva (la parte lineal no cambia).
+pub(crate) fn eidr_shift_geom(geom: &mut EidrGeom, dx: f64, dy: f64) {
+    geom.f0[0] += dx;
+    geom.f0[1] += dy;
+    let g2 = [geom.gx, geom.gy];
+    geom.g0 = [
+        -(g2[0][0] * geom.f0[0] + g2[1][0] * geom.f0[1]),
+        -(g2[0][1] * geom.f0[0] + g2[1][1] * geom.f0[1]),
+    ];
+}
+
+// ---------------------------------------------------------------------------
 // Puerta local de recuperabilidad (F9.3, §7.4)
 // ---------------------------------------------------------------------------
 //
@@ -2044,6 +2172,7 @@ mod tests {
                     lut,
                     inv_var: [1.0, 0.8, 1.2],
                     mask: vec![0u64; (fw * fh + 63) / 64],
+                    robust_w: None,
                     w: fw,
                     h: fh,
                 }
@@ -2454,6 +2583,7 @@ mod tests {
                     lut,
                     inv_var: [ivar; 3],
                     mask: vec![0u64; (w * h + 63) / 64],
+                    robust_w: None,
                     w,
                     h,
                 }
@@ -2670,6 +2800,7 @@ mod tests {
                     lut,
                     inv_var: [ivar; 3],
                     mask: vec![0u64; (w * h + 63) / 64],
+                    robust_w: None,
                     w,
                     h,
                 }
@@ -2724,6 +2855,279 @@ mod tests {
             "plano no recuperado: mean={:.2} worst={:.2}",
             sum / cnt as f64,
             worst
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Gates F10 (CPU): Huber-IRLS, campo vacío, microregistro
+    // -----------------------------------------------------------------------
+
+    fn f10_scene_ops(
+        w: usize,
+        h: usize,
+        n_frames: usize,
+        with_stars: bool,
+        seed: u64,
+    ) -> (EidrOperator, Vec<Vec<f32>>, Vec<(f64, f64)>, crate::deepsky_sim::SimScene) {
+        use crate::deepsky_sim as sim;
+        let mut stars = Vec::new();
+        if with_stars {
+            for j in 0..3 {
+                for i in 0..3 {
+                    stars.push(sim::SimStar {
+                        x: 16.4 + 25.1 * i as f64,
+                        y: 14.2 + 22.7 * j as f64,
+                        flux_adu: 9000.0,
+                        fwhm_px: 1.2,
+                        moffat_beta: Some(2.5),
+                    });
+                }
+            }
+        }
+        let scene = sim::SimScene {
+            width: w,
+            height: h,
+            background_adu: 150.0,
+            gradient_adu_per_px: (0.0, 0.0),
+            color: [1.0; 3],
+            stars,
+        };
+        let sensor = sim::SimSensor {
+            gain_e_per_adu: 1.0,
+            read_noise_e: 2.0,
+            bias_adu: 500.0,
+            dark_adu_per_s: 0.0,
+            full_well_adu: 1e12,
+            hot_pixels: vec![],
+            bayer: None,
+            vignette: None,
+        };
+        let mut st = seed;
+        let mut datas = Vec::new();
+        let mut dithers = Vec::new();
+        for i in 0..n_frames {
+            let dx = lcg(&mut st) + (i % 3) as f64 - 1.0;
+            let dy = lcg(&mut st) + ((i / 3) % 3) as f64 - 1.0;
+            let exp = sim::SimExposure { exposure_s: 1.0, dx, dy, seed: seed ^ (i as u64) };
+            let (data, _var) = sim::render_light(&scene, &sensor, &exp);
+            datas.push(data.iter().map(|&v| v - 500.0).collect());
+            dithers.push((dx, dy));
+        }
+        const PAD: usize = 4;
+        let gamma = MoffatPsf { fwhm_x: 1.2, fwhm_y: 1.2, theta: 0.0, beta: 2.5 };
+        let frames_op: Vec<EidrFrameOp> = dithers
+            .iter()
+            .map(|&(dx, dy)| {
+                let t = crate::DsTransform::from_similarity((
+                    1.0,
+                    0.0,
+                    (PAD as f64 - dx) as f32,
+                    (PAD as f64 - dy) as f32,
+                ));
+                let geom = eidr_geom(&t, 2.0).unwrap();
+                let lut = eidr_build_lut(None, gamma, &geom);
+                EidrFrameOp {
+                    geom,
+                    lut,
+                    inv_var: [1.0 / 154.0; 3],
+                    mask: vec![0u64; (w * h + 63) / 64],
+                    robust_w: None,
+                    w,
+                    h,
+                }
+            })
+            .collect();
+        let op = EidrOperator {
+            frames: frames_op,
+            w_out: ((w + 2 * PAD) * 2) as usize,
+            h_out: ((h + 2 * PAD) * 2) as usize,
+            cfa: None,
+            ch: 1,
+        };
+        (op, datas, dithers, scene)
+    }
+
+    /// F10 §7.10: un satélite brillante en UNA toma. El cuadrático lo diluye
+    /// (≈trail/N en el máster); Huber-IRLS lo pesa a ~0 y el máster queda
+    /// limpio. El baseline cuadrático se mantiene como referencia (§7.9).
+    #[test]
+    fn gate_f10_huber_removes_satellite() {
+        let (mut op, mut datas, _d, scene_ref) = f10_scene_ops(96, 80, 12, true, 0xf10a);
+        let (w, _h) = (96usize, 80usize);
+        // Traza diagonal brillante en el frame 5.
+        for t in 0..800 {
+            let x = 8 + (t * 80) / 800;
+            let y = 8 + (t * 60) / 800;
+            for k in 0..2usize {
+                datas[5][(y + k) * w + x] += 2500.0;
+            }
+        }
+        let all: Vec<usize> = (0..12).collect();
+        let z_q = eidr_solve_subset(&op, &datas, &all, None);
+        // IRLS real: pesos desde el modelo directo → RE-solve → pesos → solve.
+        let mut z_h = z_q.clone();
+        for _round in 0..3 {
+            let weights: Vec<Vec<f32>> = all
+                .iter()
+                .map(|&fi| eidr_irls_weights(&op, fi, 0, &z_h, &datas[fi], 2.5))
+                .collect();
+            for (&fi, wv) in all.iter().zip(weights.into_iter()) {
+                op.frames[fi].robust_w = Some(wv);
+            }
+            z_h = eidr_solve_subset(&op, &datas, &all, None);
+        }
+        // Media del residuo sobre el locus de la traza en coords de salida.
+        let stars = &scene_ref.stars;
+        let trail_mean = |z: &[f32]| -> f64 {
+            let mut acc = 0.0f64;
+            let mut n = 0usize;
+            for t in (0..800).step_by(7) {
+                let x = 8 + (t * 80) / 800;
+                let y = 8 + (t * 60) / 800;
+                // Fuera de las alas estelares: solo mide la traza.
+                if stars
+                    .iter()
+                    .any(|st| (st.x - x as f64).hypot(st.y - y as f64) < 8.0)
+                {
+                    continue;
+                }
+                // dither del frame 5 ≈ conocido: usar geometría real.
+                let (gx, gy) = op.frames[5].geom.g(x as f64, y as f64);
+                let (qx, qy) = (gx.round() as usize, gy.round() as usize);
+                if qx < op.w_out && qy < op.h_out {
+                    acc += (z[qy * op.w_out + qx] - 150.0) as f64;
+                    n += 1;
+                }
+            }
+            acc / n.max(1) as f64
+        };
+        let (m_q, m_h) = (trail_mean(&z_q), trail_mean(&z_h));
+        assert!(
+            m_q > 80.0,
+            "el cuadrático debería mostrar la traza diluida (medido {m_q:.1})"
+        );
+        assert!(
+            m_h < 0.02 * m_q && m_h < 60.0,
+            "Huber no limpió la traza: {m_h:.1} vs cuadrático {m_q:.1}"
+        );
+    }
+
+    /// F10 §7.10: campo VACÍO — las falsas detecciones a 5σ no superan a
+    /// Drizzle en más del 5% (+2 de margen entero). Solve con la penalización
+    /// espectral de producción (la banda sin evidencia no inventa fuentes).
+    #[test]
+    fn gate_f10_empty_field_no_false_sources() {
+        let (op, datas, dithers, _s) = f10_scene_ops(96, 80, 12, false, 0xe1d);
+        let all: Vec<usize> = (0..12).collect();
+        // Puerta + penalización como en producción.
+        let gate_fr: Vec<EidrGateFrame> = dithers
+            .iter()
+            .map(|&(dx, dy)| {
+                let t = crate::DsTransform::from_similarity((1.0, 0.0, -dx as f32, -dy as f32));
+                EidrGateFrame {
+                    geom: eidr_geom(&t, 2.0).unwrap(),
+                    psf: Some(MoffatPsf { fwhm_x: 1.2, fwhm_y: 1.2, theta: 0.0, beta: 2.5 }),
+                    sigma: (154.0f64).sqrt(),
+                }
+            })
+            .collect();
+        let gamma = MoffatPsf { fwhm_x: 1.2, fwhm_y: 1.2, theta: 0.0, beta: 2.5 };
+        let rep = eidr_recoverability_gate(&gate_fr, gamma, 96, 80, 2.0, None, 64);
+        let mut diag = vec![0.0f64; op.w_out * op.h_out];
+        for &fi in &all {
+            op.normal_diag_accum(fi, 0, &mut diag);
+        }
+        let mut dpos: Vec<f64> = diag.iter().copied().filter(|&d| d > 0.0).collect();
+        let dm = dpos.len() / 2;
+        dpos.select_nth_unstable_by(dm, |a, b| a.partial_cmp(b).unwrap());
+        let pen = eidr_freq_penalty(&rep, op.w_out, op.h_out, dpos[dm]);
+        let z = eidr_solve_subset(&op, &datas, &all, pen.as_ref());
+        let dz = drizzle_ref(&datas, &dithers, &all, 96, 80, 2.0, 0.9);
+        // Detector de fuentes: máximo local con (v−mediana) > 5·σ_MAD.
+        let count_sources = |img: &[f32], w: usize, _h: usize, x0: usize, y0: usize, ww: usize, hh: usize| -> usize {
+            let mut vals: Vec<f32> = Vec::with_capacity(ww * hh);
+            for y in y0..y0 + hh {
+                for x in x0..x0 + ww {
+                    vals.push(img[y * w + x]);
+                }
+            }
+            let mid = vals.len() / 2;
+            vals.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+            let med = vals[mid];
+            let mut devs: Vec<f32> = vals.iter().map(|&v| (v - med).abs()).collect();
+            devs.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+            let sigma = devs[mid] * 1.4826;
+            let thr = med + 5.0 * sigma.max(1e-3);
+            let mut n = 0usize;
+            for y in y0 + 1..y0 + hh - 1 {
+                for x in x0 + 1..x0 + ww - 1 {
+                    let v = img[y * w + x];
+                    if v <= thr {
+                        continue;
+                    }
+                    let mut is_max = true;
+                    for oy in 0..3usize {
+                        for ox in 0..3usize {
+                            if (ox, oy) != (1, 1)
+                                && img[(y + oy - 1) * w + (x + ox - 1)] >= v
+                            {
+                                is_max = false;
+                            }
+                        }
+                    }
+                    if is_max {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        // Región común sin bordes: el lienzo EIDR está acolchado (+8 out px).
+        let n_eidr = count_sources(&z, op.w_out, op.h_out, 24, 24, 144, 112);
+        let n_drz = count_sources(&dz, 192, 160, 16, 16, 144, 112);
+        assert!(
+            n_eidr as f64 <= n_drz as f64 * 1.05 + 2.0,
+            "falsas fuentes: EIDR {n_eidr} vs Drizzle {n_drz}"
+        );
+    }
+
+    /// F10 §7.5(5): microregistro GN recupera un error de traslación
+    /// inyectado (0.15, −0.12) px y mejora el residual del frame.
+    #[test]
+    fn gate_f10_refine_translation_recovers_shift() {
+        let (mut op, datas, _d, _s) = f10_scene_ops(96, 80, 12, true, 0x5417);
+        let all: Vec<usize> = (0..12).collect();
+        // Estropear a sabiendas la geometría del frame 7.
+        let (true_ex, true_ey) = (0.15f64, -0.12f64);
+        eidr_shift_geom(&mut op.frames[7].geom, -true_ex, -true_ey);
+        let z = eidr_solve_subset(&op, &datas, &all, None);
+        let rms_frame = |op: &EidrOperator, z: &[f32]| -> f64 {
+            let f = &op.frames[7];
+            let mut pred = vec![0.0f32; f.w * f.h];
+            op.apply(7, 0, z, &mut pred);
+            let mut acc = 0.0f64;
+            let mut n = 0usize;
+            for idx in 0..pred.len() {
+                if pred[idx] != 0.0 {
+                    let d = (datas[7][idx] - pred[idx]) as f64;
+                    acc += d * d;
+                    n += 1;
+                }
+            }
+            (acc / n.max(1) as f64).sqrt()
+        };
+        let rms_before = rms_frame(&op, &z);
+        let (ex, ey) = eidr_refine_translation(&op, 7, 0, &z, &datas[7], 0.2)
+            .expect("refinamiento");
+        assert!(
+            (ex - true_ex).abs() < 0.06 && (ey - true_ey).abs() < 0.06,
+            "corrección estimada ({ex:.3},{ey:.3}) vs verdad ({true_ex},{true_ey})"
+        );
+        eidr_shift_geom(&mut op.frames[7].geom, ex, ey);
+        let rms_after = rms_frame(&op, &z);
+        assert!(
+            rms_after < rms_before * 0.9,
+            "el residual no mejoró: {rms_before:.2} → {rms_after:.2}"
         );
     }
 
@@ -2970,6 +3374,7 @@ mod tests {
                     lut,
                     inv_var: [ivar; 3],
                     mask: vec![0u64; (w * h + 63) / 64],
+                    robust_w: None,
                     w,
                     h,
                 }
