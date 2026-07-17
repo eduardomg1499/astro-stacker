@@ -2037,11 +2037,24 @@ impl FfmpegStreamIterator {
         // autorrotación implícita evita doble giro y mantiene CPU/GPU idénticos.
         args.push("-noautorotate");
 
-        // INTELLIGENT CPU MANAGEMENT (Modest PCs)
-        // Detect logical cores and reserve 1-2 cores to prevent freezing.
+        // PR-13: presupuesto de hilos por RUTA. El valor incondicional
+        // (cpus-2) hacía que FFmpeg compitiera con el pool rayon del apilado
+        // por los mismos núcleos durante todo el solape decode∥cómputo.
+        // - Decode HW (VideoToolbox/NVDEC/QSV): el códec corre en silicio
+        //   dedicado; 2 hilos bastan para demux/colas.
+        // - Pasada de apilado (select exacto): el consumidor hace SAD/LK/warp
+        //   pesados en paralelo → ceder núcleos: max(4, cpus/3). Los decoders
+        //   H.264/HEVC escalan sublinealmente más allá de ~4-6 hilos.
+        // - Análisis/lotes/referencia (sin select): normalmente decode-bound
+        //   (el scoring va por lotes GPU o es barato) → conservar cpus-2.
         let num_cpus = num_cpus::get(); // Use the standard `num_cpus` crate already in use for rayon
-        let ffmpeg_threads = if num_cpus <= 4 {
+        let stacking_overlap = selected_indices.is_some();
+        let ffmpeg_threads = if expected_hardware_backend.is_some() {
+            2
+        } else if num_cpus <= 4 {
             (num_cpus - 1).max(1) // Keep at least 1 core free for OS on weak PCs
+        } else if stacking_overlap {
+            (num_cpus / 3).max(4)
         } else {
             (num_cpus - 2).max(4) // Keep 2 cores free for OS on powerful PCs
         };
@@ -2049,7 +2062,8 @@ impl FfmpegStreamIterator {
         args.extend_from_slice(&["-threads", &thread_str]);
         // Los filtros (scale neighbor / crop / format) van por defecto en UN
         // solo hilo — en 4K rgb48le la conversión era el cuello del productor.
-        // El troceado por slices es determinista: bytes idénticos.
+        // El troceado por slices es determinista: bytes idénticos. Acotado al
+        // presupuesto de la ruta (mismo razonamiento que -threads).
         args.extend_from_slice(&["-filter_threads", &thread_str]);
 
         args.extend_from_slice(&["-i", path, "-map", "0:v:0"]);
