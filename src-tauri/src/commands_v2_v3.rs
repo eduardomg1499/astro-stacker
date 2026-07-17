@@ -3198,7 +3198,10 @@ fn perform_standardized_analysis(
                             } else {
                                 let _s = crate::perf_trace::span(pt, "gpu_preprocess")
                                     .items(items.len() as u64);
-                                match preprocess_gpu_batch(&items) {
+                                // PR-20: la conversión raw→mono corre DENTRO de
+                                // analysis_pool — antes iba al pool global de
+                                // rayon y competía con éste por los núcleos.
+                                match analysis_pool.install(|| preprocess_gpu_batch(&items)) {
                                     Ok(outputs) => outputs.into_iter().map(Some).collect(),
                                     Err(e) => {
                                         gpu_analysis_failed.store(true, Ordering::Relaxed);
@@ -3462,7 +3465,9 @@ fn perform_standardized_analysis(
                     } else {
                         let _s = crate::perf_trace::span(pt, "gpu_preprocess")
                             .items(items.len() as u64);
-                        match preprocess_gpu_batch(&items) {
+                        // PR-20: conversión dentro del pool acotado del análisis
+                        // (no en el global) — un solo presupuesto de hilos.
+                        match pool.install(|| preprocess_gpu_batch(&items)) {
                             Ok(outputs) => outputs.into_iter().map(Some).collect(),
                             Err(e) => {
                                 gpu_analysis_failed.store(true, Ordering::Relaxed);
