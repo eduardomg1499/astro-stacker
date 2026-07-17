@@ -83,6 +83,17 @@ pub fn enhance_for_alignment_into_amount(
         out.resize(len, 0);
     }
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        // PR-21: NEON es baseline en aarch64 — la variante unchecked se
+        // auto-vectoriza (los bounds checks del escalar lo impedían y esta
+        // fase corre por frame y por pasada: era el mayor déficit SIMD).
+        unsafe {
+            enhance_for_alignment_unchecked(input, width, height, scratch1, scratch2, out, amount);
+        }
+        return;
+    }
+
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -93,6 +104,7 @@ pub fn enhance_for_alignment_into_amount(
         }
     }
 
+    #[cfg(not(target_arch = "aarch64"))]
     enhance_for_alignment_scalar(input, width, height, scratch1, scratch2, out, amount);
 }
 
@@ -240,6 +252,28 @@ pub fn normalize_patch_stats(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn enhance_for_alignment_avx2(
+    input: &[u16],
+    width: usize,
+    height: usize,
+    scratch1: &mut Vec<u16>,
+    scratch2: &mut Vec<u16>,
+    out: &mut Vec<u16>,
+    amount: f32,
+) {
+    // El cuerpo real vive en enhance_for_alignment_unchecked (inline(always)):
+    // al inlinearse AQUÍ recibe codegen AVX2 y LLVM lo auto-vectoriza.
+    unsafe {
+        enhance_for_alignment_unchecked(input, width, height, scratch1, scratch2, out, amount);
+    }
+}
+
+/// PR-21: cuerpo compartido SIN bounds checks. No usa intrínsecos: son los
+/// mismos bucles del escalar con `get_unchecked`, que es lo único que impedía
+/// la auto-vectorización. En x86_64 se inlinea dentro del wrapper
+/// #[target_feature(avx2)]; en aarch64 se llama directo (NEON es baseline,
+/// no necesita target_feature). Matemática idéntica al escalar → bit-exacto.
+#[inline(always)]
+unsafe fn enhance_for_alignment_unchecked(
     input: &[u16],
     width: usize,
     height: usize,
@@ -2020,6 +2054,39 @@ pub fn enhance_solar_surface(input: &[u16], width: usize, height: usize) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PR-21: la variante unchecked (auto-vectorizada NEON/AVX2) debe ser
+    /// BIT-EXACTA contra el escalar con bounds checks — mismos bucles, misma
+    /// aritmética; sólo cambia la comprobación de límites. Geometrías impares
+    /// incluidas para cubrir los bordes de los blurs.
+    #[test]
+    fn enhance_unchecked_matches_scalar_bit_exact() {
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as u16
+        };
+        for &(w, h) in &[(64usize, 48usize), (37, 29), (129, 65), (8, 8)] {
+            let input: Vec<u16> = (0..w * h).map(|_| rnd()).collect();
+            for &amount in &[0.6f32, 1.0, 2.4] {
+                let (mut s1a, mut s2a, mut oa) = (Vec::new(), Vec::new(), Vec::new());
+                let (mut s1b, mut s2b, mut ob) = (Vec::new(), Vec::new(), Vec::new());
+                s1a.resize(w * h, 0);
+                s2a.resize(w * h, 0);
+                oa.resize(w * h, 0);
+                s1b.resize(w * h, 0);
+                s2b.resize(w * h, 0);
+                ob.resize(w * h, 0);
+                enhance_for_alignment_scalar(&input, w, h, &mut s1a, &mut s2a, &mut oa, amount);
+                unsafe {
+                    enhance_for_alignment_unchecked(
+                        &input, w, h, &mut s1b, &mut s2b, &mut ob, amount,
+                    );
+                }
+                assert_eq!(oa, ob, "divergencia en {w}x{h} amount={amount}");
+            }
+        }
+    }
 
     /// PARIDAD del early-abort SIMD: el kernel con poda por fila debe devolver
     /// EXACTAMENTE el mismo (sad, dx, dy) que un barrido exhaustivo sin poda,
