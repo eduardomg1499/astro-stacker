@@ -16,6 +16,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 deepsky-sim = []
 # Ídem para el simulador planetario (planetary_sim, arnés A/B F0).
 planetary-sim = []
+# Bypass de licencia SOLO para builds locales de desarrollo/benchmark:
+# ademas de compilar con esta feature hay que exportar ZAS_DEV_LICENSE=1.
+# Los binarios distribuidos NO llevan esta feature (el codigo ni se compila).
+dev-license = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
