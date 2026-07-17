@@ -418,75 +418,92 @@ mod tests {
             eprintln!("ffmpeg no disponible; test omitido");
             return;
         };
-        let selected: Vec<usize> = (0..2056).step_by(2).collect();
-        assert_eq!(selected.len(), 1028);
-        let never_cancel: crate::FfmpegCancelCheck = std::sync::Arc::new(|| false);
-        let mut stream = crate::FfmpegStreamIterator::new_cancelable_selected(
-            &path.to_string_lossy(),
-            64,
-            48,
-            0,
-            0,
-            64,
-            48,
-            100,
-            "ffmpeg",
-            None,
-            "h264",
-            0,
-            &selected,
-            never_cancel,
-        )
-        .unwrap();
-        // Contrato de exactitud: comparar los 1028 outputs contra un decode
-        // secuencial del mismo H.264 (incluye B-frames), no sólo comprobar que
-        // FFmpeg produjo la cantidad esperada.
-        let mut sequential = crate::FfmpegStreamIterator::new(
-            &path.to_string_lossy(),
-            64,
-            48,
-            0,
-            0,
-            64,
-            48,
-            100,
-            "ffmpeg",
-            None,
-            None,
-            "h264",
-            0,
-        )
-        .unwrap();
-        let mut selected_frame = vec![0u8; 64 * 48 * 6];
-        let mut sequential_frame = vec![0u8; 64 * 48 * 6];
-        let mut sequential_index = 0usize;
-        let mut first = Vec::new();
-        let mut last = Vec::new();
-        for (position, &expected_index) in selected.iter().enumerate() {
-            while sequential_index <= expected_index {
+        // Contrato de exactitud: comparar los outputs del select contra un
+        // decode secuencial del mismo H.264 (incluye B-frames). Dos rutas:
+        // 1028 índices (expresión inline -vf) y 2050 índices (>24 KiB →
+        // -filter_script:v, PR-12) — ambas byte-exactas.
+        let verify_selection = |selected: &[usize]| {
+            let never_cancel: crate::FfmpegCancelCheck = std::sync::Arc::new(|| false);
+            let mut stream = crate::FfmpegStreamIterator::new_cancelable_selected(
+                &path.to_string_lossy(),
+                64,
+                48,
+                0,
+                0,
+                64,
+                48,
+                100,
+                "ffmpeg",
+                None,
+                "h264",
+                0,
+                selected,
+                never_cancel,
+            )
+            .unwrap();
+            let mut sequential = crate::FfmpegStreamIterator::new(
+                &path.to_string_lossy(),
+                64,
+                48,
+                0,
+                0,
+                64,
+                48,
+                100,
+                "ffmpeg",
+                None,
+                None,
+                "h264",
+                0,
+            )
+            .unwrap();
+            let mut selected_frame = vec![0u8; 64 * 48 * 6];
+            let mut sequential_frame = vec![0u8; 64 * 48 * 6];
+            let mut sequential_index = 0usize;
+            let mut first = Vec::new();
+            let mut last = Vec::new();
+            for (position, &expected_index) in selected.iter().enumerate() {
+                while sequential_index <= expected_index {
+                    assert!(
+                        sequential.read_frame_into(&mut sequential_frame),
+                        "secuencial terminó en {sequential_index}"
+                    );
+                    sequential_index += 1;
+                }
                 assert!(
-                    sequential.read_frame_into(&mut sequential_frame),
-                    "secuencial terminó en {sequential_index}"
+                    stream.read_frame_into(&mut selected_frame),
+                    "salida #{position} (índice {expected_index})"
                 );
-                sequential_index += 1;
+                assert_eq!(
+                    selected_frame, sequential_frame,
+                    "select reasignó o alteró el frame absoluto {expected_index}"
+                );
+                if position == 0 {
+                    first.clone_from(&selected_frame);
+                }
+                if position + 1 == selected.len() {
+                    last.clone_from(&selected_frame);
+                }
             }
-            assert!(
-                stream.read_frame_into(&mut selected_frame),
-                "salida #{position} (índice {expected_index})"
-            );
-            assert_eq!(
-                selected_frame, sequential_frame,
-                "select reasignó o alteró el frame absoluto {expected_index}"
-            );
-            if position == 0 {
-                first.clone_from(&selected_frame);
-            }
-            if position + 1 == selected.len() {
-                last.clone_from(&selected_frame);
-            }
-        }
-        assert!(first.iter().any(|&value| value != 0));
-        assert_ne!(first, last, "testsrc2 debe cambiar entre frames 0 y 2054");
+            assert!(first.iter().any(|&value| value != 0));
+            assert_ne!(first, last, "testsrc2 debe cambiar entre el primer y el último frame");
+        };
+
+        let inline: Vec<usize> = (0..2056).step_by(2).collect();
+        assert_eq!(inline.len(), 1028);
+        verify_selection(&inline);
+
+        // PR-12: >2048 índices fuerza la ruta -filter_script:v (la expresión
+        // supera el umbral de línea de comandos). Mismo contrato byte-exacto.
+        let scripted: Vec<usize> = (0..2050).collect();
+        assert!(
+            crate::ffmpeg_exact_frame_select_filter(&scripted)
+                .map(|f| f.len() > 24 * 1024)
+                .unwrap_or(false),
+            "la selección de 2050 debe exceder el umbral inline"
+        );
+        verify_selection(&scripted);
+
         let _ = std::fs::remove_file(path);
     }
 

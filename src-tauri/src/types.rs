@@ -1525,6 +1525,9 @@ pub struct FfmpegStreamIterator {
     watchdog_started: std::time::Instant,
     terminal_error: Arc<Mutex<Option<String>>>,
     watchdog_thread: Option<std::thread::JoinHandle<()>>,
+    /// PR-12: filtergraph en fichero (-filter_script:v) para selecciones
+    /// grandes; se borra en Drop.
+    filter_script_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1633,14 +1636,21 @@ fn ffmpeg_stream_is_color(color_id: i32) -> bool {
 /// entrada del filtro, por lo que no depende de FPS, timestamps, GOP ni VFR.
 /// Se limita la cantidad para mantener acotada la línea de comando y el coste
 /// de evaluar la expresión; los lotes de referencia usan normalmente 12–20.
+/// Umbral de línea de comandos: CreateProcess limita la línea completa a
+/// ~32 KiB en Windows; por encima el MISMO filtergraph va a un fichero
+/// temporal con `-filter_script:v` (PR-12) en vez de `-vf` inline.
+const MAX_INLINE_FILTER_BYTES: usize = 24 * 1024;
+static FILTER_SCRIPT_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn ffmpeg_exact_frame_select_filter(indices: &[usize]) -> Result<String, String> {
-    // CreateProcess limita la linea completa a ~32 KiB en Windows. Dejamos
-    // margen para rutas/codec/resto de argumentos y, dentro de ese limite,
-    // admitimos selecciones planetarias reales (p. ej. 1028/2055 frames).
-    // El limite anterior de 256 obligaba al apilado a convertir y transportar
-    // por el pipe TODOS los RGB48 aunque solo se apilara el 50 %.
-    const MAX_SELECTED_FRAMES: usize = 2048;
-    const MAX_SELECT_FILTER_BYTES: usize = 24 * 1024;
+    // PR-12: el límite ya NO es la línea de comandos (las expresiones grandes
+    // van por filter_script), sino el tamaño del AST del evaluador de FFmpeg.
+    // 16384 términos ≈ 200 KiB de script con profundidad O(log N) — muy por
+    // debajo de cualquier límite práctico. El límite anterior de 2048 hacía
+    // caer selecciones grandes al pipe secuencial que convierte TODOS los
+    // frames a RGB48 (mucho peor).
+    const MAX_SELECTED_FRAMES: usize = 16_384;
     if indices.is_empty() {
         return Err("La selección FFmpeg exacta está vacía".into());
     }
@@ -1675,15 +1685,7 @@ fn ffmpeg_exact_frame_select_filter(indices: &[usize]) -> Result<String, String>
         }
         terms = balanced;
     }
-    let filter = format!("select={}", terms.pop().expect("indices no vacios"));
-    if filter.len() > MAX_SELECT_FILTER_BYTES {
-        return Err(format!(
-            "La expresion FFmpeg select ocupa {} bytes y supera el limite seguro de {} bytes",
-            filter.len(),
-            MAX_SELECT_FILTER_BYTES
-        ));
-    }
-    Ok(filter)
+    Ok(format!("select={}", terms.pop().expect("indices no vacios")))
 }
 
 fn read_exact_ffmpeg_frame<R: std::io::Read>(reader: &mut R, buffer: &mut [u8]) -> bool {
@@ -1993,6 +1995,22 @@ impl FfmpegStreamIterator {
         args.extend_from_slice(&["-hide_banner", "-nostdin", "-y"]);
 
         let filter_str = filters.join(",");
+        // PR-12: por encima del umbral de línea de comandos el MISMO
+        // filtergraph se escribe a un fichero temporal y se pasa con
+        // -filter_script:v (bit-exacto por construcción; imprescindible para
+        // selecciones exactas de >2048 frames, sobre todo en Windows).
+        let filter_script_path = if filter_str.len() > MAX_INLINE_FILTER_BYTES {
+            let path = std::env::temp_dir().join(format!(
+                "zas-filter-{}-{}.txt",
+                std::process::id(),
+                FILTER_SCRIPT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::write(&path, &filter_str)
+                .map_err(|e| format!("No se pudo escribir el filter_script FFmpeg: {e}"))?;
+            Some(path)
+        } else {
+            None
+        };
 
         // La ruta GPU ya fue medida por el probe y debe ser explícita. Usar
         // `auto` aquí permitiría que FFmpeg cambiara silenciosamente de
@@ -2044,10 +2062,15 @@ impl FfmpegStreamIterator {
             "rawvideo",
             "-pix_fmt",
             p_fmt,
-            "-vf",
-            &filter_str,
-            "pipe:1",
         ]);
+        let filter_script_arg: String;
+        if let Some(script) = &filter_script_path {
+            filter_script_arg = script.to_string_lossy().into_owned();
+            args.extend_from_slice(&["-filter_script:v", &filter_script_arg]);
+        } else {
+            args.extend_from_slice(&["-vf", &filter_str]);
+        }
+        args.push("pipe:1");
 
         eprintln!("DEBUG: FfmpegStreamIterator Args: {:?}", args);
         eprintln!("DEBUG: Frame Size Bytes: {}", frame_size_bytes);
@@ -2155,6 +2178,7 @@ impl FfmpegStreamIterator {
             watchdog_started,
             terminal_error,
             watchdog_thread: Some(watchdog_thread),
+            filter_script_path,
         })
     }
 }
@@ -2418,6 +2442,9 @@ impl Drop for FfmpegStreamIterator {
         self.stop_watchdog();
         if let Some(thread) = self.stderr_thread.take() {
             let _ = thread.join();
+        }
+        if let Some(script) = self.filter_script_path.take() {
+            let _ = std::fs::remove_file(script);
         }
     }
 }
@@ -3251,12 +3278,27 @@ mod frame_stream_tests {
         assert!(super::ffmpeg_exact_frame_select_filter(&[7, 7]).is_err());
         assert!(super::ffmpeg_exact_frame_select_filter(&[9, 3]).is_err());
         assert!(super::ffmpeg_exact_frame_select_filter(&(0..1028).collect::<Vec<_>>()).is_ok());
+        // PR-12: >2048 índices ya es válido (la expresión larga viaja por
+        // -filter_script:v, no por la línea de comandos).
+        let big = super::ffmpeg_exact_frame_select_filter(&(0..3000).collect::<Vec<_>>())
+            .expect("3000 índices deben ser válidos");
+        assert!(
+            big.len() > super::MAX_INLINE_FILTER_BYTES,
+            "3000 términos deben superar el umbral inline y forzar filter_script"
+        );
+        assert!(
+            super::ffmpeg_exact_frame_select_filter(&(0..16_385).collect::<Vec<_>>()).is_err(),
+            "por encima del tope del AST se rechaza (fallback secuencial)"
+        );
         let balanced =
             super::ffmpeg_exact_frame_select_filter(&(0..520).step_by(2).collect::<Vec<_>>())
                 .unwrap();
         assert!(balanced.starts_with("select=("));
         assert!(balanced.contains("eq(n\\,518)"));
-        assert!(super::ffmpeg_exact_frame_select_filter(&(0..2049).collect::<Vec<_>>()).is_err());
+        assert!(
+            super::ffmpeg_exact_frame_select_filter(&(0..2049).collect::<Vec<_>>()).is_ok(),
+            "2049 índices dejaron de ser un acantilado (PR-12)"
+        );
     }
 
     #[test]
