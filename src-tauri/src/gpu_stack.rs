@@ -886,9 +886,6 @@ fn stack_bands_per_submit(
     use_warp: bool,
     neighbours: usize,
 ) -> usize {
-    if is_metal {
-        return band_count.max(1);
-    }
     // Un píxel Lanczos visita 6×6 muestras; drizzle drop es más barato. El
     // mapa IDW añade lecturas/mezclas por vecino. Presupuestar sólo píxeles,
     // como hacía el código anterior, subestimaba hasta ~40× el command buffer.
@@ -901,7 +898,18 @@ fn stack_bands_per_submit(
     let work_per_band = band_pixels
         .max(1)
         .saturating_mul(sampling_cost.saturating_add(warp_cost).max(1));
-    (64_000_000usize / work_per_band).clamp(1, band_count.max(1))
+    // Metal no tiene el TDR de ~2 s de Windows, pero sí un watchdog de
+    // command buffer propio: con lienzos drizzle 3× de 20 MP el submit único
+    // histórico agregaba TODAS las bandas (>8G de trabajo) y podía perder el
+    // device — y GPU_LOST desactiva la GPU el resto de la sesión. Presupuesto
+    // 8× más holgado que DX12/Vulkan: el caso típico (≤1× drizzle) sigue
+    // siendo un único submit y sólo los lienzos gigantes se trocean.
+    let budget = if is_metal {
+        512_000_000usize
+    } else {
+        64_000_000usize
+    };
+    (budget / work_per_band).clamp(1, band_count.max(1))
 }
 /// Chunk de descarga (staging map): acota la memoria de readback.
 const DOWNLOAD_CHUNK: u64 = 128 * 1024 * 1024;
@@ -1470,8 +1478,9 @@ impl GpuPassAccumulator {
         // TDR" razonaba sobre la unidad equivocada. Con lienzos gigantes
         // (drizzle 3× → 9× píxeles, Lanczos 6×6 + IDW por píxel) el submit
         // único agregaba TODOS los dispatches de banda. Fuera de Metal se
-        // trocea en un submit por cada ~2 bandas (~4 Mpx); en Metal se
-        // conserva el submit único (medido sin problema en Apple Silicon).
+        // trocea en un submit por cada ~2 bandas (~4 Mpx); en Metal el
+        // presupuesto es 8× (su watchdog es más laxo): el caso típico sigue
+        // en un submit y sólo los lienzos drizzle gigantes se trocean (PR-05).
         let bands_indexed: Vec<(usize, u32)> = self.bands.iter().copied().enumerate().collect();
         let band_px = self
             .cfg
@@ -2294,8 +2303,15 @@ mod tests {
             stack_bands_per_submit(false, 2_000_000, 8, true, true, 4),
             2
         );
+        // Metal: presupuesto 8× (512M de trabajo). 2Mpx×(40+8)=96M por banda
+        // → 5 bandas por submit; ya NO es un submit único incondicional.
         assert_eq!(
             stack_bands_per_submit(true, 2_000_000, 8, false, true, 4),
+            5
+        );
+        // Caso típico sin drizzle a 1×: banda pequeña → sigue en un submit.
+        assert_eq!(
+            stack_bands_per_submit(true, 400_000, 8, false, true, 4),
             8
         );
     }

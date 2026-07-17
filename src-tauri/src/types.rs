@@ -577,10 +577,24 @@ const FFMPEG_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// por lo que el timeout normal de 20 s puede matar un HEVC/AV1 válido. Sólo
 /// los streams selectos reciben esta tolerancia adaptativa; la cancelación del
 /// usuario sigue comprobándose cada 25 ms por el watchdog.
-fn ffmpeg_selected_idle_timeout(indices: &[usize]) -> std::time::Duration {
-    const CONSERVATIVE_DECODE_FPS: usize = 4;
+fn ffmpeg_selected_idle_timeout(indices: &[usize], frame_size_bytes: usize) -> std::time::Duration {
+    // PR-05: el ritmo conservador de decode escala con la GEOMETRÍA. El valor
+    // fijo de 4 fps era correcto a 1080p pero mataba decodes HEVC 20 MP sanos
+    // en equipos lentos (<4 fps reales) al toparse el techo antiguo de 120 s.
+    const BASELINE_PIXELS: usize = 2_073_600; // 1080p
+    const BASELINE_MILLI_FPS: usize = 4_000; // 4 fps a 1080p
+    const MIN_MILLI_FPS: usize = 500; // 0.5 fps en frames gigantes (20 MP HEVC)
     const STARTUP_MARGIN_SECS: usize = 5;
-    const MAX_SELECTED_IDLE_SECS: usize = 120;
+    const MAX_SELECTED_IDLE_SECS: usize = 600;
+
+    // El pipe selecto de análisis es G16 (2 B/px); con RGB48 esto sobreestima
+    // los píxeles ×3 y sólo ALARGA el margen (dirección segura, techo 600 s).
+    let pixels = (frame_size_bytes / 2).max(1);
+    let milli_fps = BASELINE_MILLI_FPS
+        .saturating_mul(BASELINE_PIXELS)
+        .checked_div(pixels)
+        .unwrap_or(BASELINE_MILLI_FPS)
+        .clamp(MIN_MILLI_FPS, BASELINE_MILLI_FPS);
 
     let first_gap = indices
         .first()
@@ -592,7 +606,8 @@ fn ffmpeg_selected_idle_timeout(indices: &[usize]) -> std::time::Duration {
         .map(|pair| pair[1].saturating_sub(pair[0]))
         .fold(first_gap, usize::max);
     let estimated_secs = max_gap
-        .div_ceil(CONSERVATIVE_DECODE_FPS)
+        .saturating_mul(1000)
+        .div_ceil(milli_fps)
         .saturating_add(STARTUP_MARGIN_SECS)
         .clamp(
             FFMPEG_STREAM_IDLE_TIMEOUT.as_secs() as usize,
@@ -603,10 +618,11 @@ fn ffmpeg_selected_idle_timeout(indices: &[usize]) -> std::time::Duration {
 
 fn ffmpeg_effective_idle_timeout(
     selected_indices: Option<&[usize]>,
+    frame_size_bytes: usize,
     normal_timeout: std::time::Duration,
 ) -> std::time::Duration {
     selected_indices
-        .map(ffmpeg_selected_idle_timeout)
+        .map(|indices| ffmpeg_selected_idle_timeout(indices, frame_size_bytes))
         .unwrap_or(normal_timeout)
 }
 const MAX_PLANETARY_FRAME_DIMENSION: usize = 262_144;
@@ -2116,7 +2132,7 @@ impl FfmpegStreamIterator {
         let watchdog_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let terminal_error = Arc::new(Mutex::new(None));
         let effective_idle_timeout =
-            ffmpeg_effective_idle_timeout(selected_indices, idle_timeout);
+            ffmpeg_effective_idle_timeout(selected_indices, frame_size_bytes, idle_timeout);
         let watchdog_thread = spawn_ffmpeg_stream_watchdog(
             process.clone(),
             cancel_check.clone(),
@@ -3247,26 +3263,43 @@ mod frame_stream_tests {
     fn ffmpeg_selected_timeout_grows_only_for_sparse_select_gaps() {
         use std::time::Duration;
 
+        // 1080p G16: 2 B/px (el ritmo base histórico de 4 fps se conserva).
+        const FHD: usize = 2_073_600 * 2;
+        // 20 MP G16 (3312×5888): el ritmo conservador baja a 0.5 fps.
+        const HUGE: usize = 19_501_056 * 2;
+
         assert_eq!(
-            super::ffmpeg_effective_idle_timeout(None, Duration::from_secs(7)),
+            super::ffmpeg_effective_idle_timeout(None, FHD, Duration::from_secs(7)),
             Duration::from_secs(7),
-            "un stream normal nunca hereda el máximo de 120 s de select"
+            "un stream normal nunca hereda el máximo adaptativo de select"
         );
         assert_eq!(
-            super::ffmpeg_selected_idle_timeout(&[0, 1, 2]),
+            super::ffmpeg_selected_idle_timeout(&[0, 1, 2], FHD),
             Duration::from_secs(20)
         );
         assert_eq!(
-            super::ffmpeg_selected_idle_timeout(&[100]),
+            super::ffmpeg_selected_idle_timeout(&[100], FHD),
             Duration::from_secs(31)
         );
         assert_eq!(
-            super::ffmpeg_selected_idle_timeout(&[0, 400]),
+            super::ffmpeg_selected_idle_timeout(&[0, 400], FHD),
             Duration::from_secs(105)
         );
+        // Techo nuevo 600 s (antes 120 s: mataba HEVC 20 MP sanos y lentos).
         assert_eq!(
-            super::ffmpeg_selected_idle_timeout(&[10_000]),
-            Duration::from_secs(120)
+            super::ffmpeg_selected_idle_timeout(&[10_000], FHD),
+            Duration::from_secs(600)
+        );
+        // 20 MP: mismo hueco de 400 frames → margen mucho mayor (0.5 fps),
+        // acotado por el techo.
+        assert_eq!(
+            super::ffmpeg_selected_idle_timeout(&[0, 400], HUGE),
+            Duration::from_secs(600)
+        );
+        // Hueco moderado a 20 MP: 100 frames / 0.5 fps + 5 s = 205 s.
+        assert_eq!(
+            super::ffmpeg_selected_idle_timeout(&[0, 100], HUGE),
+            Duration::from_secs(205)
         );
     }
 
