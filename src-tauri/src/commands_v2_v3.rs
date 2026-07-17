@@ -2652,7 +2652,7 @@ fn perform_standardized_analysis(
     };
     let ffmpeg_analysis_cache_plan: Option<(PathBuf, u64, usize, usize)> = if r.is_ffmpeg() {
         let full_frame_decode = rx == 0 && ry == 0 && rw == tw && rh == th;
-        let cache_dir = std::env::temp_dir().join("astro_stacker_cache");
+        let cache_dir = decode_cache_root_dir();
         let _ = std::fs::create_dir_all(&cache_dir);
         let cache_budget = decode_cache_budget_bytes(&cache_dir);
         let expected_len = tw
@@ -4116,6 +4116,17 @@ fn decode_cache_usage_ledger(dir: &Path) -> Arc<std::sync::atomic::AtomicU64> {
 /// Presupuesto por máquina, no una constante de portátil. Por defecto usa
 /// 1/8 de la RAM (3–12 GiB) y nunca invade la reserva segura del volumen. El
 /// override permite a estaciones NVMe grandes dedicar hasta 64 GiB.
+/// PR-14: directorio del caché de decode. Override `ZAS_DECODE_CACHE_DIR`
+/// para llevarlo a otro volumen (p. ej. un SSD externo cuando el interno va
+/// lleno: con <12GB libres la salvaguarda desactiva el caché y las pasadas
+/// vuelven a re-decodificar).
+fn decode_cache_root_dir() -> std::path::PathBuf {
+    match std::env::var_os("ZAS_DECODE_CACHE_DIR") {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => std::env::temp_dir().join("astro_stacker_cache"),
+    }
+}
+
 /// PR-14: decide QUÉ índices de la selección se cachean. Completa si cabe en
 /// presupuesto; si no, el SUFIJO que cabe (la pasada siguiente decodifica el
 /// prefijo y el decoder se corta ahí). Un sufijo <5% de la selección no
@@ -4160,7 +4171,7 @@ fn read_selected_from_decode_cache(
     if indices.is_empty() {
         return None;
     }
-    let cache_dir = std::env::temp_dir().join("astro_stacker_cache");
+    let cache_dir = decode_cache_root_dir();
     let is_color_stream = ffmpeg_stream_is_color(color_id);
     let cached_frame_len = width * height * (if is_color_stream { 3 } else { 1 });
     let mut routes: Vec<String> = vec![ffmpeg_decode_route_label(ffmpeg_path, None)];
@@ -4534,7 +4545,7 @@ fn stream_frames_ffmpeg_chunked(
     force_cpu_decode: bool,
     decode_route_hardware: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
-    let cache_dir = std::env::temp_dir().join("astro_stacker_cache");
+    let cache_dir = decode_cache_root_dir();
     if !cache_dir.exists() {
         let _ = std::fs::create_dir_all(&cache_dir);
     }
@@ -8891,7 +8902,7 @@ fn stack_video_liquid_warping_impl(
     // CACHE DE DECODE PERSISTENTE: ya NO se borra al terminar — re-apilar el
     // mismo video (otro %, otra malla, otro drizzle) sirve los frames desde
     // disco sin re-decodificar. La poda LRU se adapta a RAM y espacio libre.
-    let cache_dir = std::env::temp_dir().join("astro_stacker_cache");
+    let cache_dir = decode_cache_root_dir();
     let cache_budget = decode_cache_budget_bytes(&cache_dir);
     prune_decode_cache_to_budget(&cache_dir, cache_budget);
 
