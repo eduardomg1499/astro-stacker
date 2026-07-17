@@ -7387,8 +7387,18 @@ fn stack_video_liquid_warping_impl(
     let gpu_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let gpu_px_pool: std::sync::Arc<std::sync::Mutex<Vec<Vec<u16>>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (gpu_tx, gpu_join) = if use_gpu_pass {
-        let rt = gpu_rt.expect("use_gpu_pass implica runtime");
+    // Invariante: use_gpu_pass implica runtime. Si se rompiera, degradar a
+    // reintento CPU del pase (gpu_failed) — nunca abortar el apilado.
+    let gpu_rt_for_pass = if use_gpu_pass {
+        if gpu_rt.is_none() {
+            eprintln!("[gpu] use_gpu_pass sin runtime wgpu; el pase se reintenta en CPU");
+            gpu_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        gpu_rt
+    } else {
+        None
+    };
+    let (gpu_tx, gpu_join) = if let Some(rt) = gpu_rt_for_pass {
         let cfg = crate::gpu_stack::GpuPassConfig {
             w_in,
             h_in,
@@ -7413,30 +7423,29 @@ fn stack_video_liquid_warping_impl(
         match crate::gpu_stack::GpuPassAccumulator::new(rt, cfg, &warp_indices, &warp_weights) {
             Ok(acc) => {
                 // Pasada 2: subir los limites de winsorizacion sigma-clip.
-                let bounds_res = if clip_g.is_some() {
+                // clip_* ausente = invariante rota: se trata como error del
+                // pase GPU (fallback CPU integro), nunca panic en caliente.
+                let bounds_res = (|| -> Result<(), String> {
+                    if clip_g.is_none() {
+                        return Ok(());
+                    }
+                    let missing =
+                        |name: &str| format!("{name} ausente en pasada 2 (invariante sigma-clip)");
                     let chans: Vec<(&[f32], &[f32])> = if !is_mono_stack {
+                        let r = clip_r.as_ref().ok_or_else(|| missing("clip_r"))?;
+                        let g = clip_g.as_ref().ok_or_else(|| missing("clip_g"))?;
+                        let b = clip_b.as_ref().ok_or_else(|| missing("clip_b"))?;
                         vec![
-                            {
-                                let c = clip_r.as_ref().expect("clip_r en pasada 2 color");
-                                (c.0.as_slice(), c.1.as_slice())
-                            },
-                            {
-                                let c = clip_g.as_ref().expect("clip_g en pasada 2");
-                                (c.0.as_slice(), c.1.as_slice())
-                            },
-                            {
-                                let c = clip_b.as_ref().expect("clip_b en pasada 2 color");
-                                (c.0.as_slice(), c.1.as_slice())
-                            },
+                            (r.0.as_slice(), r.1.as_slice()),
+                            (g.0.as_slice(), g.1.as_slice()),
+                            (b.0.as_slice(), b.1.as_slice()),
                         ]
                     } else {
-                        let c = clip_g.as_ref().expect("clip_g en pasada 2");
-                        vec![(c.0.as_slice(), c.1.as_slice())]
+                        let g = clip_g.as_ref().ok_or_else(|| missing("clip_g"))?;
+                        vec![(g.0.as_slice(), g.1.as_slice())]
                     };
                     acc.set_sigma_bounds(&chans)
-                } else {
-                    Ok(())
-                };
+                })();
                 if let Err(e) = bounds_res {
                     if !compute_policy.allows_fallback() {
                         return Err(format!(

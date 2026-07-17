@@ -1545,7 +1545,15 @@ impl GpuPassAccumulator {
             })
             .collect();
 
-        let mut raw = Vec::<u64>::with_capacity(n_px * planes);
+        // try_reserve: a 20MP con drizzle este buffer llega a varios GB — un
+        // OOM debe degradar a error de pase (fallback CPU), no abortar la app.
+        let mut raw = Vec::<u64>::new();
+        raw.try_reserve_exact(n_px * planes).map_err(|_| {
+            format!(
+                "Sin RAM para descargar el pase GPU ({} MB)",
+                (n_px * planes * 8) / (1024 * 1024)
+            )
+        })?;
         let mut off = 0u64;
         while off < total_bytes {
             let mut chunks = Vec::with_capacity(staging_count);
@@ -1604,6 +1612,19 @@ impl GpuPassAccumulator {
         let to_f64_q24 = |v: u64| v as f64 / 16_777_216.0;
         let to_f64_q8 = |v: u64| v as f64 / 256.0;
         let plane = |i: usize| &raw[i * n_px..(i + 1) * n_px];
+        // try_reserve: cada plano f64 puede superar los 600MB a 20MP con
+        // drizzle — un OOM debe ser Err (fallback CPU), no abort del proceso.
+        fn q_plane(src: &[u64], f: impl Fn(u64) -> f64, label: &str) -> Result<Vec<f64>, String> {
+            let mut out = Vec::new();
+            out.try_reserve_exact(src.len()).map_err(|_| {
+                format!(
+                    "Sin RAM para el plano {label} de la descarga GPU ({} MB)",
+                    (src.len() * 8) / (1024 * 1024)
+                )
+            })?;
+            out.extend(src.iter().map(|&v| f(v)));
+            Ok(out)
+        }
 
         let mut out = GpuDownload {
             direct_r: Vec::new(),
@@ -1616,22 +1637,22 @@ impl GpuPassAccumulator {
             m2_b: Vec::new(),
         };
         if self.cfg.is_color {
-            out.direct_r = plane(0).iter().map(|&v| to_f64_q24(v)).collect();
-            out.direct_g = plane(1).iter().map(|&v| to_f64_q24(v)).collect();
-            out.direct_b = plane(2).iter().map(|&v| to_f64_q24(v)).collect();
-            out.direct_w = plane(3).iter().map(|&v| to_f64_q24(v)).collect();
+            out.direct_r = q_plane(plane(0), to_f64_q24, "direct_r")?;
+            out.direct_g = q_plane(plane(1), to_f64_q24, "direct_g")?;
+            out.direct_b = q_plane(plane(2), to_f64_q24, "direct_b")?;
+            out.direct_w = q_plane(plane(3), to_f64_q24, "direct_w")?;
             if self.cfg.track_m2 {
-                out.direct_w2 = plane(4).iter().map(|&v| to_f64_q24(v)).collect();
-                out.m2_r = plane(5).iter().map(|&v| to_f64_q8(v)).collect();
-                out.m2_g = plane(6).iter().map(|&v| to_f64_q8(v)).collect();
-                out.m2_b = plane(7).iter().map(|&v| to_f64_q8(v)).collect();
+                out.direct_w2 = q_plane(plane(4), to_f64_q24, "direct_w2")?;
+                out.m2_r = q_plane(plane(5), to_f64_q8, "m2_r")?;
+                out.m2_g = q_plane(plane(6), to_f64_q8, "m2_g")?;
+                out.m2_b = q_plane(plane(7), to_f64_q8, "m2_b")?;
             }
         } else {
-            out.direct_g = plane(0).iter().map(|&v| to_f64_q24(v)).collect();
-            out.direct_w = plane(1).iter().map(|&v| to_f64_q24(v)).collect();
+            out.direct_g = q_plane(plane(0), to_f64_q24, "direct_g")?;
+            out.direct_w = q_plane(plane(1), to_f64_q24, "direct_w")?;
             if self.cfg.track_m2 {
-                out.direct_w2 = plane(2).iter().map(|&v| to_f64_q24(v)).collect();
-                out.m2_g = plane(3).iter().map(|&v| to_f64_q8(v)).collect();
+                out.direct_w2 = q_plane(plane(2), to_f64_q24, "direct_w2")?;
+                out.m2_g = q_plane(plane(3), to_f64_q8, "m2_g")?;
             }
         }
         Ok(out)
