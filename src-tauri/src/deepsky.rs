@@ -7571,6 +7571,72 @@ fn ds_integrate_gpu_streaming(
     ))
 }
 
+/// INV-A: planifica la secuencia de dithering óptima para la evidencia de
+/// super-resolución (fase fraccional por diseño experimental sobre las
+/// matrices de alias + parte entera aleatoria anti walking-noise). Con
+/// `existing` no vacío re-planifica en bucle cerrado (tomas ya adquiridas o
+/// perdidas). Devuelve las recomendaciones y la evidencia prevista.
+#[tauri::command]
+async fn deepsky_plan_dither(
+    count: usize,
+    scale: f32,
+    fwhm_px: f32,
+    cfa: Option<i32>,
+    existing: Option<Vec<(f64, f64)>>,
+) -> Result<serde_json::Value, String> {
+    if count == 0 || count > 200 {
+        return Err("count debe estar entre 1 y 200".into());
+    }
+    if !(1.0..=2.0).contains(&scale) {
+        return Err("scale debe estar entre 1.0 y 2.0".into());
+    }
+    let psf = crate::deepsky_psf::MoffatPsf {
+        fwhm_x: fwhm_px.clamp(0.6, 6.0),
+        fwhm_y: fwhm_px.clamp(0.6, 6.0),
+        theta: 0.0,
+        beta: 2.5,
+    };
+    let phases = existing.unwrap_or_default();
+    let inp = crate::eidr::DitherPlanInput {
+        phases: &phases,
+        psf,
+        scale,
+        cfa: cfa.filter(|c| (8..=11).contains(c)),
+    };
+    let recs = crate::eidr::eidr_plan_dither_sequence(&inp, count);
+    // Parte entera sugerida (anti walking-noise), determinista por índice.
+    let mut state = 0x5eed_d17e_c0de_u64.wrapping_add(phases.len() as u64);
+    let mut lcg = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 33) as f64) / (u32::MAX as f64 + 1.0)
+    };
+    let period = if inp.cfa.is_some() { 2.0f64 } else { 1.0 };
+    let items: Vec<serde_json::Value> = recs
+        .iter()
+        .map(|r| {
+            let ix = (lcg() * 5.0).floor() * period;
+            let iy = (lcg() * 5.0).floor() * period;
+            serde_json::json!({
+                "dx": r.dx,
+                "dy": r.dy,
+                "dxFull": ix + r.dx,
+                "dyFull": iy + r.dy,
+                "evidence": r.evidence_after,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "scale": scale,
+        "cfa": inp.cfa,
+        "fwhmPx": psf.fwhm_x,
+        "evidenceStart": recs.first().map(|r| r.evidence_before),
+        "evidenceEnd": recs.last().map(|r| r.evidence_after),
+        "plan": items,
+    }))
+}
+
 /// Resultado de la ejecución EIDR (F9): máster a la escala efectiva +
 /// productos científicos + metadatos para receta/log.
 struct DsEidrOutcome {

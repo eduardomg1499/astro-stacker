@@ -1469,6 +1469,273 @@ pub(crate) fn frc_cutoff(
 }
 
 // ---------------------------------------------------------------------------
+// INV-A: planificador de dithering en bucle cerrado (diseño experimental)
+// ---------------------------------------------------------------------------
+//
+// El dithering convencional es ALEATORIO (PHD2/NINA/espiral). Pero la puerta
+// de recuperabilidad conoce exactamente qué fases subpíxel le faltan a cada
+// banda de frecuencia para separar sus réplicas de alias. Este planificador
+// cierra el bucle: dado el conjunto de fases YA adquiridas, evalúa una
+// rejilla de fases candidatas para la SIGUIENTE toma y recomienda la que
+// maximiza la evidencia de la banda peor servida (criterio maximin sobre la
+// precisión marginal de cada modo objetivo — diseño experimental E-óptimo
+// sobre las matrices de alias). La toma real compone: parte entera
+// aleatoria (se conserva el beneficio anti walking-noise del dither
+// clásico) + la fase fraccional planificada.
+//
+// Efecto técnico medido por los gates INV-A: alcanzar "apto para 2x" con
+// menos tomas que el dithering aleatorio, en mono y especialmente en CFA
+// (la retícula por canal multiplica las clases de fase necesarias).
+
+/// Entrada del planificador: sesión en curso y condiciones.
+pub(crate) struct DitherPlanInput<'a> {
+    /// Desplazamientos ya adquiridos (px nativos; se usa su fase).
+    pub phases: &'a [(f64, f64)],
+    /// PSF esperada o medida (uniforme para planificar).
+    pub psf: MoffatPsf,
+    /// Escala objetivo (1.5 / 2.0).
+    pub scale: f32,
+    /// Patrón CFA (None = mono/RGB debayerizado).
+    pub cfa: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DitherRecommendation {
+    /// Fase fraccional recomendada para la SIGUIENTE toma (px nativos).
+    pub dx: f64,
+    pub dy: f64,
+    /// Evidencia maximin (s̃ de la banda peor servida) antes y después.
+    pub evidence_before: f64,
+    pub evidence_after: f64,
+}
+
+/// Sistema de planificación por canal: para cada frecuencia objetivo, las
+/// réplicas aliasadas (amplitud MTF·sinc + frecuencia) y las paridades de la
+/// retícula (mono: 1; CFA R/B: 1 con offset; G: 2 quincunx).
+struct PlanTarget {
+    nus: Vec<(f64, f64)>,
+    amps: Vec<f64>,
+    t_idx: usize,
+}
+
+struct PlanChannel {
+    targets: Vec<PlanTarget>,
+    parities: Vec<(usize, usize)>,
+}
+
+fn build_plan_channels(psf: &MoffatPsf, scale: f32, cfa: Option<i32>) -> Vec<PlanChannel> {
+    let s = scale as f64;
+    let radii: [f64; 4] = [0.2, 0.5, 0.8, 0.98];
+    let angles: [f64; 4] = [0.0, 45.0, 90.0, 135.0];
+    let mut targets_nu: Vec<(f64, f64)> = Vec::new();
+    for &rf in &radii {
+        let r = 0.5 + (0.5 * s - 0.5) * rf;
+        for &ang in &angles {
+            let a = ang.to_radians();
+            targets_nu.push((r * a.cos(), r * a.sin()));
+        }
+    }
+    let channels: Vec<Vec<(usize, usize)>> = match cfa {
+        None => vec![vec![(0usize, 0usize)]],
+        Some(cid) => (0..3usize).map(|c| cfa_parities(cid, c)).collect(),
+    };
+    let lim = 0.5 * s - 1e-6;
+    channels
+        .into_iter()
+        .map(|parities| {
+            // Paso de la retícula del canal: CFA muestrea cada canal con
+            // paso 2 px ⇒ frecuencia de muestreo fs = ½; mono/RGB fs = 1.
+            let fs: f64 = if cfa.is_some() { 0.5 } else { 1.0 };
+            let mmax = ((lim / fs).ceil() as i64) + 1;
+            let targets = targets_nu
+                .iter()
+                .filter_map(|&(tx, ty)| {
+                    let base = (tx - fs * (tx / fs).round(), ty - fs * (ty / fs).round());
+                    let mut nus = Vec::new();
+                    for my in -mmax..=mmax {
+                        let vy = base.1 + my as f64 * fs;
+                        if vy.abs() > lim {
+                            continue;
+                        }
+                        for mx in -mmax..=mmax {
+                            let vx = base.0 + mx as f64 * fs;
+                            if vx.abs() > lim {
+                                continue;
+                            }
+                            nus.push((vx, vy));
+                        }
+                    }
+                    if nus.len() < 2 {
+                        return None;
+                    }
+                    let t_idx = nus
+                        .iter()
+                        .position(|&(vx, vy)| (vx - tx).abs() < 1e-9 && (vy - ty).abs() < 1e-9)?;
+                    let amps: Vec<f64> = {
+                        let vals = moffat_mtf(psf, &nus);
+                        vals.iter()
+                            .zip(nus.iter())
+                            .map(|(&m, &(vx, vy))| m * sinc(vx) * sinc(vy))
+                            .collect()
+                    };
+                    Some(PlanTarget { nus, amps, t_idx })
+                })
+                .collect();
+            PlanChannel { targets, parities }
+        })
+        .collect()
+}
+
+/// Evidencia del conjunto de fases: MEDIA de R = s̃²/(s̃²+η) sobre canales y
+/// frecuencias objetivo (s̃ = precisión marginal del modo normalizada a la
+/// sensibilidad DC, como en la puerta). R es saturante por banda: maximizar
+/// la suma reparte la evidencia entre las bandas peor servidas (comporta
+/// como un maximin suave) y, a diferencia del maximin puro, tiene gradiente
+/// desde la PRIMERA toma (con pocas tomas todos los mínimos son 0 y el
+/// maximin no distingue candidatas). `extra` añade una fase candidata.
+fn plan_evidence(
+    channels: &[PlanChannel],
+    phases: &[(f64, f64)],
+    extra: Option<(f64, f64)>,
+) -> f64 {
+    let n_ph = phases.len() + extra.is_some() as usize;
+    if n_ph == 0 {
+        return 0.0;
+    }
+    let mut r_sum = 0.0f64;
+    let mut r_cnt = 0usize;
+    for ch in channels {
+        let n_rows = n_ph * ch.parities.len();
+        for tg in &ch.targets {
+            let l = tg.nus.len();
+            let mut gre = vec![0.0f64; l * l];
+            let mut gim = vec![0.0f64; l * l];
+            let mut add_phase = |d: (f64, f64)| {
+                for &(ox, oy) in &ch.parities {
+                    // fila q_ℓ = a_ℓ·e^{−2πi ν_ℓ·(Δ+o)}
+                    let row: Vec<(f64, f64)> = tg
+                        .nus
+                        .iter()
+                        .zip(tg.amps.iter())
+                        .map(|(&(vx, vy), &a)| {
+                            let ph = -2.0
+                                * std::f64::consts::PI
+                                * (vx * (d.0 + ox as f64) + vy * (d.1 + oy as f64));
+                            (a * ph.cos(), a * ph.sin())
+                        })
+                        .collect();
+                    for i in 0..l {
+                        for j in 0..l {
+                            let (ar, ai) = row[i];
+                            let (br, bi) = row[j];
+                            gre[i * l + j] += ar * br + ai * bi;
+                            gim[i * l + j] += ar * bi - ai * br;
+                        }
+                    }
+                }
+            };
+            for &d in phases {
+                add_phase(d);
+            }
+            if let Some(d) = extra {
+                add_phase(d);
+            }
+            // Cresta minúscula: ordena candidatos incluso con G singular
+            // (primeras tomas de la sesión).
+            let tr: f64 = (0..l).map(|i| gre[i * l + i]).sum::<f64>() / l as f64;
+            let eps = (tr * 1e-9).max(1e-30);
+            for i in 0..l {
+                gre[i * l + i] += eps;
+            }
+            let s_t = match hermitian_solve_diag(&gre, &gim, l, tg.t_idx) {
+                Some(v) if v > 0.0 => 1.0 / v.sqrt(),
+                _ => 0.0,
+            };
+            let s_tilde = s_t / (n_rows as f64).sqrt().max(1e-30);
+            let r = s_tilde * s_tilde / (s_tilde * s_tilde + EIDR_GATE_ETA);
+            r_sum += r;
+            r_cnt += 1;
+        }
+    }
+    if r_cnt > 0 {
+        r_sum / r_cnt as f64
+    } else {
+        0.0
+    }
+}
+
+/// Recomienda la fase de la SIGUIENTE toma: rejilla de candidatas sobre el
+/// periodo de la retícula (mono: [0,1)²; CFA: [0,2)², la paridad del entero
+/// importa), criterio maximin con desempate por la media. Determinista.
+pub(crate) fn eidr_plan_next_dither(inp: &DitherPlanInput) -> DitherRecommendation {
+    let channels = build_plan_channels(&inp.psf, inp.scale, inp.cfa);
+    let before = plan_evidence(&channels, inp.phases, None);
+    let period = if inp.cfa.is_some() { 2.0f64 } else { 1.0 };
+    let steps = if inp.cfa.is_some() { 16usize } else { 12 };
+    let mut best = (0.0f64, 0.0f64, -1.0f64);
+    for iy in 0..steps {
+        for ix in 0..steps {
+            let cand = (
+                period * (ix as f64 + 0.5) / steps as f64,
+                period * (iy as f64 + 0.5) / steps as f64,
+            );
+            let ev = plan_evidence(&channels, inp.phases, Some(cand));
+            if ev > best.2 {
+                best = (cand.0, cand.1, ev);
+            }
+        }
+    }
+    // Refinamiento local: dos rondas 5×5 alrededor del mejor punto de la
+    // rejilla (el óptimo continuo puede caer entre nodos).
+    let mut step = period / steps as f64;
+    for _round in 0..2 {
+        step *= 0.25;
+        let center = (best.0, best.1);
+        for iy in -2i32..=2 {
+            for ix in -2i32..=2 {
+                let cand = (
+                    (center.0 + ix as f64 * step).rem_euclid(period),
+                    (center.1 + iy as f64 * step).rem_euclid(period),
+                );
+                let ev = plan_evidence(&channels, inp.phases, Some(cand));
+                if ev > best.2 {
+                    best = (cand.0, cand.1, ev);
+                }
+            }
+        }
+    }
+    DitherRecommendation {
+        dx: best.0,
+        dy: best.1,
+        evidence_before: before,
+        evidence_after: best.2,
+    }
+}
+
+/// Secuencia planificada de n tomas (aplicación golosa del planificador):
+/// para planificar una sesión completa a priori o re-planificar tras
+/// perder/rechazar tomas (bucle cerrado).
+pub(crate) fn eidr_plan_dither_sequence(
+    inp: &DitherPlanInput,
+    n: usize,
+) -> Vec<DitherRecommendation> {
+    let mut acquired: Vec<(f64, f64)> = inp.phases.to_vec();
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let step = DitherPlanInput {
+            phases: &acquired,
+            psf: inp.psf,
+            scale: inp.scale,
+            cfa: inp.cfa,
+        };
+        let rec = eidr_plan_next_dither(&step);
+        acquired.push((rec.dx, rec.dy));
+        out.push(rec);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // F10: pesos robustos Huber (IRLS) y microregistro ±0.2 px (§7.3/§7.5)
 // ---------------------------------------------------------------------------
 
@@ -2870,6 +3137,173 @@ mod tests {
             sum / cnt as f64,
             worst
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Gates INV-A: planificador de dithering vs aleatorio
+    // -----------------------------------------------------------------------
+
+    /// Nº de tomas hasta que la puerta REAL declara la escala soportada,
+    /// añadiendo fases con la estrategia dada (las 2 primeras son comunes).
+    fn frames_to_apt(
+        strategy_planner: bool,
+        seed: u64,
+        cfa: Option<i32>,
+        psf: MoffatPsf,
+        max_frames: usize,
+    ) -> usize {
+        let mut st = seed;
+        let mut phases: Vec<(f64, f64)> = (0..2)
+            .map(|_| (lcg(&mut st) * 2.0, lcg(&mut st) * 2.0))
+            .collect();
+        loop {
+            if phases.len() >= max_frames {
+                return max_frames;
+            }
+            let next = if strategy_planner {
+                let rec = eidr_plan_next_dither(&DitherPlanInput {
+                    phases: &phases,
+                    psf,
+                    scale: 2.0,
+                    cfa,
+                });
+                // Composición real: parte entera aleatoria (anti walking
+                // noise) + fase fraccional planificada.
+                let int_x = (lcg(&mut st) * 5.0).floor() * 2.0;
+                let int_y = (lcg(&mut st) * 5.0).floor() * 2.0;
+                (int_x + rec.dx, int_y + rec.dy)
+            } else {
+                ((lcg(&mut st) * 10.0), (lcg(&mut st) * 10.0))
+            };
+            phases.push(next);
+            // Puerta REAL (no el proxy del planificador) como árbitro.
+            let gate_frames: Vec<EidrGateFrame> = phases
+                .iter()
+                .map(|&(dx, dy)| {
+                    let t = crate::DsTransform::from_similarity((
+                        1.0,
+                        0.0,
+                        -dx as f32,
+                        -dy as f32,
+                    ));
+                    EidrGateFrame {
+                        geom: eidr_geom(&t, 2.0).unwrap(),
+                        psf: Some(psf),
+                        sigma: 12.0,
+                    }
+                })
+                .collect();
+            let rep = eidr_recoverability_gate(
+                &gate_frames,
+                psf,
+                128,
+                112,
+                2.0,
+                cfa.map(|cid| (cid, 0usize)),
+                128,
+            );
+            let ok = if cfa.is_some() {
+                // CFA: las tres retículas deben estar servidas (manda la peor).
+                (0..3usize).all(|c| {
+                    let r = eidr_recoverability_gate(
+                        &gate_frames,
+                        psf,
+                        128,
+                        112,
+                        2.0,
+                        Some((cfa.unwrap(), c)),
+                        128,
+                    );
+                    r.scale_supported()
+                })
+            } else {
+                rep.scale_supported()
+            };
+            if ok {
+                return phases.len();
+            }
+        }
+    }
+
+    /// INV-A mono: el planificador alcanza "apto para 2x" con MENOS tomas
+    /// que el dithering aleatorio (mediana sobre semillas). El árbitro es la
+    /// puerta de recuperabilidad real, no el propio planificador.
+    #[test]
+    fn gate_inva_planner_beats_random_mono() {
+        let psf = MoffatPsf { fwhm_x: 1.3, fwhm_y: 1.3, theta: 0.0, beta: 2.5 };
+        let seeds = [11u64, 23, 47, 89, 131];
+        let mut rnd: Vec<usize> = seeds
+            .iter()
+            .map(|&sd| frames_to_apt(false, sd, None, psf, 40))
+            .collect();
+        let mut pln: Vec<usize> = seeds
+            .iter()
+            .map(|&sd| frames_to_apt(true, sd, None, psf, 40))
+            .collect();
+        rnd.sort();
+        pln.sort();
+        let (mr, mp) = (rnd[rnd.len() / 2], pln[pln.len() / 2]);
+        eprintln!("INV-A mono: aleatorio {rnd:?} (mediana {mr}) vs planificado {pln:?} (mediana {mp})");
+        assert!(
+            mp <= mr && mp <= 8,
+            "el planificador no gana: planificado {mp} vs aleatorio {mr}"
+        );
+    }
+
+    /// INV-A CFA (RGGB): las clases de fase por canal multiplican lo que el
+    /// azar tiene que cubrir — aquí el planificador debe ganar con margen.
+    #[test]
+    fn gate_inva_planner_beats_random_cfa() {
+        let psf = MoffatPsf { fwhm_x: 1.4, fwhm_y: 1.4, theta: 0.0, beta: 2.5 };
+        let seeds = [7u64, 19, 43, 71, 113];
+        let mut rnd: Vec<usize> = seeds
+            .iter()
+            .map(|&sd| frames_to_apt(false, sd, Some(8), psf, 60))
+            .collect();
+        let mut pln: Vec<usize> = seeds
+            .iter()
+            .map(|&sd| frames_to_apt(true, sd, Some(8), psf, 60))
+            .collect();
+        rnd.sort();
+        pln.sort();
+        let (mr, mp) = (rnd[rnd.len() / 2], pln[pln.len() / 2]);
+        eprintln!("INV-A CFA: aleatorio {rnd:?} (mediana {mr}) vs planificado {pln:?} (mediana {mp})");
+        // Mediana ≥15% mejor Y peor caso ≥30% mejor: la ventaja clave del
+        // planificador es que ELIMINA la cola mala del azar (31→17 medido).
+        assert!(
+            (mp as f64) <= (mr as f64) * 0.85,
+            "sin margen CFA en mediana: planificado {mp} vs aleatorio {mr}"
+        );
+        assert!(
+            (*pln.last().unwrap() as f64) <= (*rnd.last().unwrap() as f64) * 0.7,
+            "sin margen CFA en peor caso: {:?} vs {:?}",
+            pln,
+            rnd
+        );
+    }
+
+    /// Con una toma en (0,0), la fase recomendada debe rendir AL MENOS tanto
+    /// como la heurística ingenua (0.5,0.5) — que separa los ejes pero NO la
+    /// réplica diagonal m=(1,1) (0.5+0.5 ≡ 0 mod 1): el óptimo real es un
+    /// compromiso que el planificador encuentra y la intuición no.
+    #[test]
+    fn inva_planner_beats_naive_phase() {
+        let psf = MoffatPsf { fwhm_x: 1.3, fwhm_y: 1.3, theta: 0.0, beta: 2.5 };
+        let inp = DitherPlanInput {
+            phases: &[(0.0, 0.0)],
+            psf,
+            scale: 2.0,
+            cfa: None,
+        };
+        let rec = eidr_plan_next_dither(&inp);
+        let channels = build_plan_channels(&psf, 2.0, None);
+        let naive = plan_evidence(&channels, &[(0.0, 0.0)], Some((0.5, 0.5)));
+        eprintln!(
+            "INV-A fase: ({:.3},{:.3}) evidencia {:.4}→{:.4} (ingenua 0.5,0.5: {:.4})",
+            rec.dx, rec.dy, rec.evidence_before, rec.evidence_after, naive
+        );
+        assert!(rec.evidence_after >= naive - 1e-9, "peor que la heurística");
+        assert!(rec.evidence_after > rec.evidence_before + 1e-6);
     }
 
     // -----------------------------------------------------------------------

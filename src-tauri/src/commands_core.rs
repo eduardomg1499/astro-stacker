@@ -10654,6 +10654,7 @@ fn main() {
             prepare_deepsky_stack,
             run_deepsky_stack,
             deepsky_cancel_job,
+            deepsky_plan_dither,
             prepare_deepsky_session,
             run_deepsky_session,
             stack_deepsky,
