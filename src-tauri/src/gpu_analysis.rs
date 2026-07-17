@@ -1280,6 +1280,16 @@ pub fn search_sad_points(
         .write_buffer(&e.points, 0, bytemuck::cast_slice(points));
     let pp = sad_pipelines(rt);
     let used_bytes = (points.len() * 16) as u64;
+    // PR-30: staging POR LLAMADA (≈20 KB para miles de APs). Permite soltar el
+    // motor compartido justo después del submit: el siguiente worker sube y
+    // despacha su frame mientras este espera su readback — antes el mutex se
+    // mantenía durante la espera y los 8 workers quedaban en fila india.
+    let call_staging = rt.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("zas-analysis-sad-staging-call"),
+        size: used_bytes.max(16),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
     for (range_index, &(start, end)) in submit_ranges.iter().enumerate() {
         rt.queue.write_buffer(
             &e.params,
@@ -1308,12 +1318,16 @@ pub fn search_sad_points(
             pass.dispatch_workgroups(((end - start) as u32).div_ceil(64), 1, 1);
         }
         if range_index + 1 == submit_ranges.len() {
-            enc.copy_buffer_to_buffer(&e.results, 0, &e.staging, 0, used_bytes);
+            enc.copy_buffer_to_buffer(&e.results, 0, &call_staging, 0, used_bytes);
         }
         rt.queue.submit(Some(enc.finish()));
     }
+    // PR-30: el contenido del staging quedó fijado por ORDEN DE COLA (nuestra
+    // copia se sometió antes de soltar el lock); los write_buffer/dispatch del
+    // siguiente caller se ejecutan después y no pueden afectarlo.
+    drop(guard);
 
-    let slice = e.staging.slice(0..used_bytes);
+    let slice = call_staging.slice(0..used_bytes);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = tx.send(result);
@@ -1342,7 +1356,7 @@ pub fn search_sad_points(
         }
         out
     };
-    e.staging.unmap();
+    call_staging.unmap();
     if crate::gpu_stack::gpu_error_since(error_epoch) {
         return Err("Device loss/OOM durante SAD GPU".into());
     }
