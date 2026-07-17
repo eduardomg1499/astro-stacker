@@ -1176,6 +1176,150 @@ pub fn refine_shift_lucas_kanade(
     box_size: usize,
     iterations: usize,
 ) -> Option<(f32, f32)> {
+    // PR-21b: delega en la variante sin bounds checks. SAFETY: el check de
+    // margen inicial acota los indices del master (ax/ay ± half dentro de
+    // [1, w-2]/[1, h-2]) y el bounds check por iteracion acota el muestreo
+    // bilineal del target (esquinas < (w-1, h-1)).
+    unsafe {
+        refine_shift_lucas_kanade_unchecked(
+            master, target, w, h, ax, ay, shift_dx, shift_dy, box_size, iterations,
+        )
+    }
+}
+
+/// PR-21b: cuerpo real del LK con get_unchecked — los bounds checks de los
+/// 6 accesos por pixel eran el unico freno del optimizador en este bucle
+/// (misma aritmetica f64 en el mismo orden que la copia checked del test).
+#[inline(always)]
+unsafe fn refine_shift_lucas_kanade_unchecked(
+    master: &[u16],
+    target: &[u16],
+    w: usize,
+    h: usize,
+    ax: usize,
+    ay: usize,
+    shift_dx: f32,
+    shift_dy: f32,
+    box_size: usize,
+    iterations: usize,
+) -> Option<(f32, f32)> {
+    let half = (box_size / 2) as i32;
+    let axi = ax as i32;
+    let ayi = ay as i32;
+    // Margen ±1 para el gradiente central del master.
+    if axi - half < 1 || ayi - half < 1 || axi + half >= w as i32 - 1 || ayi + half >= h as i32 - 1
+    {
+        return None;
+    }
+
+    // Hessiano 2×2 del master (una sola vez — inverse compositional).
+    let mut h00 = 0.0f64;
+    let mut h01 = 0.0f64;
+    let mut h11 = 0.0f64;
+    for oy in -half..half {
+        let y = (ayi + oy) as usize;
+        let row = y * w;
+        for ox in -half..half {
+            let x = (axi + ox) as usize;
+            let i = row + x;
+            let gx = (*master.get_unchecked(i + 1) as f64 - *master.get_unchecked(i - 1) as f64) * 0.5;
+            let gy = (*master.get_unchecked(i + w) as f64 - *master.get_unchecked(i - w) as f64) * 0.5;
+            h00 += gx * gx;
+            h01 += gx * gy;
+            h11 += gy * gy;
+        }
+    }
+    // Sin energia de gradiente en algun eje (patch plano) o sistema casi
+    // singular (borde 1-D puro → aperture problem): dejar el estimado SAD.
+    let det = h00 * h11 - h01 * h01;
+    if h00 < 1.0 || h11 < 1.0 || det < 1e-6 * h00 * h11 {
+        return None;
+    }
+    let inv00 = h11 / det;
+    let inv01 = -h01 / det;
+    let inv11 = h00 / det;
+
+    let mut pdx = shift_dx;
+    let mut pdy = shift_dy;
+    for _ in 0..iterations.max(1) {
+        // Bounds del patch desplazado para el muestreo bilineal: si alguna
+        // esquina se sale del frame, abortar (conservar estimado SAD).
+        let min_x = (axi - half) as f32 + pdx;
+        let min_y = (ayi - half) as f32 + pdy;
+        let max_x = (axi + half - 1) as f32 + pdx;
+        let max_y = (ayi + half - 1) as f32 + pdy;
+        if min_x < 0.0 || min_y < 0.0 || max_x >= (w - 1) as f32 || max_y >= (h - 1) as f32 {
+            return None;
+        }
+
+        let mut b0 = 0.0f64;
+        let mut b1 = 0.0f64;
+        for oy in -half..half {
+            let y = (ayi + oy) as usize;
+            let syf = y as f32 + pdy;
+            let sy0 = syf as usize; // syf >= 0 garantizado por el bounds check
+            let fy = syf - sy0 as f32;
+            let row_m = y * w;
+            let row_t = sy0 * w;
+            for ox in -half..half {
+                let x = (axi + ox) as usize;
+                let i = row_m + x;
+                let gx = (*master.get_unchecked(i + 1) as f64 - *master.get_unchecked(i - 1) as f64) * 0.5;
+                let gy = (*master.get_unchecked(i + w) as f64 - *master.get_unchecked(i - w) as f64) * 0.5;
+
+                let sxf = x as f32 + pdx;
+                let sx0 = sxf as usize;
+                let fx = sxf - sx0 as f32;
+                let t00 = *target.get_unchecked(row_t + sx0) as f32;
+                let t10 = *target.get_unchecked(row_t + sx0 + 1) as f32;
+                let t01 = *target.get_unchecked(row_t + w + sx0) as f32;
+                let t11 = *target.get_unchecked(row_t + w + sx0 + 1) as f32;
+                let tv = t00 * (1.0 - fx) * (1.0 - fy)
+                    + t10 * fx * (1.0 - fy)
+                    + t01 * (1.0 - fx) * fy
+                    + t11 * fx * fy;
+
+                let e = tv as f64 - *master.get_unchecked(i) as f64;
+                b0 += gx * e;
+                b1 += gy * e;
+            }
+        }
+
+        // Gauss-Newton para traslacion pura: p ← p − H⁻¹·b
+        let ddx = (inv00 * b0 + inv01 * b1) as f32;
+        let ddy = (inv01 * b0 + inv11 * b1) as f32;
+        if !ddx.is_finite() || !ddy.is_finite() || ddx.abs() > 1.5 || ddy.abs() > 1.5 {
+            return None; // divergencia: el residuo no es un pulido local
+        }
+        pdx -= ddx;
+        pdy -= ddy;
+        if ddx.abs() < 0.005 && ddy.abs() < 0.005 {
+            break; // convergido
+        }
+    }
+
+    // LK solo pule: una correccion grande significa salto de cuenca del SAD.
+    if (pdx - shift_dx).abs() > 0.75 || (pdy - shift_dy).abs() > 0.75 {
+        return None;
+    }
+    Some((pdx, pdy))
+}
+
+
+
+#[cfg(test)]
+fn refine_shift_lucas_kanade_checked(
+    master: &[u16],
+    target: &[u16],
+    w: usize,
+    h: usize,
+    ax: usize,
+    ay: usize,
+    shift_dx: f32,
+    shift_dy: f32,
+    box_size: usize,
+    iterations: usize,
+) -> Option<(f32, f32)> {
     let half = (box_size / 2) as i32;
     let axi = ax as i32;
     let ayi = ay as i32;
@@ -2054,6 +2198,60 @@ pub fn enhance_solar_surface(input: &[u16], width: usize, height: usize) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PR-21b: el LK unchecked debe ser BIT-EXACTO contra la copia checked
+    /// (misma aritmética f64 en el mismo orden; solo difiere la comprobación
+    /// de límites). Patches con gradiente real y shifts subpíxel variados.
+    #[test]
+    fn lk_unchecked_matches_checked_bit_exact() {
+        let w = 128usize;
+        let h = 96usize;
+        let mut seed = 0x9e37_79b9u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 16) as u16
+        };
+        let mut master = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let v = 8000.0
+                    + 6000.0 * ((x as f32) * 0.13).sin() * ((y as f32) * 0.11).cos()
+                    + (rnd() % 500) as f32;
+                master[y * w + x] = v as u16;
+            }
+        }
+        // target = master desplazado ~(0.6, -0.4) por muestreo bilineal.
+        let (tdx, tdy) = (0.6f32, -0.4f32);
+        let mut target = vec![0u16; w * h];
+        for y in 1..h - 1 {
+            for x in 1..w - 1 {
+                let sx = x as f32 - tdx;
+                let sy = y as f32 - tdy;
+                let x0 = sx as usize;
+                let y0 = sy as usize;
+                let fx = sx - x0 as f32;
+                let fy = sy - y0 as f32;
+                let i00 = master[y0 * w + x0] as f32;
+                let i10 = master[y0 * w + x0 + 1] as f32;
+                let i01 = master[(y0 + 1) * w + x0] as f32;
+                let i11 = master[(y0 + 1) * w + x0 + 1] as f32;
+                target[y * w + x] = (i00 * (1.0 - fx) * (1.0 - fy)
+                    + i10 * fx * (1.0 - fy)
+                    + i01 * (1.0 - fx) * fy
+                    + i11 * fx * fy) as u16;
+            }
+        }
+        for &(ax, ay, sdx, sdy) in &[
+            (48usize, 48usize, 0.5f32, -0.5f32),
+            (40, 30, 0.9, -0.1),
+            (70, 60, 0.35, -0.62),
+        ] {
+            let a = refine_shift_lucas_kanade(&master, &target, w, h, ax, ay, sdx, sdy, 32, 3);
+            let b =
+                refine_shift_lucas_kanade_checked(&master, &target, w, h, ax, ay, sdx, sdy, 32, 3);
+            assert_eq!(a, b, "divergencia LK en ap=({ax},{ay}) seed=({sdx},{sdy})");
+        }
+    }
 
     /// PR-21: la variante unchecked (auto-vectorizada NEON/AVX2) debe ser
     /// BIT-EXACTA contra el escalar con bounds checks — mismos bucles, misma
