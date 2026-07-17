@@ -9106,8 +9106,9 @@ function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
                     // decide la PSF medida + la puerta de recuperabilidad; los
                     // fallbacks quedan en receta (nunca silenciosos).
                     scale: value("sel-ds-eidrscale", "auto"),
-                    solveMode: "scientificQuadratic",
+                    solveMode: value("sel-ds-eidrmode", "scientificQuadratic"),
                     cfaDirect: checked("chk-ds-cfadirect", false),
+                    refineRegistration: checked("chk-ds-eidrrefine", false),
                 },
             }
             : {}),
@@ -10714,7 +10715,9 @@ function dsLoadUxFixtureIfRequested(modal) {
         // escala solo a EIDR.
         [["chk-ds-cfadirect", "lbl-ds-cfadirect", nfActive || eidrActive],
          ["sel-ds-outputbin", "lbl-ds-outputbin", nfActive],
-         ["sel-ds-eidrscale", "lbl-ds-eidrscale", eidrActive]].forEach(([inputId, labelId, active]) => {
+         ["sel-ds-eidrscale", "lbl-ds-eidrscale", eidrActive],
+         ["sel-ds-eidrmode", "lbl-ds-eidrmode", eidrActive],
+         ["chk-ds-eidrrefine", "lbl-ds-eidrrefine", eidrActive]].forEach(([inputId, labelId, active]) => {
             const input = document.getElementById(inputId);
             if (input) input.disabled = !active;
             const label = document.getElementById(labelId);

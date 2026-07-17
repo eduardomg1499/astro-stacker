@@ -1182,6 +1182,10 @@
         "eidr_scale_1": "1x",
         "eidr_scale_15": "1.5x",
         "eidr_scale_2": "2x",
-        "view_recoverability": "Recoverability (EIDR)"
+        "view_recoverability": "Recoverability (EIDR)",
+        "eidr_mode_label": "EIDR mode",
+        "eidr_mode_quadratic": "Scientific quadratic",
+        "eidr_mode_experimental": "Experimental detail (Huber)",
+        "eidr_refine_label": "Micro-registration ±0.2 px"
     }
 }

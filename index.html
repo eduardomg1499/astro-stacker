@@ -1553,6 +1553,17 @@
                                 <option value="x2" data-i18n="deepsky.eidr_scale_2">2x</option>
                             </select>
                         </label>
+                        <label id="lbl-ds-eidrmode" class="ds-row" title="Solo EIDR: el modo cuadrático es la referencia científica (lineal, reproducible). El Detalle experimental añade pesos robustos Huber contra el modelo directo (limpia satélites/rayos presentes en pocas tomas); el cuadrático corre como baseline y si el holdout empeora se revierte automáticamente.">
+                            <span data-i18n="deepsky.eidr_mode_label">Modo EIDR</span>
+                            <select id="sel-ds-eidrmode" class="ds-sel">
+                                <option value="scientificQuadratic" selected data-i18n="deepsky.eidr_mode_quadratic">Cuadrático científico</option>
+                                <option value="experimentalDetail" data-i18n="deepsky.eidr_mode_experimental">Detalle experimental (Huber)</option>
+                            </select>
+                        </label>
+                        <label id="lbl-ds-eidrrefine" class="ds-row" title="Solo EIDR: refina la traslación de cada toma ±0.2 px contra el modelo directo (Gauss-Newton). Solo se acepta si el holdout mejora; si no, se revierte y queda registrado.">
+                            <span data-i18n="deepsky.eidr_refine_label">Microregistro ±0.2 px</span>
+                            <span class="switch"><input type="checkbox" id="chk-ds-eidrrefine"><span class="slider round"></span></span>
+                        </label>
                         <label id="lbl-ds-cfadirect" class="ds-row" title="Solo NebulaFusion: apila cada fotosito CFA en su propio canal, sin interpolar el debayer. Requiere lights CFA (RAW/FITS Bayer); el preflight lo valida.">
                             <span data-i18n="deepsky.cfa_direct_label">Modo CFA directo (sin debayer)</span>
                             <span class="switch"><input type="checkbox" id="chk-ds-cfadirect"><span class="slider round"></span></span>

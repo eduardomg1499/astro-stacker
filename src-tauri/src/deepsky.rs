@@ -5582,8 +5582,8 @@ fn prepare_deepsky_stack_impl(request: DeepSkyStackRequest, with_advisor: bool) 
         }
         pipeline::DeepSkyIntegrationMethod::Eidr(eidr_cfg) => {
             if matches!(eidr_cfg.solve_mode, pipeline::EidrSolveMode::ExperimentalDetail) {
-                errors.push(
-                    "EIDR ExperimentalDetail (Huber+TGV) llega en la siguiente fase; usa el modo cuadrático científico".into(),
+                warnings.push(
+                    "EIDR Detalle experimental (Huber-IRLS): el cuadrático científico corre como baseline interno y si el holdout empeora se REVIERTE automáticamente (§7.9/§7.10). TGV queda fuera de esta versión".into(),
                 );
             }
             let n = request.lights.len();
@@ -7595,6 +7595,14 @@ struct DsEidrOutcome {
     lambda_f: f64,
     holdout_frames: usize,
     holdout_chi2_median: Option<f64>,
+    solver_mode_used: String,
+    huber_adopted_channels: usize,
+    huber_reverted_channels: usize,
+    irls_rounds: usize,
+    refine_applied_frames: usize,
+    refine_p90_px: f64,
+    refine_reverted: bool,
+    multigrid_used: bool,
     gamma_fwhm_px: Option<f32>,
     geometry_only_frames: usize,
     excluded_frames: usize,
@@ -7835,7 +7843,7 @@ fn ds_run_eidr(
     if kept_idx.len() < 3 {
         return Err("EIDR: quedan menos de 3 frames utilizables".into());
     }
-    let op = EidrOperator {
+    let mut op = EidrOperator {
         frames: op_frames,
         w_out: w_pad_out,
         h_out: h_pad_out,
@@ -7843,6 +7851,50 @@ fn ds_run_eidr(
         ch: ch_out,
     };
     let nk = kept_idx.len();
+
+    // Multigrid (F10, §6 del plan): operador espejo a escala nativa para el
+    // warm start 1x→s. Mismos frames/máscaras/PSF; solo cambia la celda.
+    let (w1_out, h1_out) = (w + 2 * pad, h + 2 * pad);
+    let mut op1: Option<EidrOperator> = if cfg.multigrid && cfg.warm_start && scale_eff > 1.01 {
+        let mut fr1 = Vec::with_capacity(nk);
+        for &k in &kept_idx {
+            let t = registered[k].1;
+            let mut tp = t;
+            tp.h[2] += pad as f64 * tp.h[8];
+            tp.h[5] += pad as f64 * tp.h[8];
+            let Some(geom) = eidr_geom(&tp, 1.0) else { break };
+            let lut = eidr_build_lut(psfs[k], gamma_nominal, &geom);
+            let mut inv_var = [0.0f32; 3];
+            for c in 0..3 {
+                let sg = sigma_of(k, c);
+                inv_var[c] = (1.0 / (sg * sg)) as f32;
+            }
+            let mut fr = EidrFrameOp {
+                geom,
+                lut,
+                inv_var,
+                mask: masks[k].clone(),
+                robust_w: None,
+                w,
+                h,
+            };
+            eidr_mask_partial_rows(&mut fr, w1_out, h1_out);
+            fr1.push(fr);
+        }
+        if fr1.len() == nk {
+            Some(EidrOperator {
+                frames: fr1,
+                w_out: w1_out,
+                h_out: h1_out,
+                cfa,
+                ch: ch_out,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Holdout §7.5: 10-20% de frames fuera del solve de validación.
     let n_hold = if kept_idx.len() >= 8 {
@@ -7874,18 +7926,76 @@ fn ds_run_eidr(
     let pen = eidr_freq_penalty(&gate_report, op.w_out, op.h_out, diag_med);
     let nu_cut = eidr_cutoff_from_gate(&gate_report);
 
-    // --- Solve por canal (secuencial): b/diag/aone → train → holdout → all ---
+    // --- Solve por canal (secuencial) ---
+    // Flujo F10 por canal: sistemas b/diag (+espejo 1x) → warm start
+    // (multigrid o piloto) → cuadrático de ENTRENAMIENTO (baseline SIEMPRE,
+    // §7.9) → microregistro opcional con guardia de holdout → Huber-IRLS
+    // opcional con REVERSIÓN automática si el holdout empeora → solve final
+    // con todos los frames (warm) → productos.
     let mut planes: Vec<Vec<f32>> = Vec::with_capacity(ch_out);
     let mut variance: Vec<f32> = vec![f32::NAN; n_out * ch_out];
     let mut neff_plane: Vec<f32> = vec![0.0; n_out * ch_out];
     let mut coverage_luma = vec![0.0f64; n_out];
     let mut chi2_medians: Vec<f64> = Vec::new();
     let mut last_rep: Option<EidrSolveReport> = None;
+    let experimental = matches!(cfg.solve_mode, pipeline::EidrSolveMode::ExperimentalDetail);
+    let mut huber_adopted = 0usize;
+    let mut huber_reverted = 0usize;
+    let mut refine_applied = 0usize;
+    let mut refine_p90_px = 0.0f64;
+    let mut refine_reverted = false;
+    let multigrid_used = op1.is_some();
+    const IRLS_ROUNDS: usize = 2;
     let solve_cfg = EidrSolveConfig {
         max_iterations: cfg.max_iterations.max(20) as usize,
         data_size: train.len() * w * h,
         ..EidrSolveConfig::default()
     };
+
+    // Plano normalizado del frame fi (no toca `op`: permite mutarlo fuera).
+    let extract_plane = |fi: usize, c: usize, buf: &mut [f32]| -> Result<(), String> {
+        let k = kept_idx[fi];
+        let img = load_cached(registered[k].0)?;
+        let (mul, add) = norms[k];
+        if let Some(cid) = cfa {
+            for p in 0..w * h {
+                let cc = ds_cfa_channel(cid, p % w, p / w);
+                buf[p] = img.data[p] * mul[cc] + add[cc];
+            }
+        } else {
+            for p in 0..w * h {
+                let v = img.data[p * img.ch + c.min(img.ch - 1)];
+                buf[p] = v * mul[c.min(2)] + add[c.min(2)];
+            }
+        }
+        Ok(())
+    };
+    let diag_of = |op: &EidrOperator, c: usize, set: &[usize]| -> Vec<f64> {
+        let mut d = vec![0.0f64; op.w_out * op.h_out];
+        for &fi in set {
+            op.normal_diag_accum(fi, c, &mut d);
+        }
+        d
+    };
+    // χ² mediano de los frames de holdout contra la solución dada.
+    let holdout_chi2 = |op: &EidrOperator,
+                        c: usize,
+                        z: &[f32],
+                        hold_planes: &[(usize, Vec<f32>)]| -> Option<f64> {
+        let mut meds: Vec<f64> = hold_planes
+            .iter()
+            .filter_map(|&(fi, ref plane)| {
+                let st = eidr_holdout_stat(op, fi, c, z, plane, None);
+                (st.pixels > 500 && st.chi2_median.is_finite()).then_some(st.chi2_median)
+            })
+            .collect();
+        if meds.is_empty() {
+            return None;
+        }
+        meds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Some(meds[meds.len() / 2])
+    };
+
     for c in 0..ch_out {
         cancellation_checkpoint(cancel, "EIDR: solve")?;
         emit_progress(
@@ -7894,48 +8004,32 @@ fn ds_run_eidr(
             45.0 + 45.0 * c as f32 / ch_out as f32,
             None,
         );
-        // b (todos) y b_hold en una pasada de datos; diag por canal.
+        // b (todos) + b_hold + espejo 1x en UNA pasada de datos.
         let mut b_all = vec![0.0f64; n_out];
         let mut b_hold = vec![0.0f64; n_out];
+        let mut b1_all = op1.as_ref().map(|o| vec![0.0f64; o.w_out * o.h_out]);
         let mut plane_buf = vec![0.0f32; w * h];
         let mut hold_planes: Vec<(usize, Vec<f32>)> = Vec::new();
-        for (pos, &fi) in all.iter().enumerate() {
+        for &fi in &all {
             cancellation_checkpoint(cancel, "EIDR: retroproyección")?;
-            let k = kept_idx[fi];
-            let img = load_cached(registered[k].0)?;
-            let (mul, add) = norms[k];
-            if let Some(cid) = cfa {
-                for p in 0..w * h {
-                    let cc = ds_cfa_channel(cid, p % w, p / w);
-                    plane_buf[p] = img.data[p] * mul[cc] + add[cc];
-                }
-            } else {
-                for p in 0..w * h {
-                    let v = img.data[p * img.ch + c.min(img.ch - 1)];
-                    plane_buf[p] = v * mul[c.min(2)] + add[c.min(2)];
-                }
-            }
+            extract_plane(fi, c, &mut plane_buf)?;
             let ivar = op.frames[fi].inv_var[c.min(2)] as f64;
             op.adjoint_accum(fi, c, &plane_buf, ivar, &mut b_all);
+            if let (Some(o1), Some(b1)) = (op1.as_ref(), b1_all.as_mut()) {
+                o1.adjoint_accum(fi, c, &plane_buf, ivar, b1);
+            }
             if holdout.contains(&fi) {
                 op.adjoint_accum(fi, c, &plane_buf, ivar, &mut b_hold);
                 hold_planes.push((fi, plane_buf.clone()));
             }
-            let _ = pos;
         }
-        let mut diag_all = vec![0.0f64; n_out];
-        let mut diag_hold = vec![0.0f64; n_out];
-        for &fi in &all {
-            op.normal_diag_accum(fi, c, &mut diag_all);
-        }
-        for &fi in &holdout {
-            op.normal_diag_accum(fi, c, &mut diag_hold);
-        }
-        let b_train: Vec<f64> = b_all.iter().zip(b_hold.iter()).map(|(&a, &b)| a - b).collect();
-        let diag_train: Vec<f64> =
+        let mut diag_all = diag_of(&op, c, &all);
+        let diag_hold = diag_of(&op, c, &holdout);
+        let mut b_train: Vec<f64> =
+            b_all.iter().zip(b_hold.iter()).map(|(&a, &b)| a - b).collect();
+        let mut diag_train: Vec<f64> =
             diag_all.iter().zip(diag_hold.iter()).map(|(&a, &b)| a - b).collect();
         let aone_all = eidr_backprojected_flat(&op, c, &all);
-        let z0 = eidr_pilot(&b_all, &aone_all);
         let mut progress_cb = |k: usize, kmax: usize| {
             if k % 8 == 0 {
                 emit_progress(
@@ -7946,41 +8040,216 @@ fn ds_run_eidr(
                 );
             }
         };
-        // Validación con holdout: solve de entrenamiento + χ² de predicción.
-        let z_final = if !holdout.is_empty() {
-            let (z_train, _rt) = eidr_solve_channel(
-                &op, c, &train, &b_train, &diag_train, &z0, &solve_cfg, pen.as_ref(),
-                Some(cancel), &mut progress_cb,
+        // Warm start: multigrid 1x→s si está activo; si no, piloto; con
+        // warm_start=false, ceros (§7.5 lo permite; queda en receta).
+        let z0: Vec<f32> = if !cfg.warm_start {
+            vec![0.0f32; n_out]
+        } else if let (Some(o1), Some(b1)) = (op1.as_ref(), b1_all.as_ref()) {
+            let diag1 = diag_of(o1, c, &all);
+            let aone1 = eidr_backprojected_flat(o1, c, &all);
+            let z01 = eidr_pilot(b1, &aone1);
+            let cfg1 = EidrSolveConfig {
+                max_iterations: (solve_cfg.max_iterations / 2).max(15),
+                data_size: all.len() * w * h,
+                ..EidrSolveConfig::default()
+            };
+            let mut noop = |_k: usize, _n: usize| {};
+            let (z1, _r1) = eidr_solve_channel(
+                o1, c, &all, b1, &diag1, &z01, &cfg1, None, Some(cancel), &mut noop,
             )?;
-            for &(fi, ref plane) in &hold_planes {
-                let st = eidr_holdout_stat(&op, fi, c, &z_train, plane, None);
-                if st.pixels > 500 && st.chi2_median.is_finite() {
-                    chi2_medians.push(st.chi2_median);
+            eidr_prolong(&z1, o1.w_out, o1.h_out, op.w_out, op.h_out)
+        } else {
+            eidr_pilot(&b_all, &aone_all)
+        };
+
+        // Cuadrático de ENTRENAMIENTO — baseline obligatorio (§7.9).
+        let (mut z_train, _rep_train) = eidr_solve_channel(
+            &op, c, &train, &b_train, &diag_train, &z0, &solve_cfg, pen.as_ref(),
+            Some(cancel), &mut progress_cb,
+        )?;
+        let mut chi2_ref = holdout_chi2(&op, c, &z_train, &hold_planes);
+
+        // Microregistro ±0.2 px (F10, opt-in) con guardia de holdout: solo
+        // en el primer canal (la corrección geométrica es común) y solo si
+        // hay holdout para poder revertir.
+        if c == 0 && cfg.refine_registration && !hold_planes.is_empty() {
+            cancellation_checkpoint(cancel, "EIDR: microregistro")?;
+            emit_progress(app, "EIDR: microregistro ±0.2 px...", 52.0, None);
+            let geoms_backup: Vec<crate::eidr::EidrGeom> =
+                op.frames.iter().map(|f| f.geom).collect();
+            let geoms1_backup: Option<Vec<crate::eidr::EidrGeom>> =
+                op1.as_ref().map(|o| o.frames.iter().map(|f| f.geom).collect());
+            let mut shifts: Vec<f64> = Vec::new();
+            let mut n_shifted = 0usize;
+            for &fi in &all {
+                extract_plane(fi, c, &mut plane_buf)?;
+                if let Some((dx, dy)) =
+                    eidr_refine_translation(&op, fi, c, &z_train, &plane_buf, 0.2)
+                {
+                    let mag = (dx * dx + dy * dy).sqrt();
+                    shifts.push(mag);
+                    if mag > 0.01 {
+                        eidr_shift_geom(&mut op.frames[fi].geom, dx, dy);
+                        if let Some(o1) = op1.as_mut() {
+                            eidr_shift_geom(&mut o1.frames[fi].geom, dx, dy);
+                        }
+                        n_shifted += 1;
+                    }
                 }
             }
-            // Solve final con TODOS los frames, warm start del de train.
-            let (z, rep) = eidr_solve_channel(
-                &op, c, &all, &b_all, &diag_all, &z_train, &solve_cfg, pen.as_ref(),
-                Some(cancel), &mut progress_cb,
-            )?;
-            last_rep = Some(rep);
-            z
-        } else {
-            let (z, rep) = eidr_solve_channel(
-                &op, c, &all, &b_all, &diag_all, &z0, &solve_cfg, pen.as_ref(),
-                Some(cancel), &mut progress_cb,
-            )?;
-            last_rep = Some(rep);
-            z
-        };
+            if n_shifted > 0 {
+                // Reconstruir sistemas con la geometría corregida.
+                let mut nb_all = vec![0.0f64; n_out];
+                let mut nb_hold = vec![0.0f64; n_out];
+                let mut nhold: Vec<(usize, Vec<f32>)> = Vec::new();
+                for &fi in &all {
+                    extract_plane(fi, c, &mut plane_buf)?;
+                    let ivar = op.frames[fi].inv_var[c.min(2)] as f64;
+                    op.adjoint_accum(fi, c, &plane_buf, ivar, &mut nb_all);
+                    if holdout.contains(&fi) {
+                        op.adjoint_accum(fi, c, &plane_buf, ivar, &mut nb_hold);
+                        nhold.push((fi, plane_buf.clone()));
+                    }
+                }
+                let nd_all = diag_of(&op, c, &all);
+                let nd_hold = diag_of(&op, c, &holdout);
+                let nb_train: Vec<f64> =
+                    nb_all.iter().zip(nb_hold.iter()).map(|(&a, &b)| a - b).collect();
+                let nd_train: Vec<f64> =
+                    nd_all.iter().zip(nd_hold.iter()).map(|(&a, &b)| a - b).collect();
+                let (z2, _r2) = eidr_solve_channel(
+                    &op, c, &train, &nb_train, &nd_train, &z_train, &solve_cfg,
+                    pen.as_ref(), Some(cancel), &mut progress_cb,
+                )?;
+                let chi2_after = holdout_chi2(&op, c, &z2, &nhold);
+                let better = match (chi2_ref, chi2_after) {
+                    (Some(b0), Some(a)) => a <= b0 * 1.02,
+                    _ => false,
+                };
+                if better {
+                    shifts.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+                    refine_applied = n_shifted;
+                    refine_p90_px = shifts[(shifts.len() * 9 / 10).min(shifts.len() - 1)];
+                    b_all = nb_all;
+                    b_train = nb_train;
+                    diag_all = nd_all;
+                    diag_train = nd_train;
+                    hold_planes = nhold;
+                    z_train = z2;
+                    chi2_ref = chi2_after;
+                    log_to_front(
+                        app,
+                        "INFO",
+                        &format!(
+                            "EIDR: microregistro aplicado a {n_shifted} frame(s), p90 {refine_p90_px:.3} px."
+                        ),
+                    );
+                } else {
+                    for (f, g) in op.frames.iter_mut().zip(geoms_backup) {
+                        f.geom = g;
+                    }
+                    if let (Some(o1), Some(gb)) = (op1.as_mut(), geoms1_backup) {
+                        for (f, g) in o1.frames.iter_mut().zip(gb) {
+                            f.geom = g;
+                        }
+                    }
+                    refine_reverted = true;
+                    log_to_front(
+                        app,
+                        "WARN",
+                        "EIDR: el microregistro no mejoró el holdout — revertido (§7.8).",
+                    );
+                }
+            }
+        }
+
+        // Huber-IRLS (ExperimentalDetail): pesos SOLO contra el modelo
+        // directo, con el cuadrático como baseline y reversión por holdout.
+        if experimental && !hold_planes.is_empty() {
+            cancellation_checkpoint(cancel, "EIDR: Huber IRLS")?;
+            let mut z_h = z_train.clone();
+            for round in 0..IRLS_ROUNDS {
+                emit_progress(
+                    app,
+                    &format!("EIDR: canal {}/{} — IRLS Huber {}/{IRLS_ROUNDS}", c + 1, ch_out, round + 1),
+                    50.0 + 40.0 * c as f32 / ch_out as f32,
+                    None,
+                );
+                let mut bt = vec![0.0f64; n_out];
+                for &fi in &train {
+                    cancellation_checkpoint(cancel, "EIDR: pesos Huber")?;
+                    extract_plane(fi, c, &mut plane_buf)?;
+                    let wts = eidr_irls_weights(&op, fi, c, &z_h, &plane_buf, cfg.huber_delta);
+                    op.frames[fi].robust_w = Some(wts);
+                    let ivar = op.frames[fi].inv_var[c.min(2)] as f64;
+                    op.adjoint_accum(fi, c, &plane_buf, ivar, &mut bt);
+                }
+                let dt = diag_of(&op, c, &train);
+                let (zr, _r) = eidr_solve_channel(
+                    &op, c, &train, &bt, &dt, &z_h, &solve_cfg, pen.as_ref(),
+                    Some(cancel), &mut progress_cb,
+                )?;
+                z_h = zr;
+            }
+            let chi2_h = holdout_chi2(&op, c, &z_h, &hold_planes);
+            let adopt = match (chi2_ref, chi2_h) {
+                (Some(q), Some(hh)) => hh <= q * 1.05,
+                _ => false,
+            };
+            if adopt {
+                huber_adopted += 1;
+                // Pesos también para los frames de holdout (entran al solve
+                // final) y b_all/diag_all reconstruidos con W.
+                for &(fi, ref plane) in &hold_planes {
+                    let wts = eidr_irls_weights(&op, fi, c, &z_h, plane, cfg.huber_delta);
+                    op.frames[fi].robust_w = Some(wts);
+                }
+                let mut nb_all = vec![0.0f64; n_out];
+                for &fi in &all {
+                    extract_plane(fi, c, &mut plane_buf)?;
+                    let ivar = op.frames[fi].inv_var[c.min(2)] as f64;
+                    op.adjoint_accum(fi, c, &plane_buf, ivar, &mut nb_all);
+                }
+                b_all = nb_all;
+                diag_all = diag_of(&op, c, &all);
+                z_train = z_h;
+                chi2_ref = chi2_h;
+            } else {
+                huber_reverted += 1;
+                for &fi in &all {
+                    op.frames[fi].robust_w = None;
+                }
+                log_to_front(
+                    app,
+                    "WARN",
+                    &format!(
+                        "EIDR canal {}: Huber empeoró el holdout (χ² {:?} vs {:?}) — REVERTIDO al cuadrático (§7.10).",
+                        c + 1,
+                        chi2_h,
+                        chi2_ref
+                    ),
+                );
+            }
+        }
+        if let Some(chi2) = chi2_ref {
+            chi2_medians.push(chi2);
+        }
+
+        // Solve final con TODOS los frames, warm start del ganador.
+        let (z_final, rep) = eidr_solve_channel(
+            &op, c, &all, &b_all, &diag_all, &z_train, &solve_cfg, pen.as_ref(),
+            Some(cancel), &mut progress_cb,
+        )?;
+        last_rep = Some(rep);
+
         // Varianza aproximada 1/diag (origen declarado) + NEFF = frames
         // efectivos (aone·s²/ivar_medio) + cobertura para crop/DQ.
         let ivar_c = {
-            let mut s = 0.0f64;
+            let mut sum = 0.0f64;
             for &fi in &all {
-                s += op.frames[fi].inv_var[c.min(2)] as f64;
+                sum += op.frames[fi].inv_var[c.min(2)] as f64;
             }
-            s / all.len() as f64
+            sum / all.len() as f64
         };
         let cell = (scale_eff as f64) * (scale_eff as f64);
         for q in 0..n_out {
@@ -7996,6 +8265,10 @@ fn ds_run_eidr(
             }
         }
         planes.push(z_final);
+        // Los pesos robustos son por canal: limpiar antes del siguiente.
+        for &fi in &all {
+            op.frames[fi].robust_w = None;
+        }
     }
     let chi2_median = if chi2_medians.is_empty() {
         None
@@ -8096,6 +8369,20 @@ fn ds_run_eidr(
         lambda_f: pen.as_ref().map(|p| p.lambda).unwrap_or(0.0),
         holdout_frames: holdout.len(),
         holdout_chi2_median: chi2_median,
+        solver_mode_used: if experimental && huber_adopted > 0 {
+            format!("experimentalDetailHuber({huber_adopted}/{ch_out} canales)")
+        } else if experimental {
+            "scientificQuadratic (Huber revertido)".into()
+        } else {
+            "scientificQuadratic".into()
+        },
+        huber_adopted_channels: huber_adopted,
+        huber_reverted_channels: huber_reverted,
+        irls_rounds: if experimental { IRLS_ROUNDS } else { 0 },
+        refine_applied_frames: refine_applied,
+        refine_p90_px,
+        refine_reverted,
+        multigrid_used,
         gamma_fwhm_px: gamma.map(|g| g.fwhm_x),
         geometry_only_frames: geometry_only,
         excluded_frames: excluded,
@@ -10407,12 +10694,21 @@ async fn stack_deepsky(
                 "publishedCutoffCyclesPerPx": e.nu_cut,
             },
             "solver": {
-                "mode": "scientificQuadratic",
+                "mode": e.solver_mode_used,
                 "iterations": e.solver_iterations,
                 "relResidual": e.solver_rel_residual,
                 "converged": e.solver_converged,
                 "ridge": e.solver_ridge,
                 "lambdaFreqPenalty": e.lambda_f,
+                "irlsRounds": e.irls_rounds,
+                "huberAdoptedChannels": e.huber_adopted_channels,
+                "huberRevertedChannels": e.huber_reverted_channels,
+                "multigrid": e.multigrid_used,
+            },
+            "refineRegistration": {
+                "appliedFrames": e.refine_applied_frames,
+                "p90ShiftPx": e.refine_p90_px,
+                "reverted": e.refine_reverted,
             },
             "holdout": {
                 "frames": e.holdout_frames,
