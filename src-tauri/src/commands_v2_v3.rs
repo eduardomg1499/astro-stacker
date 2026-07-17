@@ -6953,6 +6953,25 @@ fn stack_video_liquid_warping_impl(
                 return;
             }
 
+            // PR-11: lectores nativos PERSISTENTES por pasada. El diseño
+            // anterior abría un VideoInput por GRUPO y por LOTE (hasta 8 ×
+            // n_lotes × 2 pasadas reaperturas ≈ 300 en un SER típico, cada una
+            // re-parseando cabecera + escaneando el trailer de timestamps).
+            // Ahora n_io lectores se abren UNA vez y sirven todos los lotes de
+            // la pasada; los grupos vacíos del último lote ya no abren nada.
+            let n_io = rayon::current_num_threads().clamp(1, 8);
+            let readers: Vec<VideoInput> = match (0..n_io)
+                .map(|_| VideoInput::open(&pre_path, &pre_app))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(readers) => readers,
+                Err(error) => {
+                    let _ = tx.send(Err(format!(
+                        "No se pudo abrir el lector nativo persistente: {error}"
+                    )));
+                    return;
+                }
+            };
             for (batch_idx, indices_to_load) in pre_chunks.into_iter().enumerate() {
                 if pre_cancel.is_cancelled() {
                     break; // cancelado: no cargar mas lotes
@@ -6970,35 +6989,32 @@ fn stack_video_liquid_warping_impl(
                     // Was a single-threaded for-loop: on a multicore box the whole
                     // selection loaded serially at ~1% CPU BEFORE any stacking ran
                     // (the parallel stacker then sat idle waiting on rx.recv()).
-                    // mmap-backed readers scale across cores; each worker opens its
-                    // own cheap reader (the OS shares the underlying mmap pages) so
-                    // there is no cross-thread aliasing on reader state. IO fan-out
-                    // is capped so it overlaps with — instead of starving — the
-                    // stacking pass that runs on the same rayon pool.
-                    let n_io = rayon::current_num_threads().clamp(1, 8);
+                    // mmap-backed readers scale across cores; cada slot par usa SU
+                    // lector persistente (zip 1:1, sin aliasing de estado). IO
+                    // fan-out is capped so it overlaps with — instead of starving —
+                    // the stacking pass that runs on the same rayon pool.
                     let mut groups: Vec<Vec<usize>> = (0..n_io).map(|_| Vec::new()).collect();
                     for (k, &idx) in indices_to_load.iter().enumerate() {
                         groups[k % n_io].push(idx);
                     }
                     groups
                         .par_iter()
-                        .map(|group| {
+                        .zip(readers.par_iter())
+                        .map(|(group, r_local)| {
                             let mut m =
                                 std::collections::HashMap::with_capacity(group.len());
-                            if let Ok(r_local) = VideoInput::open(&pre_path, &pre_app) {
-                                for &idx in group {
-                                    // SER cancel: without this, cancelling mid-load
-                                    // waited for the whole batch to finish reading.
-                                    if pre_cancel.is_cancelled() {
-                                        break;
-                                    }
-                                    let raw = r_local.get_frame(idx, pre_color_id);
-                                    if !raw.is_empty() {
-                                        m.insert(
-                                            idx,
-                                            raw_to_u16_buffer(&raw, pre_w, pre_h, pre_bpp),
-                                        );
-                                    }
+                            for &idx in group {
+                                // SER cancel: without this, cancelling mid-load
+                                // waited for the whole batch to finish reading.
+                                if pre_cancel.is_cancelled() {
+                                    break;
+                                }
+                                let raw = r_local.get_frame(idx, pre_color_id);
+                                if !raw.is_empty() {
+                                    m.insert(
+                                        idx,
+                                        raw_to_u16_buffer(&raw, pre_w, pre_h, pre_bpp),
+                                    );
                                 }
                             }
                             m
