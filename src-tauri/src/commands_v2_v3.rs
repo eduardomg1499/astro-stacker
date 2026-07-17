@@ -138,6 +138,95 @@ fn validate_stream_decode(
 /// `index / fps` are not frame-exact for VFR/B-frame material. One ascending
 /// batch walks the stream once and preserves candidate indices; if an estimated
 /// frame count points past clean EOF, frame zero remains an exact safe seed.
+/// PR-22: extrae UN frame cercano al índice pedido con `-ss` (seek rápido a
+/// keyframe + decode de un solo GOP). No garantiza el índice exacto — vale
+/// para usos NO científicos (frame ancla del análisis, preview) donde un
+/// vecino a ±unos frames es equivalente y el camino exacto costaba minutos
+/// (144 s el ancla + 122 s la preview a 20MP HEVC, baseline 2026-07-17).
+fn ffmpeg_fast_seek_frame(
+    reader: &FfmpegReader,
+    path: &str,
+    width: usize,
+    height: usize,
+    color_id: i32,
+    index: usize,
+) -> Option<Vec<u8>> {
+    let fps = if reader.fps.is_finite() && reader.fps > 0.1 {
+        reader.fps
+    } else {
+        30.0
+    };
+    // Margen de 0.2 s antes del instante pedido: garantiza material aunque el
+    // demuxer redondee el seek hacia delante.
+    let seconds = ((index as f64 / fps) - 0.2).max(0.0);
+    let stream_bpp = if ffmpeg_stream_is_color(color_id) { 6 } else { 2 };
+    let mut stream = FfmpegStreamIterator::new(
+        path,
+        width,
+        height,
+        0,
+        0,
+        width,
+        height,
+        color_id,
+        &reader.ffmpeg_path,
+        Some(format!("{seconds:.3}")),
+        None,
+        &reader.codec_name,
+        reader.rotation,
+    )
+    .ok()?;
+    let mut raw = vec![0u8; width * height * stream_bpp];
+    stream.read_frame_into(&mut raw).then_some(raw)
+}
+
+/// PR-22 (cambio de flujo aprobado 2026-07-16; ZAS_EXACT_ANCHOR=1 lo
+/// revierte): elegir el frame ANCLA muestreando por seek en vez de
+/// decodificar 0..tf/2 con select exacto. El ancla es una imagen de
+/// referencia — un frame real cercano al instante pedido es igual de válido
+/// que el del índice exacto.
+fn select_signal_frame_fast_seek(
+    r: &VideoInput,
+    path: &str,
+    width: usize,
+    height: usize,
+    bpp: usize,
+    color_id: i32,
+    total: usize,
+    preferred_idx: usize,
+) -> Option<(usize, Vec<u8>)> {
+    if std::env::var("ZAS_EXACT_ANCHOR").ok().as_deref() == Some("1") {
+        return None;
+    }
+    let VideoInput::Ffmpeg(ref reader) = r else {
+        return None;
+    };
+    let total = total.max(1);
+    let preferred = preferred_idx.min(total - 1);
+    let mut indices = vec![
+        0,
+        preferred,
+        (total / 10).min(total - 1),
+        (total / 4).min(total - 1),
+    ];
+    indices.sort_unstable();
+    indices.dedup();
+
+    let mut best: Option<(usize, f32, Vec<u8>)> = None;
+    for index in indices {
+        let Some(raw) = ffmpeg_fast_seek_frame(reader, path, width, height, color_id, index)
+        else {
+            continue;
+        };
+        let (max_v, avg) = estimate_raw_frame_signal(&raw, width, height, bpp);
+        let score = max_v as f32 + avg * 8.0;
+        if best.as_ref().map_or(true, |candidate| score > candidate.1) {
+            best = Some((index, score, raw));
+        }
+    }
+    best.map(|(index, _, raw)| (index, raw))
+}
+
 fn select_signal_frame_from_source(
     source: &UnifiedFrameSource,
     width: usize,
@@ -2138,7 +2227,25 @@ fn perform_standardized_analysis(
                             None
                         }) {
                             Some(mut frames) => frames.pop().unwrap_or_default(),
-                            None => read_exact_source_frame(&unified_source, bi)?,
+                            None => {
+                                // PR-22: preview cosmética por seek rápido
+                                // también en el cache-hit del análisis.
+                                let fast = if std::env::var("ZAS_EXACT_ANCHOR").ok().as_deref()
+                                    != Some("1")
+                                {
+                                    if let VideoInput::Ffmpeg(ref fr) = r {
+                                        ffmpeg_fast_seek_frame(fr, path, tw, th, cid, bi)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+                                match fast {
+                                    Some(raw) => raw,
+                                    None => read_exact_source_frame(&unified_source, bi)?,
+                                }
+                            }
                         };
                         let u16_raw = raw_to_u16_buffer(&raw, tw, th, tbp);
                         drop(raw);
@@ -2276,7 +2383,13 @@ fn perform_standardized_analysis(
     let (_analysis_ref_idx, analysis_ref_raw) = {
         let _s = crate::perf_trace::span(pt, "ref_select");
         if r.is_ffmpeg() {
-            select_signal_frame_from_source(&unified_source, tw, th, tbp, tf / 2)?
+            // PR-22: primero el muestreo por seek (~1 GOP por candidato);
+            // el camino exacto (decodifica 0..tf/2) queda como fallback y
+            // como modo forzable con ZAS_EXACT_ANCHOR=1.
+            match select_signal_frame_fast_seek(&r, path, tw, th, tbp, cid, tf, tf / 2) {
+                Some(anchor) => anchor,
+                None => select_signal_frame_from_source(&unified_source, tw, th, tbp, tf / 2)?,
+            }
         } else {
             let index = select_signal_frame_index(&r, tw, th, tbp, cid, tf / 2);
             (index, read_exact_source_frame(&unified_source, index)?)
@@ -3563,7 +3676,23 @@ fn perform_standardized_analysis(
         };
         match cached {
             Some(mut frames) => frames.pop().unwrap_or_default(),
-            None => read_exact_source_frame(&unified_source, best_frame_idx)?,
+            None => {
+                // PR-22: la preview es cosmética — un frame vecino por seek
+                // rápido evita re-decodificar 0..best (122 s medidos a 20MP).
+                let fast = if std::env::var("ZAS_EXACT_ANCHOR").ok().as_deref() != Some("1") {
+                    if let VideoInput::Ffmpeg(ref fr) = r {
+                        ffmpeg_fast_seek_frame(fr, path, tw, th, cid, best_frame_idx)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                match fast {
+                    Some(raw) => raw,
+                    None => read_exact_source_frame(&unified_source, best_frame_idx)?,
+                }
+            }
         }
     };
     let u16_raw = raw_to_u16_buffer(&raw, tw, th, tbp);
