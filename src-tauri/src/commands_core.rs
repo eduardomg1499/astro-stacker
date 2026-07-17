@@ -4558,14 +4558,19 @@ fn apply_autostakkert_sharpening(buffer: &mut [u16], width: usize, height: usize
         (3.0 * intensity, 2.8 * intensity, 1.5 * intensity, 0.8 * intensity, 0.2 * intensity)
     };
 
+    // PR-33: los bucles por píxel del sharpening final van en paralelo (cada
+    // píxel es independiente; misma aritmética → bit-exacto). Antes esta fase
+    // era 100% serie con la GPU y el resto de núcleos parados.
+    use rayon::prelude::*;
+
     // 1. EXTRACT LUMINANCE
     let mut lum = vec![0.0f32; npix];
-    for i in 0..npix {
+    lum.par_iter_mut().enumerate().for_each(|(i, l)| {
         let r = buffer[i * 3] as f32;
         let g = buffer[i * 3 + 1] as f32;
         let b = buffer[i * 3 + 2] as f32;
-        lum[i] = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    }
+        *l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    });
 
     // 2. ESTIMATE NOISE from background corners (MAD estimator)
     let mut noise_samples = Vec::with_capacity(200);
@@ -4595,15 +4600,15 @@ fn apply_autostakkert_sharpening(buffer: &mut [u16], width: usize, height: usize
     let b4_blur = apply_gaussian_blur_f32(&b3_blur, width, height, 8.0);
     let b5_blur = apply_gaussian_blur_f32(&b4_blur, width, height, 16.0);
 
-    let band1: Vec<f32> = lum.iter().zip(b1_blur.iter()).map(|(a, b)| a - b).collect();
-    let band2: Vec<f32> = b1_blur.iter().zip(b2_blur.iter()).map(|(a, b)| a - b).collect();
-    let band3: Vec<f32> = b2_blur.iter().zip(b3_blur.iter()).map(|(a, b)| a - b).collect();
-    let band4: Vec<f32> = b3_blur.iter().zip(b4_blur.iter()).map(|(a, b)| a - b).collect();
-    let band5: Vec<f32> = b4_blur.iter().zip(b5_blur.iter()).map(|(a, b)| a - b).collect();
+    let band1: Vec<f32> = lum.par_iter().zip(b1_blur.par_iter()).map(|(a, b)| a - b).collect();
+    let band2: Vec<f32> = b1_blur.par_iter().zip(b2_blur.par_iter()).map(|(a, b)| a - b).collect();
+    let band3: Vec<f32> = b2_blur.par_iter().zip(b3_blur.par_iter()).map(|(a, b)| a - b).collect();
+    let band4: Vec<f32> = b3_blur.par_iter().zip(b4_blur.par_iter()).map(|(a, b)| a - b).collect();
+    let band5: Vec<f32> = b4_blur.par_iter().zip(b5_blur.par_iter()).map(|(a, b)| a - b).collect();
 
     // 4. SHARPEN LUMINANCE with adaptive soft coring + SNR masking
     let mut sharp_lum = vec![0.0f32; npix];
-    for i in 0..npix {
+    sharp_lum.par_iter_mut().enumerate().for_each(|(i, sl)| {
         let orig_l = lum[i];
 
         // SNR mask: don't sharpen background
@@ -4614,8 +4619,8 @@ fn apply_autostakkert_sharpening(buffer: &mut [u16], width: usize, height: usize
         };
 
         if snr_weight < 0.01 {
-            sharp_lum[i] = orig_l;
-            continue;
+            *sl = orig_l;
+            return;
         }
 
         // Soft coring: only amplify coefficients above noise floor
@@ -4631,25 +4636,28 @@ fn apply_autostakkert_sharpening(buffer: &mut [u16], width: usize, height: usize
         let d5 = core(band5[i], base_threshold * 0.2) * s5_amp;
 
         let total = (d1 + d2 + d3 + d4 + d5) * snr_weight;
-        sharp_lum[i] = (orig_l + total).clamp(0.0, 65535.0);
-    }
+        *sl = (orig_l + total).clamp(0.0, 65535.0);
+    });
 
     // 5. APPLY back to RGB preserving chrominance (zero chromatic noise)
-    for i in 0..npix {
-        let orig_l = lum[i];
-        let new_l = sharp_lum[i];
-        if orig_l < 1.0 {
-            let v = new_l.clamp(0.0, 65535.0) as u16;
-            buffer[i * 3] = v;
-            buffer[i * 3 + 1] = v;
-            buffer[i * 3 + 2] = v;
-        } else {
-            let ratio = new_l / orig_l;
-            buffer[i * 3]     = (buffer[i * 3] as f32 * ratio).clamp(0.0, 65535.0) as u16;
-            buffer[i * 3 + 1] = (buffer[i * 3 + 1] as f32 * ratio).clamp(0.0, 65535.0) as u16;
-            buffer[i * 3 + 2] = (buffer[i * 3 + 2] as f32 * ratio).clamp(0.0, 65535.0) as u16;
-        }
-    }
+    buffer[..npix * 3]
+        .par_chunks_mut(3)
+        .enumerate()
+        .for_each(|(i, px)| {
+            let orig_l = lum[i];
+            let new_l = sharp_lum[i];
+            if orig_l < 1.0 {
+                let v = new_l.clamp(0.0, 65535.0) as u16;
+                px[0] = v;
+                px[1] = v;
+                px[2] = v;
+            } else {
+                let ratio = new_l / orig_l;
+                px[0] = (px[0] as f32 * ratio).clamp(0.0, 65535.0) as u16;
+                px[1] = (px[1] as f32 * ratio).clamp(0.0, 65535.0) as u16;
+                px[2] = (px[2] as f32 * ratio).clamp(0.0, 65535.0) as u16;
+            }
+        });
 }
 
 // True separable Gaussian blur honoring sigma.
@@ -4674,32 +4682,40 @@ fn apply_gaussian_blur_f32(data: &[f32], w: usize, h: usize, sigma: f32) -> Vec<
         *v /= sum;
     }
 
+    // PR-33: ambas pasadas separables en paralelo por FILAS de salida — cada
+    // elemento se calcula con la misma suma en el mismo orden que la versión
+    // serial (bit-exacto); solo cambia qué hilo lo escribe. A 20MP con σ=16
+    // (radio 48) la cascada del sharpening pasa de decenas de segundos a ~1 s.
+    use rayon::prelude::*;
     let mut tmp = vec![0.0f32; w * h];
     let mut out = vec![0.0f32; w * h];
 
     // Horizontal pass
-    for y in 0..h {
+    tmp.par_chunks_mut(w).enumerate().for_each(|(y, trow)| {
         let row = y * w;
         for x in 0..w {
             let mut acc = 0.0f32;
             for (k, &kv) in kernel.iter().enumerate() {
-                let xx = (x as isize + k as isize - radius as isize).clamp(0, w as isize - 1) as usize;
+                let xx =
+                    (x as isize + k as isize - radius as isize).clamp(0, w as isize - 1) as usize;
                 acc += data[row + xx] * kv;
             }
-            tmp[row + x] = acc;
+            trow[x] = acc;
         }
-    }
-    // Vertical pass
-    for x in 0..w {
-        for y in 0..h {
+    });
+    // Vertical pass (misma aritmética elemento a elemento que el barrido
+    // x-mayor anterior; el orden de escritura no afecta al resultado).
+    out.par_chunks_mut(w).enumerate().for_each(|(y, orow)| {
+        for x in 0..w {
             let mut acc = 0.0f32;
             for (k, &kv) in kernel.iter().enumerate() {
-                let yy = (y as isize + k as isize - radius as isize).clamp(0, h as isize - 1) as usize;
+                let yy =
+                    (y as isize + k as isize - radius as isize).clamp(0, h as isize - 1) as usize;
                 acc += tmp[yy * w + x] * kv;
             }
-            out[y * w + x] = acc;
+            orow[x] = acc;
         }
-    }
+    });
     out
 }
 
