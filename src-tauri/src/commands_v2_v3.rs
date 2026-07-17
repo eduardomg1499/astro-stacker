@@ -6763,9 +6763,18 @@ fn stack_video_liquid_warping_impl(
         // One ascending exact batch: FFmpeg walks 0..max(index) once instead of
         // spawning/seeking once per reference frame. This is both frame-exact
         // for VFR/B-frames and faster for the 12–20 frame robust master.
-        let ref_data: Vec<(Vec<u16>, (f32, f32))> = preloaded_reference_batch
+        let ref_pairs: Vec<(usize, Vec<u8>)> = preloaded_reference_batch
             .into_iter()
             .flat_map(|batch| batch.indices.into_iter().zip(batch.frames))
+            .collect();
+        // PR-24: alinear los frames de referencia EN PARALELO — cada uno solo
+        // depende del ancla compartida (bit-exacto por construcción). La
+        // concurrencia se acota a ~4 para que el pico transitorio raw+RGB no
+        // desborde el plan de RAM en máquinas justas.
+        let ref_chunk = ref_pairs.len().div_ceil(4).max(1);
+        let ref_data: Vec<(Vec<u16>, (f32, f32))> = ref_pairs
+            .into_par_iter()
+            .with_min_len(ref_chunk)
             .map(|(_idx, f)| -> Result<(Vec<u16>, (f32, f32)), String> {
                 // Cancelacion durante la generacion del master (decodifica y
                 // alinea ~20 frames grandes): frame vacio → el guard de slices
@@ -9102,17 +9111,21 @@ fn precompute_ap_master_stats(
     points: &[ApPoint],
     box_size: usize,
 ) -> (Vec<f32>, Vec<f32>) {
-    let mut contrast = Vec::with_capacity(points.len());
-    let mut lap = Vec::with_capacity(points.len());
-    for ap in points {
-        contrast.push(get_area_complexity(
-            master_edges, w, h, ap.x as usize, ap.y as usize, box_size, 100.0,
-        ));
-        lap.push(get_area_quality_laplacian(
-            master_mono, w, h, ap.x as usize, ap.y as usize, box_size,
-        ));
-    }
-    (contrast, lap)
+    // PR-24: cada AP es independiente — par_iter + unzip conserva el orden
+    // (bit-exacto). Con miles de APs a 20MP esto corre por pasada.
+    points
+        .par_iter()
+        .map(|ap| {
+            (
+                get_area_complexity(
+                    master_edges, w, h, ap.x as usize, ap.y as usize, box_size, 100.0,
+                ),
+                get_area_quality_laplacian(
+                    master_mono, w, h, ap.x as usize, ap.y as usize, box_size,
+                ),
+            )
+        })
+        .unzip()
 }
 
 /// Estimates the per-AP residual shifts of ONE frame against the master.
