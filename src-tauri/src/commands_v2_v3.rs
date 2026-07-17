@@ -1453,6 +1453,9 @@ fn process_analysis_frame(
     // camino unitario/CPU para compatibilidad y fallback.
     gpu_preprocessed_override: Option<crate::gpu_analysis::AnalysisGpuOutput>,
     prepared_mono_override: Option<Vec<u16>>,
+    // perf_trace del job de análisis (0 = sin traza): sub-fases a_prep /
+    // a_metric / a_sad / a_grid para separar el coste del scoring por modo.
+    perf_job: u64,
 ) -> FrameAlignmentData {
     if raw.is_empty() {
         return FrameAlignmentData::empty(i);
@@ -1461,6 +1464,7 @@ fn process_analysis_frame(
     let qual_score: u64;
     let dx: f32;
     let dy: f32;
+    let t_prep = std::time::Instant::now();
 
     // ALL MODES now use Phase Correlation (SAD) and Noise-Resistant scoring.
     if let Some(mono) = prepared_mono_override {
@@ -1535,12 +1539,21 @@ fn process_analysis_frame(
         (hw, hh)
     };
 
+    crate::perf_trace::add_ns(
+        perf_job,
+        crate::perf_trace::GLOBAL_PASS,
+        "a_prep",
+        t_prep.elapsed().as_nanos(),
+        1,
+    );
+
     // SCORER v2 (PR-1.1): métrica única planeta/superficie sobre el
     // Laplaciano CRUDO multi-escala, ANTES de normalizar el mapa para SAD.
     // El v1 puntuaba el mapa ya autonormalizado y ordenaba los frames AL
     // REVÉS (baseline F0: Spearman −1.0 contra verdad conocida). Ambos
     // caminos (CPU y GPU) puntúan aquí con la MISMA función sobre los
     // mismos buffers: paridad por construcción.
+    let t_metric = std::time::Instant::now();
     let score_val = score_frame_quality_v2(
         &buffers.blur_out,
         &buffers.lap_out,
@@ -1549,6 +1562,14 @@ fn process_analysis_frame(
         &mut buffers.quarter_u16,
     );
     normalize_lap_for_sad(&mut buffers.lap_out);
+    crate::perf_trace::add_ns(
+        perf_job,
+        crate::perf_trace::GLOBAL_PASS,
+        "a_metric",
+        t_metric.elapsed().as_nanos(),
+        1,
+    );
+    let t_sad = std::time::Instant::now();
 
     let search_w = hw / 2;
     let search_h = hh / 2;
@@ -1681,9 +1702,17 @@ fn process_analysis_frame(
     }
 
     qual_score = score_val;
+    crate::perf_trace::add_ns(
+        perf_job,
+        crate::perf_trace::GLOBAL_PASS,
+        "a_sad",
+        t_sad.elapsed().as_nanos(),
+        1,
+    );
 
     let mut grid_scores = None;
     if warping_analysis {
+        let t_grid = std::time::Instant::now();
         grid_scores = if gpu_grid_scores.is_some() {
             gpu_grid_scores.take()
         } else {
@@ -1700,6 +1729,13 @@ fn process_analysis_frame(
                 texture_align,
             ))
         };
+        crate::perf_trace::add_ns(
+            perf_job,
+            crate::perf_trace::GLOBAL_PASS,
+            "a_grid",
+            t_grid.elapsed().as_nanos(),
+            1,
+        );
     }
 
     FrameAlignmentData {
@@ -2833,6 +2869,7 @@ fn perform_standardized_analysis(
             gpu_analysis_enabled.then_some(gpu_analysis_failed.as_ref()),
             gpu,
             prepared_mono,
+            pt,
         )
     };
     let analyze_fn = |i: usize, raw: &[u8], bufs: &mut AnalysisBufferSet| -> FrameAlignmentData {
