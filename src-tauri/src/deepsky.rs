@@ -5605,9 +5605,8 @@ fn prepare_deepsky_stack_impl(request: DeepSkyStackRequest, with_advisor: bool) 
                     "EIDR sustituye a drizzle: deja drizzle en 1× (la escala 1x/1.5x/2x se elige en el método)".into(),
                 );
             }
-            if matches!(request.compute_policy, ComputePolicy::GpuOnly) {
-                errors.push("EIDR ejecuta en CPU en esta fase; usa Auto o Hybrid".into());
-            }
+            // GpuOnly se valida en ejecución (runtime + paridad física del
+            // matvec EIDR); Auto/Hybrid usan GPU cuando está disponible.
         }
     }
     if probes.is_empty() {
@@ -7629,6 +7628,7 @@ fn ds_run_eidr(
     h: usize,
     ch_in: usize,
     cfa: Option<i32>,
+    compute_policy: ComputePolicy,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<DsEidrOutcome, String> {
     use crate::eidr::*;
@@ -7939,6 +7939,19 @@ fn ds_run_eidr(
     let mut chi2_medians: Vec<f64> = Vec::new();
     let mut last_rep: Option<EidrSolveReport> = None;
     let experimental = matches!(cfg.solve_mode, pipeline::EidrSolveMode::ExperimentalDetail);
+    // GPU (F10): matvec de las ecuaciones normales en wgpu, con paridad
+    // física verificada ANTES del primer uso; sin paridad no hay GPU.
+    let gpu_allowed = compute_policy.allows_gpu()
+        && crate::gpu_stack::gpu_runtime().is_some()
+        && crate::gpu_eidr::ensure_eidr_parity();
+    if matches!(compute_policy, ComputePolicy::GpuOnly) && !gpu_allowed {
+        return Err(
+            "GPU only: no hay runtime wgpu con paridad EIDR verificada; usa Auto o Hybrid".into(),
+        );
+    }
+    if gpu_allowed {
+        log_to_front(app, "INFO", "EIDR: matvec en GPU (paridad CPU verificada).");
+    }
     let mut huber_adopted = 0usize;
     let mut huber_reverted = 0usize;
     let mut refine_applied = 0usize;
@@ -8040,6 +8053,39 @@ fn ds_run_eidr(
                 );
             }
         };
+        // Solve con matvec GPU (contexto fresco por solve: los buffers llevan
+        // pesos/geometrías del momento) y fallback CPU DECLARADO ante errores.
+        let solve_with = |op: &EidrOperator,
+                          set: &[usize],
+                          b: &[f64],
+                          d: &[f64],
+                          z0: &[f32],
+                          progress: &mut dyn FnMut(usize, usize)|
+         -> Result<(Vec<f32>, EidrSolveReport), String> {
+            if gpu_allowed {
+                if let Some(ctx) = crate::gpu_eidr::EidrGpuMatvec::new(op, set, c) {
+                    let g = move |pv: &[f32], ov: &mut [f64]| {
+                        ctx.matvec(pv, ov).map_err(|e| format!("GPU: {e}"))
+                    };
+                    match eidr_solve_channel(
+                        op, c, set, b, d, z0, &solve_cfg, pen.as_ref(), Some(&g),
+                        Some(cancel), progress,
+                    ) {
+                        Err(e) if e.starts_with("GPU: ") => {
+                            log_to_front(
+                                app,
+                                "WARN",
+                                &format!("EIDR: matvec GPU falló ({e}); reintentando en CPU."),
+                            );
+                        }
+                        other => return other,
+                    }
+                }
+            }
+            eidr_solve_channel(
+                op, c, set, b, d, z0, &solve_cfg, pen.as_ref(), None, Some(cancel), progress,
+            )
+        };
         // Warm start: multigrid 1x→s si está activo; si no, piloto; con
         // warm_start=false, ceros (§7.5 lo permite; queda en receta).
         let z0: Vec<f32> = if !cfg.warm_start {
@@ -8055,7 +8101,7 @@ fn ds_run_eidr(
             };
             let mut noop = |_k: usize, _n: usize| {};
             let (z1, _r1) = eidr_solve_channel(
-                o1, c, &all, b1, &diag1, &z01, &cfg1, None, Some(cancel), &mut noop,
+                o1, c, &all, b1, &diag1, &z01, &cfg1, None, None, Some(cancel), &mut noop,
             )?;
             eidr_prolong(&z1, o1.w_out, o1.h_out, op.w_out, op.h_out)
         } else {
@@ -8063,10 +8109,8 @@ fn ds_run_eidr(
         };
 
         // Cuadrático de ENTRENAMIENTO — baseline obligatorio (§7.9).
-        let (mut z_train, _rep_train) = eidr_solve_channel(
-            &op, c, &train, &b_train, &diag_train, &z0, &solve_cfg, pen.as_ref(),
-            Some(cancel), &mut progress_cb,
-        )?;
+        let (mut z_train, _rep_train) =
+            solve_with(&op, &train, &b_train, &diag_train, &z0, &mut progress_cb)?;
         let mut chi2_ref = holdout_chi2(&op, c, &z_train, &hold_planes);
 
         // Microregistro ±0.2 px (F10, opt-in) con guardia de holdout: solo
@@ -8117,10 +8161,8 @@ fn ds_run_eidr(
                     nb_all.iter().zip(nb_hold.iter()).map(|(&a, &b)| a - b).collect();
                 let nd_train: Vec<f64> =
                     nd_all.iter().zip(nd_hold.iter()).map(|(&a, &b)| a - b).collect();
-                let (z2, _r2) = eidr_solve_channel(
-                    &op, c, &train, &nb_train, &nd_train, &z_train, &solve_cfg,
-                    pen.as_ref(), Some(cancel), &mut progress_cb,
-                )?;
+                let (z2, _r2) =
+                    solve_with(&op, &train, &nb_train, &nd_train, &z_train, &mut progress_cb)?;
                 let chi2_after = holdout_chi2(&op, c, &z2, &nhold);
                 let better = match (chi2_ref, chi2_after) {
                     (Some(b0), Some(a)) => a <= b0 * 1.02,
@@ -8185,10 +8227,7 @@ fn ds_run_eidr(
                     op.adjoint_accum(fi, c, &plane_buf, ivar, &mut bt);
                 }
                 let dt = diag_of(&op, c, &train);
-                let (zr, _r) = eidr_solve_channel(
-                    &op, c, &train, &bt, &dt, &z_h, &solve_cfg, pen.as_ref(),
-                    Some(cancel), &mut progress_cb,
-                )?;
+                let (zr, _r) = solve_with(&op, &train, &bt, &dt, &z_h, &mut progress_cb)?;
                 z_h = zr;
             }
             let chi2_h = holdout_chi2(&op, c, &z_h, &hold_planes);
@@ -8236,10 +8275,8 @@ fn ds_run_eidr(
         }
 
         // Solve final con TODOS los frames, warm start del ganador.
-        let (z_final, rep) = eidr_solve_channel(
-            &op, c, &all, &b_all, &diag_all, &z_train, &solve_cfg, pen.as_ref(),
-            Some(cancel), &mut progress_cb,
-        )?;
+        let (z_final, rep) =
+            solve_with(&op, &all, &b_all, &diag_all, &z_train, &mut progress_cb)?;
         last_rep = Some(rep);
 
         // Varianza aproximada 1/diag (origen declarado) + NEFF = frames
@@ -9962,6 +9999,7 @@ async fn stack_deepsky(
             h,
             ch,
             cfa_drizzle_pattern.filter(|_| eidr_cfa_direct),
+            compute_policy,
             cancel.as_ref(),
         )?;
         effective_engine = format!("eidr_{:.1}x", out.scale_eff).replace(".0x", "x");

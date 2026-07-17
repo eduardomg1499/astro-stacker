@@ -168,6 +168,11 @@ pub(crate) struct EidrLut {
 }
 
 impl EidrLut {
+    /// Datos crudos para la GPU: (tabla, n, radio px, 1/paso).
+    pub(crate) fn raw(&self) -> (&[f32], usize, f32, f32) {
+        (&self.data, self.n, self.radius, 1.0 / EIDR_LUT_STEP as f32)
+    }
+
     /// K(Δ) por interpolación bilineal; 0 fuera del soporte.
     #[inline]
     pub(crate) fn eval(&self, dx: f32, dy: f32) -> f32 {
@@ -987,6 +992,7 @@ pub(crate) fn eidr_solve_channel(
     z0: &[f32],
     cfg: &EidrSolveConfig,
     freq: Option<&EidrFreqPenalty>,
+    gpu_matvec: Option<&dyn Fn(&[f32], &mut [f64]) -> Result<(), String>>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<(Vec<f32>, EidrSolveReport), String> {
@@ -1022,7 +1028,11 @@ pub(crate) fn eidr_solve_channel(
     for (dst, &src) in pf32.iter_mut().zip(z.iter()) {
         *dst = src as f32;
     }
-    op.normal_apply(c, idxs, &pf32, &mut ap, &mut scratch_f32);
+    if let Some(g) = gpu_matvec {
+        g(&pf32, &mut ap)?;
+    } else {
+        op.normal_apply(c, idxs, &pf32, &mut ap, &mut scratch_f32);
+    }
     if let Some(pen) = freq {
         eidr_freq_penalty_apply(pen, &z, op.w_out, op.h_out, &mut ap);
     }
@@ -1052,7 +1062,11 @@ pub(crate) fn eidr_solve_channel(
         for (dst, &src) in pf32.iter_mut().zip(p.iter()) {
             *dst = src as f32;
         }
-        op.normal_apply(c, idxs, &pf32, &mut ap, &mut scratch_f32);
+        if let Some(g) = gpu_matvec {
+            g(&pf32, &mut ap)?;
+        } else {
+            op.normal_apply(c, idxs, &pf32, &mut ap, &mut scratch_f32);
+        }
         if let Some(pen) = freq {
             eidr_freq_penalty_apply(pen, &p, op.w_out, op.h_out, &mut ap);
         }
@@ -2464,7 +2478,7 @@ mod tests {
             data_size: idxs.iter().map(|&fi| op.frames[fi].w * op.frames[fi].h).sum(),
             ..EidrSolveConfig::default()
         };
-        let (z, rep) = eidr_solve_channel(&op, 0, idxs, &b, &diag, &z0, &cfg, freq, None, &mut noop)
+        let (z, rep) = eidr_solve_channel(&op, 0, idxs, &b, &diag, &z0, &cfg, freq, None, None, &mut noop)
             .expect("solve");
         assert!(rep.converged, "subset sin converger: {rep:?}");
         z
@@ -2831,7 +2845,7 @@ mod tests {
         };
         let idxs_all: Vec<usize> = (0..12).collect();
         let (z, rep) =
-            eidr_solve_channel(&op, 0, &idxs_all, &b, &diag, &z0, &cfg, None, None, &mut noop)
+            eidr_solve_channel(&op, 0, &idxs_all, &b, &diag, &z0, &cfg, None, None, None, &mut noop)
                 .unwrap();
         // Interior del lienzo (sin pad):
         let off = (PAD as f32 * scale) as usize;
@@ -3403,7 +3417,7 @@ mod tests {
         };
         let idxs_all: Vec<usize> = (0..n_frames).collect();
         let (z, rep) =
-            eidr_solve_channel(&op, 0, &idxs_all, &b, &diag, &z0, &cfg, None, None, &mut noop)
+            eidr_solve_channel(&op, 0, &idxs_all, &b, &diag, &z0, &cfg, None, None, None, &mut noop)
                 .expect("solve");
         assert!(
             rep.converged,
