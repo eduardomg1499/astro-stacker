@@ -3764,8 +3764,11 @@ fn ver_licencia(state: State<'_, AppState>) -> AppStatus {
 // selección cabe, la segunda pasada se sirve íntegra desde NVMe; si no, cada
 // pasada usa un único stream secuencial sin trabajo de caché inútil.
 // ===========================================================================
-const DECODE_CACHE_MIN_BYTES: u64 = 3 * 1024 * 1024 * 1024;
-const DECODE_CACHE_MAX_AUTO_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+// PR-14 (decisión del usuario 2026-07-16): presupuesto auto por DISCO libre
+// (40% del disponible, suelo 12GB, techo 256GB) en vez del antiguo RAM/8
+// clamp 3..12GB que jamás admitía una selección 20MP color (~60-120GB).
+const DECODE_CACHE_MIN_AUTO_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+const DECODE_CACHE_MAX_AUTO_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 const DECODE_CACHE_ALGORITHM_VERSION: &str = "planetary-ffmpeg-decode-v6-route-crc32";
 const DECODE_CACHE_PAYLOAD_MAGIC: &[u8; 8] = b"ZDCFv5\0\0";
 static DECODE_CACHE_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
@@ -3849,6 +3852,14 @@ impl DecodeFrameCacheTransaction {
     fn write_frame(&self, idx: usize, frame: &[u16]) {
         if frame.len() != self.expected_len {
             return;
+        }
+        // PR-14: con admisión por sufijo solo se cachean los índices del
+        // conjunto esperado — comprimir un prefijo que jamás se publicará
+        // sería exactamente la E/S inútil que la admisión intenta evitar.
+        if let Some(expected) = self.expected_indices.as_ref() {
+            if !expected.contains(&idx) {
+                return;
+            }
         }
         let final_path = decode_cache_frame_path(&self.cache_dir, self.key, idx);
         if read_cached_frame(&final_path, self.expected_len).is_some() {
@@ -4066,19 +4077,37 @@ fn decode_cache_usage_ledger(dir: &Path) -> Arc<std::sync::atomic::AtomicU64> {
 /// Presupuesto por máquina, no una constante de portátil. Por defecto usa
 /// 1/8 de la RAM (3–12 GiB) y nunca invade la reserva segura del volumen. El
 /// override permite a estaciones NVMe grandes dedicar hasta 64 GiB.
+/// PR-14: decide QUÉ índices de la selección se cachean. Completa si cabe en
+/// presupuesto; si no, el SUFIJO que cabe (la pasada siguiente decodifica el
+/// prefijo y el decoder se corta ahí). Un sufijo <5% de la selección no
+/// compensa la E/S de sembrado.
+fn decode_cache_expected_set(
+    exact_selected: &[usize],
+    max_cache_file: u64,
+    cache_budget: u64,
+) -> Vec<usize> {
+    if exact_selected.is_empty() || max_cache_file == 0 {
+        return Vec::new();
+    }
+    let selection_worst_case = max_cache_file.saturating_mul(exact_selected.len() as u64);
+    if selection_worst_case <= cache_budget {
+        return exact_selected.to_vec();
+    }
+    let suffix_capacity = (cache_budget / max_cache_file) as usize;
+    if suffix_capacity.saturating_mul(20) >= exact_selected.len() && suffix_capacity > 0 {
+        exact_selected[exact_selected.len() - suffix_capacity..].to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
 fn decode_cache_budget_bytes(dir: &Path) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     let override_bytes = std::env::var("ZAS_DECODE_CACHE_GB")
         .ok()
         .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .map(|gb| (gb.clamp(0.0, 64.0) * GIB as f64) as u64);
-
-    let configured = override_bytes.unwrap_or_else(|| {
-        let mut system = System::new();
-        system.refresh_memory();
-        (system.total_memory() / 8).clamp(DECODE_CACHE_MIN_BYTES, DECODE_CACHE_MAX_AUTO_BYTES)
-    });
-    if configured == 0 {
+        .map(|gb| (gb.clamp(0.0, 512.0) * GIB as f64) as u64);
+    if override_bytes == Some(0) {
         return 0;
     }
 
@@ -4086,15 +4115,30 @@ fn decode_cache_budget_bytes(dir: &Path) -> u64 {
         .or_else(|_| std::fs::canonicalize(dir.parent().unwrap_or(dir)))
         .unwrap_or_else(|_| dir.to_path_buf());
     let disks = sysinfo::Disks::new_with_refreshed_list();
-    let Some(disk) = disks
+    let disk = disks
         .list()
         .iter()
         .filter(|disk| target.starts_with(disk.mount_point()))
-        .max_by_key(|disk| disk.mount_point().as_os_str().len())
-    else {
+        .max_by_key(|disk| disk.mount_point().as_os_str().len());
+    let current = decode_cache_total_bytes(dir);
+
+    let configured = override_bytes.unwrap_or_else(|| {
+        // PR-14: auto según DISCO libre — 40% del disponible (contando lo ya
+        // cacheado, que es reutilizable), clamp [12GB, 256GB]. El techo
+        // antiguo de 12GB por RAM hacía imposible servir la 2ª pasada de un
+        // 20MP color desde NVMe.
+        match disk {
+            Some(d) => (current.saturating_add(d.available_space()) * 2 / 5)
+                .clamp(DECODE_CACHE_MIN_AUTO_BYTES, DECODE_CACHE_MAX_AUTO_BYTES),
+            None => DECODE_CACHE_MIN_AUTO_BYTES,
+        }
+    });
+    if configured == 0 {
+        return 0;
+    }
+    let Some(disk) = disk else {
         return configured;
     };
-    let current = decode_cache_total_bytes(dir);
     let reserve = (disk.total_space() / 20).max(2 * GIB); // 5% o 2 GiB
     let safe_total = current
         .saturating_add(disk.available_space())
@@ -4473,13 +4517,18 @@ fn stream_frames_ffmpeg_chunked(
         !requested_indices.is_empty() && plausible_cached == requested_indices.len();
     let missing_frames = requested_indices.len().saturating_sub(plausible_cached);
     let selection_worst_case = max_cache_file.saturating_mul(requested_indices.len() as u64);
-    let can_publish_complete = !complete_cache_candidate
-        && missing_frames > 0
-        && selection_worst_case <= cache_budget;
-    let mut cache_transaction = if can_publish_complete {
+    // PR-14: conjunto a SEMBRAR — la selección completa si cabe; si no, el
+    // SUFIJO que cabe (la pasada siguiente decodifica sólo el prefijo y corta
+    // el decoder ahí). Un sufijo <5% de la selección no merece la E/S.
+    let cache_expected: Vec<usize> =
+        decode_cache_expected_set(&exact_selected_indices, max_cache_file, cache_budget);
+    let can_publish_cache =
+        !complete_cache_candidate && missing_frames > 0 && !cache_expected.is_empty();
+    let mut cache_transaction = if can_publish_cache {
+        let expected_worst_case = max_cache_file.saturating_mul(cache_expected.len() as u64);
         prune_decode_cache_to_budget(
             &cache_dir,
-            cache_budget.saturating_sub(selection_worst_case),
+            cache_budget.saturating_sub(expected_worst_case),
         );
         DecodeFrameCacheTransaction::new(
             &cache_dir,
@@ -4488,11 +4537,37 @@ fn stream_frames_ffmpeg_chunked(
             cache_budget,
         )
         .map(|transaction| {
-            transaction.with_expected_indices(requested_indices.iter().copied())
+            transaction.with_expected_indices(cache_expected.iter().copied())
         })
     } else {
         None
     };
+    // PR-14: modo SUFIJO-SERVIDO — el mayor sufijo de la selección con TODOS
+    // sus frames ya plausibles en caché (sembrado por la pasada anterior).
+    // Esos lotes salen de NVMe y el stream sólo decodifica el prefijo.
+    let suffix_start_index: Option<usize> = if !complete_cache_candidate
+        && !exact_selected_indices.is_empty()
+    {
+        let mut from = exact_selected_indices.len();
+        for i in (0..exact_selected_indices.len()).rev() {
+            if cache_file_is_plausible(exact_selected_indices[i]) {
+                from = i;
+            } else {
+                break;
+            }
+        }
+        let covered = exact_selected_indices.len() - from;
+        (covered.saturating_mul(20) >= exact_selected_indices.len())
+            .then(|| exact_selected_indices[from])
+    } else {
+        None
+    };
+    let mut stream_cutoff = suffix_start_index.unwrap_or(usize::MAX);
+    let last_stream_index = exact_selected_indices
+        .iter()
+        .copied()
+        .filter(|&index| index < stream_cutoff)
+        .max();
     decode_route_hardware.store(use_gpu, Ordering::Release);
     log_to_front(
         app,
@@ -4522,9 +4597,30 @@ fn stream_frames_ffmpeg_chunked(
             app,
             "INFO",
             &format!(
-                "Caché FFmpeg omitida: la selección completa requiere hasta {} MB y el presupuesto es {} MB; se evita comprimir un caché parcial que no ahorra decode.",
+                "Caché FFmpeg omitida: la selección completa requiere hasta {} MB y el presupuesto es {} MB (ni siquiera un sufijo ≥5% cabe); se evita comprimir un caché parcial inútil.",
                 selection_worst_case.div_ceil(1024 * 1024),
                 cache_budget / (1024 * 1024),
+            ),
+        );
+    } else if can_publish_cache && cache_expected.len() < exact_selected_indices.len() {
+        log_to_front(
+            app,
+            "INFO",
+            &format!(
+                "Caché FFmpeg por sufijo: se sembrarán los últimos {} de {} frames (presupuesto {} MB); la siguiente pasada decodificará sólo el prefijo.",
+                cache_expected.len(),
+                exact_selected_indices.len(),
+                cache_budget / (1024 * 1024),
+            ),
+        );
+    }
+    if let Some(cutoff) = suffix_start_index {
+        log_to_front(
+            app,
+            "INFO",
+            &format!(
+                "Caché FFmpeg: sufijo desde el frame {} servido desde NVMe; el decoder se detendrá al agotar el prefijo.",
+                cutoff
             ),
         );
     }
@@ -4605,12 +4701,61 @@ fn stream_frames_ffmpeg_chunked(
             map.clear();
         }
 
+        // PR-14: sufijo servido desde NVMe (índices ≥ stream_cutoff).
+        if stream_cutoff != usize::MAX {
+            let from_cache: Vec<usize> = indices
+                .iter()
+                .copied()
+                .filter(|&idx| idx >= stream_cutoff && !map.contains_key(&idx))
+                .collect();
+            if !from_cache.is_empty() {
+                let cached: Vec<Option<(usize, Vec<u16>)>> = from_cache
+                    .par_iter()
+                    .map(|&idx| {
+                        read_cached_frame(
+                            &decode_cache_frame_path(&cache_dir, path_hash, idx),
+                            cached_frame_len,
+                        )
+                        .map(|frame| (idx, frame))
+                    })
+                    .collect();
+                let mut corrupt = false;
+                let mut served = 0usize;
+                for item in cached {
+                    match item {
+                        Some((idx, frame)) => {
+                            map.insert(idx, frame);
+                            served += 1;
+                        }
+                        None => corrupt = true,
+                    }
+                }
+                cache_hits.fetch_add(served, std::sync::atomic::Ordering::Relaxed);
+                if corrupt {
+                    // Entrada corrupta en el sufijo: abandonar el modo sufijo
+                    // y recuperar lo que falte con el stream recreado SIN
+                    // cutoff (decodifica de más una vez; la corrección manda).
+                    log_to_front(
+                        app,
+                        "WARN",
+                        "Caché FFmpeg: entrada de sufijo corrupta; se recupera por decode.",
+                    );
+                    stream_cutoff = usize::MAX;
+                    it = None;
+                }
+            }
+        }
+
         // 2. Serve from the persistent sequential stream.
-        let wanted: std::collections::HashSet<usize> = indices.iter().copied().collect();
-        let last_wanted = indices.iter().copied().max().unwrap_or(0);
+        let wanted: std::collections::HashSet<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&idx| idx < stream_cutoff)
+            .collect();
+        let last_wanted = wanted.iter().copied().max().unwrap_or(0);
         let mut cancelled = false;
 
-        loop {
+        while map.len() < indices.len() {
             if it.is_none() {
                 let stream_cancel = {
                     let token = cancel.clone();
@@ -4626,7 +4771,9 @@ fn stream_frames_ffmpeg_chunked(
                     exact_selected_indices
                         .iter()
                         .copied()
-                        .filter(|&index| index >= first_needed)
+                        // PR-14: los índices del sufijo cacheado NO pasan por
+                        // el stream — el decoder sólo recorre el prefijo.
+                        .filter(|&index| index >= first_needed && index < stream_cutoff)
                         .collect()
                 } else {
                     Vec::new()
@@ -4684,7 +4831,9 @@ fn stream_frames_ffmpeg_chunked(
             let s = it.as_mut().expect("stream just ensured");
             let mut stream_ok = true;
             if use_exact_selected_pipe {
-                for &index in indices {
+                // PR-14: sólo los índices del prefijo salen del stream (el
+                // filtro select del proceso excluye el sufijo cacheado).
+                for &index in indices.iter().filter(|&&idx| idx < stream_cutoff) {
                     if cancel.is_cancelled() {
                         cancelled = true;
                         break;
@@ -4758,6 +4907,23 @@ fn stream_frames_ffmpeg_chunked(
                     indices.len(),
                     pos
                 ));
+            }
+        }
+
+        // PR-14: prefijo agotado — matar el decoder YA (Drop termina y
+        // cosecha el proceso ffmpeg); el resto del pase se sirve de NVMe. La
+        // ruta HW se valida antes de soltar el stream (la validación final
+        // sobre `it` ya no lo verá). Sólo aplica mientras el modo sufijo siga
+        // activo (una corrupción lo desactiva y el stream vuelve a ser dueño
+        // de todos los índices).
+        if stream_cutoff != usize::MAX {
+            if let Some(last) = last_stream_index {
+                if pos > last {
+                    if let Some(stream) = it.as_ref() {
+                        stream.validate_hardware_route()?;
+                    }
+                    it = None;
+                }
             }
         }
 
@@ -11630,6 +11796,23 @@ fn warp_frame_lanczos3(frame: &[f32], w: usize, h: usize, warp: &[f32]) -> Vec<f
 #[cfg(test)]
 mod zas_v3_tests {
     use super::*;
+
+    #[test]
+    fn decode_cache_expected_set_admits_full_suffix_or_nothing() {
+        let sel: Vec<usize> = (0..1000).map(|i| i * 2).collect();
+        // Cabe entera → selección completa.
+        assert_eq!(decode_cache_expected_set(&sel, 100, 100_000), sel);
+        // No cabe entera pero sí un sufijo (500 frames) → últimos 500.
+        let suffix = decode_cache_expected_set(&sel, 100, 50_000);
+        assert_eq!(suffix.len(), 500);
+        assert_eq!(suffix[0], sel[500]);
+        assert_eq!(*suffix.last().unwrap(), *sel.last().unwrap());
+        // Sufijo <5% de la selección → nada (E/S inútil).
+        assert!(decode_cache_expected_set(&sel, 100, 4_000).is_empty());
+        // Bordes.
+        assert!(decode_cache_expected_set(&[], 100, 100_000).is_empty());
+        assert!(decode_cache_expected_set(&sel, 0, 100_000).is_empty());
+    }
 
     #[test]
     fn robust_ref_combine_survives_nan_and_keeps_median_semantics() {
