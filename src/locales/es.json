@@ -452,6 +452,13 @@
         "worst_score": "<svg class='zas-icon'><use href='#icon-down'></use></svg> Peor Nota",
         "best_score": "<svg class='zas-icon'><use href='#icon-trophy'></use></svg> Mejor Nota"
     },
+    "cache": {
+        "location": {
+            "title": "Ubicación del caché",
+            "origin": "Origen (junto al vídeo)",
+            "choose": "Elegir ubicación…"
+        }
+    },
     "analysis": {
         "title": "Integracion y Apilado",
         "chart": {

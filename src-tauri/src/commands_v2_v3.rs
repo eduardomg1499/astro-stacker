@@ -4287,11 +4287,57 @@ fn decode_cache_usage_ledger(dir: &Path) -> Arc<std::sync::atomic::AtomicU64> {
 /// Presupuesto por máquina, no una constante de portátil. Por defecto usa
 /// 1/8 de la RAM (3–12 GiB) y nunca invade la reserva segura del volumen. El
 /// override permite a estaciones NVMe grandes dedicar hasta 64 GiB.
-/// PR-14: directorio del caché de decode. Override `ZAS_DECODE_CACHE_DIR`
-/// para llevarlo a otro volumen (p. ej. un SSD externo cuando el interno va
-/// lleno: con <12GB libres la salvaguarda desactiva el caché y las pasadas
-/// vuelven a re-decodificar).
+/// Ubicación del caché elegida por el USUARIO desde la UI (selector
+/// "Origen / Elegir ubicación"). Tiene prioridad sobre la variable de
+/// entorno y el default. None = sin preferencia.
+static DECODE_CACHE_DIR_OVERRIDE: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::path::PathBuf>>,
+> = std::sync::OnceLock::new();
+
+fn decode_cache_dir_override() -> &'static std::sync::Mutex<Option<std::path::PathBuf>> {
+    DECODE_CACHE_DIR_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Comando de la UI: fija (o limpia con None/"") dónde vive el caché de
+/// decode de análisis/apilado. La UI lo invoca al importar un vídeo según el
+/// modo elegido: "origen" = carpeta zenith-cache junto al vídeo (funciona en
+/// discos externos e internos por igual); "elegir" = carpeta del usuario.
+#[tauri::command]
+fn set_decode_cache_location(path: Option<String>) -> Result<String, String> {
+    let normalized = path.map(std::path::PathBuf::from).filter(|p| {
+        !p.as_os_str().is_empty()
+    });
+    if let Some(dir) = normalized.as_ref() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("No se pudo crear la carpeta de caché {dir:?}: {e}"))?;
+        // Probar escritura real: un caché no escribible degradaría silencioso.
+        let probe = dir.join(".zas-cache-probe");
+        std::fs::write(&probe, b"ok")
+            .map_err(|e| format!("La carpeta de caché {dir:?} no es escribible: {e}"))?;
+        let _ = std::fs::remove_file(&probe);
+    }
+    let resolved = normalized
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(default)".into());
+    *decode_cache_dir_override()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = normalized;
+    Ok(resolved)
+}
+
+/// PR-14: directorio del caché de decode. Prioridad: selección del usuario
+/// en la UI ("Origen"/"Elegir ubicación") > `ZAS_DECODE_CACHE_DIR` > temp
+/// del sistema. Llevarlo a otro volumen evita que la salvaguarda de espacio
+/// desactive el caché cuando el disco interno va lleno.
 fn decode_cache_root_dir() -> std::path::PathBuf {
+    if let Some(dir) = decode_cache_dir_override()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return dir;
+    }
     match std::env::var_os("ZAS_DECODE_CACHE_DIR") {
         Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
         _ => std::env::temp_dir().join("astro_stacker_cache"),
@@ -5320,7 +5366,12 @@ fn try_filled_vec<T: Clone>(len: usize, value: T, label: &str) -> Result<Vec<T>,
 /// GiB reclamables. Usamos la mejor de ambas lecturas, limitada siempre por la
 /// RAM física. En Linux `available` ya incluye page cache reclamable y gana;
 /// en Windows ambas magnitudes son equivalentes.
-fn resolve_planetary_available_memory(reported: u64, total: u64, used: u64) -> u64 {
+fn resolve_planetary_available_memory(
+    reported: u64,
+    total: u64,
+    used: u64,
+    used_swap: u64,
+) -> u64 {
     // `used == 0` con RAM total no nula suele significar que host_statistics
     // falló; en ese caso no asumimos peligrosamente que toda la RAM está libre.
     let accounted_available = if total > 0 && used > 0 {
@@ -5331,10 +5382,17 @@ fn resolve_planetary_available_memory(reported: u64, total: u64, used: u64) -> u
     // PERF (hilos del apilado): en macOS "used" incluye GB de caché de
     // ficheros PURGABLE que el sistema recupera bajo presión — el snapshot
     // instantáneo infra-reporta lo utilizable y el plan elegía 4/10 hilos en
-    // un M5 de 24GB (medido). Suelo: 45% de la RAM total. Es seguro porque
-    // todas las asignaciones grandes pasan por try_reserve/presupuestos con
-    // Err limpio, y el pico planificado sigue auditado contra working_budget.
-    let purgeable_floor = if total > 0 { (total / 20) * 9 } else { 0 };
+    // un M5 de 24GB (medido). Suelo: 45% de la RAM total, PERO SOLO si el
+    // sistema NO está ya swappeando: con swap en uso la memoria está
+    // genuinamente comprometida y el suelo sobre-comprometía (929 s medidos
+    // con thrashing: alineación 950 ms/f vs 193 sin presión). En ese caso se
+    // vuelve al snapshot conservador: menos hilos > swap.
+    let swapping = used_swap > 256 * 1024 * 1024;
+    let purgeable_floor = if total > 0 && !swapping {
+        (total / 20) * 9
+    } else {
+        0
+    };
     let resolved = reported.max(accounted_available).max(purgeable_floor);
     if total > 0 {
         resolved.min(total)
@@ -5350,6 +5408,7 @@ fn planetary_available_memory_snapshot() -> u64 {
         system.available_memory(),
         system.total_memory(),
         system.used_memory(),
+        system.used_swap(),
     )
 }
 
@@ -12536,25 +12595,32 @@ mod zas_v3_tests {
         // elegía 4/10 hilos en un M5 de 24GB). 45% de 16GiB = 7.2GiB.
         let floor_16 = (16 * gib / 20) * 9;
         assert_eq!(
-            resolve_planetary_available_memory(0, 16 * gib, 9 * gib),
+            resolve_planetary_available_memory(0, 16 * gib, 9 * gib, 0),
             (7 * gib).max(floor_16)
         );
         assert_eq!(
-            resolve_planetary_available_memory(5 * gib, 16 * gib, 9 * gib),
+            resolve_planetary_available_memory(5 * gib, 16 * gib, 9 * gib, 0),
             (7 * gib).max(floor_16)
         );
-        assert_eq!(resolve_planetary_available_memory(3 * gib, 0, 0), 3 * gib);
+        assert_eq!(resolve_planetary_available_memory(3 * gib, 0, 0, 0), 3 * gib);
         // used==0 (host_statistics roto): NUNCA asumir toda la RAM libre —
         // pero el suelo del 45% sí es presupuestable (try_reserve guarda el
         // resto del camino).
-        assert_eq!(resolve_planetary_available_memory(0, 16 * gib, 0), floor_16);
+        assert_eq!(resolve_planetary_available_memory(0, 16 * gib, 0, 0), floor_16);
+        // Con SWAP en uso la memoria está genuinamente comprometida: el suelo
+        // se desactiva y vuelve el snapshot conservador (929 s de thrashing
+        // medidos cuando el suelo sobre-comprometía bajo presión real).
+        assert_eq!(
+            resolve_planetary_available_memory(3 * gib, 16 * gib, 13 * gib, 1 * gib),
+            3 * gib
+        );
     }
 
     #[test]
     fn reported_mac_geometry_no_longer_collapses_to_sixteen_mb_budget() {
         let gib = 1024 * 1024 * 1024u64;
         let mut input = ram_inputs();
-        input.available_ram = resolve_planetary_available_memory(0, 24 * gib, 8 * gib);
+        input.available_ram = resolve_planetary_available_memory(0, 24 * gib, 8 * gib, 0);
         input.width_in = 3312;
         input.height_in = 5888;
         input.width_out = 3312;

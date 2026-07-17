@@ -10694,6 +10694,7 @@ fn main() {
             cancel_processing,
             analyze_video_v2,
             analyze_planetary,
+            set_decode_cache_location,
             stop_analysis,
             activate_license,
             ver_licencia,

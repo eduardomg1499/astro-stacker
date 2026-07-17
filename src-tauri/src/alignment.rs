@@ -1942,21 +1942,15 @@ pub fn refine_best_match_sad_from_coarse_checked(
             let (dx6, dy6, sad6) = find_best_match_sad(
                 ref_edges, tgt_edges, w, ax, ay, fine_fx, fine_fy, box_size, 6,
             );
-            if dx6.abs() >= 6.0 || dy6.abs() >= 6.0 {
-                // PERF: antes se reportaba saturación aquí y el caller caía al
-                // piramidal COMPLETO — medido, disparaba p2/local_shifts a
-                // ~196 s (los APs de limbo saturan a menudo). Una etapa ±12
-                // (625 evals, ~25× más barata que el piramidal) resuelve la
-                // gran mayoría; solo si TAMBIÉN toca el borde ±12 se declara
-                // saturación real y el caller escala a la búsqueda completa.
-                let (dx12, dy12, sad12) = find_best_match_sad(
-                    ref_edges, tgt_edges, w, ax, ay, fine_fx, fine_fy, box_size, 12,
-                );
-                let sat = dx12.abs() >= 12.0 || dy12.abs() >= 12.0;
-                (dx12, dy12, sad12, sat)
-            } else {
-                (dx6, dy6, sad6, false)
-            }
+            // CALIDAD PRIMERO (validado con las pruebas del usuario): una
+            // etapa intermedia ±12 aquí ACEPTABA mínimos falsos interiores en
+            // zonas planas/limbo (en una meseta SAD el argmin no se ancla al
+            // borde, así que el flag no los detecta) y reintrodujo artefactos
+            // alrededor del disco. Saturación en ±6 → el caller escala a la
+            // búsqueda piramidal completa; su coste extra se reparte entre
+            // los workers y no compromete la calidad.
+            let sat = dx6.abs() >= 6.0 || dy6.abs() >= 6.0;
+            (dx6, dy6, sad6, sat)
         } else {
             (dx3, dy3, sad3, false)
         }

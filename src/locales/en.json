@@ -452,6 +452,13 @@
         "worst_score": "<svg class='zas-icon'><use href='#icon-down'></use></svg> Worst Score",
         "best_score": "<svg class='zas-icon'><use href='#icon-trophy'></use></svg> Best Score"
     },
+    "cache": {
+        "location": {
+            "title": "Cache location",
+            "origin": "Source (next to video)",
+            "choose": "Choose location…"
+        }
+    },
     "analysis": {
         "title": "Integration & Stacking",
         "chart": {

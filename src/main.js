@@ -285,6 +285,37 @@ function initCustomSelect() {
             persistZenithTargetCategory(sel.value, true);
         });
     })();
+
+    // Selector de ubicación del caché (Origen / Elegir ubicación).
+    (function initCacheLocationSelector() {
+        const btnOrigin = document.getElementById('btn-cache-origin');
+        const btnChoose = document.getElementById('btn-cache-choose');
+        if (!btnOrigin || !btnChoose) return;
+        const paint = () => {
+            const on = '#38bdf8', off = '#334155';
+            btnOrigin.style.borderColor = cacheLocationMode === 'origin' ? on : off;
+            btnChoose.style.borderColor = cacheLocationMode === 'choose' ? on : off;
+        };
+        btnOrigin.addEventListener('click', () => {
+            cacheLocationMode = 'origin';
+            localStorage.setItem('zas_cache_mode', 'origin');
+            paint();
+            applyCacheLocation();
+        });
+        btnChoose.addEventListener('click', async () => {
+            const folder = await openDialog({ directory: true, multiple: false });
+            const dir = (typeof folder === 'object' && folder && folder.path) ? folder.path : folder;
+            if (!dir) return;
+            cacheLocationMode = 'choose';
+            cacheChosenDir = dir;
+            localStorage.setItem('zas_cache_mode', 'choose');
+            localStorage.setItem('zas_cache_dir', dir);
+            paint();
+            applyCacheLocation();
+        });
+        paint();
+        applyCacheLocation();
+    })();
 }
 
 function normalizeLanguageCode(lang) {
@@ -1254,10 +1285,47 @@ if (btnTrialStart) {
 
 let currentFilePath = "";
 window.currentFilePath = "";
+// Ubicación del caché de análisis/apilado elegida por el usuario. "origin" =
+// junto al vídeo; "choose" = carpeta fija seleccionada. Persistente.
+let cacheLocationMode = localStorage.getItem("zas_cache_mode") || "origin";
+let cacheChosenDir = localStorage.getItem("zas_cache_dir") || "";
+
+function parentDirOf(filePath) {
+    if (!filePath) return "";
+    const norm = filePath.replace(/\\/g, "/");
+    const i = norm.lastIndexOf("/");
+    return i > 0 ? filePath.slice(0, i) : "";
+}
+
+// Envía la ubicación efectiva del caché al backend según el modo y el vídeo
+// actual. Se llama al importar un vídeo y al cambiar el modo.
+async function applyCacheLocation() {
+    let target = null;
+    if (cacheLocationMode === "origin") {
+        const dir = parentDirOf(currentFilePath);
+        target = dir ? `${dir}/zenith-cache` : null; // null => default del backend
+    } else if (cacheLocationMode === "choose" && cacheChosenDir) {
+        target = cacheChosenDir;
+    }
+    const pathSpan = document.getElementById("cache-location-path");
+    try {
+        const resolved = await invoke("set_decode_cache_location", { path: target });
+        if (pathSpan) pathSpan.textContent = target ? `Caché: ${resolved}` : "Caché: temporal del sistema";
+    } catch (e) {
+        if (pathSpan) pathSpan.textContent = `Caché no utilizable: ${normalizeBackendText(e)}`;
+        log("WARN", `Ubicación de caché rechazada (${normalizeBackendText(e)}); se usa el temporal del sistema.`);
+        try { await invoke("set_decode_cache_location", { path: null }); } catch (_) {}
+    }
+}
+window.applyCacheLocation = applyCacheLocation;
+
 window.setCurrentFilePath = (path = "") => {
     currentFilePath = path || "";
     window.currentFilePath = currentFilePath;
     updateBayerOverrideAvailability(currentFilePath);
+    // Reaplicar la ubicación del caché al nuevo vídeo (modo "origin" depende
+    // de dónde esté el vídeo importado).
+    applyCacheLocation();
 };
 window.getCurrentFilePath = () => currentFilePath;
 window.setMosaicViewportMode = (active = false) => {
