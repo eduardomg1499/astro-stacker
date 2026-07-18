@@ -1641,19 +1641,67 @@ fn process_analysis_frame(
             None
         };
         if let Some((guess_dx, guess_dy)) = gpu_seed {
-            crate::alignment::refine_best_match_sad_offset(
-                anchor_mono_ref,
-                &buffers.lap_out,
-                hw,
-                hh,
-                search_x,
-                search_y,
-                search_w,
-                search_h,
-                guess_dx,
-                guess_dy,
-                16,
-            )
+            // A1 (2026-07-17): la ventana fina ±16 se evalúa DENSA en GPU
+            // (mismas sumas enteras sobre la misma caja interior) y la CPU
+            // conserva el argmin con la política exacta del barrido de
+            // referencia y el subpíxel original — bit-idéntico. Era el coste
+            // dominante del análisis de superficie: 628 ms/frame de CPU
+            // memory-bound a 20MP (1292 s de los 386 s de pared medidos).
+            // Cualquier fallo GPU o candidato no evaluable cae a la ruta CPU
+            // completa de siempre.
+            let dense = if gpu_frame_active {
+                match crate::gpu_analysis::search_sad_dense_window(
+                    anchor_mono_ref,
+                    &buffers.lap_out,
+                    hw,
+                    hh,
+                    search_x,
+                    search_y,
+                    search_w,
+                    search_h,
+                    guess_dx,
+                    guess_dy,
+                    16,
+                ) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        if let Some(failed) = gpu_analysis_failed {
+                            failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some((fidx, fidy, fsad)) = dense {
+                crate::alignment::subpixel_after_integer_sad(
+                    anchor_mono_ref,
+                    &buffers.lap_out,
+                    hw,
+                    search_x,
+                    search_y,
+                    search_w,
+                    search_h,
+                    fidx,
+                    fidy,
+                    fsad,
+                )
+            } else {
+                crate::alignment::refine_best_match_sad_offset(
+                    anchor_mono_ref,
+                    &buffers.lap_out,
+                    hw,
+                    hh,
+                    search_x,
+                    search_y,
+                    search_w,
+                    search_h,
+                    guess_dx,
+                    guess_dy,
+                    16,
+                )
+            }
         } else {
             crate::alignment::find_best_match_sad_pyramid_offset(
                 anchor_mono_ref,
@@ -3745,6 +3793,107 @@ fn perform_standardized_analysis(
         &cache_expectation,
     )?;
     emit_progress(app, "Finalizando...", 100.0, None);
+    // S6 (2026-07-17): precalentar EN SEGUNDO PLANO el caché de decode con el
+    // top-24 por score — los candidatos de la referencia robusta del apilado.
+    // ref_decode recorre con select casi todo el vídeo (~1-2 min a 20MP HEVC)
+    // aunque materialice ≤20 frames; sembrarlos mientras el usuario revisa el
+    // análisis lo convierte en una lectura NVMe. Mismo comparador que la
+    // selección del apilado (score desc, idx asc): su top-K es prefijo de este
+    // top-24 también con empates. Ruta CPU para que la etiqueta de la clave
+    // coincida siempre con los bytes escritos. Best-effort silencioso: la
+    // transacción pone presupuesto/CRC/dedupe y cualquier fallo se ignora.
+    // Si el apilado arranca antes de terminar, ambos escriben los mismos
+    // bytes bajo la misma clave (write_frame deduplica y el commit repara).
+    // ZAS_NO_REF_PREWARM=1 lo desactiva.
+    if matches!(r, VideoInput::Ffmpeg(_))
+        && std::env::var("ZAS_NO_REF_PREWARM").ok().as_deref() != Some("1")
+    {
+        static REF_PREWARM_ACTIVE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if REF_PREWARM_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let mut by_score: Vec<(_, usize)> =
+                stats.iter().map(|s| (s.score, s.idx)).collect();
+            by_score.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            let mut warm_indices: Vec<usize> =
+                by_score.iter().take(24).map(|&(_, idx)| idx).collect();
+            warm_indices.sort_unstable();
+            let warm_input = r.clone();
+            let warm_path = path.to_string();
+            let (warm_cid, warm_w, warm_h, warm_bpp) = (cid, tw, th, tbp);
+            std::thread::spawn(move || {
+                let run = || {
+                    let VideoInput::Ffmpeg(ref fr) = warm_input else {
+                        return;
+                    };
+                    let is_color = ffmpeg_stream_is_color(warm_cid);
+                    let cached_frame_len = warm_w * warm_h * (if is_color { 3 } else { 1 });
+                    let cache_dir = decode_cache_root_dir();
+                    let budget = decode_cache_budget_bytes(&cache_dir);
+                    if budget == 0
+                        || cached_frame_len == 0
+                        || std::fs::create_dir_all(&cache_dir).is_err()
+                    {
+                        return;
+                    }
+                    let key = ffmpeg_decode_cache_key(
+                        &warm_path,
+                        warm_w,
+                        warm_h,
+                        warm_bpp,
+                        warm_cid,
+                        fr.rotation,
+                        &fr.codec_name,
+                        &ffmpeg_decode_route_label(&fr.ffmpeg_path, None),
+                    );
+                    let missing: Vec<usize> = warm_indices
+                        .iter()
+                        .copied()
+                        .filter(|&idx| {
+                            read_cached_frame(
+                                &decode_cache_frame_path(&cache_dir, key, idx),
+                                cached_frame_len,
+                            )
+                            .is_none()
+                        })
+                        .collect();
+                    if missing.is_empty() {
+                        return;
+                    }
+                    let max_file = decode_cache_max_file_bytes(cached_frame_len);
+                    prune_decode_cache_to_budget(
+                        &cache_dir,
+                        budget.saturating_sub(max_file.saturating_mul(missing.len() as u64)),
+                    );
+                    let Some(mut transaction) =
+                        DecodeFrameCacheTransaction::new(&cache_dir, key, cached_frame_len, budget)
+                            .map(|t| t.with_expected_indices(missing.iter().copied()))
+                    else {
+                        return;
+                    };
+                    let source =
+                        UnifiedFrameSource::from_input(warm_input.clone(), warm_cid);
+                    match source.read_batch_with_hardware(&missing, None, None) {
+                        Ok(batch) => {
+                            for (idx, frame) in batch.indices.iter().zip(&batch.frames) {
+                                transaction.write_raw_le_u16(*idx, frame);
+                            }
+                            transaction.commit();
+                            eprintln!(
+                                "[ref-prewarm] {} candidatos de referencia sembrados en el caché de decode",
+                                batch.indices.len()
+                            );
+                        }
+                        Err(error) => eprintln!("[ref-prewarm] omitido: {error}"),
+                    }
+                };
+                run();
+                REF_PREWARM_ACTIVE.store(false, Ordering::Release);
+            });
+        }
+    }
     let mut buf = Vec::new();
     let raw = {
         let _s = crate::perf_trace::span(pt, "preview_decode");

@@ -1206,6 +1206,75 @@ pub fn search_sad_single_parallel(
     Ok(best)
 }
 
+/// A1 (2026-07-17): ventana fina DENSA del SAD global de superficie en GPU.
+/// Evalúa las (2r+1)² sumas SAD enteras de una caja `roi_w×roi_h` (esquina
+/// `roi_x,roi_y`) contra el target desplazado `guess+(dx,dy)`, y devuelve el
+/// argmin con EXACTAMENTE la política del barrido CPU de referencia
+/// (`find_best_match_sad_internal`): dy exterior desde −r, dx interior desde
+/// −r, comparación estricta `<` — primer mínimo global del barrido. Las sumas
+/// del kernel son enteras sobre el mismo conjunto de píxeles (origen = centro
+/// − caja/2), así que sobre ventanas interiores el trío (dx, dy, sad) es
+/// bit-idéntico al de la CPU. Si CUALQUIER candidato no se pudo evaluar
+/// (bordes: el kernel es 1 px más estricto que la CPU), devuelve None y el
+/// caller usa la ruta CPU completa — la equivalencia deja de ser demostrable.
+#[allow(clippy::too_many_arguments)]
+pub fn search_sad_dense_window(
+    reference: &[u16],
+    target: &[u16],
+    w: usize,
+    h: usize,
+    roi_x: usize,
+    roi_y: usize,
+    roi_w: usize,
+    roi_h: usize,
+    guess_dx: isize,
+    guess_dy: isize,
+    radius: i32,
+) -> Result<Option<(isize, isize, u64)>, String> {
+    if radius < 0 || roi_w == 0 || roi_h == 0 {
+        return Ok(None);
+    }
+    // Convención del kernel: origen muestreado = centro − caja/2. Con centro
+    // = esquina + caja/2 el origen reconstruido es EXACTAMENTE la esquina,
+    // para caja par e impar (misma división entera truncada).
+    let ref_cx = (roi_x + roi_w / 2) as i32;
+    let ref_cy = (roi_y + roi_h / 2) as i32;
+    let side = (2 * radius + 1) as usize;
+    let mut points = Vec::with_capacity(side * side);
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            points.push(SadPoint::rectangular(
+                ref_cx,
+                ref_cy,
+                ref_cx + guess_dx as i32 + dx,
+                ref_cy + guess_dy as i32 + dy,
+                roi_w as i32,
+                roi_h as i32,
+                0,
+                true,
+            ));
+        }
+    }
+    let results = search_sad_points(reference, target, w, h, &points)?;
+    if results.len() != points.len() {
+        return Ok(None);
+    }
+    let mut best: Option<(isize, isize, u64)> = None;
+    let mut index = 0usize;
+    for dy in -(radius as isize)..=(radius as isize) {
+        for dx in -(radius as isize)..=(radius as isize) {
+            let Some(m) = results[index].as_ref() else {
+                return Ok(None);
+            };
+            index += 1;
+            if best.as_ref().is_none_or(|&(_, _, b)| m.sad < b) {
+                best = Some((guess_dx + dx, guess_dy + dy, m.sad));
+            }
+        }
+    }
+    Ok(best)
+}
+
 /// Ejecuta búsquedas SAD gruesas para todos los AP. El caso normal usa un solo
 /// dispatch; cargas grandes se dividen en command buffers acotados por TDR.
 /// Los mapas deben tener geometría idéntica y normalmente son pirámides 4×.
@@ -2005,6 +2074,54 @@ mod tests {
     #[ignore = "requiere GPU física Metal/DX12/Vulkan"]
     fn planetary_analysis_gpu_parity_physical() {
         assert!(super::ensure_parity());
+    }
+
+    /// A1: la ventana fina densa del SAD global de superficie resuelta en GPU
+    /// debe producir el MISMO trío (dx, dy, sad) que el barrido CPU de
+    /// referencia y, encadenada al subpíxel compartido, el mismo resultado
+    /// bit a bit que `refine_best_match_sad_offset`. Cubre la igualdad de
+    /// sumas del kernel (mismo conjunto de píxeles) y la política de empates
+    /// del argmin replicada en `search_sad_dense_window`.
+    #[test]
+    #[ignore = "requiere GPU física Metal/DX12/Vulkan"]
+    fn dense_window_matches_cpu_refine_physical() {
+        let w = 640usize;
+        let h = 480usize;
+        let mut state = 0x8bad_f00du32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 16) as u16
+        };
+        let reference: Vec<u16> = (0..w * h).map(|_| next()).collect();
+        let (shift_x, shift_y) = (7isize, -11isize);
+        let target: Vec<u16> = (0..w * h)
+            .map(|i| {
+                let x = (i % w) as isize - shift_x;
+                let y = (i / w) as isize - shift_y;
+                if x >= 0 && (x as usize) < w && y >= 0 && (y as usize) < h {
+                    reference[y as usize * w + x as usize]
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let (roi_x, roi_y, roi_w, roi_h) = (160usize, 120usize, 320usize, 240usize);
+        for (guess_dx, guess_dy) in [(0isize, 0isize), (5, -4)] {
+            let dense = super::search_sad_dense_window(
+                &reference, &target, w, h, roi_x, roi_y, roi_w, roi_h, guess_dx, guess_dy, 16,
+            )
+            .expect("runtime GPU disponible")
+            .expect("ventana interior: todos los candidatos evaluables");
+            assert_eq!((dense.0, dense.1), (shift_x, shift_y));
+            let cpu = crate::alignment::refine_best_match_sad_offset(
+                &reference, &target, w, h, roi_x, roi_y, roi_w, roi_h, guess_dx, guess_dy, 16,
+            );
+            let split = crate::alignment::subpixel_after_integer_sad(
+                &reference, &target, w, roi_x, roi_y, roi_w, roi_h, dense.0, dense.1, dense.2,
+            );
+            assert_eq!(cpu.0.to_bits(), split.0.to_bits());
+            assert_eq!(cpu.1.to_bits(), split.1.to_bits());
+        }
     }
 
     #[test]

@@ -763,6 +763,43 @@ pub fn refine_best_match_sad_offset(
     )
 }
 
+/// Subpíxel de la ruta de referencia aplicado a un argmin entero YA resuelto
+/// por otro motor sobre las MISMAS sumas enteras (p. ej. el SAD denso GPU).
+/// Con (fidx, fidy, fsad) iguales a los que produciría el barrido CPU, el
+/// resultado es bit-idéntico a `refine_best_match_sad_offset`: es la misma
+/// llamada subpíxel con los mismos argumentos (test
+/// `subpixel_after_integer_sad_matches_full_search`).
+#[allow(clippy::too_many_arguments)]
+pub fn subpixel_after_integer_sad(
+    ref_data: &[u16],
+    tgt_data: &[u16],
+    width: usize,
+    roi_x: usize,
+    roi_y: usize,
+    roi_w: usize,
+    roi_h: usize,
+    fidx: isize,
+    fidy: isize,
+    fsad: u64,
+) -> (f32, f32) {
+    let target_idx_x = (roi_x as isize + fidx).max(0) as usize;
+    let target_idx_y = (roi_y as isize + fidy).max(0) as usize;
+    let (sdx, sdy) = subpixel_refine_sad(
+        ref_data,
+        tgt_data,
+        width,
+        roi_x,
+        roi_y,
+        target_idx_x,
+        target_idx_y,
+        roi_w.min(roi_h),
+        fidx as f32,
+        fidy as f32,
+        fsad,
+    );
+    (fidx as f32 + sdx, fidy as f32 + sdy)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn find_best_match_sad_rect_avx2(
@@ -2236,6 +2273,50 @@ pub fn enhance_solar_surface(input: &[u16], width: usize, height: usize) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A1: la descomposición (argmin entero externo → subpíxel) debe ser
+    /// bit-idéntica a la ruta monolítica `find_best_match_sad_subpixel`
+    /// cuando el trío (fidx, fidy, fsad) es el del propio barrido CPU. Es el
+    /// contrato que permite resolver la ventana densa en GPU y conservar el
+    /// subpíxel de referencia sin cambiar un bit.
+    #[test]
+    fn subpixel_after_integer_sad_matches_full_search() {
+        let w = 96usize;
+        let h = 80usize;
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 16) as u16
+        };
+        let reference: Vec<u16> = (0..w * h).map(|_| next()).collect();
+        let (shift_x, shift_y) = (5isize, -3isize);
+        let target: Vec<u16> = (0..w * h)
+            .map(|i| {
+                let x = (i % w) as isize - shift_x;
+                let y = (i / w) as isize - shift_y;
+                if x >= 0 && (x as usize) < w && y >= 0 && (y as usize) < h {
+                    reference[y as usize * w + x as usize]
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let (roi_x, roi_y, roi_w, roi_h) = (24usize, 20usize, 40usize, 32usize);
+        for (guess_dx, guess_dy) in [(0isize, 0isize), (4, -2), (-6, 6)] {
+            let full = find_best_match_sad_subpixel(
+                &reference, &target, w, h, roi_x, roi_y, roi_w, roi_h, guess_dx, guess_dy, 16,
+            );
+            let (fsad, fidx, fidy) = find_best_match_sad_rect(
+                &reference, &target, w, h, roi_x, roi_y, roi_w, roi_h, guess_dx, guess_dy, 16,
+            );
+            assert_eq!((fidx, fidy), (shift_x, shift_y));
+            let split = subpixel_after_integer_sad(
+                &reference, &target, w, roi_x, roi_y, roi_w, roi_h, fidx, fidy, fsad,
+            );
+            assert_eq!(full.0.to_bits(), split.0.to_bits());
+            assert_eq!(full.1.to_bits(), split.1.to_bits());
+        }
+    }
 
     /// PR-23 FIX: una semilla en píxeles FULL-RES debe usarse con
     /// coarse_scale=1.0. Este test habría cazado el bug de escala ×4:
