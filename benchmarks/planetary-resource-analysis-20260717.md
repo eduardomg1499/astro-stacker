@@ -264,10 +264,24 @@ P0 COMPLETO en dos commits (c27ab19 tanda 1, 0d44a1a tanda 2), suite 390/0
   análisis (misma clave/ruta CPU que leerá la referencia).
   `ZAS_NO_REF_PREWARM=1` revierte.
 
-Pendiente (sin cambios): P1 (enhance GPU, LK GPU si la telemetría lo pide),
-P2 (coarse GPU en p2 con gates del limbo; replanificar RAM con RSS medido),
-P3 (validación física DX12/Vulkan, cap TDR 200/300M, sidecar). La validación
-física E2E la ejecuta el usuario (`scripts/benchmark/planetary_e2e.sh`).
+P1 IMPLEMENTADO (commit 2611857, suite 391/0, físicos 26/26): blur del
+enhance en GPU con diseño conservador — SOLO las dos pasadas enteras de box
+blur van a GPU (kernel WGSL u32, división truncada idéntica); la cola f32
+con noise-gate queda SIEMPRE en CPU con las mismas expresiones
+(`enhance_highpass_from_blur`) → bit-idéntico sin depender del fast-math del
+backend. Gates: test unitario split==ruta de producción (NEON/AVX2 real),
+self-test de sesión `ensure_enhance_parity()` con latch a CPU, test físico
+validado en Metal (3 geometrías, bit a bit), `ZAS_NO_GPU_ENHANCE=1`. Orden
+en p2: caché de planos S1 → GPU enhance → CPU (componen; la caché sigue
+cubriendo CpuOnly/paridad-fallida y re-apilados).
+
+Pendiente condicionado a telemetría del usuario: LK a GPU (PR-32, si
+local_shifts sigue dominando tras P0+P1) y conversión P010→RGB48 en GPU (si
+el decode en frío sigue limitando tras S2). P2 (coarse GPU en p2 — QUALITY-
+RISK con gates del limbo y A/B visual del usuario; replanificar RAM con RSS
+medido sin swap) y P3 (validación física DX12/Vulkan, cap TDR 200/300M,
+sidecar) sin cambios. La validación física E2E la ejecuta el usuario
+(`scripts/benchmark/planetary_e2e.sh`).
 
 Qué mirar en la próxima traza de superficie: en análisis, `a_sad` avg debe
 caer de ~628 ms a decenas de ms y `decode_wait` volverá a ser visible
