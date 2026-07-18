@@ -200,6 +200,94 @@ fn enhance_for_alignment_scalar(
     }
 }
 
+/// P1 (2026-07-17): réplica EXACTA de las pasadas 3 del enhance escalar
+/// (box blur radio 1 separable, bordes conscientes, división ENTERA truncada
+/// por count 2/3) como función independiente. Es la referencia CPU del kernel
+/// GPU de blur (paridad bit a bit) y la mitad "entera" del enhance partido.
+/// No la usa la ruta CPU de producción (esa conserva sus variantes fusionadas
+/// scalar/unchecked/AVX2 intactas).
+pub fn box_blur_r1_edge_aware(
+    input: &[u16],
+    width: usize,
+    height: usize,
+    tmp: &mut Vec<u16>,
+    out: &mut Vec<u16>,
+) {
+    let len = width * height;
+    if len == 0 {
+        return;
+    }
+    if tmp.len() < len {
+        tmp.resize(len, 0);
+    }
+    if out.len() < len {
+        out.resize(len, 0);
+    }
+    for y in 0..height {
+        let row_off = y * width;
+        for x in 0..width {
+            let mut sum: u32 = 0;
+            let start = x.saturating_sub(1);
+            let end = (x + 2).min(width);
+            let count = end - start;
+            for ix in start..end {
+                sum += input[row_off + ix] as u32;
+            }
+            tmp[row_off + x] = (sum / count as u32) as u16;
+        }
+    }
+    for y in 0..height {
+        let y_start = y.saturating_sub(1);
+        let y_end = (y + 2).min(height);
+        let count = y_end - y_start;
+        let row_off = y * width;
+        for x in 0..width {
+            let mut sum: u32 = 0;
+            for iy in y_start..y_end {
+                sum += tmp[iy * width + x] as u32;
+            }
+            out[row_off + x] = (sum / count as u32) as u16;
+        }
+    }
+}
+
+/// P1: cola del enhance (high-pass f32 con noise gate) IDÉNTICA a la ruta
+/// escalar, aplicada a un plano de blur ya calculado (p. ej. por el kernel
+/// GPU entero). Mismas expresiones f32 en el mismo orden → con un blur
+/// bit-idéntico al de la ruta CPU, el resultado completo es bit-idéntico
+/// (test `split_enhance_matches_production_path`). El float se queda SIEMPRE
+/// en CPU: no depende del modo fast-math del backend gráfico.
+pub fn enhance_highpass_from_blur(
+    input: &[u16],
+    blur: &[u16],
+    width: usize,
+    height: usize,
+    out: &mut Vec<u16>,
+    amount: f32,
+) {
+    let len = width * height;
+    if len == 0 || input.len() < len || blur.len() < len {
+        return;
+    }
+    if out.len() < len {
+        out.resize(len, 0);
+    }
+    let noise_floor = estimate_noise_floor_corners(input, width, height);
+    let noise_gate = noise_floor + 200;
+    for i in 0..len {
+        let v = input[i] as i32;
+        let b = blur[i] as i32;
+        let diff = v - b;
+        let snr_weight = if v > noise_gate {
+            1.0f32
+        } else {
+            ((v - noise_floor).max(0) as f32 / 200.0).powi(2)
+        };
+        let enhanced = v as f32 + (diff as f32 * amount * snr_weight);
+        out[i] = enhanced.clamp(0.0, 65535.0) as u16;
+    }
+}
+
 /// Normalizes a patch to have consistent mean and standard deviation.
 /// Compensates for atmospheric scintillation (temporal brightness fluctuations).
 pub fn normalize_patch_stats(
@@ -2273,6 +2361,46 @@ pub fn enhance_solar_surface(input: &[u16], width: usize, height: usize) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P1: el enhance partido (blur entero extraíble a GPU + cola f32 en CPU)
+    /// debe ser bit-idéntico a la ruta de producción
+    /// `enhance_for_alignment_into_amount` (en aarch64 ejercita la variante
+    /// NEON unchecked real; en x86_64 la AVX2). Dimensiones IMPARES a
+    /// propósito: bordes del blur y empaquetado GPU de palabra a medias.
+    #[test]
+    fn split_enhance_matches_production_path() {
+        let w = 97usize;
+        let h = 61usize;
+        let mut state = 0xc0ff_ee11u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 16) as u16
+        };
+        // Mezcla de zonas brillantes (rama snr_weight=1.0) y oscuras (rama
+        // f32 con powi) para cubrir ambas ramas del high-pass.
+        let input: Vec<u16> = (0..w * h)
+            .map(|i| {
+                let base = next();
+                if (i / w) % 7 < 2 {
+                    base / 64
+                } else {
+                    base
+                }
+            })
+            .collect();
+        for amount in [4.0f32, 6.0] {
+            let mut s1 = Vec::new();
+            let mut s2 = Vec::new();
+            let mut full = Vec::new();
+            enhance_for_alignment_into_amount(&input, w, h, &mut s1, &mut s2, &mut full, amount);
+            let mut tmp = Vec::new();
+            let mut blur = Vec::new();
+            box_blur_r1_edge_aware(&input, w, h, &mut tmp, &mut blur);
+            let mut split = Vec::new();
+            enhance_highpass_from_blur(&input, &blur, w, h, &mut split, amount);
+            assert_eq!(full[..w * h], split[..w * h], "amount={amount}");
+        }
+    }
 
     /// A1: la descomposición (argmin entero externo → subpíxel) debe ser
     /// bit-idéntica a la ruta monolítica `find_best_match_sad_subpixel`

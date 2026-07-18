@@ -1275,6 +1275,360 @@ pub fn search_sad_dense_window(
     Ok(best)
 }
 
+// ---------------------------------------------------------------------------
+// P1 (2026-07-17): blur del enhance de alineación en GPU. SOLO las dos
+// pasadas de box blur radio 1 (aritmética ENTERA u32 con división truncada
+// por count 2/3, misma que la ruta escalar CPU) viven aquí; la cola f32 con
+// noise-gate se queda SIEMPRE en CPU (`enhance_highpass_from_blur`) para no
+// depender del modo fast-math del backend (lección Kahan de gpu_stack). Con
+// blur bit-idéntico, el enhance completo es bit-idéntico por construcción.
+// Patrón PR-30: lock durante upload+submit, staging por llamada, readback
+// fuera del lock. Paridad de sesión: `ensure_enhance_parity()`.
+// ---------------------------------------------------------------------------
+
+const ENHANCE_WGSL: &str = r#"
+struct BlurParams { w: u32, h: u32, dir: u32, pad: u32 }
+@group(0) @binding(0) var<uniform> P: BlurParams;
+@group(0) @binding(1) var<storage, read> src: array<u32>;
+@group(0) @binding(2) var<storage, read_write> dst: array<u32>;
+
+fn src_at(i: u32) -> u32 {
+    return (src[i >> 1u] >> ((i & 1u) * 16u)) & 0xffffu;
+}
+
+// Cada invocation produce UNA palabra de dst (dos píxeles) para no hacer
+// read-modify-write parcial de palabras compartidas entre hilos.
+@compute @workgroup_size(256)
+fn blur_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n = P.w * P.h;
+    if (gid.x >= (n + 1u) / 2u) { return; }
+    var packed = 0u;
+    for (var k = 0u; k < 2u; k = k + 1u) {
+        let i = gid.x * 2u + k;
+        if (i >= n) { break; }
+        let x = i % P.w;
+        let y = i / P.w;
+        var sum = 0u;
+        var start = 0u;
+        var end = 0u;
+        if (P.dir == 0u) {
+            start = select(x - 1u, 0u, x == 0u);
+            end = min(x + 2u, P.w);
+            for (var ix = start; ix < end; ix = ix + 1u) {
+                sum = sum + src_at(y * P.w + ix);
+            }
+        } else {
+            start = select(y - 1u, 0u, y == 0u);
+            end = min(y + 2u, P.h);
+            for (var iy = start; iy < end; iy = iy + 1u) {
+                sum = sum + src_at(iy * P.w + x);
+            }
+        }
+        let v = sum / (end - start);
+        packed = packed | (v << (k * 16u));
+    }
+    dst[gid.x] = packed;
+}
+"#;
+
+struct EnhancePipelines {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+static ENHANCE_PIPELINES: std::sync::OnceLock<EnhancePipelines> = std::sync::OnceLock::new();
+
+fn enhance_pipelines(rt: &'static crate::gpu_stack::GpuRuntime) -> &'static EnhancePipelines {
+    ENHANCE_PIPELINES.get_or_init(|| {
+        let module = rt
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("zas-enhance-blur-shader"),
+                source: wgpu::ShaderSource::Wgsl(ENHANCE_WGSL.into()),
+            });
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let layout = rt
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("zas-enhance-blur-layout"),
+                entries: &[
+                    entry(0, wgpu::BufferBindingType::Uniform),
+                    entry(1, wgpu::BufferBindingType::Storage { read_only: true }),
+                    entry(2, wgpu::BufferBindingType::Storage { read_only: false }),
+                ],
+            });
+        let pl = rt
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("zas-enhance-blur-pipeline-layout"),
+                bind_group_layouts: &[&layout],
+                push_constant_ranges: &[],
+            });
+        let pipeline = rt
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("zas-enhance-blur-pipeline"),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some("blur_pass"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        EnhancePipelines { pipeline, layout }
+    })
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BlurParams {
+    w: u32,
+    h: u32,
+    dir: u32,
+    pad: u32,
+}
+
+struct EnhanceEngine {
+    w: usize,
+    h: usize,
+    src: wgpu::Buffer,
+    tmp: wgpu::Buffer,
+    dst: wgpu::Buffer,
+    bind_h: wgpu::BindGroup,
+    bind_v: wgpu::BindGroup,
+}
+
+impl EnhanceEngine {
+    fn new(
+        rt: &'static crate::gpu_stack::GpuRuntime,
+        w: usize,
+        h: usize,
+    ) -> Result<Self, String> {
+        let image_bytes = w
+            .checked_mul(h)
+            .ok_or("Plano de enhance demasiado grande")?
+            .div_ceil(2) as u64
+            * 4;
+        let needed = image_bytes.saturating_mul(4).saturating_add(4096);
+        if image_bytes > rt.max_binding || needed > rt.vram_budget {
+            return Err(format!(
+                "Blur GPU requiere {} MB y el presupuesto es {} MB",
+                needed / 1_048_576,
+                rt.vram_budget / 1_048_576
+            ));
+        }
+        let mk = |label: &str, copy_dst: bool, copy_src: bool| {
+            rt.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: image_bytes,
+                usage: wgpu::BufferUsages::STORAGE
+                    | if copy_dst {
+                        wgpu::BufferUsages::COPY_DST
+                    } else {
+                        wgpu::BufferUsages::empty()
+                    }
+                    | if copy_src {
+                        wgpu::BufferUsages::COPY_SRC
+                    } else {
+                        wgpu::BufferUsages::empty()
+                    },
+                mapped_at_creation: false,
+            })
+        };
+        let src = mk("zas-enhance-src", true, false);
+        let tmp = mk("zas-enhance-tmp", false, false);
+        let dst = mk("zas-enhance-dst", false, true);
+        let mk_params = |dir: u32| {
+            let buffer = rt.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("zas-enhance-params"),
+                size: std::mem::size_of::<BlurParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let params = BlurParams {
+                w: w as u32,
+                h: h as u32,
+                dir,
+                pad: 0,
+            };
+            rt.queue.write_buffer(&buffer, 0, bytemuck::bytes_of(&params));
+            buffer
+        };
+        let params_h = mk_params(0);
+        let params_v = mk_params(1);
+        let pp = enhance_pipelines(rt);
+        let mk_bind = |params: &wgpu::Buffer, pass_src: &wgpu::Buffer, pass_dst: &wgpu::Buffer| {
+            rt.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("zas-enhance-bind"),
+                layout: &pp.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: pass_src.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: pass_dst.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        let bind_h = mk_bind(&params_h, &src, &tmp);
+        let bind_v = mk_bind(&params_v, &tmp, &dst);
+        Ok(Self {
+            w,
+            h,
+            src,
+            tmp,
+            dst,
+            bind_h,
+            bind_v,
+        })
+    }
+}
+
+static ENHANCE_ENGINE: std::sync::OnceLock<std::sync::Mutex<Option<EnhanceEngine>>> =
+    std::sync::OnceLock::new();
+
+/// Blur radio 1 (dos pasadas enteras) en GPU, bit-idéntico a
+/// `crate::alignment::box_blur_r1_edge_aware`. `out` recibe exactamente
+/// `w*h` muestras. Errores → el caller usa la ruta CPU completa.
+pub fn gpu_box_blur_r1_into(
+    input: &[u16],
+    w: usize,
+    h: usize,
+    out: &mut Vec<u16>,
+) -> Result<(), String> {
+    let n = w.checked_mul(h).ok_or("Geometría de blur demasiado grande")?;
+    if n == 0 {
+        return Err("Blur GPU con imagen vacía".into());
+    }
+    if input.len() < n {
+        return Err("Blur GPU con frame truncado".into());
+    }
+    let words = n.div_ceil(2);
+    let workgroups = words.div_ceil(256);
+    if workgroups > 65_535 {
+        // Límite del dispatch 1D de wgpu; imágenes >~34 Mpx mono siguen en CPU.
+        return Err("Blur GPU: la imagen excede el dispatch 1D".into());
+    }
+    let rt = crate::gpu_stack::gpu_runtime().ok_or("No hay runtime wgpu")?;
+    let error_epoch = crate::gpu_stack::begin_gpu_operation();
+    if crate::gpu_stack::gpu_error_since(error_epoch) {
+        return Err("El device GPU se perdió antes del blur".into());
+    }
+    let mx = ENHANCE_ENGINE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = mx.lock().map_err(|_| "Mutex GPU de enhance dañado")?;
+    let rebuild = guard.as_ref().is_none_or(|e| e.w != w || e.h != h);
+    if rebuild {
+        *guard = Some(EnhanceEngine::new(rt, w, h)?);
+    }
+    let engine = guard.as_ref().unwrap();
+    write_packed_u16(&rt.queue, &engine.src, &input[..n]);
+    // Staging POR LLAMADA: el lock se suelta tras el submit y el siguiente
+    // worker sube/despacha mientras este espera su readback (PR-30).
+    let staging = rt.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("zas-enhance-staging"),
+        size: (words * 4) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let pp = enhance_pipelines(rt);
+    let mut enc = rt
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("zas-enhance-encoder"),
+        });
+    for bind in [&engine.bind_h, &engine.bind_v] {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("zas-enhance-blur-pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pp.pipeline);
+        pass.set_bind_group(0, bind, &[]);
+        pass.dispatch_workgroups(workgroups as u32, 1, 1);
+    }
+    enc.copy_buffer_to_buffer(&engine.dst, 0, &staging, 0, (words * 4) as u64);
+    rt.queue.submit(Some(enc.finish()));
+    drop(guard);
+
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    crate::gpu_stack::wait_for_readback_since(
+        &rt.device,
+        &rx,
+        "readback del blur de enhance",
+        error_epoch,
+    )?;
+    {
+        let mapped = slice.get_mapped_range();
+        let packed: &[u32] = bytemuck::cast_slice(&mapped);
+        out.clear();
+        out.reserve(n);
+        for &word in packed.iter().take(words) {
+            out.push((word & 0xffff) as u16);
+            if out.len() < n {
+                out.push((word >> 16) as u16);
+            }
+        }
+    }
+    staging.unmap();
+    if crate::gpu_stack::gpu_error_since(error_epoch) {
+        return Err("Device loss/OOM durante el blur de enhance".into());
+    }
+    if out.len() != n {
+        return Err("Blur GPU devolvió un plano incompleto".into());
+    }
+    Ok(())
+}
+
+static ENHANCE_PARITY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Self-test de sesión del blur GPU (como `ensure_parity` del análisis):
+/// imagen determinista de dimensiones IMPARES (bordes + palabra a medias)
+/// comparada bit a bit contra la referencia CPU. Falla → enhance en CPU toda
+/// la sesión.
+pub fn ensure_enhance_parity() -> bool {
+    use std::sync::atomic::Ordering;
+    match ENHANCE_PARITY.load(Ordering::Acquire) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    let w = 129usize;
+    let h = 67usize;
+    let mono: Vec<u16> = (0..w * h)
+        .map(|i| ((i * 137 + (i / w) * 79) % 65535) as u16)
+        .collect();
+    let mut tmp = Vec::new();
+    let mut cpu = Vec::new();
+    crate::alignment::box_blur_r1_edge_aware(&mono, w, h, &mut tmp, &mut cpu);
+    let mut gpu = Vec::new();
+    let ok = gpu_box_blur_r1_into(&mono, w, h, &mut gpu).is_ok() && gpu[..w * h] == cpu[..w * h];
+    ENHANCE_PARITY.store(if ok { 1 } else { 2 }, Ordering::Release);
+    if !ok {
+        eprintln!(
+            "[gpu-enhance] paridad blur GPU/CPU no disponible; el enhance sigue en CPU (resultado idéntico)"
+        );
+    }
+    ok
+}
+
 /// Ejecuta búsquedas SAD gruesas para todos los AP. El caso normal usa un solo
 /// dispatch; cargas grandes se dividen en command buffers acotados por TDR.
 /// Los mapas deben tener geometría idéntica y normalmente son pirámides 4×.
@@ -2074,6 +2428,54 @@ mod tests {
     #[ignore = "requiere GPU física Metal/DX12/Vulkan"]
     fn planetary_analysis_gpu_parity_physical() {
         assert!(super::ensure_parity());
+    }
+
+    /// P1: el blur GPU debe ser bit-idéntico a la referencia CPU
+    /// `box_blur_r1_edge_aware` (incluidas dimensiones impares: bordes y
+    /// palabra de empaquetado a medias), y el enhance partido (blur GPU +
+    /// cola f32 CPU) bit-idéntico a la ruta de producción completa.
+    #[test]
+    #[ignore = "requiere GPU física Metal/DX12/Vulkan"]
+    fn gpu_blur_and_split_enhance_match_cpu_physical() {
+        for (w, h) in [(97usize, 61usize), (640, 480), (1023, 511)] {
+            let mut state = 0xfeed_beefu32;
+            let mut next = || {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 16) as u16
+            };
+            // Zonas oscuras intercaladas: cubren la rama f32 del noise-gate.
+            let mono: Vec<u16> = (0..w * h)
+                .map(|i| {
+                    let v = next();
+                    if (i / w) % 5 == 0 {
+                        v / 64
+                    } else {
+                        v
+                    }
+                })
+                .collect();
+            let mut tmp = Vec::new();
+            let mut cpu_blur = Vec::new();
+            crate::alignment::box_blur_r1_edge_aware(&mono, w, h, &mut tmp, &mut cpu_blur);
+            let mut gpu_blur = Vec::new();
+            super::gpu_box_blur_r1_into(&mono, w, h, &mut gpu_blur)
+                .expect("runtime GPU disponible");
+            assert_eq!(cpu_blur[..w * h], gpu_blur[..w * h], "blur {w}x{h}");
+            for amount in [4.0f32, 6.0] {
+                let mut s1 = Vec::new();
+                let mut s2 = Vec::new();
+                let mut full = Vec::new();
+                crate::alignment::enhance_for_alignment_into_amount(
+                    &mono, w, h, &mut s1, &mut s2, &mut full, amount,
+                );
+                let mut split = Vec::new();
+                crate::alignment::enhance_highpass_from_blur(
+                    &mono, &gpu_blur, w, h, &mut split, amount,
+                );
+                assert_eq!(full[..w * h], split[..w * h], "enhance {w}x{h} amount={amount}");
+            }
+        }
+        assert!(super::ensure_enhance_parity());
     }
 
     /// A1: la ventana fina densa del SAD global de superficie resuelta en GPU

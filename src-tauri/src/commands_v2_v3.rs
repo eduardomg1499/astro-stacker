@@ -8193,6 +8193,16 @@ fn stack_video_liquid_warping_impl(
         static PLANES_WRITE_BLOB: std::cell::RefCell<Vec<u16>> =
             std::cell::RefCell::new(Vec::new());
     }
+    // P1 (2026-07-17): blur del enhance en GPU (entero, bit-exacto contra la
+    // referencia CPU — self-test de sesión) + cola f32 SIEMPRE en CPU con el
+    // código de siempre → resultado final bit-idéntico. El enhance era el
+    // mayor coste CPU del pase 1 (387 ms/frame, ~497 s sumados a 20MP).
+    // Cualquier fallo GPU latchéa este apilado a la ruta CPU completa.
+    // ZAS_NO_GPU_ENHANCE=1 lo desactiva.
+    let gpu_enhance_enabled = compute_policy.allows_gpu()
+        && std::env::var("ZAS_NO_GPU_ENHANCE").ok().as_deref() != Some("1")
+        && crate::gpu_analysis::ensure_enhance_parity();
+    let gpu_enhance_failed = std::sync::atomic::AtomicBool::new(false);
     for pass in 0..total_passes {
     let pass_label = if total_passes > 1 {
         format!("[Pasada {}/{}] ", pass + 1, total_passes)
@@ -8748,7 +8758,44 @@ fn stack_video_liquid_warping_impl(
                                 .is_some()
                         });
                         if !planes_hit {
-                            enhance_for_alignment_into_amount(&sc.mono_buf, w_in, h_in, &mut sc.f_s1, &mut sc.f_s2, &mut sc.f_edges, align_amount);
+                            // P1: blur entero en GPU + cola f32 en CPU
+                            // (bit-idéntico; ver gate arriba). Fallo → latch y
+                            // ruta CPU completa para el resto del apilado.
+                            let mut gpu_blur_done = false;
+                            if gpu_enhance_enabled
+                                && !gpu_enhance_failed.load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                match crate::gpu_analysis::gpu_box_blur_r1_into(
+                                    &sc.mono_buf,
+                                    w_in,
+                                    h_in,
+                                    &mut sc.f_s1,
+                                ) {
+                                    Ok(()) => {
+                                        crate::alignment::enhance_highpass_from_blur(
+                                            &sc.mono_buf,
+                                            &sc.f_s1,
+                                            w_in,
+                                            h_in,
+                                            &mut sc.f_edges,
+                                            align_amount,
+                                        );
+                                        gpu_blur_done = true;
+                                    }
+                                    Err(error) => {
+                                        if !gpu_enhance_failed
+                                            .swap(true, std::sync::atomic::Ordering::AcqRel)
+                                        {
+                                            eprintln!(
+                                                "[gpu-enhance] fallo GPU ({error}); este apilado sigue con enhance CPU (resultado idéntico)"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if !gpu_blur_done {
+                                enhance_for_alignment_into_amount(&sc.mono_buf, w_in, h_in, &mut sc.f_s1, &mut sc.f_s2, &mut sc.f_edges, align_amount);
+                            }
                             downscale_4x(&sc.f_edges, w_in, h_in, &mut sc.f_ds);
                             if pass == 0 {
                                 if let Some(transaction) = planes_tx.as_ref() {
