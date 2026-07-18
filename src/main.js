@@ -19,6 +19,13 @@ let appWindow = null;
 // PROGRAMÁTICO (restore/auto-detección) para no confundirlo con una elección
 // manual del usuario.
 let zasCategoryProgrammatic = false;
+// Ubicación del caché de análisis/apilado elegida por el usuario. "origin" =
+// junto al vídeo; "choose" = carpeta fija. DEBEN declararse ANTES de
+// initCustomSelect() (se ejecuta síncrono al cargar el módulo): init
+// CacheLocationSelector las lee en paint() y un `let` posterior las dejaría
+// en TDZ → ReferenceError que abortaba el módulo y colgaba el splash.
+let cacheLocationMode = localStorage.getItem("zas_cache_mode") || "origin";
+let cacheChosenDir = localStorage.getItem("zas_cache_dir") || "";
 
 function persistZenithTargetCategory(value, manual) {
     try {
@@ -314,7 +321,10 @@ function initCustomSelect() {
             applyCacheLocation();
         });
         paint();
-        applyCacheLocation();
+        // NO llamar a applyCacheLocation() aquí: initCustomSelect corre al
+        // cargar el módulo, antes de que `currentFilePath` esté inicializado
+        // (TDZ). La ubicación se aplica al importar el vídeo (setCurrentFilePath)
+        // y cuando el usuario pulsa un botón de modo.
     })();
 }
 
@@ -1285,10 +1295,8 @@ if (btnTrialStart) {
 
 let currentFilePath = "";
 window.currentFilePath = "";
-// Ubicación del caché de análisis/apilado elegida por el usuario. "origin" =
-// junto al vídeo; "choose" = carpeta fija seleccionada. Persistente.
-let cacheLocationMode = localStorage.getItem("zas_cache_mode") || "origin";
-let cacheChosenDir = localStorage.getItem("zas_cache_dir") || "";
+// (cacheLocationMode / cacheChosenDir se declaran arriba, junto a appWindow,
+// para no quedar en TDZ cuando initCustomSelect corre al cargar el módulo.)
 
 function parentDirOf(filePath) {
     if (!filePath) return "";
