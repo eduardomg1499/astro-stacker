@@ -80,6 +80,22 @@ impl FrameSource for UnifiedFrameSource {
     }
 
     fn read_batch(&self, indices: &[usize], roi: Option<FrameRoi>) -> Result<FrameBatch, String> {
+        self.read_batch_with_hardware(indices, roi, None)
+    }
+}
+
+impl UnifiedFrameSource {
+    /// Igual que `FrameSource::read_batch`, pero permite al coordinador pasar
+    /// la ruta de decode FFmpeg confirmada por la sonda HW/CPU. La referencia
+    /// robusta recorre con `select` casi todo el vídeo aunque solo materialice
+    /// el top-N: en HEVC 20MP la ruta software duplicaba el tiempo medido.
+    /// Cualquier fallo de la ruta HW reintenta por CPU (semántica Auto/Hybrid).
+    pub(crate) fn read_batch_with_hardware(
+        &self,
+        indices: &[usize],
+        roi: Option<FrameRoi>,
+        hardware_backend: Option<&str>,
+    ) -> Result<FrameBatch, String> {
         let desc = self.descriptor();
         let roi = roi.map(|r| FrameRoi {
             x: r.x.min(desc.width),
@@ -102,7 +118,7 @@ impl FrameSource for UnifiedFrameSource {
             // timestamp. Para FFmpeg recorremos desde cero una sola vez: usar
             // `-ss index/fps` no es exacto con GOP largos o video VFR.
             crate::VideoInput::Ffmpeg(reader) => {
-                read_ffmpeg_batch_exact(reader, indices, roi, self.color_id)?
+                read_ffmpeg_batch_exact(reader, indices, roi, self.color_id, hardware_backend)?
             }
             _ => {
                 let mut frames = Vec::with_capacity(indices.len());
@@ -136,6 +152,7 @@ fn read_ffmpeg_batch_exact(
     indices: &[usize],
     roi: Option<FrameRoi>,
     color_id: i32,
+    hardware_backend: Option<&str>,
 ) -> Result<Vec<Vec<u8>>, String> {
     if indices.is_empty() {
         return Ok(Vec::new());
@@ -169,6 +186,7 @@ fn read_ffmpeg_batch_exact(
     selected_indices.sort_unstable();
     selected_indices.dedup();
     if crate::ffmpeg_exact_frame_select_filter(&selected_indices).is_ok() {
+        let run_selected = |backend: Option<&str>| -> Result<Vec<Vec<u8>>, String> {
         let mut stream = crate::FfmpegStreamIterator::new_selected(
             &reader.path,
             reader.width,
@@ -179,7 +197,7 @@ fn read_ffmpeg_batch_exact(
             region.height,
             color_id,
             &reader.ffmpeg_path,
-            None,
+            backend,
             &reader.codec_name,
             reader.rotation,
             &selected_indices,
@@ -221,7 +239,20 @@ fn read_ffmpeg_batch_exact(
             *uses -= 1;
             ordered.push(frame);
         }
-        return Ok(ordered);
+        Ok(ordered)
+        };
+        // Ruta HW primero si la sonda la confirmó; cualquier fallo (apertura
+        // o stream truncado) reintenta por CPU, como en las pasadas de
+        // apilado. Sin backend, directo por CPU (comportamiento previo).
+        if let Some(backend) = hardware_backend {
+            match run_selected(Some(backend)) {
+                Ok(ordered) => return Ok(ordered),
+                Err(error) => eprintln!(
+                    "WARN: ruta HW '{backend}' falló en el lote select exacto; reintento por CPU: {error}"
+                ),
+            }
+        }
+        return run_selected(None);
     }
 
     // Esta ruta es el fallback contractual de FrameSource. La selección

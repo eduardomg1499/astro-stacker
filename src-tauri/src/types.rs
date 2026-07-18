@@ -2046,39 +2046,37 @@ impl FfmpegStreamIterator {
         // autorrotación implícita evita doble giro y mantiene CPU/GPU idénticos.
         args.push("-noautorotate");
 
-        // PR-13: presupuesto de hilos por RUTA. El valor incondicional
-        // (cpus-2) hacía que FFmpeg compitiera con el pool rayon del apilado
-        // por los mismos núcleos durante todo el solape decode∥cómputo.
-        // - Decode HW (VideoToolbox/NVDEC/QSV): el códec corre en silicio
+        // PR-13 revisado con trazas 2026-07-17: presupuesto de hilos por RUTA.
+        // - Decode HW (VideoToolbox/D3D11VA/QSV): el códec corre en silicio
         //   dedicado; 2 hilos bastan para demux/colas.
-        // - Pasada de apilado (select exacto): el consumidor hace SAD/LK/warp
-        //   pesados en paralelo → ceder núcleos: max(4, cpus/3). Los decoders
-        //   H.264/HEVC escalan sublinealmente más allá de ~4-6 hilos.
-        // - Análisis/lotes/referencia (sin select): normalmente decode-bound
-        //   (el scoring va por lotes GPU o es barato) → conservar cpus-2.
+        // - Resto: cpus-2, TAMBIÉN en pasadas de apilado. El cap anterior de
+        //   cpus/3 ("ceder núcleos al pool durante el solape") resultó
+        //   contraproducente medido: con MOV 20MP en frío el suministro caía a
+        //   ~5 fps y el pool pasaba 352 s (38% de la pared) ocioso en
+        //   decode_wait. El backpressure del pipe + sync_channel ya cede
+        //   núcleos solo: cuando el cómputo manda, FFmpeg se bloquea al
+        //   escribir y sus hilos duermen.
         let num_cpus = num_cpus::get(); // Use the standard `num_cpus` crate already in use for rayon
-        // Solo las selecciones GRANDES (pasadas de apilado) solapan con
-        // cómputo pesado y deben ceder núcleos. Los lotes pequeños (los 12-20
-        // frames de la referencia robusta, previews) corren ANTES del pase,
-        // sin nada con qué solapar — capar ahí duplicaba el tiempo del
-        // ref_decode (107 s vs 57 s medidos a 20MP).
-        let stacking_overlap = selected_indices.is_some_and(|indices| indices.len() > 64);
-        let ffmpeg_threads = if expected_hardware_backend.is_some() {
-            2
-        } else if num_cpus <= 4 {
+        let cpu_route_threads = if num_cpus <= 4 {
             (num_cpus - 1).max(1) // Keep at least 1 core free for OS on weak PCs
-        } else if stacking_overlap {
-            (num_cpus / 3).max(4)
         } else {
             (num_cpus - 2).max(4) // Keep 2 cores free for OS on powerful PCs
+        };
+        let ffmpeg_threads = if expected_hardware_backend.is_some() {
+            2
+        } else {
+            cpu_route_threads
         };
         let thread_str = ffmpeg_threads.to_string();
         args.extend_from_slice(&["-threads", &thread_str]);
         // Los filtros (scale neighbor / crop / format) van por defecto en UN
-        // solo hilo — en 4K rgb48le la conversión era el cuello del productor.
-        // El troceado por slices es determinista: bytes idénticos. Acotado al
-        // presupuesto de la ruta (mismo razonamiento que -threads).
-        args.extend_from_slice(&["-filter_threads", &thread_str]);
+        // solo hilo — en 4K rgb48le la conversión swscale es el coste
+        // dominante del productor (117 MB/frame a 20MP). El troceado por
+        // slices es determinista: bytes idénticos. OJO: NO heredar el "2" de
+        // la ruta HW — el decoder va en silicio pero la conversión es CPU
+        // pura y con 2 hilos estrangulaba el suministro igual que en SW.
+        let filter_threads_str = cpu_route_threads.to_string();
+        args.extend_from_slice(&["-filter_threads", &filter_threads_str]);
 
         args.extend_from_slice(&["-i", path, "-map", "0:v:0"]);
         args.extend_from_slice(&[

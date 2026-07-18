@@ -527,14 +527,24 @@ impl BatchReadbackLayout {
     /// muestras por palabra; CoG/rejilla sólo ocupan staging cuando se piden.
     /// Superficie no consume `half` después del preprocesado (usa blur+lap),
     /// por lo que tampoco se descarga ese mapa de varios megapíxeles.
-    fn new(w: usize, h: usize, want_cog: bool, want_grid: bool, want_half: bool) -> Self {
+    fn new(
+        w: usize,
+        h: usize,
+        want_cog: bool,
+        want_grid: bool,
+        want_half: bool,
+        want_score: bool,
+    ) -> Self {
         let n = (w / 2) * (h / 2);
         let packed_image_words = n.div_ceil(2);
         let half = 0;
         let blur = half + if want_half { packed_image_words } else { 0 };
         let lap = blur + packed_image_words;
         let score = lap + packed_image_words;
-        let cog_x = score + (h / 2) * 2;
+        // A3 2026-07-17: el camino de análisis re-puntúa SIEMPRE en CPU sobre
+        // el lap crudo ("paridad por construcción") y descartaba este score —
+        // sin want_score ni se despacha el kernel ni viaja su readback.
+        let cog_x = score + if want_score { (h / 2) * 2 } else { 0 };
         let cog_y = cog_x + if want_cog { w * 3 } else { 0 };
         let grid = cog_y + if want_cog { h * 3 } else { 0 };
         let stride = grid + if want_grid { 40 * 40 } else { 0 };
@@ -556,7 +566,7 @@ impl BatchReadbackLayout {
 fn batch_vram_bytes(w: usize, h: usize, capacity: usize) -> u64 {
     // Contrato conservador usado al recomendar un lote: reserva el peor caso
     // (CoG + rejilla). La asignación real de BatchEngine usa el layout compacto.
-    let layout = BatchReadbackLayout::new(w, h, true, true, true);
+    let layout = BatchReadbackLayout::new(w, h, true, true, true, true);
     batch_vram_bytes_for_layout(w, h, capacity, layout.stride)
 }
 
@@ -725,7 +735,7 @@ fn finish_analysis_output(
     half_raw: Option<&[u32]>,
     blur_raw: &[u32],
     lap_raw: &[u32],
-    score_raw: &[u32],
+    score_raw: Option<&[u32]>,
     cog_x_raw: Option<&[u32]>,
     cog_y_raw: Option<&[u32]>,
     grid_raw: Option<&[u32]>,
@@ -747,9 +757,12 @@ fn finish_analysis_output(
         values
     };
     let score = score_raw
-        .chunks_exact(2)
-        .map(|v| ((v[1] as u64) << 32) | v[0] as u64)
-        .sum();
+        .map(|raw| {
+            raw.chunks_exact(2)
+                .map(|v| ((v[1] as u64) << 32) | v[0] as u64)
+                .sum()
+        })
+        .unwrap_or(0);
     let geometric_center = cog_x_raw.zip(cog_y_raw).map(|(px, py)| {
         let px: Vec<f32> = px.iter().map(|&v| f32::from_bits(v)).collect();
         let py: Vec<f32> = py.iter().map(|&v| f32::from_bits(v)).collect();
@@ -1439,6 +1452,7 @@ pub fn process_with_options(
     surface_grid: bool,
     want_grid: bool,
     want_cog: bool,
+    want_score: bool,
 ) -> Result<AnalysisGpuOutput, String> {
     // PR-2.3: delega en el motor por LOTES (un submit + un staging + UN solo
     // map_async). El antiguo cuerpo unitario hacía hasta 7 readbacks
@@ -1451,10 +1465,12 @@ pub fn process_with_options(
     if mono.len() < frame_len {
         return Err("Frame mono truncado".into());
     }
-    process_batch_slices(&[mono], w, h, surface_grid, want_grid, want_cog).map(|mut v| {
-        v.pop()
-            .expect("el lote de un frame produce exactamente un output")
-    })
+    process_batch_slices(&[mono], w, h, surface_grid, want_grid, want_cog, want_score).map(
+        |mut v| {
+            v.pop()
+                .expect("el lote de un frame produce exactamente un output")
+        },
+    )
 }
 
 /// Procesa varios frames con un único submit y un único map de readback.
@@ -1467,9 +1483,10 @@ pub fn process_batch_with_options(
     surface_grid: bool,
     want_grid: bool,
     want_cog: bool,
+    want_score: bool,
 ) -> Result<Vec<AnalysisGpuOutput>, String> {
     let refs: Vec<&[u16]> = frames.iter().map(|f| f.as_slice()).collect();
-    process_batch_slices(&refs, w, h, surface_grid, want_grid, want_cog)
+    process_batch_slices(&refs, w, h, surface_grid, want_grid, want_cog, want_score)
 }
 
 /// Sube muestras u16 al storage `array<u32>` sin la expansión/copia temporal
@@ -1508,6 +1525,7 @@ fn process_batch_slices(
     surface_grid: bool,
     want_grid: bool,
     want_cog: bool,
+    want_score: bool,
 ) -> Result<Vec<AnalysisGpuOutput>, String> {
     if frames.is_empty() {
         return Ok(Vec::new());
@@ -1531,6 +1549,7 @@ fn process_batch_slices(
                 surface_grid,
                 want_grid,
                 want_cog,
+                want_score,
             )?);
         }
         return Ok(out);
@@ -1542,7 +1561,7 @@ fn process_batch_slices(
     let rt = crate::gpu_stack::gpu_runtime().ok_or("No hay runtime wgpu")?;
     // En superficie `process_analysis_frame` usa blur para calidad/grilla y
     // lap para SAD; el mapa half sólo alimenta el camino planetario/CoG.
-    let layout = BatchReadbackLayout::new(w, h, want_cog, want_grid, !surface_grid);
+    let layout = BatchReadbackLayout::new(w, h, want_cog, want_grid, !surface_grid, want_score);
     let memory_cap = max_batch_len_for_limits(
         w,
         h,
@@ -1564,6 +1583,7 @@ fn process_batch_slices(
                 surface_grid,
                 want_grid,
                 want_cog,
+                want_score,
             )?);
         }
         return Ok(out);
@@ -1643,7 +1663,7 @@ fn process_batch_slices(
             pass.set_bind_group(0, &slot.bind, &[]);
             pass.dispatch_workgroups((hw as u32).div_ceil(16), (hh as u32).div_ceil(16), 1);
         }
-        {
+        if want_score {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("zas-analysis-batch-score"),
                 timestamp_writes: None,
@@ -1706,7 +1726,9 @@ fn process_batch_slices(
         }
         pack_and_copy(&pp.pack_blur, layout.blur);
         pack_and_copy(&pp.pack_lap, layout.lap);
-        copy(&mut enc, &slot.score_rows, layout.score, hh * 2);
+        if want_score {
+            copy(&mut enc, &slot.score_rows, layout.score, hh * 2);
+        }
         if want_cog {
             copy(&mut enc, &slot.cog_x, layout.cog_x, w * 3);
             copy(&mut enc, &slot.cog_y, layout.cog_y, h * 3);
@@ -1742,7 +1764,7 @@ fn process_batch_slices(
                     .then(|| at(layout.half, layout.packed_image_words)),
                 at(layout.blur, layout.packed_image_words),
                 at(layout.lap, layout.packed_image_words),
-                at(layout.score, hh * 2),
+                want_score.then(|| at(layout.score, hh * 2)),
                 want_cog.then(|| at(layout.cog_x, w * 3)),
                 want_cog.then(|| at(layout.cog_y, h * 3)),
                 want_grid.then(|| at(layout.grid, 40 * 40)),
@@ -1771,17 +1793,17 @@ pub fn ensure_parity() -> bool {
     let mono: Vec<u16> = (0..w * h)
         .map(|i| ((i * 137 + (i / w) * 79) % 65535) as u16)
         .collect();
-    let gpu = process_with_options(&mono, w, h, true, true, true);
-    let gpu_planet_grid = process_with_options(&mono, w, h, false, true, false);
+    let gpu = process_with_options(&mono, w, h, true, true, true, true);
+    let gpu_planet_grid = process_with_options(&mono, w, h, false, true, false, true);
     let batch_frames = vec![
         mono.clone(),
         mono.iter().map(|&v| v.saturating_add(731)).collect(),
         mono.iter().map(|&v| v.saturating_sub(419)).collect(),
     ];
-    let batch = process_batch_with_options(&batch_frames, w, h, true, true, true);
+    let batch = process_batch_with_options(&batch_frames, w, h, true, true, true, true);
     let singles: Result<Vec<_>, _> = batch_frames
         .iter()
-        .map(|f| process_with_options(f, w, h, true, true, true))
+        .map(|f| process_with_options(f, w, h, true, true, true, true))
         .collect();
     let mut half = Vec::new();
     let (hw, hh) = crate::alignment::downscale_2x_into(&mono, w, h, &mut half);
@@ -1921,28 +1943,31 @@ mod tests {
     #[test]
     fn optional_analysis_products_do_not_consume_readback_bandwidth() {
         let (w, h) = (3840usize, 2160usize);
-        let base = super::BatchReadbackLayout::new(w, h, false, false, true);
-        let grid = super::BatchReadbackLayout::new(w, h, false, true, true);
-        let cog = super::BatchReadbackLayout::new(w, h, true, false, true);
-        let full = super::BatchReadbackLayout::new(w, h, true, true, true);
+        let base = super::BatchReadbackLayout::new(w, h, false, false, true, true);
+        let grid = super::BatchReadbackLayout::new(w, h, false, true, true, true);
+        let cog = super::BatchReadbackLayout::new(w, h, true, false, true, true);
+        let full = super::BatchReadbackLayout::new(w, h, true, true, true, true);
         assert_eq!(grid.stride - base.stride, 40 * 40);
         assert_eq!(cog.stride - base.stride, (w + h) * 3);
         assert_eq!(full.stride, base.stride + (w + h) * 3 + 40 * 40);
+        // A3: sin want_score el layout tampoco reserva las filas de score.
+        let no_score = super::BatchReadbackLayout::new(w, h, false, false, true, false);
+        assert_eq!(base.stride - no_score.stride, (h / 2) * 2);
     }
 
     #[test]
     fn surface_readback_omits_half_and_packs_u16_exactly() {
         let (w, h) = (3312usize, 5888usize);
         let image_words = ((w / 2) * (h / 2)).div_ceil(2);
-        let planet = super::BatchReadbackLayout::new(w, h, false, false, true);
-        let surface = super::BatchReadbackLayout::new(w, h, false, false, false);
+        let planet = super::BatchReadbackLayout::new(w, h, false, false, true, true);
+        let surface = super::BatchReadbackLayout::new(w, h, false, false, false, true);
         assert_eq!(planet.packed_image_words, image_words);
         assert_eq!(planet.stride - surface.stride, image_words);
         assert_eq!(surface.stride, image_words * 2 + (h / 2) * 2);
 
         let packed = [0x1234_abcd, 0xffff_0000];
         let output =
-            super::finish_analysis_output(None, &packed, &packed, &[], None, None, None, 4, 2);
+            super::finish_analysis_output(None, &packed, &packed, None, None, None, None, 4, 2);
         assert_eq!(output.half, Vec::<u16>::new());
         assert_eq!(output.blurred, [0xabcd, 0x1234]);
         assert_eq!(output.laplacian, [0xabcd, 0x1234]);
@@ -1951,7 +1976,7 @@ mod tests {
     #[test]
     fn batch_pool_uses_exact_capacity_and_chunks_before_gpu_fallback() {
         let (w, h) = (1920usize, 1080usize);
-        let layout = super::BatchReadbackLayout::new(w, h, false, false, true);
+        let layout = super::BatchReadbackLayout::new(w, h, false, false, true, true);
         let budget = super::batch_vram_bytes_for_layout(w, h, 3, layout.stride);
         let max_buffer = layout.stride as u64 * 3 * 4;
         assert_eq!(
@@ -2070,7 +2095,7 @@ mod tests {
                 })
                 .collect();
             let t0 = std::time::Instant::now();
-            let out = super::process_batch_with_options(&frames, w, h, true, true, true)
+            let out = super::process_batch_with_options(&frames, w, h, true, true, true, true)
                 .unwrap_or_else(|e| panic!("{label}: primer lote GPU falló: {e}"));
             eprintln!(
                 "{label}: batch_len={batch_len} · working-set {} MB · lote en {:.2?} ({:.1} ms/frame)",

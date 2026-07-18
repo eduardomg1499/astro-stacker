@@ -64,10 +64,9 @@ fn debayer_into_buffer(
     if out.capacity() < target_size {
         out.reserve(target_size);
     }
-    // SAFE FIX: Initialize with zeros to avoid garbage in borders
-    out.resize(target_size, 0);
 
     if ser::ser_color_is_cmyg(color_id) {
+        out.resize(target_size, 0);
         // CMYG no es una permutación de Bayer RGB: necesita una matriz de
         // separación de color específica de la cámara. La apertura normal
         // rechaza estos SER con un error de usuario; esta guarda secundaria
@@ -82,16 +81,24 @@ fn debayer_into_buffer(
 
     if input.len() == target_size {
         if ser::ser_color_is_direct_bgr(color_id) {
+            out.resize(target_size, 0);
             for (dst, src) in out.chunks_exact_mut(3).zip(input.chunks_exact(3)) {
                 dst[0] = src[2];
                 dst[1] = src[1];
                 dst[2] = src[0];
             }
         } else {
-            out.copy_from_slice(input);
+            // RGB directo (MOV/MP4 rgb48): una sola pasada. El resize(0)
+            // previo costaba otra pasada completa de escritura (117 MB/frame
+            // a 20 MP) que copy_from_slice sobrescribía entera.
+            out.extend_from_slice(input);
         }
         return;
     }
+
+    // Rutas demosaico/YUV: canvas a cero primero (los bordes sin cobertura y
+    // la escritura por puntero de YUY2 exigen el buffer ya dimensionado).
+    out.resize(target_size, 0);
 
     let (rx, ry) = match color_id {
         8 => (0, 0),
