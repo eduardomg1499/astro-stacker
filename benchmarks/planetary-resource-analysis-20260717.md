@@ -236,7 +236,46 @@ En frío, S2+S6 acercan la primera pasada al régimen caliente. Los claims
 frente a AutoStakkert!4 se validan con benchmarks/protocol-as4.md (5 runs,
 mediana, cold/warm, CPU/GPU/Hybrid por separado).
 
-## 9. Guardarraíles
+## 9. ESTADO DE IMPLEMENTACIÓN (2026-07-17 noche)
+
+P0 COMPLETO en dos commits (c27ab19 tanda 1, 0d44a1a tanda 2), suite 390/0
+(+1 test CPU nuevo, +1 test físico nuevo; 26 ignored físicos):
+
+- A1 hecho: SAD fino ±16 denso en GPU (kernel sad_points), argmin CPU con la
+  política exacta del barrido de referencia, subpíxel original
+  (`subpixel_after_integer_sad`). VALIDADO EN METAL FÍSICO en este M5:
+  `dense_window_matches_cpu_refine_physical` = GPU≡CPU bit a bit, y los dos
+  parity self-tests. Fallback CPU íntegro ante cualquier fallo.
+- A2 hecho: preprocess GPU del lote N+1 en hilo auxiliar ∥ score del lote N.
+- A3 hecho: `want_score` — sin kernel ni readback del score GPU descartado.
+- A4 hecho: pool del análisis con `resolve_planetary_available_memory` y bpp
+  real del stream (color FFmpeg = G16).
+- S1 hecho: caché NVMe de planos f_edges+f_ds entre pasadas y re-apilados
+  (transacción con presupuesto/CRC compartidos). `ZAS_NO_ALIGN_PLANES_CACHE=1`
+  revierte.
+- S2 hecho: `-threads`/`-filter_threads` de pasadas de apilado a cpus−2 (la
+  conversión swscale con el decoder HW conserva 2 hilos de demux pero filtros
+  a cpus−2).
+- S3 hecho: `parallel_aps` activo siempre con ≥128 APs (work-stealing).
+- S4 hecho: `read_batch_with_hardware` — la referencia usa la ruta HW
+  confirmada por la sonda con reintento CPU.
+- S5 hecho: debayer RGB sin zero-fill previo.
+- S6 hecho: prewarm en segundo plano del top-24 por score al acabar el
+  análisis (misma clave/ruta CPU que leerá la referencia).
+  `ZAS_NO_REF_PREWARM=1` revierte.
+
+Pendiente (sin cambios): P1 (enhance GPU, LK GPU si la telemetría lo pide),
+P2 (coarse GPU en p2 con gates del limbo; replanificar RAM con RSS medido),
+P3 (validación física DX12/Vulkan, cap TDR 200/300M, sidecar). La validación
+física E2E la ejecuta el usuario (`scripts/benchmark/planetary_e2e.sh`).
+
+Qué mirar en la próxima traza de superficie: en análisis, `a_sad` avg debe
+caer de ~628 ms a decenas de ms y `decode_wait` volverá a ser visible
+(decode-bound ≈ bien); en apilado, `p2/enhance` avg debe caer de ~345-450 ms
+a ~decenas (lectura LZ4), `ref_decode` ~0 con prewarm/caché, `p1/debayer`
+≈ mitad, y los núcleos efectivos de los pases deben subir claramente.
+
+## 10. Guardarraíles
 
 - No asumir unimodalidad del SAD jamás; ±16 y caja intactos salvo A/B
   visual aprobado por el usuario.
