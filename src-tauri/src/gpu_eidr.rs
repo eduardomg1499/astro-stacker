@@ -280,8 +280,18 @@ pub(crate) struct EidrGpuMatvec {
 }
 
 impl EidrGpuMatvec {
-    /// None si no hay runtime/pipeline o los buffers exceden los límites.
+    /// None si no hay runtime/pipeline, los buffers exceden los límites o el
+    /// operador usa Σ⁻¹ espacial. El shader actual sólo representa un
+    /// escalar por frame/canal; aceptar un plano espacial produciría un solve
+    /// científicamente distinto del CPU, por lo que el caller debe hacer
+    /// fallback explícito a CPU hasta implementar ese buffer en GPU.
     pub(crate) fn new(op: &EidrOperator, idxs: &[usize], c: usize) -> Option<Self> {
+        if idxs
+            .iter()
+            .any(|&fi| op.frames.get(fi).map_or(true, |frame| frame.has_spatial_inv_var()))
+        {
+            return None;
+        }
         let rt = gpu_runtime()?;
         let pipe = eidr_pipe()?;
         let _ = &pipe.pipeline;
@@ -494,6 +504,7 @@ fn parity_op() -> EidrOperator {
             geom,
             lut,
             inv_var: [1.0 / 150.0; 3],
+            spatial_inv_var: None,
             mask: vec![0u64; (48 * 40 + 63) / 64],
             robust_w: None,
             w: 48,
@@ -574,6 +585,7 @@ mod tests {
                 geom,
                 lut,
                 inv_var: [1.0 / 150.0; 3],
+                spatial_inv_var: None,
                 mask: vec![0u64; (48 * 40 + 63) / 64],
                 robust_w: None,
                 w: 48,
@@ -582,6 +594,26 @@ mod tests {
         })
         .collect();
         EidrOperator { frames, w_out: 96, h_out: 80, cfa: None, ch: 1 }
+    }
+
+    #[test]
+    fn gpu_matvec_rejects_spatial_inverse_variance_before_runtime_probe() {
+        let mut op = tiny_op();
+        let (w, h) = (op.frames[0].w, op.frames[0].h);
+        let spatial = EidrSpatialInvVar::new(
+            EidrInvVarLayout::Mono,
+            vec![1.0; w * h],
+            w,
+            h,
+        )
+        .unwrap();
+        op.frames[0]
+            .set_spatial_inv_var(Some(spatial))
+            .unwrap();
+        assert!(
+            EidrGpuMatvec::new(&op, &(0..op.frames.len()).collect::<Vec<_>>(), 0).is_none(),
+            "GPU no debe aceptar un operador cuya Sigma^-1 espacial no puede representar"
+        );
     }
 
     /// Paridad CPU/GPU del matvec completo (requiere GPU real: --ignored).

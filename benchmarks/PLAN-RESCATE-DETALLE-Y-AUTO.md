@@ -1,5 +1,19 @@
 # Plan de implementación pendiente — Deepsky élite
 
+> **CERRADO 2026-07-20.** La receta AUTO (parches 0-11, con N>50 →
+> Winsorized por la nota de seguridad) y el rescate de detalle (incluidos los
+> parches GPU 10-11 con paridad física Metal y la activación en Máxima
+> Calidad) están implementados; ver
+> `DEEPSKY_REMEDIATION_STATUS_2026-07-19.md` § "Cierre 2026-07-20".
+> Quedan diferidos: término de gradiente G (bump de caché) y pedestal
+> automático (parche 7 del bloque AUTO).
+
+> **Nota de seguridad (2026-07-19):** las propuestas que seleccionan
+> `linearfit` quedan reemplazadas por Winsorized/sigma. La implementación
+> histórica ordenaba intensidades y no ajustaba frame contra referencia; por
+> ello está deshabilitada en UI, preflight y runtime hasta disponer de una
+> regresión robusta real y rechazo sobre residuales.
+
 Diseños completos generados el 2026-07-12 por auditoría multi-agente.
 Los parches de drizzle (activación en perfiles, convención centro, agujeros,
 avisos) YA están aplicados; este documento conserva los DOS bloques grandes

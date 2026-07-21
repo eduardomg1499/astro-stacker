@@ -11,9 +11,9 @@
 //! - `DQ` — máscara de calidad de la salida (bit NO_COVERAGE en huecos).
 //!
 //! Decisiones documentadas de la fase Lite:
-//! - σ por celda (~64 px nativos) medida con el ruido MRS del frame calibrado
-//!   y NORMALIZADO (σ′ = mul·σ); un solo σ de luma para los 3 canales (los
-//!   pesos por canal llegan con el modo CFA de F4).
+//! - σ por celda (~64 px nativos) gobierna los pesos espaciales Lite. Full
+//!   mide además σ′ independiente por canal normalizado; CFA usa cada
+//!   subplano Bayer y RGB nunca replica un único sigma de luma.
 //! - La correlación introducida por el remuestreo Lanczos se ignora en Lite
 //!   (subestima levemente VAR); NF-Full la corrige vía PSD (F6).
 //! - Los pesos por frame de calidad WBPP (FWHM/PSF/redondez) NO se usan:
@@ -27,6 +27,7 @@
 #![allow(dead_code)]
 
 use std::sync::atomic::AtomicBool;
+use rayon::prelude::*;
 
 /// Lado de la celda nativa para la medición de σ (px).
 const SIGMA_CELL_PX: usize = 64;
@@ -74,6 +75,197 @@ pub(crate) struct NfLiteOutput {
     pub struct_residual: Option<Vec<f32>>,
     /// (aceptados, total) por nivel starlet — para receta/QA.
     pub struct_accepted: Option<Vec<(usize, usize)>>,
+    /// FullWithStruct solicitado pero degradado conservando SCI Full/Lite.
+    /// Nunca se mezcla con `full_fallback`, que significa Full → Lite.
+    pub struct_fallback: Option<String>,
+    /// Parámetros solicitados que no pudieron aplicarse literalmente y su
+    /// comportamiento efectivo. Debe persistirse en receta/telemetría.
+    pub parameter_fallbacks: Vec<String>,
+    /// Valores que realmente gobernaron el motor. La receta conserva por
+    /// separado la configuración solicitada; este objeto impide presentarla
+    /// como efectiva cuando Full, STRUCT o cross-fit cayeron por un gate.
+    pub effective_config: NfEffectiveConfig,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NfEffectiveConfig {
+    pub variance_weighting: &'static str,
+    pub crossfit_mode: &'static str,
+    pub crossfit_reference_frames: usize,
+    pub full_active: bool,
+    pub tile_size: Option<usize>,
+    pub max_psf_leakage: Option<f32>,
+    pub max_noise_amplification: Option<f32>,
+    pub empirical_psd: bool,
+    pub struct_active: bool,
+    pub fdr_q: Option<f32>,
+    pub min_split_sigma: Option<f32>,
+}
+
+/// Incertidumbre espacial de un light ya calibrado, en la misma geometria y
+/// layout que SCI. El loader productivo la construye desde los stores VAR/DQ;
+/// mantenerla como contrato separado evita que NF confunda un sigma MRS
+/// empirico con varianza formal de calibracion.
+#[derive(Clone)]
+pub(crate) struct NfCalibrationUncertainty {
+    pub variance: Vec<f32>,
+    pub dq: Vec<u32>,
+    pub w: usize,
+    pub h: usize,
+    pub ch: usize,
+}
+
+impl NfCalibrationUncertainty {
+    fn validate_for(&self, image: &crate::DsImage) -> Result<(), String> {
+        let pixels = image
+            .w
+            .checked_mul(image.h)
+            .ok_or("NebulaFusion: geometria VAR/DQ fuera de rango")?;
+        let samples = pixels
+            .checked_mul(image.ch)
+            .ok_or("NebulaFusion: layout VAR fuera de rango")?;
+        if self.w != image.w
+            || self.h != image.h
+            || self.ch != image.ch
+            || self.variance.len() != samples
+            || self.dq.len() != pixels
+        {
+            return Err(format!(
+                "NebulaFusion: VAR/DQ de calibracion incompatible con SCI (SCI={}x{}x{}, VAR={}x{}x{}, muestras={}, dq={})",
+                image.w,
+                image.h,
+                image.ch,
+                self.w,
+                self.h,
+                self.ch,
+                self.variance.len(),
+                self.dq.len()
+            ));
+        }
+        let fatal = nf_fatal_input_dq();
+        let mut valid = 0usize;
+        for pixel in 0..pixels {
+            if self.dq[pixel] & fatal != 0 {
+                continue;
+            }
+            for channel in 0..image.ch {
+                let variance = self.variance[pixel * image.ch + channel];
+                if !variance.is_finite() || variance <= 0.0 {
+                    return Err(format!(
+                        "NebulaFusion: VAR no positiva/no finita sin DQ fatal en pixel {pixel}, canal {channel}"
+                    ));
+                }
+                valid += 1;
+            }
+        }
+        if valid == 0 {
+            return Err("NebulaFusion: VAR/DQ no contiene ninguna muestra cientifica valida".into());
+        }
+        Ok(())
+    }
+}
+
+#[inline]
+fn nf_fatal_input_dq() -> u32 {
+    crate::deepsky_variance::dq::SATURATED
+        | crate::deepsky_variance::dq::NONLINEAR
+        | crate::deepsky_variance::dq::HOT_COLD
+        | crate::deepsky_variance::dq::COSMIC
+        | crate::deepsky_variance::dq::NAN_INPUT
+        | crate::deepsky_variance::dq::FLAT_INVALID
+        | crate::deepsky_variance::dq::NO_COVERAGE
+        | crate::deepsky_variance::dq::DEGRADED_CALIBRATION
+}
+
+/// Normalize the final SCI/VAR/NEFF/DQ contract after all Lite/Full fallbacks.
+/// DQ is spatial, so a pixel with an unavailable RGB channel cannot honestly
+/// publish zeros for that channel. A transient invalid input may still yield a
+/// complete estimate from the remaining observations; in that case the input
+/// flag is consumed by the zero-weight mask and the aggregate remains valid.
+fn nf_finalize_scientific_pixels(
+    science: &mut [f32],
+    variance: &mut [f32],
+    neff: &mut [f32],
+    dq: &mut [u32],
+    pixels: usize,
+    channels: usize,
+) -> Result<(), String> {
+    let samples = pixels
+        .checked_mul(channels)
+        .ok_or("NebulaFusion: geometría final fuera de rango")?;
+    if !matches!(channels, 1 | 3)
+        || science.len() != samples
+        || variance.len() != samples
+        || neff.len() != samples
+        || dq.len() != pixels
+    {
+        return Err("NebulaFusion: planos SCI/VAR/NEFF/DQ finales incompatibles".into());
+    }
+    for pixel in 0..pixels {
+        let complete = (0..channels).all(|channel| {
+            let index = pixel * channels + channel;
+            science[index].is_finite()
+                && variance[index].is_finite()
+                && variance[index] >= 0.0
+                && neff[index].is_finite()
+                && neff[index] > 0.0
+        });
+        if complete {
+            dq[pixel] &= !(crate::deepsky_variance::dq::NO_COVERAGE
+                | crate::deepsky_variance::dq::NAN_INPUT);
+        } else {
+            dq[pixel] |= crate::deepsky_variance::dq::NO_COVERAGE;
+            for channel in 0..channels {
+                let index = pixel * channels + channel;
+                science[index] = f32::NAN;
+                variance[index] = f32::NAN;
+                neff[index] = 0.0;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Configuración efectiva del motor. Vive junto al contexto para que ninguna
+/// opción pública quede sólo serializada en la receta sin gobernar el cálculo.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NfRuntimeConfig {
+    pub tile_size: usize,
+    pub max_psf_leakage: f32,
+    pub max_noise_amplification: f32,
+    pub empirical_psd: bool,
+    pub crossfit_folds: usize,
+    pub fdr_q: f32,
+    pub min_split_sigma: f32,
+}
+
+impl Default for NfRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            tile_size: 512,
+            max_psf_leakage: 1e-3,
+            max_noise_amplification: 1.5,
+            empirical_psd: false,
+            crossfit_folds: 4,
+            fdr_q: 0.01,
+            min_split_sigma: 2.5,
+        }
+    }
+}
+
+impl From<&crate::pipeline::NebulaFusionConfig> for NfRuntimeConfig {
+    fn from(value: &crate::pipeline::NebulaFusionConfig) -> Self {
+        Self {
+            tile_size: value.tile_size as usize,
+            max_psf_leakage: value.max_psf_leakage,
+            max_noise_amplification: value.max_noise_amplification,
+            empirical_psd: value.empirical_psd,
+            crossfit_folds: value.crossfit_folds as usize,
+            fdr_q: value.fdr_q,
+            min_split_sigma: value.min_split_sigma,
+        }
+    }
 }
 
 pub(crate) struct NfLiteContext<'a> {
@@ -100,6 +292,7 @@ pub(crate) struct NfLiteContext<'a> {
     /// Catálogos estelares por índice ORIGINAL de frame (frames[i].1 del
     /// pipeline) — los usa el ajuste PSF Moffat del modo Full.
     pub stars: &'a [Vec<(f32, f32, f32)>],
+    pub config: NfRuntimeConfig,
 }
 
 /// Pesos de un frame: rejilla espacial 1/σ² (mono/RGB) o escalar por canal
@@ -155,6 +348,400 @@ pub(crate) fn cfa_channel_sigmas(img: &crate::DsImage, cid: i32) -> ([f32; 3], f
     (sigma_ch, g_offset)
 }
 
+/// Sigma MRS independiente por canal. En RGB no se usa una luma compartida:
+/// la demosaización y la respuesta del sensor correlacionan y escalan cada
+/// canal de forma distinta, por lo que replicar un único sigma falsearía el
+/// denominador espectral y la VAR de NF-Full.
+fn image_channel_sigmas(img: &crate::DsImage) -> [f32; 3] {
+    if img.ch <= 1 {
+        let sigma = crate::ds_mrs_noise(&img.data, img.w, img.h).max(1e-3);
+        return [sigma; 3];
+    }
+    let npx = img.w.saturating_mul(img.h);
+    let mut out = [0.0f32; 3];
+    for (c, sigma) in out.iter_mut().enumerate().take(img.ch.min(3)) {
+        let mut plane = Vec::with_capacity(npx);
+        plane.extend((0..npx).map(|p| img.data[p * img.ch + c]));
+        *sigma = crate::ds_mrs_noise(&plane, img.w, img.h).max(1e-3);
+    }
+    if img.ch == 2 {
+        out[2] = out[1];
+    }
+    out
+}
+
+/// Muestra SCI y propaga VAR con exactamente la misma huella de
+/// interpolacion. Cualquier sensel fatal de peso no nulo invalida la muestra
+/// completa: una correccion cosmetica, flat debil o cosmic nunca se convierte
+/// en una observacion por el mero hecho de haber sido interpolado.
+#[inline]
+fn nf_sample_science_variance(
+    image: &crate::DsImage,
+    uncertainty: &NfCalibrationUncertainty,
+    sxf: f32,
+    syf: f32,
+    lanczos: bool,
+    science: &mut [f32; 3],
+    variance: &mut [f32; 3],
+) -> bool {
+    let channels = image.ch;
+    let x0 = sxf.floor() as usize;
+    let y0 = syf.floor() as usize;
+    let fatal = nf_fatal_input_dq();
+    if lanczos
+        && sxf >= 3.0
+        && syf >= 3.0
+        && sxf < (image.w - 4) as f32
+        && syf < (image.h - 4) as f32
+    {
+        let lut = crate::ds_l3_lut();
+        let fx = sxf - x0 as f32;
+        let fy = syf - y0 as f32;
+        let mut wx = [0.0f32; 6];
+        let mut wy = [0.0f32; 6];
+        let (mut swx, mut swy) = (0.0f32, 0.0f32);
+        for tap in 0..6 {
+            let offset = tap as f32 - 2.0;
+            let ix = ((offset - fx).abs() * crate::DS_L3_RES as f32) as usize;
+            let iy = ((offset - fy).abs() * crate::DS_L3_RES as f32) as usize;
+            wx[tap] = lut.get(ix).copied().unwrap_or(0.0);
+            wy[tap] = lut.get(iy).copied().unwrap_or(0.0);
+            swx += wx[tap];
+            swy += wy[tap];
+        }
+        let normalization = 1.0 / (swx * swy).max(1.0e-6);
+        for channel in 0..channels {
+            let mut sci = 0.0f64;
+            let mut var = 0.0f64;
+            for yy in 0..6 {
+                for xx in 0..6 {
+                    let coefficient = wx[xx] * wy[yy] * normalization;
+                    if coefficient.abs() <= f32::EPSILON {
+                        continue;
+                    }
+                    let source_pixel = (y0 + yy - 2) * image.w + (x0 + xx - 2);
+                    if uncertainty.dq[source_pixel] & fatal != 0 {
+                        return false;
+                    }
+                    let source = source_pixel * channels + channel;
+                    let value = image.data[source];
+                    let input_variance = uncertainty.variance[source];
+                    if !value.is_finite() || !input_variance.is_finite() || input_variance <= 0.0 {
+                        return false;
+                    }
+                    sci += coefficient as f64 * value as f64;
+                    var += coefficient as f64 * coefficient as f64 * input_variance as f64;
+                }
+            }
+            science[channel] = sci as f32;
+            variance[channel] = var as f32;
+        }
+        return science[..channels].iter().all(|value| value.is_finite())
+            && variance[..channels]
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0);
+    }
+
+    let fx = sxf - x0 as f32;
+    let fy = syf - y0 as f32;
+    let coefficients = [
+        (1.0 - fx) * (1.0 - fy),
+        fx * (1.0 - fy),
+        (1.0 - fx) * fy,
+        fx * fy,
+    ];
+    let source_pixels = [
+        y0 * image.w + x0,
+        y0 * image.w + x0 + 1,
+        (y0 + 1) * image.w + x0,
+        (y0 + 1) * image.w + x0 + 1,
+    ];
+    for channel in 0..channels {
+        let mut sci = 0.0f64;
+        let mut var = 0.0f64;
+        for tap in 0..4 {
+            let coefficient = coefficients[tap];
+            if coefficient.abs() <= f32::EPSILON {
+                continue;
+            }
+            let pixel = source_pixels[tap];
+            if uncertainty.dq[pixel] & fatal != 0 {
+                return false;
+            }
+            let source = pixel * channels + channel;
+            let value = image.data[source];
+            let input_variance = uncertainty.variance[source];
+            if !value.is_finite() || !input_variance.is_finite() || input_variance <= 0.0 {
+                return false;
+            }
+            sci += coefficient as f64 * value as f64;
+            var += coefficient as f64 * coefficient as f64 * input_variance as f64;
+        }
+        science[channel] = sci as f32;
+        variance[channel] = var as f32;
+    }
+    science[..channels].iter().all(|value| value.is_finite())
+        && variance[..channels]
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nf_accumulate_formal_warp(
+    ctx: &NfLiteContext,
+    k: usize,
+    transform: crate::DsTransform,
+    image: &crate::DsImage,
+    uncertainty: &NfCalibrationUncertainty,
+    sum: &mut [f64],
+    weight: &mut [f64],
+    skip_mask: Option<&[u64]>,
+    weight_sq: Option<&mut Vec<f64>>,
+    variance_numerator: Option<&mut Vec<f64>>,
+) {
+    let samples_per_row = ctx.w_out * ctx.ch;
+    let sum_ptr = sum.as_mut_ptr() as usize;
+    let weight_ptr = weight.as_mut_ptr() as usize;
+    let weight_sq_ptr = weight_sq.map(|plane| plane.as_mut_ptr() as usize);
+    let variance_ptr = variance_numerator.map(|plane| plane.as_mut_ptr() as usize);
+    let loc = ctx.loc_fields[k]
+        .as_ref()
+        .map(|field| (field.as_slice(), ctx.loc_grid, ctx.loc_grid));
+    (0..ctx.h_out).into_par_iter().for_each(|y| {
+        let sum_row = unsafe {
+            std::slice::from_raw_parts_mut(
+                (sum_ptr as *mut f64).add(y * samples_per_row),
+                samples_per_row,
+            )
+        };
+        let weight_row = unsafe {
+            std::slice::from_raw_parts_mut(
+                (weight_ptr as *mut f64).add(y * samples_per_row),
+                samples_per_row,
+            )
+        };
+        let mut weight_sq_row = weight_sq_ptr.map(|ptr| unsafe {
+            std::slice::from_raw_parts_mut(
+                (ptr as *mut f64).add(y * samples_per_row),
+                samples_per_row,
+            )
+        });
+        let mut variance_row = variance_ptr.map(|ptr| unsafe {
+            std::slice::from_raw_parts_mut(
+                (ptr as *mut f64).add(y * samples_per_row),
+                samples_per_row,
+            )
+        });
+        for x in 0..ctx.w_out {
+            let pixel = y * ctx.w_out + x;
+            if skip_mask.is_some_and(|mask| (mask[pixel >> 6] >> (pixel & 63)) & 1 == 1) {
+                continue;
+            }
+            let Some((sx, sy)) = transform.inverse(x as f32, y as f32) else {
+                continue;
+            };
+            if sx < 0.0
+                || sy < 0.0
+                || sx >= (image.w - 1) as f32
+                || sy >= (image.h - 1) as f32
+            {
+                continue;
+            }
+            let mut sampled_science = [f32::NAN; 3];
+            let mut sampled_variance = [f32::NAN; 3];
+            if !nf_sample_science_variance(
+                image,
+                uncertainty,
+                sx,
+                sy,
+                ctx.use_lanczos,
+                &mut sampled_science,
+                &mut sampled_variance,
+            ) {
+                continue;
+            }
+            for channel in 0..ctx.ch {
+                let multiply = ctx.norms[k].0[channel];
+                let normalized_variance = sampled_variance[channel] * multiply * multiply;
+                let local_offset = loc
+                    .map(|(grid, gw, gh)| {
+                        crate::ds_sample_local_field(
+                            grid,
+                            gw,
+                            gh,
+                            ctx.ch,
+                            channel,
+                            x as f32 / ctx.w_out as f32,
+                            y as f32 / ctx.h_out as f32,
+                        )
+                    })
+                    .unwrap_or(0.0);
+                let value = sampled_science[channel] * multiply
+                    + ctx.norms[k].1[channel]
+                    + local_offset;
+                if !value.is_finite()
+                    || !normalized_variance.is_finite()
+                    || normalized_variance <= 0.0
+                {
+                    continue;
+                }
+                let precision = 1.0 / normalized_variance as f64;
+                let index = x * ctx.ch + channel;
+                sum_row[index] += value as f64 * precision;
+                weight_row[index] += precision;
+                if let Some(plane) = weight_sq_row.as_deref_mut() {
+                    plane[index] += precision * precision;
+                }
+                if let Some(plane) = variance_row.as_deref_mut() {
+                    plane[index] += precision * precision * normalized_variance as f64;
+                }
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nf_accumulate_formal_cfa(
+    ctx: &NfLiteContext,
+    k: usize,
+    cid: i32,
+    transform: crate::DsTransform,
+    image: &crate::DsImage,
+    uncertainty: &NfCalibrationUncertainty,
+    sum: &mut [f64],
+    weight: &mut [f64],
+    skip_mask: Option<&[u64]>,
+    weight_sq: Option<&mut Vec<f64>>,
+    variance_numerator: Option<&mut Vec<f64>>,
+) {
+    if image.ch != 1 || uncertainty.ch != 1 || !matches!(cid, 8..=11) {
+        return;
+    }
+    let half = 0.5f32;
+    let sum_ptr = sum.as_mut_ptr() as usize;
+    let weight_ptr = weight.as_mut_ptr() as usize;
+    let weight_sq_ptr = weight_sq.map(|plane| plane.as_mut_ptr() as usize);
+    let variance_ptr = variance_numerator.map(|plane| plane.as_mut_ptr() as usize);
+    let fatal = nf_fatal_input_dq();
+    let loc = ctx.loc_fields[k]
+        .as_ref()
+        .map(|field| (field.as_slice(), ctx.loc_grid, ctx.loc_grid));
+    let bands = rayon::current_num_threads().max(1);
+    let band_h = ctx.h_out.div_ceil(bands);
+    (0..bands).into_par_iter().for_each(|band| {
+        let oy0 = band * band_h;
+        let oy1 = ((band + 1) * band_h).min(ctx.h_out);
+        if oy0 >= oy1 {
+            return;
+        }
+        let rows = oy1 - oy0;
+        let band_samples = rows * ctx.w_out * 3;
+        let sum_band = unsafe {
+            std::slice::from_raw_parts_mut(
+                (sum_ptr as *mut f64).add(oy0 * ctx.w_out * 3),
+                band_samples,
+            )
+        };
+        let weight_band = unsafe {
+            std::slice::from_raw_parts_mut(
+                (weight_ptr as *mut f64).add(oy0 * ctx.w_out * 3),
+                band_samples,
+            )
+        };
+        let mut weight_sq_band = weight_sq_ptr.map(|ptr| unsafe {
+            std::slice::from_raw_parts_mut(
+                (ptr as *mut f64).add(oy0 * ctx.w_out * 3),
+                band_samples,
+            )
+        });
+        let mut variance_band = variance_ptr.map(|ptr| unsafe {
+            std::slice::from_raw_parts_mut(
+                (ptr as *mut f64).add(oy0 * ctx.w_out * 3),
+                band_samples,
+            )
+        });
+        for iy in 0..image.h {
+            for ix in 0..image.w {
+                let source_pixel = iy * image.w + ix;
+                if uncertainty.dq[source_pixel] & fatal != 0 {
+                    continue;
+                }
+                let raw_variance = uncertainty.variance[source_pixel];
+                let raw_value = image.data[source_pixel];
+                if !raw_value.is_finite() || !raw_variance.is_finite() || raw_variance <= 0.0 {
+                    continue;
+                }
+                let channel = crate::ds_cfa_channel(cid, ix, iy);
+                let (rx, ry) = transform.forward(ix as f32, iy as f32);
+                if !rx.is_finite() || !ry.is_finite() {
+                    continue;
+                }
+                let (ox, oy) = (rx + 0.5, ry + 0.5);
+                let (dx0, dx1, dy0, dy1) = (ox - half, ox + half, oy - half, oy + half);
+                let px0 = dx0.floor() as i32;
+                let px1 = (dx1.ceil() as i32 - 1).max(px0);
+                let py0 = dy0.floor() as i32;
+                let py1 = (dy1.ceil() as i32 - 1).max(py0);
+                let normalized_variance =
+                    raw_variance * ctx.norms[k].0[channel] * ctx.norms[k].0[channel];
+                if !normalized_variance.is_finite() || normalized_variance <= 0.0 {
+                    continue;
+                }
+                for opy in py0.max(oy0 as i32)..=py1.min(oy1 as i32 - 1) {
+                    let ay = (dy1.min(opy as f32 + 1.0) - dy0.max(opy as f32)).max(0.0);
+                    if ay <= 0.0 {
+                        continue;
+                    }
+                    for opx in px0.max(0)..=px1.min(ctx.w_out as i32 - 1) {
+                        let ax = (dx1.min(opx as f32 + 1.0) - dx0.max(opx as f32)).max(0.0);
+                        let area = (ax * ay) as f64;
+                        if area <= 0.0 {
+                            continue;
+                        }
+                        let output_pixel = opy as usize * ctx.w_out + opx as usize;
+                        if skip_mask.is_some_and(|mask| {
+                            (mask[output_pixel >> 6] >> (output_pixel & 63)) & 1 == 1
+                        }) {
+                            continue;
+                        }
+                        let local_offset = loc
+                            .map(|(grid, gw, gh)| {
+                                crate::ds_sample_local_field(
+                                    grid,
+                                    gw,
+                                    gh,
+                                    3,
+                                    channel,
+                                    opx as f32 / ctx.w_out as f32,
+                                    opy as f32 / ctx.h_out as f32,
+                                )
+                            })
+                            .unwrap_or(0.0);
+                        let value = raw_value * ctx.norms[k].0[channel]
+                            + ctx.norms[k].1[channel]
+                            + local_offset;
+                        if !value.is_finite() {
+                            continue;
+                        }
+                        let precision = area / normalized_variance as f64;
+                        let local_pixel = (opy as usize - oy0) * ctx.w_out + opx as usize;
+                        let index = local_pixel * 3 + channel;
+                        sum_band[index] += value as f64 * precision;
+                        weight_band[index] += precision;
+                        if let Some(plane) = weight_sq_band.as_deref_mut() {
+                            plane[index] += precision * precision;
+                        }
+                        if let Some(plane) = variance_band.as_deref_mut() {
+                            plane[index] +=
+                                precision * precision * normalized_variance as f64;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Una acumulación NF (despacho mono/RGB vs CFA directo) con los parámetros
 /// comunes del contexto. Mantiene la geometría idéntica entre pasadas.
 #[allow(clippy::too_many_arguments)]
@@ -164,19 +751,69 @@ fn nf_accumulate(
     t: crate::DsTransform,
     img: &crate::DsImage,
     weights: &FrameWeights,
+    uncertainty: Option<&NfCalibrationUncertainty>,
     sum: &mut [f64],
     wgt: &mut [f64],
     mask: Option<&[u64]>,
     wsq: Option<&mut Vec<f64>>,
+    variance_numerator: Option<&mut Vec<f64>>,
 ) {
+    if let Some(uncertainty) = uncertainty {
+        if let Some(cid) = ctx.cfa {
+            nf_accumulate_formal_cfa(
+                ctx,
+                k,
+                cid,
+                t,
+                img,
+                uncertainty,
+                sum,
+                wgt,
+                mask,
+                wsq,
+                variance_numerator,
+            );
+        } else {
+            nf_accumulate_formal_warp(
+                ctx,
+                k,
+                t,
+                img,
+                uncertainty,
+                sum,
+                wgt,
+                mask,
+                wsq,
+                variance_numerator,
+            );
+        }
+        return;
+    }
     let loc_ref = ctx.loc_fields[k]
         .as_ref()
         .map(|f| (f.as_slice(), ctx.loc_grid, ctx.loc_grid));
     match (ctx.cfa, weights) {
         (Some(cid), FrameWeights::Rgb(fw_rgb)) => {
             crate::ds_drizzle_cfa_accumulate(
-                img, cid, t, sum, None, wgt, None, None, ctx.w_out, ctx.h_out, 1.0, 1.0, 1.0,
-                ctx.norms[k], loc_ref, None, Some(*fw_rgb), mask, wsq,
+                img,
+                cid,
+                t,
+                sum,
+                None,
+                wgt,
+                None,
+                None,
+                ctx.w_out,
+                ctx.h_out,
+                1.0,
+                1.0,
+                1.0,
+                ctx.norms[k],
+                loc_ref,
+                None,
+                Some(*fw_rgb),
+                mask,
+                wsq,
             );
         }
         (_, FrameWeights::Grid(grid)) => {
@@ -490,11 +1127,157 @@ fn cov_reduce(wgt: &[f64], npx: usize, ch: usize) -> Vec<f64> {
         .collect()
 }
 
+fn struct_allocation_error(label: &str, error: std::collections::TryReserveError) -> String {
+    format!("STRUCT omitido: no se pudo reservar {label}: {error}")
+}
+
+fn try_zeroed_f64(len: usize, label: &str) -> Result<Vec<f64>, String> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(len)
+        .map_err(|error| struct_allocation_error(label, error))?;
+    out.resize(len, 0.0);
+    Ok(out)
+}
+
+fn try_struct_halves(len: usize) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>), String> {
+    Ok((
+        try_zeroed_f64(len, "suma split-half A")?,
+        try_zeroed_f64(len, "peso split-half A")?,
+        try_zeroed_f64(len, "suma split-half B")?,
+        try_zeroed_f64(len, "peso split-half B")?,
+    ))
+}
+
+fn try_half_luma(s: &[f64], weights: &[f64], npx: usize, ch: usize) -> Result<Vec<f32>, String> {
+    let expected = npx
+        .checked_mul(ch)
+        .ok_or_else(|| "STRUCT omitido: geometría split-half fuera de rango".to_string())?;
+    if s.len() != expected || weights.len() != expected {
+        return Err("STRUCT omitido: buffers split-half con geometría inconsistente".into());
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(npx)
+        .map_err(|error| struct_allocation_error("luma split-half", error))?;
+    for p in 0..npx {
+        let mut vs = 0.0f64;
+        let mut vw = 0.0f64;
+        for c in 0..ch {
+            vs += s[p * ch + c];
+            vw += weights[p * ch + c];
+        }
+        out.push(if vw > 0.0 { (vs / vw) as f32 } else { 0.0 });
+    }
+    Ok(out)
+}
+
+fn try_full_luma(data: &[f32], npx: usize, ch: usize) -> Result<Vec<f32>, String> {
+    let expected = npx
+        .checked_mul(ch)
+        .ok_or_else(|| "STRUCT omitido: geometría SCI fuera de rango".to_string())?;
+    if data.len() != expected {
+        return Err("STRUCT omitido: SCI con geometría inconsistente".into());
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(npx)
+        .map_err(|error| struct_allocation_error("luma SCI", error))?;
+    if ch == 1 {
+        out.extend_from_slice(data);
+    } else {
+        for p in 0..npx {
+            let mut sum = 0.0f32;
+            for c in 0..ch {
+                sum += data[p * ch + c];
+            }
+            out.push(sum / ch as f32);
+        }
+    }
+    Ok(out)
+}
+
+fn validate_struct_config(config: NfRuntimeConfig) -> Result<(), String> {
+    if !config.fdr_q.is_finite() || !(0.0..=0.25).contains(&config.fdr_q) || config.fdr_q == 0.0 {
+        return Err(format!(
+            "STRUCT omitido: fdrQ={} debe estar en (0, 0.25]",
+            config.fdr_q
+        ));
+    }
+    if !config.min_split_sigma.is_finite() || !(1.0..=10.0).contains(&config.min_split_sigma) {
+        return Err(format!(
+            "STRUCT omitido: minSplitSigma={} debe estar en [1, 10]",
+            config.min_split_sigma
+        ));
+    }
+    Ok(())
+}
+
+fn validate_full_config(config: NfRuntimeConfig) -> Result<(), String> {
+    if !(64..=512).contains(&config.tile_size) || !config.tile_size.is_power_of_two() {
+        return Err(format!(
+            "tileSize={} no es una potencia de dos entre 64 y 512",
+            config.tile_size
+        ));
+    }
+    if !config.max_psf_leakage.is_finite() || !(1e-6..=0.1).contains(&config.max_psf_leakage) {
+        return Err(format!(
+            "maxPsfLeakage={} debe estar en [1e-6, 0.1]",
+            config.max_psf_leakage
+        ));
+    }
+    if !config.max_noise_amplification.is_finite()
+        || !(1.0..=10.0).contains(&config.max_noise_amplification)
+    {
+        return Err(format!(
+            "maxNoiseAmplification={} debe estar en [1, 10]",
+            config.max_noise_amplification
+        ));
+    }
+    Ok(())
+}
+
+/// Prepara el operador geométrico W×PSF. Similarity/affine se representan
+/// mediante su Jacobiano exacto y projective mediante una linealización local
+/// verificada por tile. LocalDistortion conserva el fallback seguro hasta que
+/// exista un contrato de soporte y adjunto publicable para el polinomio.
+fn full_supported_warps(
+    registered: &[(usize, crate::DsTransform, f64)],
+    w: usize,
+    h: usize,
+) -> Result<Vec<crate::nebula_fusion_full::NfFullWarp>, String> {
+    crate::nebula_fusion_full::prepare_full_warps(registered, w, h)
+}
+
+fn fit_channel_psfs(
+    img: &crate::DsImage,
+    stars: &[(f32, f32, f32)],
+) -> Option<[crate::deepsky_psf::MoffatPsf; 3]> {
+    if img.ch <= 1 {
+        let (fit, _report) =
+            crate::deepsky_psf::fit_frame_psf(&img.data, img.w, img.h, stars, 0.2)?;
+        let psf = fit.at(0.5, 0.5);
+        return Some([psf; 3]);
+    }
+    let npx = img.w.checked_mul(img.h)?;
+    let mut out: [Option<crate::deepsky_psf::MoffatPsf>; 3] = [None, None, None];
+    for (c, slot) in out.iter_mut().enumerate().take(img.ch.min(3)) {
+        let mut plane = Vec::with_capacity(npx);
+        plane.extend((0..npx).map(|p| img.data[p * img.ch + c]));
+        let (fit, _report) = crate::deepsky_psf::fit_frame_psf(&plane, img.w, img.h, stars, 0.2)?;
+        *slot = Some(fit.at(0.5, 0.5));
+    }
+    if img.ch == 2 {
+        out[2] = out[1];
+    }
+    Some([out[0]?, out[1]?, out[2]?])
+}
+
 /// Motor NF-Lite completo: tres pasadas de streaming sobre los frames ya
 /// calibrados/registrados/normalizados (escala nativa, drizzle excluido).
 pub(crate) fn run_lite(
     ctx: &NfLiteContext,
     load: &dyn Fn(usize) -> Result<crate::DsImage, String>,
+    load_uncertainty: Option<
+        &dyn Fn(usize) -> Result<NfCalibrationUncertainty, String>,
+    >,
     progress: &mut dyn FnMut(&str, usize, usize),
 ) -> Result<NfLiteOutput, String> {
     let (w_out, h_out, ch) = (ctx.w_out, ctx.h_out, ctx.ch);
@@ -503,10 +1286,67 @@ pub(crate) fn run_lite(
     if n == 0 {
         return Err("NebulaFusion: sin frames registrados".into());
     }
+    let mut parameter_fallbacks = Vec::new();
+    let formal_uncertainty = load_uncertainty.is_some();
+    if !formal_uncertainty {
+        parameter_fallbacks.push(
+            "VAR/DQ formal no suministrada: NF usa pesos empiricos MRS y declara varianceOrigin=empirical"
+                .to_string(),
+        );
+    }
+    if ctx.config.empirical_psd && !ctx.full {
+        parameter_fallbacks.push(
+            "empiricalPsd=true no aplica a NF-Lite: la VAR efectiva conserva el modelo analítico sin corrección espectral; active Full cuando exista un estimador PSD publicable"
+                .to_string(),
+        );
+    }
+    let crossfit_min_frames = if (2..=64).contains(&ctx.config.crossfit_folds) {
+        ctx.config.crossfit_folds.saturating_add(1).max(5)
+    } else {
+        parameter_fallbacks.push(format!(
+            "crossfitFolds={} inválido: rechazo cross-fit deshabilitado (se requieren 2..=64)",
+            ctx.config.crossfit_folds
+        ));
+        usize::MAX
+    };
+    if crossfit_min_frames != usize::MAX && n >= crossfit_min_frames {
+        // El motor calcula LOO exacto, estadísticamente más independiente
+        // que K-fold para el mismo coste de almacenamiento. La cardinalidad
+        // solicitada sí gobierna el gate de activación y el efectivo queda
+        // declarado, no fingido en la receta.
+        parameter_fallbacks.push(format!(
+            "crossfitFolds={} solicitado; piloto efectivo leave-one-out ({} referencias por frame), gate N>={} ",
+            ctx.config.crossfit_folds,
+            n.saturating_sub(1),
+            crossfit_min_frames
+        ));
+    } else if crossfit_min_frames != usize::MAX {
+        parameter_fallbacks.push(format!(
+            "crossfitFolds={}: N={} < {}; rechazo cross-fit deshabilitado",
+            ctx.config.crossfit_folds, n, crossfit_min_frames
+        ));
+    }
+    // STRUCT es un producto derivado: si su working set no cabe, se omite
+    // antes de reservar las cuatro mitades f64. SCI Full/Lite continúa igual.
+    let mut struct_fallback = None;
+    let struct_enabled = if ctx.struct_mode {
+        match validate_struct_config(ctx.config).and_then(|_| {
+            crate::deepsky_struct::validate_pipeline_memory_budget(w_out, h_out, ch).map(|_| ())
+        }) {
+            Ok(()) => true,
+            Err(reason) => {
+                struct_fallback = Some(reason);
+                false
+            }
+        }
+    } else {
+        false
+    };
 
     let mut total_sum = vec![0.0f64; npx * ch];
     let mut total_wgt = vec![0.0f64; npx * ch];
     let mut frame_weights: Vec<FrameWeights> = Vec::with_capacity(n);
+    let mut frame_sigmas: Vec<[f32; 3]> = Vec::with_capacity(n);
     let mut g1g2_offset_max = 0.0f32;
 
     // --- Pasada A: pesos por frame + totales S=Σw·y, W=Σw ---
@@ -514,16 +1354,28 @@ pub(crate) fn run_lite(
         crate::pipeline::cancellation_checkpoint(ctx.cancel, "NebulaFusion: totales")?;
         progress("pesos y totales", k + 1, n);
         let img = load(i)?;
-        let weights = if let Some(cid) = ctx.cfa {
+        let uncertainty = match load_uncertainty {
+            Some(loader) => {
+                let uncertainty = loader(i).map_err(|reason| {
+                    format!("NebulaFusion: no se pudo cargar VAR/DQ formal del frame {i}: {reason}")
+                })?;
+                uncertainty.validate_for(&img)?;
+                Some(uncertainty)
+            }
+            None => None,
+        };
+        let (weights, normalized_sigmas) = if let Some(cid) = ctx.cfa {
             // CFA directo: 1/σ′² POR CANAL desde los sub-planos Bayer.
             let (sigmas, g_off) = cfa_channel_sigmas(&img, cid);
             g1g2_offset_max = g1g2_offset_max.max(g_off.abs());
             let mut fw = [0.0f64; 3];
+            let mut normalized = [0.0f32; 3];
             for c in 0..3 {
                 let s = (sigmas[c] * ctx.norms[k].0[c].max(1e-6)).max(1e-3) as f64;
                 fw[c] = 1.0 / (s * s);
+                normalized[c] = s as f32;
             }
-            FrameWeights::Rgb(fw)
+            (FrameWeights::Rgb(fw), normalized)
         } else {
             let sigma = native_sigma_grid(&img);
             let mul_mean = {
@@ -534,9 +1386,16 @@ pub(crate) fn run_lite(
                     (m[0] + m[1] + m[2]) / 3.0
                 }
             };
-            FrameWeights::Grid(reference_weight_grid(
-                &sigma, &t, mul_mean, img.w, img.h, w_out, h_out,
-            ))
+            let mut normalized = image_channel_sigmas(&img);
+            for (c, value) in normalized.iter_mut().enumerate() {
+                *value = (*value * ctx.norms[k].0[c].max(1e-6)).max(1e-3);
+            }
+            (
+                FrameWeights::Grid(reference_weight_grid(
+                    &sigma, &t, mul_mean, img.w, img.h, w_out, h_out,
+                )),
+                normalized,
+            )
         };
         nf_accumulate(
             ctx,
@@ -544,18 +1403,22 @@ pub(crate) fn run_lite(
             t,
             &img,
             &weights,
+            uncertainty.as_ref(),
             &mut total_sum,
             &mut total_wgt,
             None,
             None,
+            None,
         );
         frame_weights.push(weights);
+        frame_sigmas.push(normalized_sigmas);
     }
     let wgt1 = cov_reduce(&total_wgt, npx, ch);
     let total_cov: f64 = wgt1.iter().sum();
 
     let cfg = crate::deepsky_masks::CrossFitConfig {
         dilate_px: if ctx.use_lanczos { 2 } else { 1 },
+        min_frames: crossfit_min_frames,
         ..crate::deepsky_masks::CrossFitConfig::default()
     };
     let crossfit_enabled = n >= cfg.min_frames;
@@ -568,12 +1431,34 @@ pub(crate) fn run_lite(
                       t: crate::DsTransform,
                       fs: &mut Vec<f64>,
                       fw: &mut Vec<f64>|
-     -> Result<crate::DsImage, String> {
+     -> Result<(crate::DsImage, Option<NfCalibrationUncertainty>), String> {
         let img = load(i)?;
+        let uncertainty = match load_uncertainty {
+            Some(loader) => {
+                let uncertainty = loader(i).map_err(|reason| {
+                    format!("NebulaFusion: no se pudo cargar VAR/DQ formal del frame {i}: {reason}")
+                })?;
+                uncertainty.validate_for(&img)?;
+                Some(uncertainty)
+            }
+            None => None,
+        };
         fs.iter_mut().for_each(|v| *v = 0.0);
         fw.iter_mut().for_each(|v| *v = 0.0);
-        nf_accumulate(ctx, k, t, &img, &frame_weights_ref[k], fs, fw, None, None);
-        Ok(img)
+        nf_accumulate(
+            ctx,
+            k,
+            t,
+            &img,
+            &frame_weights_ref[k],
+            uncertainty.as_ref(),
+            fs,
+            fw,
+            None,
+            None,
+            None,
+        );
+        Ok((img, uncertainty))
     };
 
     // --- Pasada B1: curva ruido-vs-nivel por canal (residuales LOO) ---
@@ -584,7 +1469,7 @@ pub(crate) fn run_lite(
         for (k, &(i, t, _fw)) in ctx.registered.iter().enumerate() {
             crate::pipeline::cancellation_checkpoint(ctx.cancel, "NebulaFusion: curva de ruido")?;
             progress("curva de ruido", k + 1, n);
-            warp_frame(k, i, t, &mut frame_sum, &mut frame_wgt)?;
+            let _ = warp_frame(k, i, t, &mut frame_sum, &mut frame_wgt)?;
             for c in 0..ch {
                 let (lo, hi) = ranges[c];
                 let step = ((hi - lo) / NOISE_BINS as f32).max(1e-6);
@@ -668,7 +1553,7 @@ pub(crate) fn run_lite(
             });
             continue;
         }
-        let img = warp_frame(k, i, t, &mut frame_sum, &mut frame_wgt)?;
+        let (img, uncertainty) = warp_frame(k, i, t, &mut frame_sum, &mut frame_wgt)?;
         residual_plane(
             &frame_sum,
             &frame_wgt,
@@ -677,8 +1562,7 @@ pub(crate) fn run_lite(
             true,
             &mut residual,
         );
-        let mask =
-            crate::deepsky_masks::build_frozen_mask(&residual, w_out, h_out, n, &cfg, false);
+        let mask = crate::deepsky_masks::build_frozen_mask(&residual, w_out, h_out, n, &cfg, false);
         // Acumular este frame en los totales limpios saltando su máscara r1.
         let bits;
         let mask_ref = if mask.is_empty() {
@@ -693,9 +1577,11 @@ pub(crate) fn run_lite(
             t,
             &img,
             &frame_weights_ref[k],
+            uncertainty.as_ref(),
             &mut clean_sum,
             &mut clean_wgt,
             mask_ref,
+            None,
             None,
         );
         masks.push(mask);
@@ -713,7 +1599,7 @@ pub(crate) fn run_lite(
         for (k, &(i, t, _fw)) in ctx.registered.iter().enumerate() {
             crate::pipeline::cancellation_checkpoint(ctx.cancel, "NebulaFusion: máscaras r2")?;
             progress("máscaras (ronda 2)", k + 1, n);
-            warp_frame(k, i, t, &mut frame_sum, &mut frame_wgt)?;
+            let _ = warp_frame(k, i, t, &mut frame_sum, &mut frame_wgt)?;
             // Piloto limpio EXCLUYENDO la aportación limpia de este frame:
             // donde el frame estaba enmascarado en r1, su aporte a los
             // totales limpios ya es cero.
@@ -771,14 +1657,22 @@ pub(crate) fn run_lite(
     total_sum.iter_mut().for_each(|v| *v = 0.0);
     total_wgt.iter_mut().for_each(|v| *v = 0.0);
     let mut weight_sq = vec![0.0f64; npx * ch];
+    // Σ(w²·VAR) permite propagar de forma exacta tambien el drop CFA, donde
+    // el factor de area hace que VAR no sea simplemente 1/Σw.
+    let mut variance_numerator = formal_uncertainty.then(|| vec![0.0f64; npx * ch]);
     // STRUCT (F7): mitades independientes por paridad de índice temporal.
-    let mut halves: Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> = if ctx.struct_mode {
-        Some((
-            vec![0.0f64; npx * ch],
-            vec![0.0f64; npx * ch],
-            vec![0.0f64; npx * ch],
-            vec![0.0f64; npx * ch],
-        ))
+    let mut halves: Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> = if struct_enabled {
+        let allocation = npx
+            .checked_mul(ch)
+            .ok_or_else(|| "STRUCT omitido: geometría split-half fuera de rango".to_string())
+            .and_then(try_struct_halves);
+        match allocation {
+            Ok(halves) => Some(halves),
+            Err(reason) => {
+                struct_fallback = Some(reason);
+                None
+            }
+        }
     } else {
         None
     };
@@ -786,6 +1680,16 @@ pub(crate) fn run_lite(
         crate::pipeline::cancellation_checkpoint(ctx.cancel, "NebulaFusion: integración")?;
         progress("integración final", k + 1, n);
         let img = load(i)?;
+        let uncertainty = match load_uncertainty {
+            Some(loader) => {
+                let uncertainty = loader(i).map_err(|reason| {
+                    format!("NebulaFusion: no se pudo cargar VAR/DQ formal del frame {i}: {reason}")
+                })?;
+                uncertainty.validate_for(&img)?;
+                Some(uncertainty)
+            }
+            None => None,
+        };
         let bits;
         let mask_ref = if masks[k].is_empty() {
             None
@@ -799,14 +1703,28 @@ pub(crate) fn run_lite(
             t,
             &img,
             &frame_weights_ref[k],
+            uncertainty.as_ref(),
             &mut total_sum,
             &mut total_wgt,
             mask_ref,
             Some(&mut weight_sq),
+            variance_numerator.as_mut(),
         );
         if let Some((sa, wa, sb, wb)) = halves.as_mut() {
             let (hs, hw) = if k % 2 == 0 { (sa, wa) } else { (sb, wb) };
-            nf_accumulate(ctx, k, t, &img, &frame_weights_ref[k], hs, hw, mask_ref, None);
+            nf_accumulate(
+                ctx,
+                k,
+                t,
+                &img,
+                &frame_weights_ref[k],
+                uncertainty.as_ref(),
+                hs,
+                hw,
+                mask_ref,
+                None,
+                None,
+            );
         }
     }
 
@@ -823,7 +1741,10 @@ pub(crate) fn run_lite(
             if wv > 0.0 {
                 covered = true;
                 final_data[i] = (total_sum[i] / wv) as f32;
-                variance[i] = (1.0 / wv) as f32;
+                variance[i] = variance_numerator
+                    .as_ref()
+                    .map(|numerator| (numerator[i] / (wv * wv)) as f32)
+                    .unwrap_or_else(|| (1.0 / wv) as f32);
                 if weight_sq[i] > 0.0 {
                     neff[i] = ((wv * wv) / weight_sq[i]) as f32;
                 }
@@ -836,30 +1757,24 @@ pub(crate) fn run_lite(
     // STRUCT (F7): lumas y σ de las mitades (la validación corre tras el
     // modo Full, sobre el SCI definitivo).
     let struct_halves: Option<(Vec<f32>, Vec<f32>, f32, f32)> =
-        halves.take().map(|(sa, wa, sb, wb)| {
-            let luma = |s: &[f64], wgt_h: &[f64]| -> Vec<f32> {
-                (0..npx)
-                    .map(|p| {
-                        let mut vs = 0.0f64;
-                        let mut vw = 0.0f64;
-                        for c in 0..ch {
-                            vs += s[p * ch + c];
-                            vw += wgt_h[p * ch + c];
-                        }
-                        if vw > 0.0 {
-                            (vs / vw) as f32
-                        } else {
-                            0.0
-                        }
-                    })
-                    .collect()
-            };
-            let la = luma(&sa, &wa);
-            let lb = luma(&sb, &wb);
-            let s_a = crate::ds_mrs_noise(&la, w_out, h_out);
-            let s_b = crate::ds_mrs_noise(&lb, w_out, h_out);
-            (la, lb, s_a, s_b)
-        });
+        if let Some((sa, wa, sb, wb)) = halves.take() {
+            match (
+                try_half_luma(&sa, &wa, npx, ch),
+                try_half_luma(&sb, &wb, npx, ch),
+            ) {
+                (Ok(la), Ok(lb)) => {
+                    let s_a = crate::ds_mrs_noise(&la, w_out, h_out);
+                    let s_b = crate::ds_mrs_noise(&lb, w_out, h_out);
+                    Some((la, lb, s_a, s_b))
+                }
+                (Err(reason), _) | (_, Err(reason)) => {
+                    struct_fallback = Some(reason);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
     // --- Modo Full (F6): recombinación espectral con PSF objetivo ---
     // Mantiene NEFF/cobertura/rechazos del pase C y REEMPLAZA SCI y VAR por
@@ -871,122 +1786,144 @@ pub(crate) fn run_lite(
         if ctx.cfa.is_some() {
             full_fallback =
                 Some("el modo Full requiere la ruta demosaiced (CFA directo llega después)".into());
+        } else if let Err(reason) = validate_full_config(ctx.config) {
+            full_fallback = Some(format!("configuración Full inválida: {reason}"));
+        } else if ctx.config.empirical_psd {
+            let reason = "empiricalPsd=true todavía no dispone de un estimador PSD cross-fit por frame/canal; Full se degrada a Lite para no etiquetar una PSD analítica como empírica".to_string();
+            parameter_fallbacks.push(reason.clone());
+            full_fallback = Some(reason);
         } else {
-            // 1. PSF Moffat por frame (espacio nativo; la rotación del
-            //    registro se ignora en v1 — campos con rotación pequeña).
-            let mut psfs: Vec<crate::deepsky_psf::MoffatPsf> = Vec::with_capacity(n);
-            let mut psf_fail: Option<String> = None;
-            for (k, &(i, _t, _fw)) in ctx.registered.iter().enumerate() {
-                crate::pipeline::cancellation_checkpoint(ctx.cancel, "NebulaFusion Full: PSF")?;
-                progress("ajuste PSF Moffat", k + 1, n);
-                let img = load(i)?;
-                let npx_native = img.w * img.h;
-                let luma: Vec<f32> = if img.ch == 1 {
-                    img.data.clone()
-                } else {
-                    (0..npx_native)
-                        .map(|p| {
-                            (img.data[p * img.ch]
-                                + img.data[p * img.ch + 1]
-                                + img.data[p * img.ch + 2])
-                                / 3.0
-                        })
-                        .collect()
-                };
-                let stars = ctx.stars.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
-                match crate::deepsky_psf::fit_frame_psf(&luma, img.w, img.h, stars, 0.2) {
-                    Some((fp, _rep)) => psfs.push(fp.at(0.5, 0.5)),
-                    None => {
-                        psf_fail = Some(format!(
-                            "frame {i}: censo estelar insuficiente para la PSF Moffat (se integra en Lite)"
-                        ));
-                        break;
-                    }
-                }
-            }
-            if let Some(reason) = psf_fail {
+            let warps = full_supported_warps(ctx.registered, w_out, h_out);
+            if let Err(reason) = warps {
                 full_fallback = Some(reason);
             } else {
-                // 2. σ′ por frame/canal desde los pesos inverso-varianza.
-                let sigmas: Vec<[f32; 3]> = frame_weights
-                    .iter()
-                    .map(|fw| match fw {
-                        FrameWeights::Rgb(w3) => {
-                            let mut s = [0f32; 3];
-                            for c in 0..3 {
-                                s[c] = (1.0 / w3[c].max(1e-12)).sqrt() as f32;
-                            }
-                            s
-                        }
-                        FrameWeights::Grid(g) => {
-                            let mut sg = g.clone();
-                            sg.sort_by(|a, b| a.total_cmp(b));
-                            let s = (1.0 / sg[sg.len() / 2].max(1e-12) as f64).sqrt() as f32;
-                            [s, s, s]
-                        }
-                    })
-                    .collect();
-                // 3. Pase W: frames warpeados con outliers sustituidos por el
-                //    piloto limpio (bit INTERPOLATED en DQ — compromiso v1
-                //    documentado: el solver local exacto llega después).
-                let dir = std::env::temp_dir().join("zenith_nf_full");
-                let tag = format!(
-                    "nf_full_{}_{}",
-                    std::process::id(),
-                    crate::pipeline::new_job_id("w")
-                );
-                let mut wstore =
-                    crate::frame_store::AdaptiveFrameStore::new(n, npx * ch, &dir, &tag)?;
-                for (k, &(i, t, _fw)) in ctx.registered.iter().enumerate() {
-                    crate::pipeline::cancellation_checkpoint(ctx.cancel, "NebulaFusion Full: warp")?;
-                    progress("warp para recombinación", k + 1, n);
-                    warp_frame(k, i, t, &mut frame_sum, &mut frame_wgt)?;
-                    let mut y = vec![0.0f32; npx * ch];
-                    for idx in 0..npx * ch {
-                        if frame_wgt[idx] > 0.0 {
-                            y[idx] = (frame_sum[idx] / frame_wgt[idx]) as f32;
-                        } else if clean_wgt[idx] > 0.0 {
-                            // Píxel NO cubierto por este frame: la FFT no
-                            // admite huecos y un 0 sesgaría hacia negro los
-                            // bordes con cobertura parcial (12/16 frames ⇒
-                            // 0.75·V). Se sustituye por el piloto limpio y
-                            // DQ|=EDGE lo declara (hallazgo de la revisión
-                            // adversarial F5-F8).
-                            y[idx] = (clean_sum[idx] / clean_wgt[idx]) as f32;
-                            dq[idx / ch] |= crate::deepsky_variance::dq::EDGE;
+                let warps = warps.expect("resultado comprobado");
+                // 1. PSF Moffat independiente por frame/canal. Si un canal
+                // RGB no sostiene una medida, no se replica la PSF de luma.
+                let mut psfs: Vec<[crate::deepsky_psf::MoffatPsf; 3]> = Vec::with_capacity(n);
+                let mut psf_fail: Option<String> = None;
+                for (k, &(i, _t, _fw)) in ctx.registered.iter().enumerate() {
+                    crate::pipeline::cancellation_checkpoint(ctx.cancel, "NebulaFusion Full: PSF")?;
+                    progress("ajuste PSF Moffat por canal", k + 1, n);
+                    let img = load(i)?;
+                    let stars = ctx.stars.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+                    match fit_channel_psfs(&img, stars) {
+                        Some(per_channel) => psfs.push(per_channel),
+                        None => {
+                            psf_fail = Some(format!(
+                                "frame {i}: al menos un canal no tiene censo suficiente para medir su PSF; Full degradado a Lite"
+                            ));
+                            break;
                         }
                     }
-                    for &p in masks[k].positive.iter().chain(&masks[k].negative) {
-                        let p = p as usize;
-                        for c in 0..ch {
-                            let idx = p * ch + c;
-                            if clean_wgt[idx] > 0.0 {
-                                y[idx] = (clean_sum[idx] / clean_wgt[idx]) as f32;
-                            }
-                        }
-                        dq[p] |= crate::deepsky_variance::dq::INTERPOLATED;
-                    }
-                    wstore.put(k, &y)?;
                 }
-                // 4. Recombinación GLS por frecuencia con Γ objetivo.
-                let inputs = crate::nebula_fusion_full::NfFullInputs {
-                    warped: &wstore,
-                    n_frames: n,
-                    w: w_out,
-                    h: h_out,
-                    ch,
-                    sigmas: &sigmas,
-                    psfs: &psfs,
-                    lanczos: ctx.use_lanczos,
-                    cancel: ctx.cancel,
-                };
-                let fout = crate::nebula_fusion_full::combine_full(&inputs, progress)?;
-                final_data = fout.sci;
-                variance = fout.var_map;
-                full_report = Some((fout.target_fwhm, fout.tiles_fallback, fout.tiles_total));
+                if let Some(reason) = psf_fail {
+                    full_fallback = Some(reason);
+                } else {
+                    // 2. Pase W: los datos ausentes y outliers quedan con
+                    // peso CERO en un store explícito. No se imputa el piloto.
+                    let dir = std::env::temp_dir().join("zenith_nf_full");
+                    let job = crate::pipeline::new_job_id("w");
+                    let tag = format!("nf_full_{}_{}", std::process::id(), job);
+                    let vtag = format!("nf_full_valid_{}_{}", std::process::id(), job);
+                    let ptag = format!("nf_full_precision_{}_{}", std::process::id(), job);
+                    let mut wstore =
+                        crate::frame_store::AdaptiveFrameStore::new(n, npx * ch, &dir, &tag)?;
+                    let mut vstore =
+                        crate::frame_store::AdaptiveFrameStore::new(n, npx * ch, &dir, &vtag)?;
+                    let mut pstore = crate::frame_store::AdaptiveFrameStore::new(
+                        n,
+                        npx * ch,
+                        &dir,
+                        &ptag,
+                    )?;
+                    for (k, &(i, t, _fw)) in ctx.registered.iter().enumerate() {
+                        crate::pipeline::cancellation_checkpoint(
+                            ctx.cancel,
+                            "NebulaFusion Full: warp",
+                        )?;
+                        progress("warp y máscara para recombinación", k + 1, n);
+                        let _ = warp_frame(k, i, t, &mut frame_sum, &mut frame_wgt)?;
+                        let rejected = masks[k].to_bitset(npx);
+                        let mut y = vec![0.0f32; npx * ch];
+                        let mut valid = vec![0.0f32; npx * ch];
+                        let mut precision = vec![0.0f32; npx * ch];
+                        for p in 0..npx {
+                            let masked = (rejected[p >> 6] >> (p & 63)) & 1 == 1;
+                            for c in 0..ch {
+                                let idx = p * ch + c;
+                                if masked || frame_wgt[idx] <= 0.0 {
+                                    if !masked {
+                                        dq[p] |= crate::deepsky_variance::dq::EDGE;
+                                    }
+                                    continue;
+                                }
+                                let value = (frame_sum[idx] / frame_wgt[idx]) as f32;
+                                if value.is_finite() {
+                                    y[idx] = value;
+                                    valid[idx] = 1.0;
+                                    precision[idx] = frame_wgt[idx] as f32;
+                                } else {
+                                    dq[p] |= crate::deepsky_variance::dq::NAN_INPUT;
+                                }
+                            }
+                        }
+                        wstore.put(k, &y)?;
+                        vstore.put(k, &valid)?;
+                        pstore.put(k, &precision)?;
+                    }
+                    // 3. Recombinación GLS; los tiles con alguna muestra de
+                    // peso cero usan media espacial local, sin contarla en NEFF.
+                    let inputs = crate::nebula_fusion_full::NfFullInputs {
+                        warped: &wstore,
+                        validity: &vstore,
+                        precision: formal_uncertainty.then_some(&pstore),
+                        n_frames: n,
+                        w: w_out,
+                        h: h_out,
+                        ch,
+                        sigmas: &frame_sigmas,
+                        psfs: &psfs,
+                        warps: &warps,
+                        lanczos: ctx.use_lanczos,
+                        tile_size: ctx.config.tile_size,
+                        max_psf_leakage: ctx.config.max_psf_leakage,
+                        max_noise_amplification: ctx.config.max_noise_amplification,
+                        cancel: ctx.cancel,
+                    };
+                    match crate::nebula_fusion_full::combine_full(&inputs, progress) {
+                        Ok(fout) if fout.gls_tiles > 0 => {
+                            final_data = fout.sci;
+                            variance = fout.var_map;
+                            neff = fout.neff_map;
+                            full_report =
+                                Some((fout.target_fwhm, fout.tiles_fallback, fout.tiles_total));
+                        }
+                        Ok(fout) => {
+                            full_fallback = Some(format!(
+                                "ningún tile sostuvo el operador GLS ({} tiles con datos ausentes/PSF no recuperable); SCI Lite conservado",
+                                fout.tiles_fallback
+                            ));
+                        }
+                        Err(reason) => {
+                            full_fallback = Some(format!(
+                                "solver Full rechazado; SCI Lite conservado: {reason}"
+                            ));
+                        }
+                    }
+                }
             }
         }
     }
+
+    nf_finalize_scientific_pixels(
+        &mut final_data,
+        &mut variance,
+        &mut neff,
+        &mut dq,
+        npx,
+        ch,
+    )?;
 
     // --- STRUCT (F7): validación split-half sobre el SCI definitivo ---
     let mut struct_map: Option<Vec<f32>> = None;
@@ -994,21 +1931,38 @@ pub(crate) fn run_lite(
     let mut struct_accepted: Option<Vec<(usize, usize)>> = None;
     if let Some((la, lb, s_a, s_b)) = struct_halves {
         progress("STRUCT: validación por mitades", 1, 1);
-        let full_luma: Vec<f32> = if ch == 1 {
-            final_data.clone()
+        match try_full_luma(&final_data, npx, ch).and_then(|full_luma| {
+            crate::deepsky_struct::build_struct(
+                &full_luma,
+                &la,
+                &lb,
+                w_out,
+                h_out,
+                s_a,
+                s_b,
+                ctx.config.fdr_q,
+                ctx.config.min_split_sigma,
+            )
+        }) {
+            Ok(out_s) => {
+                struct_accepted = Some(out_s.accepted_per_level);
+                struct_map = Some(out_s.struct_map);
+                struct_residual = Some(out_s.residual);
+            }
+            Err(reason) => struct_fallback = Some(reason),
+        }
+    }
+
+    if let Some(reason) = struct_fallback.take() {
+        let effective = if ctx.full && full_report.is_some() {
+            format!("FullWithStruct degradado a Full; SCI Full conservado: {reason}")
+        } else if ctx.full {
+            format!("FullWithStruct degradado a Lite sin STRUCT: {reason}")
         } else {
-            (0..npx)
-                .map(|p| {
-                    (final_data[p * ch] + final_data[p * ch + 1] + final_data[p * ch + 2]) / 3.0
-                })
-                .collect()
+            format!("STRUCT omitido; SCI Lite conservado: {reason}")
         };
-        let out_s = crate::deepsky_struct::build_struct(
-            &full_luma, &la, &lb, w_out, h_out, s_a, s_b, 0.01, 2.5,
-        );
-        struct_accepted = Some(out_s.accepted_per_level);
-        struct_map = Some(out_s.struct_map);
-        struct_residual = Some(out_s.residual);
+        progress(&effective, 1, 1);
+        struct_fallback = Some(effective);
     }
 
     let weight_map = cov_reduce(&total_wgt, npx, ch);
@@ -1024,6 +1978,37 @@ pub(crate) fn run_lite(
         0.0
     };
 
+    let effective_config = NfEffectiveConfig {
+        variance_weighting: if formal_uncertainty {
+            "calibration_var_dq_spatial"
+        } else {
+            "empirical_mrs"
+        },
+        crossfit_mode: if crossfit_enabled {
+            "leave_one_out"
+        } else {
+            "disabled"
+        },
+        crossfit_reference_frames: if crossfit_enabled {
+            n.saturating_sub(1)
+        } else {
+            0
+        },
+        full_active: full_report.is_some(),
+        tile_size: full_report.map(|_| ctx.config.tile_size),
+        max_psf_leakage: full_report.map(|_| ctx.config.max_psf_leakage),
+        max_noise_amplification: full_report
+            .map(|_| ctx.config.max_noise_amplification),
+        // empiricalPsd=true currently fails its explicit gate, so no
+        // successful effective configuration can claim it.
+        empirical_psd: false,
+        struct_active: struct_accepted.is_some(),
+        fdr_q: struct_accepted.as_ref().map(|_| ctx.config.fdr_q),
+        min_split_sigma: struct_accepted
+            .as_ref()
+            .map(|_| ctx.config.min_split_sigma),
+    };
+
     Ok(NfLiteOutput {
         final_data,
         wgt1,
@@ -1037,7 +2022,11 @@ pub(crate) fn run_lite(
             neff,
             dq,
             masked_samples,
-            variance_origin: crate::deepsky_variance::VarianceOrigin::Empirical,
+            variance_origin: if formal_uncertainty {
+                crate::deepsky_variance::VarianceOrigin::HybridEmpiricalPropagated
+            } else {
+                crate::deepsky_variance::VarianceOrigin::Empirical
+            },
             g1g2_offset_max: ctx.cfa.map(|_| g1g2_offset_max),
         },
         full_report,
@@ -1045,6 +2034,9 @@ pub(crate) fn run_lite(
         struct_map,
         struct_residual,
         struct_accepted,
+        struct_fallback,
+        parameter_fallbacks,
+        effective_config,
     })
 }
 
@@ -1091,7 +2083,13 @@ mod tests {
 
     fn identity_registered(n: usize) -> Vec<(usize, crate::DsTransform, f64)> {
         (0..n)
-            .map(|i| (i, crate::DsTransform::from_similarity((1.0, 0.0, 0.0, 0.0)), 1.0))
+            .map(|i| {
+                (
+                    i,
+                    crate::DsTransform::from_similarity((1.0, 0.0, 0.0, 0.0)),
+                    1.0,
+                )
+            })
             .collect()
     }
 
@@ -1136,6 +2134,7 @@ mod tests {
             full: false,
             stars: &[],
             struct_mode: false,
+            config: NfRuntimeConfig::default(),
         };
         let load = |i: usize| -> Result<crate::DsImage, String> {
             Ok(crate::DsImage {
@@ -1146,7 +2145,7 @@ mod tests {
                 bayer: None,
             })
         };
-        run_lite(&ctx, &load, &mut |_, _, _| {}).expect("run_lite")
+        run_lite(&ctx, &load, None, &mut |_, _, _| {}).expect("run_lite")
     }
 
     /// Gate F3: SNR de fondo ≥98% del óptimo 1/σ². Dos poblaciones de ruido
@@ -1277,6 +2276,7 @@ mod tests {
             full: false,
             stars: &[],
             struct_mode: false,
+            config: NfRuntimeConfig::default(),
         };
         let frames_ref = &frames;
         let load = |i: usize| -> Result<crate::DsImage, String> {
@@ -1288,7 +2288,7 @@ mod tests {
                 bayer: None,
             })
         };
-        let out = run_lite(&ctx, &load, &mut |_, _, _| {}).expect("run_lite");
+        let out = run_lite(&ctx, &load, None, &mut |_, _, _| {}).expect("run_lite");
         // Recall: cada píxel inyectado debe estar rechazado (mapa alto > 0).
         let hit = injected
             .iter()
@@ -1443,6 +2443,7 @@ mod tests {
             full: false,
             stars: &[],
             struct_mode: false,
+            config: NfRuntimeConfig::default(),
         };
         let frames_ref = &frames;
         let load = |i: usize| -> Result<crate::DsImage, String> {
@@ -1454,7 +2455,7 @@ mod tests {
                 bayer: Some(8),
             })
         };
-        let out = run_lite(&ctx, &load, &mut |_, _, _| {}).expect("run_lite CFA");
+        let out = run_lite(&ctx, &load, None, &mut |_, _, _| {}).expect("run_lite CFA");
         // Cociente de canales: media interior por canal vs verdad 400·color.
         let mut ch_mean = [0.0f64; 3];
         let mut ch_cnt = [0.0f64; 3];
@@ -1539,7 +2540,10 @@ mod tests {
         dq[2] = crate::deepsky_variance::dq::HOT_COLD;
         let b_dq = bin_dq(&dq, w, h, 1, 2);
         assert_eq!(b_dq[0], crate::deepsky_variance::dq::NO_COVERAGE);
-        assert_eq!(b_dq[1] & crate::deepsky_variance::dq::HOT_COLD, crate::deepsky_variance::dq::HOT_COLD);
+        assert_eq!(
+            b_dq[1] & crate::deepsky_variance::dq::HOT_COLD,
+            crate::deepsky_variance::dq::HOT_COLD
+        );
         assert_eq!(b_dq[1] & crate::deepsky_variance::dq::NO_COVERAGE, 0);
     }
 
@@ -1558,10 +2562,10 @@ mod tests {
         for y in 0..h {
             for x in 0..w {
                 let base = match (x & 1, y & 1) {
-                    (0, 0) => 100.0,        // R
-                    (1, 0) => 200.0,        // G1
-                    (0, 1) => 210.0,        // G2 (offset +10)
-                    _ => 50.0,              // B
+                    (0, 0) => 100.0, // R
+                    (1, 0) => 200.0, // G1
+                    (0, 1) => 210.0, // G2 (offset +10)
+                    _ => 50.0,       // B
                 };
                 data[y * w + x] = base + noise();
             }
@@ -1656,7 +2660,8 @@ mod tests {
             cfa: None,
             full: true,
             stars: &catalogs,
-            struct_mode: false,
+            struct_mode: true,
+            config: NfRuntimeConfig::default(),
         };
         let frames_ref = &frames;
         let load = |i: usize| -> Result<crate::DsImage, String> {
@@ -1668,11 +2673,21 @@ mod tests {
                 bayer: None,
             })
         };
-        let out = run_lite(&ctx, &load, &mut |_, _, _| {}).expect("run_lite full");
+        let _struct_budget = crate::deepsky_struct::override_test_memory_budget(1);
+        let out = run_lite(&ctx, &load, None, &mut |_, _, _| {}).expect("run_lite full");
         assert!(
             out.full_fallback.is_none(),
             "Full degradado: {:?}",
             out.full_fallback
+        );
+        assert!(out.struct_map.is_none());
+        assert!(out.struct_residual.is_none());
+        assert!(
+            out.struct_fallback
+                .as_deref()
+                .is_some_and(|reason| reason.contains("FullWithStruct degradado a Full")),
+            "fallback STRUCT no registrado: {:?}",
+            out.struct_fallback
         );
         let (target_fwhm, _fb, total) = out.full_report.expect("full_report");
         assert!(total > 0);
@@ -1770,6 +2785,7 @@ mod tests {
             full: false,
             stars: &[],
             struct_mode: true,
+            config: NfRuntimeConfig::default(),
         };
         let frames_ref = &frames;
         let load = |i: usize| -> Result<crate::DsImage, String> {
@@ -1781,7 +2797,8 @@ mod tests {
                 bayer: None,
             })
         };
-        let out = run_lite(&ctx, &load, &mut |_, _, _| {}).expect("run_lite struct");
+        let out = run_lite(&ctx, &load, None, &mut |_, _, _| {}).expect("run_lite struct");
+        assert!(out.struct_fallback.is_none());
         let sm = out.struct_map.as_ref().expect("struct_map");
         let sr = out.struct_residual.as_ref().expect("struct_residual");
         let acc = out.struct_accepted.as_ref().expect("accepted");
@@ -1842,10 +2859,188 @@ mod tests {
             "VAR {var:.2} vs esperado {expected:.2}"
         );
         let neff = out.products.neff[center] as f64;
-        assert!(
-            (neff - n as f64).abs() < 0.5,
-            "NEFF {neff:.2} vs {n}"
-        );
+        assert!((neff - n as f64).abs() < 0.5, "NEFF {neff:.2} vs {n}");
         assert_eq!(out.products.dq[center], 0);
+    }
+
+    #[test]
+    fn formal_calibration_variance_and_dq_govern_lite_weights() {
+        let (w, h) = (8usize, 8usize);
+        let frames = [vec![10.0f32; w * h], vec![20.0f32; w * h]];
+        let mut uncertainties = [
+            NfCalibrationUncertainty {
+                variance: vec![1.0; w * h],
+                dq: vec![0; w * h],
+                w,
+                h,
+                ch: 1,
+            },
+            NfCalibrationUncertainty {
+                variance: vec![4.0; w * h],
+                dq: vec![0; w * h],
+                w,
+                h,
+                ch: 1,
+            },
+        ];
+        let excluded = 3 * w + 3;
+        uncertainties[0].dq[excluded] = crate::deepsky_variance::dq::HOT_COLD
+            | crate::deepsky_variance::dq::INTERPOLATED;
+        uncertainties[0].variance[excluded] = f32::NAN;
+        let registered = identity_registered(2);
+        let norms = neutral_norms(2);
+        let loc = vec![None, None];
+        let cancel = no_cancel();
+        let ctx = NfLiteContext {
+            registered: &registered,
+            norms: &norms,
+            loc_fields: &loc,
+            loc_grid: 24,
+            w_out: w,
+            h_out: h,
+            ch: 1,
+            use_lanczos: false,
+            cancel: &cancel,
+            cfa: None,
+            full: false,
+            stars: &[],
+            struct_mode: false,
+            config: NfRuntimeConfig::default(),
+        };
+        let load = |index: usize| {
+            Ok(crate::DsImage {
+                data: frames[index].clone(),
+                w,
+                h,
+                ch: 1,
+                bayer: None,
+            })
+        };
+        let load_uncertainty = |index: usize| Ok(uncertainties[index].clone());
+        let out = run_lite(
+            &ctx,
+            &load,
+            Some(&load_uncertainty),
+            &mut |_, _, _| {},
+        )
+        .expect("NF formal");
+
+        let clean = 2 * w + 2;
+        assert!((out.final_data[clean] - 12.0).abs() < 1.0e-6);
+        assert!((out.products.variance[clean] - 0.8).abs() < 1.0e-6);
+        assert!((out.products.neff[clean] - 1.470_588_2).abs() < 1.0e-5);
+        assert_eq!(out.final_data[excluded], 20.0);
+        assert_eq!(out.products.variance[excluded], 4.0);
+        assert_eq!(out.products.neff[excluded], 1.0);
+        assert_eq!(out.products.dq[excluded], 0);
+        assert_eq!(
+            out.products.variance_origin,
+            crate::deepsky_variance::VarianceOrigin::HybridEmpiricalPropagated
+        );
+    }
+
+    #[test]
+    fn formal_variance_missing_without_fatal_dq_fails_closed() {
+        let image = crate::DsImage {
+            data: vec![1.0; 16],
+            w: 4,
+            h: 4,
+            ch: 1,
+            bayer: None,
+        };
+        let uncertainty = NfCalibrationUncertainty {
+            variance: vec![f32::NAN; 16],
+            dq: vec![0; 16],
+            w: 4,
+            h: 4,
+            ch: 1,
+        };
+        let error = uncertainty
+            .validate_for(&image)
+            .expect_err("VAR ausente no puede degradarse silenciosamente");
+        assert!(error.contains("VAR no positiva/no finita"));
+    }
+
+    #[test]
+    fn incomplete_rgb_pixel_invalidates_all_science_channels() {
+        let mut science = vec![1.0, 2.0, f32::NAN];
+        let mut variance = vec![1.0, 1.0, f32::NAN];
+        let mut neff = vec![2.0, 2.0, 0.0];
+        let mut dq = vec![0u32];
+        nf_finalize_scientific_pixels(
+            &mut science,
+            &mut variance,
+            &mut neff,
+            &mut dq,
+            1,
+            3,
+        )
+        .expect("contrato RGB");
+        assert!(science.iter().all(|value| value.is_nan()));
+        assert!(variance.iter().all(|value| value.is_nan()));
+        assert!(neff.iter().all(|value| *value == 0.0));
+        assert_ne!(dq[0] & crate::deepsky_variance::dq::NO_COVERAGE, 0);
+    }
+
+    #[test]
+    fn full_geometry_gate_accepts_supported_warps_and_rejects_local_distortion() {
+        let angle = 0.5f32.to_radians();
+        let rotated = crate::DsTransform::from_similarity((angle.cos(), angle.sin(), 0.25, -0.4));
+        let registered = vec![(0usize, rotated, 1.0f64)];
+        let warps = full_supported_warps(&registered, 4096, 3072)
+            .expect("una rotación similarity tiene operador W×PSF");
+        assert_eq!(
+            warps[0].kind,
+            crate::nebula_fusion_full::NfFullWarpKind::Affine
+        );
+
+        let translated = vec![(
+            0usize,
+            crate::DsTransform::from_similarity((1.0, 0.0, 0.25, -0.4)),
+            1.0f64,
+        )];
+        let warps = full_supported_warps(&translated, 4096, 3072)
+            .expect("la traslación tiene operador por frame");
+        assert_eq!(
+            warps[0].kind,
+            crate::nebula_fusion_full::NfFullWarpKind::Translation
+        );
+
+        let affine = crate::DsTransform {
+            model: crate::DsRegistrationModel::Affine,
+            h: [1.002, -0.006, 0.3, 0.004, 0.998, -0.2, 0.0, 0.0, 1.0],
+            poly: [0.0; 12],
+            norm: [0.0, 0.0, 1.0],
+        };
+        let projective = crate::DsTransform {
+            model: crate::DsRegistrationModel::Projective,
+            h: [1.0, -0.002, 0.2, 0.001, 1.0, -0.1, 2e-7, -1e-7, 1.0],
+            poly: [0.0; 12],
+            norm: [0.0, 0.0, 1.0],
+        };
+        let mixed = vec![(0, affine, 1.0), (1, projective, 1.0)];
+        let warps = full_supported_warps(&mixed, 4096, 3072)
+            .expect("affine y projective suaves deben pasar el preflight");
+        assert_eq!(
+            warps[0].kind,
+            crate::nebula_fusion_full::NfFullWarpKind::Affine
+        );
+        assert_eq!(
+            warps[1].kind,
+            crate::nebula_fusion_full::NfFullWarpKind::Projective
+        );
+
+        let local = crate::DsTransform {
+            model: crate::DsRegistrationModel::LocalDistortion,
+            h: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            poly: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            norm: [0.0, 0.0, 1.0],
+        };
+        let error = full_supported_warps(&[(0, local, 1.0)], 4096, 3072)
+            .expect_err("LocalDistortion debe conservar fallback seguro");
+        assert!(
+            error.contains("LocalDistortion"),
+            "fallback no auditable: {error}"
+        );
     }
 }

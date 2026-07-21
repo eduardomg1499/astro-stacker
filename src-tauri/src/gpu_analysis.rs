@@ -6,8 +6,10 @@
 //! workers Rayon siguen con SAD/CoG/decisiones de frames anteriores.
 
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 static PARITY: AtomicU8 = AtomicU8::new(0); // 0 pending, 1 ok, 2 failed
+static SAD_PARITY: AtomicU8 = AtomicU8::new(0); // kernel SAD batched independiente
 
 const WGSL: &str = r#"
 struct Params {
@@ -667,6 +669,7 @@ struct BatchEngine {
     slots: Vec<Engine>,
     staging: wgpu::Buffer,
     staging_words_per_slot: usize,
+    _vram_reservation: crate::gpu_stack::PlanetaryVramReservation,
 }
 
 impl BatchEngine {
@@ -696,6 +699,9 @@ impl BatchEngine {
                 rt.vram_budget / 1_048_576
             ));
         }
+        let vram_reservation = rt
+            .planetary_vram
+            .try_reserve(needed, "lotes de análisis planetario")?;
         let mut slots = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             slots.push(Engine::new(rt, w, h)?);
@@ -713,6 +719,7 @@ impl BatchEngine {
             slots,
             staging,
             staging_words_per_slot,
+            _vram_reservation: vram_reservation,
         })
     }
 }
@@ -835,8 +842,8 @@ fn sad_points(@builtin(global_invocation_id) gid: vec3<u32>) {
     let half_h = ap.box_h / 2;
     let rx0 = ap.ref_x - half_w;
     let ry0 = ap.ref_y - half_h;
-    if (rx0 < 0 || ry0 < 0 || rx0 + ap.box_w >= i32(P.w)
-        || ry0 + ap.box_h >= i32(P.h)) {
+    if (rx0 < 0 || ry0 < 0 || rx0 + ap.box_w > i32(P.w)
+        || ry0 + ap.box_h > i32(P.h)) {
         results[pi] = SadResult(0, 0, 0xffffffffu, 0xffffffffu);
         return;
     }
@@ -853,8 +860,8 @@ fn sad_points(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if ((phase == 0) != (dx == 0 && dy == 0)) { continue; }
                 let tx0 = ap.tgt_x + dx - half_w;
                 let ty0 = ap.tgt_y + dy - half_h;
-                if (tx0 < 0 || ty0 < 0 || tx0 + ap.box_w >= i32(P.w)
-                    || ty0 + ap.box_h >= i32(P.h)) { continue; }
+                if (tx0 < 0 || ty0 < 0 || tx0 + ap.box_w > i32(P.w)
+                    || ty0 + ap.box_h > i32(P.h)) { continue; }
                 var lo = 0u;
                 var hi = 0u;
                 var pruned = false;
@@ -1037,8 +1044,52 @@ struct SadEngine {
     target: wgpu::Buffer,
     points: wgpu::Buffer,
     results: wgpu::Buffer,
-    staging: wgpu::Buffer,
     bind: wgpu::BindGroup,
+    /// Arc permite que una llamada conserve la reserva hasta terminar su
+    /// readback aunque el LRU desaloje el engine después del submit.
+    _vram_reservation: Arc<crate::gpu_stack::PlanetaryVramReservation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SadEngineAllocation {
+    image_bytes: u64,
+    point_bytes: u64,
+    result_bytes: u64,
+    /// Buffers persistentes. Cada llamada reserva aparte su staging real para
+    /// que un batch de varios targets también quede cubierto exactamente.
+    reserved_bytes: u64,
+}
+
+fn sad_engine_allocation(
+    w: usize,
+    h: usize,
+    capacity: usize,
+) -> Result<SadEngineAllocation, String> {
+    let pixels = w.checked_mul(h).ok_or("Mapa SAD demasiado grande")?;
+    // Dos u16 por palabra u32: mitad de VRAM y ancho de upload que una
+    // expansión u16 -> u32.
+    let image_bytes = (pixels.div_ceil(2) as u64)
+        .checked_mul(4)
+        .ok_or("Mapa SAD demasiado grande")?;
+    let capacity = capacity.max(1);
+    let point_bytes = (capacity as u64)
+        .checked_mul(std::mem::size_of::<SadPoint>() as u64)
+        .ok_or("Demasiados puntos SAD")?;
+    let result_bytes = (capacity as u64)
+        .checked_mul(16)
+        .ok_or("Demasiados resultados SAD")?;
+    let reserved_bytes = image_bytes
+        .checked_mul(2)
+        .and_then(|v| v.checked_add(point_bytes))
+        .and_then(|v| v.checked_add(result_bytes))
+        .and_then(|v| v.checked_add(4096))
+        .ok_or("Reserva SAD GPU demasiado grande")?;
+    Ok(SadEngineAllocation {
+        image_bytes,
+        point_bytes,
+        result_bytes,
+        reserved_bytes,
+    })
 }
 
 impl SadEngine {
@@ -1048,31 +1099,22 @@ impl SadEngine {
         h: usize,
         capacity: usize,
     ) -> Result<Self, String> {
-        // Dos u16 por palabra u32: mitad de VRAM y ancho de upload que la
-        // antigua expansión de cada muestra a u32.
-        let image_bytes = w
-            .checked_mul(h)
-            .ok_or("Mapa SAD demasiado grande")?
-            .div_ceil(2) as u64
-            * 4;
-        let point_bytes = (capacity.max(1) * std::mem::size_of::<SadPoint>()) as u64;
-        let result_bytes = (capacity.max(1) * 16) as u64;
-        let needed = image_bytes
-            .saturating_mul(2)
-            .saturating_add(point_bytes)
-            .saturating_add(result_bytes.saturating_mul(2))
-            .saturating_add(4096);
-        if image_bytes > rt.max_binding
-            || point_bytes > rt.max_binding
-            || result_bytes > rt.max_binding
-            || needed > rt.vram_budget
+        let allocation = sad_engine_allocation(w, h, capacity)?;
+        if allocation.image_bytes > rt.max_binding
+            || allocation.point_bytes > rt.max_binding
+            || allocation.result_bytes > rt.max_binding
+            || allocation.reserved_bytes > rt.vram_budget
         {
             return Err(format!(
                 "SAD GPU requiere {} MB y el presupuesto es {} MB",
-                needed / 1_048_576,
+                allocation.reserved_bytes / 1_048_576,
                 rt.vram_budget / 1_048_576
             ));
         }
+        let vram_reservation = Arc::new(
+            rt.planetary_vram
+                .try_reserve(allocation.reserved_bytes, "motor SAD planetario")?,
+        );
         let params = rt.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("zas-analysis-sad-params"),
             size: std::mem::size_of::<SadParams>() as u64,
@@ -1093,16 +1135,10 @@ impl SadEngine {
                 mapped_at_creation: false,
             })
         };
-        let reference = mk("zas-analysis-sad-reference", image_bytes, false);
-        let target = mk("zas-analysis-sad-target", image_bytes, false);
-        let points = mk("zas-analysis-sad-points", point_bytes, false);
-        let results = mk("zas-analysis-sad-results", result_bytes, true);
-        let staging = rt.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("zas-analysis-sad-staging"),
-            size: result_bytes,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let reference = mk("zas-analysis-sad-reference", allocation.image_bytes, false);
+        let target = mk("zas-analysis-sad-target", allocation.image_bytes, false);
+        let points = mk("zas-analysis-sad-points", allocation.point_bytes, false);
+        let results = mk("zas-analysis-sad-results", allocation.result_bytes, true);
         let pp = sad_pipelines(rt);
         let bind = rt.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("zas-analysis-sad-bind"),
@@ -1139,13 +1175,153 @@ impl SadEngine {
             target,
             points,
             results,
-            staging,
             bind,
+            _vram_reservation: vram_reservation,
         })
     }
 }
 
-static SAD_ENGINE: std::sync::OnceLock<std::sync::Mutex<Option<SadEngine>>> =
+const SAD_ENGINE_POOL_MAX_ENTRIES: usize = 4;
+const SAD_ENGINE_POOL_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+fn sad_engine_pool_budget(vram_budget: u64) -> u64 {
+    // SAD comparte el adapter con preprocess/enhance/stack. Una cuarta parte
+    // permite mantener coarse y fine a la vez sin apropiarse de toda la VRAM.
+    (vram_budget / 4).min(SAD_ENGINE_POOL_MAX_BYTES).max(1)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SadCacheRecord {
+    w: usize,
+    h: usize,
+    capacity: usize,
+    reserved_bytes: u64,
+    last_used: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SadCachePlan {
+    Reuse(usize),
+    Insert { evict: Vec<usize> },
+}
+
+/// Decide reutilización/evicción sin tocar wgpu, para que el límite del pool
+/// pueda probarse de forma determinista. Un engine mayor que la cuota normal
+/// se admite sólo como singleton (siempre que `SadEngine::new` confirme que
+/// cabe en la VRAM real); así se conserva compatibilidad sin crecimiento sin
+/// límite.
+fn plan_sad_cache(
+    records: &[SadCacheRecord],
+    w: usize,
+    h: usize,
+    capacity: usize,
+    reserved_bytes: u64,
+    budget: u64,
+    max_entries: usize,
+) -> SadCachePlan {
+    if let Some((index, _)) = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.w == w && r.h == h && r.capacity >= capacity)
+        .min_by_key(|(_, r)| r.capacity)
+    {
+        return SadCachePlan::Reuse(index);
+    }
+
+    let mut evict = Vec::new();
+    // Un capacity nuevo sustituye engines menores de la misma geometría; el
+    // mayor también sirve las llamadas pequeñas posteriores.
+    for (index, record) in records.iter().enumerate() {
+        if record.w == w && record.h == h {
+            evict.push(index);
+        }
+    }
+    let effective_budget = budget.max(reserved_bytes);
+    let max_entries = max_entries.max(1);
+    loop {
+        let kept_bytes = records
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !evict.contains(i))
+            .map(|(_, r)| r.reserved_bytes)
+            .sum::<u64>();
+        let kept_count = records.len().saturating_sub(evict.len());
+        if kept_count < max_entries && kept_bytes.saturating_add(reserved_bytes) <= effective_budget
+        {
+            break;
+        }
+        let Some((index, _)) = records
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !evict.contains(i))
+            .min_by_key(|(_, r)| r.last_used)
+        else {
+            break;
+        };
+        evict.push(index);
+    }
+    evict.sort_unstable_by(|a, b| b.cmp(a));
+    SadCachePlan::Insert { evict }
+}
+
+struct SadEngineEntry {
+    record: SadCacheRecord,
+    engine: SadEngine,
+}
+
+#[derive(Default)]
+struct SadEnginePool {
+    entries: Vec<SadEngineEntry>,
+    clock: u64,
+}
+
+impl SadEnginePool {
+    fn engine_for(
+        &mut self,
+        rt: &'static crate::gpu_stack::GpuRuntime,
+        w: usize,
+        h: usize,
+        capacity: usize,
+    ) -> Result<&SadEngine, String> {
+        let capacity = capacity.max(1);
+        let allocation = sad_engine_allocation(w, h, capacity)?;
+        let records: Vec<_> = self.entries.iter().map(|entry| entry.record).collect();
+        let plan = plan_sad_cache(
+            &records,
+            w,
+            h,
+            capacity,
+            allocation.reserved_bytes,
+            sad_engine_pool_budget(rt.vram_budget),
+            SAD_ENGINE_POOL_MAX_ENTRIES,
+        );
+        self.clock = self.clock.wrapping_add(1).max(1);
+        let index = match plan {
+            SadCachePlan::Reuse(index) => index,
+            SadCachePlan::Insert { evict } => {
+                for index in evict {
+                    self.entries.remove(index);
+                }
+                let engine = SadEngine::new(rt, w, h, capacity)?;
+                self.entries.push(SadEngineEntry {
+                    record: SadCacheRecord {
+                        w,
+                        h,
+                        capacity,
+                        reserved_bytes: allocation.reserved_bytes,
+                        last_used: self.clock,
+                    },
+                    engine,
+                });
+                self.entries.len() - 1
+            }
+        };
+        self.entries[index].record.last_used = self.clock;
+        Ok(&self.entries[index].engine)
+    }
+}
+
+static SAD_ENGINE_POOL: std::sync::OnceLock<std::sync::Mutex<SadEnginePool>> =
     std::sync::OnceLock::new();
 
 /// Búsqueda SAD exhaustiva de UN punto grande, paralelizada por
@@ -1404,27 +1580,28 @@ struct EnhanceEngine {
     dst: wgpu::Buffer,
     bind_h: wgpu::BindGroup,
     bind_v: wgpu::BindGroup,
+    _vram_reservation: crate::gpu_stack::PlanetaryVramReservation,
 }
 
 impl EnhanceEngine {
-    fn new(
-        rt: &'static crate::gpu_stack::GpuRuntime,
-        w: usize,
-        h: usize,
-    ) -> Result<Self, String> {
+    fn new(rt: &'static crate::gpu_stack::GpuRuntime, w: usize, h: usize) -> Result<Self, String> {
         let image_bytes = w
             .checked_mul(h)
             .ok_or("Plano de enhance demasiado grande")?
             .div_ceil(2) as u64
             * 4;
-        let needed = image_bytes.saturating_mul(4).saturating_add(4096);
-        if image_bytes > rt.max_binding || needed > rt.vram_budget {
+        let persistent_bytes = image_bytes.saturating_mul(3).saturating_add(4096);
+        let peak_bytes = persistent_bytes.saturating_add(image_bytes);
+        if image_bytes > rt.max_binding || peak_bytes > rt.vram_budget {
             return Err(format!(
                 "Blur GPU requiere {} MB y el presupuesto es {} MB",
-                needed / 1_048_576,
+                peak_bytes / 1_048_576,
                 rt.vram_budget / 1_048_576
             ));
         }
+        let vram_reservation = rt
+            .planetary_vram
+            .try_reserve(persistent_bytes, "motor enhance planetario")?;
         let mk = |label: &str, copy_dst: bool, copy_src: bool| {
             rt.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -1459,7 +1636,8 @@ impl EnhanceEngine {
                 dir,
                 pad: 0,
             };
-            rt.queue.write_buffer(&buffer, 0, bytemuck::bytes_of(&params));
+            rt.queue
+                .write_buffer(&buffer, 0, bytemuck::bytes_of(&params));
             buffer
         };
         let params_h = mk_params(0);
@@ -1495,12 +1673,47 @@ impl EnhanceEngine {
             dst,
             bind_h,
             bind_v,
+            _vram_reservation: vram_reservation,
         })
     }
 }
 
 static ENHANCE_ENGINE: std::sync::OnceLock<std::sync::Mutex<Option<EnhanceEngine>>> =
     std::sync::OnceLock::new();
+// El staging de readback también consume VRAM. Serializar la llamada completa
+// mantiene un único staging vivo y evita que la concurrencia de frames exceda
+// silenciosamente el presupuesto aunque el engine persistente sea compartido.
+static ENHANCE_CALL_GATE: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+/// Libera caches planetarios únicamente cuando cada motor está ocioso. Se usa
+/// antes de un acumulador grande para que buffers de una etapa ya terminada no
+/// fuercen un fallback CPU artificial. Todos los locks son `try_lock`: esta
+/// función jamás espera ni puede formar un ciclo con una operación activa.
+pub(crate) fn evict_idle_planetary_gpu_caches() {
+    if let Some(mx) = BATCH_ENGINE.get() {
+        if let Ok(mut cache) = mx.try_lock() {
+            drop(cache.take());
+        }
+    }
+    if let Some(mx) = SAD_ENGINE_POOL.get() {
+        if let Ok(mut pool) = mx.try_lock() {
+            pool.entries.clear();
+        }
+    }
+    // Enhance suelta el mutex del engine antes del readback, pero conserva el
+    // call gate durante toda la llamada. Exigir ambos garantiza que no se
+    // libere la reserva mientras el command buffer aún usa sus buffers.
+    if let Some(call_gate) = ENHANCE_CALL_GATE.get() {
+        if let Ok(_call) = call_gate.try_lock() {
+            if let Some(mx) = ENHANCE_ENGINE.get() {
+                if let Ok(mut cache) = mx.try_lock() {
+                    drop(cache.take());
+                }
+            }
+        }
+    }
+}
 
 /// Blur radio 1 (dos pasadas enteras) en GPU, bit-idéntico a
 /// `crate::alignment::box_blur_r1_edge_aware`. `out` recibe exactamente
@@ -1511,7 +1724,13 @@ pub fn gpu_box_blur_r1_into(
     h: usize,
     out: &mut Vec<u16>,
 ) -> Result<(), String> {
-    let n = w.checked_mul(h).ok_or("Geometría de blur demasiado grande")?;
+    let _call_guard = ENHANCE_CALL_GATE
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .map_err(|_| "Mutex de presupuesto GPU de enhance dañado")?;
+    let n = w
+        .checked_mul(h)
+        .ok_or("Geometría de blur demasiado grande")?;
     if n == 0 {
         return Err("Blur GPU con imagen vacía".into());
     }
@@ -1533,12 +1752,18 @@ pub fn gpu_box_blur_r1_into(
     let mut guard = mx.lock().map_err(|_| "Mutex GPU de enhance dañado")?;
     let rebuild = guard.as_ref().is_none_or(|e| e.w != w || e.h != h);
     if rebuild {
+        // Liberar la geometría anterior antes de reservar la nueva. Crear
+        // primero ambas simultáneamente produciría un falso OOM del contador.
+        drop(guard.take());
         *guard = Some(EnhanceEngine::new(rt, w, h)?);
     }
     let engine = guard.as_ref().unwrap();
     write_packed_u16(&rt.queue, &engine.src, &input[..n]);
-    // Staging POR LLAMADA: el lock se suelta tras el submit y el siguiente
-    // worker sube/despacha mientras este espera su readback (PR-30).
+    // Staging POR LLAMADA, pero con una única llamada activa: el gate exterior
+    // lo contabiliza como parte del presupuesto de VRAM hasta terminar readback.
+    let _staging_vram_reservation = rt
+        .planetary_vram
+        .try_reserve((words * 4) as u64, "readback enhance planetario")?;
     let staging = rt.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("zas-enhance-staging"),
         size: (words * 4) as u64,
@@ -1669,24 +1894,110 @@ fn sad_submit_ranges(points: &[SadPoint], budget: u64) -> Result<Vec<(usize, usi
     Ok(ranges)
 }
 
-pub fn search_sad_points(
-    reference: &[u16],
-    target: &[u16],
-    w: usize,
-    h: usize,
-    points: &[SadPoint],
-) -> Result<Vec<Option<SadMatch>>, String> {
-    if points.is_empty() {
+#[derive(Clone, Copy)]
+pub struct SadBatchRequest<'a> {
+    pub target: &'a [u16],
+    pub points: &'a [SadPoint],
+}
+
+impl<'a> SadBatchRequest<'a> {
+    pub fn new(target: &'a [u16], points: &'a [SadPoint]) -> Self {
+        Self { target, points }
+    }
+}
+
+fn sad_batch_ranges(
+    result_bytes: &[u64],
+    target_cap: usize,
+    readback_budget: u64,
+    max_buffer_size: u64,
+) -> Result<Vec<(usize, usize)>, String> {
+    if result_bytes.is_empty() {
         return Ok(Vec::new());
     }
+    let target_cap = target_cap.max(1);
+    let readback_budget = readback_budget.max(16);
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0u64;
+    for (index, &item_bytes) in result_bytes.iter().enumerate() {
+        if item_bytes > max_buffer_size {
+            return Err(format!(
+                "Readback SAD del target {index} excede max_buffer_size"
+            ));
+        }
+        let target_limit = index.saturating_sub(start) >= target_cap;
+        let byte_limit = index > start && bytes.saturating_add(item_bytes) > readback_budget;
+        if target_limit || byte_limit {
+            ranges.push((start, index));
+            start = index;
+            bytes = 0;
+        }
+        bytes = bytes
+            .checked_add(item_bytes)
+            .ok_or("Readback SAD por lote demasiado grande")?;
+    }
+    ranges.push((start, result_bytes.len()));
+    Ok(ranges)
+}
+
+fn decode_sad_matches(raw: &[u32], count: usize) -> Vec<Option<SadMatch>> {
+    let mut out = Vec::with_capacity(count);
+    for r in raw.chunks_exact(4).take(count) {
+        let sad = ((r[3] as u64) << 32) | r[2] as u64;
+        if sad == u64::MAX {
+            out.push(None);
+        } else {
+            out.push(Some(SadMatch {
+                dx: r[0] as i32,
+                dy: r[1] as i32,
+                sad,
+            }));
+        }
+    }
+    out
+}
+
+fn search_sad_points_batch_chunk(
+    reference: &[u16],
+    requests: &[SadBatchRequest<'_>],
+    w: usize,
+    h: usize,
+    rt: &'static crate::gpu_stack::GpuRuntime,
+) -> Result<Vec<Vec<Option<SadMatch>>>, String> {
+    if requests.iter().all(|request| request.points.is_empty()) {
+        return Ok(requests.iter().map(|_| Vec::new()).collect());
+    }
     let n = w.checked_mul(h).ok_or("Mapa SAD demasiado grande")?;
-    if w > u32::MAX as usize || h > u32::MAX as usize || points.len() > u32::MAX as usize {
-        return Err("Geometría SAD excede el contrato u32 del shader".into());
+    let capacity = requests
+        .iter()
+        .map(|request| request.points.len())
+        .max()
+        .unwrap_or(1)
+        .max(1)
+        .checked_next_power_of_two()
+        .ok_or("Demasiados puntos SAD")?;
+    let result_sizes: Vec<u64> = requests
+        .iter()
+        .map(|request| {
+            (request.points.len() as u64)
+                .checked_mul(16)
+                .ok_or_else(|| "Demasiados resultados SAD".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let staging_bytes = result_sizes.iter().try_fold(0u64, |total, &bytes| {
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| "Readback SAD por lote demasiado grande".to_string())
+    })?;
+    if staging_bytes > rt.max_buffer_size {
+        return Err(format!(
+            "Readback SAD por lote requiere {} MB y max_buffer_size permite {} MB",
+            staging_bytes / 1_048_576,
+            rt.max_buffer_size / 1_048_576
+        ));
     }
-    if reference.len() < n || target.len() < n {
-        return Err("Mapa SAD GPU truncado".into());
-    }
-    let rt = crate::gpu_stack::gpu_runtime().ok_or("No hay runtime wgpu")?;
+
     let error_epoch = crate::gpu_stack::begin_gpu_operation();
     if crate::gpu_stack::gpu_error_since(error_epoch) {
         return Err("El device GPU se perdió antes de iniciar SAD".into());
@@ -1696,74 +2007,92 @@ pub fn search_sad_points(
     } else {
         200_000_000u64
     };
-    let submit_ranges = sad_submit_ranges(points, work_budget)?;
-    let mx = SAD_ENGINE.get_or_init(|| std::sync::Mutex::new(None));
-    let mut guard = mx.lock().map_err(|_| "Mutex GPU SAD dañado")?;
-    let rebuild = guard
-        .as_ref()
-        .is_none_or(|e| e.w != w || e.h != h || e.capacity < points.len());
-    if rebuild {
-        let capacity = points
-            .len()
-            .checked_next_power_of_two()
-            .ok_or("Demasiados puntos SAD")?;
-        *guard = Some(SadEngine::new(rt, w, h, capacity)?);
-    }
-    let e = guard.as_ref().unwrap();
-    write_packed_u16(&rt.queue, &e.reference, &reference[..n]);
-    write_packed_u16(&rt.queue, &e.target, &target[..n]);
-    rt.queue
-        .write_buffer(&e.points, 0, bytemuck::cast_slice(points));
-    let pp = sad_pipelines(rt);
-    let used_bytes = (points.len() * 16) as u64;
-    // PR-30: staging POR LLAMADA (≈20 KB para miles de APs). Permite soltar el
-    // motor compartido justo después del submit: el siguiente worker sube y
-    // despacha su frame mientras este espera su readback — antes el mutex se
-    // mantenía durante la espera y los 8 workers quedaban en fila india.
+    // Valida TODOS los targets antes de enviar el primero: un punto serial
+    // patológico no puede dejar un prefijo del batch ejecutado.
+    let submit_ranges: Vec<Vec<(usize, usize)>> = requests
+        .iter()
+        .map(|request| sad_submit_ranges(request.points, work_budget))
+        .collect::<Result<_, _>>()?;
+
+    let _staging_vram_reservation = rt
+        .planetary_vram
+        .try_reserve(staging_bytes.max(16), "readback SAD planetario")?;
     let call_staging = rt.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("zas-analysis-sad-staging-call"),
-        size: used_bytes.max(16),
+        label: Some("zas-analysis-sad-staging-batch"),
+        size: staging_bytes.max(16),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    for (range_index, &(start, end)) in submit_ranges.iter().enumerate() {
-        rt.queue.write_buffer(
-            &e.params,
-            0,
-            bytemuck::bytes_of(&SadParams {
-                w: w as u32,
-                h: h as u32,
-                // `count` es el fin exclusivo de este chunk; el shader suma
-                // `start` y así las invocaciones de padding no pisan el siguiente.
-                count: end as u32,
-                start: start as u32,
-            }),
-        );
-        let mut enc = rt
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("zas-analysis-sad-encoder"),
-            });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("zas-analysis-sad-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&pp.pipeline);
-            pass.set_bind_group(0, &e.bind, &[]);
-            pass.dispatch_workgroups(((end - start) as u32).div_ceil(64), 1, 1);
+    let mx = SAD_ENGINE_POOL.get_or_init(|| std::sync::Mutex::new(SadEnginePool::default()));
+    let mut guard = mx.lock().map_err(|_| "Mutex GPU SAD dañado")?;
+    let e = guard.engine_for(rt, w, h, capacity)?;
+    let _engine_vram_lease = Arc::clone(&e._vram_reservation);
+    write_packed_u16(&rt.queue, &e.reference, &reference[..n]);
+    let pp = sad_pipelines(rt);
+    let mut readback_offset = 0u64;
+
+    // Diseño deliberadamente conservador: cada target termina su submit y
+    // copia antes de que el siguiente sobrescriba target/points/results. La
+    // Queue garantiza el orden; todos comparten UN map/readback al final. No
+    // se construye un command buffer multiframe gigante, preservando los
+    // cortes de trabajo que protegen Metal y el TDR de Windows.
+    for ((request, ranges), &used_bytes) in requests
+        .iter()
+        .zip(submit_ranges.iter())
+        .zip(result_sizes.iter())
+    {
+        if request.points.is_empty() {
+            continue;
         }
-        if range_index + 1 == submit_ranges.len() {
-            enc.copy_buffer_to_buffer(&e.results, 0, &call_staging, 0, used_bytes);
+        write_packed_u16(&rt.queue, &e.target, &request.target[..n]);
+        rt.queue
+            .write_buffer(&e.points, 0, bytemuck::cast_slice(request.points));
+        for (range_index, &(start, end)) in ranges.iter().enumerate() {
+            rt.queue.write_buffer(
+                &e.params,
+                0,
+                bytemuck::bytes_of(&SadParams {
+                    w: w as u32,
+                    h: h as u32,
+                    // `count` es el fin exclusivo; `start` conserva el índice
+                    // global y evita que el padding invada el siguiente rango.
+                    count: end as u32,
+                    start: start as u32,
+                }),
+            );
+            let mut enc = rt
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("zas-analysis-sad-batch-encoder"),
+                });
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("zas-analysis-sad-batch-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&pp.pipeline);
+                pass.set_bind_group(0, &e.bind, &[]);
+                pass.dispatch_workgroups(((end - start) as u32).div_ceil(64), 1, 1);
+            }
+            if range_index + 1 == ranges.len() {
+                enc.copy_buffer_to_buffer(
+                    &e.results,
+                    0,
+                    &call_staging,
+                    readback_offset,
+                    used_bytes,
+                );
+            }
+            rt.queue.submit(Some(enc.finish()));
         }
-        rt.queue.submit(Some(enc.finish()));
+        readback_offset += used_bytes;
     }
-    // PR-30: el contenido del staging quedó fijado por ORDEN DE COLA (nuestra
-    // copia se sometió antes de soltar el lock); los write_buffer/dispatch del
-    // siguiente caller se ejecutan después y no pueden afectarlo.
+    debug_assert_eq!(readback_offset, staging_bytes);
+    // La copia del lote ya quedó ordenada en la Queue. Otro caller puede usar
+    // el engine mientras éste espera, sin alterar el staging exclusivo.
     drop(guard);
 
-    let slice = call_staging.slice(0..used_bytes);
+    let slice = call_staging.slice(0..staging_bytes);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = tx.send(result);
@@ -1771,32 +2100,211 @@ pub fn search_sad_points(
     crate::gpu_stack::wait_for_readback_since(
         &rt.device,
         &rx,
-        "readback SAD GPU",
+        "readback SAD GPU por lote",
         error_epoch,
     )?;
     let out = {
         let mapped = slice.get_mapped_range();
         let raw: &[u32] = bytemuck::cast_slice(&mapped);
-        let mut out = Vec::with_capacity(points.len());
-        for r in raw.chunks_exact(4) {
-            let sad = ((r[3] as u64) << 32) | r[2] as u64;
-            if sad == u64::MAX {
-                out.push(None);
-            } else {
-                out.push(Some(SadMatch {
-                    dx: r[0] as i32,
-                    dy: r[1] as i32,
-                    sad,
-                }));
-            }
+        let mut offset_words = 0usize;
+        let mut out = Vec::with_capacity(requests.len());
+        for request in requests {
+            let words = request.points.len() * 4;
+            out.push(decode_sad_matches(
+                &raw[offset_words..offset_words + words],
+                request.points.len(),
+            ));
+            offset_words += words;
         }
         out
     };
     call_staging.unmap();
     if crate::gpu_stack::gpu_error_since(error_epoch) {
-        return Err("Device loss/OOM durante SAD GPU".into());
+        return Err("Device loss/OOM durante SAD GPU por lote".into());
     }
     Ok(out)
+}
+
+/// Ejecuta varios targets que comparten referencia y geometría. El API acota
+/// cada lote por backend/tamaño y por bytes de readback; dentro de cada lote
+/// conserva submits ordenados y realiza un solo punto de coordinación (`map`).
+/// Las sumas u64, el orden de puntos y la política de empate del shader no se
+/// modifican. El límite actual NO fusiona varios targets en un command buffer:
+/// hacerlo requeriría buffers target/result por slot y se habilitará sólo tras
+/// medir VRAM y TDR en hardware Windows/Metal.
+pub fn search_sad_points_batch(
+    reference: &[u16],
+    requests: &[SadBatchRequest<'_>],
+    w: usize,
+    h: usize,
+) -> Result<Vec<Vec<Option<SadMatch>>>, String> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    if requests.iter().all(|request| request.points.is_empty()) {
+        return Ok(requests.iter().map(|_| Vec::new()).collect());
+    }
+    let n = w.checked_mul(h).ok_or("Mapa SAD demasiado grande")?;
+    if w > u32::MAX as usize || h > u32::MAX as usize {
+        return Err("Geometría SAD excede el contrato u32 del shader".into());
+    }
+    if reference.len() < n
+        || requests
+            .iter()
+            .any(|request| !request.points.is_empty() && request.target.len() < n)
+    {
+        return Err("Mapa SAD GPU truncado".into());
+    }
+    if requests
+        .iter()
+        .any(|request| request.points.len() > u32::MAX as usize)
+    {
+        return Err("Geometría SAD excede el contrato u32 del shader".into());
+    }
+    let result_sizes: Vec<u64> = requests
+        .iter()
+        .map(|request| {
+            (request.points.len() as u64)
+                .checked_mul(16)
+                .ok_or_else(|| "Demasiados resultados SAD".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let rt = crate::gpu_stack::gpu_runtime().ok_or("No hay runtime wgpu")?;
+    let target_cap = crate::gpu_stack::analysis_submit_cap(w, h).clamp(1, 8);
+    let readback_budget = (rt.vram_budget / 64)
+        .max(16)
+        .min(64 * 1024 * 1024)
+        .min(rt.max_buffer_size);
+    let batch_ranges = sad_batch_ranges(
+        &result_sizes,
+        target_cap,
+        readback_budget,
+        rt.max_buffer_size,
+    )?;
+    let mut out = Vec::with_capacity(requests.len());
+    for (start, end) in batch_ranges {
+        out.extend(search_sad_points_batch_chunk(
+            reference,
+            &requests[start..end],
+            w,
+            h,
+            rt,
+        )?);
+    }
+    Ok(out)
+}
+
+pub fn search_sad_points(
+    reference: &[u16],
+    target: &[u16],
+    w: usize,
+    h: usize,
+    points: &[SadPoint],
+) -> Result<Vec<Option<SadMatch>>, String> {
+    let mut batch =
+        search_sad_points_batch(reference, &[SadBatchRequest::new(target, points)], w, h)?;
+    Ok(batch.pop().unwrap_or_default())
+}
+
+/// Gate de sesión específico del kernel SAD por AP. La paridad del
+/// preprocesado no demuestra este shader: aquí se comparan desplazamiento,
+/// desempate y acumulación u64 exacta contra el oráculo CPU antes de permitir
+/// que CoarseSad aparezca como apto en un plan de producción.
+pub fn ensure_sad_parity() -> bool {
+    match SAD_PARITY.load(Ordering::Acquire) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    let (w, h) = (96usize, 72usize);
+    let reference: Vec<u16> = (0..w * h)
+        .map(|i| {
+            let x = i % w;
+            let y = i / w;
+            (((x * 977 + y * 613 + x * y * 17) ^ (x << 7) ^ (y << 5)) & 0xffff) as u16
+        })
+        .collect();
+    let mut target = vec![0u16; w * h];
+    let (truth_dx, truth_dy) = (3i32, -2i32);
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let tx = x + truth_dx;
+            let ty = y + truth_dy;
+            if tx >= 0 && ty >= 0 && tx < w as i32 && ty < h as i32 {
+                target[ty as usize * w + tx as usize] = reference[y as usize * w + x as usize];
+            }
+        }
+    }
+    let points = vec![
+        SadPoint::new(30, 24, 30, 24, 18, 6, true),
+        SadPoint::new(64, 46, 64, 46, 24, 6, true),
+        SadPoint::new(48, 36, 48, 36, 20, 6, false),
+    ];
+    let gpu = match search_sad_points(&reference, &target, w, h, &points) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("[gpu-sad parity] fallo de transporte: {error}");
+            return false;
+        }
+    };
+    let translated_ok = gpu.len() == points.len()
+        && points.iter().zip(gpu.iter()).all(|(point, got)| {
+            if point.enabled == 0 {
+                return got.is_none();
+            }
+            let (dx, dy, sad) = crate::alignment::find_best_match_sad(
+                &reference,
+                &target,
+                w,
+                point.ref_x as usize,
+                point.ref_y as usize,
+                point.tgt_x as usize,
+                point.tgt_y as usize,
+                point.box_w as usize,
+                point.search_r,
+            );
+            got.as_ref().is_some_and(|got| {
+                (got.dx, got.dy, got.sad) == (dx as i32, dy as i32, sad)
+                    && (got.dx, got.dy) == (truth_dx, truth_dy)
+            })
+        });
+    // Extremos exclusivos exactamente en width/height son válidos en CPU.
+    // Incluye caja par e impar para mantener idéntica la división del centro.
+    let edge_points = vec![
+        SadPoint::new((w - 9) as i32, 30, (w - 9) as i32, 30, 18, 0, true),
+        SadPoint::new(48, (h - 9) as i32, 48, (h - 9) as i32, 17, 0, true),
+    ];
+    let edge_ok = search_sad_points(&reference, &reference, w, h, &edge_points)
+        .ok()
+        .is_some_and(|matches| {
+            matches.len() == edge_points.len()
+                && matches
+                    .iter()
+                    .zip(edge_points.iter())
+                    .all(|(value, point)| {
+                        let (dx, dy, sad) = crate::alignment::find_best_match_sad(
+                            &reference,
+                            &reference,
+                            w,
+                            point.ref_x as usize,
+                            point.ref_y as usize,
+                            point.tgt_x as usize,
+                            point.tgt_y as usize,
+                            point.box_w as usize,
+                            point.search_r,
+                        );
+                        value.as_ref().is_some_and(|gpu| {
+                            (gpu.dx, gpu.dy, gpu.sad) == (dx as i32, dy as i32, sad)
+                                && (gpu.dx, gpu.dy, gpu.sad) == (0, 0, 0)
+                        })
+                    })
+        });
+    let ok = translated_ok && edge_ok;
+    SAD_PARITY.store(if ok { 1 } else { 2 }, Ordering::Release);
+    if !ok {
+        eprintln!("[gpu-sad parity] el kernel batched no igualó el oráculo CPU");
+    }
+    ok
 }
 
 fn cog_thresholds(mono: &[u16], w: usize, h: usize) -> [f32; 3] {
@@ -2041,6 +2549,9 @@ fn process_batch_slices(
             || e.staging_words_per_slot < layout.stride
     });
     if rebuild {
+        // La cache vieja debe liberar su token antes de reservar la nueva;
+        // ambas geometrías nunca se necesitan a la vez.
+        drop(guard.take());
         *guard = Some(BatchEngine::new(rt, w, h, capacity, layout.stride)?);
     }
     let batch = guard.as_ref().unwrap();
@@ -2364,6 +2875,84 @@ mod tests {
     }
 
     #[test]
+    fn sad_engine_pool_reuses_geometry_and_evicts_within_budget() {
+        let records = vec![
+            super::SadCacheRecord {
+                w: 960,
+                h: 540,
+                capacity: 128,
+                reserved_bytes: 10,
+                last_used: 5,
+            },
+            super::SadCacheRecord {
+                w: 1920,
+                h: 1080,
+                capacity: 256,
+                reserved_bytes: 30,
+                last_used: 10,
+            },
+            super::SadCacheRecord {
+                w: 320,
+                h: 240,
+                capacity: 64,
+                reserved_bytes: 20,
+                last_used: 1,
+            },
+        ];
+        assert_eq!(
+            super::plan_sad_cache(&records, 960, 540, 64, 8, 60, 4),
+            super::SadCachePlan::Reuse(0),
+            "un capacity mayor de la misma geometría debe reutilizarse"
+        );
+        assert_eq!(
+            super::plan_sad_cache(&records, 640, 360, 32, 25, 60, 4),
+            super::SadCachePlan::Insert { evict: vec![2, 0] },
+            "LRU debe desalojar sólo lo necesario para respetar bytes"
+        );
+        assert_eq!(
+            super::plan_sad_cache(&records[..2], 960, 540, 512, 25, 80, 4),
+            super::SadCachePlan::Insert { evict: vec![0] },
+            "un capacity mayor sustituye el engine pequeño de igual geometría"
+        );
+        assert_eq!(
+            super::plan_sad_cache(&records, 8000, 8000, 1, 100, 60, 4),
+            super::SadCachePlan::Insert {
+                evict: vec![2, 1, 0]
+            },
+            "una petición mayor que la cuota sólo se admite como singleton"
+        );
+    }
+
+    #[test]
+    fn sad_engine_allocation_and_batch_limits_are_bounded() {
+        let allocation = super::sad_engine_allocation(101, 51, 7).unwrap();
+        assert_eq!(allocation.image_bytes, 10_304);
+        assert_eq!(
+            allocation.point_bytes,
+            7 * std::mem::size_of::<super::SadPoint>() as u64
+        );
+        assert_eq!(allocation.result_bytes, 7 * 16);
+        assert_eq!(
+            allocation.reserved_bytes,
+            allocation.image_bytes * 2
+                + allocation.point_bytes
+                + allocation.result_bytes
+                + 4096
+        );
+        assert_eq!(super::sad_engine_pool_budget(8 * 1024), 2 * 1024);
+        assert_eq!(
+            super::sad_engine_pool_budget(8 * 1024 * 1024 * 1024),
+            super::SAD_ENGINE_POOL_MAX_BYTES
+        );
+
+        assert_eq!(
+            super::sad_batch_ranges(&[16, 32, 48, 96], 2, 64, 100).unwrap(),
+            vec![(0, 2), (2, 3), (3, 4)]
+        );
+        assert!(super::sad_batch_ranges(&[101], 8, 64, 100).is_err());
+    }
+
+    #[test]
     fn optional_analysis_products_do_not_consume_readback_bandwidth() {
         let (w, h) = (3840usize, 2160usize);
         let base = super::BatchReadbackLayout::new(w, h, false, false, true, true);
@@ -2472,7 +3061,11 @@ mod tests {
                 crate::alignment::enhance_highpass_from_blur(
                     &mono, &gpu_blur, w, h, &mut split, amount,
                 );
-                assert_eq!(full[..w * h], split[..w * h], "enhance {w}x{h} amount={amount}");
+                assert_eq!(
+                    full[..w * h],
+                    split[..w * h],
+                    "enhance {w}x{h} amount={amount}"
+                );
             }
         }
         assert!(super::ensure_enhance_parity());
@@ -2745,6 +3338,79 @@ mod tests {
                 assert_eq!(gpu.sad, sad);
             }
             assert_eq!((gpu.dx, gpu.dy), (truth_dx, truth_dy));
+        }
+    }
+
+    /// P2: varios targets con referencia/geometría comunes deben conservar el
+    /// mismo orden y los mismos u64 exactos que llamadas unitarias. Para AP
+    /// cuadrados también se contrasta cada resultado con el oráculo CPU.
+    #[test]
+    #[ignore = "requiere GPU física; SAD multiframe con un readback por lote"]
+    fn sad_multitarget_batch_matches_single_and_cpu_physical() {
+        let (w, h) = (160usize, 112usize);
+        let reference: Vec<u16> = (0..w * h)
+            .map(|i| {
+                let x = i % w;
+                let y = i / w;
+                (((x * 977 + y * 613 + x * y * 17) ^ (x << 7) ^ (y << 5)) & 0xffff) as u16
+            })
+            .collect();
+        let shifts = [(3i32, -2i32), (-4, 1), (0, 0)];
+        let targets: Vec<Vec<u16>> = shifts
+            .iter()
+            .map(|&(dx, dy)| {
+                let mut target = vec![0u16; w * h];
+                for y in 0..h as i32 {
+                    for x in 0..w as i32 {
+                        let tx = x + dx;
+                        let ty = y + dy;
+                        if tx >= 0 && ty >= 0 && tx < w as i32 && ty < h as i32 {
+                            target[ty as usize * w + tx as usize] =
+                                reference[y as usize * w + x as usize];
+                        }
+                    }
+                }
+                target
+            })
+            .collect();
+        let points = [
+            vec![
+                super::SadPoint::new(42, 35, 42, 35, 20, 6, true),
+                super::SadPoint::new(104, 72, 104, 72, 28, 6, true),
+            ],
+            vec![
+                super::SadPoint::new(44, 36, 44, 36, 22, 6, true),
+                super::SadPoint::new(80, 58, 80, 58, 30, 6, true),
+                super::SadPoint::new(116, 76, 116, 76, 18, 6, true),
+            ],
+            vec![super::SadPoint::new(80, 56, 80, 56, 32, 6, true)],
+        ];
+        let requests = [
+            super::SadBatchRequest::new(&targets[0], &points[0]),
+            super::SadBatchRequest::new(&targets[1], &points[1]),
+            super::SadBatchRequest::new(&targets[2], &points[2]),
+        ];
+        let batched = super::search_sad_points_batch(&reference, &requests, w, h).unwrap();
+        assert_eq!(batched.len(), requests.len());
+        for (request_index, request) in requests.iter().enumerate() {
+            let single =
+                super::search_sad_points(&reference, request.target, w, h, request.points).unwrap();
+            assert_eq!(batched[request_index], single);
+            for (point, gpu) in request.points.iter().zip(&batched[request_index]) {
+                let gpu = gpu.expect("AP interior válido");
+                let (dx, dy, sad) = crate::alignment::find_best_match_sad(
+                    &reference,
+                    request.target,
+                    w,
+                    point.ref_x as usize,
+                    point.ref_y as usize,
+                    point.tgt_x as usize,
+                    point.tgt_y as usize,
+                    point.box_w as usize,
+                    point.search_r,
+                );
+                assert_eq!((gpu.dx, gpu.dy, gpu.sad), (dx as i32, dy as i32, sad));
+            }
         }
     }
 }

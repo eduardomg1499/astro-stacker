@@ -287,6 +287,13 @@ impl SerReader {
         let mut frame_count = parsed.frame_count;
         let is_little_endian = parsed.pixel_little_endian;
 
+        if ser_color_is_yuv422(color_id) && pixel_depth > 8 {
+            return Err(format!(
+                "SER YUV422 >8-bit no soportado en preflight ({} bits, ColorID {}): se requiere validar packing, rango y matriz antes de convertir; el trabajo no se iniciará",
+                pixel_depth, color_id
+            ));
+        }
+
         if width == 0 || height == 0 {
             return Err(
                 "Error fatal: Dimensiones 0x0. Intenta volver a grabar sin ROI variable.".into(),
@@ -599,6 +606,61 @@ mod tests {
     }
 
     #[test]
+    fn native_rgb_and_bgr_eight_and_sixteen_bit_layouts_are_exact() {
+        let (w, h) = (16usize, 16usize);
+        for color_id in [100, 101] {
+            for bits in [8usize, 16] {
+                let endian_cases: &[(i32, bool)] = if bits == 8 {
+                    &[(0, false)]
+                } else {
+                    &[(0, false), (1, true)]
+                };
+                for &(flag, big_endian) in endian_cases {
+                    let source: Vec<u16> = (0..w * h * 3)
+                        .map(|index| {
+                            if bits == 8 {
+                                ((index * 53 + 7) & 0xff) as u16
+                            } else {
+                                (index as u16).wrapping_mul(977).wrapping_add(31)
+                            }
+                        })
+                        .collect();
+                    let mut payload = Vec::with_capacity(source.len() * if bits == 8 { 1 } else { 2 });
+                    for &sample in &source {
+                        if bits == 8 {
+                            payload.push(sample as u8);
+                        } else if big_endian {
+                            payload.extend_from_slice(&sample.to_be_bytes());
+                        } else {
+                            payload.extend_from_slice(&sample.to_le_bytes());
+                        }
+                    }
+                    let path = temp_ser(
+                        &format!("cid{color_id}_{bits}b_flag{flag}"),
+                        &standard_ser(w, h, bits, color_id, flag, 1, &payload),
+                    );
+                    let reader = SerReader::new(&path).expect("SER RGB/BGR válido");
+                    assert_eq!(reader.info.bytes_per_pixel, if bits == 8 { 3 } else { 6 });
+                    let canonical = reader.get_frame(0, color_id);
+                    let decoded = crate::raw_to_u16_buffer(
+                        &canonical,
+                        w,
+                        h,
+                        reader.info.bytes_per_pixel,
+                    );
+                    let expected: Vec<u16> = if bits == 8 {
+                        source.iter().map(|sample| sample * 257).collect()
+                    } else {
+                        source
+                    };
+                    assert_eq!(decoded, expected, "CID={color_id}, bits={bits}, flag={flag}");
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn eight_bit_pixels_ignore_endian_flag() {
         let (w, h) = (16usize, 16usize);
         let payload: Vec<u8> = (0..w * h).map(|i| (i * 73 + 11) as u8).collect();
@@ -631,6 +693,20 @@ mod tests {
 
         let error = SerReader::new(&path).expect_err("YUV422 requiere parejas horizontales");
         assert!(error.contains("ancho debe ser par"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn yuv422_over_eight_bits_fails_explicit_preflight() {
+        let (w, h) = (16usize, 16usize);
+        let payload = vec![0u8; w * h * 4];
+        let path = temp_ser(
+            "yuv422_12bit",
+            &standard_ser(w, h, 12, 12, 0, 1, &payload),
+        );
+        let error = SerReader::new(&path).expect_err("YUV422 >8-bit no es elegible");
+        assert!(error.contains("YUV422 >8-bit"), "{error}");
+        assert!(error.contains("preflight"), "{error}");
         let _ = std::fs::remove_file(path);
     }
 

@@ -363,6 +363,21 @@ pub(crate) fn render_dark(
     exposure_s: f64,
     seed: u64,
 ) -> Vec<f32> {
+    render_dark_with_pattern(sensor, w, h, exposure_s, None, seed)
+}
+
+/// Dark con patrón térmico espacial adicional (p. ej. amp glow o banding),
+/// expresado en ADU/s. El patrón pertenece al detector y no se viñetea.
+/// Esta ruta permite construir corpus de calibración con verdad conocida sin
+/// contaminar el modelo óptico de la escena.
+pub(crate) fn render_dark_with_pattern(
+    sensor: &SimSensor,
+    w: usize,
+    h: usize,
+    exposure_s: f64,
+    spatial_dark_adu_per_s: Option<&(dyn Fn(f64, f64) -> f64 + Send + Sync)>,
+    seed: u64,
+) -> Vec<f32> {
     let mut hot = vec![0.0f64; w * h];
     for &(x, y, adu_s) in &sensor.hot_pixels {
         if x < w && y < h {
@@ -373,7 +388,12 @@ pub(crate) fn render_dark(
     let mut rng = StdRng::seed_from_u64(seed);
     let mut out = vec![0.0f32; w * h];
     for i in 0..w * h {
-        let lambda_e = (sensor.dark_adu_per_s + hot[i]).max(0.0) * exposure_s * gain;
+        let x = (i % w) as f64;
+        let y = (i / w) as f64;
+        let spatial = spatial_dark_adu_per_s.map_or(0.0, |pattern| pattern(x, y));
+        let lambda_e = (sensor.dark_adu_per_s + hot[i] + spatial).max(0.0)
+            * exposure_s
+            * gain;
         let shot_e = muestra_poisson(&mut rng, lambda_e);
         let lectura_e = muestra_normal(&mut rng) * sensor.read_noise_e;
         out[i] = ((shot_e + lectura_e) / gain + sensor.bias_adu)
@@ -393,7 +413,29 @@ pub(crate) fn render_flat(
     flat_level_adu: f64,
     seed: u64,
 ) -> Vec<f32> {
+    render_flat_exposure(sensor, w, h, flat_level_adu, 0.0, None, seed)
+}
+
+/// Flat de exposición finita. Además de la iluminación óptica, incluye dark
+/// current, hot pixels y un patrón térmico espacial opcional. Un dark-flat
+/// compatible se obtiene con `render_dark_with_pattern` usando exactamente la
+/// misma exposición y patrón.
+pub(crate) fn render_flat_exposure(
+    sensor: &SimSensor,
+    w: usize,
+    h: usize,
+    flat_level_adu: f64,
+    exposure_s: f64,
+    spatial_dark_adu_per_s: Option<&(dyn Fn(f64, f64) -> f64 + Send + Sync)>,
+    seed: u64,
+) -> Vec<f32> {
     let gain = sensor.gain_e_per_adu.max(1e-12);
+    let mut hot = vec![0.0f64; w * h];
+    for &(x, y, adu_s) in &sensor.hot_pixels {
+        if x < w && y < h {
+            hot[y * w + x] += adu_s;
+        }
+    }
     let mut rng = StdRng::seed_from_u64(seed);
     let mut out = vec![0.0f32; w * h];
     for py in 0..h {
@@ -402,10 +444,15 @@ pub(crate) fn render_flat(
             if let Some(vg) = &sensor.vignette {
                 nivel *= vg(px as f64, py as f64);
             }
-            let lambda_e = nivel.max(0.0) * gain;
+            let i = py * w + px;
+            let spatial = spatial_dark_adu_per_s
+                .map_or(0.0, |pattern| pattern(px as f64, py as f64));
+            let thermal_adu =
+                (sensor.dark_adu_per_s + hot[i] + spatial).max(0.0) * exposure_s;
+            let lambda_e = (nivel.max(0.0) + thermal_adu) * gain;
             let shot_e = muestra_poisson(&mut rng, lambda_e);
             let lectura_e = muestra_normal(&mut rng) * sensor.read_noise_e;
-            out[py * w + px] = ((shot_e + lectura_e) / gain + sensor.bias_adu)
+            out[i] = ((shot_e + lectura_e) / gain + sensor.bias_adu)
                 .clamp(0.0, sensor.full_well_adu) as f32;
         }
     }
@@ -702,6 +749,83 @@ mod tests {
         assert!(
             (obtenido - esperado).abs() / esperado < 0.02,
             "razon esquina/centro {obtenido:.4} vs viñeteo esperado {esperado:.4}"
+        );
+    }
+
+    /// Un flat largo con amp glow conserva un gradiente térmico si sólo se
+    /// resta bias; un dark-flat de exposición idéntica debe retirarlo sin
+    /// escalar. Éste es el fixture sintético mínimo del gate dark-flat/CMOS.
+    #[test]
+    fn sim_matching_dark_flat_removes_amp_glow_pattern() {
+        let (w, h) = (32usize, 32usize);
+        let mut sensor = sensor_base();
+        sensor.read_noise_e = 1.0;
+        sensor.dark_adu_per_s = 0.5;
+        let exposure_s = 8.0;
+        let amp_glow = |x: f64, _y: f64| 40.0 * x / (w - 1) as f64;
+        let n = 32usize;
+        let mut flat_mean = vec![0.0f64; w * h];
+        let mut dark_flat_mean = vec![0.0f64; w * h];
+        for k in 0..n {
+            let flat = render_flat_exposure(
+                &sensor,
+                w,
+                h,
+                20_000.0,
+                exposure_s,
+                Some(&amp_glow),
+                10_000 + k as u64,
+            );
+            let dark_flat = render_dark_with_pattern(
+                &sensor,
+                w,
+                h,
+                exposure_s,
+                Some(&amp_glow),
+                20_000 + k as u64,
+            );
+            for i in 0..w * h {
+                flat_mean[i] += flat[i] as f64 / n as f64;
+                dark_flat_mean[i] += dark_flat[i] as f64 / n as f64;
+            }
+        }
+
+        let column_mean = |image: &[f64], x: usize| -> f64 {
+            (0..h).map(|y| image[y * w + x]).sum::<f64>() / h as f64
+        };
+        let bias_only_left = column_mean(&flat_mean, 0) - sensor.bias_adu;
+        let bias_only_right = column_mean(&flat_mean, w - 1) - sensor.bias_adu;
+        let bias_only_delta = bias_only_right - bias_only_left;
+
+        let calibrated: Vec<f64> = flat_mean
+            .iter()
+            .zip(&dark_flat_mean)
+            .map(|(flat, dark_flat)| flat - dark_flat)
+            .collect();
+        let calibrated_delta =
+            column_mean(&calibrated, w - 1) - column_mean(&calibrated, 0);
+
+        assert!(
+            bias_only_delta > 250.0,
+            "el fixture debe contener amp glow visible: delta={bias_only_delta:.2} ADU"
+        );
+        assert!(
+            calibrated_delta.abs() < 20.0,
+            "el dark-flat exacto no retiro el patron: delta={calibrated_delta:.2} ADU"
+        );
+    }
+
+    #[test]
+    fn sim_long_flat_and_patterned_dark_are_deterministic() {
+        let sensor = sensor_base();
+        let glow = |x: f64, y: f64| 0.2 * x + 0.1 * y;
+        assert_eq!(
+            render_flat_exposure(&sensor, 12, 10, 10_000.0, 3.0, Some(&glow), 91),
+            render_flat_exposure(&sensor, 12, 10, 10_000.0, 3.0, Some(&glow), 91)
+        );
+        assert_eq!(
+            render_dark_with_pattern(&sensor, 12, 10, 3.0, Some(&glow), 92),
+            render_dark_with_pattern(&sensor, 12, 10, 3.0, Some(&glow), 92)
         );
     }
 }

@@ -65,6 +65,937 @@ fn get_available_fonts() -> Vec<String> {
     map.iter().map(|(name, _)| name.clone()).collect()
 }
 
+const PLANETARY_BATCH_OUTPUT_MARKER: &str = ".zenith-planetary-batch-output";
+const PLANETARY_BATCH_MANIFEST: &str = "Zenith_Batch_manifest.json";
+static PLANETARY_BATCH_MANIFEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+static PLANETARY_BATCH_MANIFEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchOutputError {
+    code: String,
+    path: Option<String>,
+    message: String,
+}
+
+impl BatchOutputError {
+    fn new(code: &str, path: Option<&Path>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.to_string(),
+            path: path.map(|value| clean_windows_path(value.to_path_buf())),
+            message: message.into(),
+        }
+    }
+
+    fn io(operation: &str, path: &Path, error: std::io::Error) -> Self {
+        let code = match (error.kind(), error.raw_os_error()) {
+            (std::io::ErrorKind::PermissionDenied, _) => "permission_denied",
+            (_, Some(28 | 112)) => "no_space",
+            // ERROR_WRITE_PROTECT=19 en Windows; EROFS=30 en Unix.
+            (_, Some(19 | 30)) => "read_only_volume",
+            (std::io::ErrorKind::NotFound, _) => "not_found",
+            (std::io::ErrorKind::AlreadyExists, _) => "already_exists",
+            _ => "io_error",
+        };
+        Self::new(
+            code,
+            Some(path),
+            format!("{operation} en {}: {error}", path.display()),
+        )
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct NormalizedBatchApPoint {
+    x: f32,
+    y: f32,
+    size: f32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchOutputEntry {
+    source_path: String,
+    output_folder: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchOutputPlan {
+    schema_version: u32,
+    session_id: String,
+    policy: String,
+    animation_folder: String,
+    entries: Vec<BatchOutputEntry>,
+    sequence_plan: PlanetarySequencePlan,
+    normalized_ap_points: Vec<NormalizedBatchApPoint>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedBatchSource {
+    source_path: String,
+    parent: PathBuf,
+    relative_parent: PathBuf,
+    source_name: PathBuf,
+}
+
+fn is_planetary_batch_output_dir(path: &Path) -> bool {
+    path.join(PLANETARY_BATCH_OUTPUT_MARKER).is_file()
+}
+
+fn scan_video_directory(root: &Path, recursive: bool) -> std::io::Result<Vec<String>> {
+    fn visit_dirs(dir: &Path, files: &mut Vec<String>, recursive: bool) -> std::io::Result<()> {
+        if !dir.is_dir() || is_planetary_batch_output_dir(dir) {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                if recursive && !is_planetary_batch_output_dir(&path) {
+                    visit_dirs(&path, files, recursive)?;
+                }
+            } else if let Some(ext) = path.extension() {
+                let ext_str = ext.to_string_lossy().to_lowercase();
+                if matches!(ext_str.as_str(), "ser" | "avi" | "mp4" | "mov" | "mkv") {
+                    files.push(clean_windows_path(path));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    visit_dirs(root, &mut files, recursive)?;
+    files.sort();
+    Ok(files)
+}
+
+fn canonical_batch_directory(value: &str, label: &str) -> Result<PathBuf, BatchOutputError> {
+    let path = PathBuf::from(value);
+    if value.trim().is_empty() || !path.is_absolute() {
+        return Err(BatchOutputError::new(
+            "invalid_path",
+            Some(&path),
+            format!("{label} debe ser una ruta absoluta."),
+        ));
+    }
+    let canonical = dunce::canonicalize(&path)
+        .map_err(|error| BatchOutputError::io(&format!("Abrir {label}"), &path, error))?;
+    if !canonical.is_dir() {
+        return Err(BatchOutputError::new(
+            "not_directory",
+            Some(&canonical),
+            format!("{label} no es una carpeta."),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn next_planetary_batch_session_id() -> String {
+    let mut uuid: [u8; 16] = rand::random();
+    // UUID v4 / RFC 4122. El nombre no revela rutas y mantiene la misma sesión
+    // identificable en todos los volúmenes que contienen fuentes del lote.
+    uuid[6] = (uuid[6] & 0x0f) | 0x40;
+    uuid[8] = (uuid[8] & 0x3f) | 0x80;
+    format!(
+        "Zenith_Batch_{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        uuid[0], uuid[1], uuid[2], uuid[3],
+        uuid[4], uuid[5], uuid[6], uuid[7],
+        uuid[8], uuid[9], uuid[10], uuid[11],
+        uuid[12], uuid[13], uuid[14], uuid[15],
+    )
+}
+
+fn normalize_batch_ap_points(
+    points: &[ApPoint],
+    canvas: [u32; 2],
+) -> Result<Vec<NormalizedBatchApPoint>, BatchOutputError> {
+    let width = canvas[0] as f32;
+    let height = canvas[1] as f32;
+    let scale = width.min(height);
+    if width <= 1.0 || height <= 1.0 || scale <= 1.0 {
+        return Err(BatchOutputError::new(
+            "invalid_reference_canvas",
+            None,
+            "El canvas de referencia del lote no tiene dimensiones válidas.",
+        ));
+    }
+    if points.is_empty() {
+        return Err(BatchOutputError::new(
+            "missing_reference_ap",
+            None,
+            "La referencia del lote no contiene puntos AP para congelar.",
+        ));
+    }
+    let mut normalized = Vec::with_capacity(points.len());
+    for point in points {
+        if !point.x.is_finite() || !point.y.is_finite() || point.size == 0 {
+            return Err(BatchOutputError::new(
+                "invalid_reference_ap",
+                None,
+                "La referencia contiene un punto AP inválido.",
+            ));
+        }
+        normalized.push(NormalizedBatchApPoint {
+            x: (point.x / (width - 1.0)).clamp(0.0, 1.0),
+            y: (point.y / (height - 1.0)).clamp(0.0, 1.0),
+            size: (point.size as f32 / scale).clamp(8.0 / scale, 1.0),
+        });
+    }
+    Ok(normalized)
+}
+
+fn materialize_batch_ap_points(
+    points: &[NormalizedBatchApPoint],
+    width: usize,
+    height: usize,
+) -> Vec<ApPoint> {
+    if width <= 1 || height <= 1 {
+        return Vec::new();
+    }
+    let scale = width.min(height) as f32;
+    points
+        .iter()
+        .map(|point| ApPoint {
+            x: (point.x.clamp(0.0, 1.0) * (width.saturating_sub(1)) as f32)
+                .clamp(0.0, width.saturating_sub(1) as f32),
+            y: (point.y.clamp(0.0, 1.0) * (height.saturating_sub(1)) as f32)
+                .clamp(0.0, height.saturating_sub(1) as f32),
+            size: (point.size.clamp(0.0, 1.0) * scale)
+                .round()
+                .clamp(8.0, scale.max(8.0)) as usize,
+        })
+        .collect()
+}
+
+fn batch_rgb16_to_mono(rgb: &[u16]) -> Vec<u16> {
+    rgb.chunks_exact(3)
+        .map(|pixel| {
+            ((pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32) / 3) as u16
+        })
+        .collect()
+}
+
+fn batch_planet_disc_is_reliable(
+    disc: &crate::derotation::PlanetDisc,
+    mono: &[u16],
+    width: usize,
+    height: usize,
+) -> bool {
+    if mono.len() != width.saturating_mul(height) || width < 16 || height < 16 {
+        return false;
+    }
+    let min_dim = width.min(height) as f64;
+    if !disc.cx.is_finite()
+        || !disc.cy.is_finite()
+        || !disc.radius_x.is_finite()
+        || !disc.radius_y.is_finite()
+        || disc.radius_x < min_dim * 0.02
+        || disc.radius_y < min_dim * 0.02
+        || disc.radius_x > width as f64 * 0.49
+        || disc.radius_y > height as f64 * 0.49
+        || disc.cx - disc.radius_x < 0.0
+        || disc.cy - disc.radius_y < 0.0
+        || disc.cx + disc.radius_x >= width as f64
+        || disc.cy + disc.radius_y >= height as f64
+    {
+        return false;
+    }
+
+    let sample_step = ((width.saturating_mul(height) / 120_000).max(1) as f64)
+        .sqrt()
+        .ceil() as usize;
+    let mut inside_sum = 0u64;
+    let mut outside_sum = 0u64;
+    let mut inside_count = 0usize;
+    let mut outside_count = 0usize;
+    for y in (0..height).step_by(sample_step.max(1)) {
+        let dy = (y as f64 - disc.cy) / disc.radius_y.max(1.0);
+        for x in (0..width).step_by(sample_step.max(1)) {
+            let dx = (x as f64 - disc.cx) / disc.radius_x.max(1.0);
+            let radius2 = dx * dx + dy * dy;
+            let value = mono[y * width + x] as u64;
+            if radius2 <= 0.64 {
+                inside_sum = inside_sum.saturating_add(value);
+                inside_count += 1;
+            } else if (1.15..=1.80).contains(&radius2) {
+                outside_sum = outside_sum.saturating_add(value);
+                outside_count += 1;
+            }
+        }
+    }
+    if inside_count < 16 || outside_count < 16 {
+        return false;
+    }
+    let inside = inside_sum as f64 / inside_count as f64;
+    let outside = outside_sum as f64 / outside_count as f64;
+    inside >= outside * 1.08 + 32.0
+}
+
+fn batch_warp_disc_to_reference(
+    rgb: &[u16],
+    width: usize,
+    height: usize,
+    current: &crate::derotation::PlanetDisc,
+    reference: &crate::derotation::PlanetDisc,
+    max_scale_delta: f32,
+    max_roll_degrees: f32,
+) -> Vec<u16> {
+    let current_radius = (current.radius_x * current.radius_y).sqrt().max(1.0);
+    let reference_radius = (reference.radius_x * reference.radius_y).sqrt().max(1.0);
+    let scale_limit = max_scale_delta.clamp(0.0, 0.25) as f64;
+    let scale = (reference_radius / current_radius).clamp(1.0 - scale_limit, 1.0 + scale_limit);
+    let roll = (reference.angle_deg - current.angle_deg)
+        .clamp(-(max_roll_degrees as f64), max_roll_degrees as f64)
+        .to_radians();
+    let cos_roll = roll.cos();
+    let sin_roll = roll.sin();
+    let mut output = vec![0u16; width.saturating_mul(height).saturating_mul(3)];
+    for y in 0..height {
+        for x in 0..width {
+            let target_x = (x as f64 - reference.cx) / scale;
+            let target_y = (y as f64 - reference.cy) / scale;
+            let source_x = current.cx + target_x * cos_roll + target_y * sin_roll;
+            let source_y = current.cy - target_x * sin_roll + target_y * cos_roll;
+            if source_x < 0.0
+                || source_y < 0.0
+                || source_x >= width.saturating_sub(1) as f64
+                || source_y >= height.saturating_sub(1) as f64
+            {
+                continue;
+            }
+            let x0 = source_x.floor() as usize;
+            let y0 = source_y.floor() as usize;
+            let wx = (source_x - x0 as f64) as f32;
+            let wy = (source_y - y0 as f64) as f32;
+            let dst = (y * width + x) * 3;
+            for channel in 0..3 {
+                let v00 = rgb[(y0 * width + x0) * 3 + channel] as f32;
+                let v10 = rgb[(y0 * width + x0 + 1) * 3 + channel] as f32;
+                let v01 = rgb[((y0 + 1) * width + x0) * 3 + channel] as f32;
+                let v11 = rgb[((y0 + 1) * width + x0 + 1) * 3 + channel] as f32;
+                output[dst + channel] = ((v00 * (1.0 - wx) + v10 * wx) * (1.0 - wy)
+                    + (v01 * (1.0 - wx) + v11 * wx) * wy)
+                    .round()
+                    .clamp(0.0, 65_535.0) as u16;
+            }
+        }
+    }
+    output
+}
+
+fn batch_common_rgb_luminance_scalar(reference: &[u16], current: &[u16]) -> f32 {
+    if reference.len() != current.len() || reference.len() < 3 {
+        return 1.0;
+    }
+    let pixel_count = reference.len() / 3;
+    let step = (pixel_count / 200_000).max(1);
+    let mut pairs = Vec::with_capacity((pixel_count / step).max(1));
+    let mut reference_peak = 0u16;
+    let mut current_peak = 0u16;
+    for pixel in (0..pixel_count).step_by(step) {
+        let index = pixel * 3;
+        let reference_luma = ((reference[index] as u32
+            + reference[index + 1] as u32
+            + reference[index + 2] as u32)
+            / 3) as u16;
+        let current_luma = ((current[index] as u32
+            + current[index + 1] as u32
+            + current[index + 2] as u32)
+            / 3) as u16;
+        reference_peak = reference_peak.max(reference_luma);
+        current_peak = current_peak.max(current_luma);
+        pairs.push((reference_luma, current_luma));
+    }
+    let reference_floor = (reference_peak as f32 * 0.08).max(32.0) as u16;
+    let current_floor = (current_peak as f32 * 0.08).max(32.0) as u16;
+    let reference_ceiling = (reference_peak as f32 * 0.985).min(65_000.0) as u16;
+    let current_ceiling = (current_peak as f32 * 0.985).min(65_000.0) as u16;
+    let mut reference_samples = Vec::new();
+    let mut current_samples = Vec::new();
+    for (reference_luma, current_luma) in pairs {
+        if reference_luma >= reference_floor
+            && current_luma >= current_floor
+            && reference_luma <= reference_ceiling
+            && current_luma <= current_ceiling
+        {
+            reference_samples.push(reference_luma);
+            current_samples.push(current_luma);
+        }
+    }
+    if reference_samples.len() < 32 {
+        return 1.0;
+    }
+    reference_samples.sort_unstable();
+    current_samples.sort_unstable();
+    let middle = reference_samples.len() / 2;
+    let reference_median = reference_samples[middle] as f32;
+    let current_median = current_samples[middle].max(1) as f32;
+    (reference_median / current_median).clamp(0.5, 2.0)
+}
+
+fn batch_apply_common_rgb_scalar(rgb: &mut [u16], scalar: f32) {
+    if !scalar.is_finite() || (scalar - 1.0).abs() <= f32::EPSILON {
+        return;
+    }
+    rgb.iter_mut().for_each(|value| {
+        *value = (*value as f32 * scalar).round().clamp(0.0, 65_535.0) as u16;
+    });
+}
+
+fn rollback_batch_output_directories(created: &[PathBuf]) {
+    for directory in created.iter().rev() {
+        // Cada ruta fue creada con `create_dir` por este intento y el nombre de
+        // sesión es único. Nunca se elimina una carpeta elegida por el usuario.
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn atomic_replace_batch_file(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    let from: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: ambas cadenas están terminadas en NUL y viven durante la llamada.
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn atomic_replace_batch_file(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(temporary, target)
+}
+
+fn probe_batch_output_directory_impl<F>(
+    directory: &Path,
+    session_id: &str,
+    after_rename: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
+    let temporary = directory.join(format!(".zenith-write-probe-{session_id}.tmp"));
+    let committed = directory.join(format!(".zenith-write-probe-{session_id}.committed"));
+    let result = (|| -> std::io::Result<()> {
+        let mut probe = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        probe.write_all(b"ok")?;
+        probe.flush()?;
+        probe.sync_all()?;
+        drop(probe);
+        std::fs::rename(&temporary, &committed)?;
+        after_rename()?;
+        std::fs::remove_file(&committed)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        let _ = std::fs::remove_file(&committed);
+    }
+    result
+}
+
+fn probe_batch_output_directory(directory: &Path, session_id: &str) -> std::io::Result<()> {
+    probe_batch_output_directory_impl(directory, session_id, || Ok(()))
+}
+
+fn write_batch_manifest_value(
+    directory: &Path,
+    value: &serde_json::Value,
+) -> Result<(), BatchOutputError> {
+    let target = directory.join(PLANETARY_BATCH_MANIFEST);
+    let sequence = PLANETARY_BATCH_MANIFEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = directory.join(format!(
+        ".Zenith_Batch_manifest.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+        BatchOutputError::new(
+            "manifest_encode_failed",
+            Some(&target),
+            format!("No se pudo codificar el manifiesto del lote: {error}"),
+        )
+    })?;
+    let write_result = (|| -> std::io::Result<()> {
+        let mut staged = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        staged.write_all(&bytes)?;
+        staged.flush()?;
+        staged.sync_all()?;
+        drop(staged);
+        atomic_replace_batch_file(&temporary, &target)
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(BatchOutputError::io(
+            "Publicar manifiesto del lote",
+            &target,
+            error,
+        ));
+    }
+    Ok(())
+}
+
+fn initialize_batch_output_directory(
+    directory: &Path,
+    session_id: &str,
+    sequence_plan: &PlanetarySequencePlan,
+    normalized_ap_points: &[NormalizedBatchApPoint],
+) -> Result<(), BatchOutputError> {
+    let marker_path = directory.join(PLANETARY_BATCH_OUTPUT_MARKER);
+    let marker_body = serde_json::to_vec_pretty(&serde_json::json!({
+        "schemaVersion": 1,
+        "kind": "planetaryBatchOutput",
+        "sessionId": session_id,
+        "sequencePlan": sequence_plan,
+        "normalizedApPoints": normalized_ap_points,
+    }))
+    .map_err(|error| {
+        BatchOutputError::new(
+            "manifest_encode_failed",
+            Some(&marker_path),
+            format!("No se pudo codificar el manifiesto del lote: {error}"),
+        )
+    })?;
+    let mut marker = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_path)
+        .map_err(|error| BatchOutputError::io("Crear marcador de salida", &marker_path, error))?;
+    marker
+        .write_all(&marker_body)
+        .and_then(|_| marker.flush())
+        .and_then(|_| marker.sync_all())
+        .map_err(|error| BatchOutputError::io("Escribir marcador de salida", &marker_path, error))?;
+
+    if let Err(error) = probe_batch_output_directory(directory, session_id) {
+        return Err(BatchOutputError::io(
+            "Comprobar escritura del lote",
+            directory,
+            error,
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_batch_output_impl(
+    files: Vec<String>,
+    source_root: String,
+    policy: String,
+    single_directory: Option<String>,
+    reference_canvas: [u32; 2],
+    reference_ap_points: Vec<ApPoint>,
+) -> Result<BatchOutputPlan, BatchOutputError> {
+    if files.is_empty() {
+        return Err(BatchOutputError::new(
+            "empty_batch",
+            None,
+            "El lote no contiene vídeos.",
+        ));
+    }
+    if policy != "sourceAdjacent" && policy != "singleDirectory" {
+        return Err(BatchOutputError::new(
+            "invalid_policy",
+            None,
+            "La política de salida debe ser sourceAdjacent o singleDirectory.",
+        ));
+    }
+
+    let normalized_ap_points = normalize_batch_ap_points(&reference_ap_points, reference_canvas)?;
+    let reference_source = files[0].clone();
+    let source_root = canonical_batch_directory(&source_root, "la carpeta fuente del lote")?;
+    let single_base = if policy == "singleDirectory" {
+        let selected = single_directory.as_deref().ok_or_else(|| {
+            BatchOutputError::new(
+                "missing_destination",
+                None,
+                "Elige una carpeta única para la salida del lote.",
+            )
+        })?;
+        Some(canonical_batch_directory(selected, "la carpeta de salida elegida")?)
+    } else {
+        None
+    };
+
+    let mut sources = Vec::with_capacity(files.len());
+    let mut seen_sources = std::collections::HashSet::with_capacity(files.len());
+    for original in files {
+        let path = PathBuf::from(&original);
+        if !path.is_absolute() {
+            return Err(BatchOutputError::new(
+                "invalid_source_path",
+                Some(&path),
+                "La ruta de un vídeo del lote no es absoluta.",
+            ));
+        }
+        let canonical = dunce::canonicalize(&path)
+            .map_err(|error| BatchOutputError::io("Abrir vídeo del lote", &path, error))?;
+        if !canonical.is_file() {
+            return Err(BatchOutputError::new(
+                "source_not_file",
+                Some(&canonical),
+                "Una fuente del lote no es un archivo.",
+            ));
+        }
+        if !seen_sources.insert(canonical.clone()) {
+            return Err(BatchOutputError::new(
+                "duplicate_source",
+                Some(&canonical),
+                "El lote contiene el mismo vídeo más de una vez.",
+            ));
+        }
+        let parent = canonical.parent().ok_or_else(|| {
+            BatchOutputError::new(
+                "source_without_parent",
+                Some(&canonical),
+                "No se pudo determinar la carpeta del vídeo.",
+            )
+        })?;
+        let relative_parent = if policy == "singleDirectory" {
+            parent
+                .strip_prefix(&source_root)
+                .map(Path::to_path_buf)
+                .map_err(|_| {
+                    BatchOutputError::new(
+                        "source_outside_root",
+                        Some(&canonical),
+                        "Una fuente no pertenece a la carpeta raíz del lote.",
+                    )
+                })?
+        } else {
+            PathBuf::new()
+        };
+        let source_name = canonical
+            .file_name()
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                BatchOutputError::new(
+                    "source_without_name",
+                    Some(&canonical),
+                    "No se pudo determinar el nombre del vídeo.",
+                )
+            })?;
+        sources.push(PreparedBatchSource {
+            source_path: original,
+            parent: parent.to_path_buf(),
+            relative_parent,
+            source_name,
+        });
+    }
+
+    let animation_base = single_base.clone().unwrap_or_else(|| source_root.clone());
+    for _ in 0..32 {
+        let session_id = next_planetary_batch_session_id();
+        let sequence_plan = PlanetarySequencePlan {
+            plan_id: session_id.clone(),
+            reference_source: reference_source.clone(),
+            fixed_canvas: reference_canvas,
+            frozen: true,
+            ..PlanetarySequencePlan::default()
+        };
+        sequence_plan.validate().map_err(|message| {
+            BatchOutputError::new("invalid_sequence_plan", None, message)
+        })?;
+        let mut bases = std::collections::BTreeSet::new();
+        bases.insert(animation_base.clone());
+        if policy == "sourceAdjacent" {
+            for source in &sources {
+                bases.insert(source.parent.clone());
+            }
+        }
+
+        let mut created_roots = Vec::with_capacity(bases.len());
+        let mut collision = false;
+        for base in &bases {
+            let target = base.join(&session_id);
+            match std::fs::create_dir(&target) {
+                Ok(()) => created_roots.push(target),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    collision = true;
+                    break;
+                }
+                Err(error) => {
+                    rollback_batch_output_directories(&created_roots);
+                    return Err(BatchOutputError::io(
+                        "Crear carpeta de salida del lote",
+                        &target,
+                        error,
+                    ));
+                }
+            }
+        }
+        if collision {
+            rollback_batch_output_directories(&created_roots);
+            continue;
+        }
+
+        for directory in &created_roots {
+            if let Err(error) = initialize_batch_output_directory(
+                directory,
+                &session_id,
+                &sequence_plan,
+                &normalized_ap_points,
+            ) {
+                rollback_batch_output_directories(&created_roots);
+                return Err(error);
+            }
+        }
+
+        let target_by_base: std::collections::HashMap<PathBuf, PathBuf> = bases
+            .into_iter()
+            .map(|base| {
+                let target = base.join(&session_id);
+                (base, target)
+            })
+            .collect();
+        let mut entry_targets = Vec::with_capacity(sources.len());
+        let mut unique_targets = std::collections::HashSet::with_capacity(sources.len());
+        for source in &sources {
+            let session_root = if policy == "singleDirectory" {
+                target_by_base
+                    .get(single_base.as_ref().expect("singleDirectory validado"))
+            } else {
+                target_by_base.get(&source.parent)
+            }
+            .expect("cada base fue materializada");
+            let output_folder = if policy == "singleDirectory" {
+                session_root
+                    .join(&source.relative_parent)
+                    .join(&source.source_name)
+            } else {
+                session_root.join(&source.source_name)
+            };
+            if !unique_targets.insert(output_folder.clone()) {
+                rollback_batch_output_directories(&created_roots);
+                return Err(BatchOutputError::new(
+                    "output_collision",
+                    Some(&output_folder),
+                    "Dos fuentes del lote producirían el mismo directorio de salida.",
+                ));
+            }
+            if let Err(error) = std::fs::create_dir_all(&output_folder) {
+                rollback_batch_output_directories(&created_roots);
+                return Err(BatchOutputError::io(
+                    "Crear carpeta individual de la fuente",
+                    &output_folder,
+                    error,
+                ));
+            }
+            entry_targets.push(BatchOutputEntry {
+                source_path: source.source_path.clone(),
+                output_folder: clean_windows_path(output_folder),
+            });
+        }
+        let animation_folder = clean_windows_path(
+            target_by_base
+                .get(&animation_base)
+                .cloned()
+                .expect("la base de animación fue materializada"),
+        );
+        let plan = BatchOutputPlan {
+            schema_version: 1,
+            session_id,
+            policy,
+            animation_folder,
+            entries: entry_targets,
+            sequence_plan,
+            normalized_ap_points,
+        };
+        let manifest = serde_json::json!({
+            "schemaVersion": plan.schema_version,
+            "kind": "planetaryBatchSession",
+            "sessionId": plan.session_id,
+            "policy": plan.policy,
+            "animationFolder": plan.animation_folder,
+            "entries": plan.entries,
+            "sequencePlan": plan.sequence_plan,
+            "normalizedApPoints": plan.normalized_ap_points,
+            "completedResults": [],
+        });
+        if let Err(error) = write_batch_manifest_value(
+            Path::new(&plan.animation_folder),
+            &manifest,
+        ) {
+            rollback_batch_output_directories(&created_roots);
+            return Err(error);
+        }
+        return Ok(plan);
+    }
+
+    Err(BatchOutputError::new(
+        "name_collision",
+        Some(&animation_base),
+        "No se pudo reservar un nombre único para la sesión del lote.",
+    ))
+}
+
+#[tauri::command]
+fn prepare_batch_output(
+    state: State<'_, AppState>,
+    files: Vec<String>,
+    source_root: String,
+    policy: String,
+    single_directory: Option<String>,
+    reference_canvas: [u32; 2],
+    reference_ap_points: Vec<ApPoint>,
+) -> Result<BatchOutputPlan, BatchOutputError> {
+    state
+        .license_manager
+        .check_access()
+        .map_err(|message| BatchOutputError::new("license", None, message))?;
+    prepare_batch_output_impl(
+        files,
+        source_root,
+        policy,
+        single_directory,
+        reference_canvas,
+        reference_ap_points,
+    )
+}
+
+fn register_batch_output_result_impl(
+    animation_folder: &str,
+    session_id: &str,
+    source_path: &str,
+    prepared_path: &str,
+    linear_master_path: &str,
+) -> Result<(), BatchOutputError> {
+    let directory = canonical_batch_directory(animation_folder, "la sesión de salida del lote")?;
+    if !directory.join(PLANETARY_BATCH_OUTPUT_MARKER).is_file() {
+        return Err(BatchOutputError::new(
+            "unmanaged_batch_folder",
+            Some(&directory),
+            "La carpeta no pertenece a una sesión batch administrada.",
+        ));
+    }
+    let manifest_path = directory.join(PLANETARY_BATCH_MANIFEST);
+    let _manifest_guard = PLANETARY_BATCH_MANIFEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let bytes = std::fs::read(&manifest_path)
+        .map_err(|error| BatchOutputError::io("Leer manifiesto del lote", &manifest_path, error))?;
+    let mut manifest: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        BatchOutputError::new(
+            "manifest_decode_failed",
+            Some(&manifest_path),
+            format!("El manifiesto del lote no es válido: {error}"),
+        )
+    })?;
+    if manifest.get("sessionId").and_then(|value| value.as_str()) != Some(session_id) {
+        return Err(BatchOutputError::new(
+            "session_mismatch",
+            Some(&manifest_path),
+            "El resultado no pertenece a la sesión batch activa.",
+        ));
+    }
+    let output_folder = manifest
+        .get("entries")
+        .and_then(|value| value.as_array())
+        .and_then(|entries| {
+            entries.iter().find_map(|entry| {
+                (entry.get("sourcePath").and_then(|value| value.as_str()) == Some(source_path))
+                    .then(|| entry.get("outputFolder").and_then(|value| value.as_str()))
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| {
+            BatchOutputError::new(
+                "source_not_in_session",
+                None,
+                "La fuente terminada no existe en el plan de la sesión.",
+            )
+        })?;
+    let output_folder = canonical_batch_directory(output_folder, "la salida individual del vídeo")?;
+    let validate_result = |value: &str, label: &str| -> Result<PathBuf, BatchOutputError> {
+        let path = PathBuf::from(value);
+        let canonical = dunce::canonicalize(&path)
+            .map_err(|error| BatchOutputError::io(label, &path, error))?;
+        if !canonical.is_file() || !canonical.starts_with(&output_folder) {
+            return Err(BatchOutputError::new(
+                "result_outside_source_folder",
+                Some(&canonical),
+                format!("{label} no está dentro de la carpeta reservada para la fuente."),
+            ));
+        }
+        Ok(canonical)
+    };
+    let prepared = validate_result(prepared_path, "La salida preparada")?;
+    let linear_master = validate_result(linear_master_path, "El máster lineal RGB16")?;
+    let completed = manifest
+        .as_object_mut()
+        .ok_or_else(|| {
+            BatchOutputError::new(
+                "manifest_shape_invalid",
+                Some(&manifest_path),
+                "El manifiesto batch no contiene un objeto raíz.",
+            )
+        })?
+        .entry("completedResults")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let completed = completed.as_array_mut().ok_or_else(|| {
+        BatchOutputError::new(
+            "manifest_shape_invalid",
+            Some(&manifest_path),
+            "completedResults no es una lista válida.",
+        )
+    })?;
+    completed.retain(|entry| {
+        entry.get("sourcePath").and_then(|value| value.as_str()) != Some(source_path)
+    });
+    completed.push(serde_json::json!({
+        "sourcePath": source_path,
+        "preparedPath": clean_windows_path(prepared),
+        "linearMasterPath": clean_windows_path(linear_master),
+        "completedAt": chrono::Utc::now().to_rfc3339(),
+    }));
+    write_batch_manifest_value(&directory, &manifest)
+}
+
+#[tauri::command]
+fn register_batch_output_result(
+    state: State<'_, AppState>,
+    animation_folder: String,
+    session_id: String,
+    source_path: String,
+    prepared_path: String,
+    linear_master_path: String,
+) -> Result<(), BatchOutputError> {
+    state
+        .license_manager
+        .check_access()
+        .map_err(|message| BatchOutputError::new("license", None, message))?;
+    register_batch_output_result_impl(
+        &animation_folder,
+        &session_id,
+        &source_path,
+        &prepared_path,
+        &linear_master_path,
+    )
+}
+
 #[tauri::command]
 async fn scan_directory(
     _app: tauri::AppHandle,
@@ -74,36 +1005,380 @@ async fn scan_directory(
 ) -> Result<Vec<String>, String> {
     state.license_manager.check_access()?;
 
-    let mut files = Vec::new();
     let root = Path::new(&path);
     if !root.exists() {
         return Err("La carpeta no existe".into());
     }
+    if !root.is_dir() {
+        return Err("La ruta de escaneo no es una carpeta".into());
+    }
+    scan_video_directory(root, recursive).map_err(|error| error.to_string())
+}
 
-    fn visit_dirs(dir: &Path, files: &mut Vec<String>, recursive: bool) -> std::io::Result<()> {
-        if dir.is_dir() {
-            for entry in fs::read_dir(dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_dir() && recursive {
-                    visit_dirs(&path, files, recursive)?;
-                } else if let Some(ext) = path.extension() {
-                    let ext_str = ext.to_string_lossy().to_lowercase();
-                    // PR-1.9: el motor decodifica mp4/mov/mkv vía FFmpeg desde
-                    // siempre, pero el escaneo del lote los OMITÍA en silencio
-                    // (el usuario obtenía un lote vacío sin saber por qué).
-                    if matches!(ext_str.as_str(), "ser" | "avi" | "mp4" | "mov" | "mkv") {
-                        files.push(clean_windows_path(path));
-                    }
+#[cfg(test)]
+mod batch_output_tests {
+    use super::{
+        batch_apply_common_rgb_scalar, batch_common_rgb_luminance_scalar,
+        batch_planet_disc_is_reliable, batch_warp_disc_to_reference,
+        materialize_batch_ap_points, next_planetary_batch_session_id,
+        prepare_batch_output_impl, probe_batch_output_directory_impl,
+        register_batch_output_result_impl, scan_video_directory, PLANETARY_BATCH_MANIFEST,
+        PLANETARY_BATCH_OUTPUT_MARKER,
+    };
+    use crate::smart_grid::ApPoint;
+    use std::path::{Path, PathBuf};
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "zenith-batch-output-{label}-{}",
+                next_planetary_batch_session_id()
+            ));
+            std::fs::create_dir_all(&path).expect("crear raíz temporal");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_source(path: &Path) -> String {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("crear parent de fuente");
+        }
+        std::fs::write(path, b"fixture").expect("escribir fuente");
+        path.display().to_string()
+    }
+
+    fn reference_points() -> Vec<ApPoint> {
+        vec![
+            ApPoint { x: 32.0, y: 24.0, size: 16 },
+            ApPoint { x: 96.0, y: 72.0, size: 24 },
+        ]
+    }
+
+    fn canonical(path: &Path) -> PathBuf {
+        dunce::canonicalize(path).expect("canonicalizar fixture")
+    }
+
+    #[test]
+    fn source_adjacent_creates_a_named_source_folder_below_each_session_root() {
+        let root = TestRoot::new("adjacent");
+        let first = write_source(&root.path().join("jupiter.ser"));
+        let second = write_source(&root.path().join("night-2").join("jupiter.mov"));
+        let third = write_source(&root.path().join("jupiter.mov"));
+
+        let plan = prepare_batch_output_impl(
+            vec![first.clone(), second.clone(), third.clone()],
+            root.path().display().to_string(),
+            "sourceAdjacent".to_string(),
+            None,
+            [128, 96],
+            reference_points(),
+        )
+        .expect("preflight sourceAdjacent");
+
+        assert_eq!(plan.schema_version, 1);
+        assert_eq!(plan.policy, "sourceAdjacent");
+        assert_eq!(plan.entries.len(), 3);
+        assert!(plan.sequence_plan.frozen);
+        assert_eq!(plan.sequence_plan.reference_source, first);
+        assert_eq!(plan.sequence_plan.fixed_canvas, [128, 96]);
+        assert_eq!(plan.normalized_ap_points.len(), 2);
+        assert_eq!(plan.entries[0].source_path, first);
+        assert_eq!(plan.entries[1].source_path, second);
+        assert_eq!(plan.entries[2].source_path, third);
+
+        let first_output = PathBuf::from(&plan.entries[0].output_folder);
+        let second_output = PathBuf::from(&plan.entries[1].output_folder);
+        let third_output = PathBuf::from(&plan.entries[2].output_folder);
+        let animation_output = PathBuf::from(&plan.animation_folder);
+        assert!(animation_output
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("Zenith_Batch_"));
+        assert_eq!(animation_output.parent(), Some(canonical(root.path()).as_path()));
+        assert_eq!(first_output.parent(), Some(animation_output.as_path()));
+        assert_eq!(first_output.file_name().unwrap(), "jupiter.ser");
+        assert_eq!(third_output.parent(), Some(animation_output.as_path()));
+        assert_eq!(third_output.file_name().unwrap(), "jupiter.mov");
+        let second_session = second_output.parent().expect("sesión de fuente anidada");
+        assert_eq!(second_session.file_name(), animation_output.file_name());
+        assert_eq!(
+            second_session.parent(),
+            Some(canonical(&root.path().join("night-2")).as_path())
+        );
+        assert_eq!(second_output.file_name().unwrap(), "jupiter.mov");
+        assert!(first_output.is_dir());
+        assert!(second_output.is_dir());
+        assert!(third_output.is_dir());
+        assert!(animation_output.join(PLANETARY_BATCH_OUTPUT_MARKER).is_file());
+        assert!(second_session.join(PLANETARY_BATCH_OUTPUT_MARKER).is_file());
+        assert!(animation_output.join(PLANETARY_BATCH_MANIFEST).is_file());
+
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(animation_output.join(PLANETARY_BATCH_MANIFEST))
+                .expect("leer manifiesto"),
+        )
+        .expect("decodificar manifiesto");
+        assert_eq!(manifest["sequencePlan"]["frozen"], true);
+        assert_eq!(manifest["sequencePlan"]["fixedCanvas"], serde_json::json!([128, 96]));
+        assert_eq!(manifest["normalizedApPoints"].as_array().unwrap().len(), 2);
+        assert_eq!(manifest["entries"].as_array().unwrap().len(), 3);
+        assert!(manifest["completedResults"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn single_directory_preserves_relative_paths_for_homonymous_sources() {
+        let root = TestRoot::new("single-source");
+        let destination = TestRoot::new("single-destination");
+        let first = write_source(&root.path().join("night-a").join("jupiter.ser"));
+        let second = write_source(&root.path().join("night-b").join("jupiter.ser"));
+        let third = write_source(&root.path().join("moon.mov"));
+
+        let plan = prepare_batch_output_impl(
+            vec![first, second, third],
+            root.path().display().to_string(),
+            "singleDirectory".to_string(),
+            Some(destination.path().display().to_string()),
+            [128, 96],
+            reference_points(),
+        )
+        .expect("preflight singleDirectory");
+
+        assert_eq!(plan.policy, "singleDirectory");
+        assert_eq!(plan.entries.len(), 3);
+        let session_root = PathBuf::from(&plan.animation_folder);
+        assert!(session_root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("Zenith_Batch_"));
+        assert_eq!(session_root.parent(), Some(canonical(destination.path()).as_path()));
+        assert_eq!(
+            PathBuf::from(&plan.entries[0].output_folder),
+            session_root.join("night-a").join("jupiter.ser")
+        );
+        assert_eq!(
+            PathBuf::from(&plan.entries[1].output_folder),
+            session_root.join("night-b").join("jupiter.ser")
+        );
+        assert_eq!(
+            PathBuf::from(&plan.entries[2].output_folder),
+            session_root.join("moon.mov")
+        );
+        assert!(plan
+            .entries
+            .iter()
+            .all(|entry| Path::new(&entry.output_folder).is_dir()));
+        assert!(session_root.join(PLANETARY_BATCH_OUTPUT_MARKER).is_file());
+        assert!(session_root.join(PLANETARY_BATCH_MANIFEST).is_file());
+    }
+
+    #[test]
+    fn failed_write_probe_removes_temporary_and_committed_names() {
+        let root = TestRoot::new("probe-cleanup");
+        let session_id = "test-session";
+        let temporary = root
+            .path()
+            .join(format!(".zenith-write-probe-{session_id}.tmp"));
+        let committed = root
+            .path()
+            .join(format!(".zenith-write-probe-{session_id}.committed"));
+
+        let error = probe_batch_output_directory_impl(root.path(), session_id, || {
+            Err(std::io::Error::other("fallo inyectado después del rename"))
+        })
+        .expect_err("el fallo inyectado debe propagarse");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(!temporary.exists());
+        assert!(!committed.exists());
+    }
+
+    #[test]
+    fn completed_pair_is_recorded_atomically_in_the_session_manifest() {
+        let root = TestRoot::new("manifest-result");
+        let source = write_source(&root.path().join("jupiter.ser"));
+        let plan = prepare_batch_output_impl(
+            vec![source.clone()],
+            root.path().display().to_string(),
+            "sourceAdjacent".to_string(),
+            None,
+            [128, 96],
+            reference_points(),
+        )
+        .expect("preflight");
+        let output = PathBuf::from(&plan.entries[0].output_folder).join("Stack_fixture");
+        std::fs::create_dir(&output).expect("crear publicación simulada");
+        let prepared = output.join("jupiter_Prepared_RGB16.png");
+        let master = output.join("jupiter_Linear_Master_RGB16.tiff");
+        std::fs::write(&prepared, b"png").expect("escribir preparada");
+        std::fs::write(&master, b"tiff").expect("escribir master");
+
+        register_batch_output_result_impl(
+            &plan.animation_folder,
+            &plan.session_id,
+            &source,
+            &prepared.display().to_string(),
+            &master.display().to_string(),
+        )
+        .expect("registrar resultado");
+
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(Path::new(&plan.animation_folder).join(PLANETARY_BATCH_MANIFEST))
+                .expect("leer manifiesto"),
+        )
+        .expect("decodificar manifiesto");
+        let completed = manifest["completedResults"].as_array().unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0]["sourcePath"], source);
+        assert_eq!(
+            completed[0]["preparedPath"],
+            canonical(&prepared).display().to_string()
+        );
+        assert_eq!(
+            completed[0]["linearMasterPath"],
+            canonical(&master).display().to_string()
+        );
+        assert!(std::fs::read_dir(&plan.animation_folder)
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".Zenith_Batch_manifest.")));
+    }
+
+    #[test]
+    fn recursive_scan_ignores_marked_output_directories_and_their_videos() {
+        let root = TestRoot::new("scan-marker");
+        let source = write_source(&root.path().join("capture.ser"));
+        let nested_source = write_source(&root.path().join("inputs").join("capture.mov"));
+        let output = root.path().join("Animacion_previous");
+        std::fs::create_dir_all(&output).expect("crear salida anterior");
+        std::fs::write(output.join(PLANETARY_BATCH_OUTPUT_MARKER), b"marker")
+            .expect("marcar salida anterior");
+        write_source(&output.join("animacion.mp4"));
+
+        let recursive = scan_video_directory(root.path(), true).expect("scan recursivo");
+        assert_eq!(recursive, vec![source, nested_source]);
+        assert!(scan_video_directory(&output, true)
+            .expect("scan directo de salida")
+            .is_empty());
+
+        let root_only = scan_video_directory(root.path(), false).expect("scan raíz");
+        assert_eq!(root_only, vec![root.path().join("capture.ser").display().to_string()]);
+    }
+
+    #[test]
+    fn invalid_policy_fails_before_creating_any_session_directory() {
+        let root = TestRoot::new("invalid-policy");
+        let source = write_source(&root.path().join("capture.ser"));
+        let entries_before = std::fs::read_dir(root.path()).unwrap().count();
+
+        let error = prepare_batch_output_impl(
+            vec![source],
+            root.path().display().to_string(),
+            "somewhereElse".to_string(),
+            None,
+            [128, 96],
+            reference_points(),
+        )
+        .expect_err("política inválida");
+
+        assert_eq!(error.code, "invalid_policy");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), entries_before);
+    }
+
+    #[test]
+    fn normalized_ap_geometry_scales_without_changing_the_grid_topology() {
+        let normalized = super::normalize_batch_ap_points(&reference_points(), [128, 96])
+            .expect("normalizar AP");
+        let round_trip = materialize_batch_ap_points(&normalized, 128, 96);
+        let materialized = materialize_batch_ap_points(&normalized, 256, 192);
+
+        assert_eq!(round_trip.len(), 2);
+        assert!((round_trip[0].x - 32.0).abs() <= 0.0001);
+        assert!((round_trip[0].y - 24.0).abs() <= 0.0001);
+        assert_eq!(round_trip[0].size, 16);
+        assert_eq!(materialized.len(), 2);
+        assert!((materialized[0].x - 64.0).abs() <= 1.0);
+        assert!((materialized[0].y - 48.0).abs() <= 1.0);
+        assert_eq!(materialized[0].size, 32);
+        assert!((materialized[1].x - 192.0).abs() <= 1.0);
+        assert!((materialized[1].y - 144.0).abs() <= 1.0);
+        assert_eq!(materialized[1].size, 48);
+    }
+
+    #[test]
+    fn limb_transform_recenters_a_reliable_disc_without_texture_matching() {
+        let (width, height) = (64usize, 64usize);
+        let mut mono = vec![100u16; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let dx = x as f64 - 21.0;
+                let dy = y as f64 - 27.0;
+                if dx * dx + dy * dy <= 10.0 * 10.0 {
+                    mono[y * width + x] = 12_000;
                 }
             }
         }
-        Ok(())
+        let current = crate::derotation::detect_planet_disc(&mono, width, height);
+        assert!(batch_planet_disc_is_reliable(
+            &current, &mono, width, height
+        ));
+        let reference = crate::derotation::PlanetDisc {
+            cx: width as f64 / 2.0,
+            cy: height as f64 / 2.0,
+            radius_x: current.radius_x,
+            radius_y: current.radius_y,
+            angle_deg: current.angle_deg,
+            phase: current.phase,
+        };
+        let rgb: Vec<u16> = mono
+            .iter()
+            .flat_map(|value| [*value, *value, *value])
+            .collect();
+        let aligned = batch_warp_disc_to_reference(
+            &rgb,
+            width,
+            height,
+            &current,
+            &reference,
+            0.02,
+            1.0,
+        );
+        let aligned_mono: Vec<u16> = aligned.chunks_exact(3).map(|pixel| pixel[0]).collect();
+        let detected = crate::derotation::detect_planet_disc(&aligned_mono, width, height);
+        assert!((detected.cx - reference.cx).abs() <= 1.0);
+        assert!((detected.cy - reference.cy).abs() <= 1.0);
     }
 
-    visit_dirs(root, &mut files, recursive).map_err(|e| e.to_string())?;
-    files.sort();
-    Ok(files)
+    #[test]
+    fn photometric_normalization_uses_one_scalar_for_all_rgb_channels() {
+        let mut reference = Vec::new();
+        let mut current = Vec::new();
+        for value in 1_000u16..2_000u16 {
+            reference.extend_from_slice(&[value, value, value]);
+            current.extend_from_slice(&[value / 2, value / 2, value / 2]);
+        }
+        let scalar = batch_common_rgb_luminance_scalar(&reference, &current);
+        assert!((scalar - 2.0).abs() <= 0.01);
+        let mut rgb = vec![1_000u16, 2_000, 3_000];
+        batch_apply_common_rgb_scalar(&mut rgb, scalar);
+        assert_eq!(rgb, vec![2_000, 4_000, 6_000]);
+    }
 }
 
 #[tauri::command]
@@ -1787,26 +3062,58 @@ fn apply_image_gain_preserving_layout(image: &mut DynamicImage, gain: f32) {
 /// Rename a directory only if the destination does not exist.  POSIX rename
 /// normally replaces an existing empty directory, which is unsafe for an
 /// output transaction even when names contain a random suffix.
+fn portable_unique_directory_rename(
+    source: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    if destination.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "el destino ya existe",
+        ));
+    }
+    // This path is used only when the filesystem rejects the platform's
+    // no-replace extension (notably macOS exFAT).  The destination contains
+    // PID+clock+sequence, so it is private to this single-instance process;
+    // the rename itself remains atomic and never crosses filesystems.
+    std::fs::rename(source, destination)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn no_replace_extension_is_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+    ) || error.raw_os_error().is_some_and(|code| {
+        code == libc::EINVAL || code == libc::ENOSYS || code == libc::ENOTSUP
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn rename_directory_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let source = CString::new(source.as_os_str().as_bytes())?;
-    let destination = CString::new(destination.as_os_str().as_bytes())?;
+    let source_c = CString::new(source.as_os_str().as_bytes())?;
+    let destination_c = CString::new(destination.as_os_str().as_bytes())?;
     let result = unsafe {
         libc::renameat2(
             libc::AT_FDCWD,
-            source.as_ptr(),
+            source_c.as_ptr(),
             libc::AT_FDCWD,
-            destination.as_ptr(),
+            destination_c.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
     };
     if result == 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error())
+        let error = std::io::Error::last_os_error();
+        if no_replace_extension_is_unsupported(&error) {
+            portable_unique_directory_rename(source, destination)
+        } else {
+            Err(error)
+        }
     }
 }
 
@@ -1815,33 +3122,32 @@ fn rename_directory_no_replace(source: &Path, destination: &Path) -> std::io::Re
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let source = CString::new(source.as_os_str().as_bytes())?;
-    let destination = CString::new(destination.as_os_str().as_bytes())?;
+    let source_c = CString::new(source.as_os_str().as_bytes())?;
+    let destination_c = CString::new(destination.as_os_str().as_bytes())?;
     let result = unsafe {
         libc::renamex_np(
-            source.as_ptr(),
-            destination.as_ptr(),
+            source_c.as_ptr(),
+            destination_c.as_ptr(),
             libc::RENAME_EXCL,
         )
     };
     if result == 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error())
+        let error = std::io::Error::last_os_error();
+        if no_replace_extension_is_unsupported(&error) {
+            portable_unique_directory_rename(source, destination)
+        } else {
+            Err(error)
+        }
     }
 }
 
 #[cfg(any(target_os = "windows", not(any(target_os = "linux", target_os = "macos"))))]
 fn rename_directory_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    if destination.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "el destino ya existe",
-        ));
-    }
     // MoveFile/MoveFileEx without MOVEFILE_REPLACE_EXISTING is exclusive on
     // Windows.  The preflight is retained for less common targets.
-    std::fs::rename(source, destination)
+    portable_unique_directory_rename(source, destination)
 }
 
 /// Multi-file outputs are encoded and fsynced below a hidden sibling
@@ -1893,10 +3199,14 @@ impl StagedPlanetaryDirectory {
                 self.final_dir.display()
             ));
         }
+        // Cada PNG/TIFF ya fue flush+fsync. El fsync del directorio es una
+        // barrera adicional disponible en APFS/NTFS, pero exFAT y algunos
+        // volúmenes de red devuelven EINVAL/ENOTSUP. No debe invalidar horas
+        // de cómputo cuando la publicación atómica por rename sí es viable.
         #[cfg(not(target_os = "windows"))]
-        File::open(&self.temporary_dir)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| format!("No se pudo sincronizar el lote temporal: {error}"))?;
+        if let Ok(directory) = File::open(&self.temporary_dir) {
+            let _ = directory.sync_all();
+        }
         rename_directory_no_replace(&self.temporary_dir, &self.final_dir)
             .map_err(|error| format!("No se pudo publicar el lote completo: {error}"))?;
         sync_parent_directory(&self.final_dir);
@@ -1915,7 +3225,7 @@ impl Drop for StagedPlanetaryDirectory {
 
 #[cfg(test)]
 mod planetary_directory_transaction_tests {
-    use super::StagedPlanetaryDirectory;
+    use super::{StagedPlanetaryArtifact, StagedPlanetaryDirectory};
 
     fn test_parent(label: &str) -> std::path::PathBuf {
         let parent = std::env::temp_dir().join(format!(
@@ -1955,6 +3265,66 @@ mod planetary_directory_transaction_tests {
         assert_eq!(std::fs::read(final_dir.join("master.tiff")).unwrap(), b"master");
         assert_eq!(std::fs::read(final_dir.join("preview.png")).unwrap(), b"preview");
         drop(staged);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn rgb16_prepared_and_linear_master_publish_as_one_pair() {
+        let parent = test_parent("rgb16-pair");
+        let mut pair = StagedPlanetaryDirectory::create(&parent, "Stack_Jupiter").unwrap();
+        let rgb = vec![
+            100u16, 200, 300, 400, 500, 600,
+            700, 800, 900, 1_000, 1_100, 1_200,
+        ];
+        let prepared_name = "Jupiter_Prepared_RGB16.png";
+        let master_name = "Jupiter_Linear_Master_RGB16.tiff";
+        let prepared_final = pair.final_path(prepared_name);
+        let master_final = pair.final_path(master_name);
+        let mut prepared = StagedPlanetaryArtifact::encode_rgb16_png(
+            pair.temporary_path(prepared_name),
+            &rgb,
+            2,
+            2,
+        )
+        .unwrap();
+        prepared.publish(false).unwrap();
+        let mut master = StagedPlanetaryArtifact::encode_rgb16_tiff(
+            pair.temporary_path(master_name),
+            &rgb,
+            2,
+            2,
+        )
+        .unwrap();
+        master.publish(false).unwrap();
+        assert!(!prepared_final.exists());
+        assert!(!master_final.exists());
+
+        pair.publish().unwrap();
+
+        assert_eq!(image::open(&prepared_final).unwrap().to_rgb16().as_raw(), &rgb);
+        assert_eq!(image::open(&master_final).unwrap().to_rgb16().as_raw(), &rgb);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn optional_external_volume_publishes_the_complete_pair() {
+        let Some(root) = std::env::var_os("ZAS_BATCH_EXTERNAL_TEST_ROOT") else {
+            return;
+        };
+        let parent = std::path::PathBuf::from(root).join(format!(
+            ".zas-batch-publish-test-{}-{}",
+            std::process::id(),
+            super::ANIMATION_EXPORT_SEQUENCE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let mut pair = StagedPlanetaryDirectory::create(&parent, "Stack_External").unwrap();
+        std::fs::write(pair.temporary_path("prepared.png"), b"prepared").unwrap();
+        std::fs::write(pair.temporary_path("master.tiff"), b"master").unwrap();
+        let final_dir = pair.final_dir.clone();
+        pair.publish().unwrap();
+        assert_eq!(std::fs::read(final_dir.join("prepared.png")).unwrap(), b"prepared");
+        assert_eq!(std::fs::read(final_dir.join("master.tiff")).unwrap(), b"master");
         std::fs::remove_dir_all(parent).unwrap();
     }
 }
@@ -2613,6 +3983,11 @@ async fn process_batch_entry(
     ap_threshold: Option<f32>,  // R13: umbral de malla del flujo Zenith
     align_rgb: Option<bool>,    // switch de alineacion RGB automatica
     gpu_mode: Option<String>,   // GPU compute: "auto" | "gpu" | "cpu"
+    compute_policy: Option<String>, // contrato nuevo; gpu_mode queda legado
+    decode_policy: Option<String>,  // FFmpeg: auto/software/hardware
+    quality_policy: Option<String>, // rigor AP: adaptive/standard/maximum
+    sequence_plan: Option<PlanetarySequencePlan>,
+    normalized_ap_points: Option<Vec<NormalizedBatchApPoint>>,
     edge_aware_wavelets: Option<bool>, // B: wavelets edge-aware
     psf_from_limb: Option<bool>,       // A: deconv con PSF medida
     edge_aware_strength: Option<f32>,  // B+: intensidad edge-aware (0..100)
@@ -2642,6 +4017,35 @@ async fn process_batch_entry(
         batch_mode.contains("surface") || batch_mode.contains("solar") || is_surface_target(&target_type);
     let warping_analysis = zenith_should_warp(&target_type, is_surface_batch, warping_analysis);
     let is_v3 = is_v3.unwrap_or_else(|| align_mode.contains("v3") || batch_mode.contains("v3"));
+    let requested_quality_policy = match quality_policy
+        .as_deref()
+        .unwrap_or("adaptive")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "standard" => QualityPolicy::Standard,
+        "maximum" => QualityPolicy::Maximum,
+        _ => QualityPolicy::Adaptive,
+    };
+    if let Some(plan) = sequence_plan.as_ref() {
+        plan.validate()?;
+        if !plan.frozen || !plan.normalized_ap_geometry {
+            return Err("El plan de secuencia batch debe llegar congelado y con AP normalizados."
+                .into());
+        }
+    }
+    let sequence_common_rgb_scalar = sequence_plan
+        .as_ref()
+        .is_some_and(|plan| plan.common_rgb_luminance_scalar);
+    let sequence_max_scale_delta = sequence_plan
+        .as_ref()
+        .map(|plan| plan.max_scale_delta)
+        .unwrap_or(0.0);
+    let sequence_max_roll_degrees = sequence_plan
+        .as_ref()
+        .map(|plan| plan.max_roll_degrees)
+        .unwrap_or(0.0);
     // Removed: let _ = (deconv_iter, deconv_sigma, vc_iter, vc_sigma);
     // Now using these parameters to apply deconvolution in batch mode
     if drizzle > 1.0 && !state.license_manager.is_pro() {
@@ -2653,14 +4057,6 @@ async fn process_batch_entry(
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "frame".to_string());
-    // PR-1.9: sin colisiones de salida. El escaneo recursivo puede traer
-    // vídeos homónimos de subcarpetas distintas (A/Mars.ser y B/Mars.ser);
-    // nombrar solo por file_stem SOBRESCRIBÍA el primero en silencio.
-    // El sufijo de alta resolución elimina el check-then-create y mantiene
-    // resultados homónimos/solapados separados sin truncar al ganador.
-    let save_path = Path::new(&output_folder)
-        .join(format!("{}_{}.png", fname, derot_unique_suffix()));
-
     let prefix_str = progress_prefix.clone().unwrap_or_default();
     let get_msg = |msg: &str| {
         if prefix_str.is_empty() {
@@ -2730,7 +4126,11 @@ async fn process_batch_entry(
             progress_prefix,
             // El lote respeta el mismo selector GPU de Ajustes que el flujo
             // individual (antes forzaba Auto e ignoraba la elección).
-            ComputePolicy::from_legacy(gpu_mode.as_deref()),
+            ComputePolicy::from_planetary_legacy(
+                compute_policy.as_deref().or(gpu_mode.as_deref()),
+            ),
+            DecodePolicy::from_legacy(decode_policy.as_deref()),
+            requested_quality_policy,
         )?; // PR-2.5: síncrona (el lote ya corre por entrada, sin .await)
         cached_opt = load_validated_analysis_cache(&cache_path, &cache_expectation)
             .map(|(cached, _location)| cached);
@@ -2772,6 +4172,21 @@ async fn process_batch_entry(
             &format!("Batch: {} puntos AP generados para {}", custom_points.len(), fname),
         );
     }
+    if let Some(normalized) = normalized_ap_points.as_deref() {
+        let planned_points = materialize_batch_ap_points(normalized, w, h);
+        if planned_points.is_empty() {
+            return Err("El plan de secuencia no pudo materializar sus AP normalizados.".into());
+        }
+        custom_points = planned_points;
+        log_to_front(
+            &app,
+            "INFO",
+            &format!(
+                "Batch: {} AP de secuencia materializados desde la referencia congelada",
+                custom_points.len()
+            ),
+        );
+    }
 
     // 2. El motor borra el cache temporal de frames al terminar: el lector
     //    local debe cerrarse antes y no debe usarse despues.
@@ -2802,7 +4217,11 @@ async fn process_batch_entry(
         Some(get_msg("")),
         None, // keep_full_frame: el lote usa el recorte por defecto
         align_rgb, // switch de usuario (mismo toggle que el flujo individual)
-        gpu_mode.clone(), // GPU compute: mismo select de Ajustes que el flujo individual
+        ComputePolicy::from_planetary_legacy(
+            compute_policy.as_deref().or(gpu_mode.as_deref()),
+        ),
+        DecodePolicy::from_legacy(decode_policy.as_deref()),
+        requested_quality_policy,
     )?; // PR-2.5: síncrona (el lote ya corre por entrada, sin .await)
 
     // 3. Recoger el resultado del motor (y liberar el slot compartido).
@@ -2843,23 +4262,12 @@ async fn process_batch_entry(
         state.cancel_requested.clone(),
     );
 
-    // CONSISTENCIA CON EL FIX DE DISCO GRANDE (single-file): una Luna / fase
-    // lunar grande se estabiliza por TEXTURA (SAD contra anchor), igual que
-    // Superficie. El re-centrado CoG planetario haria que el disco "baile" entre
-    // frames del timelapse al moverse el centroide con la fase. Los planetas
-    // pequenos (blob diminuto) conservan intacto su re-centrado CoG.
-    let large_disc_batch = if is_surface_batch {
-        false
-    } else {
-        let mono: Vec<u16> = stacked_data
-            .chunks_exact(3)
-            .map(|p| ((p[0] as u32 + p[1] as u32 + p[2] as u32) / 3) as u16)
-            .collect();
-        is_large_lunar_disc(&mono, out_w, out_h)
-    };
-
-    // --- RECORTE Y ESTABILIZACION SOLAR (Logica Mantenida) ---
-    let (centered_data, cw, ch) = if is_surface_batch || large_disc_batch {
+    // La secuencia nunca persigue la textura interior entre vídeos: filamentos,
+    // manchas y detalle joviano pueden moverse físicamente. Superficie conserva
+    // sólo un canvas fijo; los discos visibles continúan por el recenter CoG de
+    // la rama inferior. El anchor de referencia queda inmutable para telemetría
+    // y nunca acumula deriva de una entrada a la siguiente.
+    let (centered_data, cw, ch) = if is_surface_batch {
         // En modo solar/surface, maximizamos el area.
         // Recortamos un margen minimo de seguridad (Protection Frame) para estabilizacion
         // Reducimos el recorte a algo minimo (ej. 8-10px) para maximizar FOV
@@ -2880,163 +4288,49 @@ async fn process_batch_entry(
             }
         }
 
-        // Snapshot coherente del anchor. El cálculo pesado queda fuera de los
-        // mutex y el commit vuelve a pasar por el gate generacional: un worker
-        // sustituido nunca puede repoblar la sesión después de clear_app_memory.
-        let (anchor_snapshot, anchor_dims) = with_current_planetary_job(
+        let (fixed_w, fixed_h) = with_current_planetary_job(
             &state.planetary_generation_gate,
             &batch_postprocess_token,
-            "la lectura del anchor batch",
+            "la congelacion del canvas batch",
             || {
-                let anchor = state
-                    .batch_anchor
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone();
-                let dims = *state
+                let mut dims = state
                     .batch_anchor_dims
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
-                (anchor, dims)
+                if dims.0 == 0 || dims.1 == 0 {
+                    *dims = (safe_w, safe_h);
+                }
+                *dims
             },
         )?;
-
-        if anchor_snapshot.is_none() {
-            with_current_planetary_job(
-                &state.planetary_generation_gate,
-                &batch_postprocess_token,
-                "la inicializacion del anchor batch",
-                || {
-                    let mut anchor = state
-                        .batch_anchor
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    let mut dims = state
-                        .batch_anchor_dims
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    *anchor = Some(solar_out.clone());
-                    *dims = (safe_w, safe_h);
-                },
-            )?;
-            (solar_out, safe_w, safe_h)
-        } else {
-            let (aw, ah) = anchor_dims;
-            if aw == 0 || ah == 0 {
-                return Err("El anchor batch tiene dimensiones invalidas".into());
-            }
-            // R13: el auto-crop del motor Zenith puede variar las dimensiones
-            // unos pixeles entre archivos. Ajustamos por recorte/padding
-            // centrado a las dims del anchor en vez del reset silencioso
-            // anterior (que rompia la estabilizacion del timelapse).
-            let solar_out = if aw == safe_w && ah == safe_h {
-                solar_out
-            } else {
-                center_crop_or_pad_rgb(&solar_out, safe_w, safe_h, aw, ah)
-            };
-            let (safe_w, safe_h) = (aw, ah);
-            // Alineamos este resultado final contra el snapshot del anchor.
-            let anchor = anchor_snapshot.as_ref().expect("anchor comprobado");
-            if anchor.len() != solar_out.len() {
-                return Err("El anchor batch no coincide con sus dimensiones".into());
-            }
-            let to_mono = |data: &[u16]| -> Vec<u16> {
-                data.chunks_exact(3)
-                    .map(|pixel| {
-                        ((pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32) / 3) as u16
-                    })
-                    .collect()
-            };
-            let anchor_mono = to_mono(anchor);
-            let current_mono = to_mono(&solar_out);
-            let anchor_pyramid = downscale_integer(&anchor_mono, safe_w, safe_h, 4);
-            let roi_w = (safe_w as f32 * 0.85) as usize;
-            let roi_h = (safe_h as f32 * 0.85) as usize;
-            let stab_x = safe_w.saturating_sub(roi_w) / 2;
-            let stab_y = safe_h.saturating_sub(roi_h) / 2;
-            let (dx, dy) = find_best_match_sad_pyramid(
-                &anchor_mono,
-                &current_mono,
-                &anchor_pyramid,
-                safe_w,
-                safe_h,
-                safe_w / 4,
-                safe_h / 4,
-                stab_x,
-                stab_y,
-                roi_w,
-                roi_h,
-                120,
-                4,
-                4,
-            );
-
-            let mut shifted = vec![0u16; solar_out.len()];
-            for y in 0..safe_h {
-                for x in 0..safe_w {
-                    let sx = x as f32 + dx;
-                    let sy = y as f32 + dy;
-                    if sx >= 0.0
-                        && sx < (safe_w - 1) as f32
-                        && sy >= 0.0
-                        && sy < (safe_h - 1) as f32
-                    {
-                        let x0 = sx.floor() as usize;
-                        let x1 = x0 + 1;
-                        let y0 = sy.floor() as usize;
-                        let y1 = y0 + 1;
-                        let wx = sx - x0 as f32;
-                        let wy = sy - y0 as f32;
-                        let idx_dst = (y * safe_w + x) * 3;
-                        for c in 0..3 {
-                            let v00 = solar_out[(y0 * safe_w + x0) * 3 + c] as f32;
-                            let v10 = solar_out[(y0 * safe_w + x1) * 3 + c] as f32;
-                            let v01 = solar_out[(y1 * safe_w + x0) * 3 + c] as f32;
-                            let v11 = solar_out[(y1 * safe_w + x1) * 3 + c] as f32;
-                            shifted[idx_dst + c] = ((v00 * (1.0 - wx) + v10 * wx)
-                                * (1.0 - wy)
-                                + (v01 * (1.0 - wx) + v11 * wx) * wy)
-                                as u16;
-                        }
-                    }
-                }
-            }
-
-            with_current_planetary_job(
-                &state.planetary_generation_gate,
-                &batch_postprocess_token,
-                "la actualizacion del anchor batch",
-                || -> Result<(), String> {
-                    let mut anchor_guard = state
-                        .batch_anchor
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    let dims = *state
-                        .batch_anchor_dims
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    let anchor_mut = anchor_guard
-                        .as_mut()
-                        .ok_or_else(|| "El anchor batch desaparecio antes del commit".to_string())?;
-                    if dims != (safe_w, safe_h) || anchor_mut.len() != shifted.len() {
-                        return Err("El anchor batch cambio antes del commit".into());
-                    }
-                    // Drift de 0.5%: estabiliza sin perseguir turbulencia.
-                    for (old, new) in anchor_mut.iter_mut().zip(&shifted) {
-                        *old = (*old as f32 * 0.995 + *new as f32 * 0.005) as u16;
-                    }
-                    Ok(())
-                },
-            )??;
-
-            (shifted, safe_w, safe_h)
+        if fixed_w == 0 || fixed_h == 0 {
+            return Err("El canvas batch tiene dimensiones invalidas".into());
         }
+        let fixed = if fixed_w == safe_w && fixed_h == safe_h {
+            solar_out
+        } else {
+            center_crop_or_pad_rgb(&solar_out, safe_w, safe_h, fixed_w, fixed_h)
+        };
+        with_current_planetary_job(
+            &state.planetary_generation_gate,
+            &batch_postprocess_token,
+            "la referencia inmutable del lote",
+            || {
+                let mut anchor = state
+                    .batch_anchor
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if anchor.is_none() {
+                    *anchor = Some(fixed.clone());
+                }
+            },
+        )?;
+        (fixed, fixed_w, fixed_h)
     } else {
-        // R13: RE-CENTRADO CoG PLANETARIO (timelapse estable)
-        // Cada stack se desplaza para que el centro de gravedad del disco
-        // caiga en el centro del lienzo — posicion identica entre archivos
-        // del lote. Dimensiones compartidas via batch_anchor_dims para que
-        // todos los PNG salgan del mismo tamano aunque el auto-crop varie.
+        // La consistencia del disco se obtiene del limbo, no de la textura
+        // interior. Esto evita que bandas de Júpiter o cráteres lunares muevan
+        // el centro entre capturas. Escala/roll sólo se aplican cuando tanto la
+        // detección actual como la referencia superan el gate de contraste.
         let (tw, th) = with_current_planetary_job(
             &state.planetary_generation_gate,
             &batch_postprocess_token,
@@ -3059,60 +4353,130 @@ async fn process_batch_entry(
             center_crop_or_pad_rgb(&stacked_data, out_w, out_h, tw, th)
         };
 
-        let mono: Vec<u16> = base
-            .chunks_exact(3)
-            .map(|p| ((p[0] as u32 + p[1] as u32 + p[2] as u32) / 3) as u16)
-            .collect();
-        let peak = mono.iter().copied().max().unwrap_or(2000) as f32;
-        let cog_threshold = (peak * 0.15).max(512.0) as u16;
-        let out = match crate::alignment::calculate_center_of_gravity(&mono, tw, th, cog_threshold)
-        {
-            Some((cx, cy)) => {
-                // Muestreo: src = dst + (dx, dy) — misma convencion que surface
-                let dx = cx - tw as f32 / 2.0;
-                let dy = cy - th as f32 / 2.0;
-                let mut shifted = vec![0u16; base.len()];
-                for y in 0..th {
-                    for x in 0..tw {
-                        let sx = x as f32 + dx;
-                        let sy = y as f32 + dy;
-                        if sx >= 0.0
-                            && sx < (tw - 1) as f32
-                            && sy >= 0.0
-                            && sy < (th - 1) as f32
-                        {
-                            let x0 = sx.floor() as usize;
-                            let x1 = x0 + 1;
-                            let y0 = sy.floor() as usize;
-                            let y1 = y0 + 1;
-                            let wx = sx - x0 as f32;
-                            let wy = sy - y0 as f32;
-                            let idx_dst = (y * tw + x) * 3;
-                            for c in 0..3 {
-                                let v00 = base[(y0 * tw + x0) * 3 + c] as f32;
-                                let v10 = base[(y0 * tw + x1) * 3 + c] as f32;
-                                let v01 = base[(y1 * tw + x0) * 3 + c] as f32;
-                                let v11 = base[(y1 * tw + x1) * 3 + c] as f32;
-                                shifted[idx_dst + c] = ((v00 * (1.0 - wx) + v10 * wx)
-                                    * (1.0 - wy)
-                                    + (v01 * (1.0 - wx) + v11 * wx) * wy)
-                                    as u16;
-                            }
-                        }
-                    }
-                }
-                shifted
-            }
-            None => base,
+        let mono = batch_rgb16_to_mono(&base);
+        let current_disc = crate::derotation::detect_planet_disc(&mono, tw, th);
+        let current_reliable = batch_planet_disc_is_reliable(&current_disc, &mono, tw, th);
+        let anchor_snapshot = with_current_planetary_job(
+            &state.planetary_generation_gate,
+            &batch_postprocess_token,
+            "la lectura de referencia de limbo",
+            || {
+                state
+                    .batch_anchor
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone()
+            },
+        )?;
+        let reference_disc = anchor_snapshot
+            .as_ref()
+            .filter(|anchor| anchor.len() == base.len())
+            .and_then(|anchor| {
+                let reference_mono = batch_rgb16_to_mono(anchor);
+                let disc = crate::derotation::detect_planet_disc(&reference_mono, tw, th);
+                batch_planet_disc_is_reliable(&disc, &reference_mono, tw, th).then_some(disc)
+            });
+        let out = if current_reliable {
+            let target_disc = reference_disc.unwrap_or_else(|| crate::derotation::PlanetDisc {
+                cx: tw as f64 / 2.0,
+                cy: th as f64 / 2.0,
+                radius_x: current_disc.radius_x,
+                radius_y: current_disc.radius_y,
+                angle_deg: current_disc.angle_deg,
+                phase: current_disc.phase,
+            });
+            batch_warp_disc_to_reference(
+                &base,
+                tw,
+                th,
+                &current_disc,
+                &target_disc,
+                if anchor_snapshot.is_some() {
+                    sequence_max_scale_delta
+                } else {
+                    0.0
+                },
+                if anchor_snapshot.is_some() {
+                    sequence_max_roll_degrees
+                } else {
+                    0.0
+                },
+            )
+        } else {
+            log_to_front(
+                &app,
+                "WARNING",
+                "Batch: limbo no confiable; se conserva el frame sin escala ni roll.",
+            );
+            base
         };
+        with_current_planetary_job(
+            &state.planetary_generation_gate,
+            &batch_postprocess_token,
+            "la referencia planetaria inmutable del lote",
+            || {
+                let mut anchor = state
+                    .batch_anchor
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if anchor.is_none() {
+                    *anchor = Some(out.clone());
+                }
+            },
+        )?;
         (out, tw, th)
     };
+
+    // El máster de secuencia se congela antes de wavelets, deconvolución,
+    // niveles o normalización fotométrica. Ambos artefactos se codifican bajo
+    // una carpeta oculta y aparecen juntos mediante un único rename.
+    let mut staged_output = StagedPlanetaryDirectory::create(
+        Path::new(&output_folder),
+        &format!("Stack_{fname}"),
+    )?;
+    let prepared_file_name = format!("{fname}_Prepared_RGB16.png");
+    let linear_master_file_name = format!("{fname}_Linear_Master_RGB16.tiff");
+    let prepared_path = staged_output.final_path(&prepared_file_name);
+    let linear_master_path = staged_output.final_path(&linear_master_file_name);
+    let mut staged_master = StagedPlanetaryArtifact::encode_rgb16_tiff(
+        staged_output.temporary_path(&linear_master_file_name),
+        &centered_data,
+        cw,
+        ch,
+    )?;
+    staged_master.publish(false)?;
 
     // --- R13: la salida del motor Zenith YA incluye rechazo de outliers
     // (planetas), balance de blancos sin clipping, normalizacion de rango y
     // sharpening opcional. Los antiguos bloques "parity" duplicaban WB y
     // sharpening (doble aplicacion) y dependian del master legacy: eliminados.
-    let pre_processed = centered_data;
+    let mut pre_processed = centered_data;
+    if sequence_common_rgb_scalar {
+        let reference = with_current_planetary_job(
+            &state.planetary_generation_gate,
+            &batch_postprocess_token,
+            "la referencia fotometrica del lote",
+            || {
+                state
+                    .batch_anchor
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone()
+            },
+        )?;
+        if let Some(reference) = reference.filter(|value| value.len() == pre_processed.len()) {
+            let scalar = batch_common_rgb_luminance_scalar(&reference, &pre_processed);
+            batch_apply_common_rgb_scalar(&mut pre_processed, scalar);
+            log_to_front(
+                &app,
+                "INFO",
+                &format!(
+                    "Batch: normalización fotométrica común RGB {:.4} (máster lineal intacto)",
+                    scalar
+                ),
+            );
+        }
+    }
     let (safe_w, safe_h) = (cw, ch);
 
     let temp_res = StackResult {
@@ -3191,17 +4555,18 @@ async fn process_batch_entry(
         return Err("Cancelado por el usuario".to_string());
     }
     planetary_derotation_checkpoint(&batch_postprocess_token, "el postprocesado batch")?;
-    let mut staged = StagedPlanetaryArtifact::encode_rgb16_png(
-        save_path.clone(),
+    let mut staged_prepared = StagedPlanetaryArtifact::encode_rgb16_png(
+        staged_output.temporary_path(&prepared_file_name),
         &processed,
         safe_w,
         safe_h,
     )?;
+    staged_prepared.publish(false)?;
     with_current_planetary_job(
         &state.planetary_generation_gate,
         &batch_postprocess_token,
         "la publicacion batch",
-        || staged.publish(false),
+        || staged_output.publish(),
     )??;
 
     // ASSET PROTOCOL: la UI (batch y mosaico) carga `path` con convertFileSrc,
@@ -3210,7 +4575,12 @@ async fn process_batch_entry(
     // frontend RETENIA todos esos strings en RAM para el reproductor — en lotes
     // grandes empujaba el heap del WebView a >1 GB (crash del renderer).
     Ok(BatchEntryResult {
-        path: clean_windows_path(dunce::canonicalize(&save_path).unwrap_or(save_path)),
+        path: clean_windows_path(
+            dunce::canonicalize(&prepared_path).unwrap_or(prepared_path),
+        ),
+        master_path: clean_windows_path(
+            dunce::canonicalize(&linear_master_path).unwrap_or(linear_master_path),
+        ),
         preview_base64: String::new(),
     })
 }
@@ -3929,6 +5299,8 @@ async fn analyze_video(
                     recommended_pct: rec_pct,
                     ap_points: vec![],
                     best_frame_idx: best_idx,
+                    execution_plan: None,
+                    stage_telemetry: Vec::new(),
                 });
             }
         }
@@ -4299,6 +5671,8 @@ async fn analyze_video(
         recommended_pct: rec_pct as f32,
         ap_points: vec![],
         best_frame_idx: best_idx,
+        execution_plan: None,
+        stage_telemetry: Vec::new(),
     })
 }
 
@@ -4742,6 +6116,8 @@ async fn stack_video(
     target_type: String,               // NEW
     keep_full_frame: Option<bool>,     // NEW: mantener encuadre completo (no recortar)
     gpu_mode: Option<String>,          // GPU compute: "auto" | "gpu" | "cpu"
+    compute_policy: Option<String>,    // contrato nuevo; prevalece sobre gpu_mode
+    decode_policy: Option<String>,     // FFmpeg decode independiente
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
  
@@ -4779,6 +6155,9 @@ async fn stack_video(
         keep_full_frame,
         None, // align_rgb: el legacy usa el default (activado, con gates de seguridad)
         gpu_mode,
+        compute_policy,
+        decode_policy,
+        None, // quality_policy: el comando legado conserva Adaptive
     )
     .await;
 }
@@ -5883,6 +7262,8 @@ async fn load_image_thumbnail(path: String) -> Result<AnalysisResult, String> {
         recommended_pct: 0.0,
         ap_points: Vec::new(),
         best_frame_idx: 0,
+        execution_plan: None,
+        stage_telemetry: Vec::new(),
     })
 }
 
@@ -9791,6 +11172,8 @@ async fn stitch_mosaic(
         preview_base64: preview_ref,
         recommended_pct: 100.0,
         ap_points: vec![],
+        execution_plan: None,
+        stage_telemetry: Vec::new(),
     })
 }
 
@@ -10530,7 +11913,7 @@ async fn zas_stack_video_elite(
     let is_surface = category_key.contains("surface")
         || category_key.contains("solar")
         || category_key.contains("lunar");
-    run_planetary_stack(
+    let response = run_planetary_stack(
         app,
         state,
         PlanetaryStackRequest {
@@ -10553,10 +11936,13 @@ async fn zas_stack_video_elite(
             keep_full_frame: Some(false),
             align_rgb: Some(true),
             compute_policy: ComputePolicy::Hybrid,
+            decode_policy: DecodePolicy::Auto,
+            quality_policy: QualityPolicy::Adaptive,
             profile: PipelineProfile::Custom,
         },
     )
-    .await
+    .await?;
+    Ok(response.preview_src)
 }
 
 fn main() {
@@ -10636,6 +12022,8 @@ fn main() {
             analyze_psf,
             crop_stacked_image,
             scan_directory,
+            prepare_batch_output,
+            register_batch_output_result,
             export_animation_video,
             process_batch_entry,
             get_ser_conversion_preflight,

@@ -16,7 +16,7 @@ Windows hardware listed at the end.
 | Common frame source for SER/AVI/FITS/FFmpeg | `frame_source.rs`: `FrameSource`, `FrameBatch`, exact out-of-order/duplicate index tests, ROI and Bayer-vs-RGB descriptor metadata | Locally verified |
 | Adaptive RAM → mmap → LZ4 store | `frame_store.rs`; ranged tiled reads, roundtrip, reuse, corruption and injected disk-full tests; calibration masters use the same adaptive store | Locally verified |
 | Cache versioned by algorithm, geometry and source | Planetary analysis schema/fingerprint/envelope a10 (`ZACv10`) binds source content, CFA, ROI, anchor and target with CRC32/1 GiB bound and private-temp fallback. FFmpeg decode algorithm/key v6 (payload `ZDCFv5`) adds codec, route/backend, FFmpeg identity, CFA/color and rotation; a complete attempt must validate before commit | Locally verified, including overwrite invalidation, corrupt-entry repair, route isolation and rollback |
-| Reproducible cold/warm suite and per-phase resources | `benchmark.rs`, embedded/exposed matrix v3, timed benchmark sessions and telemetry v2 phase summaries | Locally verified; all twenty scenarios also exercised end to end with deterministic synthetic artifacts |
+| Reproducible cold/warm suite and per-phase resources | `benchmark.rs`, embedded/exposed matrix v3, timed benchmark sessions and telemetry v2 phase summaries | Locally verified; all scenarios defined by the matrix are also exercised end to end with deterministic synthetic artifacts |
 | Scenario matrix cannot drift from the executable | Manifest IDs/domains, quality thresholds, own-CPU targets, per-dataset competitor ratio and per-requirement evidence are bound to the embedded matrix | Locally verified |
 | Reject incompatible or falsely declared outputs | Manifest validation checks absolute files, actual dimensions/channels and FITS BITPIX/TIFF depth against `processing` | Locally verified |
 | Publishability gated by complete evidence | Report v5 recomputes SHA-256, binds configurations/provenance and requires automated artifact-backed evidence per requirement. Every run must beat its fastest rival; every planetary dataset must additionally show ≥1 objective win, zero losses and a higher composite score against an independent reference | Locally verified contract; real A/B evidence pending |
@@ -44,7 +44,7 @@ Windows hardware listed at the end.
 | GPU calibration, cosmetic, debayer/star map, warp and integration | `gpu_deepsky.rs`; session gates cover pixels, similarity, projective/local distortion and tiled rejection before preflight accepts GPU | Locally verified; physical Metal parity passed |
 | PSF centroids, RANSAC and automatic model selection | Gaussian PSF fit plus similarity/affine/projective/local-distortion tests | Locally verified |
 | Robust additive/multiplicative/local normalization | PSF signal scaling, noise fallback and local 24×24 background model stored per frame in recipe | Locally verified |
-| Mean/sigma/Winsorized/linear-fit GPU; remaining tiled CPU methods | Engine selection and parity gates in `deepsky.rs`/`gpu_deepsky.rs` | Locally verified |
+| Mean/sigma/Winsorized GPU; remaining tiled CPU methods | Engine selection and parity gates in `deepsky.rs`/`gpu_deepsky.rs`; the historical rank-based "linear-fit" approximation is explicitly disabled pending robust frame-to-reference regression | Locally verified; linear-fit intentionally unavailable |
 | True mono/RGB/CFA drizzle and dithering warning | Drop-kernel/CFA accumulation tests; runtime counts subpixel positions for every drizzle type | Locally verified |
 | Requested vs effective rejection visible before execution | `PreparedStackPlan.requestedRejection/effectiveRejection`, UI method display and fallback telemetry | Locally verified |
 | Master plus rejection/weight/coverage/residual maps | `DeepSkyResult`, result views and float32 diagnostic FITS export | Locally verified |
@@ -79,7 +79,7 @@ Windows hardware listed at the end.
 
 ## Evidence that is still external
 
-The goal cannot be declared competitively accepted until all twenty real scenarios
+The goal cannot be declared competitively accepted until all required real scenarios
 in `dataset-matrix.json` have cold and warm Zenith runs, current Zenith CPU
 baselines, rival masters/logs and matching output contracts. The release matrix
 must also run on Apple M1-or-newer and available Windows NVIDIA, AMD and Intel

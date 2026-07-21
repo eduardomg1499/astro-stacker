@@ -35,6 +35,64 @@
     "Operar en Apple Silicon y Windows moderno sin TDR, swap ni fallos silenciosos",
     "Mantener cielo profundo fuera del alcance funcional de esta optimizacion"
   ],
+  "objectiveCoverage": [
+    {
+      "order": 1,
+      "objective": "Superficie General en MOV/MP4",
+      "implementation": "Ruta compacta y selector exacto implementados",
+      "evidence": "Exactitud H.264/B-frames a 64x48 y modelado a 20 MP",
+      "gap": "E2E real, HEVC/ProRes 20 MP y cold/warm cache"
+    },
+    {
+      "order": 2,
+      "objective": "SER mono, color y Bayer",
+      "implementation": "Lector nativo, CFA y profundidades de 8 a 16 bits",
+      "evidence": "Suite funcional y analisis rapido observado",
+      "gap": "Reapertura por lote y E2E de segunda pasada"
+    },
+    {
+      "order": 3,
+      "objective": "CPU, GPU e Hybrid",
+      "implementation": "Politicas, paridad y fallback integro",
+      "evidence": "Metal fisico en Apple M5",
+      "gap": "Ventaja E2E y scheduler unificado"
+    },
+    {
+      "order": 4,
+      "objective": "Solar, lunar, fases y planetas",
+      "implementation": "Ruteo y matriz de escenarios definidos",
+      "evidence": "Fixtures y pruebas unitarias",
+      "gap": "Corpus real por modalidad y holdout independiente"
+    },
+    {
+      "order": 5,
+      "objective": "Matrices Bayer de camara",
+      "implementation": "RGGB, GRBG, GBRG y BGGR; profundidades SER cubiertas",
+      "evidence": "Pruebas de CFA y paridad",
+      "gap": "Camaras reales, ROI/rotacion y politica para CFA no Bayer"
+    },
+    {
+      "order": 6,
+      "objective": "macOS y Windows",
+      "implementation": "Metal y backends wgpu previstos",
+      "evidence": "Apple M5 fisico",
+      "gap": "NVIDIA, AMD, Intel iGPU, TDR y fallback fisicos"
+    },
+    {
+      "order": 7,
+      "objective": "Superar AutoStakkert!4",
+      "implementation": "Arnes y gates competitivos definidos",
+      "evidence": "Sin A/B real autorizado",
+      "gap": "Misma captura, hardware, configuracion y evaluacion ciega"
+    },
+    {
+      "order": 8,
+      "objective": "No tocar cielo profundo",
+      "implementation": "Sin cambio matematico intencional en esta optimizacion",
+      "evidence": "Smoke test previo del runtime GPU compartido",
+      "gap": "Resolver cambios concurrentes y repetir regresion completa"
+    }
+  ],
   "sourceSnapshot": {
     "branch": "codex/planetary-world-class",
     "baseCommit": "4181a933218f3e30eeb7ce065211fcefb9cdf12d",

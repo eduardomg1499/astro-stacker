@@ -54,7 +54,29 @@ pub struct BenchmarkClaimPolicy {
     pub competitor: BenchmarkCompetitorPolicy,
     pub quality: BenchmarkQualityLimits,
     pub quality_superiority: BenchmarkQualitySuperiorityPolicy,
+    pub deep_sky_scientific: BenchmarkDeepSkyScientificPolicy,
     pub evidence: BenchmarkEvidencePolicy,
+}
+
+/// Gates absolutos del máster científico de cielo profundo. A diferencia de
+/// los límites comparativos generales, éstos deben aprobarse incluso cuando
+/// ningún competidor forme parte de la corrida.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkDeepSkyScientificPolicy {
+    pub max_flat_residual_percent: f64,
+    pub max_dark_pattern_residual_percent: f64,
+    pub max_synthetic_photometry_bias_percent: f64,
+    pub max_real_photometry_bias_percent: f64,
+    pub max_registration_p95_px: f64,
+    pub max_eidr_geometry_p95_px: f64,
+    pub max_variance_coverage_error_points: f64,
+    pub max_tile_seam_sigma: f64,
+    pub max_read_amplification: f64,
+    pub max_read_amplification_hard: f64,
+    pub max_ram_fraction: f64,
+    pub min_gpu_speedup: f64,
+    pub max_gpu_readback_fraction: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -645,11 +667,32 @@ fn parse_dataset_matrix() -> Result<BenchmarkDatasetMatrix, String> {
         policy.quality.max_registration_residual_px,
         policy.quality.max_registration_correction_px,
         policy.quality.min_correlation,
+        policy.deep_sky_scientific.max_flat_residual_percent,
+        policy.deep_sky_scientific.max_dark_pattern_residual_percent,
+        policy
+            .deep_sky_scientific
+            .max_synthetic_photometry_bias_percent,
+        policy.deep_sky_scientific.max_real_photometry_bias_percent,
+        policy.deep_sky_scientific.max_registration_p95_px,
+        policy.deep_sky_scientific.max_eidr_geometry_p95_px,
+        policy
+            .deep_sky_scientific
+            .max_variance_coverage_error_points,
+        policy.deep_sky_scientific.max_tile_seam_sigma,
+        policy.deep_sky_scientific.max_read_amplification,
+        policy.deep_sky_scientific.max_read_amplification_hard,
+        policy.deep_sky_scientific.max_ram_fraction,
+        policy.deep_sky_scientific.min_gpu_speedup,
+        policy.deep_sky_scientific.max_gpu_readback_fraction,
     ];
     if positive
         .iter()
         .any(|value| !value.is_finite() || *value <= 0.0)
         || policy.quality.min_correlation > 1.0
+        || policy.deep_sky_scientific.max_ram_fraction > 1.0
+        || policy.deep_sky_scientific.max_gpu_readback_fraction > 1.0
+        || policy.deep_sky_scientific.max_read_amplification_hard
+            < policy.deep_sky_scientific.max_read_amplification
         || !policy.competitor.require_every_run
         || policy.quality_superiority.minimum_objective_wins_per_dataset == 0
         || !policy.quality_superiority.require_independent_reference
@@ -3755,7 +3798,24 @@ mod tests {
                 .minimum_speed_ratio_per_dataset,
             1.05
         );
-        assert_eq!(matrix.required_scenarios.len(), 20);
+        assert_eq!(
+            matrix
+                .claim_policy
+                .deep_sky_scientific
+                .max_flat_residual_percent,
+            0.5
+        );
+        assert_eq!(
+            matrix
+                .claim_policy
+                .deep_sky_scientific
+                .max_eidr_geometry_p95_px,
+            0.02
+        );
+        // 14 planetary + 15 deep-sky scenarios. Keep this binding explicit:
+        // adding a release class without updating the executable contract is
+        // evidence drift, not a harmless fixture change.
+        assert_eq!(matrix.required_scenarios.len(), 29);
         assert!(matrix.required_scenarios.iter().all(|scenario| {
             !scenario.required_tags.is_empty() && !scenario.acceptance.is_empty()
         }));
@@ -3782,6 +3842,24 @@ mod tests {
                     .iter()
                     .any(|scenario| scenario.id == required_planetary_case),
                 "falta el caso competitivo {required_planetary_case}"
+            );
+        }
+        for required_deep_sky_case in [
+            "deep-sky-darkflat-ampglow",
+            "deep-sky-dualband-osc",
+            "deep-sky-mono-sho",
+            "deep-sky-cfa-cache-layout",
+            "deep-sky-invalid-pixels-flat",
+            "deep-sky-walking-noise",
+            "deep-sky-nebulafusion-scientific",
+            "deep-sky-eidr-recoverability",
+        ] {
+            assert!(
+                matrix
+                    .required_scenarios
+                    .iter()
+                    .any(|scenario| scenario.id == required_deep_sky_case),
+                "falta el gate cientifico {required_deep_sky_case}"
             );
         }
         let satellite = matrix

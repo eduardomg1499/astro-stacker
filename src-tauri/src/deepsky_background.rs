@@ -26,7 +26,16 @@
 
 /// Mínimo de celdas comunes para aceptar una arista entre dos frames.
 const MIN_COMMON_CELLS: usize = 12;
+/// Límites explícitos del API productivo. Mantienen acotadas la matriz densa
+/// del grafo (3·frames en primer orden) y las rejillas de salida.
+const MAX_LOCAL_NORM_FRAMES: usize = 512;
+const MAX_LOCAL_NORM_CHANNELS: usize = 4;
+const MAX_LOCAL_NORM_GRID_CELLS: usize = 4_096;
+const MAX_LOCAL_NORM_FIELD_SAMPLES: usize =
+    MAX_LOCAL_NORM_FRAMES * MAX_LOCAL_NORM_CHANNELS * MAX_LOCAL_NORM_GRID_CELLS;
+const MAX_NOISE_DIFFERENCES: usize = 131_072;
 
+#[derive(Debug)]
 pub(crate) struct BackgroundGraphSolution {
     /// Offset aditivo por frame (gauge Σ=0 POR COMPONENTE conexa). Restar
     /// `offsets[i]` del frame i iguala los fondos sin elegir referencia.
@@ -40,6 +49,9 @@ pub(crate) struct BackgroundGraphSolution {
     /// solape) los offsets ENTRE componentes son indeterminables por
     /// definición: cada componente queda con media 0 y el caller debe avisar.
     pub components: usize,
+    /// Identificador determinista 0..components por frame. Permite conservar
+    /// el gauge separado cuando dos paneles/sesiones no tienen solape.
+    pub component_ids: Vec<usize>,
     /// RMS de los residuales de celda tras aplicar la solución — la
     /// "costura" restante entre frames, en las unidades de las muestras.
     pub rms_residual: f64,
@@ -92,6 +104,9 @@ pub(crate) fn solve_background_graph(
             let mut diffs: Vec<(f64, f64, f64)> = Vec::new(); // (xn, yn, si−sj)
             for cell in 0..cells {
                 if let (Some(vi), Some(vj)) = (samples[i][cell], samples[j][cell]) {
+                    if !vi.is_finite() || !vj.is_finite() {
+                        continue;
+                    }
                     let (xn, yn) = cell_xy(cell);
                     diffs.push((xn, yn, vi - vj));
                 }
@@ -160,6 +175,14 @@ pub(crate) fn solve_background_graph(
     component_roots.sort_unstable();
     component_roots.dedup();
     let components = component_roots.len();
+    let component_ids: Vec<usize> = roots
+        .iter()
+        .map(|root| {
+            component_roots
+                .binary_search(root)
+                .expect("la raíz union-find debe existir")
+        })
+        .collect();
     let lambda = (total_weight / n as f64).max(1e-9);
     for comp in 0..unknowns_per_frame {
         for fi in 0..n {
@@ -199,8 +222,22 @@ pub(crate) fn solve_background_graph(
     };
     for i in 0..n {
         for j in (i + 1)..n {
+            let common = (0..cells)
+                .filter(|&cell| {
+                    matches!(
+                        (samples[i][cell], samples[j][cell]),
+                        (Some(vi), Some(vj)) if vi.is_finite() && vj.is_finite()
+                    )
+                })
+                .count();
+            if common < MIN_COMMON_CELLS {
+                continue;
+            }
             for cell in 0..cells {
                 if let (Some(vi), Some(vj)) = (samples[i][cell], samples[j][cell]) {
+                    if !vi.is_finite() || !vj.is_finite() {
+                        continue;
+                    }
                     let (xn, yn) = cell_xy(cell);
                     let res = (vi - eval(i, xn, yn)) - (vj - eval(j, xn, yn));
                     sq_sum += res * res;
@@ -220,27 +257,209 @@ pub(crate) fn solve_background_graph(
         planes,
         edges,
         components,
+        component_ids,
         rms_residual,
     })
 }
 
-/// Rejilla de muestras de fondo de un frame para el grafo: percentil 15 por
-/// celda (mismo estimador robusto que el modelo BG), `None` en celdas con
-/// menos de 8 muestras válidas o completamente sin datos (valor exacto 0.0 de
-/// los bordes de warp).
-pub(crate) fn background_cell_samples(
+/// Frame lineal ya registrado en el canvas común. `coverage` tiene un byte por
+/// píxel (cero = sin cobertura); no se infiere cobertura desde SCI porque cero
+/// y los valores negativos son muestras calibradas perfectamente válidas.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RegisteredBackgroundFrame<'a> {
+    pub data: &'a [f32],
+    pub coverage: Option<&'a [u8]>,
+}
+
+/// Configuración acotada de normalización local. `first_order=true` produce
+/// campos suaves capaces de igualar gradientes lineales rotados entre sesiones;
+/// `false` conserva el mismo contrato con un offset constante por frame/canal.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SymmetricLocalNormalizationConfig {
+    pub grid_width: usize,
+    pub grid_height: usize,
+    pub first_order: bool,
+}
+
+impl Default for SymmetricLocalNormalizationConfig {
+    fn default() -> Self {
+        Self {
+            grid_width: 24,
+            grid_height: 24,
+            first_order: true,
+        }
+    }
+}
+
+/// QA por canal. El RMS se mide sólo sobre aristas aceptadas del grafo; nunca
+/// compara componentes cuyo nivel absoluto es indeterminable.
+#[derive(Clone, Debug)]
+pub(crate) struct LocalNormalizationChannelMetrics {
+    pub edges: usize,
+    pub components: usize,
+    pub component_ids: Vec<usize>,
+    pub rms_seam: f64,
+    /// Estimación MAD de ruido de alta frecuencia en las entradas registradas.
+    pub noise_sigma: f64,
+    /// `rms_seam/noise_sigma`; el gate científico objetivo es <0.2.
+    pub seam_sigma_ratio: f64,
+}
+
+/// Campos aditivos simétricos. El layout es frame-major/canal-major:
+/// `((frame*channels + channel)*grid_height + gy)*grid_width + gx`.
+/// Aplicación: `SCI_normalizada = SCI_escalada + campo_aditivo`; el factor
+/// fotométrico, si existe, debe aplicarse antes. Ningún frame es referencia.
+#[derive(Debug)]
+pub(crate) struct SymmetricLocalNormalization {
+    pub frame_count: usize,
+    pub channels: usize,
+    pub grid_width: usize,
+    pub grid_height: usize,
+    pub additive_fields: Vec<f32>,
+    pub channel_metrics: Vec<LocalNormalizationChannelMetrics>,
+}
+
+impl SymmetricLocalNormalization {
+    pub(crate) fn field(&self, frame: usize, channel: usize) -> Option<&[f32]> {
+        if frame >= self.frame_count || channel >= self.channels {
+            return None;
+        }
+        let cells = self.grid_width.checked_mul(self.grid_height)?;
+        let start = frame
+            .checked_mul(self.channels)?
+            .checked_add(channel)?
+            .checked_mul(cells)?;
+        self.additive_fields.get(start..start + cells)
+    }
+
+    /// Muestreo bilineal compatible con las rejillas de integración actuales.
+    pub(crate) fn sample_additive(
+        &self,
+        frame: usize,
+        channel: usize,
+        u: f32,
+        v: f32,
+    ) -> Option<f32> {
+        let grid = self.field(frame, channel)?;
+        let gw = self.grid_width;
+        let gh = self.grid_height;
+        let fx = u.clamp(0.0, 1.0) * (gw as f32 - 1.0);
+        let fy = v.clamp(0.0, 1.0) * (gh as f32 - 1.0);
+        let x0 = (fx.floor() as usize).min(gw - 1);
+        let y0 = (fy.floor() as usize).min(gh - 1);
+        let x1 = (x0 + 1).min(gw - 1);
+        let y1 = (y0 + 1).min(gh - 1);
+        let tx = fx - x0 as f32;
+        let ty = fy - y0 as f32;
+        let top = grid[y0 * gw + x0] * (1.0 - tx) + grid[y0 * gw + x1] * tx;
+        let bottom = grid[y1 * gw + x0] * (1.0 - tx) + grid[y1 * gw + x1] * tx;
+        Some(top * (1.0 - ty) + bottom * ty)
+    }
+}
+
+fn validate_local_normalization_inputs(
+    frames: &[RegisteredBackgroundFrame<'_>],
+    w: usize,
+    h: usize,
+    ch: usize,
+    config: SymmetricLocalNormalizationConfig,
+) -> Result<(usize, usize), String> {
+    if frames.len() < 2 || frames.len() > MAX_LOCAL_NORM_FRAMES {
+        return Err(format!(
+            "normalización local requiere 2..={MAX_LOCAL_NORM_FRAMES} frames; recibió {}",
+            frames.len()
+        ));
+    }
+    if ch == 0 || ch > MAX_LOCAL_NORM_CHANNELS {
+        return Err(format!(
+            "normalización local admite 1..={MAX_LOCAL_NORM_CHANNELS} canales; recibió {ch}"
+        ));
+    }
+    let pixels = w
+        .checked_mul(h)
+        .filter(|&count| count > 0)
+        .ok_or_else(|| "geometría de normalización local vacía o fuera de rango".to_string())?;
+    let samples_per_frame = pixels
+        .checked_mul(ch)
+        .ok_or_else(|| "geometría multicanal fuera de rango".to_string())?;
+    let cells = config
+        .grid_width
+        .checked_mul(config.grid_height)
+        .filter(|&count| count >= MIN_COMMON_CELLS && count <= MAX_LOCAL_NORM_GRID_CELLS)
+        .ok_or_else(|| {
+            format!(
+                "rejilla local debe contener {MIN_COMMON_CELLS}..={MAX_LOCAL_NORM_GRID_CELLS} celdas"
+            )
+        })?;
+    if config.grid_width < 2
+        || config.grid_height < 2
+        || config.grid_width > w
+        || config.grid_height > h
+    {
+        return Err(format!(
+            "rejilla {}x{} incompatible con canvas {w}x{h}",
+            config.grid_width, config.grid_height
+        ));
+    }
+    let output_samples = frames
+        .len()
+        .checked_mul(ch)
+        .and_then(|count| count.checked_mul(cells))
+        .filter(|&count| count <= MAX_LOCAL_NORM_FIELD_SAMPLES)
+        .ok_or_else(|| "campos de normalización local exceden el límite acotado".to_string())?;
+    for (index, frame) in frames.iter().enumerate() {
+        if frame.data.len() != samples_per_frame {
+            return Err(format!(
+                "frame registrado {index}: {} muestras, esperadas {samples_per_frame}",
+                frame.data.len()
+            ));
+        }
+        if let Some(coverage) = frame.coverage {
+            if coverage.len() != pixels {
+                return Err(format!(
+                    "cobertura del frame {index}: {} muestras, esperadas {pixels}",
+                    coverage.len()
+                ));
+            }
+        }
+    }
+    Ok((cells, output_samples))
+}
+
+/// Percentil 15 por celda usando exclusivamente cobertura/DQ y finitud como
+/// criterios de elegibilidad. Conserva negativos y ceros calibrados.
+fn background_cell_samples_with_coverage(
     data: &[f32],
+    coverage: Option<&[u8]>,
     w: usize,
     h: usize,
     ch: usize,
     channel: usize,
     gw: usize,
     gh: usize,
-) -> Vec<Option<f64>> {
-    let mut out = vec![None; gw * gh];
-    if w == 0 || h == 0 || channel >= ch {
-        return out;
+) -> Result<Vec<Option<f64>>, String> {
+    let pixels = w
+        .checked_mul(h)
+        .filter(|&count| count > 0)
+        .ok_or_else(|| "geometría de muestras de fondo inválida".to_string())?;
+    let expected = pixels
+        .checked_mul(ch)
+        .ok_or_else(|| "geometría multicanal de fondo fuera de rango".to_string())?;
+    let cells = gw
+        .checked_mul(gh)
+        .filter(|&count| count > 0 && count <= MAX_LOCAL_NORM_GRID_CELLS)
+        .ok_or_else(|| "rejilla de fondo vacía o excesiva".to_string())?;
+    if channel >= ch || data.len() != expected {
+        return Err("canal o longitud de frame inválidos para muestras de fondo".to_string());
     }
+    if coverage.is_some_and(|mask| mask.len() != pixels) {
+        return Err("longitud de cobertura inválida para muestras de fondo".to_string());
+    }
+
+    let mut out = Vec::new();
+    out.try_reserve_exact(cells)
+        .map_err(|error| format!("sin memoria para rejilla de fondo: {error}"))?;
+    out.resize(cells, None);
     for gy in 0..gh {
         for gx in 0..gw {
             let x0 = gx * w / gw;
@@ -254,9 +473,11 @@ pub(crate) fn background_cell_samples(
             while y < y1 {
                 let mut x = x0;
                 while x < x1 {
-                    let v = data[(y * w + x) * ch + channel];
-                    if v.is_finite() && v != 0.0 {
-                        cell.push(v);
+                    let pixel = y * w + x;
+                    let covered = coverage.map(|mask| mask[pixel] != 0).unwrap_or(true);
+                    let value = data[pixel * ch + channel];
+                    if covered && value.is_finite() {
+                        cell.push(value);
                     }
                     x += sx;
                 }
@@ -265,11 +486,167 @@ pub(crate) fn background_cell_samples(
             if cell.len() < 8 {
                 continue;
             }
-            cell.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            cell.sort_by(|a, b| a.total_cmp(b));
             out[gy * gw + gx] = Some(cell[cell.len() * 3 / 20] as f64);
         }
     }
-    out
+    Ok(out)
+}
+
+fn estimate_registered_noise_sigma(
+    frames: &[RegisteredBackgroundFrame<'_>],
+    w: usize,
+    h: usize,
+    ch: usize,
+    channel: usize,
+) -> f64 {
+    let possible = frames
+        .len()
+        .saturating_mul(h)
+        .saturating_mul(w.saturating_sub(1));
+    let stride = possible.div_ceil(MAX_NOISE_DIFFERENCES).max(1);
+    let mut differences = Vec::with_capacity(possible.min(MAX_NOISE_DIFFERENCES));
+    let mut ordinal = 0usize;
+    for frame in frames {
+        for y in 0..h {
+            for x in 1..w {
+                let take = ordinal % stride == 0;
+                ordinal = ordinal.saturating_add(1);
+                if !take {
+                    continue;
+                }
+                let p0 = y * w + x - 1;
+                let p1 = p0 + 1;
+                let covered = frame
+                    .coverage
+                    .map(|mask| mask[p0] != 0 && mask[p1] != 0)
+                    .unwrap_or(true);
+                let a = frame.data[p0 * ch + channel];
+                let b = frame.data[p1 * ch + channel];
+                if covered && a.is_finite() && b.is_finite() {
+                    differences.push((b as f64 - a as f64) * std::f64::consts::FRAC_1_SQRT_2);
+                }
+            }
+        }
+    }
+    if differences.len() < 16 {
+        return f64::NAN;
+    }
+    differences.sort_by(|a, b| a.total_cmp(b));
+    let center = differences[differences.len() / 2];
+    for value in &mut differences {
+        *value = (*value - center).abs();
+    }
+    differences.sort_by(|a, b| a.total_cmp(b));
+    differences[differences.len() / 2] * 1.4826
+}
+
+/// Normalización local simétrica multiframe por canal. Construye una rejilla
+/// robusta por frame/canal, resuelve todas las diferencias mediante el grafo
+/// de solapes y renderiza el negativo de la solución gauge-cero. Por ello la
+/// referencia efectiva es el centro robusto del conjunto/componente, nunca la
+/// toma 0 ni la toma de mayor peso.
+pub(crate) fn solve_symmetric_local_normalization(
+    frames: &[RegisteredBackgroundFrame<'_>],
+    w: usize,
+    h: usize,
+    ch: usize,
+    config: SymmetricLocalNormalizationConfig,
+) -> Result<SymmetricLocalNormalization, String> {
+    let (cells, output_samples) = validate_local_normalization_inputs(frames, w, h, ch, config)?;
+    let mut additive_fields = Vec::new();
+    additive_fields
+        .try_reserve_exact(output_samples)
+        .map_err(|error| format!("sin memoria para campos de normalización local: {error}"))?;
+    additive_fields.resize(output_samples, 0.0f32);
+    let mut channel_metrics = Vec::with_capacity(ch);
+
+    for channel in 0..ch {
+        let mut samples = Vec::with_capacity(frames.len());
+        for frame in frames {
+            samples.push(background_cell_samples_with_coverage(
+                frame.data,
+                frame.coverage,
+                w,
+                h,
+                ch,
+                channel,
+                config.grid_width,
+                config.grid_height,
+            )?);
+        }
+        let graph = solve_background_graph(
+            &samples,
+            config.grid_width,
+            config.grid_height,
+            config.first_order,
+        )
+        .ok_or_else(|| {
+            format!(
+                "canal {channel}: no hay {} celdas comunes para formar el grafo local",
+                MIN_COMMON_CELLS
+            )
+        })?;
+
+        for frame in 0..frames.len() {
+            let base = (frame * ch + channel) * cells;
+            for gy in 0..config.grid_height {
+                let yn = gy as f64 / (config.grid_height - 1) as f64;
+                for gx in 0..config.grid_width {
+                    let xn = gx as f64 / (config.grid_width - 1) as f64;
+                    let solved_background = match &graph.planes {
+                        Some(planes) => {
+                            planes[frame][0] + planes[frame][1] * xn + planes[frame][2] * yn
+                        }
+                        None => graph.offsets[frame],
+                    };
+                    additive_fields[base + gy * config.grid_width + gx] = -solved_background as f32;
+                }
+            }
+        }
+
+        let noise_sigma = estimate_registered_noise_sigma(frames, w, h, ch, channel);
+        let seam_sigma_ratio = if noise_sigma.is_finite() && noise_sigma > 0.0 {
+            graph.rms_residual / noise_sigma
+        } else if graph.rms_residual == 0.0 {
+            0.0
+        } else {
+            f64::INFINITY
+        };
+        channel_metrics.push(LocalNormalizationChannelMetrics {
+            edges: graph.edges,
+            components: graph.components,
+            component_ids: graph.component_ids,
+            rms_seam: graph.rms_residual,
+            noise_sigma,
+            seam_sigma_ratio,
+        });
+    }
+
+    Ok(SymmetricLocalNormalization {
+        frame_count: frames.len(),
+        channels: ch,
+        grid_width: config.grid_width,
+        grid_height: config.grid_height,
+        additive_fields,
+        channel_metrics,
+    })
+}
+
+/// Rejilla de muestras de fondo de un frame completamente cubierto: percentil
+/// 15 por celda. Todos los valores finitos, incluidos negativos y cero, son
+/// científicamente válidos. Para un warp con bordes use el API superior con
+/// una máscara de cobertura explícita.
+pub(crate) fn background_cell_samples(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    ch: usize,
+    channel: usize,
+    gw: usize,
+    gh: usize,
+) -> Vec<Option<f64>> {
+    background_cell_samples_with_coverage(data, None, w, h, ch, channel, gw, gh).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -300,40 +677,38 @@ impl BgModel {
         use rayon::prelude::*;
         let (w, h, ch) = (self.w, self.h, self.ch);
         let mut out = vec![0.0f32; w * h * ch];
-        out.par_chunks_mut(w * ch)
-            .enumerate()
-            .for_each(|(y, row)| {
-                let yn = y as f64 / h as f64;
-                for c in 0..ch {
-                    if self.coeffs[c].is_empty() {
-                        continue;
+        out.par_chunks_mut(w * ch).enumerate().for_each(|(y, row)| {
+            let yn = y as f64 / h as f64;
+            for c in 0..ch {
+                if self.coeffs[c].is_empty() {
+                    continue;
+                }
+                let k = &self.coeffs[c];
+                let level = self.level[c];
+                if self.degree == 2 && k.len() == 6 {
+                    for x in 0..w {
+                        let xn = x as f64 / w as f64;
+                        let g = k[0]
+                            + k[1] * xn
+                            + k[2] * xn * xn
+                            + k[3] * yn
+                            + k[4] * xn * yn
+                            + k[5] * yn * yn;
+                        row[x * ch + c] = (g - level) as f32;
                     }
-                    let k = &self.coeffs[c];
-                    let level = self.level[c];
-                    if self.degree == 2 && k.len() == 6 {
-                        for x in 0..w {
-                            let xn = x as f64 / w as f64;
-                            let g = k[0]
-                                + k[1] * xn
-                                + k[2] * xn * xn
-                                + k[3] * yn
-                                + k[4] * xn * yn
-                                + k[5] * yn * yn;
-                            row[x * ch + c] = (g - level) as f32;
-                        }
-                    } else {
-                        for x in 0..w {
-                            let xn = x as f64 / w as f64;
-                            let g: f64 = crate::ds_poly_basis(xn, yn, self.degree)
-                                .iter()
-                                .zip(k)
-                                .map(|(b, cc)| b * cc)
-                                .sum();
-                            row[x * ch + c] = (g - level) as f32;
-                        }
+                } else {
+                    for x in 0..w {
+                        let xn = x as f64 / w as f64;
+                        let g: f64 = crate::ds_poly_basis(xn, yn, self.degree)
+                            .iter()
+                            .zip(k)
+                            .map(|(b, cc)| b * cc)
+                            .sum();
+                        row[x * ch + c] = (g - level) as f32;
                     }
                 }
-            });
+            }
+        });
         out
     }
 
@@ -350,12 +725,7 @@ impl BgModel {
 /// rechazo robusto que `ds_extract_background_gradient` (rejilla 32×32,
 /// percentil 15 por celda, 3 pasadas descartando > ajuste + 2.5σ): un canal
 /// sin muestras suficientes queda con `coeffs` vacío.
-pub(crate) fn fit_background_model(
-    data: &[f32],
-    w: usize,
-    h: usize,
-    ch: usize,
-) -> Option<BgModel> {
+pub(crate) fn fit_background_model(data: &[f32], w: usize, h: usize, ch: usize) -> Option<BgModel> {
     const GRID: usize = 32;
     const DEG: usize = 2;
     let nterms = (DEG + 1) * (DEG + 2) / 2;
@@ -674,20 +1044,242 @@ mod tests {
     }
 
     #[test]
+    fn local_samples_preserve_negative_and_zero_and_respect_coverage() {
+        let (w, h, gw, gh) = (16usize, 16usize, 2usize, 2usize);
+        let mut data = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                data[y * w + x] = match (x >= 8, y >= 8) {
+                    (false, false) => -17.5,
+                    (true, false) => 0.0,
+                    (false, true) => f32::NAN,
+                    (true, true) => 9.0,
+                };
+            }
+        }
+        let all_covered = vec![1u8; w * h];
+        let samples =
+            background_cell_samples_with_coverage(&data, Some(&all_covered), w, h, 1, 0, gw, gh)
+                .unwrap();
+        assert_eq!(samples, vec![Some(-17.5), Some(0.0), None, Some(9.0)]);
+
+        let mut masked = all_covered;
+        for y in 0..8 {
+            for x in 8..16 {
+                masked[y * w + x] = 0;
+            }
+        }
+        let samples =
+            background_cell_samples_with_coverage(&data, Some(&masked), w, h, 1, 0, gw, gh)
+                .unwrap();
+        assert_eq!(samples[0], Some(-17.5));
+        assert_eq!(
+            samples[1], None,
+            "la máscara, y no el valor SCI=0, debe declarar no-cobertura"
+        );
+    }
+
+    #[test]
+    fn symmetric_local_normalization_is_rgb_per_channel_and_gradient_aware() {
+        let (w, h, ch) = (64usize, 48usize, 3usize);
+        let config = SymmetricLocalNormalizationConfig {
+            grid_width: 8,
+            grid_height: 6,
+            first_order: true,
+        };
+        let truth: [[[f64; 3]; 3]; 4] = [
+            [[-8.0, 3.0, -2.0], [22.0, -5.0, 1.0], [90.0, 2.0, 7.0]],
+            [[4.0, -1.0, 5.0], [-12.0, 4.0, -6.0], [20.0, -8.0, 3.0]],
+            [[11.0, 6.0, 1.0], [7.0, 2.0, 9.0], [-40.0, 3.0, -5.0]],
+            [[-3.0, -8.0, -4.0], [31.0, -1.0, 2.0], [60.0, 5.0, -1.0]],
+        ];
+        let base = [-120.0f64, 200.0, 900.0];
+        let mut owned = Vec::new();
+        for frame_planes in &truth {
+            let mut data = vec![0.0f32; w * h * ch];
+            for y in 0..h {
+                for x in 0..w {
+                    let gx = x * config.grid_width / w;
+                    let gy = y * config.grid_height / h;
+                    let xn = (gx as f64 + 0.5) / config.grid_width as f64;
+                    let yn = (gy as f64 + 0.5) / config.grid_height as f64;
+                    for channel in 0..ch {
+                        let common = base[channel] + (channel as f64 + 1.0) * (4.0 * xn - 3.0 * yn);
+                        let p = frame_planes[channel];
+                        data[(y * w + x) * ch + channel] =
+                            (common + p[0] + p[1] * xn + p[2] * yn) as f32;
+                    }
+                }
+            }
+            owned.push(data);
+        }
+        let inputs: Vec<RegisteredBackgroundFrame<'_>> = owned
+            .iter()
+            .map(|data| RegisteredBackgroundFrame {
+                data,
+                coverage: None,
+            })
+            .collect();
+        let solution = solve_symmetric_local_normalization(&inputs, w, h, ch, config).unwrap();
+        assert_eq!(solution.frame_count, 4);
+        assert_eq!(solution.channels, 3);
+        for metric in &solution.channel_metrics {
+            assert_eq!(metric.edges, 6);
+            assert_eq!(metric.components, 1);
+            assert_eq!(metric.component_ids, vec![0, 0, 0, 0]);
+            assert!(metric.rms_seam < 5e-4, "seam RGB = {}", metric.rms_seam);
+        }
+
+        // En cada canal/celda, todos los frames llegan al mismo centro robusto
+        // y los campos suman cero: no existe una toma de referencia oculta.
+        for channel in 0..ch {
+            for gy in 0..config.grid_height {
+                for gx in 0..config.grid_width {
+                    let xn = (gx as f32 + 0.5) / config.grid_width as f32;
+                    let yn = (gy as f32 + 0.5) / config.grid_height as f32;
+                    let x = gx * w / config.grid_width;
+                    let y = gy * h / config.grid_height;
+                    let mut corrected = Vec::new();
+                    let mut field_sum = 0.0f64;
+                    for frame in 0..owned.len() {
+                        let field = solution.sample_additive(frame, channel, xn, yn).unwrap();
+                        field_sum += field as f64;
+                        corrected.push(owned[frame][(y * w + x) * ch + channel] + field);
+                    }
+                    let span = corrected.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+                        - corrected.iter().copied().fold(f32::INFINITY, f32::min);
+                    assert!(span < 1e-3, "canal {channel}, celda {gx},{gy}: span={span}");
+                    assert!(field_sum.abs() < 2e-4, "gauge no simétrico: {field_sum}");
+                }
+            }
+        }
+        assert!(owned[0].iter().step_by(ch).all(|value| *value < 0.0));
+        assert_ne!(solution.field(0, 0).unwrap(), solution.field(0, 1).unwrap());
+    }
+
+    #[test]
+    fn symmetric_local_normalization_keeps_disconnected_component_gauges() {
+        let (w, h, ch) = (64usize, 32usize, 1usize);
+        let config = SymmetricLocalNormalizationConfig {
+            grid_width: 8,
+            grid_height: 4,
+            first_order: true,
+        };
+        let offsets = [6.0f32, 2.0, -5.0, -1.0];
+        let mut owned = Vec::new();
+        let mut masks = Vec::new();
+        for (frame, &offset) in offsets.iter().enumerate() {
+            let left = frame < 2;
+            let mut data = vec![f32::NAN; w * h];
+            let mut coverage = vec![0u8; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    if (x < w / 2) == left {
+                        data[y * w + x] = 80.0 + offset;
+                        coverage[y * w + x] = 1;
+                    }
+                }
+            }
+            owned.push(data);
+            masks.push(coverage);
+        }
+        let inputs: Vec<RegisteredBackgroundFrame<'_>> = owned
+            .iter()
+            .zip(&masks)
+            .map(|(data, coverage)| RegisteredBackgroundFrame {
+                data,
+                coverage: Some(coverage),
+            })
+            .collect();
+        let solution = solve_symmetric_local_normalization(&inputs, w, h, ch, config).unwrap();
+        let metric = &solution.channel_metrics[0];
+        assert_eq!(metric.components, 2);
+        assert_eq!(metric.edges, 2);
+        assert_eq!(metric.component_ids[0], metric.component_ids[1]);
+        assert_eq!(metric.component_ids[2], metric.component_ids[3]);
+        assert_ne!(metric.component_ids[0], metric.component_ids[2]);
+        for pair in [[0usize, 1usize], [2usize, 3usize]] {
+            let f0 = solution.sample_additive(pair[0], 0, 0.5, 0.5).unwrap();
+            let f1 = solution.sample_additive(pair[1], 0, 0.5, 0.5).unwrap();
+            assert!((f0 + f1).abs() < 1e-5, "gauge de componente no nulo");
+            let corrected0 = 80.0 + offsets[pair[0]] + f0;
+            let corrected1 = 80.0 + offsets[pair[1]] + f1;
+            assert!((corrected0 - corrected1).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn gate_symmetric_local_normalization_seam_below_02_sigma() {
+        let (w, h, ch) = (128usize, 96usize, 1usize);
+        let sigma = 10.0f64;
+        let config = SymmetricLocalNormalizationConfig {
+            grid_width: 8,
+            grid_height: 6,
+            first_order: true,
+        };
+        let planes = [
+            [40.0f64, 18.0, -12.0],
+            [-25.0, -9.0, 16.0],
+            [5.0, 4.0, 3.0],
+            [18.0, -14.0, -6.0],
+            [-11.0, 7.0, -15.0],
+            [2.0, -6.0, 11.0],
+        ];
+        let mut state = 0xD1CE_BA5E_CAFE_F00Du64;
+        let mut normal = || {
+            let mut sum = 0.0f64;
+            for _ in 0..12 {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                sum += (state >> 11) as f64 / (1u64 << 53) as f64;
+            }
+            sum - 6.0
+        };
+        let mut owned = Vec::new();
+        for plane in planes {
+            let mut data = vec![0.0f32; w * h];
+            for y in 0..h {
+                let yn = (y as f64 + 0.5) / h as f64;
+                for x in 0..w {
+                    let xn = (x as f64 + 0.5) / w as f64;
+                    let common = -35.0 + 12.0 * xn - 8.0 * yn;
+                    data[y * w + x] =
+                        (common + plane[0] + plane[1] * xn + plane[2] * yn + sigma * normal())
+                            as f32;
+                }
+            }
+            owned.push(data);
+        }
+        let inputs: Vec<RegisteredBackgroundFrame<'_>> = owned
+            .iter()
+            .map(|data| RegisteredBackgroundFrame {
+                data,
+                coverage: None,
+            })
+            .collect();
+        let solution = solve_symmetric_local_normalization(&inputs, w, h, ch, config).unwrap();
+        let metric = &solution.channel_metrics[0];
+        assert!(
+            metric.rms_seam < 0.2 * sigma,
+            "seam {:.3} >= 0.2 sigma ({:.3})",
+            metric.rms_seam,
+            0.2 * sigma
+        );
+        assert!(
+            metric.seam_sigma_ratio < 0.2,
+            "ratio seam/sigma estimada = {:.3}, sigma estimada = {:.3}",
+            metric.seam_sigma_ratio,
+            metric.noise_sigma
+        );
+    }
+
+    #[test]
     fn gate_f2_sampling_advisor_classifies_synthetic_scenarios() {
-        assert_eq!(
-            advise_sampling(1.2),
-            (SamplingClass::Undersampled, "2x")
-        );
-        assert_eq!(
-            advise_sampling(1.7),
-            (SamplingClass::Undersampled, "1.5x")
-        );
+        assert_eq!(advise_sampling(1.2), (SamplingClass::Undersampled, "2x"));
+        assert_eq!(advise_sampling(1.7), (SamplingClass::Undersampled, "1.5x"));
         assert_eq!(advise_sampling(2.5), (SamplingClass::WellSampled, "1x"));
-        assert_eq!(
-            advise_sampling(4.2),
-            (SamplingClass::Oversampled, "0.75x")
-        );
+        assert_eq!(advise_sampling(4.2), (SamplingClass::Oversampled, "0.75x"));
         assert_eq!(advise_sampling(6.5), (SamplingClass::Oversampled, "0.5x"));
         // Degenerado: sin medida fiable, no recomendar nada distinto de 1x.
         assert_eq!(advise_sampling(f64::NAN).1, "1x");
@@ -710,8 +1302,11 @@ mod tests {
             vignette: None,
         };
         // Tres "sesiones" con fondo y gradiente distintos (luna/LP cambiante).
-        let sessions: [(f64, (f64, f64)); 3] =
-            [(200.0, (0.3, 0.0)), (260.0, (-0.2, 0.25)), (230.0, (0.0, -0.35))];
+        let sessions: [(f64, (f64, f64)); 3] = [
+            (200.0, (0.3, 0.0)),
+            (260.0, (-0.2, 0.25)),
+            (230.0, (0.0, -0.35)),
+        ];
         let mut samples: Vec<Vec<Option<f64>>> = Vec::new();
         let (gw, gh) = (12, 12);
         let mut sigma_bg = 0.0f64;

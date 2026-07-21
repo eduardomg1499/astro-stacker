@@ -3,7 +3,6 @@ import { MosaicManager } from "./mosaic_manager.js";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-shell"; // CORRECT IMPORT
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog"; // Renamed to avoid conflict
-import { mkdir } from "@tauri-apps/plugin-fs";
 import { listen } from "@tauri-apps/api/event";
 import { check } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
@@ -11,8 +10,15 @@ import { getVersion } from '@tauri-apps/api/app';
 import { i18n } from "./i18n.js";
 import { tutorialManager } from "./tutorial_manager.js";
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
-
-window.mkdir = mkdir;
+import {
+    BATCH_OUTPUT_POLICY_SINGLE_DIRECTORY,
+    BATCH_OUTPUT_POLICY_SOURCE_ADJACENT,
+    buildBatchOutputLookup,
+    formatBatchOutputError,
+    freezeBatchProcessingContract,
+    normalizeBatchEntryResult,
+    normalizeBatchOutputSettings
+} from "./batch_output.js";
 
 let appWindow = null;
 // Persistencia de la categoría de objetivo: true mientras un cambio es
@@ -1442,6 +1448,15 @@ let isBatchMode = false;
 let batchFiles = [];
 let batchSourcePath = "";
 let batchOutputFolder = "";
+let batchOutputFoldersBySource = new Map();
+let batchSequencePlan = null;
+let batchNormalizedApPoints = [];
+const storedBatchOutput = normalizeBatchOutputSettings(
+    localStorage.getItem("zas_batch_output_policy_v1"),
+    localStorage.getItem("zas_batch_output_directory_v1")
+);
+let batchOutputPolicy = storedBatchOutput.policy;
+let batchSingleOutputDirectory = storedBatchOutput.directory;
 let batchGeneratedImages = [];
 let batchResultPaths = [];
 let mosaicManager = null; // Instance
@@ -2021,14 +2036,62 @@ window.toDisplaySrc = toDisplaySrc;
 // realign SOBRESCRIBEN los mismos archivos — sin esto el WebView serviría la
 // imagen vieja cacheada por URL. Se bumpea al completar esas operaciones; el
 // asset protocol resuelve por el path de la URL e ignora la query string.
-// ===== GPU COMPUTE: modo del usuario (Hybrid/Auto/GPU/CPU) + deteccion =====
-// Hybrid v2 permanece experimental hasta completar la matriz competitiva;
-// Auto sólo se promoverá a predeterminado después de superar ese gate.
+// ===== PLANIFICACION PLANETARIA: compute + decode independientes =====
+// v2 convierte Auto en el valor seguro por defecto. Antes de esta clave de
+// versión, `hybrid` era también el default que la aplicación persistía; por eso
+// null e Hybrid se migran una sola vez. Tras marcar v2, Hybrid vuelve a ser una
+// elección experta válida y se conserva en aperturas posteriores.
+const PLANETARY_POLICY_PREF_VERSION = "2";
+const PLANETARY_POLICY_PREF_VERSION_KEY = "zas_planetary_policy_version";
+const PLANETARY_QUALITY_PREF_VERSION = "1";
+const PLANETARY_QUALITY_PREF_VERSION_KEY = "zas_planetary_quality_policy_version";
+
+function migratePlanetaryPolicyPreference() {
+    const storedVersion = localStorage.getItem(PLANETARY_POLICY_PREF_VERSION_KEY);
+    if (storedVersion === PLANETARY_POLICY_PREF_VERSION) {
+        return;
+    }
+    const legacyCompute = localStorage.getItem("zas_gpu_mode");
+    if (legacyCompute === null || (storedVersion === null && legacyCompute === "hybrid")) {
+        localStorage.setItem("zas_gpu_mode", "auto");
+    }
+    localStorage.setItem(PLANETARY_POLICY_PREF_VERSION_KEY, PLANETARY_POLICY_PREF_VERSION);
+}
+
 function getGpuMode() {
+    migratePlanetaryPolicyPreference();
     const v = localStorage.getItem("zas_gpu_mode");
-    return (v === "gpu" || v === "cpu" || v === "auto" || v === "hybrid") ? v : "hybrid";
+    return (v === "gpu" || v === "cpu" || v === "auto" || v === "hybrid") ? v : "auto";
 }
 window.getGpuMode = getGpuMode;
+
+function getComputePolicy() {
+    return ({
+        gpu: "gpu_only",
+        cpu: "cpu_only",
+        auto: "auto",
+        hybrid: "hybrid"
+    })[getGpuMode()] || "auto";
+}
+window.getComputePolicy = getComputePolicy;
+
+function getDecodePolicy() {
+    const value = localStorage.getItem("zas_decode_policy");
+    return (value === "software" || value === "hardware" || value === "auto") ? value : "auto";
+}
+window.getDecodePolicy = getDecodePolicy;
+
+function getQualityPolicy() {
+    if (localStorage.getItem(PLANETARY_QUALITY_PREF_VERSION_KEY) !== PLANETARY_QUALITY_PREF_VERSION) {
+        localStorage.setItem("zas_planetary_quality_policy", "adaptive");
+        localStorage.setItem(PLANETARY_QUALITY_PREF_VERSION_KEY, PLANETARY_QUALITY_PREF_VERSION);
+    }
+    const value = localStorage.getItem("zas_planetary_quality_policy");
+    return (value === "standard" || value === "maximum" || value === "adaptive")
+        ? value
+        : "adaptive";
+}
+window.getQualityPolicy = getQualityPolicy;
 
 (async function initGpuUi() {
     try {
@@ -2037,7 +2100,27 @@ window.getGpuMode = getGpuMode;
             selGpu.value = getGpuMode();
             selGpu.addEventListener("change", () => {
                 localStorage.setItem("zas_gpu_mode", selGpu.value);
-                log("INFO", `Modo GPU: ${selGpu.value === "hybrid" ? "Hybrid v2 experimental" : selGpu.value === "auto" ? "Auto" : selGpu.value === "gpu" ? "Forzar GPU" : "Solo CPU"}`);
+                log("INFO", `Cómputo planetario: ${selGpu.value === "hybrid" ? "Hybrid experimental" : selGpu.value === "auto" ? "Auto" : selGpu.value === "gpu" ? "Solo GPU (estricto)" : "Solo CPU"}`);
+            });
+        }
+        const selDecode = document.getElementById("sel-decode-policy");
+        if (selDecode) {
+            selDecode.value = getDecodePolicy();
+            selDecode.addEventListener("change", () => {
+                localStorage.setItem("zas_decode_policy", selDecode.value);
+                log("INFO", `Decodificacion FFmpeg: ${selDecode.value === "hardware" ? "Hardware estricto" : selDecode.value === "software" ? "Software (CPU)" : "Auto"}`);
+            });
+        }
+        const selQuality = document.getElementById("sel-planetary-quality-policy");
+        if (selQuality) {
+            selQuality.value = getQualityPolicy();
+            selQuality.addEventListener("change", () => {
+                const value = (selQuality.value === "standard" || selQuality.value === "maximum")
+                    ? selQuality.value
+                    : "adaptive";
+                localStorage.setItem("zas_planetary_quality_policy", value);
+                localStorage.setItem(PLANETARY_QUALITY_PREF_VERSION_KEY, PLANETARY_QUALITY_PREF_VERSION);
+                log("INFO", `Rigor planetario por AP: ${value}`);
             });
         }
         const info = await invoke("get_gpu_info");
@@ -2045,9 +2128,9 @@ window.getGpuMode = getGpuMode;
         const line = document.getElementById("gpu-info-line");
         if (info && info.available) {
             if (line) line.textContent = `✔ ${info.name} — ${info.backend} · VRAM presupuestada: ${info.vram_budget_mb} MB`;
-            log("INFO", `GPU detectada: ${info.name} (${info.backend}) — ${info.vram_budget_mb} MB presupuestados para el apilado.`);
+            log("INFO", `GPU detectada: ${info.name} (${info.backend}) — ${info.vram_budget_mb} MB presupuestados para cómputo planetario.`);
         } else {
-            if (line) line.textContent = tr("settings.general.gpu_none", "Sin GPU compatible — el apilado usa CPU (SIMD).");
+            if (line) line.textContent = tr("settings.general.gpu_none", "Sin GPU compatible — análisis y apilado usan CPU (SIMD).");
         }
     } catch (e) {
         console.warn("get_gpu_info:", e);
@@ -2605,6 +2688,9 @@ const ui = {
     panelBatch: $("#panel-batch"),
     batchSourcePath: $("#batch-source-path"),
     batchCount: $("#batch-count"),
+    btnBatchOutputSourceAdjacent: $("#btn-batch-output-source-adjacent"),
+    btnBatchOutputSingleDirectory: $("#btn-batch-output-single-directory"),
+    batchOutputPath: $("#batch-output-path"),
     btnBatchTune: $("#btn-batch-tune"),
     btnBatchRun: $("#btn-batch-run"),
     selBatchType: $("#sel-batch-type"),
@@ -5024,6 +5110,10 @@ function resetDataAcquisitionUI() {
     currentVideoStats = null;
     batchGeneratedImages = [];
     batchResultPaths = [];
+    batchOutputFolder = "";
+    batchOutputFoldersBySource = new Map();
+    batchSequencePlan = null;
+    batchNormalizedApPoints = [];
     if (chartInstance) {
         chartInstance.destroy();
         chartInstance = null;
@@ -5162,6 +5252,62 @@ function updateStackButtonState() {
 if (ui.alignMode) {
     ui.alignMode.addEventListener("change", updateStackButtonState);
 }
+
+function paintBatchOutputPolicy() {
+    const sourceSelected = batchOutputPolicy === BATCH_OUTPUT_POLICY_SOURCE_ADJACENT;
+    const paintButton = (button, selected) => {
+        if (!button) return;
+        button.classList.toggle("selected", selected);
+        button.setAttribute("aria-pressed", String(selected));
+        button.style.borderColor = selected ? "#a855f7" : "#334155";
+        button.style.color = selected ? "#e9d5ff" : "#94a3b8";
+        button.style.background = selected ? "rgba(168,85,247,0.14)" : "#0f172a";
+    };
+    paintButton(ui.btnBatchOutputSourceAdjacent, sourceSelected);
+    paintButton(ui.btnBatchOutputSingleDirectory, !sourceSelected);
+    if (ui.batchOutputPath) {
+        ui.batchOutputPath.textContent = sourceSelected
+            ? tr("batch.output.source_adjacent_hint", "Crea Zenith_Batch_<sesión>/<vídeo>/ junto a cada fuente, sin sobrescribir.")
+            : trFormat(
+                "batch.output.single_directory_hint",
+                { path: batchSingleOutputDirectory },
+                `Carpeta elegida: ${batchSingleOutputDirectory}`
+            );
+    }
+}
+
+function persistBatchOutputPolicy() {
+    localStorage.setItem("zas_batch_output_policy_v1", batchOutputPolicy);
+    if (batchSingleOutputDirectory) {
+        localStorage.setItem("zas_batch_output_directory_v1", batchSingleOutputDirectory);
+    }
+}
+
+if (ui.btnBatchOutputSourceAdjacent) {
+    ui.btnBatchOutputSourceAdjacent.addEventListener("click", () => {
+        batchOutputPolicy = BATCH_OUTPUT_POLICY_SOURCE_ADJACENT;
+        persistBatchOutputPolicy();
+        paintBatchOutputPolicy();
+    });
+}
+
+if (ui.btnBatchOutputSingleDirectory) {
+    ui.btnBatchOutputSingleDirectory.addEventListener("click", async () => {
+        const folder = await openDialog({
+            directory: true,
+            multiple: false,
+            title: tr("batch.output.choose_title", "Elegir carpeta única para el lote")
+        });
+        const selected = (typeof folder === "object" && folder && folder.path) ? folder.path : folder;
+        if (!selected) return;
+        batchSingleOutputDirectory = String(selected);
+        batchOutputPolicy = BATCH_OUTPUT_POLICY_SINGLE_DIRECTORY;
+        persistBatchOutputPolicy();
+        paintBatchOutputPolicy();
+    });
+}
+
+paintBatchOutputPolicy();
 
 // 1. Selector de Carpeta para Batch
 if (ui.btnBatchMode) {
@@ -6162,20 +6308,88 @@ if (ui.btnBatchRun) {
             tutorialManager.hideOverlay();
         }
 
-        const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-        const sep = batchSourcePath.includes("\\") ? "\\" : "/";
-        batchOutputFolder = `${batchSourcePath}${sep}Animacion_${timestamp}`;
         batchGeneratedImages = [];
         batchResultPaths = [];
+        batchOutputFolder = "";
+        batchOutputFoldersBySource = new Map();
+        batchSequencePlan = null;
+        batchNormalizedApPoints = [];
+        let frozenBatchContract = null;
 
         try {
-            await mkdir(batchOutputFolder);
+            const referenceWidth = Number(currentFileMetadata?.width || ui.imgSource?.naturalWidth || 0);
+            const referenceHeight = Number(currentFileMetadata?.height || ui.imgSource?.naturalHeight || 0);
+            const referenceApPoints = (activeAPoints || []).map(point => Array.isArray(point)
+                ? { x: Number(point[0]), y: Number(point[1]), size: parseInt(ui.apSize?.value || "48", 10) }
+                : {
+                    x: Number(point.x),
+                    y: Number(point.y),
+                    size: parseInt(point.size || ui.apSize?.value || "48", 10)
+                });
+            const frozenTarget = ui.selBatchTargetCategory?.value || getSelectedTargetCategory();
+            const frozenOutputSettings = normalizeBatchOutputSettings(
+                batchOutputPolicy,
+                batchSingleOutputDirectory
+            );
+            // Congelar una sola vez la receta ajustada sobre la referencia.
+            // El loop no vuelve a leer sliders ni toggles mientras Rust trabaja.
+            frozenBatchContract = freezeBatchProcessingContract({
+                pipeline: getPipelineParams(),
+                stackPct: parseFloat(ui.stackSlider.value),
+                drizzle: parseFloat(ui.drizzleScale.value),
+                target: frozenTarget,
+                flow: getZenithUltimateFlow(frozenTarget),
+                outputPolicy: frozenOutputSettings.policy,
+                singleOutputDirectory: frozenOutputSettings.directory,
+                referenceCanvas: [referenceWidth, referenceHeight],
+                referenceApPoints,
+                bayerOverrides: batchFiles.map(file => getBayerOverrideValue(file)),
+                anchorOverride: getManualAnchorOverrideValue(),
+                sharpened: document.getElementById("chk-sharpened").checked,
+                sharpenIntensity: parseFloat(ui.selSharpenIntensity?.value || "0.5"),
+                doublePass: document.getElementById("chk-double-pass").checked,
+                normalizeColors: document.getElementById("chk-normalize-colors")?.checked || false,
+                alignRgb: document.getElementById("chk-rgb-align")
+                    ? document.getElementById("chk-rgb-align").checked
+                    : true,
+                gpuMode: getGpuMode(),
+                computePolicy: getComputePolicy(),
+                decodePolicy: getDecodePolicy(),
+                qualityPolicy: getQualityPolicy()
+            });
+            const outputPlan = await invoke("prepare_batch_output", {
+                files: batchFiles.map(file => String(file)),
+                sourceRoot: String(batchSourcePath),
+                policy: frozenBatchContract.outputPolicy,
+                singleDirectory: frozenBatchContract.outputPolicy === BATCH_OUTPUT_POLICY_SINGLE_DIRECTORY
+                    ? frozenBatchContract.singleOutputDirectory
+                    : null,
+                referenceCanvas: frozenBatchContract.referenceCanvas,
+                referenceApPoints: frozenBatchContract.referenceApPoints
+            });
+            batchOutputFoldersBySource = buildBatchOutputLookup(outputPlan, batchFiles);
+            batchOutputFolder = outputPlan.animationFolder;
+            batchSequencePlan = freezeBatchProcessingContract(outputPlan.sequencePlan);
+            batchNormalizedApPoints = freezeBatchProcessingContract(outputPlan.normalizedApPoints || []);
+            if (ui.batchOutputPath) {
+                ui.batchOutputPath.textContent = trFormat(
+                    "batch.output.active_path",
+                    { path: batchOutputFolder },
+                    `Salida de esta sesión: ${batchOutputFolder}`
+                );
+            }
+            log("INFO", `Salida batch preparada (${outputPlan.policy}): ${batchOutputFolder}`);
         } catch (e) {
-            // PR-1.9: sin fallback silencioso a la carpeta fuente — mezclaba
-            // salidas con los vídeos originales y podía sobrescribir.
-            log("ERROR", `No se pudo crear la carpeta de salida: ${batchOutputFolder} (${e})`);
-            showCustomAlert(tr("general.error", "Error"),
-                tr("batch.execution.mkdir_failed", "No se pudo crear la carpeta de salida del lote. Revisa permisos de escritura."));
+            const detail = formatBatchOutputError(e);
+            log("ERROR", `No se pudo preparar la salida del lote: ${detail}`);
+            showCustomAlert(
+                tr("general.error", "Error"),
+                trFormat(
+                    "batch.execution.output_preflight_failed",
+                    { error: detail },
+                    `No se pudo preparar la salida del lote antes de procesar.\n\n${detail}`
+                )
+            );
             return;
         }
 
@@ -6194,11 +6408,10 @@ if (ui.btnBatchRun) {
         }
 
         try {
-            const p = getPipelineParams();
-            const stackPct = parseFloat(ui.stackSlider.value);
-            const drizzle = parseFloat(ui.drizzleScale.value);
-            const batchTarget = ui.selBatchTargetCategory?.value || getSelectedTargetCategory();
-            const batchFlow = getZenithUltimateFlow(batchTarget);
+            const p = frozenBatchContract.pipeline;
+            const stackPct = frozenBatchContract.stackPct;
+            const drizzle = frozenBatchContract.drizzle;
+            const batchFlow = frozenBatchContract.flow;
             const align = batchFlow.alignMode;
 
             // Reset the shared batch anchor once, then keep it alive for all entries.
@@ -6212,6 +6425,7 @@ if (ui.btnBatchRun) {
             const actualBatchMode = batchFlow.batchMode;
 
             const batchFailedNames = [];
+            const batchFailureDetails = [];
             let batchCancelled = false;
             for (let i = 0; i < batchFiles.length; i++) {
                 // PR-1.9: cierre del race de cancelación ENTRE vídeos — si el
@@ -6238,10 +6452,14 @@ if (ui.btnBatchRun) {
                 }, `[Batch ${displayIdx}/${batchFiles.length}] Procesando: ${fileName}...`));
 
                 try {
-                    const bOverride = getBayerOverrideValue(file);
+                    const bOverride = frozenBatchContract.bayerOverrides[i];
+                    const entryOutputFolder = batchOutputFoldersBySource.get(file);
+                    if (!entryOutputFolder) {
+                        throw new Error(`El plan de salida no contiene destino para ${file}`);
+                    }
                     const result = await invoke("process_batch_entry", {
                         filePath: file,
-                        outputFolder: batchOutputFolder,
+                        outputFolder: entryOutputFolder,
                         stackPct: stackPct,
                         drizzle: drizzle,
                         alignMode: align,
@@ -6281,47 +6499,65 @@ if (ui.btnBatchRun) {
                         batchMode: actualBatchMode,
                         targetType: batchFlow.category,
                         bayerOverride: bOverride,
-                        anchorOverride: getManualAnchorOverrideValue(),
-                        sharpened: document.getElementById("chk-sharpened").checked,
-                        sharpenIntensity: parseFloat(ui.selSharpenIntensity?.value || "0.5"),
-                        doublePass: document.getElementById("chk-double-pass").checked,
+                        anchorOverride: frozenBatchContract.anchorOverride,
+                        sharpened: frozenBatchContract.sharpened,
+                        sharpenIntensity: frozenBatchContract.sharpenIntensity,
+                        doublePass: frozenBatchContract.doublePass,
                         warpingAnalysis: batchFlow.warpingAnalysis,
-                        normalizeColors: document.getElementById("chk-normalize-colors")?.checked || false,
+                        normalizeColors: frozenBatchContract.normalizeColors,
                         isV3: batchFlow.isV3,
                         apGridSize: batchFlow.apSize,
                         apThreshold: batchFlow.apThreshold,
                         progressPrefix: `[${displayIdx}/${batchFiles.length}]`,
-                        alignRgb: document.getElementById("chk-rgb-align") ? document.getElementById("chk-rgb-align").checked : true,
-                        gpuMode: getGpuMode()
+                        alignRgb: frozenBatchContract.alignRgb,
+                        // gpuMode se conserva mientras las releases anteriores
+                        // sigan aceptando el contrato legado.
+                        gpuMode: frozenBatchContract.gpuMode,
+                        computePolicy: frozenBatchContract.computePolicy,
+                        decodePolicy: frozenBatchContract.decodePolicy,
+                        qualityPolicy: frozenBatchContract.qualityPolicy,
+                        sequencePlan: batchSequencePlan,
+                        normalizedApPoints: batchNormalizedApPoints
                     });
 
                     // ASSET PROTOCOL: guardar la RUTA (string diminuto) en vez del
                     // base64 — el reproductor ya convierte rutas con convertFileSrc.
                     // Antes un lote grande retenia TODOS los PNG en base64 en el
                     // heap del WebView (>1 GB → crash del renderer).
-                    const preview = result?.path || result?.preview_base64;
-                    if (preview && result?.path) {
-                        batchGeneratedImages.push(preview);
-                        batchResultPaths.push(result.path);
-                    } else {
-                        batchFailedNames.push(fileName);
-                        log("WARN", trFormat("batch.logs.file_failed", {
-                            name: fileName,
-                            error: tr("animation.errors.no_valid_images", "No se generaron imagenes validas para reproducir.")
-                        }, `Fallo en ${fileName}: salida inválida`));
+                    const published = normalizeBatchEntryResult(result);
+                    if (batchSequencePlan?.planId) {
+                        try {
+                            await invoke("register_batch_output_result", {
+                                animationFolder: batchOutputFolder,
+                                sessionId: batchSequencePlan.planId,
+                                sourcePath: file,
+                                preparedPath: published.preparedPath,
+                                linearMasterPath: published.linearMasterPath
+                            });
+                        } catch (manifestError) {
+                            log("WARN", trFormat(
+                                "batch.output.manifest_warning",
+                                { error: formatBatchOutputError(manifestError) },
+                                `El resultado se guardó, pero no se pudo actualizar el manifiesto batch: ${formatBatchOutputError(manifestError)}`
+                            ));
+                        }
                     }
+                    batchGeneratedImages.push(published.preview);
+                    batchResultPaths.push(published.preparedPath);
 
                     // Cleanup per item without destroying the shared batch anchor/dimensions.
                     await invoke("clear_stack_memory").catch(() => {});
 
                 } catch (e) {
-                    log("ERROR", trFormat("batch.logs.file_failed", { name: fileName, error: e }, `Fallo en ${file}: ${e}`));
+                    const failureDetail = formatBatchOutputError(e);
+                    log("ERROR", trFormat("batch.logs.file_failed", { name: fileName, error: failureDetail }, `Fallo en ${file}: ${failureDetail}`));
                     if (isCancellationError(e)) {
                         batchCancelled = true;
                         log("WARN", tr("batch.logs.cancelled", "Lote cancelado por el usuario."));
                         break; // no seguir con los archivos restantes
                     }
                     batchFailedNames.push(fileName);
+                    batchFailureDetails.push(`${fileName}: ${failureDetail}`);
                 }
             }
 
@@ -6335,7 +6571,17 @@ if (ui.btnBatchRun) {
                 }, `Lote: ${batchFailedNames.length}/${batchFiles.length} vídeos fallaron: ${batchFailedNames.join(", ")}`));
             }
             if (batchGeneratedImages.length === 0) {
-                showCustomAlert(tr("general.error", "Error"), tr("batch.execution.no_outputs", "El lote terminó, pero no se generaron frames válidos."));
+                const details = batchFailureDetails.slice(0, 5).join("\n");
+                showCustomAlert(
+                    tr("general.error", "Error"),
+                    details
+                        ? trFormat(
+                            "batch.execution.no_outputs_detail",
+                            { details },
+                            `El lote terminó sin salidas publicadas.\n\n${details}`
+                        )
+                        : tr("batch.execution.no_outputs", "El lote terminó, pero no se generaron frames válidos.")
+                );
                 return;
             }
             if (batchCancelled) {
@@ -6674,12 +6920,7 @@ if (ui.btnRunAnalysis) {
                 const warpingAnalysis = flow.warpingAnalysis;
                 log("INFO", `Iniciando ${flow.name} con modo: ${analysisMode} (${flow.category}, Warping: ${warpingAnalysis})`);
 
-                const computePolicy = ({
-                    gpu: "gpu_only",
-                    cpu: "cpu_only",
-                    auto: "auto",
-                    hybrid: "hybrid"
-                })[getGpuMode()] || "hybrid";
+                const computePolicy = getComputePolicy();
                 const res = await invoke("analyze_planetary", {
                     request: {
                         path: currentFilePath,
@@ -6689,6 +6930,8 @@ if (ui.btnRunAnalysis) {
                         bayerOverride: bOverride,
                         anchorOverride: getManualAnchorOverrideValue(),
                         computePolicy,
+                        decodePolicy: getDecodePolicy(),
+                        qualityPolicy: getQualityPolicy(),
                         profile: "custom"
                     }
                 });
@@ -6852,6 +7095,7 @@ function resetWorkflowForSettingsChange() {
     "#sel-color-space-override",
     "#sel-bayer-override",
     "#sel-quality-method",
+    "#sel-planetary-quality-policy",
     "#sel-target-category",
     "#align-mode"
 ].forEach(selector => {
@@ -7204,27 +7448,33 @@ if (ui.btnStack) {
                 if (isZenithUltimateSelected() || alignModeStr === "liquid_warping" || alignModeStr === "liquid_v3" || alignModeStr === "zenith_v3") {
                     // Zenith Ultimate (both categories) + legacy liquid_warping modes
                     log("INFO", `Iniciando ${isZenithUltimateSelected() ? flow.name : (alignModeStr === "liquid_v3" ? "Zenith Precision V3 (Multipoint)" : "Liquid Warping V2")}...`);
-                    b64 = await invoke("stack_video_liquid_warping", {
-                        path: currentFilePath,
-                        percent: parseFloat(ui.stackSlider.value),
-                        customPoints: pointsToSend,
-                        drizzle: drizzleFactor,
-                        isSurface: isSurfaceMode,
-                        bayerOverride: getBayerOverrideValue(),
-                        apSize: parseInt(ui.apSize.value) || flow.apSize || 48,
-                        sharpened: document.getElementById("chk-sharpened").checked,
-                        sharpenIntensity: sharpenIntensity,
-                        doublePass: document.getElementById("chk-double-pass").checked,
-                        warpingAnalysis, // NEW
-                        anchorOverride: getManualAnchorOverrideValue(),
-                        stackingRoi: getStackingRoiOverrideValue(),
-                        normalizeColors: document.getElementById("chk-normalize-colors")?.checked || false,
-                        isV3: flow.isV3 || (alignModeStr === "liquid_v3") || (alignModeStr === "zenith_v3"), // V3 flag for all these modes
-                        keepFullFrame: document.getElementById("chk-keep-full-frame") ? document.getElementById("chk-keep-full-frame").checked : false,
-                        targetType: flow.category,
-                        alignRgb: document.getElementById("chk-rgb-align") ? document.getElementById("chk-rgb-align").checked : true,
-                        gpuMode: getGpuMode()
+                    const stackResponse = await invoke("run_planetary_stack", {
+                        request: {
+                            path: currentFilePath,
+                            percent: parseFloat(ui.stackSlider.value),
+                            customPoints: pointsToSend,
+                            drizzle: drizzleFactor,
+                            isSurface: isSurfaceMode,
+                            bayerOverride: getBayerOverrideValue(),
+                            apSize: parseInt(ui.apSize.value) || flow.apSize || 48,
+                            sharpened: document.getElementById("chk-sharpened").checked,
+                            sharpenIntensity: sharpenIntensity,
+                            doublePass: document.getElementById("chk-double-pass").checked,
+                            warpingAnalysis,
+                            anchorOverride: getManualAnchorOverrideValue(),
+                            stackingRoi: getStackingRoiOverrideValue(),
+                            normalizeColors: document.getElementById("chk-normalize-colors")?.checked || false,
+                            isV3: flow.isV3 || (alignModeStr === "liquid_v3") || (alignModeStr === "zenith_v3"),
+                            keepFullFrame: document.getElementById("chk-keep-full-frame") ? document.getElementById("chk-keep-full-frame").checked : false,
+                            targetType: flow.category,
+                            alignRgb: document.getElementById("chk-rgb-align") ? document.getElementById("chk-rgb-align").checked : true,
+                            computePolicy: getComputePolicy(),
+                            decodePolicy: getDecodePolicy(),
+                            qualityPolicy: getQualityPolicy(),
+                            profile: "custom"
+                        }
                     });
+                    b64 = stackResponse.previewSrc;
                 } else {
                     // MODO GLOBAL / STANDARD
                     b64 = await invoke("stack_video", {
@@ -7246,7 +7496,9 @@ if (ui.btnStack) {
                         isV3: flow.isV3 || (alignModeStr === "zenith_v3"), // NEW FLAG
                         keepFullFrame: document.getElementById("chk-keep-full-frame") ? document.getElementById("chk-keep-full-frame").checked : false,
                         targetType: flow.category,
-                        gpuMode: getGpuMode()
+                        gpuMode: getGpuMode(),
+                        computePolicy: getComputePolicy(),
+                        decodePolicy: getDecodePolicy()
                     });
                 }
 
@@ -8443,7 +8695,7 @@ function renderFrameManager() {
 
         // X Icon for excluded
         const icon = document.createElement("span");
-        icon.innerHTML = "✕";
+        icon.innerHTML = '<svg class="zas-icon zas-icon-inline" style="width:1em;height:1em;"><use href="#icon-cross"></use></svg>';
         icon.style.fontSize = "3rem";
         icon.style.color = "#ef4444";
         icon.style.fontWeight = "bold";
@@ -8654,13 +8906,15 @@ updateAlignModeUI();
 // con diagnóstico, e integración σ-clip. El resultado LINEAL entra al
 // mismo pipeline de post-procesado que los apilados planetarios.
 // ============================================================
-const dsFiles = { lights: [], darks: [], flats: [], bias: [] }; // DsProbe[]
+const DEEP_SKY_STACK_REQUEST_SCHEMA_VERSION = 4;
+const dsFiles = { lights: [], darks: [], flats: [], darkFlats: [], bias: [] }; // DsProbe[]
 let dsSelectedGroup = null; // keyword activa o null = todos
 
 const DS_SECTIONS = [
     { kind: "lights", icon: "icon-sequence", labelKey: "deepsky.pick_lights", fallback: "Lights (imágenes del objeto)", iconBg: "rgba(99,102,241,0.18)", iconColor: "#a5b4fc" },
     { kind: "darks", icon: "icon-moon", labelKey: "deepsky.pick_darks", fallback: "Darks (opcional)", iconBg: "rgba(100,116,139,0.18)", iconColor: "#94a3b8" },
     { kind: "flats", icon: "icon-lightbulb", labelKey: "deepsky.pick_flats", fallback: "Flats (opcional)", iconBg: "rgba(245,158,11,0.15)", iconColor: "#fbbf24" },
+    { kind: "darkFlats", icon: "icon-moon", labelKey: "deepsky.pick_dark_flats", fallback: "Dark-flats (opcional)", iconBg: "rgba(168,85,247,0.14)", iconColor: "#c4b5fd" },
     { kind: "bias", icon: "icon-film", labelKey: "deepsky.pick_bias", fallback: "Bias (opcional)", iconBg: "rgba(6,182,212,0.15)", iconColor: "#67e8f9" }
 ];
 
@@ -8679,9 +8933,9 @@ function dsActiveLights() {
     return dsFiles.lights.filter(f => f.ok && f.name.toLowerCase().includes(dsSelectedGroup));
 }
 
-// Calibración emparejada: si hay grupo activo, se prefieren los archivos de
-// calibración que contengan la misma palabra clave; los que no llevan NINGUNA
-// keyword se consideran globales (sirven para todos los grupos).
+// Pool PRELIMINAR por etiqueta de sesión. Una coincidencia de nombre nunca
+// significa compatibilidad científica: el preflight del backend decide por la
+// CalibrationSignature completa y puede bloquear cualquiera de estos raws.
 function dsMatchedCalib(kind) {
     const all = dsFiles[kind].filter(f => f.ok);
     if (!dsSelectedGroup) return all;
@@ -8718,14 +8972,17 @@ function dsRenderFileList(container, kind, files, lightsRef) {
         row.addEventListener("dragend", () => { row.style.opacity = "1"; });
 
         const grip = document.createElement("span");
-        grip.textContent = "⠿";
+        grip.innerHTML = '<svg class="zas-icon zas-icon-inline"><use href="#icon-grip"></use></svg>';
         grip.setAttribute("aria-hidden", "true");
         grip.style.color = "#475569";
         let warn = "";
         if (!f.ok) { warn = f.error || "ilegible"; }
         else if (lightsRef && (f.w !== lightsRef.w || f.h !== lightsRef.h)) { warn = tr("deepsky.warn_dims", "dims ≠"); }
         const status = document.createElement("span");
-        status.textContent = f.ok && !warn ? "✓" : "⚠︎"; // marca de aviso en texto monocromo (VS15), no emoji
+        // Iconos del sprite zas-icon (regla del proyecto: nunca emoji).
+        status.innerHTML = f.ok && !warn
+            ? '<svg class="zas-icon zas-icon-inline"><use href="#icon-check"></use></svg>'
+            : '<svg class="zas-icon zas-icon-inline"><use href="#icon-warning"></use></svg>';
         status.style.color = f.ok && !warn ? "#34d399" : "#f59e0b";
         status.title = warn;
         const name = document.createElement("span");
@@ -8762,7 +9019,7 @@ function dsRenderFileList(container, kind, files, lightsRef) {
         move.addEventListener("change", e => dsMoveFile(kind, f.path, e.target.value));
         const del = document.createElement("button");
         del.type = "button";
-        del.textContent = "✕";
+        del.innerHTML = '<svg class="zas-icon zas-icon-inline"><use href="#icon-cross"></use></svg>';
         del.title = tr("deepsky.remove_file", "Quitar este archivo");
         del.setAttribute("aria-label", `${del.title}: ${f.name}`);
         del.style.cssText = "width:24px; min-width:24px; height:24px; padding:0; border:0; background:transparent; color:#64748b; cursor:pointer; text-align:center;";
@@ -8797,7 +9054,7 @@ function dsRenderSections() {
     host.dataset.built = "1";
 
     // Botón de auto-clasificación de carpeta (una sola carpeta raíz →
-    // lights/darks/flats/bias por palabras clave del nombre, recursivo).
+    // lights/darks/flats/dark-flats/bias por palabras clave, recursivo).
     const auto = document.createElement("button");
     auto.type = "button";
     auto.className = "donation-option";
@@ -8808,7 +9065,7 @@ function dsRenderSections() {
         </span>
         <span class="donation-option-copy" style="min-width:0;">
             <strong data-i18n="deepsky.scan_folder" style="letter-spacing:0.05em;">Escanear carpeta (auto-clasificar)</strong>
-            <small data-i18n="deepsky.scan_folder_hint">Detecta lights/darks/flats/bias en subcarpetas por nombre</small>
+            <small data-i18n="deepsky.scan_folder_hint">Detecta lights/darks/flats/dark-flats/bias en subcarpetas por nombre</small>
         </span>`;
     auto.addEventListener("click", dsScanFolder);
     host.appendChild(auto);
@@ -8903,7 +9160,7 @@ function dsRenderSections() {
         clear.type = "button";
         clear.title = tr("deepsky.clear", "Limpiar");
         clear.setAttribute("aria-label", `${clear.title}: ${s.fallback}`);
-        clear.textContent = "✕";
+        clear.innerHTML = '<svg class="zas-icon zas-icon-inline"><use href="#icon-cross"></use></svg>';
         clear.style.cssText = "flex:0 0 auto; width:auto; background:none; border:1px solid #334155; color:#64748b; border-radius:8px; padding:6px 10px; cursor:pointer; font-size:0.7rem;";
         clear.addEventListener("click", () => { dsFiles[s.kind] = []; dsUpdateUI(); });
 
@@ -8917,12 +9174,17 @@ function dsRenderSections() {
     }
 }
 
-// ---- Emparejamiento estilo WBPP: agrupa lights por exposición y empareja
-// cada grupo con su lote de darks (por exposición), bias (universal) y flats
-// (por filtro). Cada light sabe así con qué calibración se procesa. ----
+// ---- Vista preliminar estilo WBPP. Sólo presenta candidatos por etiqueta,
+// filtro y exposición; la matriz tipada del backend es la autoridad sobre la
+// compatibilidad de sensor/read-mode/gain/offset/binning/ROI/CFA/temperatura. ----
 function dsExpKey(f) {
     if (f.exptime === null || f.exptime === undefined) return "?";
     return f.exptime >= 10 ? String(Math.round(f.exptime)) : String(Math.round(f.exptime * 10) / 10);
+}
+function dsExactExposureMatch(a, b) {
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+    const tolerance = Math.max(0.001, Math.max(Math.abs(a), Math.abs(b)) * 1e-6);
+    return Math.abs(a - b) <= tolerance;
 }
 // Filtro canónico por TOKEN (mismo criterio que el backend). Las variantes
 // dual-band se detectan antes que las líneas individuales.
@@ -9029,10 +9291,11 @@ function dsRenderCalibrationPlan(container, lights) {
     const biasPool = dsMatchedCalib("bias");
     const darksPool = dsMatchedCalib("darks");
     const flatsPool = dsMatchedCalib("flats");
+    const darkFlatsPool = dsMatchedCalib("darkFlats");
 
     const chip = (icon, color, label, count, detail, status) => {
-        const col = status === "ok" ? "#34d399" : status === "warn" ? "#fbbf24" : "#64748b";
-        const mark = status === "ok" ? "✓" : status === "warn" ? "⚠︎" : "—"; // aviso en texto (VS15)
+        const col = status === "ok" ? "#34d399" : status === "candidate" ? "#7dd3fc" : status === "warn" ? "#fbbf24" : "#64748b";
+        const mark = status === "ok" ? "✓" : status === "candidate" ? "?" : status === "warn" ? "⚠︎" : "—"; // aviso en texto (VS15)
         return `<div style="display:flex; align-items:center; gap:9px; padding:7px 13px; background:rgba(15,23,42,0.55); border:1px solid ${status === "warn" ? "rgba(245,158,11,0.35)" : "rgba(255,255,255,0.07)"}; border-radius:11px; flex:1 1 190px; min-width:170px;">
             <svg class="zas-icon" style="width:16px;height:16px;color:${color};"><use href="#${icon}"></use></svg>
             <div style="min-width:0; flex:1;">
@@ -9044,27 +9307,34 @@ function dsRenderCalibrationPlan(container, lights) {
     };
 
     let warned = false;
+    let darkFlatWarned = false;
     const cards = groups.map(({ filter: gFilterKey, expKey, files: gLights }) => {
         const ref = gLights.find(f => f.ok);
         const dimsOk = (arr) => !ref || arr.length === 0 || arr.every(f => f.w === ref.w && f.h === ref.h);
         const nLights = gLights.filter(f => f.ok).length;
         const gFilter = gFilterKey || dsFilterOf(gLights);
 
-        // BIAS: universal.
+        // BIAS: jamás universal. La UI sólo conoce candidatos; Strict exige
+        // identidad exacta de sensor/read-mode/gain/offset/binning/ROI.
         const biasChip = biasPool.length
-            ? chip("icon-film", "#67e8f9", tr("deepsky.step_bias_s", "Bias"), biasPool.length, tr("deepsky.frames_n", "tomas"), dimsOk(biasPool) ? "ok" : "warn")
+            ? chip("icon-film", "#67e8f9", tr("deepsky.step_bias_s", "Bias"), biasPool.length, tr("deepsky.signature_pending", "candidatos · firma pendiente"), dimsOk(biasPool) ? "candidate" : "warn")
             : chip("icon-film", "#475569", tr("deepsky.step_bias_s", "Bias"), 0, tr("deepsky.none_opt", "opcional"), "none");
 
-        // DARKS: por exposición (±15%); si no hay exactos pero sí darks, se escalan (opt.dark).
+        // DARKS: exposición exacta según precisión de cabecera. Una exposición
+        // distinta sólo puede escalarse después de los gates físicos del
+        // backend (bias-subtracted, sin glow, correlación/R²/residuo).
         let darkChip;
-        const expN = expKey === "?" ? null : parseFloat(expKey);
-        const tol = expN ? Math.max(expN * 0.15, 1) : 0;
-        const exactD = expN ? darksPool.filter(d => d.exptime != null && Math.abs(d.exptime - expN) <= tol) : darksPool;
+        // Use the actual light header for compatibility; expKey is rounded
+        // only for grouping/display and must never define an exposure gate.
+        const expN = Number.isFinite(ref?.exptime)
+            ? ref.exptime
+            : (expKey === "?" ? null : parseFloat(expKey));
+        const exactD = expN !== null ? darksPool.filter(d => dsExactExposureMatch(d.exptime, expN)) : darksPool;
         if (exactD.length) {
-            darkChip = chip("icon-moon", "#94a3b8", tr("deepsky.step_dark_s", "Darks"), exactD.length, `@ ${dsFmtExp(expN)}`, dimsOk(exactD) ? "ok" : "warn");
+            darkChip = chip("icon-moon", "#94a3b8", tr("deepsky.step_dark_s", "Darks"), exactD.length, `@ ${dsFmtExp(expN)} · ${tr("deepsky.signature_pending_short", "firma pendiente")}`, dimsOk(exactD) ? "candidate" : "warn");
         } else if (darksPool.length) {
             warned = true;
-            darkChip = chip("icon-moon", "#94a3b8", tr("deepsky.step_dark_s", "Darks"), darksPool.length, tr("deepsky.dark_scaled", "otra exp · se escalan"), "warn");
+            darkChip = chip("icon-moon", "#94a3b8", tr("deepsky.step_dark_s", "Darks"), darksPool.length, tr("deepsky.dark_scaled", "otra exp · requiere validación"), "warn");
         } else {
             darkChip = chip("icon-moon", "#475569", tr("deepsky.step_dark_s", "Darks"), 0, tr("deepsky.cosmetic_fallback", "→ cosmética"), "none");
         }
@@ -9076,8 +9346,27 @@ function dsRenderCalibrationPlan(container, lights) {
             if (byF.length) flatsM = byF;
         }
         const flatChip = flatsM.length
-            ? chip("icon-lightbulb", "#fbbf24", tr("deepsky.step_flat_s", "Flats"), flatsM.length, gFilter ? `(${gFilter})` : tr("deepsky.frames_n", "tomas"), dimsOk(flatsM) ? "ok" : "warn")
+            ? chip("icon-lightbulb", "#fbbf24", tr("deepsky.step_flat_s", "Flats"), flatsM.length, gFilter ? `(${gFilter}) · ${tr("deepsky.signature_pending_short", "firma pendiente")}` : tr("deepsky.signature_pending", "candidatos · firma pendiente"), dimsOk(flatsM) ? "candidate" : "warn")
             : chip("icon-lightbulb", "#475569", tr("deepsky.step_flat_s", "Flats"), 0, tr("deepsky.none_opt", "opcional"), "none");
+
+        // DARK-FLATS: deben coincidir con la exposición de los flats, no con
+        // la de los lights. El backend Strict valida además gain/offset/ROI.
+        const flatExposures = flatsM
+            .map(flat => flat.exptime)
+            .filter(exposure => exposure !== null && exposure !== undefined);
+        const darkFlatsM = flatExposures.length
+            ? darkFlatsPool.filter(darkFlat => darkFlat.exptime != null && flatExposures.some(flatExposure =>
+                dsExactExposureMatch(darkFlat.exptime, flatExposure)))
+            : darkFlatsPool;
+        let darkFlatChip;
+        if (darkFlatsM.length) {
+            darkFlatChip = chip("icon-moon", "#c4b5fd", tr("deepsky.step_dark_flat_s", "Dark-flats"), darkFlatsM.length, flatExposures.length ? `@ ${dsFmtExp(flatExposures[0])} · ${tr("deepsky.signature_pending_short", "firma pendiente")}` : tr("deepsky.signature_pending", "candidatos · firma pendiente"), dimsOk(darkFlatsM) ? "candidate" : "warn");
+        } else if (darkFlatsPool.length && flatsM.length) {
+            darkFlatWarned = true;
+            darkFlatChip = chip("icon-moon", "#c4b5fd", tr("deepsky.step_dark_flat_s", "Dark-flats"), darkFlatsPool.length, tr("deepsky.dark_flat_mismatch", "exposición distinta"), "warn");
+        } else {
+            darkFlatChip = chip("icon-moon", "#475569", tr("deepsky.step_dark_flat_s", "Dark-flats"), 0, tr("deepsky.dark_flat_or_bias", "o bias validado"), "none");
+        }
 
         const meta = dsMetaBits(gLights).join(" · ");
         return `<div style="border:1px solid rgba(124,58,237,0.22); border-radius:14px; padding:13px 15px; margin-bottom:10px; background:rgba(124,58,237,0.05);">
@@ -9089,7 +9378,7 @@ function dsRenderCalibrationPlan(container, lights) {
                 <span style="margin-left:auto; font-size:0.66rem; color:#94a3b8; font-family:'Courier New',monospace;">${meta}</span>
             </div>
             <div style="display:flex; gap:9px; flex-wrap:wrap; align-items:stretch;">
-                ${biasChip}${darkChip}${flatChip}
+                ${biasChip}${darkChip}${flatChip}${darkFlatChip}
                 <div style="display:flex; align-items:center; gap:7px; padding:7px 15px; background:rgba(240,171,252,0.08); border:1px solid rgba(240,171,252,0.22); border-radius:11px;">
                     <svg class="zas-icon" style="width:16px;height:16px;color:#f0abfc;"><use href="#icon-galaxy"></use></svg>
                     <span style="font-size:0.72rem; color:#f5d0fe; font-weight:600;">${tr("deepsky.step_integrate", "Integración κ-σ")}</span>
@@ -9099,7 +9388,10 @@ function dsRenderCalibrationPlan(container, lights) {
     }).join("");
 
     const note = warned
-        ? `<div style="font-size:0.62rem; color:#fbbf24; margin-top:2px;">⚠︎ ${tr("deepsky.plan_scale_note", "Hay darks de otra exposición: se escalarán automáticamente (optimización de dark). Ideal: darks con la misma exposición que los lights.")}</div>`
+        ? `<div style="font-size:0.62rem; color:#fbbf24; margin-top:2px;">⚠︎ ${tr("deepsky.plan_scale_note", "Hay darks de otra exposición. No se aceptarán ni escalarán salvo que el backend valide pedestal, ausencia de amp glow, linealidad, correlación y residuo.")}</div>`
+        : "";
+    const darkFlatNote = darkFlatWarned
+        ? `<div style="font-size:0.62rem; color:#fbbf24; margin-top:2px;">⚠︎ ${tr("deepsky.plan_dark_flat_note", "Los dark-flats no coinciden con la exposición de los flats. La política Strict bloqueará la calibración incompatible.")}</div>`
         : "";
     // Una sesión multibanda coordina varios masters sin mezclar sus muestras.
     const mixNote = distinctFilters.length >= 2
@@ -9111,10 +9403,11 @@ function dsRenderCalibrationPlan(container, lights) {
         : "";
     container.innerHTML = `
         <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px;">
-            <span style="font-size:0.66rem; color:#a5b4fc; font-weight:700; letter-spacing:0.05em;">${tr("deepsky.plan_title", "PLAN DE CALIBRACIÓN")}</span>
+            <span style="font-size:0.66rem; color:#a5b4fc; font-weight:700; letter-spacing:0.05em;">${tr("deepsky.plan_title", "PLAN PRELIMINAR DE CALIBRACIÓN")}</span>
             <span style="font-size:0.62rem; color:#64748b;">${groups.length} ${groups.length === 1 ? tr("deepsky.plan_group", "grupo") : tr("deepsky.plan_groups", "grupos")}${distinctFilters.length ? ` · ${distinctFilters.length} ${distinctFilters.length === 1 ? tr("deepsky.filter_one", "filtro") : tr("deepsky.filter_many", "filtros")}` : ""}</span>
         </div>
-        ${cards}${note}${mixNote}`;
+        <div style="font-size:0.62rem; color:#7dd3fc; margin:-4px 0 9px;">${tr("deepsky.plan_candidate_note", "? = candidato por nombre/filtro/exposición. Sólo la matriz Strict del preflight confirma compatibilidad científica.")}</div>
+        ${cards}${note}${darkFlatNote}${mixNote}`;
 }
 
 function dsUpdateMultibandControls() {
@@ -9143,13 +9436,46 @@ function dsRenderSessionResult(result) {
         const outputs = Object.entries(group.componentPaths || {})
             .map(([name, path]) => `<li><b>${escapeHtml(name)}</b><span title="${escapeHtml(path)}">${escapeHtml(path.split(/[\\/]/).pop())}</span></li>`)
             .join("");
-        const diagnosticCount = Object.keys(group.diagnosticPaths || {}).length;
         const recommendations = (q.recommendations || []).map(item => `<li>${escapeHtml(item)}</li>`).join("");
+        // Manifiesto científico tipado del grupo: productos SCI/VAR/NEFF/DQ y
+        // diagnósticos con geometría y unidades, más fallbacks y avisos. Nunca
+        // un conteo opaco: cada producto publicado queda visible y localizable.
+        const bundle = group.scientificBundle || {};
+        const bundleProducts = (bundle.products || []).map(product => {
+            const fileName = String(product.path || "").split(/[\\/]/).pop();
+            const badge = product.derived
+                ? `<span style="color:#c4b5fd;">${tr("deepsky.product_derived", "derivado")}</span>`
+                : product.linear
+                    ? `<span style="color:#6ee7b7;">${tr("deepsky.product_linear", "lineal")}</span>`
+                    : "";
+            return `<tr style="border-top:1px solid rgba(148,163,184,.1);">
+                <td style="padding:3px 8px;color:#e2e8f0;font-weight:700;">${escapeHtml(product.kind || "")}</td>
+                <td style="padding:3px 8px;color:#94a3b8;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(product.path || "")}">${escapeHtml(fileName)}</td>
+                <td style="padding:3px 8px;text-align:right;color:#94a3b8;">${product.width || 0}×${product.height || 0}×${product.channels || 0}</td>
+                <td style="padding:3px 8px;color:#94a3b8;">${escapeHtml(product.bunit || "")}</td>
+                <td style="padding:3px 8px;">${badge}</td>
+            </tr>`;
+        }).join("");
+        const bundleChips = [
+            ...(bundle.fallbacks || []).map(item => `<span style="display:inline-block;margin:2px 4px 0 0;padding:2px 7px;border:1px solid rgba(251,191,36,.35);border-radius:999px;color:#fcd34d;">${escapeHtml(item)}</span>`),
+            ...(bundle.warnings || []).map(item => `<span style="display:inline-block;margin:2px 4px 0 0;padding:2px 7px;border:1px solid rgba(148,163,184,.3);border-radius:999px;color:#94a3b8;">${escapeHtml(item)}</span>`),
+        ].join("");
+        const bundleBlock = bundleProducts
+            ? `<details style="margin-top:7px;">
+                <summary style="cursor:pointer;color:#7dd3fc;font-size:.62rem;font-weight:700;letter-spacing:.04em;">${tr("deepsky.bundle_title", "PRODUCTOS CIENTÍFICOS")} · ${(bundle.products || []).length}</summary>
+                <div style="overflow:auto;border:1px solid rgba(148,163,184,.12);border-radius:8px;margin-top:4px;">
+                <table style="width:100%;border-collapse:collapse;font-size:.58rem;min-width:520px;">
+                    <thead style="background:#111827;color:#94a3b8;"><tr><th style="padding:3px 8px;text-align:left;">Producto</th><th style="padding:3px 8px;text-align:left;">Archivo</th><th style="padding:3px 8px;text-align:right;">Geometría</th><th style="padding:3px 8px;text-align:left;">Unidad</th><th></th></tr></thead>
+                    <tbody>${bundleProducts}</tbody>
+                </table></div>
+                ${bundleChips ? `<div style="margin-top:4px;font-size:.58rem;">${bundleChips}</div>` : ""}
+            </details>`
+            : "";
         return `<article class="ds-quality-card">
             <div class="ds-quality-head"><div><strong>${escapeHtml(dsFilterLabel(group.filterProfile))}</strong><span>${group.framesUsed} usadas · ${group.framesRejected} rechazadas</span></div><b data-grade="${escapeHtml(q.grade || "Revisar")}">${escapeHtml(q.grade || "Revisar")}</b></div>
             <div class="ds-quality-metrics"><span>Cobertura <b>${Number(q.coveragePercent || 0).toFixed(1)}%</b></span><span>Rechazo <b>${Number(q.rejectionPercent || 0).toFixed(1)}%</b></span><span>Ruido fondo <b>${Number(q.backgroundNoise || 0).toFixed(2)}</b></span></div>
             ${outputs ? `<ul class="ds-output-list">${outputs}</ul>` : ""}
-            ${diagnosticCount ? `<div style="margin-top:7px;color:#7dd3fc;">${diagnosticCount} mapas científicos: cobertura, peso, rechazo y residuales.</div>` : ""}
+            ${bundleBlock}
             <ul class="ds-quality-recommendations">${recommendations}</ul>
         </article>`;
     }).join("");
@@ -9172,21 +9498,30 @@ function dsRenderSessionResult(result) {
 
 // ============ PRESETS + DIAGRAMA DE PROCESO + TIEMPO ESTIMADO ============
 // Presets estilo WBPP: fijan todos los controles del modal con un clic.
-let dsActivePreset = "balanced";
+// AUTO por defecto: abrir el módulo → plan con receta medida y razones, cero
+// decisiones obligatorias. Los cuatro presets clásicos siguen disponibles.
+let dsActivePreset = "auto";
 let dsWizardStep = 0;
 let dsPreparedPlan = null;
 let dsPreflightSerial = 0;
 let dsPreflightTimer = null;
 let dsFrameInspection = [];
+// Diagnósticos globales de la última inspección: predicción de dithering
+// (walking noise) y patrón de detector. Los publica inspect_deepsky_frames.
+let dsInspectionDiagnostics = null;
 // Descartes MANUALES de la inspección PSF: los lights marcados no viajan al
 // plan ni al apilado, pero siguen visibles en la tabla para poder restaurarlos.
 const dsDiscardedPaths = new Set();
 let dsInspectionFingerprint = "";
 let dsInspectionSerial = 0;
 const DS_PRESETS = {
-    fast:     { interp: "bilinear", drizzle: "1", rejection: "sigma", kappaLow: 3.0, kappaHigh: 3.0, clipIters: "1",    norm: "additive", autocrop: true, cosmetic: true, darkopt: true, gradient: false, pedestal: "0" },
-    balanced: { interp: "lanczos3", drizzle: "1", rejection: "sigma", kappaLow: 3.0, kappaHigh: 3.0, clipIters: "auto", norm: "scaling",  autocrop: true, cosmetic: true, darkopt: true, gradient: false, pedestal: "0" },
-    max:      { interp: "lanczos3", drizzle: "1", rejection: "winsorized", kappaLow: 2.5, kappaHigh: 3.0, clipIters: "3", norm: "local", autocrop: true, cosmetic: true, darkopt: true, gradient: false, pedestal: "0" },
+    fast:     { interp: "bilinear", drizzle: "1", rejection: "sigma", kappaLow: 3.0, kappaHigh: 3.0, clipIters: "1",    norm: "additive", autocrop: true, cosmetic: true, darkopt: true, gradient: false, pedestal: "0", localw: false },
+    // El backend resuelve Balanced con Winsorized (pipeline resolved_profile);
+    // el preset refleja EXACTAMENTE lo que se ejecutará.
+    balanced: { interp: "lanczos3", drizzle: "1", rejection: "winsorized", kappaLow: 3.0, kappaHigh: 3.0, clipIters: "auto", norm: "scaling",  autocrop: true, cosmetic: true, darkopt: true, gradient: false, pedestal: "0", localw: false },
+    // localw: rescate de detalle (pesos locales FWHM) — espejo del backend
+    // (PipelineProfile::MaximumQuality lo activa; Fast/Balanced lo apagan).
+    max:      { interp: "lanczos3", drizzle: "1", rejection: "winsorized", kappaLow: 2.5, kappaHigh: 3.0, clipIters: "3", norm: "local", autocrop: true, cosmetic: true, darkopt: true, gradient: false, pedestal: "0", localw: true },
 };
 
 function dsCalibrationForIntegration(kind, filter) {
@@ -9194,6 +9529,21 @@ function dsCalibrationForIntegration(kind, filter) {
     if (kind !== "flats" || !filter || filter === "BROADBAND") return pool;
     const exact = pool.filter(file => dsFilterOfFile(file) === filter);
     return exact.length ? exact : pool;
+}
+
+// `index.html` predates the v4 broadband-mono contract. Keep the extension
+// idempotent so hot reloads and repeated modal openings cannot duplicate it;
+// `data-i18n` also lets the global language manager update it normally.
+function dsEnsureCaptureModeOptions() {
+    const select = document.getElementById("sel-ds-capture-mode");
+    if (!select || select.querySelector('option[value="broadbandMono"]')) return;
+
+    const option = document.createElement("option");
+    option.value = "broadbandMono";
+    option.dataset.i18n = "deepsky.capture_broadband_mono";
+    option.textContent = tr("deepsky.capture_broadband_mono", "Banda ancha mono");
+    const dualBandOsc = select.querySelector('option[value="dualBandOsc"]');
+    select.insertBefore(option, dualBandOsc);
 }
 
 function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
@@ -9209,12 +9559,17 @@ function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
     // backend use el motor clásico exacto; NebulaFusion viaja como objeto camelCase.
     const dsMethod = value("sel-ds-method", "classic");
     const pedestalRaw = value("sel-ds-pedestal", "0");
-    const profile = ({ fast: "fast", balanced: "balanced", max: "maximum_quality" })[dsActivePreset] || "custom";
+    const profile = ({ auto: "auto", fast: "fast", balanced: "balanced", max: "maximum_quality" })[dsActivePreset] || "custom";
     return {
+        schemaVersion: DEEP_SKY_STACK_REQUEST_SCHEMA_VERSION,
+        scientificProducts: true,
         lights: lights.map(f => f.path),
         darks: dsCalibrationForIntegration("darks", filter).map(f => f.path),
         flats: dsCalibrationForIntegration("flats", filter).map(f => f.path),
+        darkFlats: dsCalibrationForIntegration("darkFlats", filter).map(f => f.path),
         bias: dsCalibrationForIntegration("bias", filter).map(f => f.path),
+        captureMode: value("sel-ds-capture-mode", "auto"),
+        calibrationPolicy: value("sel-ds-calibration-policy", "strict"),
         computePolicy: value("sel-ds-compute", "hybrid"),
         profile,
         rejection,
@@ -9273,7 +9628,13 @@ function dsIsMultibandSession() {
 
 function dsBuildSessionRequest() {
     const lights = dsActiveLights();
-    const groups = dsIntegrationGroups(lights).map((group, index) => ({
+    // Los descartes manuales se excluyen ANTES de agrupar; un filtro cuyas
+    // tomas se descartaron por completo se omite (con las demás bandas
+    // intactas) en vez de invalidar la sesión entera (auditoría 2026-07-20).
+    const groups = dsIntegrationGroups(lights)
+        .map(group => ({ ...group, files: group.files.filter(f => !dsDiscardedPaths.has(f.path)) }))
+        .filter(group => group.files.length > 0)
+        .map((group, index) => ({
         id: `${String(index + 1).padStart(2, "0")}_${group.filter.toLowerCase()}`,
         label: `${dsFilterLabel(group.filter)} · ${group.files.length} lights`,
         filterProfile: group.filter,
@@ -9314,6 +9675,7 @@ function dsFormatSessionPreflight(plan) {
             <div class="ds-component-flow"><span>Salidas:</span>${components || `<span class="ds-component-chip">Máster</span>`}</div>
             ${dsFormatSamplingAdvisor(p.samplingAdvisor)}
             ${dsFormatSessionMap(p.sessionMap)}
+            ${dsFormatCalibrationDecisions(p.calibrationDecisions)}
         </article>`;
     }).join("");
     return `<div class="ds-session-overview">
@@ -9333,7 +9695,7 @@ function dsFormatSessionMap(map) {
         <td style="padding:4px 8px;color:#e2e8f0;">${escapeHtml(e.night)}</td>
         <td style="padding:4px 8px;text-align:right;">${e.lights}</td>
         <td style="padding:4px 8px;text-align:right;">${fmtExp(e.exposureSeconds || 0)}</td>
-        <td style="padding:4px 8px;color:${e.flatDistanceDays > 30 ? "#fcd34d" : "#cbd5e1"};">${e.flatNight ? `${escapeHtml(e.flatNight)} · ${e.flatCount} tomas${e.flatDistanceDays ? ` · Δ${e.flatDistanceDays} d` : ""}` : "—"}</td>
+        <td style="padding:4px 8px;color:${e.flatDistanceDays > 30 ? "#fcd34d" : "#cbd5e1"};">${e.flatNight ? `${escapeHtml(e.flatNight)} · ${e.flatCount} tomas${e.flatDistanceDays > 0 && e.flatDistanceDays < 3650 ? ` · Δ${e.flatDistanceDays} d` : ""}` : "—"}</td>
         <td style="padding:4px 8px;color:#94a3b8;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(e.darks || "")}">${escapeHtml((e.darks || "—").replace(/^darks: /, ""))}</td>
     </tr>`).join("");
     return `<div style="margin-top:10px;">
@@ -9344,6 +9706,38 @@ function dsFormatSessionMap(map) {
                 <th style="padding:4px 8px;text-align:left;">Noche (lights)</th><th style="padding:4px 8px;text-align:right;">Lights</th><th style="padding:4px 8px;text-align:right;">Exposición</th><th style="padding:4px 8px;text-align:left;">Flats que aplicará</th><th style="padding:4px 8px;text-align:left;">Darks</th>
             </tr></thead><tbody>${rows}</tbody>
         </table></div></div>`;
+}
+
+// Matriz tipada por light. El backend nunca oculta decisiones dentro de un
+// warning: aquí se ve qué master se eligió, si hubo degradación y por qué.
+function dsFormatCalibrationDecisions(decisions) {
+    if (!decisions?.length) return "";
+    const visible = decisions.slice(0, 50);
+    const masterLabel = (path) => path ? escapeHtml(String(path).replace(/^master:\/\//, "")) : "—";
+    const rows = visible.map(decision => {
+        const ok = decision.compatible && !decision.degraded;
+        const reasons = (decision.reasons || []).join(" · ");
+        const status = ok ? "Exacta" : decision.degraded ? "Degradada" : "Bloqueada";
+        const color = ok ? "#6ee7b7" : decision.degraded ? "#fcd34d" : "#fca5a5";
+        return `<tr style="border-top:1px solid rgba(148,163,184,.1);">
+            <td style="padding:4px 8px;color:#e2e8f0;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(decision.framePath || "")}">${escapeHtml(pathBaseName(decision.framePath || ""))}</td>
+            <td style="padding:4px 8px;color:${color};font-weight:700;">${status}</td>
+            <td style="padding:4px 8px;color:#94a3b8;">${masterLabel(decision.biasMasterPath)}</td>
+            <td style="padding:4px 8px;color:#94a3b8;">${masterLabel(decision.darkMasterPath)}${decision.darkScale != null ? ` · k=${Number(decision.darkScale).toFixed(3)}` : ""}</td>
+            <td style="padding:4px 8px;color:#94a3b8;">${masterLabel(decision.darkFlatMasterPath)}</td>
+            <td style="padding:4px 8px;color:#94a3b8;">${masterLabel(decision.flatMasterPath)}</td>
+            <td style="padding:4px 8px;color:${ok ? "#64748b" : color};max-width:300px;" title="${escapeHtml(reasons)}">${escapeHtml(reasons || decision.fallback || "—")}</td>
+        </tr>`;
+    }).join("");
+    const omitted = decisions.length - visible.length;
+    return `<details style="margin-top:10px;" ${decisions.some(decision => decision.degraded || !decision.compatible) ? "open" : ""}>
+        <summary style="cursor:pointer;color:#a5b4fc;font-size:.62rem;font-weight:700;letter-spacing:.05em;">MATRIZ DE CALIBRACIÓN · ${decisions.length} LIGHTS</summary>
+        <div style="overflow:auto;border:1px solid rgba(148,163,184,.12);border-radius:8px;margin-top:4px;">
+        <table style="width:100%;border-collapse:collapse;font-size:.58rem;min-width:980px;">
+            <thead style="background:#111827;color:#94a3b8;"><tr><th style="padding:4px 8px;text-align:left;">Light</th><th style="padding:4px 8px;text-align:left;">Estado</th><th style="padding:4px 8px;text-align:left;">Bias</th><th style="padding:4px 8px;text-align:left;">Dark</th><th style="padding:4px 8px;text-align:left;">Dark-flat</th><th style="padding:4px 8px;text-align:left;">Flat</th><th style="padding:4px 8px;text-align:left;">Razón / fallback</th></tr></thead>
+            <tbody>${rows}</tbody>
+        </table></div>${omitted > 0 ? `<div style="color:#94a3b8;margin-top:4px;">Se muestran 50 de ${decisions.length}; la receta conserva todas.</div>` : ""}
+    </details>`;
 }
 
 // Tarjeta "Fondo y muestreo" (asesor F2): FWHM mediana medida, clasificación
@@ -9393,12 +9787,17 @@ function dsFormatPreflight(plan) {
         <b style="color:#e2e8f0;">${g.frameCount} lights · ${g.width}×${g.height}×${g.channels}</b>
         <span style="color:#64748b;"> · ${escapeHtml(g.bayerPattern || g.filter || "mono/RGB")} · ${escapeHtml(g.filter || "sin filtro")} · ${g.exposureSeconds ?? "?"} s · gain ${g.gain ?? "?"} · bin ${g.binning ?? "?"} · ${g.temperatureC ?? "?"} °C</span>
     </div>`).join("");
+    const alertIcon = (icon) => `<svg class="zas-icon zas-icon-inline" style="margin-top:2px;"><use href="#icon-${icon}"></use></svg>`;
     const alerts = [
-        ...errors.map(e => `<div style="color:#fca5a5;">✕ ${escapeHtml(e)}</div>`),
-        ...warnings.map(w => `<div style="color:#fcd34d;">⚠ ${escapeHtml(w)}</div>`),
+        ...errors.map(e => `<div style="color:#fca5a5;display:flex;gap:5px;align-items:flex-start;">${alertIcon("cross")}<span>${escapeHtml(e)}</span></div>`),
+        ...warnings.map(w => `<div style="color:#fcd34d;display:flex;gap:5px;align-items:flex-start;">${alertIcon("warning")}<span>${escapeHtml(w)}</span></div>`),
+        ...(plan.scientificEligible === false
+            ? [`<div style="color:#fcd34d;display:flex;gap:5px;align-items:flex-start;">${alertIcon("warning")}<span>${escapeHtml(tr("deepsky.method_blocked_nonlinear", "EIDR y NebulaFusion requieren entradas científicas lineales (FITS/TIFF); revisa los avisos del plan."))}</span></div>`]
+            : []),
     ].join("");
     const recommendedKey = plan.recommendedProfile || "balanced";
     const recommendedLabel = {
+        auto: "Auto (receta medida)",
         fast: "Rápido",
         balanced: "Equilibrado",
         maximum_quality: "Máxima calidad",
@@ -9407,6 +9806,25 @@ function dsFormatPreflight(plan) {
     const recommendation = (plan.recommendationReasons || [])
         .map(reason => `<div>• ${escapeHtml(reason)}</div>`)
         .join("");
+    // Receta AUTO resuelta: el plan que ve el usuario ES la receta que se
+    // ejecutará (paridad plan↔run garantizada por el resolver compartido).
+    const resolved = plan.resolvedRecipe || {};
+    const RESOLVED_PARAM_KEYS = ["rejection", "kappa_low", "kappa_high", "clip_iters", "normalization", "interpolation", "drizzle", "pixfrac", "pedestal"];
+    const resolvedChips = RESOLVED_PARAM_KEYS
+        .filter(key => resolved[key] !== undefined)
+        .map(key => `<span style="display:inline-block;margin:2px 4px 0 0;padding:2px 8px;border:1px solid rgba(52,211,153,.3);border-radius:999px;color:#a7f3d0;">${escapeHtml(key)} <b style="color:#e2e8f0;">${escapeHtml(resolved[key])}</b></span>`)
+        .join("");
+    const resolvedSignals = ["n_lights", "sessions", "narrowband", "dark_nebula", "background_over_noise", "gradient_strength", "stars_per_mpx", "fwhm_px", "dithering_rms_px"]
+        .filter(key => resolved[key] !== undefined)
+        .map(key => `${escapeHtml(key)}=${escapeHtml(resolved[key])}`)
+        .join(" · ");
+    const resolvedBlock = resolvedChips
+        ? `<div style="margin:0 0 8px;padding:7px 9px;border:1px solid rgba(52,211,153,.25);border-radius:8px;background:rgba(16,185,129,.05);">
+            <b style="color:#6ee7b7;">${tr("deepsky.resolved_recipe_title", "Receta resuelta (AUTO)")}</b>
+            <div style="margin-top:4px;">${resolvedChips}</div>
+            ${resolvedSignals ? `<div style="margin-top:4px;color:#64748b;font-size:.58rem;">${tr("deepsky.resolved_signals", "Señales medidas")}: ${resolvedSignals}</div>` : ""}
+        </div>`
+        : "";
     const requestedRejection = plan.requestedRejection || "";
     const effectiveRejection = plan.effectiveRejection || requestedRejection;
     const methodLabel = requestedRejection && requestedRejection !== effectiveRejection
@@ -9423,11 +9841,12 @@ function dsFormatPreflight(plan) {
         <span>VRAM <b style="color:#e2e8f0;">~${plan.estimatedVramMb || 0} MB</b></span>
         <span>Disco <b style="color:#e2e8f0;">~${plan.estimatedDiskMb || 0} MB</b></span>
         <span><b style="color:#e2e8f0;">${groups.length}</b> grupo(s)</span>
+        ${plan.gpuName ? `<span>GPU <b style="color:#e2e8f0;">${escapeHtml(plan.gpuName)}</b></span>` : ""}
     </div>
     <div style="margin:0 0 8px;padding:7px 9px;border:1px solid rgba(34,211,238,.2);border-radius:8px;background:rgba(8,145,178,.06);color:#a5f3fc;">
         <b>Perfil recomendado: ${escapeHtml(recommendedLabel)}</b>
         ${recommendation ? `<div style="margin-top:3px;color:#94a3b8;line-height:1.45;">${recommendation}</div>` : ""}
-    </div>${dsFormatSamplingAdvisor(plan.samplingAdvisor)}${alerts}${groupRows}${dsFormatSessionMap(plan.sessionMap)}<div style="margin-top:8px;">${stages}</div>
+    </div>${resolvedBlock}${dsFormatSamplingAdvisor(plan.samplingAdvisor)}${alerts}${groupRows}${dsFormatSessionMap(plan.sessionMap)}${dsFormatCalibrationDecisions(plan.calibrationDecisions)}<div style="margin-top:8px;">${stages}</div>
     ${normModel ? `<details style="margin-top:7px;"><summary style="cursor:pointer;color:#a5f3fc;">Modelo de normalización a inspeccionar</summary><div style="padding-top:5px;">${normModel}</div></details>` : ""}`;
 }
 
@@ -9442,11 +9861,30 @@ function dsApplyPreparedPlan(plan) {
         if (recommended) button.setAttribute("aria-description", "Recomendado para los datos actuales");
         else button.removeAttribute("aria-description");
     });
+    // Gating de motores experimentales: si los datos no son elegibles
+    // científicamente (p. ej. entradas no lineales), EIDR/NebulaFusion no
+    // pueden ejecutarse — se deshabilitan las opciones SIN revertir la
+    // selección del usuario (el preflight ya publica el error bloqueante).
+    const sessionPlans = (plan?.groups || []).map(group => group.plan).filter(Boolean);
+    const scientificEligible = sessionPlans.length
+        ? sessionPlans.every(p => p?.scientificEligible !== false)
+        : plan?.scientificEligible !== false;
+    const methodSelect = document.getElementById("sel-ds-method");
+    if (methodSelect) {
+        for (const value of ["nebula_fusion", "nebula_fusion_full", "nebula_fusion_struct", "eidr"]) {
+            const option = methodSelect.querySelector(`option[value="${value}"]`);
+            if (option) option.disabled = !scientificEligible;
+        }
+        methodSelect.title = scientificEligible
+            ? ""
+            : tr("deepsky.method_blocked_nonlinear", "EIDR y NebulaFusion requieren entradas científicas lineales (FITS/TIFF); revisa los avisos del plan.");
+    }
     for (const id of ["ds-preflight-inspection", "ds-preflight-review"]) {
         const panel = document.getElementById(id);
         if (!panel) continue;
         panel.dataset.state = plan?.valid ? "ok" : "error";
-        panel.innerHTML = dsFormatPreflight(plan);
+        panel.innerHTML = dsFormatPreflight(plan)
+            + (id === "ds-preflight-review" ? dsFormatInspectionDiagnostics() : "");
     }
     const run = document.getElementById("btn-deepsky-run");
     if (run) {
@@ -9454,6 +9892,48 @@ function dsApplyPreparedPlan(plan) {
         run.style.opacity = plan?.valid ? "1" : ".5";
     }
     dsSyncWizard();
+}
+
+// Tarjetas QC de la inspección: predicción de dithering (walking noise) y
+// patrón de detector (banding), medidas por el backend antes de reservar el
+// stack. La predicción es pre-registro; el diagnóstico definitivo se recalcula
+// durante el apilado con el registro real.
+function dsFormatInspectionDiagnostics() {
+    const diag = dsInspectionDiagnostics;
+    if (!diag) return "";
+    const cards = [];
+    const dither = diag.dither;
+    if (dither) {
+        const risk = !!dither.walkingNoiseRisk;
+        const color = risk ? "#fca5a5" : "#6ee7b7";
+        const border = risk ? "rgba(248,113,113,.35)" : "rgba(52,211,153,.25)";
+        const reasons = (dither.reasons || []).map(reason => `<div>• ${escapeHtml(reason)}</div>`).join("");
+        cards.push(`<div style="flex:1 1 260px;padding:7px 9px;border:1px solid ${border};border-radius:8px;background:rgba(15,23,42,.35);font-size:.6rem;">
+            <b style="color:${color};display:inline-flex;align-items:center;gap:5px;"><svg class="zas-icon zas-icon-inline"><use href="#icon-${risk ? "warning" : "check"}"></use></svg>${risk ? tr("deepsky.dither_risk", "Riesgo de walking noise") : tr("deepsky.dither_ok", "Dithering suficiente (predicción)")}</b>
+            <div style="margin-top:3px;color:#94a3b8;line-height:1.5;">
+                <div>${dither.frames} tomas · ${dither.uniqueQuarterPixelCells} posiciones (0.25 px) · recorrido ${Number(dither.spanXPx || 0).toFixed(1)}×${Number(dither.spanYPx || 0).toFixed(1)} px</div>
+                <div>RMS ${Number(dither.rmsRadiusPx || 0).toFixed(2)} px · isotropía ${Number(dither.isotropy || 0).toFixed(2)} · deriva temporal ${Number(dither.temporalDriftCorrelation || 0).toFixed(2)}</div>
+                ${reasons}
+                <div style="color:#64748b;">${tr("deepsky.dither_prediction_note", "Predicción pre-registro por offsets de estrellas; el apilado la recalcula con el registro real.")}</div>
+            </div>
+        </div>`);
+    }
+    const pattern = diag.detectorPattern;
+    if (pattern) {
+        const detected = !!pattern.bandingDetected;
+        const color = detected ? "#fcd34d" : "#6ee7b7";
+        const border = detected ? "rgba(251,191,36,.35)" : "rgba(52,211,153,.25)";
+        cards.push(`<div style="flex:1 1 260px;padding:7px 9px;border:1px solid ${border};border-radius:8px;background:rgba(15,23,42,.35);font-size:.6rem;">
+            <b style="color:${color};display:inline-flex;align-items:center;gap:5px;"><svg class="zas-icon zas-icon-inline"><use href="#icon-${detected ? "warning" : "check"}"></use></svg>${detected ? tr("deepsky.pattern_detected", "Banding de detector detectado") : tr("deepsky.pattern_ok", "Sin patrón de detector aparente")}</b>
+            <div style="margin-top:3px;color:#94a3b8;line-height:1.5;">
+                <div>${Number(pattern.bandingSigma || 0).toFixed(2)}σ sobre el ruido · filas ${Number(pattern.rowOffsetRmsAdu || 0).toFixed(2)} ADU · columnas ${Number(pattern.columnOffsetRmsAdu || 0).toFixed(2)} ADU</div>
+                <div>correlación lag-1 filas ${Number(pattern.rowLag1Correlation || 0).toFixed(2)} · columnas ${Number(pattern.columnLag1Correlation || 0).toFixed(2)}</div>
+                ${detected ? `<div>${tr("deepsky.pattern_hint", "Dithering + rechazo robusto mitigan el banding; revisa darks/bias de la misma sesión.")}</div>` : ""}
+            </div>
+        </div>`);
+    }
+    if (!cards.length) return "";
+    return `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">${cards.join("")}</div>`;
 }
 
 function dsRenderFrameInspection(rows) {
@@ -9506,7 +9986,8 @@ function dsRenderFrameInspection(rows) {
             </tr></thead><tbody>${tableRows}</tbody>
         </table>
     </div>
-    <div style="margin-top:6px;color:#64748b;font-size:.58rem;">Clic en una fila para ver la toma estirada y su motivo. "Descartar" la excluye del plan y del apilado (reversible); la decisión final sobre las demás se recalcula con los datos calibrados completos.</div>`;
+    <div style="margin-top:6px;color:#64748b;font-size:.58rem;">Clic en una fila para ver la toma estirada y su motivo. "Descartar" la excluye del plan y del apilado (reversible); la decisión final sobre las demás se recalcula con los datos calibrados completos.</div>
+    ${dsFormatInspectionDiagnostics()}`;
 
     // Delegación: el tbody se regenera con cada render, los listeners van con él.
     panel.querySelectorAll("[data-ds-discard]").forEach(btn => {
@@ -9623,6 +10104,7 @@ async function dsInspectFrames(force = false) {
     const fingerprint = lights.map(light => light.path).sort().join("\n");
     if (!lights.length) {
         dsFrameInspection = [];
+        dsInspectionDiagnostics = null;
         dsInspectionFingerprint = "";
         dsRenderFrameInspection([]);
         return [];
@@ -9638,8 +10120,14 @@ async function dsInspectFrames(force = false) {
         panel.textContent = "Midiendo estrellas, PSF/FWHM, ruido y eccentricidad…";
     }
     try {
-        const rows = await invoke("inspect_deepsky_frames", { paths: lights.map(light => light.path) });
+        const report = await invoke("inspect_deepsky_frames", { paths: lights.map(light => light.path) });
         if (serial !== dsInspectionSerial) return dsFrameInspection;
+        // Contrato tipado: { frames, dither, detectorPattern }. Se acepta el
+        // array plano histórico por robustez ante una versión mixta.
+        const rows = Array.isArray(report) ? report : (report?.frames || []);
+        dsInspectionDiagnostics = Array.isArray(report)
+            ? null
+            : { dither: report?.dither || null, detectorPattern: report?.detectorPattern || null };
         dsFrameInspection = rows || [];
         dsInspectionFingerprint = fingerprint;
         // Descarte huérfano (el archivo ya no está en la lista): limpiarlo.
@@ -9668,6 +10156,10 @@ async function dsPreparePlan() {
             const panel = document.getElementById(id);
             if (panel) { panel.dataset.state = "idle"; panel.textContent = "Añade lights para preparar el plan."; }
         }
+        // Sin lights efectivos no hay plan: Ejecutar no puede quedar armado
+        // con el estado del último plan válido (auditoría 2026-07-20).
+        const run = document.getElementById("btn-deepsky-run");
+        if (run) { run.disabled = true; run.style.opacity = ".5"; }
         dsSyncWizard();
         return null;
     }
@@ -9750,7 +10242,13 @@ function dsApplyPreset(name) {
     dsActivePreset = name;
     dsSetPresetButtons(name);
     const p = DS_PRESETS[name];
-    if (!p) { dsRenderProcessPreview(); return; } // "custom": no toca controles
+    if (!p) {
+        // "custom" y "auto" no tocan controles; AUTO además refresca el plan
+        // para que la receta resuelta y sus motivos aparezcan de inmediato.
+        dsRenderProcessPreview();
+        if (name === "auto") dsSchedulePreflight();
+        return;
+    }
     const set = (id, val) => { const el = document.getElementById(id); if (el) el.value = String(val); };
     const chk = (id, val) => { const el = document.getElementById(id); if (el) { el.checked = val; el.dataset.touched = "1"; } };
     set("sel-ds-interp", p.interp);
@@ -9765,6 +10263,7 @@ function dsApplyPreset(name) {
     chk("chk-ds-cosmetic", p.cosmetic);
     chk("chk-ds-darkopt", p.darkopt);
     chk("chk-ds-gradient", p.gradient);
+    if (p.localw !== undefined) chk("chk-ds-localw", p.localw);
     const dz = document.getElementById("sel-ds-drizzle");
     const pixfrac = document.getElementById("lbl-ds-pixfrac");
     if (pixfrac) pixfrac.style.display = (parseFloat(dz?.value) > 1) ? "flex" : "none";
@@ -9813,14 +10312,15 @@ function dsRenderProcessPreview() {
     const norm = val("sel-ds-normalization", "scaling");
     const gradient = on("chk-ds-gradient");
     const autocrop = on("chk-ds-autocrop");
-    const nCalib = dsMatchedCalib("darks").length + dsMatchedCalib("flats").length + dsMatchedCalib("bias").length;
+    const nCalib = dsMatchedCalib("darks").length + dsMatchedCalib("flats").length
+        + dsMatchedCalib("darkFlats").length + dsMatchedCalib("bias").length;
     const clipSel = val("sel-ds-clipiters", "auto");
     const nIters = rejection === "average" ? 0 : (clipSel === "auto" ? (n >= 6 ? 2 : 1) : (parseInt(clipSel) || 1));
 
     const stage = (active, icon, label) =>
         `<span class="ds-stage ${active ? "on" : "off"}"><svg class="zas-icon"><use href="#${icon}"></use></svg>${label}</span>`;
     const arrow = `<span class="ds-arrow">→</span>`;
-    const rejectionLabels = { sigma: "σ-clip", average: tr("deepsky.rej_average_s", "media"), winsorized: "Winsorized", linearfit: tr("deepsky.rej_lf_s", "aj. lineal"), median: tr("deepsky.rej_med_s", "mediana"), percentile: "percentil" };
+    const rejectionLabels = { sigma: "σ-clip", average: tr("deepsky.rej_average_s", "media"), winsorized: "Winsorized", median: tr("deepsky.rej_med_s", "mediana"), percentile: "percentil" };
     const effectiveRejLabel = rejectionLabels[rejection] || rejection;
     const requestedRejLabel = rejectionLabels[requestedRejection] || requestedRejection;
     const rejLabel = requestedRejection !== rejection
@@ -9842,11 +10342,11 @@ function dsRenderProcessPreview() {
     stages.push(stage(true, "icon-chart", tr("deepsky.st_stretch", "Estirado STF")));
 
     // Los métodos por-píxel cargan el stack completo por franjas → más pesados.
-    const perPixel = ["winsorized", "linearfit", "median", "percentile", "minmax"].includes(rejection);
+    const perPixel = ["winsorized", "median", "percentile", "minmax"].includes(rejection);
     const gi = window._gpuInfo;
     const compute = val("sel-ds-compute", "hybrid");
     const gpuTiled = gi?.available && compute !== "cpu_only"
-        && ["winsorized", "linearfit"].includes(rejection) && drz <= 1;
+        && rejection === "winsorized" && drz <= 1;
     const engineMult = perPixel && drz <= 1 ? (gpuTiled ? 1.15 : 1.7) : 1.0;
     const mpIn = (w * h) / 1e6, mpOut = (wOut * hOut) / 1e6;
     const secs = dsEstimateTime(n, mpIn, mpOut, perPixel ? 1 : nIters, drz, engineMult);
@@ -9854,7 +10354,7 @@ function dsRenderProcessPreview() {
     const fmtSize = (mb) => mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${Math.round(mb)} MB`;
     const ramMB = (wOut * hOut * ch * 8 * 3 + w * h * ch * 4) / 1e6; // acumuladores f64 + 1 frame
     const outMB = (wOut * hOut * 3 * 2) / 1e6;                        // TIFF 16-bit RGB
-    // Indicador del motor previsto. Winsorized/linear-fit ejecutan el rechazo
+    // Indicador del motor previsto. Winsorized ejecuta el rechazo
     // tiled en GPU; la CPU conserva warp/modelos y valida paridad.
     const canGpuIntegrate = gi?.available && compute !== "cpu_only"
         && (!perPixel || gpuTiled) && drz <= 1;
@@ -9967,7 +10467,7 @@ async function dsPick(kind) {
         const sel = await openDialog({
             multiple: true,
             title: kind === "lights" ? "Selecciona tus LIGHTS" : `Selecciona ${kind.toUpperCase()} (opcional)`,
-            filters: [{ name: "Astro (FITS/TIF/PNG)", extensions: ["fits", "fit", "tif", "tiff", "png", "jpg", "jpeg"] }]
+            filters: [{ name: tr("deepsky.scientific_files", "Ciencia lineal (FITS/TIFF)"), extensions: ["fits", "fit", "fts", "tif", "tiff"] }]
         });
         if (!sel) return;
         const paths = Array.isArray(sel) ? sel : [sel];
@@ -9988,7 +10488,8 @@ async function dsPickFolder(kind) {
         const dir = await openDialog({ directory: true, multiple: false, title: `Carpeta de ${kind.toUpperCase()}` });
         if (!dir) return;
         const cl = await invoke("deepsky_scan_classify", { root: dir });
-        const all = [...cl.lights, ...cl.darks, ...cl.flats, ...cl.bias];
+        const classifiedDarkFlats = cl.darkFlats || cl.dark_flats || [];
+        const all = [...cl.lights, ...cl.darks, ...cl.flats, ...classifiedDarkFlats, ...cl.bias];
         if (all.length === 0) { log("WARN", "No se encontraron imágenes en la carpeta."); return; }
         dsFiles[kind] = all;
         log("INFO", `${kind}: ${all.length} archivo(s) cargados de la carpeta (recursivo).`);
@@ -10011,7 +10512,7 @@ const DS_PHASES = [
     { id: "integrate", label: "Integración · pasada base", rx: /integrate_pass_1|integrate_fallback|integrate_method_fallback|pasada 1/i },
     { id: "reject", label: "Rechazo de píxeles", rx: /sigma_clip|tiled|reject|rechazo|pasada 2|por-píxel|franja/i },
     { id: "drizzle", label: "Drizzle y cobertura", rx: /drizzle|cobertura/i, when: () => parseFloat(document.getElementById("sel-ds-drizzle")?.value || "1") > 1 },
-    { id: "bg", label: "Acabado opcional ABE + SCNR", rx: /abe|gradiente|scnr|neutraliz/i, when: () => !!document.getElementById("chk-ds-gradient")?.checked },
+    { id: "bg", label: "Derivado opcional ABE + SCNR (SCI intacto)", rx: /abe|gradiente|scnr|neutraliz/i, when: () => !!document.getElementById("chk-ds-gradient")?.checked },
     { id: "publish", label: "Vista previa y publicación del máster", rx: /preview|vista|public|complete|estir|stf/i }
 ];
 let dsPhaseTimes = {};
@@ -10206,7 +10707,13 @@ async function dsExportResult(opts, triggerBtn) {
                 basePath: dsResultBasePath,
                 includeMaps: true,
             });
-            messages.push(`FITS float32: ${scientific.masterFits}\nJSON: ${scientific.recipeJson}\nMapas: ${(scientific.diagnosticFits || []).length}`);
+            // Cada mapa científico exportado queda listado por nombre, no como
+            // un conteo opaco: el usuario ve exactamente qué productos tiene.
+            const maps = scientific.diagnosticFits || [];
+            const mapLines = maps.length
+                ? `\nMapas (${maps.length}):\n${maps.map(p => `  · ${String(p).split(/[\\/]/).pop()}`).join("\n")}`
+                : "";
+            messages.push(`FITS float32: ${scientific.masterFits}\nJSON: ${scientific.recipeJson}${mapLines}`);
         }
         const msg = messages.join("\n");
         log("SUCCESS", normalizeBackendText(msg));
@@ -10351,6 +10858,14 @@ async function dsUpdateHistogram() {
                 html += `<br><span style="color:#7dd3fc;">${tr("deepsky.quality", "Calidad")}:</span> ` +
                     `<b>${s.stars}</b> ${tr("deepsky.q_stars", "estrellas")} · FWHM <b>${s.fwhm}</b>px · SNR <b>~${s.snr}</b> · ` +
                     `${tr("deepsky.q_reject", "rechazo")} <b>${s.rej_pct}%</b> · <b>${s.mean_cov}</b> ${tr("deepsky.q_cov", "tomas/px")}`;
+                const pattern = s.detectorPattern;
+                if (pattern && Number.isFinite(pattern.bandingSigma)) {
+                    const detected = pattern.bandingDetected === true;
+                    html += `<br><span style="color:${detected ? "#fbbf24" : "#34d399"};">` +
+                        `${tr("deepsky.q_detector_pattern", "Patrón detector")}: <b>${pattern.bandingSigma.toFixed(2)}σ</b>` +
+                        `${detected ? ` · ${tr("deepsky.q_banding_detected", "banding detectado")}` : ` · ${tr("deepsky.q_banding_clear", "sin banding significativo")}`}` +
+                        `</span>`;
+                }
             }
             info.innerHTML = html;
         }
@@ -10714,11 +11229,13 @@ async function dsScanFolder() {
         showProcessing(tr("deepsky.scanning", "ESCANEANDO Y CLASIFICANDO..."));
         const cl = await invoke("deepsky_scan_classify", { root: dir });
         hideProcessing();
+        const classifiedDarkFlats = cl.darkFlats || cl.dark_flats || [];
         if (cl.lights.length) dsFiles.lights = cl.lights;
         if (cl.darks.length) dsFiles.darks = cl.darks;
         if (cl.flats.length) dsFiles.flats = cl.flats;
+        if (classifiedDarkFlats.length) dsFiles.darkFlats = classifiedDarkFlats;
         if (cl.bias.length) dsFiles.bias = cl.bias;
-        log("SUCCESS", `Auto-clasificación: ${cl.lights.length} lights · ${cl.darks.length} darks · ${cl.flats.length} flats · ${cl.bias.length} bias.`);
+        log("SUCCESS", `Auto-clasificación: ${cl.lights.length} lights · ${cl.darks.length} darks · ${cl.flats.length} flats · ${classifiedDarkFlats.length} dark-flats · ${cl.bias.length} bias.`);
         dsUpdateUI();
     } catch (e) {
         hideProcessing();
@@ -10744,6 +11261,7 @@ function dsLoadUxFixtureIfRequested(modal) {
         ...Array.from({ length: 180 }, (_, index) => probe(`Flat_SV220_Ha_OIII_${index + 1}`, "SV220 Ha OIII", .5)),
         ...Array.from({ length: 300 }, (_, index) => probe(`Flat_SV220_SII_OIII_${index + 1}`, "SV220 SII OIII", .5)),
     ];
+    dsFiles.darkFlats = Array.from({ length: 30 }, (_, index) => probe(`DarkFlat_0.5s_${index + 1}`, null, .5));
     dsFiles.bias = [];
     dsRenderSections();
     modal.style.display = "flex";
@@ -10778,6 +11296,7 @@ function dsLoadUxFixtureIfRequested(modal) {
     const modal = document.getElementById("deepsky-modal");
     const btnOpen = document.getElementById("btn-deepsky-mode");
     if (!modal || !btnOpen) return;
+    dsEnsureCaptureModeOptions();
 
     btnOpen.addEventListener("click", () => {
         dsRenderSections();
@@ -10810,6 +11329,9 @@ function dsLoadUxFixtureIfRequested(modal) {
     document.getElementById("ds-keywords")?.addEventListener("input", () => { dsSelectedGroup = null; dsUpdateUI(); });
     document.getElementById("chk-ds-multiband-session")?.addEventListener("change", () => { dsUpdateMultibandControls(); dsSchedulePreflight(true); });
     ["sel-ds-oiii-mix", "sel-ds-crosstalk", "sel-ds-session-palette"].forEach(id => {
+        document.getElementById(id)?.addEventListener("change", () => dsSchedulePreflight(true));
+    });
+    ["sel-ds-capture-mode", "sel-ds-calibration-policy"].forEach(id => {
         document.getElementById(id)?.addEventListener("change", () => dsSchedulePreflight(true));
     });
     document.getElementById("chk-ds-cosmetic")?.addEventListener("change", (e) => { e.target.dataset.touched = "1"; });
@@ -10854,11 +11376,12 @@ function dsLoadUxFixtureIfRequested(modal) {
     // Cambiar cualquier control manualmente pasa el preset a "Personalizado" y
     // refresca el diagrama/tiempo estimado.
     // sel-ds-method (NebulaFusion) también refresca el plan: el preflight es quien
-    // avisa de incompatibilidades (drizzle, GPU only, PNG/JPEG). Los presets no lo tocan.
+    // avisa de incompatibilidades (drizzle, GPU only, metadata). Los presets no lo tocan.
     ["sel-ds-interp", "sel-ds-drizzle", "sel-ds-pixfrac", "sel-ds-rejection", "sel-ds-method", "chk-ds-cfadirect",
         "sel-ds-outputbin", "num-ds-kappa-low",
         "num-ds-kappa-high", "sel-ds-clipiters", "sel-ds-normalization", "sel-ds-pedestal",
-        "sel-ds-compute", "chk-ds-autocrop", "chk-ds-cosmetic", "chk-ds-darkopt", "chk-ds-gradient"].forEach(id => {
+        "sel-ds-compute", "chk-ds-autocrop", "chk-ds-cosmetic", "chk-ds-darkopt", "chk-ds-gradient",
+        "sel-ds-eidrscale", "sel-ds-eidrmode", "chk-ds-eidrrefine", "chk-ds-localw"].forEach(id => {
             const el = document.getElementById(id);
             if (el) el.addEventListener("change", dsMarkCustomPreset);
         });
@@ -10869,8 +11392,6 @@ function dsLoadUxFixtureIfRequested(modal) {
             log("WARN", tr("deepsky.need_lights", "Selecciona al menos 1 light."));
             return;
         }
-        const multiband = dsIsMultibandSession();
-        const request = multiband ? dsBuildSessionRequest() : dsBuildStackRequest();
         await dsInspectFrames();
         const plan = await dsPreparePlan();
         if (!plan?.valid) {
@@ -10878,6 +11399,10 @@ function dsLoadUxFixtureIfRequested(modal) {
             showCustomAlert(tr("general.error", "Error"), (plan?.errors || ["El plan contiene incompatibilidades."]).join("\n"));
             return;
         }
+        // El request se construye DESPUÉS de validar: el plan mostrado y lo
+        // ejecutado salen del MISMO estado del formulario (auditoría 2026-07-20).
+        const multiband = dsIsMultibandSession();
+        const request = multiband ? dsBuildSessionRequest() : dsBuildStackRequest();
         modal.style.display = "none";
         dsResultBasePath = localStorage.getItem("zas_ds_workdir") || lights[0]?.path || null; // carpeta destino de exportación
         dsSessionProgressTotal = multiband ? Math.max(1, request.groups.length) : 1;
@@ -10902,7 +11427,7 @@ function dsLoadUxFixtureIfRequested(modal) {
                 log("SUCCESS", `Sesión multibanda terminada: ${result.groups.length} masters · ${result.framesUsed} lights usadas · ${result.elapsedSeconds.toFixed(1)} s\nResultados: ${result.outputDir}`);
             } else {
                 log("SUCCESS", `${tr("deepsky.done", "Cielo Profundo apilado. Usa la barra inferior para ajustar el estirado (los datos quedan lineales).")}
-Motor: ${result.engine} · ${result.framesUsed} usadas · ${result.framesRejected} rechazadas · ${result.elapsedSeconds.toFixed(1)} s`);
+Motor: ${result.engine} · ${result.framesUsed} usadas · ${result.framesRejected} rechazadas · ${result.elapsedSeconds.toFixed(1)} s${result.recipePath ? `\nReceta: ${result.recipePath}` : ""}`);
             }
         } catch (e) {
             dsProgressStop();

@@ -14,6 +14,13 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "tauri:build:debug": "tauri build --debug",
+    "test:batch-output": "node --test scripts/batch-output.test.mjs",
+    "test:benchmark-report": "node --test scripts/benchmark/planetary-e2e-report.test.mjs",
+    "benchmark:deepsky-ab": "node scripts/benchmark/deepsky-ab-report.mjs",
+    "test:deepsky-ab": "node --test scripts/benchmark/deepsky-ab-report.test.mjs",
+    "test:settings-layout": "node --test scripts/settings-layout.test.mjs",
+    "test:planetary-contracts": "npm run test:batch-output && npm run test:benchmark-report && npm run test:settings-layout",
+    "test:deepsky-contracts": "node --test scripts/deepsky-contracts.test.mjs && npm run test:deepsky-ab",
     "rust:check": "cargo check --manifest-path src-tauri/Cargo.toml",
     "check": "npm run build && npm run rust:check"
   },

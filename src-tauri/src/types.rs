@@ -19,8 +19,21 @@ pub struct FfmpegReader {
     pub is_color: bool,
     pub rotation: i32,
     pub codec_name: String,
+    pub pixel_format: Option<String>,
+    pub color_range: Option<String>,
+    pub color_matrix: Option<String>,
     // THE NEW PERSISTENT STREAM CACHE
     pub stream_cache: Arc<Mutex<Option<(usize, FfmpegStreamIterator)>>>,
+}
+
+static PLANETARY_FFMPEG_THREAD_BUDGET: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_planetary_ffmpeg_thread_budget(threads: usize) {
+    PLANETARY_FFMPEG_THREAD_BUDGET.store(
+        threads.max(1),
+        std::sync::atomic::Ordering::Release,
+    );
 }
 
 #[tauri::command]
@@ -132,7 +145,7 @@ fn planetary_source_fingerprint(path: &str) -> Result<u64, String> {
     use std::hash::{Hash, Hasher};
     use std::io::{Read, Seek, SeekFrom};
 
-    const ALGORITHM_VERSION: &str = "planetary-analysis-hybrid-v2-a10";
+    const ALGORITHM_VERSION: &str = "planetary-analysis-hybrid-v2-a11";
     const SAMPLE_BYTES: usize = 64 * 1024;
     let source = Path::new(path);
     let metadata = std::fs::metadata(source)
@@ -1027,6 +1040,17 @@ impl FfmpegReader {
             .as_str()
             .unwrap_or("unknown")
             .to_lowercase();
+        let metadata_value = |key: &str| {
+            stream[key]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("unknown"))
+                .map(str::to_string)
+        };
+        let pixel_format = metadata_value("pix_fmt");
+        let color_range = metadata_value("color_range");
+        // FFprobe denomina `color_space` a la matriz (bt709, bt2020nc...).
+        let color_matrix = metadata_value("color_space");
 
         // DetecciÃ³n de rotaciÃ³n ULTRA-ROBUSTA (v4)
         let mut rotation = 0;
@@ -1401,6 +1425,9 @@ impl FfmpegReader {
             is_color,
             rotation,
             codec_name,
+            pixel_format,
+            color_range,
+            color_matrix,
             stream_cache: Arc::new(Mutex::new(None)),
         })
     }
@@ -2057,13 +2084,17 @@ impl FfmpegStreamIterator {
         //   núcleos solo: cuando el cómputo manda, FFmpeg se bloquea al
         //   escribir y sus hilos duermen.
         let num_cpus = num_cpus::get(); // Use the standard `num_cpus` crate already in use for rayon
-        let cpu_route_threads = if num_cpus <= 4 {
-            (num_cpus - 1).max(1) // Keep at least 1 core free for OS on weak PCs
+        let configured_budget = PLANETARY_FFMPEG_THREAD_BUDGET
+            .load(std::sync::atomic::Ordering::Acquire);
+        let cpu_route_threads = if configured_budget > 0 {
+            configured_budget.min(num_cpus).max(1)
+        } else if num_cpus <= 4 {
+            num_cpus.saturating_sub(1).max(1) // Keep at least 1 core free for OS on weak PCs
         } else {
             (num_cpus - 2).max(4) // Keep 2 cores free for OS on powerful PCs
         };
         let ffmpeg_threads = if expected_hardware_backend.is_some() {
-            2
+            2.min(cpu_route_threads).max(1)
         } else {
             cpu_route_threads
         };
@@ -3000,7 +3031,7 @@ struct StackResult {
     is_surface: bool, // Support for V2 surface handling
 }
 
-const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 10;
+const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct AnalysisCacheContract {
@@ -3098,6 +3129,14 @@ struct AnalysisResult {
     recommended_pct: f32,
     ap_points: Vec<(f32, f32, f32)>,
     best_frame_idx: usize,
+    #[serde(rename = "executionPlan", skip_serializing_if = "Option::is_none")]
+    execution_plan: Option<crate::pipeline::PlanetaryExecutionPlan>,
+    #[serde(
+        rename = "stageTelemetry",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    stage_telemetry: Vec<crate::pipeline::StageTelemetry>,
 }
 #[derive(Clone, serde::Serialize)]
 struct LogMessage {
@@ -3155,6 +3194,7 @@ struct PreviewResult {
 #[derive(serde::Serialize)]
 struct BatchEntryResult {
     path: String,
+    master_path: String,
     preview_base64: String,
 }
 

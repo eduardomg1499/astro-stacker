@@ -26,6 +26,21 @@
       "maximumObjectiveLossesPerDataset": 0,
       "requireIndependentReference": true
     },
+    "deepSkyScientific": {
+      "maxFlatResidualPercent": 0.5,
+      "maxDarkPatternResidualPercent": 1.0,
+      "maxSyntheticPhotometryBiasPercent": 0.5,
+      "maxRealPhotometryBiasPercent": 1.0,
+      "maxRegistrationP95Px": 0.2,
+      "maxEidrGeometryP95Px": 0.02,
+      "maxVarianceCoverageErrorPoints": 5.0,
+      "maxTileSeamSigma": 0.2,
+      "maxReadAmplification": 1.5,
+      "maxReadAmplificationHard": 2.0,
+      "maxRamFraction": 0.7,
+      "minGpuSpeedup": 1.2,
+      "maxGpuReadbackFraction": 0.1
+    },
     "evidence": {
       "sha256Required": true,
       "acceptanceEvidenceRequired": true,
@@ -130,6 +145,12 @@
       "acceptance": ["grouping", "normalization", "weights", "recipe"]
     },
     {
+      "id": "deep-sky-broadband-mono",
+      "domain": "deep_sky",
+      "requiredTags": ["mono", "broadband", "luminance", "calibration"],
+      "acceptance": ["dark-flat", "per-channel-products", "photometry", "variance", "cold-cache", "warm-cache"]
+    },
+    {
       "id": "deep-sky-variable-gradients",
       "domain": "deep_sky",
       "requiredTags": ["gradients", "local-normalization"],
@@ -145,7 +166,7 @@
       "id": "deep-sky-satellite-trails",
       "domain": "deep_sky",
       "requiredTags": ["satellite", "rejection"],
-      "acceptance": ["low-map", "high-map", "winsorized", "linear-fit", "sigma", "artifact-mask-residual"],
+      "acceptance": ["low-map", "high-map", "winsorized", "linear-fit-disabled-until-robust-regression", "sigma", "artifact-mask-residual"],
       "requiredEvidence": ["artifactFreeReference", "artifactMask"]
     },
     {
@@ -153,6 +174,54 @@
       "domain": "deep_sky",
       "requiredTags": ["high-resolution", "tiled", "mmap"],
       "acceptance": ["ram", "vram", "disk", "cancellation", "cache-corruption"]
+    },
+    {
+      "id": "deep-sky-darkflat-ampglow",
+      "domain": "deep_sky",
+      "requiredTags": ["calibration", "dark-flat", "amp-glow", "cmos"],
+      "acceptance": ["exact-exposure", "pedestal-state", "flat-calibrate-before-normalize", "dark-residual", "strict-mismatch-block"]
+    },
+    {
+      "id": "deep-sky-dualband-osc",
+      "domain": "deep_sky",
+      "requiredTags": ["osc", "dual-band", "ha", "oiii", "cfa"],
+      "acceptance": ["linear-science", "per-channel-variance", "spectral-proxy-label", "photometry", "cold-cache", "warm-cache"]
+    },
+    {
+      "id": "deep-sky-mono-sho",
+      "domain": "deep_sky",
+      "requiredTags": ["mono", "narrowband", "ha", "oiii", "sii", "multisession"],
+      "acceptance": ["per-filter-products", "dark-flat", "star-poor-registration", "normalization", "variance", "recipe"]
+    },
+    {
+      "id": "deep-sky-cfa-cache-layout",
+      "domain": "deep_sky",
+      "requiredTags": ["cfa-direct", "rggb", "grbg", "gbrg", "bggr", "cache"],
+      "acceptance": ["native-cfa-layout", "bayer-phase", "cold-cache", "warm-cache", "method-isolation", "deterministic-recipe"]
+    },
+    {
+      "id": "deep-sky-invalid-pixels-flat",
+      "domain": "deep_sky",
+      "requiredTags": ["blank", "nan", "inf", "dead-pixel", "saturation", "weak-flat"],
+      "acceptance": ["dq-propagation", "no-silent-zero", "flat-invalid", "bounded-amplification", "variance-coverage"]
+    },
+    {
+      "id": "deep-sky-walking-noise",
+      "domain": "deep_sky",
+      "requiredTags": ["walking-noise", "banding", "dither", "autocorrelation", "one-x"],
+      "acceptance": ["detector-coordinate-drift", "anisotropic-psd", "row-column-power", "visible-warning", "no-fabricated-correction"]
+    },
+    {
+      "id": "deep-sky-nebulafusion-scientific",
+      "domain": "deep_sky",
+      "requiredTags": ["nebula-fusion", "full", "psf", "warp", "missing-data"],
+      "acceptance": ["per-frame-operator", "masked-observations", "per-channel-psd", "variance-coverage", "seam", "struct-separated"]
+    },
+    {
+      "id": "deep-sky-eidr-recoverability",
+      "domain": "deep_sky",
+      "requiredTags": ["eidr", "recoverability", "holdout", "geometry", "psf"],
+      "acceptance": ["all-channel-convergence", "holdout-pass", "full-field-geometry", "measured-psf", "tile-fallback", "no-unrecoverable-frequency"]
     }
   ]
 }

@@ -249,6 +249,9 @@ const TILED_REJECT_WGSL: &str = r#"
 struct RejectParams {
     pixels: u32, channels: u32, frames: u32, method: u32,
     k_low: f32, k_high: f32, sigma_floor: f32, _p1: f32,
+    // Rescate de detalle: rejilla de calidad por frame en espacio de SALIDA.
+    // wq_g == 0 desactiva el muestreo (camino idéntico al previo).
+    out_w: u32, full_h: u32, oy0: u32, wq_g: u32,
 }
 @group(0) @binding(0) var<uniform> P: RejectParams;
 @group(0) @binding(1) var<storage, read_write> values: array<f32>;
@@ -259,6 +262,28 @@ struct RejectParams {
 @group(0) @binding(6) var<storage, read_write> present: array<f32>;
 @group(0) @binding(7) var<storage, read_write> rejected_low: array<f32>;
 @group(0) @binding(8) var<storage, read_write> rejected_high: array<f32>;
+@group(0) @binding(9) var<storage, read> quality_grids: array<f32>;
+
+// Bilineal idéntica a ds_sample_grid (nodos j/(G-1), clamp de bordes).
+fn quality_at(k: u32, pixel: u32) -> f32 {
+    if (P.wq_g == 0u) { return 1.0; }
+    let x = pixel % P.out_w;
+    let y = P.oy0 + pixel / P.out_w;
+    let u = clamp(f32(x) / f32(P.out_w), 0.0, 1.0) * f32(P.wq_g - 1u);
+    let v = clamp(f32(y) / f32(P.full_h), 0.0, 1.0) * f32(P.wq_g - 1u);
+    let x0 = min(u32(floor(u)), P.wq_g - 1u);
+    let y0 = min(u32(floor(v)), P.wq_g - 1u);
+    let x1 = min(x0 + 1u, P.wq_g - 1u);
+    let y1 = min(y0 + 1u, P.wq_g - 1u);
+    let fx = u - f32(x0);
+    let fy = v - f32(y0);
+    let base = k * P.wq_g * P.wq_g;
+    let a = quality_grids[base + y0 * P.wq_g + x0];
+    let b = quality_grids[base + y0 * P.wq_g + x1];
+    let c = quality_grids[base + y1 * P.wq_g + x0];
+    let d = quality_grids[base + y1 * P.wq_g + x1];
+    return mix(mix(a, b, fx), mix(c, d, fx), fy);
+}
 
 fn median_at(base: u32, n: u32) -> f32 {
     let m = n / 2u;
@@ -282,7 +307,8 @@ fn reject_tiled(@builtin(global_invocation_id) gid: vec3<u32>) {
         // evita que un backend con fast-math optimice `v == v` como verdadero.
         let finite = (bitcast<u32>(v) & 0x7f800000u) != 0x7f800000u;
         if (finite) {
-            let w = frame_weights[k];
+            var w = frame_weights[k];
+            if (P.wq_g != 0u) { w = w * quality_at(k, pixel); }
             values[base + n] = v;
             work_weights[base + n] = w;
             original_weight = original_weight + w;
@@ -443,6 +469,10 @@ struct RejectParams {
     k_high: f32,
     p0: f32,
     p1: f32,
+    out_w: u32,
+    full_h: u32,
+    oy0: u32,
+    wq_g: u32,
 }
 
 struct RejectPipeline {
@@ -483,7 +513,7 @@ fn reject_pipeline(rt: &'static crate::gpu_stack::GpuRuntime) -> &'static Reject
                 },
                 storage(1, false), storage(2, true), storage(3, false),
                 storage(4, false), storage(5, false), storage(6, false),
-                storage(7, false), storage(8, false),
+                storage(7, false), storage(8, false), storage(9, true),
             ],
         });
         let pl = rt.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -512,6 +542,9 @@ pub struct TiledRejectOutput {
     pub vram_bytes: u64,
 }
 
+/// `quality`: grids de calidad concatenados (frames × G²) del Rescate de
+/// detalle, en espacio de salida; `strip` = (out_w, full_h, oy0) para mapear
+/// el índice plano de píxel a coordenadas normalizadas. None = camino previo.
 pub fn reject_tiled_pass(
     stack: &[f32],
     frame_weights: &[f32],
@@ -521,6 +554,8 @@ pub fn reject_tiled_pass(
     k_low: f32,
     k_high: f32,
     sigma_floor: f32,
+    quality: Option<(&[f32], usize)>,
+    strip: (usize, usize, usize),
 ) -> Result<TiledRejectOutput, String> {
     let method_id = match method {
         "winsorized" => 1,
@@ -532,12 +567,18 @@ pub fn reject_tiled_pass(
     if frames < 3 || stack.len() != expected {
         return Err("Stack GPU tiled con geometría inválida".into());
     }
+    if let Some((grids, wq_g)) = quality {
+        if wq_g < 2 || grids.len() != frames * wq_g * wq_g {
+            return Err("Grids de calidad GPU tiled con geometría inválida".into());
+        }
+    }
     let rt = crate::gpu_stack::gpu_runtime().ok_or("No hay runtime wgpu")?;
     let stack_bytes = (stack.len() * 4) as u64;
     let px_bytes = (pixels * 4) as u64;
     let out_bytes = (pixels * channels * 4) as u64;
     let frame_bytes = (frames * 4) as u64;
-    let needed = stack_bytes * 2 + px_bytes * 4 + out_bytes + frame_bytes + 4096;
+    let quality_bytes = quality.map(|(g, _)| (g.len() * 4) as u64).unwrap_or(4);
+    let needed = stack_bytes * 2 + px_bytes * 4 + out_bytes + frame_bytes + quality_bytes + 4096;
     if stack_bytes > rt.max_binding
         || px_bytes > rt.max_binding
         || out_bytes > rt.max_binding
@@ -571,8 +612,13 @@ pub fn reject_tiled_pass(
     let present = mk("zas-deepsky-tiled-present", px_bytes, true);
     let low = mk("zas-deepsky-tiled-reject-low", px_bytes, true);
     let high = mk("zas-deepsky-tiled-reject-high", px_bytes, true);
+    let quality_buf = mk("zas-deepsky-tiled-quality", quality_bytes, false);
     rt.queue.write_buffer(&values, 0, bytemuck::cast_slice(stack));
     rt.queue.write_buffer(&frame_w, 0, bytemuck::cast_slice(frame_weights));
+    if let Some((grids, _)) = quality {
+        rt.queue.write_buffer(&quality_buf, 0, bytemuck::cast_slice(grids));
+    }
+    let (out_w, full_h, oy0) = strip;
     rt.queue.write_buffer(&params, 0, bytemuck::bytes_of(&RejectParams {
         pixels: pixels as u32,
         channels: channels as u32,
@@ -582,6 +628,10 @@ pub fn reject_tiled_pass(
         k_high,
         p0: sigma_floor,
         p1: 0.0,
+        out_w: out_w.max(1) as u32,
+        full_h: full_h.max(1) as u32,
+        oy0: oy0 as u32,
+        wq_g: quality.map(|(_, g)| g as u32).unwrap_or(0),
     }));
     let pp = reject_pipeline(rt);
     let bind = rt.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -597,6 +647,7 @@ pub fn reject_tiled_pass(
             wgpu::BindGroupEntry { binding: 6, resource: present.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: low.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 8, resource: high.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: quality_buf.as_entire_binding() },
         ],
     });
     let mut enc = rt.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -635,7 +686,7 @@ struct Params {
     src_w: u32, src_h: u32, out_w: u32, tile_rows: u32,
     tile_y0: u32, channels: u32, flags: u32, ln_g: u32,
     full_w: u32, full_h: u32, src_x0: u32, src_y0: u32,
-    out_h: u32, band_y0: u32, band_y1: u32, _p2: u32,
+    out_h: u32, band_y0: u32, band_y1: u32, wq_g: u32,
     m0: f32, m1: f32, m2: f32, m3: f32,
     m4: f32, m5: f32, m6: f32, m7: f32,
     m8: f32, inv_scale: f32, norm_mul: f32, norm_add: f32,
@@ -659,7 +710,8 @@ fn norm_add_c(c: u32) -> f32 {
     return P.norm_add;
 }
 // flags: 1=Lanczos3, 2=bounds, 4=local normalization, 8=track M2,
-//        16=transformación cuadrática de distorsión local
+//        16=transformación cuadrática de distorsión local,
+//        32=rescate de detalle (rejilla de calidad wq_g×wq_g)
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read> frame: array<f32>;
 @group(0) @binding(2) var<storage, read> local_grid: array<f32>;
@@ -671,12 +723,13 @@ fn norm_add_c(c: u32) -> f32 {
 @group(0) @binding(8) var<storage, read> l3: array<f32>;
 @group(0) @binding(9) var<storage, read_write> rejected_low: array<f32>;
 @group(0) @binding(10) var<storage, read_write> rejected_high: array<f32>;
+@group(0) @binding(11) var<storage, read> quality_grid: array<f32>;
 
 fn px(x: u32, y: u32, c: u32) -> f32 {
     return frame[(y * P.src_w + x) * P.channels + c];
 }
 
-fn grid_value(u0: f32, v0: f32) -> f32 {
+fn grid_value(u0: f32, v0: f32, channel: u32) -> f32 {
     if ((P.flags & 4u) == 0u || P.ln_g == 0u) { return 0.0; }
     let u = clamp(u0, 0.0, 1.0) * f32(P.ln_g - 1u);
     let v = clamp(v0, 0.0, 1.0) * f32(P.ln_g - 1u);
@@ -686,10 +739,30 @@ fn grid_value(u0: f32, v0: f32) -> f32 {
     let y1 = min(y0 + 1u, P.ln_g - 1u);
     let fx = u - f32(x0);
     let fy = v - f32(y0);
-    let a = local_grid[y0 * P.ln_g + x0];
-    let b = local_grid[y0 * P.ln_g + x1];
-    let c = local_grid[y1 * P.ln_g + x0];
-    let d = local_grid[y1 * P.ln_g + x1];
+    let base = channel * P.ln_g * P.ln_g;
+    let a = local_grid[base + y0 * P.ln_g + x0];
+    let b = local_grid[base + y0 * P.ln_g + x1];
+    let c = local_grid[base + y1 * P.ln_g + x0];
+    let d = local_grid[base + y1 * P.ln_g + x1];
+    return mix(mix(a, b, fx), mix(c, d, fx), fy);
+}
+
+// Rescate de detalle: bilineal idéntica a ds_sample_grid sobre la rejilla de
+// calidad (un solo canal). 1.0 exacto cuando el flag 32 está apagado.
+fn quality_value(u0: f32, v0: f32) -> f32 {
+    if ((P.flags & 32u) == 0u || P.wq_g == 0u) { return 1.0; }
+    let u = clamp(u0, 0.0, 1.0) * f32(P.wq_g - 1u);
+    let v = clamp(v0, 0.0, 1.0) * f32(P.wq_g - 1u);
+    let x0 = min(u32(floor(u)), P.wq_g - 1u);
+    let y0 = min(u32(floor(v)), P.wq_g - 1u);
+    let x1 = min(x0 + 1u, P.wq_g - 1u);
+    let y1 = min(y0 + 1u, P.wq_g - 1u);
+    let fx = u - f32(x0);
+    let fy = v - f32(y0);
+    let a = quality_grid[y0 * P.wq_g + x0];
+    let b = quality_grid[y0 * P.wq_g + x1];
+    let c = quality_grid[y1 * P.wq_g + x0];
+    let d = quality_grid[y1 * P.wq_g + x1];
     return mix(mix(a, b, fx), mix(c, d, fx), fy);
 }
 
@@ -716,7 +789,9 @@ fn bilinear(sx: f32, sy: f32, c: u32) -> f32 {
          + v11 * fx * fy;
 }
 
-// Misma LUT, orden de sumas y clamp simétrico que ds_sample_lanczos3.
+// Misma LUT y orden de sumas que el Lanczos-3 científico de CPU. La salida no
+// se limita al vecindario bilineal: hacerlo volvería el operador dependiente de
+// la señal y truncaría los overshoots/valores negativos físicamente válidos.
 fn lanczos3(sx: f32, sy: f32, c: u32) -> f32 {
     let gx0 = u32(floor(sx));
     let gy0 = u32(floor(sy));
@@ -743,15 +818,7 @@ fn lanczos3(sx: f32, sy: f32, c: u32) -> f32 {
         }
         acc = acc + wy[j] * ax;
     }
-    let bx = gx0 - P.src_x0;
-    let by = gy0 - P.src_y0;
-    let p00 = px(bx, by, c);
-    let p10 = px(bx + 1u, by, c);
-    let p01 = px(bx, by + 1u, c);
-    let p11 = px(bx + 1u, by + 1u, c);
-    let lo4 = min(min(p00, p10), min(p01, p11));
-    let hi4 = max(max(p00, p10), max(p01, p11));
-    return clamp(acc / max(swx * swy, 0.000001), lo4, hi4);
+    return acc / max(swx * swy, 0.000001);
 }
 
 @compute @workgroup_size(8, 8)
@@ -807,14 +874,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         && sx < f32(P.full_w - 4u) && sy < f32(P.full_h - 4u)
         && lsx >= 3.0 && lsy >= 3.0
         && lsx < f32(P.src_w - 4u) && lsy < f32(P.src_h - 4u);
-    let loc = grid_value(f32(gid.x) / f32(P.out_w), f32(gy) / f32(P.out_h));
     let pix = ly * P.out_w + gid.x;
     var vals: array<f32, 3>;
     for (var c = 0u; c < P.channels; c = c + 1u) {
         let raw = select(bilinear(sx, sy, c), lanczos3(sx, sy, c), lanczos_ok);
+        let loc = grid_value(f32(gid.x) / f32(P.out_w), f32(gy) / f32(P.out_h), c);
         vals[c] = raw * norm_mul_c(c) + norm_add_c(c) + loc;
     }
-    if (P.frame_weight <= 0.0) { return; }
+    var fw = P.frame_weight;
+    if ((P.flags & 32u) != 0u) {
+        fw = fw * quality_value(f32(gid.x) / f32(P.out_w), f32(gy) / f32(P.out_h));
+    }
+    if (fw <= 0.0) { return; }
     // PER-CHANNEL rejection + weighted Welford. A channel outside its κσ window is
     // rejected on its own, so one hot channel no longer discards the good data in
     // the others (no colour fringes on clipped cosmic rays/satellite trails). The
@@ -831,25 +902,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         if (accept_c) {
             let old_w = weight[oi];
-            let new_w = old_w + P.frame_weight;
+            let new_w = old_w + fw;
             let old_mean = mean[oi];
             let delta = vals[c] - old_mean;
-            let new_mean = old_mean + delta * (P.frame_weight / new_w);
+            let new_mean = old_mean + delta * (fw / new_w);
             mean[oi] = new_mean;
             if ((P.flags & 8u) != 0u) {
-                moment2[oi] = moment2[oi] + P.frame_weight * delta * (vals[c] - new_mean);
+                moment2[oi] = moment2[oi] + fw * delta * (vals[c] - new_mean);
             }
             weight[oi] = new_w;
         }
     }
     // Per-pixel rejection maps (QA): tag the pixel if ANY channel was clipped.
     if (any_low && any_high) {
-        rejected_low[pix] = rejected_low[pix] + 0.5 * P.frame_weight;
-        rejected_high[pix] = rejected_high[pix] + 0.5 * P.frame_weight;
+        rejected_low[pix] = rejected_low[pix] + 0.5 * fw;
+        rejected_high[pix] = rejected_high[pix] + 0.5 * fw;
     } else if (any_low) {
-        rejected_low[pix] = rejected_low[pix] + P.frame_weight;
+        rejected_low[pix] = rejected_low[pix] + fw;
     } else if (any_high) {
-        rejected_high[pix] = rejected_high[pix] + P.frame_weight;
+        rejected_high[pix] = rejected_high[pix] + fw;
     }
 }
 "#;
@@ -930,7 +1001,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var v = light[i];
     if ((P.flags & 1u) != 0u) { v = v - bias[i]; }
     if ((P.flags & 2u) != 0u) { v = v - P.dark_scale * dark[i]; }
-    if ((P.flags & 4u) != 0u) { v = v / max(flat[i], 0.05); }
+    if ((P.flags & 4u) != 0u) {
+        let response = flat[i];
+        // Never turn a weak/invalid flat into a finite 20x amplification.
+        // This legacy GPU helper has no DQ output, so NaN is the only honest
+        // representation; the scientific caller must mask it as FLAT_INVALID
+        // or reject the route instead of publishing the sample.
+        if (response > 0.05) {
+            v = v / response;
+        } else {
+            v = bitcast<f32>(0x7fc00000u);
+        }
+    }
     light[i] = v;
 }
 "#;
@@ -1035,7 +1117,7 @@ fn pipelines(rt: &'static crate::gpu_stack::GpuRuntime) -> &'static Pipelines {
                 },
                 storage(1, true), storage(2, true), storage(3, true), storage(4, true),
                 storage(5, false), storage(6, false), storage(7, false), storage(8, true),
-                storage(9, false), storage(10, false),
+                storage(9, false), storage(10, false), storage(11, true),
             ],
         });
         let pipe_layout = rt.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1163,6 +1245,19 @@ pub struct GpuPassResult {
 struct Crop { x: usize, y: usize, w: usize, h: usize }
 
 fn crop_for(cfg: &IntegrateConfig, meta: FrameMeta, y0: usize, y1: usize) -> Crop {
+    // Un polinomio cuadrático puede alcanzar sus extremos dentro de una arista
+    // o del propio tile. Acotar sólo con las cuatro esquinas puede excluir
+    // muestras fuente que sí contribuyen y crear huecos de cobertura. Hasta
+    // disponer de un contorno adaptativo con garantía conservadora, la ruta de
+    // distorsión local conserva el frame completo.
+    if meta.transform.local_distortion {
+        return Crop {
+            x: 0,
+            y: 0,
+            w: cfg.width,
+            h: cfg.height,
+        };
+    }
     let inv_scale = 1.0 / cfg.scale.max(1.0);
     let mut minx = f32::MAX;
     let mut maxx = f32::MIN;
@@ -1517,6 +1612,10 @@ pub fn integrate_pass(
     cfg: &IntegrateConfig,
     frames: &[FrameMeta],
     local_fields: &[Option<Vec<f32>>],
+    // Rescate de detalle: rejilla de calidad por frame (espacio de salida,
+    // wq_grid×wq_grid). None/vacío = camino previo exacto (flag apagado).
+    wq_fields: &[Option<Vec<f32>>],
+    wq_grid: usize,
     bounds: Option<(&[f32], &[f32])>,
     load: &dyn Fn(usize) -> Result<Vec<f32>, String>,
     cancel: &std::sync::atomic::AtomicBool,
@@ -1527,6 +1626,13 @@ pub fn integrate_pass(
     }
     if frames.is_empty() || local_fields.len() != frames.len() {
         return Err("Metadatos de frames GPU incompletos".into());
+    }
+    if wq_fields.len() != frames.len() {
+        return Err("Campos de calidad GPU incompletos".into());
+    }
+    let wq_cells = wq_grid * wq_grid;
+    if wq_fields.iter().flatten().any(|f| f.len() < wq_cells) {
+        return Err("Rejilla de calidad GPU con geometría inválida".into());
     }
     let rt = crate::gpu_stack::gpu_runtime().ok_or("No hay runtime wgpu")?;
     let pipes = pipelines(rt);
@@ -1556,7 +1662,9 @@ pub fn integrate_pass(
                 && (frame_capacity * 4) as u64 <= rt.max_binding;
             // mean + M2 + lower + upper + weight + rechazo bajo/alto + fuente + grids/LUT.
             let bytes = (out_elems * 16 + out_px * 12 + frame_capacity * 4
-                + cfg.local_grid_size * cfg.local_grid_size * 4 + 32 * 1024) as u64;
+                + cfg.local_grid_size * cfg.local_grid_size * cfg.channels * 4
+                + wq_cells * 4
+                + 32 * 1024) as u64;
             if bindings_ok && bytes <= rt.vram_budget { break (crops, frame_capacity, bytes); }
             if rows == 1 {
                 return Err(format!(
@@ -1584,7 +1692,9 @@ pub fn integrate_pass(
             mapped_at_creation: false,
         });
         let frame_buf = mk("zas-deepsky-frame-crop", frame_capacity, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
-        let local_buf = mk("zas-deepsky-local-grid", cfg.local_grid_size * cfg.local_grid_size, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+        let local_cells = cfg.local_grid_size * cfg.local_grid_size;
+        let local_buf = mk("zas-deepsky-local-grid", local_cells * cfg.channels, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+        let quality_buf = mk("zas-deepsky-quality-grid", wq_cells, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
         let lower_buf = mk("zas-deepsky-lower", out_elems, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
         let upper_buf = mk("zas-deepsky-upper", out_elems, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
         let rw = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
@@ -1615,6 +1725,7 @@ pub fn integrate_pass(
                 wgpu::BindGroupEntry { binding: 8, resource: pipes.lut.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: rejected_low_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: rejected_high_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: quality_buf.as_entire_binding() },
             ],
         });
 
@@ -1637,7 +1748,36 @@ pub fn integrate_pass(
             rt.queue.write_buffer(&frame_buf, 0, bytemuck::cast_slice(&cropped));
             let has_local = local_fields[k].as_ref().is_some_and(|f| !f.is_empty());
             if let Some(field) = local_fields[k].as_ref() {
-                rt.queue.write_buffer(&local_buf, 0, bytemuck::cast_slice(field));
+                if field.len() >= local_cells * cfg.channels {
+                    rt.queue.write_buffer(
+                        &local_buf,
+                        0,
+                        bytemuck::cast_slice(&field[..local_cells * cfg.channels]),
+                    );
+                } else if field.len() >= local_cells {
+                    for channel in 0..cfg.channels {
+                        rt.queue.write_buffer(
+                            &local_buf,
+                            (channel * local_cells * std::mem::size_of::<f32>()) as u64,
+                            bytemuck::cast_slice(&field[..local_cells]),
+                        );
+                    }
+                } else {
+                    return Err(format!(
+                        "campo local {} tiene {} muestras, se esperaban {} o {}",
+                        k,
+                        field.len(),
+                        local_cells,
+                        local_cells * cfg.channels
+                    ));
+                }
+            }
+            let has_quality = wq_fields[k].as_ref().is_some_and(|f| f.len() >= wq_cells);
+            if let Some(field) = wq_fields[k].as_ref() {
+                if field.len() >= wq_cells {
+                    rt.queue
+                        .write_buffer(&quality_buf, 0, bytemuck::cast_slice(&field[..wq_cells]));
+                }
             }
             let mut flags = 0u32;
             if cfg.lanczos { flags |= 1; }
@@ -1645,6 +1785,7 @@ pub fn integrate_pass(
             if has_local { flags |= 4; }
             if cfg.track_m2 { flags |= 8; }
             if meta.transform.local_distortion { flags |= 16; }
+            if has_quality { flags |= 32; }
             let m = meta.transform.inverse_h;
             let q = meta.transform.poly;
             let p = Params {
@@ -1654,7 +1795,8 @@ pub fn integrate_pass(
                 flags, ln_g: cfg.local_grid_size as u32,
                 full_w: cfg.width as u32, full_h: cfg.height as u32,
                 src_x0: crop.x as u32, src_y0: crop.y as u32,
-                out_h: cfg.height as u32, p0: 0, p1: 0, p2: 0,
+                out_h: cfg.height as u32, p0: 0, p1: 0,
+                p2: if has_quality { wq_grid as u32 } else { 0 },
                 m0: m[0], m1: m[1], m2: m[2], m3: m[3],
                 m4: m[4], m5: m[5], m6: m[6], m7: m[7], m8: m[8],
                 inv_scale: 1.0 / cfg.scale.max(1.0),
@@ -1775,54 +1917,86 @@ pub fn ensure_parity() -> bool {
     let cfg = IntegrateConfig { width: w, height: h, channels: 1, scale: 1.0, lanczos: false, local_grid_size: 1, track_m2: true };
     let local = vec![None, None, None];
     let cancel = std::sync::atomic::AtomicBool::new(false);
-    let gpu = integrate_pass(&cfg, &metas, &local, None, &|i| Ok(frames[i].clone()), &cancel, |_, _, _| {});
-    let ok = gpu.ok().is_some_and(|got| {
-        let mut cpu = vec![0.0f64; w * h];
-        let mut wt = vec![0.0f64; w * h];
-        for m in &metas {
-            let src = &frames[m.index];
-            for y in 0..h { for x in 0..w {
-                let Some((sx, sy)) = m.transform.inverse(x as f32, y as f32) else { continue; };
-                if sx < 0.0 || sy < 0.0 || sx >= (w - 1) as f32 || sy >= (h - 1) as f32 { continue; }
-                let x0 = sx.floor() as usize;
-                let y0 = sy.floor() as usize;
-                let fx = sx - x0 as f32;
-                let fy = sy - y0 as f32;
-                let v = src[y0 * w + x0] * (1.0 - fx) * (1.0 - fy)
-                    + src[y0 * w + x0 + 1] * fx * (1.0 - fy)
-                    + src[(y0 + 1) * w + x0] * (1.0 - fx) * fy
-                    + src[(y0 + 1) * w + x0 + 1] * fx * fy;
-                let v = v * m.norm.0[0] + m.norm.1[0];
-                cpu[y * w + x] += v as f64 * m.weight as f64;
-                wt[y * w + x] += m.weight as f64;
-            }}
-        }
-        let mut se = 0.0f64;
-        let mut n = 0usize;
-        let mut reference_flux = 0.0f64;
-        let mut candidate_flux = 0.0f64;
-        for i in 0..cpu.len() {
-            if wt[i] > 0.0 {
-                let reference = cpu[i] / wt[i];
-                let candidate = got.mean[i] as f64;
-                let e = candidate - reference;
-                se += e * e;
-                reference_flux += reference;
-                candidate_flux += candidate;
-                n += 1;
+    // Dos escenarios: sin calidad (camino histórico) y con grids de calidad
+    // asimétricos por frame (Rescate de detalle) — la referencia CPU replica
+    // exactamente ds_sample_grid en coordenadas normalizadas de salida.
+    let wq_g = 4usize;
+    let wq_cells = wq_g * wq_g;
+    let quality_fields: Vec<Option<Vec<f32>>> = (0..metas.len())
+        .map(|k| {
+            Some(
+                (0..wq_cells)
+                    .map(|i| 0.4 + (((i + 3 * k) * 29) % 19) as f32 * 0.06)
+                    .collect(),
+            )
+        })
+        .collect();
+    let no_quality: Vec<Option<Vec<f32>>> = vec![None, None, None];
+    let mut ok = true;
+    for wq in [&no_quality, &quality_fields] {
+        let gpu = integrate_pass(&cfg, &metas, &local, wq, wq_g, None, &|i: usize| Ok(frames[i].clone()), &cancel, |_, _, _| {});
+        let scenario_ok = gpu.ok().is_some_and(|got| {
+            let mut cpu = vec![0.0f64; w * h];
+            let mut wt = vec![0.0f64; w * h];
+            for (k, m) in metas.iter().enumerate() {
+                let src = &frames[m.index];
+                for y in 0..h { for x in 0..w {
+                    let Some((sx, sy)) = m.transform.inverse(x as f32, y as f32) else { continue; };
+                    if sx < 0.0 || sy < 0.0 || sx >= (w - 1) as f32 || sy >= (h - 1) as f32 { continue; }
+                    let x0 = sx.floor() as usize;
+                    let y0 = sy.floor() as usize;
+                    let fx = sx - x0 as f32;
+                    let fy = sy - y0 as f32;
+                    let v = src[y0 * w + x0] * (1.0 - fx) * (1.0 - fy)
+                        + src[y0 * w + x0 + 1] * fx * (1.0 - fy)
+                        + src[(y0 + 1) * w + x0] * (1.0 - fx) * fy
+                        + src[(y0 + 1) * w + x0 + 1] * fx * fy;
+                    let v = v * m.norm.0[0] + m.norm.1[0];
+                    let q = wq[k]
+                        .as_ref()
+                        .map(|g| {
+                            crate::ds_sample_grid(
+                                g,
+                                wq_g,
+                                wq_g,
+                                x as f32 / w as f32,
+                                y as f32 / h as f32,
+                            ) as f64
+                        })
+                        .unwrap_or(1.0);
+                    cpu[y * w + x] += v as f64 * m.weight as f64 * q;
+                    wt[y * w + x] += m.weight as f64 * q;
+                }}
             }
-        }
-        let rmse = (se / n.max(1) as f64).sqrt();
-        let photometric_error = (candidate_flux - reference_flux).abs()
-            / reference_flux.abs().max(1e-9);
-        if rmse > 0.5 || photometric_error > 0.001 {
-            eprintln!(
-                "[gpu deep-sky parity] RMSE={rmse:.6} ADU, error fotométrico={:.6}%",
-                photometric_error * 100.0
-            );
-        }
-        n > 0 && rmse <= 0.5 && photometric_error <= 0.001
-    });
+            let mut se = 0.0f64;
+            let mut n = 0usize;
+            let mut reference_flux = 0.0f64;
+            let mut candidate_flux = 0.0f64;
+            for i in 0..cpu.len() {
+                if wt[i] > 0.0 {
+                    let reference = cpu[i] / wt[i];
+                    let candidate = got.mean[i] as f64;
+                    let e = candidate - reference;
+                    se += e * e;
+                    reference_flux += reference;
+                    candidate_flux += candidate;
+                    n += 1;
+                }
+            }
+            let rmse = (se / n.max(1) as f64).sqrt();
+            let photometric_error = (candidate_flux - reference_flux).abs()
+                / reference_flux.abs().max(1e-9);
+            if rmse > 0.5 || photometric_error > 0.001 {
+                eprintln!(
+                    "[gpu deep-sky parity] wq={} RMSE={rmse:.6} ADU, error fotométrico={:.6}%",
+                    wq[0].is_some(),
+                    photometric_error * 100.0
+                );
+            }
+            n > 0 && rmse <= 0.5 && photometric_error <= 0.001
+        });
+        ok &= scenario_ok;
+    }
     DS_PARITY.store(if ok { PARITY_OK } else { PARITY_FAILED }, Ordering::Release);
     ok
 }
@@ -1875,6 +2049,8 @@ pub fn ensure_advanced_warp_parity() -> bool {
             &cfg,
             &[meta],
             &[None],
+            &[None],
+            1,
             None,
             &|_| Ok(frame.clone()),
             &cancel,
@@ -1981,7 +2157,10 @@ pub fn ensure_tiled_parity() -> bool {
         PARITY_FAILED => return false,
         _ => {}
     }
-    let (pixels, channels, frames) = (7usize, 2usize, 11usize);
+    // 12 píxeles como franja 4×3 con origen y=1 dentro de un lienzo de alto 5:
+    // ejercita el mapeo índice→(x,y) y el offset oy0 del muestreo de calidad.
+    let (pixels, channels, frames) = (12usize, 2usize, 11usize);
+    let strip = (4usize, 5usize, 1usize);
     let weights: Vec<f32> = (0..frames).map(|k| 0.55 + k as f32 * 0.07).collect();
     let mut stack = vec![0.0f32; pixels * channels * frames];
     for p in 0..pixels {
@@ -1996,9 +2175,16 @@ pub fn ensure_tiled_parity() -> bool {
         }
     }
     stack[frames * channels + 1] = f32::NAN;
+    // Rescate de detalle: grids asimétricos por frame (valores 0.35..1.45).
+    let wq_g = 4usize;
+    let wq_cells = wq_g * wq_g;
+    let quality_grids: Vec<f32> = (0..frames * wq_cells)
+        .map(|i| 0.35 + ((i * 37) % 23) as f32 * 0.05)
+        .collect();
 
     let mut ok = true;
     for method in ["winsorized", "linearfit"] {
+        for quality in [None, Some((&quality_grids[..], wq_g))] {
         let got = match reject_tiled_pass(
             &stack,
             &weights,
@@ -2008,6 +2194,8 @@ pub fn ensure_tiled_parity() -> bool {
             3.0,
             2.5,
             4.0,
+            quality,
+            strip,
         ) {
             Ok(v) => v,
             Err(_) => {
@@ -2019,12 +2207,31 @@ pub fn ensure_tiled_parity() -> bool {
         let mut max_cov = 0.0f64;
         let mut max_rej = 0.0f64;
         for p in 0..pixels {
+            // Peso efectivo con calidad: misma convención que el CPU tiled
+            // (ds_sample_grid en coordenadas normalizadas de salida).
+            let quality_for = |k: usize| -> f64 {
+                match quality {
+                    None => 1.0,
+                    Some((grids, g)) => {
+                        let x = p % strip.0;
+                        let y = strip.2 + p / strip.0;
+                        crate::ds_sample_grid(
+                            &grids[k * g * g..(k + 1) * g * g],
+                            g,
+                            g,
+                            x as f32 / strip.0 as f32,
+                            y as f32 / strip.1 as f32,
+                        ) as f64
+                    }
+                }
+            };
             for c in 0..channels {
                 let base = (p * channels + c) * frames;
                 let mut samples: Vec<(f32, f64)> = (0..frames)
                     .filter_map(|k| {
                         let v = stack[base + k];
-                        v.is_finite().then_some((v, weights[k] as f64))
+                        v.is_finite()
+                            .then(|| (v, weights[k] as f64 * quality_for(k)))
                     })
                     .collect();
                 let (mut cov, mut lo, mut hi) = (0.0, 0.0, 0.0);
@@ -2064,7 +2271,11 @@ pub fn ensure_tiled_parity() -> bool {
             }
         }
         if max_data > 0.5 || max_cov > 0.002 || max_rej > 0.002 {
-            eprintln!("[gpu tiled parity] {method}: data={max_data} coverage={max_cov} rejection={max_rej}");
+            eprintln!(
+                "[gpu tiled parity] {method} wq={}: data={max_data} coverage={max_cov} rejection={max_rej}",
+                quality.is_some()
+            );
+        }
         }
     }
     DS_TILED_PARITY.store(if ok { PARITY_OK } else { PARITY_FAILED }, Ordering::Release);
@@ -2073,6 +2284,188 @@ pub fn ensure_tiled_parity() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn calibration_shader_never_clamps_a_weak_flat_into_signal() {
+        assert!(!super::CALIBRATE_WGSL.contains("max(flat[i], 0.05)"));
+        assert!(super::CALIBRATE_WGSL.contains("0x7fc00000u"));
+    }
+
+    fn lanczos3_lut() -> Vec<f32> {
+        (0..=3072)
+            .map(|i| {
+                let x = i as f32 / 1024.0;
+                if x < 1e-4 {
+                    1.0
+                } else if x >= 3.0 {
+                    0.0
+                } else {
+                    let pix = std::f32::consts::PI * x;
+                    3.0 * (pix.sin() * (pix / 3.0).sin()) / (pix * pix)
+                }
+            })
+            .collect()
+    }
+
+    fn lut_weight(lut: &[f32], distance: f32) -> f32 {
+        lut[((distance.abs() * 1024.0) as usize).min(3072)]
+    }
+
+    /// Referencia host con el mismo orden separable del kernel WGSL, sin un
+    /// clamp dependiente de los valores de entrada.
+    fn shader_equivalent_lanczos3(image: &[f32], width: usize, sx: f32, sy: f32) -> f32 {
+        let x0 = sx.floor() as usize;
+        let y0 = sy.floor() as usize;
+        let fx = sx - x0 as f32;
+        let fy = sy - y0 as f32;
+        let lut = lanczos3_lut();
+        let mut wx = [0.0f32; 6];
+        let mut wy = [0.0f32; 6];
+        let mut swx = 0.0f32;
+        let mut swy = 0.0f32;
+        for k in 0..6 {
+            let off = k as f32 - 2.0;
+            wx[k] = lut_weight(&lut, off - fx);
+            wy[k] = lut_weight(&lut, off - fy);
+            swx += wx[k];
+            swy += wy[k];
+        }
+        let mut acc = 0.0f32;
+        for (j, wyj) in wy.into_iter().enumerate() {
+            let mut ax = 0.0f32;
+            for (i, wxi) in wx.into_iter().enumerate() {
+                ax += wxi * image[(y0 + j - 2) * width + x0 + i - 2];
+            }
+            acc += wyj * ax;
+        }
+        acc / (swx * swy).max(1e-6)
+    }
+
+    /// Implementación CPU directa 6×6: sirve como referencia independiente de
+    /// la descomposición en dos sumas utilizada por el shader.
+    fn cpu_lanczos3_unclamped(image: &[f32], width: usize, sx: f32, sy: f32) -> f32 {
+        let x0 = sx.floor() as usize;
+        let y0 = sy.floor() as usize;
+        let fx = sx - x0 as f32;
+        let fy = sy - y0 as f32;
+        let lut = lanczos3_lut();
+        let mut acc = 0.0f32;
+        let mut sum = 0.0f32;
+        for j in 0..6 {
+            let wy = lut_weight(&lut, j as f32 - 2.0 - fy);
+            for i in 0..6 {
+                let weight = wy * lut_weight(&lut, i as f32 - 2.0 - fx);
+                acc += weight * image[(y0 + j - 2) * width + x0 + i - 2];
+                sum += weight;
+            }
+        }
+        acc / sum.max(1e-6)
+    }
+
+    #[test]
+    fn lanczos_wgsl_has_no_signal_dependent_clamp() {
+        let start = super::DS_WGSL
+            .find("fn lanczos3")
+            .expect("función Lanczos WGSL");
+        let tail = &super::DS_WGSL[start..];
+        let end = tail
+            .find("\n}\n\n@compute")
+            .expect("fin de función Lanczos WGSL");
+        let body = &tail[..end];
+        assert!(
+            !body.contains("clamp("),
+            "Lanczos científico no debe truncar la señal"
+        );
+        assert!(!body.contains("lo4") && !body.contains("hi4"));
+        assert!(body.contains("return acc / max(swx * swy, 0.000001)"));
+    }
+
+    #[test]
+    fn lanczos_is_linear_and_preserves_flat_field() {
+        let (w, h) = (19usize, 17usize);
+        let a: Vec<f32> = (0..w * h)
+            .map(|i| ((i * 37 + i / w * 11) % 257) as f32 - 128.0)
+            .collect();
+        let b: Vec<f32> = (0..w * h)
+            .map(|i| ((i * 19 + i / w * 29) % 199) as f32 - 73.0)
+            .collect();
+        let (alpha, beta) = (1.7f32, -0.45f32);
+        let combination: Vec<f32> = a
+            .iter()
+            .zip(&b)
+            .map(|(&av, &bv)| alpha * av + beta * bv)
+            .collect();
+        let (sx, sy) = (8.37f32, 7.61f32);
+        let lhs = shader_equivalent_lanczos3(&combination, w, sx, sy);
+        let rhs = alpha * shader_equivalent_lanczos3(&a, w, sx, sy)
+            + beta * shader_equivalent_lanczos3(&b, w, sx, sy);
+        let tolerance = 2e-5 * lhs.abs().max(rhs.abs()).max(1.0);
+        assert!((lhs - rhs).abs() <= tolerance, "lhs={lhs}, rhs={rhs}");
+
+        let flat = vec![-37.25f32; w * h];
+        let sampled = shader_equivalent_lanczos3(&flat, w, sx, sy);
+        assert!((sampled + 37.25).abs() <= 1e-4, "campo plano={sampled}");
+    }
+
+    #[test]
+    fn lanczos_matches_unclamped_cpu_and_preserves_undershoot() {
+        let (w, h) = (21usize, 18usize);
+        let image: Vec<f32> = (0..w * h)
+            .map(|i| ((i * 43 + i / w * 17) % 601) as f32 - 300.0)
+            .collect();
+        for &(sx, sy) in &[(5.15, 4.73), (9.5, 8.25), (14.82, 12.31)] {
+            let gpu_formula = shader_equivalent_lanczos3(&image, w, sx, sy);
+            let cpu = cpu_lanczos3_unclamped(&image, w, sx, sy);
+            let tolerance = 2e-5 * gpu_formula.abs().max(cpu.abs()).max(1.0);
+            assert!(
+                (gpu_formula - cpu).abs() <= tolerance,
+                "({sx},{sy}) GPU={gpu_formula}, CPU={cpu}"
+            );
+        }
+
+        // Un impulso justo fuera del vecindario bilineal genera el lóbulo
+        // negativo esperado. El clamp anterior lo convertía artificialmente en
+        // cero y rompía la linealidad.
+        let mut impulse = vec![0.0f32; w * h];
+        for y in 0..h {
+            impulse[y * w + 8] = 100.0;
+        }
+        let undershoot = shader_equivalent_lanczos3(&impulse, w, 9.5, 8.25);
+        assert!(
+            undershoot < -1.0,
+            "undershoot Lanczos truncado: {undershoot}"
+        );
+    }
+
+    #[test]
+    fn local_distortion_crop_keeps_full_source_frame() {
+        let cfg = super::IntegrateConfig {
+            width: 96,
+            height: 72,
+            channels: 1,
+            scale: 1.0,
+            lanczos: true,
+            local_grid_size: 1,
+            track_m2: true,
+        };
+        let meta = super::FrameMeta {
+            index: 0,
+            transform: super::WarpTransform {
+                inverse_h: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                // Identidad más curvatura: sus extremos no están garantizados
+                // por las cuatro esquinas del band de salida.
+                poly: [
+                    36.0, 0.0, 48.0, -3.0, 2.2, 1.4, 0.0, 36.0, 36.0, 1.8, -2.0, 2.5,
+                ],
+                norm: [48.0, 36.0, 36.0],
+                local_distortion: true,
+            },
+            weight: 1.0,
+            norm: ([1.0; 3], [0.0; 3]),
+        };
+        let crop = super::crop_for(&cfg, meta, 24, 40);
+        assert_eq!((crop.x, crop.y, crop.w, crop.h), (0, 0, 96, 72));
+    }
+
     #[test]
     #[ignore = "requiere GPU física Metal/DX12/Vulkan"]
     fn deepsky_gpu_parity_physical() {

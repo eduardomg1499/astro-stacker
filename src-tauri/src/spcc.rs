@@ -31,7 +31,10 @@ struct GaiaStar {
     bp_rp: f64,
 }
 
+// camelCase: el frontend lee res.gainR/gainG/gainB; sin el rename el camino de
+// ÉXITO de SPCC lanzaba TypeError (undefined.toFixed) y se mostraba como error.
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SpccResult {
     matched: usize,
     detected: usize,

@@ -837,6 +837,11 @@
         </defs>
 
         <!-- ZAS SVG Glassmorphism Icons -->
+        <symbol id="icon-grip" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+            <circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/>
+            <circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/>
+            <circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/>
+        </symbol>
         <symbol id="icon-star" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
             stroke-linecap="round" stroke-linejoin="round">
             <polygon
@@ -1400,7 +1405,7 @@
 
                 <!-- SECCIONES (filas estilo donation-option, render dinámico) -->
                 <div style="font-size:0.62rem; color:#94a3b8; margin:0 0 6px; display:flex; align-items:center; gap:6px;">
-                    <span style="color:#7c3aed;">⠿</span>
+                    <svg class="zas-icon zas-icon-inline" style="color:#7c3aed;"><use href="#icon-grip"></use></svg>
                     <span data-i18n="deepsky.drag_hint">Arrastra un archivo a otra categoría para reclasificarlo · ✕ para quitarlo</span>
                 </div>
                 <div class="donation-options" id="ds-sections" style="margin-bottom:12px; gap:10px;"></div>
@@ -1422,15 +1427,17 @@
                 <div class="ds-presets">
                     <span class="ds-presets-label" data-i18n="deepsky.preset_label">Preset</span>
                     <div class="ds-preset-btns">
+                        <button type="button" class="ds-preset active" data-preset="auto" data-i18n="deepsky.preset_auto">Auto</button>
                         <button type="button" class="ds-preset" data-preset="fast" data-i18n="deepsky.preset_fast">Rápido</button>
-                        <button type="button" class="ds-preset active" data-preset="balanced" data-i18n="deepsky.preset_balanced">Equilibrado</button>
+                        <button type="button" class="ds-preset" data-preset="balanced" data-i18n="deepsky.preset_balanced">Equilibrado</button>
                         <button type="button" class="ds-preset" data-preset="max" data-i18n="deepsky.preset_max">Máxima calidad</button>
                         <button type="button" class="ds-preset" data-preset="custom" data-i18n="deepsky.preset_custom">Personalizado</button>
                     </div>
                 </div>
                 <div class="ds-profile-help">
+                    <div class="ds-profile-note"><b>Auto</b><span data-i18n="deepsky.profile_auto_note">Mide tus datos (nº de lights, filtro, dithering, gradiente, fondo) y fija la receta óptima; cada decisión y su motivo quedan visibles en el plan.</span></div>
                     <div class="ds-profile-note"><b>Rápido</b>Bilineal, normalización aditiva y una pasada sigma.</div>
-                    <div class="ds-profile-note"><b>Equilibrado</b>Lanczos-3, escala robusta y sigma iterativo.</div>
+                    <div class="ds-profile-note"><b>Equilibrado</b>Lanczos-3, escala robusta y rechazo Winsorized.</div>
                     <div class="ds-profile-note"><b>Máxima calidad</b>Winsorized y normalización local; exige más RAM/CPU.</div>
                 </div>
 
@@ -1475,6 +1482,22 @@
                             <svg class="zas-icon"><use href="#icon-moon"></use></svg>
                             <span data-i18n="deepsky.grp_calib">Calibración</span>
                         </div>
+                        <label class="ds-row" title="Describe la adquisición para aplicar compatibilidad y productos de color correctos; Auto sólo clasifica las tomas y nunca activa EIDR/NebulaFusion.">
+                            <span data-i18n="deepsky.capture_mode">Tipo de captura</span>
+                            <select id="sel-ds-capture-mode" class="ds-sel">
+                                <option value="auto" selected data-i18n="deepsky.capture_auto">Auto (clasificar)</option>
+                                <option value="broadbandOsc" data-i18n="deepsky.capture_broadband_osc">Banda ancha OSC</option>
+                                <option value="dualBandOsc" data-i18n="deepsky.capture_dual_band_osc">Dual-band OSC</option>
+                                <option value="monoNarrowband" data-i18n="deepsky.capture_mono_narrowband">Banda estrecha mono</option>
+                            </select>
+                        </label>
+                        <label class="ds-row" title="Strict bloquea metadata o calibraciones incompatibles. Permitir degradación exige esta selección explícita y deja cada fallback en la receta.">
+                            <span data-i18n="deepsky.calibration_policy">Política de calibración</span>
+                            <select id="sel-ds-calibration-policy" class="ds-sel">
+                                <option value="strict" selected data-i18n="deepsky.calibration_strict">Strict · bloquear y explicar</option>
+                                <option value="allowDegraded" data-i18n="deepsky.calibration_allow_degraded">Permitir degradación explícita</option>
+                            </select>
+                        </label>
                         <label class="ds-row" title="Elimina píxeles calientes/muertos cuando no hay darks (SIRIL-style)">
                             <span data-i18n="deepsky.cosmetic">Corrección cosmética</span>
                             <span class="switch"><input type="checkbox" id="chk-ds-cosmetic" checked><span class="slider round"></span></span>
@@ -1533,17 +1556,18 @@
                             <svg class="zas-icon"><use href="#icon-batch"></use></svg>
                             <span data-i18n="deepsky.grp_integrate">Integración y rechazo</span>
                         </div>
-                        <label class="ds-row" title="Motor de integración. Clásico: el motor actual (κσ/Winsorized). NebulaFusion Lite (beta): media ponderada por ruido con máscaras de rechazo congeladas y mapas científicos VAR/NEFF/DQ (incompatible con drizzle, GPU only y lights PNG/JPEG — el plan lo avisa). EIDR: próximamente.">
+                        <label class="ds-row" title="Motor de integración. Clásico es el único motor automático. NebulaFusion y EIDR son experimentales, requieren selección explícita y entradas científicas FITS/TIFF lineales; el preflight valida sus incompatibilidades.">
                             <span data-i18n="deepsky.method_label">Método de integración</span>
                             <select id="sel-ds-method" class="ds-sel">
                                 <option value="classic" selected data-i18n="deepsky.method_classic">Clásico (κσ/Winsorized)</option>
-                                <option value="nebula_fusion" data-i18n="deepsky.method_nebula_fusion">NebulaFusion Lite (beta)</option>
-                                <option value="nebula_fusion_full" data-i18n="deepsky.method_nebula_fusion_full">NebulaFusion Full (beta)</option>
-                                <option value="nebula_fusion_struct" data-i18n="deepsky.method_nebula_fusion_struct">NebulaFusion Full + STRUCT (beta)</option>
-                                <option value="eidr" data-i18n="deepsky.method_eidr">EIDR super-resolución (beta)</option>
+                                <option disabled data-i18n="deepsky.method_experimental_group">── Experimental · selección explícita ──</option>
+                                <option value="nebula_fusion" data-i18n="deepsky.method_nebula_fusion">NebulaFusion Lite (experimental)</option>
+                                <option value="nebula_fusion_full" data-i18n="deepsky.method_nebula_fusion_full">NebulaFusion Full (experimental)</option>
+                                <option value="nebula_fusion_struct" data-i18n="deepsky.method_nebula_fusion_struct">NebulaFusion Full + STRUCT (experimental)</option>
+                                <option value="eidr" data-i18n="deepsky.method_eidr">EIDR super-resolución (experimental)</option>
                             </select>
                         </label>
-                        <div style="font-size:.58rem;color:#64748b;margin:-2px 0 6px 2px;" data-i18n="deepsky.method_hint_nf">NebulaFusion: media ponderada por el ruido de cada toma + máscaras de rechazo congeladas + mapas científicos VAR/NEFF/DQ junto al máster.</div>
+                        <div style="font-size:.58rem;color:#64748b;margin:-2px 0 6px 2px;" data-i18n="deepsky.method_hint_nf">NebulaFusion y EIDR son experimentales y sólo se activan al seleccionarlos; Auto mantiene el motor clásico. NebulaFusion produce mapas VAR/NEFF/DQ junto al máster.</div>
                         <label id="lbl-ds-eidrscale" class="ds-row" title="Solo EIDR: escala de reconstrucción. Auto decide con la PSF medida y la puerta de recuperabilidad (2x exige ≥12 tomas y dithers diversos; si no hay evidencia, degrada a 1.5x/1x y lo registra en la receta).">
                             <span data-i18n="deepsky.eidr_scale_label">Escala EIDR</span>
                             <select id="sel-ds-eidrscale" class="ds-sel">
@@ -1577,13 +1601,12 @@
                                 <option value="bin0_5" data-i18n="deepsky.bin_05">0.5x (super-binning)</option>
                             </select>
                         </label>
-                        <label class="ds-row" title="Método de apilado/rechazo. Sigma (κσ) y Media usan el motor streaming (rápido). Los métodos por-píxel (Winsorized, ajuste lineal, mediana, percentil) usan el motor de máxima calidad que carga el stack completo por franjas (nivel PixInsight/Siril; sin drizzle, cae a σ-clip si falta RAM).">
+                        <label class="ds-row" title="Método de apilado/rechazo. Sigma (κσ) y Media usan el motor streaming (rápido). Los métodos por-píxel (Winsorized, mediana, percentil) usan el motor de máxima calidad que carga el stack completo por franjas (sin drizzle, cae a σ-clip si falta RAM).">
                             <span data-i18n="deepsky.rejection">Método de rechazo</span>
                             <select id="sel-ds-rejection" class="ds-sel">
                                 <option value="sigma" selected data-i18n="deepsky.rej_sigma">Sigma (κσ)</option>
                                 <option value="average" data-i18n="deepsky.rej_average">Media (sin rechazo)</option>
                                 <option value="winsorized" data-i18n="deepsky.rej_winsorized">Winsorized</option>
-                                <option value="linearfit" data-i18n="deepsky.rej_linearfit">Ajuste lineal</option>
                                 <option value="median" data-i18n="deepsky.rej_median">Mediana</option>
                                 <option value="percentile" data-i18n="deepsky.rej_percentile">Percentil</option>
                             </select>
@@ -1631,8 +1654,8 @@
                             <span class="switch"><input type="checkbox" id="chk-ds-localw"><span class="slider round"></span></span>
                         </label>
                         <div style="font-size:.58rem;color:#64748b;margin:-2px 0 6px 2px;" data-i18n="deepsky.local_weighting_note">Cada zona del cielo se apila prefiriendo las tomas donde ESA zona salió más nítida (seeing local). Exclusivo de Zenith: los apiladores tradicionales solo ponderan la toma completa.</div>
-                        <label class="ds-row" title="OPCIONAL (como PixInsight, mejor hacerlo después): resta el gradiente de fondo (ABE grado 2) + elimina el verde (SCNR) + neutraliza. Por defecto OFF para dejar un máster lineal limpio.">
-                            <span data-i18n="deepsky.gradient">Limpieza de fondo y color (ABE+SCNR)</span>
+                        <label class="ds-row" title="OPCIONAL: genera un modelo de fondo y una copia de preview/derivada ABE+SCNR. SCI, VAR, NEFF y DQ permanecen intactos y lineales.">
+                            <span data-i18n="deepsky.gradient">Derivado de fondo/color (SCI intacto)</span>
                             <span class="switch"><input type="checkbox" id="chk-ds-gradient"><span class="slider round"></span></span>
                         </label>
                         <label class="ds-row" title="Auto/Hybrid permiten fallback CPU seguro. GPU only cancela si una etapa no tiene paridad o recursos suficientes.">
@@ -2169,29 +2192,55 @@
                             </div>
                         </div>
 
-                        <!-- GPU COMPUTE (aceleracion de la acumulacion del apilado) -->
-                        <div
-                            style="margin-top:15px; margin-bottom:15px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px;">
-                            <label
-                                style="color:#cbd5e1; font-weight:bold; font-size:0.9rem; display:block; margin-bottom:8px;"
-                                data-i18n="settings.general.gpu_title">Aceleración GPU (apilado)</label>
-                            <p style="color:#64748b; font-size:0.72rem; line-height:1.35; margin:0 0 10px 0;"
+                        <!-- COMPUTE PLANETARIO (análisis y apilado por etapas) -->
+                        <div class="planetary-settings-section">
+                            <label class="planetary-settings-title"
+                                data-i18n="settings.general.gpu_title">Cómputo planetario (análisis y apilado)</label>
+                            <p class="planetary-settings-intro"
                                 data-i18n="settings.general.gpu_hint">
-                                La acumulación del apilado puede correr en la GPU (Metal en Mac, DX12/Vulkan en Windows). En Auto se usa solo si pasa la verificación de paridad numérica y el video lo amerita; ante cualquier problema vuelve a CPU con resultado idéntico.
+                                Controla por etapa el análisis y el apilado. Auto e Hybrid pueden reiniciar en CPU una etapa GPU fallida tras validar calidad y recursos. Solo GPU es estricto: si falla una etapa GPU apta, detiene el trabajo sin fallback silencioso.
                             </p>
-                            <div id="gpu-info-line"
-                                style="color:#38bdf8; font-family:'Courier New',monospace; font-size:0.72rem; margin:0 0 10px 0;"></div>
-                            <div style="display:flex; align-items:center; justify-content:space-between;">
-                                <span style="color:#94a3b8; font-size:0.8rem;"
+                            <div id="gpu-info-line" class="planetary-settings-gpu-info"></div>
+                            <div class="planetary-settings-row">
+                                <span class="planetary-settings-label"
                                     data-i18n="settings.general.gpu_mode">Modo</span>
-                                <select id="sel-gpu-mode"
-                                    style="background:#0f172a; color:#38bdf8; border:1px solid #334155; padding:4px 8px; border-radius:6px; font-size:0.8rem;">
-                                    <option value="hybrid" selected>Hybrid v2 (experimental)</option>
-                                    <option value="auto" data-i18n="settings.general.gpu_auto">Auto (tras validación)</option>
-                                    <option value="gpu" data-i18n="settings.general.gpu_force">Forzar GPU</option>
+                                <select id="sel-gpu-mode" class="planetary-settings-select planetary-settings-select--compute">
+                                    <option value="auto" selected data-i18n="settings.general.gpu_auto">Auto (recomendado)</option>
+                                    <option value="hybrid" data-i18n="settings.general.gpu_hybrid">Hybrid (experto/experimental)</option>
+                                    <option value="gpu" data-i18n="settings.general.gpu_force">Solo GPU (estricto)</option>
                                     <option value="cpu" data-i18n="settings.general.gpu_cpu">Solo CPU</option>
                                 </select>
                             </div>
+                            <div class="planetary-settings-row">
+                                <div class="planetary-settings-copy">
+                                    <span class="planetary-settings-label"
+                                        data-i18n="settings.general.quality_policy">Rigor de validación por AP</span>
+                                    <small id="planetary-quality-policy-hint" class="planetary-settings-hint"
+                                        data-i18n="settings.general.quality_policy_hint">Adaptive revisa coincidencias ambiguas. Maximum es más estricto y lento.</small>
+                                </div>
+                                <select id="sel-planetary-quality-policy" aria-describedby="planetary-quality-policy-hint"
+                                    class="planetary-settings-select planetary-settings-select--quality">
+                                    <option value="adaptive" selected data-i18n="settings.general.quality_adaptive">Adaptive (recomendado)</option>
+                                    <option value="standard" data-i18n="settings.general.quality_standard">Standard</option>
+                                    <option value="maximum" data-i18n="settings.general.quality_maximum">Maximum (experto)</option>
+                                </select>
+                            </div>
+                            <details class="planetary-settings-details">
+                                <summary
+                                    data-i18n="settings.general.decode_advanced">Decodificación avanzada (FFmpeg)</summary>
+                                <p id="planetary-decode-policy-hint" class="planetary-settings-details-copy"
+                                    data-i18n="settings.general.decode_hint">Auto mide la ruta software y la aceleración de vídeo disponible para cada archivo FFmpeg. Hardware estricto falla en preflight y nunca hace fallback silencioso; SER siempre conserva su lector nativo.</p>
+                                <div class="planetary-settings-row planetary-settings-row--nested">
+                                    <span class="planetary-settings-label"
+                                        data-i18n="settings.general.decode_mode">Decodificador</span>
+                                    <select id="sel-decode-policy" aria-describedby="planetary-decode-policy-hint"
+                                        class="planetary-settings-select planetary-settings-select--decode">
+                                        <option value="auto" selected data-i18n="settings.general.decode_auto">Auto (recomendado)</option>
+                                        <option value="software" data-i18n="settings.general.decode_software">Software (CPU)</option>
+                                        <option value="hardware" data-i18n="settings.general.decode_hardware">Hardware estricto</option>
+                                    </select>
+                                </div>
+                            </details>
                         </div>
 
                         <!-- Tutorial Settings -->
@@ -2533,6 +2582,20 @@
                             style="font-style:italic; color:#64748b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:200px;">
                             ...</div>
                     </div>
+
+                    <label style="font-size:0.7rem; color:#aaa; margin-top:9px; display:block;"
+                        data-i18n="batch.output.title">Destino del lote</label>
+                    <div style="display:flex; gap:6px; margin-top:5px;">
+                        <button id="btn-batch-output-source-adjacent" type="button" aria-pressed="true"
+                            style="flex:1; background:rgba(168,85,247,0.14); border:1px solid #a855f7; color:#e9d5ff; padding:6px 5px; border-radius:6px; cursor:pointer; font-size:0.66rem; font-weight:600;"
+                            data-i18n="batch.output.source_adjacent">Junto a cada vídeo</button>
+                        <button id="btn-batch-output-single-directory" type="button" aria-pressed="false"
+                            style="flex:1; background:#0f172a; border:1px solid #334155; color:#94a3b8; padding:6px 5px; border-radius:6px; cursor:pointer; font-size:0.66rem; font-weight:600;"
+                            data-i18n="batch.output.single_directory">Carpeta única…</button>
+                    </div>
+                    <span id="batch-output-path"
+                        style="display:block; font-size:0.61rem; color:#64748b; margin-top:5px; line-height:1.35; overflow-wrap:anywhere;"
+                        data-i18n="batch.output.source_adjacent_hint">Crea Zenith_Batch_&lt;sesión&gt;/&lt;vídeo&gt;/ junto a cada fuente, sin sobrescribir.</span>
 
                     <!--
                     LEGACY BATCH ENGINE SELECTOR

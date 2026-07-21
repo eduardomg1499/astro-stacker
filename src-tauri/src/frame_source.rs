@@ -15,6 +15,9 @@ pub struct FrameDescriptor {
     pub bayer: Option<String>,
     pub little_endian: bool,
     pub rotation_degrees: i32,
+    pub pixel_format: Option<String>,
+    pub color_range: Option<String>,
+    pub color_matrix: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -64,6 +67,14 @@ impl FrameSource for UnifiedFrameSource {
             crate::VideoInput::Ser(r) => r.info.is_little_endian,
             _ => true,
         };
+        let (pixel_format, color_range, color_matrix) = match &self.input {
+            crate::VideoInput::Ffmpeg(reader) => (
+                reader.pixel_format.clone(),
+                reader.color_range.clone(),
+                reader.color_matrix.clone(),
+            ),
+            _ => (None, None, None),
+        };
         FrameDescriptor {
             source_kind: source_kind.into(),
             width: self.input.width(),
@@ -76,6 +87,9 @@ impl FrameSource for UnifiedFrameSource {
                 .then(|| crate::ser::ser_pattern_name(self.color_id).to_string()),
             little_endian,
             rotation_degrees: self.input.rotation(),
+            pixel_format,
+            color_range,
+            color_matrix,
         }
     }
 
@@ -95,6 +109,27 @@ impl UnifiedFrameSource {
         indices: &[usize],
         roi: Option<FrameRoi>,
         hardware_backend: Option<&str>,
+    ) -> Result<FrameBatch, String> {
+        self.read_batch_with_decode_route(indices, roi, hardware_backend, true)
+    }
+
+    /// Variante strict usada por `DecodePolicy::Hardware`: verifica el
+    /// backend efectivo y jamás sustituye el intento por software.
+    pub(crate) fn read_batch_with_hardware_strict(
+        &self,
+        indices: &[usize],
+        roi: Option<FrameRoi>,
+        hardware_backend: &str,
+    ) -> Result<FrameBatch, String> {
+        self.read_batch_with_decode_route(indices, roi, Some(hardware_backend), false)
+    }
+
+    fn read_batch_with_decode_route(
+        &self,
+        indices: &[usize],
+        roi: Option<FrameRoi>,
+        hardware_backend: Option<&str>,
+        allow_software_fallback: bool,
     ) -> Result<FrameBatch, String> {
         let desc = self.descriptor();
         let roi = roi.map(|r| FrameRoi {
@@ -118,7 +153,14 @@ impl UnifiedFrameSource {
             // timestamp. Para FFmpeg recorremos desde cero una sola vez: usar
             // `-ss index/fps` no es exacto con GOP largos o video VFR.
             crate::VideoInput::Ffmpeg(reader) => {
-                read_ffmpeg_batch_exact(reader, indices, roi, self.color_id, hardware_backend)?
+                read_ffmpeg_batch_exact(
+                    reader,
+                    indices,
+                    roi,
+                    self.color_id,
+                    hardware_backend,
+                    allow_software_fallback,
+                )?
             }
             _ => {
                 let mut frames = Vec::with_capacity(indices.len());
@@ -153,6 +195,7 @@ fn read_ffmpeg_batch_exact(
     roi: Option<FrameRoi>,
     color_id: i32,
     hardware_backend: Option<&str>,
+    allow_software_fallback: bool,
 ) -> Result<Vec<Vec<u8>>, String> {
     if indices.is_empty() {
         return Ok(Vec::new());
@@ -212,6 +255,9 @@ fn read_ffmpeg_batch_exact(
             }
             decoded.insert(index, buffer.clone());
         }
+        if backend.is_some() {
+            stream.validate_hardware_route()?;
+        }
         // Mover cada frame al resultado, no clonarlo. En RGB48 3312x5888 una
         // copia son ~111.6 MiB; el `get().cloned()` anterior duplicaba el top-N
         // completo justo en el pico de la referencia robusta (hasta 2.23 GiB
@@ -247,6 +293,11 @@ fn read_ffmpeg_batch_exact(
         if let Some(backend) = hardware_backend {
             match run_selected(Some(backend)) {
                 Ok(ordered) => return Ok(ordered),
+                Err(error) if !allow_software_fallback => {
+                    return Err(format!(
+                        "Decode Hardware strict falló en el lote select exacto ({backend}): {error}"
+                    ));
+                }
                 Err(error) => eprintln!(
                     "WARN: ruta HW '{backend}' falló en el lote select exacto; reintento por CPU: {error}"
                 ),
@@ -255,25 +306,44 @@ fn read_ffmpeg_batch_exact(
         return run_selected(None);
     }
 
-    // Esta ruta es el fallback contractual de FrameSource. La selección
-    // hardware/CPU cronometrada vive en los coordinadores de análisis/apilado;
-    // aquí CPU evita etiquetar `-hwaccel auto` como aceleración confirmada.
-    let mut stream = crate::FfmpegStreamIterator::new(
-        &reader.path,
-        reader.width,
-        reader.height,
-        region.x,
-        region.y,
-        region.width,
-        region.height,
-        color_id,
-        &reader.ffmpeg_path,
-        None,
-        None,
-        &reader.codec_name,
-        reader.rotation,
-    )?;
-    collect_exact_frames(indices, frame_size, |buffer| stream.read_frame_into(buffer))
+    let run_sequential = |backend: Option<&str>| -> Result<Vec<Vec<u8>>, String> {
+        let mut stream = crate::FfmpegStreamIterator::new(
+            &reader.path,
+            reader.width,
+            reader.height,
+            region.x,
+            region.y,
+            region.width,
+            region.height,
+            color_id,
+            &reader.ffmpeg_path,
+            None,
+            backend,
+            &reader.codec_name,
+            reader.rotation,
+        )?;
+        let frames = collect_exact_frames(indices, frame_size, |buffer| {
+            stream.read_frame_into(buffer)
+        })?;
+        if backend.is_some() {
+            stream.validate_hardware_route()?;
+        }
+        Ok(frames)
+    };
+    if let Some(backend) = hardware_backend {
+        match run_sequential(Some(backend)) {
+            Ok(frames) => return Ok(frames),
+            Err(error) if !allow_software_fallback => {
+                return Err(format!(
+                    "Decode Hardware strict falló en el recorrido exacto ({backend}): {error}"
+                ));
+            }
+            Err(error) => eprintln!(
+                "WARN: ruta HW '{backend}' falló en el recorrido exacto; reintento por CPU: {error}"
+            ),
+        }
+    }
+    run_sequential(None)
 }
 
 fn collect_exact_frames(
@@ -354,6 +424,9 @@ mod tests {
             is_color: false,
             rotation: 0,
             codec_name: "h264".into(),
+            pixel_format: Some("yuv420p".into()),
+            color_range: Some("tv".into()),
+            color_matrix: Some("bt709".into()),
             stream_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }

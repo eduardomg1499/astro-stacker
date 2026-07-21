@@ -21,10 +21,12 @@ const SCHEMA: &str = "zas-perf-trace-v1";
 /// Fases con pass=GLOBAL_PASS se emiten sin prefijo "pN/".
 pub const GLOBAL_PASS: u8 = 0;
 
-#[derive(Default)]
 struct PhaseAgg {
     total_ns: u128,
     count: u64,
+    // `wall`: elapsed critical-path span; `work`: sum of worker/lane samples.
+    // They are intentionally not additive when work overlaps across lanes.
+    measurement: &'static str,
 }
 
 struct JobTrace {
@@ -56,13 +58,23 @@ fn epoch_ms() -> u128 {
 /// Abre un job de traza y devuelve su id (0 nunca se emite).
 pub fn job_start(kind: &'static str, source: &str) -> u64 {
     let id = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
+    let mut meta = BTreeMap::new();
+    meta.insert("commit".into(), env!("ZAS_GIT_COMMIT").into());
+    meta.insert("dirty".into(), env!("ZAS_GIT_DIRTY").into());
+    meta.insert(
+        "worktree_fingerprint".into(),
+        env!("ZAS_WORKTREE_FINGERPRINT").into(),
+    );
+    meta.insert("app_version".into(), env!("CARGO_PKG_VERSION").into());
+    meta.insert("os".into(), std::env::consts::OS.into());
+    meta.insert("architecture".into(), std::env::consts::ARCH.into());
     let trace = JobTrace {
         kind,
         source: source.to_string(),
         started: Instant::now(),
         started_epoch_ms: epoch_ms(),
         phases: Vec::with_capacity(24),
-        meta: BTreeMap::new(),
+        meta,
     };
     jobs().insert(id, trace);
     id
@@ -79,7 +91,14 @@ pub fn job_meta(job: u64, key: &str, value: impl ToString) {
 }
 
 /// Acumula tiempo ya medido (ns) e items en una fase de un pase.
-pub fn add_ns(job: u64, pass: u8, phase: &'static str, ns: u128, items: u64) {
+fn add_ns_with_measurement(
+    job: u64,
+    pass: u8,
+    phase: &'static str,
+    ns: u128,
+    items: u64,
+    measurement: &'static str,
+) {
     if job == 0 {
         return;
     }
@@ -91,15 +110,31 @@ pub fn add_ns(job: u64, pass: u8, phase: &'static str, ns: u128, items: u64) {
     if let Some((_, agg)) = t.phases.iter_mut().find(|(k, _)| *k == key) {
         agg.total_ns += ns;
         agg.count += items;
+        if agg.measurement != measurement {
+            agg.measurement = "mixed";
+        }
     } else {
         t.phases.push((
             key,
             PhaseAgg {
                 total_ns: ns,
                 count: items,
+                measurement,
             },
         ));
     }
+}
+
+/// Acumula trabajo de CPU/GPU ya medido. Si varias lanes se solapan, este
+/// total puede ser mayor que la pared del job y no debe restarse del E2E.
+pub fn add_ns(job: u64, pass: u8, phase: &'static str, ns: u128, items: u64) {
+    add_ns_with_measurement(job, pass, phase, ns, items, "work");
+}
+
+/// Registra una duración de pared medida manualmente (cuando el caller también
+/// necesita conservarla para StageTelemetry y no puede usar sólo RAII).
+pub fn add_wall_ns(job: u64, pass: u8, phase: &'static str, ns: u128, items: u64) {
+    add_ns_with_measurement(job, pass, phase, ns, items, "wall");
 }
 
 /// Span RAII: mide desde su creación hasta el drop.
@@ -109,6 +144,7 @@ pub struct Span {
     phase: &'static str,
     t0: Instant,
     items: u64,
+    measurement: &'static str,
 }
 
 impl Span {
@@ -121,12 +157,13 @@ impl Span {
 
 impl Drop for Span {
     fn drop(&mut self) {
-        add_ns(
+        add_ns_with_measurement(
             self.job,
             self.pass,
             self.phase,
             self.t0.elapsed().as_nanos(),
             self.items,
+            self.measurement,
         );
     }
 }
@@ -144,6 +181,7 @@ pub fn span_pass(job: u64, pass: u8, phase: &'static str) -> Span {
         phase,
         t0: Instant::now(),
         items: 1,
+        measurement: "wall",
     }
 }
 
@@ -170,9 +208,18 @@ pub fn job_finish(job: u64, completed: bool) -> Option<std::path::PathBuf> {
         return None;
     }
     let trace = jobs().remove(&job)?;
-    let total_ms = trace.started.elapsed().as_secs_f64() * 1e3;
+    let retry_overhead_ms = trace
+        .meta
+        .get("retry_overhead_ms")
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(0.0);
+    // Los intentos internos fallidos se descartan para no duplicar jobs, pero
+    // su pared forma parte del E2E de la política solicitada. El wrapper la
+    // propaga al intento canónico mediante retry_overhead_ms.
+    let total_ms = trace.started.elapsed().as_secs_f64() * 1e3 + retry_overhead_ms;
 
-    let phases: Vec<serde_json::Value> = trace
+    let mut phases: Vec<serde_json::Value> = trace
         .phases
         .iter()
         .map(|((pass, phase), agg)| {
@@ -182,9 +229,22 @@ pub fn job_finish(job: u64, completed: bool) -> Option<std::path::PathBuf> {
                 "totalMs": (total * 1e3).round() / 1e3,
                 "count": agg.count,
                 "avgMs": if agg.count > 0 { ((total / agg.count as f64) * 1e6).round() / 1e6 } else { 0.0 },
+                "measurement": agg.measurement,
             })
         })
         .collect();
+    if retry_overhead_ms > 0.0 {
+        phases.insert(
+            0,
+            serde_json::json!({
+                "phase": "retry_overhead",
+                "totalMs": (retry_overhead_ms * 1e3).round() / 1e3,
+                "count": 1,
+                "avgMs": (retry_overhead_ms * 1e3).round() / 1e3,
+                "measurement": "wall",
+            }),
+        );
+    }
 
     let doc = serde_json::json!({
         "schema": SCHEMA,
@@ -239,6 +299,14 @@ impl JobGuard {
         self.done = true;
         job_finish(self.job, true)
     }
+
+    /// Descarta una traza que representa sólo un intento interno reiniciable,
+    /// no un trabajo de usuario terminado. El intento exterior emitirá la
+    /// traza canónica; así el reportador no cuenta dos jobs por un fallback.
+    pub fn discard(mut self) {
+        self.done = true;
+        let _ = jobs().remove(&self.job);
+    }
 }
 
 impl Drop for JobGuard {
@@ -257,10 +325,7 @@ mod tests {
     // paralelo se pisarían la variable entre sí.
     #[test]
     fn job_lifecycle_guard_and_json() {
-        let tmp = std::env::temp_dir().join(format!(
-            "zas-perf-trace-test-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("zas-perf-trace-test-{}", std::process::id()));
         std::env::set_var("ZAS_PERF_TRACE_DIR", &tmp);
 
         let job = job_start("test", "synthetic.ser");
@@ -279,15 +344,27 @@ mod tests {
         assert_eq!(doc["schema"], SCHEMA);
         assert_eq!(doc["completed"], true);
         assert_eq!(doc["meta"]["frames"], "3");
+        assert!(doc["meta"]["commit"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty()));
+        assert!(doc["meta"]["worktree_fingerprint"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty()));
+        assert_eq!(doc["meta"]["app_version"], env!("CARGO_PKG_VERSION"));
         let phases = doc["phases"].as_array().expect("phases");
         let deb = phases
             .iter()
             .find(|p| p["phase"] == "p1/debayer")
             .expect("fase debayer");
         assert_eq!(deb["count"], 3);
+        assert_eq!(deb["measurement"], "work");
         assert!(deb["totalMs"].as_f64().unwrap() >= 3.0 - 1e-6);
-        assert!(phases.iter().any(|p| p["phase"] == "open"));
-        assert!(phases.iter().any(|p| p["phase"] == "p2/warp"));
+        assert!(phases
+            .iter()
+            .any(|p| p["phase"] == "open" && p["measurement"] == "wall"));
+        assert!(phases
+            .iter()
+            .any(|p| p["phase"] == "p2/warp" && p["measurement"] == "wall"));
         // El id ya no existe: add posterior es no-op y un segundo finish es None.
         add_ns(job, 1, "debayer", 1, 1);
         assert!(job_finish(job, true).is_none());
@@ -309,6 +386,21 @@ mod tests {
             }
         }
         assert!(found_incomplete, "esperaba un volcado incompleto del guard");
+
+        let job3 = job_start("test_discard", "x");
+        JobGuard::new(job3).discard();
+        assert!(job_finish(job3, true).is_none());
+
+        let job4 = job_start("test_retry", "x");
+        job_meta(job4, "retry_overhead_ms", 125.0);
+        let retry_path = job_finish(job4, true).expect("traza con retry");
+        let retry_doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(retry_path).expect("leer retry"))
+                .expect("json retry");
+        assert!(retry_doc["totalMs"].as_f64().unwrap() >= 125.0);
+        assert!(retry_doc["phases"].as_array().unwrap().iter().any(|phase| {
+            phase["phase"] == "retry_overhead" && phase["totalMs"].as_f64().unwrap() == 125.0
+        }));
         std::env::remove_var("ZAS_PERF_TRACE_DIR");
         let _ = std::fs::remove_dir_all(&tmp);
     }

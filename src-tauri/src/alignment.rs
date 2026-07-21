@@ -1288,6 +1288,81 @@ fn subpixel_refine_sad(
 /// sale del frame o la iteracion diverge — el caller conserva entonces el
 /// estimado SAD+equiangular. La correccion total esta acotada a ±0.75 px:
 /// LK solo PULE el minimo ya encontrado, nunca re-decide el matching.
+#[derive(Clone, Copy, Debug)]
+pub struct LucasKanadeReference {
+    width: usize,
+    height: usize,
+    ax: usize,
+    ay: usize,
+    box_size: usize,
+    inv00: f64,
+    inv01: f64,
+    inv11: f64,
+}
+
+/// Descriptor inmutable del patch maestro para Lucas-Kanade.
+///
+/// La geometria y el Hessiano dependen exclusivamente del master y del AP, no
+/// del frame que se esta alineando. Materializarlos una vez por AP/pasada evita
+/// repetir un barrido completo de la caja por cada frame. Los gradientes se
+/// siguen leyendo del master durante las iteraciones para no reservar un mapa
+/// adicional de `box_size²` por cada uno de los miles de APs.
+#[allow(clippy::too_many_arguments)]
+pub fn precompute_lucas_kanade_reference(
+    master: &[u16],
+    w: usize,
+    h: usize,
+    ax: usize,
+    ay: usize,
+    box_size: usize,
+) -> Option<LucasKanadeReference> {
+    let image_len = w.checked_mul(h)?;
+    if master.len() < image_len || w < 3 || h < 3 || box_size < 2 {
+        return None;
+    }
+    let half = (box_size / 2) as i32;
+    let axi = ax as i32;
+    let ayi = ay as i32;
+    if axi - half < 1
+        || ayi - half < 1
+        || axi + half >= w as i32 - 1
+        || ayi + half >= h as i32 - 1
+    {
+        return None;
+    }
+
+    let mut h00 = 0.0f64;
+    let mut h01 = 0.0f64;
+    let mut h11 = 0.0f64;
+    for oy in -half..half {
+        let y = (ayi + oy) as usize;
+        let row = y * w;
+        for ox in -half..half {
+            let x = (axi + ox) as usize;
+            let i = row + x;
+            let gx = (master[i + 1] as f64 - master[i - 1] as f64) * 0.5;
+            let gy = (master[i + w] as f64 - master[i - w] as f64) * 0.5;
+            h00 += gx * gx;
+            h01 += gx * gy;
+            h11 += gy * gy;
+        }
+    }
+    let det = h00 * h11 - h01 * h01;
+    if h00 < 1.0 || h11 < 1.0 || det < 1e-6 * h00 * h11 {
+        return None;
+    }
+    Some(LucasKanadeReference {
+        width: w,
+        height: h,
+        ax,
+        ay,
+        box_size,
+        inv00: h11 / det,
+        inv01: -h01 / det,
+        inv11: h00 / det,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn refine_shift_lucas_kanade(
     master: &[u16],
@@ -1301,13 +1376,77 @@ pub fn refine_shift_lucas_kanade(
     box_size: usize,
     iterations: usize,
 ) -> Option<(f32, f32)> {
+    let reference =
+        precompute_lucas_kanade_reference(master, w, h, ax, ay, box_size)?;
+    refine_shift_lucas_kanade_precomputed(
+        master,
+        target,
+        w,
+        h,
+        &reference,
+        shift_dx,
+        shift_dy,
+        iterations,
+    )
+}
+
+/// Variante de producción que reutiliza el descriptor LK precomputado para un
+/// AP. Sólo publica una corrección si una posición EVALUADA reduce el SSD del
+/// patch frente a la semilla SAD; una actualización Gauss-Newton no comprobada
+/// nunca puede degradar silenciosamente el vector de alineación.
+#[allow(clippy::too_many_arguments)]
+pub fn refine_shift_lucas_kanade_precomputed(
+    master: &[u16],
+    target: &[u16],
+    w: usize,
+    h: usize,
+    reference: &LucasKanadeReference,
+    shift_dx: f32,
+    shift_dy: f32,
+    iterations: usize,
+) -> Option<(f32, f32)> {
+    refine_shift_lucas_kanade_precomputed_with_gate(
+        master, target, w, h, reference, shift_dx, shift_dy, iterations, 0.0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn refine_shift_lucas_kanade_precomputed_with_gate(
+    master: &[u16],
+    target: &[u16],
+    w: usize,
+    h: usize,
+    reference: &LucasKanadeReference,
+    shift_dx: f32,
+    shift_dy: f32,
+    iterations: usize,
+    min_objective_improvement: f32,
+) -> Option<(f32, f32)> {
+    let image_len = w.checked_mul(h)?;
+    if master.len() < image_len
+        || target.len() < image_len
+        || reference.width != w
+        || reference.height != h
+        || !min_objective_improvement.is_finite()
+        || !(0.0..1.0).contains(&min_objective_improvement)
+    {
+        return None;
+    }
     // PR-21b: delega en la variante sin bounds checks. SAFETY: el check de
     // margen inicial acota los indices del master (ax/ay ± half dentro de
     // [1, w-2]/[1, h-2]) y el bounds check por iteracion acota el muestreo
     // bilineal del target (esquinas < (w-1, h-1)).
     unsafe {
-        refine_shift_lucas_kanade_unchecked(
-            master, target, w, h, ax, ay, shift_dx, shift_dy, box_size, iterations,
+        refine_shift_lucas_kanade_precomputed_unchecked(
+            master,
+            target,
+            w,
+            h,
+            reference,
+            shift_dx,
+            shift_dy,
+            iterations,
+            min_objective_improvement,
         )
     }
 }
@@ -1316,57 +1455,30 @@ pub fn refine_shift_lucas_kanade(
 /// 6 accesos por pixel eran el unico freno del optimizador en este bucle
 /// (misma aritmetica f64 en el mismo orden que la copia checked del test).
 #[inline(always)]
-unsafe fn refine_shift_lucas_kanade_unchecked(
+unsafe fn refine_shift_lucas_kanade_precomputed_unchecked(
     master: &[u16],
     target: &[u16],
     w: usize,
     h: usize,
-    ax: usize,
-    ay: usize,
+    reference: &LucasKanadeReference,
     shift_dx: f32,
     shift_dy: f32,
-    box_size: usize,
     iterations: usize,
+    min_objective_improvement: f32,
 ) -> Option<(f32, f32)> {
-    let half = (box_size / 2) as i32;
-    let axi = ax as i32;
-    let ayi = ay as i32;
-    // Margen ±1 para el gradiente central del master.
-    if axi - half < 1 || ayi - half < 1 || axi + half >= w as i32 - 1 || ayi + half >= h as i32 - 1
-    {
-        return None;
-    }
-
-    // Hessiano 2×2 del master (una sola vez — inverse compositional).
-    let mut h00 = 0.0f64;
-    let mut h01 = 0.0f64;
-    let mut h11 = 0.0f64;
-    for oy in -half..half {
-        let y = (ayi + oy) as usize;
-        let row = y * w;
-        for ox in -half..half {
-            let x = (axi + ox) as usize;
-            let i = row + x;
-            let gx = (*master.get_unchecked(i + 1) as f64 - *master.get_unchecked(i - 1) as f64) * 0.5;
-            let gy = (*master.get_unchecked(i + w) as f64 - *master.get_unchecked(i - w) as f64) * 0.5;
-            h00 += gx * gx;
-            h01 += gx * gy;
-            h11 += gy * gy;
-        }
-    }
-    // Sin energia de gradiente en algun eje (patch plano) o sistema casi
-    // singular (borde 1-D puro → aperture problem): dejar el estimado SAD.
-    let det = h00 * h11 - h01 * h01;
-    if h00 < 1.0 || h11 < 1.0 || det < 1e-6 * h00 * h11 {
-        return None;
-    }
-    let inv00 = h11 / det;
-    let inv01 = -h01 / det;
-    let inv11 = h00 / det;
+    let half = (reference.box_size / 2) as i32;
+    let axi = reference.ax as i32;
+    let ayi = reference.ay as i32;
 
     let mut pdx = shift_dx;
     let mut pdy = shift_dy;
-    for _ in 0..iterations.max(1) {
+    let mut initial_ssd = f64::INFINITY;
+    let mut best_ssd = f64::INFINITY;
+    let mut best_dx = shift_dx;
+    let mut best_dy = shift_dy;
+    // Al menos dos evaluaciones: semilla y primera actualización. Con una
+    // sola no existe evidencia objetiva para aceptar el cambio.
+    for iteration in 0..iterations.max(2) {
         // Bounds del patch desplazado para el muestreo bilineal: si alguna
         // esquina se sale del frame, abortar (conservar estimado SAD).
         let min_x = (axi - half) as f32 + pdx;
@@ -1379,6 +1491,7 @@ unsafe fn refine_shift_lucas_kanade_unchecked(
 
         let mut b0 = 0.0f64;
         let mut b1 = 0.0f64;
+        let mut ssd = 0.0f64;
         for oy in -half..half {
             let y = (ayi + oy) as usize;
             let syf = y as f32 + pdy;
@@ -1407,12 +1520,22 @@ unsafe fn refine_shift_lucas_kanade_unchecked(
                 let e = tv as f64 - *master.get_unchecked(i) as f64;
                 b0 += gx * e;
                 b1 += gy * e;
+                ssd += e * e;
             }
         }
 
+        if iteration == 0 {
+            initial_ssd = ssd;
+        }
+        if ssd < best_ssd {
+            best_ssd = ssd;
+            best_dx = pdx;
+            best_dy = pdy;
+        }
+
         // Gauss-Newton para traslacion pura: p ← p − H⁻¹·b
-        let ddx = (inv00 * b0 + inv01 * b1) as f32;
-        let ddy = (inv01 * b0 + inv11 * b1) as f32;
+        let ddx = (reference.inv00 * b0 + reference.inv01 * b1) as f32;
+        let ddy = (reference.inv01 * b0 + reference.inv11 * b1) as f32;
         if !ddx.is_finite() || !ddy.is_finite() || ddx.abs() > 1.5 || ddy.abs() > 1.5 {
             return None; // divergencia: el residuo no es un pulido local
         }
@@ -1424,10 +1547,22 @@ unsafe fn refine_shift_lucas_kanade_unchecked(
     }
 
     // LK solo pule: una correccion grande significa salto de cuenca del SAD.
-    if (pdx - shift_dx).abs() > 0.75 || (pdy - shift_dy).abs() > 0.75 {
+    // La posicion devuelta fue realmente evaluada y debe mejorar estrictamente
+    // el objetivo inicial; `pdx/pdy` puede contener una última actualización
+    // todavía no observada y por eso no se publica directamente.
+    let objective_improvement = if initial_ssd > 0.0 {
+        ((initial_ssd - best_ssd) / initial_ssd).max(0.0)
+    } else {
+        0.0
+    };
+    if !(best_ssd < initial_ssd)
+        || objective_improvement < min_objective_improvement as f64
+        || (best_dx - shift_dx).abs() > 0.75
+        || (best_dy - shift_dy).abs() > 0.75
+    {
         return None;
     }
-    Some((pdx, pdy))
+    Some((best_dx, best_dy))
 }
 
 
@@ -1483,7 +1618,11 @@ fn refine_shift_lucas_kanade_checked(
 
     let mut pdx = shift_dx;
     let mut pdy = shift_dy;
-    for _ in 0..iterations.max(1) {
+    let mut initial_ssd = f64::INFINITY;
+    let mut best_ssd = f64::INFINITY;
+    let mut best_dx = shift_dx;
+    let mut best_dy = shift_dy;
+    for iteration in 0..iterations.max(2) {
         // Bounds del patch desplazado para el muestreo bilineal: si alguna
         // esquina se sale del frame, abortar (conservar estimado SAD).
         let min_x = (axi - half) as f32 + pdx;
@@ -1496,6 +1635,7 @@ fn refine_shift_lucas_kanade_checked(
 
         let mut b0 = 0.0f64;
         let mut b1 = 0.0f64;
+        let mut ssd = 0.0f64;
         for oy in -half..half {
             let y = (ayi + oy) as usize;
             let syf = y as f32 + pdy;
@@ -1524,7 +1664,17 @@ fn refine_shift_lucas_kanade_checked(
                 let e = tv as f64 - master[i] as f64;
                 b0 += gx * e;
                 b1 += gy * e;
+                ssd += e * e;
             }
+        }
+
+        if iteration == 0 {
+            initial_ssd = ssd;
+        }
+        if ssd < best_ssd {
+            best_ssd = ssd;
+            best_dx = pdx;
+            best_dy = pdy;
         }
 
         // Gauss-Newton para traslacion pura: p ← p − H⁻¹·b
@@ -1541,10 +1691,13 @@ fn refine_shift_lucas_kanade_checked(
     }
 
     // LK solo pule: una correccion grande significa salto de cuenca del SAD.
-    if (pdx - shift_dx).abs() > 0.75 || (pdy - shift_dy).abs() > 0.75 {
+    if !(best_ssd < initial_ssd)
+        || (best_dx - shift_dx).abs() > 0.75
+        || (best_dy - shift_dy).abs() > 0.75
+    {
         return None;
     }
-    Some((pdx, pdy))
+    Some((best_dx, best_dy))
 }
 
 fn compute_sad_at(
@@ -1588,6 +1741,148 @@ fn compute_sad_at(
         }
     }
     sad
+}
+
+/// Diagnóstico exacto de la cuenca SAD de un match entero ya resuelto.
+///
+/// `runner_up_sad` excluye la vecindad 3×3 del ganador: las muestras
+/// adyacentes pertenecen a la misma cuenca subpíxel y no prueban que exista
+/// una segunda correspondencia independiente. Esta función es deliberadamente
+/// separada del hot path SIMD; puede activarse sólo para APs sospechosos o en
+/// fixtures de paridad sin penalizar todos los AP/frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SadMatchDiagnostics {
+    pub best_sad: u64,
+    pub runner_up_sad: Option<u64>,
+    pub normalized_margin: f32,
+    pub touches_search_border: bool,
+    pub evaluated_alternatives: usize,
+}
+
+/// Sondeo barato previo al diagnóstico SAD exhaustivo.
+///
+/// Evalúa como máximo 24 posiciones (anillos a 2 px, mitad del radio y borde)
+/// fuera de la cuenca 3x3 del ganador. Sólo si alguna puede competir con el
+/// mínimo, o si el ganador toca el borde de búsqueda, el caller paga el
+/// barrido exacto de `diagnose_sad_match`. Así el gate de confianza entra en
+/// producción sin duplicar la búsqueda completa para cada AP/frame.
+#[allow(clippy::too_many_arguments)]
+pub fn sad_match_needs_exact_diagnostics(
+    ref_edges: &[u16],
+    tgt_edges: &[u16],
+    w: usize,
+    ax: usize,
+    ay: usize,
+    fx_est: usize,
+    fy_est: usize,
+    box_size: usize,
+    search_r: i32,
+    best_dx: i32,
+    best_dy: i32,
+    min_normalized_margin: f32,
+) -> bool {
+    if search_r < 2 || !min_normalized_margin.is_finite() || min_normalized_margin <= 0.0 {
+        return false;
+    }
+    if best_dx.abs() >= search_r || best_dy.abs() >= search_r {
+        return true;
+    }
+    let best_sad = compute_sad_at(
+        ref_edges, tgt_edges, w, ax, ay, fx_est, fy_est, box_size, best_dx, best_dy,
+    );
+    if best_sad == u64::MAX {
+        return true;
+    }
+
+    // El sondeo usa un margen 2x para no omitir una segunda cuenca que el
+    // muestreo disperso sólo alcance por un hombro ligeramente más caro.
+    let probe_margin = (min_normalized_margin.max(0.01) * 2.0) as f64;
+    let mut radii = [2, (search_r / 2).max(2), search_r];
+    radii.sort_unstable();
+    let directions = [
+        (-1, -1),
+        (0, -1),
+        (1, -1),
+        (-1, 0),
+        (1, 0),
+        (-1, 1),
+        (0, 1),
+        (1, 1),
+    ];
+    let mut previous_radius = 0;
+    for radius in radii {
+        if radius == previous_radius {
+            continue;
+        }
+        previous_radius = radius;
+        for (sx, sy) in directions {
+            let dx = (best_dx + sx * radius).clamp(-search_r, search_r);
+            let dy = (best_dy + sy * radius).clamp(-search_r, search_r);
+            if (dx - best_dx).abs() <= 1 && (dy - best_dy).abs() <= 1 {
+                continue;
+            }
+            let probe = compute_sad_at(
+                ref_edges, tgt_edges, w, ax, ay, fx_est, fy_est, box_size, dx, dy,
+            );
+            if probe == u64::MAX {
+                continue;
+            }
+            let margin = probe.saturating_sub(best_sad) as f64 / best_sad.max(1) as f64;
+            if probe < best_sad || margin < probe_margin {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn diagnose_sad_match(
+    ref_edges: &[u16],
+    tgt_edges: &[u16],
+    w: usize,
+    ax: usize,
+    ay: usize,
+    fx_est: usize,
+    fy_est: usize,
+    box_size: usize,
+    search_r: i32,
+    best_dx: i32,
+    best_dy: i32,
+) -> SadMatchDiagnostics {
+    let best_sad = compute_sad_at(
+        ref_edges, tgt_edges, w, ax, ay, fx_est, fy_est, box_size, best_dx, best_dy,
+    );
+    let mut runner_up_sad = None::<u64>;
+    let mut evaluated_alternatives = 0usize;
+    for dy in -search_r..=search_r {
+        for dx in -search_r..=search_r {
+            // Excluir la cuenca local que alimenta el refinamiento subpíxel.
+            if (dx - best_dx).abs() <= 1 && (dy - best_dy).abs() <= 1 {
+                continue;
+            }
+            let sad = compute_sad_at(
+                ref_edges, tgt_edges, w, ax, ay, fx_est, fy_est, box_size, dx, dy,
+            );
+            if sad == u64::MAX {
+                continue;
+            }
+            evaluated_alternatives += 1;
+            if runner_up_sad.map_or(true, |runner| sad < runner) {
+                runner_up_sad = Some(sad);
+            }
+        }
+    }
+    let normalized_margin = runner_up_sad
+        .map(|runner| runner.saturating_sub(best_sad) as f64 / best_sad.max(1) as f64)
+        .unwrap_or(f64::INFINITY) as f32;
+    SadMatchDiagnostics {
+        best_sad,
+        runner_up_sad,
+        normalized_margin,
+        touches_search_border: best_dx.abs() >= search_r || best_dy.abs() >= search_r,
+        evaluated_alternatives,
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1887,13 +2182,13 @@ fn find_best_match_sad_scalar(
                 if y_start_t < 0 || x_start_t < 0 || y_start_r < 0 || x_start_r < 0 {
                     continue;
                 }
-                if (y_start_t + box_size as i32) >= h as i32
-                    || (x_start_t + box_size as i32) >= w as i32
+                if (y_start_t + box_size as i32) > h as i32
+                    || (x_start_t + box_size as i32) > w as i32
                 {
                     continue;
                 }
-                if (y_start_r + box_size as i32) >= h as i32
-                    || (x_start_r + box_size as i32) >= w as i32
+                if (y_start_r + box_size as i32) > h as i32
+                    || (x_start_r + box_size as i32) > w as i32
                 {
                     continue;
                 }
@@ -2579,9 +2874,15 @@ mod tests {
             (70, 60, 0.35, -0.62),
         ] {
             let a = refine_shift_lucas_kanade(&master, &target, w, h, ax, ay, sdx, sdy, 32, 3);
+            let reference = precompute_lucas_kanade_reference(&master, w, h, ax, ay, 32)
+                .expect("patch texturado debe producir descriptor LK");
+            let precomputed = refine_shift_lucas_kanade_precomputed(
+                &master, &target, w, h, &reference, sdx, sdy, 3,
+            );
             let b =
                 refine_shift_lucas_kanade_checked(&master, &target, w, h, ax, ay, sdx, sdy, 32, 3);
             assert_eq!(a, b, "divergencia LK en ap=({ax},{ay}) seed=({sdx},{sdy})");
+            assert_eq!(a, precomputed, "descriptor LK debe preservar el resultado");
         }
     }
 
@@ -2775,6 +3076,131 @@ mod tests {
         // devolver None para que el caller conserve el estimado SAD.
         let flat = vec![500u16; w * h];
         assert!(refine_shift_lucas_kanade(&flat, &flat, w, h, 48, 48, 0.0, 0.0, 32, 3).is_none());
+
+        // Semilla ya óptima: el SSD no puede reducirse. El gate no debe
+        // publicar una actualización numérica sin mejora objetiva.
+        assert!(
+            refine_shift_lucas_kanade(&master, &master, w, h, 48, 48, 0.0, 0.0, 32, 3)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sad_diagnostics_distinguish_unique_ambiguous_and_border_matches() {
+        let w = 96usize;
+        let h = 80usize;
+        let mut state = 0x6d2b_79f5u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 16) as u16
+        };
+        let reference: Vec<u16> = (0..w * h).map(|_| next()).collect();
+        let make_shifted = |dx: i32, dy: i32| -> Vec<u16> {
+            (0..w * h)
+                .map(|i| {
+                    let x = (i % w) as i32 - dx;
+                    let y = (i / w) as i32 - dy;
+                    if x >= 0 && x < w as i32 && y >= 0 && y < h as i32 {
+                        reference[y as usize * w + x as usize]
+                    } else {
+                        0
+                    }
+                })
+                .collect()
+        };
+        let (ax, ay, box_size, search_r) = (48usize, 40usize, 24usize, 4i32);
+
+        let shifted = make_shifted(2, -1);
+        let (dx, dy, _) = find_best_match_sad(
+            &reference, &shifted, w, ax, ay, ax, ay, box_size, search_r,
+        );
+        assert_eq!((dx as i32, dy as i32), (2, -1));
+        let unique = diagnose_sad_match(
+            &reference,
+            &shifted,
+            w,
+            ax,
+            ay,
+            ax,
+            ay,
+            box_size,
+            search_r,
+            dx as i32,
+            dy as i32,
+        );
+        assert_eq!(unique.best_sad, 0);
+        assert!(unique.runner_up_sad.unwrap_or(0) > 0);
+        assert!(unique.normalized_margin > 0.0);
+        assert!(!unique.touches_search_border);
+        assert!(!sad_match_needs_exact_diagnostics(
+            &reference,
+            &shifted,
+            w,
+            ax,
+            ay,
+            ax,
+            ay,
+            box_size,
+            search_r,
+            dx as i32,
+            dy as i32,
+            0.03,
+        ));
+
+        let flat = vec![7000u16; w * h];
+        let ambiguous = diagnose_sad_match(
+            &flat, &flat, w, ax, ay, ax, ay, box_size, search_r, 0, 0,
+        );
+        assert_eq!(ambiguous.best_sad, 0);
+        assert_eq!(ambiguous.runner_up_sad, Some(0));
+        assert_eq!(ambiguous.normalized_margin, 0.0);
+        assert!(sad_match_needs_exact_diagnostics(
+            &flat, &flat, w, ax, ay, ax, ay, box_size, search_r, 0, 0, 0.03,
+        ));
+        assert!(!sad_match_needs_exact_diagnostics(
+            &flat, &flat, w, ax, ay, ax, ay, box_size, search_r, 0, 0, 0.0,
+        ));
+
+        let boundary_shifted = make_shifted(search_r, 0);
+        let (bdx, bdy, _) = find_best_match_sad(
+            &reference,
+            &boundary_shifted,
+            w,
+            ax,
+            ay,
+            ax,
+            ay,
+            box_size,
+            search_r,
+        );
+        let boundary = diagnose_sad_match(
+            &reference,
+            &boundary_shifted,
+            w,
+            ax,
+            ay,
+            ax,
+            ay,
+            box_size,
+            search_r,
+            bdx as i32,
+            bdy as i32,
+        );
+        assert!(boundary.touches_search_border);
+        assert!(sad_match_needs_exact_diagnostics(
+            &reference,
+            &boundary_shifted,
+            w,
+            ax,
+            ay,
+            ax,
+            ay,
+            box_size,
+            search_r,
+            bdx as i32,
+            bdy as i32,
+            0.03,
+        ));
     }
 
     #[test]

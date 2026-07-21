@@ -26,7 +26,7 @@
 // ===========================================================================
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use sysinfo::System;
 
 /// Estado del self-test de paridad: 0 = pendiente, 1 = ok, 2 = fallido.
@@ -159,6 +159,11 @@ pub struct GpuRuntime {
     /// de asignación por clase de dispositivo (sobrescribible con
     /// ZAS_GPU_BUDGET_MB), no una inferencia errónea desde max_buffer_size.
     pub vram_budget: u64,
+    /// Contador común para todos los working-sets planetarios grandes. Las
+    /// validaciones por etapa siguen siendo útiles para explicar por qué una
+    /// geometría no cabe, pero esta reserva RAII es la autoridad que impide
+    /// que analysis/SAD/enhance/accumulation superen el límite en conjunto.
+    pub planetary_vram: PlanetaryVramBudget,
     pub max_binding: u64,
     /// Tamaño máximo de un buffer (staging incluido). Puede ser mayor que el
     /// binding de storage, pero no debe confundirse con VRAM disponible.
@@ -172,6 +177,127 @@ pub struct GpuRuntime {
     /// LUT Lanczos idéntica a la de CPU (LanczosLUT::new(30000, 3.0)) subida
     /// una vez — la paridad del muestreo depende de compartir la MISMA tabla.
     lut_buf: wgpu::Buffer,
+}
+
+#[derive(Debug, Default)]
+struct PlanetaryVramState {
+    used: u64,
+    high_water: u64,
+}
+
+#[derive(Debug)]
+struct PlanetaryVramBudgetInner {
+    limit: u64,
+    state: Mutex<PlanetaryVramState>,
+}
+
+/// Presupuesto compartido, no bloqueante, de los buffers planetarios grandes.
+///
+/// `try_reserve` nunca espera a que otra etapa libere memoria: si no hay
+/// margen, el caller falla antes de crear buffers wgpu y aplica el contrato de
+/// fallback de etapa. Esto evita convertir presión de VRAM en un deadlock.
+#[derive(Clone, Debug)]
+pub struct PlanetaryVramBudget {
+    inner: Arc<PlanetaryVramBudgetInner>,
+}
+
+impl PlanetaryVramBudget {
+    pub fn new(limit: u64) -> Self {
+        Self {
+            inner: Arc::new(PlanetaryVramBudgetInner {
+                limit,
+                state: Mutex::new(PlanetaryVramState::default()),
+            }),
+        }
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.inner.limit
+    }
+
+    pub fn used(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .used
+    }
+
+    pub fn available(&self) -> u64 {
+        self.limit().saturating_sub(self.used())
+    }
+
+    #[cfg(test)]
+    fn high_water(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .high_water
+    }
+
+    pub fn try_reserve(
+        &self,
+        bytes: u64,
+        owner: &'static str,
+    ) -> Result<PlanetaryVramReservation, String> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| "Contador de VRAM planetaria dañado".to_string())?;
+        let next = state.used.checked_add(bytes).ok_or_else(|| {
+            format!("Reserva VRAM de {owner} desbordó el contador compartido")
+        })?;
+        if next > self.inner.limit {
+            return Err(format!(
+                "Presupuesto VRAM planetario compartido agotado por {owner}: solicita {} MB, en uso {} MB, límite {} MB",
+                bytes.div_ceil(MIB),
+                state.used.div_ceil(MIB),
+                self.inner.limit.div_ceil(MIB)
+            ));
+        }
+        state.used = next;
+        state.high_water = state.high_water.max(next);
+        drop(state);
+        Ok(PlanetaryVramReservation {
+            inner: Arc::clone(&self.inner),
+            bytes,
+            owner,
+        })
+    }
+}
+
+/// Token de propiedad de VRAM. No es clonable: una reserva se libera una sola
+/// vez. Los caches que necesitan prolongar una reserva durante un readback
+/// pueden envolver el token en `Arc`.
+#[derive(Debug)]
+pub struct PlanetaryVramReservation {
+    inner: Arc<PlanetaryVramBudgetInner>,
+    bytes: u64,
+    owner: &'static str,
+}
+
+impl PlanetaryVramReservation {
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for PlanetaryVramReservation {
+    fn drop(&mut self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(
+            state.used >= self.bytes,
+            "reserva VRAM de {} liberada dos veces",
+            self.owner
+        );
+        state.used = state.used.saturating_sub(self.bytes);
+    }
 }
 
 static GPU_RUNTIME: OnceLock<Option<GpuRuntime>> = OnceLock::new();
@@ -716,6 +842,7 @@ fn init_runtime() -> Option<GpuRuntime> {
         adapter_name: info.name,
         backend: backend_label(info.backend).to_string(),
         vram_budget,
+        planetary_vram: PlanetaryVramBudget::new(vram_budget),
         max_binding,
         max_buffer_size: alim.max_buffer_size,
         max_storage_buffers_per_shader_stage: requested_storage_buffers,
@@ -1061,6 +1188,57 @@ impl GpuPassConfig {
             .max()
             .unwrap_or(0)
     }
+
+    /// Bytes de buffers residentes realmente creados por el acumulador. A
+    /// diferencia de `vram_needed`, incluye padding mínimo y uniforms por
+    /// banda, por lo que sirve como reserva común autoritativa.
+    fn resident_vram_bytes(&self, band_count: usize) -> u64 {
+        let n_px = (self.w_out as u64).saturating_mul(self.h_out as u64);
+        let frame_px = (self.w_in as u64)
+            .saturating_mul(self.h_in as u64)
+            .saturating_mul(if self.is_color { 3 } else { 1 });
+        let packed_frame = frame_px.div_ceil(2).saturating_mul(4).max(16);
+        let warp_items = if self.use_warp {
+            n_px.saturating_mul(self.k as u64)
+        } else {
+            0
+        };
+        let warp_indices = if self.use_warp {
+            warp_items.div_ceil(2).saturating_mul(4)
+        } else {
+            16
+        };
+        let warp_weights = if self.use_warp {
+            warp_items.saturating_mul(4)
+        } else {
+            16
+        };
+        let bounds = if self.use_bounds {
+            n_px
+                .saturating_mul(4)
+                .saturating_mul(if self.is_color { 6 } else { 2 })
+        } else {
+            16
+        };
+        (PARAM_STRIDE.saturating_mul(band_count as u64))
+            .saturating_add(packed_frame)
+            .saturating_add(warp_indices.max(16))
+            .saturating_add(warp_weights.max(16))
+            .saturating_add((self.n_aps as u64).saturating_mul(16).max(16))
+            .saturating_add(
+                (self.dq_w as u64)
+                    .saturating_mul(self.dq_h as u64)
+                    .saturating_mul(4)
+                    .max(16),
+            )
+            .saturating_add(bounds.max(16))
+            .saturating_add(
+                n_px
+                    .saturating_mul(8)
+                    .saturating_mul(self.planes() as u64)
+                    .max(16),
+            )
+    }
 }
 
 /// Trabajo por frame que el worker CPU entrega al submitter GPU.
@@ -1116,6 +1294,7 @@ pub struct GpuPassAccumulator {
     params_scratch: Vec<u8>,
     /// Bytes de VRAM asignados (telemetría).
     pub vram_bytes: u64,
+    _vram_reservation: PlanetaryVramReservation,
 }
 
 impl GpuPassAccumulator {
@@ -1208,6 +1387,22 @@ impl GpuPassAccumulator {
             y0 += band_rows;
         }
 
+        let vram_bytes = cfg.resident_vram_bytes(bands.len());
+        let vram_reservation = match rt
+            .planetary_vram
+            .try_reserve(vram_bytes, "acumulación planetaria")
+        {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                // Los motores de análisis son caches, no resultados. Sólo se
+                // desalojan si están ociosos; `try_lock` evita esperar o crear
+                // un ciclo de locks con una etapa todavía activa.
+                crate::gpu_analysis::evict_idle_planetary_gpu_caches();
+                rt.planetary_vram
+                    .try_reserve(vram_bytes, "acumulación planetaria")?
+            }
+        };
+
         let params_buf = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("zas-params"),
             size: PARAM_STRIDE * bands.len() as u64,
@@ -1298,7 +1493,6 @@ impl GpuPassAccumulator {
             ],
         });
 
-        let vram_bytes = cfg.vram_needed();
         Ok(Self {
             rt,
             error_epoch,
@@ -1318,6 +1512,7 @@ impl GpuPassAccumulator {
             apq_scratch: Vec::new(),
             params_scratch: Vec::new(),
             vram_bytes,
+            _vram_reservation: vram_reservation,
         })
     }
 
@@ -1537,8 +1732,24 @@ impl GpuPassAccumulator {
         // Dos staging buffers permiten copiar/mapear dos chunks por submit.
         // Se reduce a la mitad el número de round-trips en acumuladores grandes
         // sin reservar un staging monolítico que dispare el pico de memoria.
-        let staging_count =
+        let preferred_staging_count =
             download_staging_count(total_bytes, self.vram_bytes, self.rt.vram_budget);
+        let staging_size = DOWNLOAD_CHUNK.min(total_bytes.max(16));
+        let (staging_count, _staging_vram_reservation) =
+            match self.rt.planetary_vram.try_reserve(
+                staging_size.saturating_mul(preferred_staging_count as u64),
+                "readback de acumulación planetaria",
+            ) {
+                Ok(reservation) => (preferred_staging_count, reservation),
+                Err(_) if preferred_staging_count > 1 => (
+                    1,
+                    self.rt.planetary_vram.try_reserve(
+                        staging_size,
+                        "readback de acumulación planetaria",
+                    )?,
+                ),
+                Err(error) => return Err(error),
+            };
         let staging: Vec<wgpu::Buffer> = (0..staging_count)
             .map(|i| {
                 self.rt.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1547,7 +1758,7 @@ impl GpuPassAccumulator {
                     } else {
                         "zas-staging-b"
                     }),
-                    size: DOWNLOAD_CHUNK.min(total_bytes.max(16)),
+                    size: staging_size,
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                     mapped_at_creation: false,
                 })
@@ -1678,7 +1889,8 @@ impl GpuPassAccumulator {
 // haya DEMOSTRADO producir el mismo resultado que la referencia.
 // ===========================================================================
 
-const PARITY_RMSE_TOLERANCE: f64 = 1.0; // ADU16
+const PARITY_RMSE_TOLERANCE: f64 = 0.003; // ADU16
+const PARITY_MAX_ABS_TOLERANCE: f64 = 1.0; // ADU16
 
 /// Corre todos los escenarios de paridad; devuelve el peor RMSE (ADU16).
 pub fn run_parity_check() -> Result<f64, String> {
@@ -2024,8 +2236,10 @@ fn parity_scenario(
     let down = gpu.finish()?;
 
     // ----------------------------- COMPARACIÓN -----------------------------
-    let rmse_plane = |cd: &[f64], cw: &[f64], gd: &[f64], gw_: &[f64]| -> (f64, usize) {
+    let rmse_plane =
+        |cd: &[f64], cw: &[f64], gd: &[f64], gw_: &[f64]| -> (f64, f64, usize) {
         let mut se = 0.0f64;
+        let mut max_abs = 0.0f64;
         let mut n = 0f64;
         let mut cover_mismatch = 0usize;
         for i in 0..n_out {
@@ -2040,31 +2254,33 @@ fn parity_scenario(
             }
             let d = cd[i] / cw[i] - gd[i] / gw_[i];
             se += d * d;
+            max_abs = max_abs.max(d.abs());
             n += 1.0;
         }
-        ((se / n.max(1.0)).sqrt(), cover_mismatch)
+        ((se / n.max(1.0)).sqrt(), max_abs, cover_mismatch)
     };
 
-    let (mut worst, mut mismatch) = rmse_plane(
+    let (mut worst, mut max_abs, mut mismatch) = rmse_plane(
         &cpu_g.direct,
         &cpu_g.direct_w,
         &down.direct_g,
         &down.direct_w,
     );
     if is_color {
-        let (r, m1) = rmse_plane(
+        let (r, r_max, m1) = rmse_plane(
             &cpu_r.direct,
             &cpu_r.direct_w,
             &down.direct_r,
             &down.direct_w,
         );
-        let (b, m2c) = rmse_plane(
+        let (b, b_max, m2c) = rmse_plane(
             &cpu_b.direct,
             &cpu_b.direct_w,
             &down.direct_b,
             &down.direct_w,
         );
         worst = worst.max(r).max(b);
+        max_abs = max_abs.max(r_max).max(b_max);
         mismatch = mismatch.max(m1).max(m2c);
     }
     if track_m2 && !cpu_g.m2.is_empty() {
@@ -2127,11 +2343,16 @@ fn parity_scenario(
         }
     }
     eprintln!(
-        "[paridad] escenario color={is_color} drz={drizzle} m2={track_m2} bounds={with_bounds}: rmse {worst:.4} ADU, cobertura difiere {mismatch}px"
+        "[paridad] escenario color={is_color} drz={drizzle} m2={track_m2} bounds={with_bounds}: rmse {worst:.4} ADU, max {max_abs:.4} ADU, cobertura difiere {mismatch}px"
     );
-    if mismatch > n_out / 200 {
+    if mismatch != 0 {
         return Err(format!(
-            "cobertura difiere en {mismatch} píxeles (> 0.5% de {n_out})"
+            "cobertura difiere en {mismatch} píxeles; el contrato exige cero diferencias"
+        ));
+    }
+    if max_abs > PARITY_MAX_ABS_TOLERANCE {
+        return Err(format!(
+            "diferencia máxima {max_abs:.4} ADU16 excede {PARITY_MAX_ABS_TOLERANCE:.1}"
         ));
     }
     Ok(worst)
@@ -2140,6 +2361,68 @@ fn parity_scenario(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_planetary_vram_reservation_is_raii_and_rejects_overcommit() {
+        let budget = PlanetaryVramBudget::new(100);
+        let first = budget.try_reserve(60, "test-a").unwrap();
+        assert_eq!(first.bytes(), 60);
+        assert_eq!(budget.used(), 60);
+        assert_eq!(budget.available(), 40);
+        let second = budget.try_reserve(40, "test-b").unwrap();
+        assert_eq!(budget.used(), 100);
+        assert_eq!(budget.high_water(), 100);
+        assert!(budget.try_reserve(1, "test-overflow").is_err());
+        drop(first);
+        assert_eq!(budget.used(), 40);
+        drop(second);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn shared_planetary_vram_arc_lease_delays_release_until_last_owner() {
+        let budget = PlanetaryVramBudget::new(128);
+        let cached = Arc::new(budget.try_reserve(96, "test-cache").unwrap());
+        let active_readback = Arc::clone(&cached);
+        drop(cached);
+        assert_eq!(budget.used(), 96);
+        drop(active_readback);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn shared_planetary_vram_contention_never_exceeds_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let budget = PlanetaryVramBudget::new(100);
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let both_attempted = Arc::new(std::sync::Barrier::new(3));
+        let successes = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let budget = budget.clone();
+            let start = Arc::clone(&start);
+            let both_attempted = Arc::clone(&both_attempted);
+            let successes = Arc::clone(&successes);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                let reservation = budget.try_reserve(60, "test-contended").ok();
+                if reservation.is_some() {
+                    successes.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                both_attempted.wait();
+                drop(reservation);
+            }));
+        }
+        start.wait();
+        both_attempted.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(successes.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(budget.high_water(), 60);
+        assert_eq!(budget.used(), 0);
+    }
 
     #[test]
     fn metal_unified_memory_budget_scales_without_endangering_small_macs() {

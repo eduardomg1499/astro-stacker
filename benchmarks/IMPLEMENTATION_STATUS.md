@@ -27,7 +27,9 @@ Zenith is faster or better than a named external engine.
   calibration-group selection, GPU cosmetic/debayer/star maps, Gaussian PSF
   centroids, RANSAC model selection and second refinement, similarity/affine/
   projective/local-distortion warps, PSF-signal and local normalization, GPU
-  mean/sigma/Winsorized/linear-fit integration, CPU tiled fallback methods,
+  mean/sigma/Winsorized integration and CPU tiled fallback methods. The former
+  rank-based "linear-fit" approximation is now blocked in UI, preflight and
+  runtime until a real robust frame-to-reference regression is implemented,
   mono/RGB/CFA drizzle, direct scientific float32 TIFF/FITS input, and
   scientific diagnostic maps.
 - Storage/failure handling: adaptive RAM/mmap/LZ4 frame store, versioned source
@@ -92,7 +94,7 @@ Zenith is faster or better than a named external engine.
 
 - `cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast`:
   336 passed, 0 failed, 20 environment/physical tests intentionally ignored. This
-  includes an end-to-end synthetic twenty-scenario manifest/report test.
+  includes an end-to-end synthetic manifest/report test for every scenario in the matrix.
 - `cargo test --manifest-path src-tauri/Cargo.toml -- --ignored --nocapture`:
   all 19 locally runnable tests passed (15 physical-GPU tests on Apple M5 / Metal,
   three real-FFmpeg exact-index tests and one debayer microbenchmark). The one
@@ -140,7 +142,7 @@ Zenith is faster or better than a named external engine.
 
 ## Evidence still required before enabling Auto or publishing superiority
 
-- Instantiate all twenty scenarios from `dataset-matrix.json` with real absolute
+- Instantiate every scenario from `dataset-matrix.json` with real absolute
   paths, exact recipes, current Zenith CPU baselines, cold/warm telemetry, and
   external-engine masters/logs.
 - Run the release matrix on Apple M1 or newer and available Windows NVIDIA, AMD,

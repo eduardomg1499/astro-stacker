@@ -261,6 +261,39 @@ fn select_signal_frame_from_source(
         .ok_or_else(|| "El origen no entregó candidatos de referencia".into())
 }
 
+fn select_signal_frame_from_source_with_hardware(
+    source: &UnifiedFrameSource,
+    width: usize,
+    height: usize,
+    bpp: usize,
+    preferred_idx: usize,
+    hardware_backend: &str,
+) -> Result<(usize, Vec<u8>), String> {
+    let total = source.descriptor().frame_count.max(1);
+    let preferred = preferred_idx.min(total - 1);
+    let mut indices = vec![
+        0,
+        preferred,
+        (total / 10).min(total - 1),
+        (total / 4).min(total - 1),
+    ];
+    indices.sort_unstable();
+    indices.dedup();
+    let batch = source
+        .read_batch_with_hardware_strict(&indices, None, hardware_backend)
+        .or_else(|_| source.read_batch_with_hardware_strict(&[0], None, hardware_backend))?;
+    let mut best: Option<(usize, f32, Vec<u8>)> = None;
+    for (index, raw) in batch.indices.into_iter().zip(batch.frames) {
+        let (max_v, avg) = estimate_raw_frame_signal(&raw, width, height, bpp);
+        let score = max_v as f32 + avg * 8.0;
+        if best.as_ref().map_or(true, |candidate| score > candidate.1) {
+            best = Some((index, score, raw));
+        }
+    }
+    best.map(|(index, _, raw)| (index, raw))
+        .ok_or_else(|| "El backend hardware no entregó candidatos de referencia".into())
+}
+
 fn read_exact_source_frame(source: &UnifiedFrameSource, index: usize) -> Result<Vec<u8>, String> {
     source
         .read_batch(&[index], None)?
@@ -268,6 +301,19 @@ fn read_exact_source_frame(source: &UnifiedFrameSource, index: usize) -> Result<
         .into_iter()
         .next()
         .ok_or_else(|| format!("El origen no entregó el frame exacto {index}"))
+}
+
+fn read_exact_source_frame_hardware(
+    source: &UnifiedFrameSource,
+    index: usize,
+    backend: &str,
+) -> Result<Vec<u8>, String> {
+    source
+        .read_batch_with_hardware_strict(&[index], None, backend)?
+        .frames
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("El backend {backend} no entregó el frame exacto {index}"))
 }
 
 fn require_native_analysis_frame(
@@ -380,7 +426,9 @@ fn zenith_analysis_cache_suffix(
     requested_roi: Rect,
 ) -> String {
     let flow = if warping_analysis { "warp" } else { "global" };
-    // "_a10" persiste y valida el contrato completo. El sufijo incluye los
+    // "_a11" invalida los scores/AP derivados del contrato de contraste
+    // anterior (que restaba brillo fijo 100) y persiste el contrato completo.
+    // El sufijo incluye los
     // valores que cambian los píxeles analizados, no sólo `anchor.is_some()`:
     // CFA efectivo, ROI inicial exacta, coordenadas completas del ancla y el
     // target normalizado (hash estable y compacto para nombres portables).
@@ -404,7 +452,7 @@ fn zenith_analysis_cache_suffix(
         })
         .unwrap_or_else(|| "none".into());
     let mut suffix = format!(
-        "{}_zenith_ultimate_{}_a10_c{}_roi{}-{}-{}-{}_anc{}_t{:08x}",
+        "{}_zenith_ultimate_{}_a11_c{}_roi{}-{}-{}-{}_anc{}_t{:08x}",
         zenith_target_key(target_type, is_surface),
         flow,
         resolved_color_id,
@@ -415,7 +463,7 @@ fn zenith_analysis_cache_suffix(
         anchor_tag,
         target_hash,
     );
-    // Contrato radiométrico YUV422: los cachés a10 antiguos contenían words
+    // Contrato radiométrico YUV422: los cachés anteriores contenían words
     // Y+U/Y+V tratados como intensidad mono. Sólo YUV necesita invalidación;
     // los demás formatos conservan sus cachés bit-idénticos.
     if ser::ser_color_is_yuv422(resolved_color_id) {
@@ -473,7 +521,7 @@ fn validate_analysis_cache(
     let contract = cached
         .contract
         .as_ref()
-        .ok_or("falta el contrato a10")?;
+        .ok_or("falta el contrato a11")?;
     if contract != &expected.contract(contract.resolved_roi) {
         return Err("los parámetros del análisis no coinciden".into());
     }
@@ -1277,6 +1325,63 @@ fn ap_grid_quality(
     }
 }
 
+/// Candidato local planetario ligado a la posición estable que ocupa dentro
+/// de `frame_stats`. El `frame_idx` se conserva por separado porque el cache
+/// permite índices únicos pero no exige que estén ordenados ni sean contiguos.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlanetaryLocalCandidate {
+    frame_position: usize,
+    frame_idx: usize,
+    score: u64,
+}
+
+#[derive(Debug)]
+struct PlanetaryApPreselection {
+    best_score: u64,
+    protected: Vec<PlanetaryLocalCandidate>,
+}
+
+#[inline]
+fn planetary_local_rank_order(
+    a: &PlanetaryLocalCandidate,
+    b: &PlanetaryLocalCandidate,
+) -> std::cmp::Ordering {
+    b.score
+        .cmp(&a.score)
+        .then_with(|| a.frame_idx.cmp(&b.frame_idx))
+}
+
+/// Conserva exactamente el mismo top-N (incluido el desempate por `frame_idx`)
+/// que la implementación histórica. El vector queda ordenado para emitir los
+/// votos preliminares y sólo se retiene el pequeño suelo local que necesitará
+/// la segunda pasada.
+fn prepare_planetary_ap_preselection(
+    candidates: &mut Vec<PlanetaryLocalCandidate>,
+    num_to_stack: usize,
+    protected_count: usize,
+) -> Result<PlanetaryApPreselection, String> {
+    if num_to_stack < candidates.len() {
+        candidates.select_nth_unstable_by(num_to_stack, planetary_local_rank_order);
+        candidates.truncate(num_to_stack);
+    }
+    candidates.sort_unstable_by(planetary_local_rank_order);
+
+    let mut protected = Vec::new();
+    protected
+        .try_reserve_exact(protected_count.min(candidates.len()))
+        .map_err(|error| format!("No se pudo reservar el suelo local AP: {error}"))?;
+    protected.extend(
+        candidates
+            .iter()
+            .take(protected_count)
+            .copied(),
+    );
+    Ok(PlanetaryApPreselection {
+        best_score: candidates.first().map_or(0, |candidate| candidate.score),
+        protected,
+    })
+}
+
 fn raw_to_analysis_mono_into(
     raw: &[u8],
     width: usize,
@@ -1641,67 +1746,23 @@ fn process_analysis_frame(
             None
         };
         if let Some((guess_dx, guess_dy)) = gpu_seed {
-            // A1 (2026-07-17): la ventana fina ±16 se evalúa DENSA en GPU
-            // (mismas sumas enteras sobre la misma caja interior) y la CPU
-            // conserva el argmin con la política exacta del barrido de
-            // referencia y el subpíxel original — bit-idéntico. Era el coste
-            // dominante del análisis de superficie: 628 ms/frame de CPU
-            // memory-bound a 20MP (1292 s de los 386 s de pared medidos).
-            // Cualquier fallo GPU o candidato no evaluable cae a la ruta CPU
-            // completa de siempre.
-            let dense = if gpu_frame_active {
-                match crate::gpu_analysis::search_sad_dense_window(
-                    anchor_mono_ref,
-                    &buffers.lap_out,
-                    hw,
-                    hh,
-                    search_x,
-                    search_y,
-                    search_w,
-                    search_h,
-                    guess_dx,
-                    guess_dy,
-                    16,
-                ) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        if let Some(failed) = gpu_analysis_failed {
-                            failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            if let Some((fidx, fidy, fsad)) = dense {
-                crate::alignment::subpixel_after_integer_sad(
-                    anchor_mono_ref,
-                    &buffers.lap_out,
-                    hw,
-                    search_x,
-                    search_y,
-                    search_w,
-                    search_h,
-                    fidx,
-                    fidy,
-                    fsad,
-                )
-            } else {
-                crate::alignment::refine_best_match_sad_offset(
-                    anchor_mono_ref,
-                    &buffers.lap_out,
-                    hw,
-                    hh,
-                    search_x,
-                    search_y,
-                    search_w,
-                    search_h,
-                    guess_dx,
-                    guess_dy,
-                    16,
-                )
-            }
+            // P0: CPU vuelve a ser el oráculo del SAD fino por frame. El
+            // kernel denso GPU permanece únicamente como fixture de paridad y
+            // benchmark; alternar coarse/fine aquí reconstruía recursos bajo
+            // mutex y añadía un readback por frame en superficie grande.
+            crate::alignment::refine_best_match_sad_offset(
+                anchor_mono_ref,
+                &buffers.lap_out,
+                hw,
+                hh,
+                search_x,
+                search_y,
+                search_w,
+                search_h,
+                guess_dx,
+                guess_dy,
+                16,
+            )
         } else {
             crate::alignment::find_best_match_sad_pyramid_offset(
                 anchor_mono_ref,
@@ -1835,13 +1896,82 @@ fn ram_aware_analysis_threads(rw: usize, rh: usize, is_color: bool, is_ffmpeg: b
     by_ram.min(hw)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum DecodeContract {
+    AnalysisGreen16,
+    StackNative16,
+}
+
 #[derive(Clone, Debug)]
 struct FfmpegDecodeProbe {
     prefer_hardware: bool,
     hardware_confirmed: bool,
     hardware_seconds: Option<f32>,
     cpu_seconds: Option<f32>,
+    hardware_samples_ms: Vec<f64>,
+    cpu_samples_ms: Vec<f64>,
     backend: Option<String>,
+    parity_passed: bool,
+    sample_count: usize,
+    deferred_by_pressure: bool,
+}
+
+fn decode_probe_from_persisted_observation(
+    observation: &crate::planetary_planner::CalibrationObservation,
+    confirmed_backend: &str,
+) -> Option<FfmpegDecodeProbe> {
+    if observation.stage != PlanetaryStage::Decode
+        || !observation.parity_passed
+        || observation.backend.as_deref() != Some(confirmed_backend)
+    {
+        return None;
+    }
+    let evaluation = crate::planetary_planner::evaluate_calibration(observation);
+    if evaluation.samples < 3 || !evaluation.stable {
+        return None;
+    }
+    Some(FfmpegDecodeProbe {
+        prefer_hardware: evaluation.accelerated_wins,
+        hardware_confirmed: true,
+        hardware_seconds: evaluation
+            .accelerated_median_ms
+            .is_finite()
+            .then_some((evaluation.accelerated_median_ms / 1000.0) as f32),
+        cpu_seconds: evaluation
+            .cpu_median_ms
+            .is_finite()
+            .then_some((evaluation.cpu_median_ms / 1000.0) as f32),
+        hardware_samples_ms: observation.accelerated_ms.clone(),
+        cpu_samples_ms: observation.cpu_ms.clone(),
+        backend: Some(confirmed_backend.to_string()),
+        parity_passed: true,
+        sample_count: evaluation.samples,
+        deferred_by_pressure: false,
+    })
+}
+
+fn ffmpeg_decode_attempt_order(policy: DecodePolicy, prefer_hardware: bool) -> Vec<bool> {
+    match policy {
+        DecodePolicy::Hardware => vec![true],
+        DecodePolicy::Software => vec![false],
+        DecodePolicy::Auto if prefer_hardware => vec![true, false],
+        DecodePolicy::Auto => vec![false],
+    }
+}
+
+fn ffmpeg_decode_uses_hardware(
+    policy: DecodePolicy,
+    prefer_hardware: bool,
+    force_cpu_decode: bool,
+) -> Result<bool, String> {
+    match policy {
+        DecodePolicy::Hardware if force_cpu_decode => {
+            Err("Decode Hardware strict no permite fallback CPU".into())
+        }
+        DecodePolicy::Hardware => Ok(true),
+        DecodePolicy::Software => Ok(false),
+        DecodePolicy::Auto => Ok(!force_cpu_decode && prefer_hardware),
+    }
 }
 
 fn ffmpeg_runtime_identity(ffmpeg: &str) -> String {
@@ -1944,11 +2074,67 @@ fn confirmed_ffmpeg_hardware_backend(log: &str, process_ok: bool) -> Option<Stri
         .map(|(backend, _)| (*backend).to_string())
 }
 
-/// Micro-benchmark reproducible del decode. `-hwaccel auto` por sí solo NO es
-/// evidencia de GPU: se exige que FFmpeg anuncie un backend de hardware en su
-/// log verbose y además que el bloque corto sea realmente más rápido que CPU.
-/// La decisión se cachea por fingerprint de origen para que análisis/apilado
-/// compartan el resultado sin repetir procesos de prueba.
+fn decode_sample_parity_passes(
+    cpu: &[u8],
+    accelerated: &[u8],
+    sample_bits: usize,
+    frame_bytes: usize,
+) -> bool {
+    if cpu.len() != accelerated.len()
+        || cpu.is_empty()
+        || cpu.len() % 2 != 0
+        || frame_bytes == 0
+        || cpu.len() % frame_bytes != 0
+    {
+        return false;
+    }
+    let source_bits = sample_bits.clamp(1, 16);
+    let source_lsb_u16 = (1u32 << (16 - source_bits)) as f64;
+    let mut sum_sq = 0.0f64;
+    let mut max_difference = 0u32;
+    for (cpu_pair, accelerated_pair) in cpu.chunks_exact(2).zip(accelerated.chunks_exact(2)) {
+        let a = u16::from_le_bytes([cpu_pair[0], cpu_pair[1]]) as i32;
+        let b = u16::from_le_bytes([accelerated_pair[0], accelerated_pair[1]]) as i32;
+        let difference = a.abs_diff(b);
+        max_difference = max_difference.max(difference);
+        sum_sq += (difference as f64) * (difference as f64);
+    }
+    let samples = (cpu.len() / 2).max(1) as f64;
+    let rmse = (sum_sq / samples).sqrt();
+    if rmse > 0.25 * source_lsb_u16 || max_difference as f64 > source_lsb_u16 {
+        return false;
+    }
+
+    // El gate de decode incluye el orden relativo de textura de los cuadros,
+    // no sólo el error píxel a píxel: una ruta que altere el ranking lucky no
+    // es elegible aunque su RMSE medio sea pequeño.
+    let rank = |bytes: &[u8]| {
+        let mut scores: Vec<(usize, u128)> = bytes
+            .chunks_exact(frame_bytes)
+            .enumerate()
+            .map(|(index, frame)| {
+                let mut previous = None;
+                let mut score = 0u128;
+                for pair in frame.chunks_exact(2) {
+                    let value = u16::from_le_bytes([pair[0], pair[1]]);
+                    if let Some(prior) = previous {
+                        score = score.saturating_add(value.abs_diff(prior) as u128);
+                    }
+                    previous = Some(value);
+                }
+                (index, score)
+            })
+            .collect();
+        scores.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        scores.into_iter().map(|(index, _)| index).collect::<Vec<_>>()
+    };
+    rank(cpu) == rank(accelerated)
+}
+
+/// Micro-benchmark reproducible del decode por contrato completo. `Software`
+/// no lanza una prueba HW; `Hardware` exige backend y paridad en preflight;
+/// `Auto` sólo acepta HW con tres lotes calientes, CV <=10 %, speedup >=10 %
+/// y paridad respecto al plano canónico CPU.
 fn benchmark_ffmpeg_decode_route(
     ffmpeg: &str,
     path: &str,
@@ -1956,60 +2142,119 @@ fn benchmark_ffmpeg_decode_route(
     color_id: i32,
     width: usize,
     height: usize,
+    total_frames: usize,
     rotation: i32,
+    sample_bits: usize,
+    policy: DecodePolicy,
+    contract: DecodeContract,
     cancel: Option<&PlanetaryJobToken>,
-) -> FfmpegDecodeProbe {
+    calibration_profile: Option<&Path>,
+) -> Result<FfmpegDecodeProbe, String> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<HashMap<String, FfmpegDecodeProbe>>> = OnceLock::new();
 
     let source_fingerprint = planetary_source_fingerprint(path).unwrap_or_default();
     let key = format!(
-        "ffmpeg-route-v3|{}|{}|{}|{}|{}|{}|{}|{}",
+        "ffmpeg-route-v5|ffmpeg={}|path={path}|codec={codec}|source={source_fingerprint}|color={color_id}|geometry={width}x{height}|frames={total_frames}|rotation={rotation}|bits={sample_bits}|policy={policy:?}|contract={contract:?}",
         ffmpeg_runtime_identity(ffmpeg),
-        path,
-        codec,
-        source_fingerprint,
-        color_id,
-        width,
-        height,
-        rotation,
     );
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(v) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned() {
-        return v;
+        return Ok(v);
     }
 
-    let run = |hardware: bool| -> (Option<f32>, String, bool, bool) {
+    if matches!(policy, DecodePolicy::Software) {
+        let probe = FfmpegDecodeProbe {
+            prefer_hardware: false,
+            hardware_confirmed: false,
+            hardware_seconds: None,
+            cpu_seconds: None,
+            hardware_samples_ms: Vec::new(),
+            cpu_samples_ms: Vec::new(),
+            backend: None,
+            parity_passed: true,
+            sample_count: 0,
+            deferred_by_pressure: false,
+        };
+        cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, probe.clone());
+        return Ok(probe);
+    }
+
+    // No calibrar seis rutas completas mientras otra aplicación ya consume
+    // CPU/RAM: esa medición no representa el siguiente trabajo y, en 20 MP,
+    // añadía decenas de segundos antes del primer frame. Auto conserva la ruta
+    // software canónica para este plan; una ejecución posterior sin presión
+    // volverá a calibrar porque este resultado deliberadamente no se persiste
+    // ni entra al caché de sesión.
+    if matches!(policy, DecodePolicy::Auto) {
+        let pressure = crate::planetary_planner::capture_runtime_resource_pressure();
+        if crate::planetary_planner::should_defer_calibration(pressure) {
+            eprintln!(
+                "[ffmpeg-calibration] diferida por presión de recursos: cpu={}%, memory_pressure={}",
+                pressure.cpu_load_percent, pressure.memory_pressure
+            );
+            return Ok(FfmpegDecodeProbe {
+                prefer_hardware: false,
+                hardware_confirmed: false,
+                hardware_seconds: None,
+                cpu_seconds: None,
+                hardware_samples_ms: Vec::new(),
+                cpu_samples_ms: Vec::new(),
+                backend: None,
+                parity_passed: true,
+                sample_count: 0,
+                deferred_by_pressure: true,
+            });
+        }
+    }
+
+    let is_color_probe = ffmpeg_stream_is_color(color_id);
+    let native_color = is_color_probe && matches!(contract, DecodeContract::StackNative16);
+    let p_fmt = if native_color { "rgb48le" } else { "gray16le" };
+    let output_bpp = if native_color { 6usize } else { 2usize };
+    let build_filters = |output_width: usize,
+                         output_height: usize,
+                         sample_indices: Option<&[usize]>| {
+        let mut filters = Vec::new();
+        if let Some(indices) = sample_indices.filter(|indices| !indices.is_empty()) {
+            let expression = indices
+                .iter()
+                .map(|index| format!("eq(n\\,{index})"))
+                .collect::<Vec<_>>()
+                .join("+");
+            filters.push(format!("select={expression}"));
+        }
+        if let Some(rotation_filter) = ffmpeg_rotation_filter(rotation) {
+            filters.push(rotation_filter.to_string());
+        }
+        filters.push(format!("scale={output_width}:{output_height}:flags=neighbor"));
+        if is_color_probe && matches!(contract, DecodeContract::AnalysisGreen16) {
+            filters.push("format=rgb48le".into());
+            filters.push("extractplanes=g".into());
+        }
+        filters.push(format!("format={p_fmt}"));
+        filters.join(",")
+    };
+
+    let run = |hardware_backend: Option<&str>| -> (Option<f64>, Option<String>, bool, bool) {
         use std::io::Read;
         let mut cmd = Command::new(ffmpeg);
         #[cfg(target_os = "windows")]
         cmd.creation_flags(0x08000000);
         cmd.args(["-hide_banner", "-nostdin", "-loglevel", "verbose", "-benchmark"]);
-        if hardware {
-            cmd.args(["-hwaccel", "auto"]);
+        if let Some(backend) = hardware_backend {
+            cmd.args(["-hwaccel", backend]);
         }
-        // El benchmark sólo necesita decidir qué decoder gana. Para vídeo de
-        // color reproduce la ruta de análisis G16, no materializa RGB48: el
-        // backend de codec es el mismo y se recortan 2/3 de los bytes de salida.
-        let is_color_probe = ffmpeg_stream_is_color(color_id);
-        let p_fmt = "gray16le";
-        let mut filters = Vec::new();
-        if let Some(rotation_filter) = ffmpeg_rotation_filter(rotation) {
-            filters.push(rotation_filter.to_string());
-        }
-        filters.push(format!("scale={width}:{height}:flags=neighbor"));
-        if is_color_probe {
-            filters.push("format=rgb48le".into());
-            filters.push("extractplanes=g".into());
-        }
-        filters.push(format!("format={p_fmt}"));
-        let filter = filters.join(",");
+        let filter = build_filters(width, height, None);
         // Antes eran 24 frames por ruta sin importar resolución: a 3312×5888
         // equivalían a 2.6 GiB RGB por prueba. Acotar por bytes conserva varias
         // muestras para calentar el decoder y evita castigar vídeo 4K/8K.
         const PROBE_TARGET_BYTES: usize = 192 * 1024 * 1024;
-        let output_bytes_per_frame = width.saturating_mul(height).saturating_mul(2).max(1);
+        let output_bytes_per_frame = width
+            .saturating_mul(height)
+            .saturating_mul(output_bpp)
+            .max(1);
         let probe_frames = PROBE_TARGET_BYTES
             .saturating_add(output_bytes_per_frame - 1)
             / output_bytes_per_frame;
@@ -2051,7 +2296,7 @@ fn benchmark_ffmpeg_decode_route(
             .stderr(std::process::Stdio::piped())
             .spawn();
         let Ok(mut child) = spawned else {
-            return (None, String::new(), false, false);
+            return (None, None, false, false);
         };
         let stderr = child.stderr.take();
         let log_thread = std::thread::spawn(move || {
@@ -2092,50 +2337,606 @@ fn benchmark_ffmpeg_decode_route(
         };
         let log = log_thread.join().unwrap_or_default();
         let ok = !aborted && status.is_some_and(|status| status.success());
-        (
-            ok.then_some(started.elapsed().as_secs_f32()),
-            log,
-            ok,
-            aborted,
-        )
+        let confirmed_backend = hardware_backend
+            .and_then(|_| confirmed_ffmpeg_hardware_backend(&log, ok));
+        (ok.then_some(started.elapsed().as_secs_f64()), confirmed_backend, ok, aborted)
     };
 
-    let (hw_s, hw_log, hw_ok, hw_aborted) = run(true);
-    let (cpu_s, _, cpu_ok, cpu_aborted) = if hw_aborted && cancel.is_some_and(PlanetaryJobToken::is_cancelled) {
-        (None, String::new(), false, true)
-    } else {
-        run(false)
+    let (warm_hw_seconds, backend, warm_hw_ok, warm_hw_aborted) = run(Some("auto"));
+    if warm_hw_aborted && cancel.is_some_and(PlanetaryJobToken::is_cancelled) {
+        return Err("Calibración FFmpeg cancelada".into());
+    }
+    let Some(backend) = backend.filter(|_| warm_hw_ok) else {
+        if matches!(policy, DecodePolicy::Hardware) {
+            return Err("Decode Hardware solicitado, pero FFmpeg no confirmó un backend compatible en preflight".into());
+        }
+        let probe = FfmpegDecodeProbe {
+            prefer_hardware: false,
+            hardware_confirmed: false,
+            hardware_seconds: warm_hw_seconds.map(|seconds| seconds as f32),
+            cpu_seconds: None,
+            hardware_samples_ms: Vec::new(),
+            cpu_samples_ms: Vec::new(),
+            backend: None,
+            parity_passed: false,
+            sample_count: 0,
+            deferred_by_pressure: false,
+        };
+        cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, probe.clone());
+        return Ok(probe);
     };
-    let backend = confirmed_ffmpeg_hardware_backend(&hw_log, hw_ok);
-    // Algunos builds escriben el nombre del decoder como h264_videotoolbox,
-    // hevc_qsv, etc.; los marcadores anteriores también los capturan.
-    let confirmed = backend.is_some();
-    let faster = match (hw_s, cpu_s) {
-        // Un margen pequeño evita elegir GPU por ruido de creación de procesos
-        // cuando ambas rutas son esencialmente equivalentes.
-        (Some(h), Some(c)) => h <= c * 0.95,
-        (Some(_), None) => true,
+
+    // La confirmación caliente anterior verifica que el backend sigue vivo en
+    // esta sesión. Después de ella podemos reutilizar las tres muestras
+    // persistidas sin repetir seis decodes completos al reiniciar la app.
+    // La clave incluye fuente, contrato, FFmpeg, app, SO, CPU y backend; el
+    // store añade además su versión de algoritmo/esquema.
+    let mut identity_system = System::new_all();
+    identity_system.refresh_cpu();
+    let cpu_identity = identity_system
+        .cpus()
+        .first()
+        .map(|cpu| cpu.brand().trim())
+        .unwrap_or("unknown-cpu");
+    let persistent_key = format!(
+        "ffmpeg-decode-profile-v1|app={}|os={}|arch={}|cpu={}|cores={}|backend={}|{}",
+        env!("CARGO_PKG_VERSION"),
+        sysinfo::System::long_os_version().unwrap_or_else(|| std::env::consts::OS.into()),
+        std::env::consts::ARCH,
+        cpu_identity,
+        identity_system.physical_core_count().unwrap_or_else(num_cpus::get_physical),
+        backend,
+        key,
+    );
+    if matches!(policy, DecodePolicy::Auto) {
+        if let Some(profile_path) = calibration_profile {
+            if let Some(observation) = crate::planetary_planner::load_calibration(
+                profile_path,
+                &persistent_key,
+                PlanetaryStage::Decode,
+            ) {
+                if let Some(probe) =
+                    decode_probe_from_persisted_observation(&observation, &backend)
+                {
+                    cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(key, probe.clone());
+                    return Ok(probe);
+                }
+            }
+        }
+    }
+
+    let sample_width = width.min(512).max(1);
+    let sample_height = height.min(512).max(1);
+    let mut sample_indices = vec![0usize];
+    if total_frames > 1 {
+        sample_indices.push(total_frames / 2);
+        sample_indices.push(total_frames.saturating_sub(1));
+    }
+    sample_indices.sort_unstable();
+    sample_indices.dedup();
+    let sample_frames = sample_indices.len();
+    let frame_bytes = sample_width
+        .saturating_mul(sample_height)
+        .saturating_mul(output_bpp);
+    let capture = |hardware_backend: Option<&str>| -> Result<(Vec<u8>, Option<String>), String> {
+        let mut cmd = Command::new(ffmpeg);
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(0x08000000);
+        cmd.args(["-hide_banner", "-nostdin", "-loglevel", "verbose"]);
+        if let Some(backend) = hardware_backend {
+            cmd.args(["-hwaccel", backend]);
+        }
+        let filter = build_filters(sample_width, sample_height, Some(&sample_indices));
+        let sample_frames_arg = sample_frames.to_string();
+        cmd.args([
+            "-noautorotate",
+            "-i",
+            path,
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            &sample_frames_arg,
+            "-an",
+            "-sn",
+            "-fps_mode",
+            "passthrough",
+            "-vf",
+            &filter,
+            "-pix_fmt",
+            p_fmt,
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ]);
+        let cancel_check = cancel.map(|token| {
+            let token = token.clone();
+            Arc::new(move || token.is_cancelled()) as FfmpegCancelCheck
+        });
+        let output = run_command_supervised(
+            cmd,
+            std::time::Duration::from_secs(12),
+            cancel_check.as_ref(),
+            "preflight de paridad FFmpeg",
+        )?;
+        if !output.status.success() {
+            return Err(format!("FFmpeg falló durante paridad: {}", output.status));
+        }
+        let log = String::from_utf8_lossy(&output.stderr);
+        let observed = hardware_backend
+            .and_then(|_| confirmed_ffmpeg_hardware_backend(&log, true));
+        if hardware_backend.is_some() && observed.as_deref() != hardware_backend {
+            return Err(format!(
+                "FFmpeg no confirmó el backend {}; observado {}",
+                hardware_backend.unwrap_or_default(),
+                observed.as_deref().unwrap_or("software/indeterminado")
+            ));
+        }
+        let complete = output.stdout.len() / frame_bytes * frame_bytes;
+        if complete == 0 {
+            return Err("FFmpeg no entregó un frame completo para paridad".into());
+        }
+        Ok((output.stdout[..complete].to_vec(), observed))
+    };
+    let parity_passed = match (capture(None), capture(Some(&backend))) {
+        (Ok((cpu, _)), Ok((accelerated, observed))) if observed.as_deref() == Some(&backend) => {
+            let frames = cpu.len() / frame_bytes;
+            frames == sample_frames
+                && cpu.len() == accelerated.len()
+                && decode_sample_parity_passes(&cpu, &accelerated, sample_bits, frame_bytes)
+        }
         _ => false,
     };
-    let probe = FfmpegDecodeProbe {
-        prefer_hardware: confirmed && faster,
-        hardware_confirmed: confirmed,
-        hardware_seconds: hw_s,
-        cpu_seconds: cpu_s.filter(|_| cpu_ok),
-        backend,
-    };
-    // Un timeout puede ser una decisión reproducible (CPU), pero una
-    // cancelación pertenece sólo al job actual y nunca debe contaminar el
-    // cache de selección de ruta para la siguiente operación.
-    if !(hw_aborted || cpu_aborted) || !cancel.is_some_and(PlanetaryJobToken::is_cancelled) {
+    if !parity_passed {
+        if matches!(policy, DecodePolicy::Hardware) {
+            return Err("Decode Hardware rechazado: no igualó el plano canónico CPU dentro del gate científico".into());
+        }
+        let probe = FfmpegDecodeProbe {
+            prefer_hardware: false,
+            hardware_confirmed: true,
+            hardware_seconds: warm_hw_seconds.map(|seconds| seconds as f32),
+            cpu_seconds: None,
+            hardware_samples_ms: Vec::new(),
+            cpu_samples_ms: Vec::new(),
+            backend: Some(backend),
+            parity_passed: false,
+            sample_count: 0,
+            deferred_by_pressure: false,
+        };
         cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, probe.clone());
+        return Ok(probe);
     }
-    probe
+
+    if matches!(policy, DecodePolicy::Hardware) {
+        let probe = FfmpegDecodeProbe {
+            prefer_hardware: true,
+            hardware_confirmed: true,
+            hardware_seconds: warm_hw_seconds.map(|seconds| seconds as f32),
+            cpu_seconds: None,
+            hardware_samples_ms: warm_hw_seconds
+                .map(|seconds| vec![seconds * 1000.0])
+                .unwrap_or_default(),
+            cpu_samples_ms: Vec::new(),
+            backend: Some(backend),
+            parity_passed: true,
+            sample_count: 1,
+            deferred_by_pressure: false,
+        };
+        cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, probe.clone());
+        return Ok(probe);
+    }
+
+    // Auto: warm-up CPU y después tres pares alternados sobre la ruta completa.
+    let (_, _, warm_cpu_ok, warm_cpu_aborted) = run(None);
+    if warm_cpu_aborted && cancel.is_some_and(PlanetaryJobToken::is_cancelled) {
+        return Err("Calibración FFmpeg cancelada".into());
+    }
+    let mut accelerated_ms = Vec::with_capacity(3);
+    let mut cpu_ms = Vec::with_capacity(3);
+    let mut all_ok = warm_cpu_ok;
+    for _ in 0..3 {
+        let (hardware_seconds, observed, hardware_ok, hardware_aborted) = run(Some(&backend));
+        let (cpu_seconds, _, cpu_ok, cpu_aborted) = run(None);
+        if (hardware_aborted || cpu_aborted)
+            && cancel.is_some_and(PlanetaryJobToken::is_cancelled)
+        {
+            return Err("Calibración FFmpeg cancelada".into());
+        }
+        all_ok &= hardware_ok && cpu_ok && observed.as_deref() == Some(&backend);
+        if let Some(seconds) = hardware_seconds {
+            accelerated_ms.push(seconds * 1000.0);
+        }
+        if let Some(seconds) = cpu_seconds {
+            cpu_ms.push(seconds * 1000.0);
+        }
+    }
+    // La paridad de tres frames no basta si cualquiera de las seis corridas
+    // cronometradas terminó mal o FFmpeg dejó de confirmar el backend. Ese
+    // estado operativo forma parte del gate y no puede perderse al persistir
+    // sólo los vectores de tiempos.
+    let route_confirmed = all_ok
+        && cpu_ms.len() == 3
+        && accelerated_ms.len() == 3
+        && parity_passed;
+    let observation = crate::planetary_planner::CalibrationObservation::new(
+        crate::pipeline::PlanetaryStage::Decode,
+        cpu_ms.clone(),
+        accelerated_ms.clone(),
+        route_confirmed,
+        Some(backend.clone()),
+    );
+    let evaluation = crate::planetary_planner::evaluate_calibration(&observation);
+    let probe = FfmpegDecodeProbe {
+        prefer_hardware: route_confirmed && evaluation.accelerated_wins,
+        hardware_confirmed: route_confirmed,
+        hardware_seconds: evaluation
+            .accelerated_median_ms
+            .is_finite()
+            .then_some((evaluation.accelerated_median_ms / 1000.0) as f32),
+        cpu_seconds: evaluation
+            .cpu_median_ms
+            .is_finite()
+            .then_some((evaluation.cpu_median_ms / 1000.0) as f32),
+        hardware_samples_ms: accelerated_ms,
+        cpu_samples_ms: cpu_ms,
+        backend: Some(backend),
+        parity_passed: route_confirmed,
+        sample_count: evaluation.samples,
+        deferred_by_pressure: false,
+    };
+    if route_confirmed && evaluation.samples >= 3 {
+        if let Some(profile_path) = calibration_profile {
+            if let Err(error) = crate::planetary_planner::save_calibration(
+                profile_path,
+                &persistent_key,
+                observation.clone(),
+            ) {
+                eprintln!("[planner] no se pudo persistir la calibración FFmpeg: {error}");
+            }
+        }
+    }
+    cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, probe.clone());
+    Ok(probe)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_planetary_plan_draft(
+    app: &tauri::AppHandle,
+    plan_id: &str,
+    descriptor: &crate::frame_source::FrameDescriptor,
+    codec: Option<&str>,
+    ffmpeg_path: Option<&str>,
+    target_type: &str,
+    is_surface: bool,
+    selected_frames: usize,
+    ap_count: usize,
+    ap_size: u32,
+    drizzle: f32,
+    double_pass: bool,
+    roi: Option<[u32; 4]>,
+    compute_policy: ComputePolicy,
+    decode_policy: DecodePolicy,
+    quality_policy: QualityPolicy,
+    decode_probe: Option<&FfmpegDecodeProbe>,
+) -> Result<PlanetaryExecutionPlan, String> {
+    let mut workload = crate::planetary_planner::build_workload_signature(
+        crate::planetary_planner::PlanetaryWorkloadContext {
+            descriptor,
+            codec,
+            target_type,
+            is_surface,
+            selected_frames,
+            ap_count,
+            ap_size,
+            drizzle,
+            double_pass,
+            roi,
+        },
+    );
+    workload.quality_policy = quality_policy;
+    let confirmed_decode_backends = decode_probe
+        .filter(|probe| probe.hardware_confirmed && probe.parity_passed)
+        .and_then(|probe| probe.backend.clone())
+        .into_iter()
+        .collect();
+    let resources = crate::planetary_planner::capture_resource_snapshot(
+        ffmpeg_path.map(ffmpeg_runtime_identity),
+        confirmed_decode_backends,
+        compute_policy.allows_gpu(),
+    );
+    let gpu_available = resources.gpu_available && compute_policy.allows_gpu();
+    let preprocess_parity = gpu_available && crate::gpu_analysis::ensure_parity();
+    let coarse_sad_parity = gpu_available && crate::gpu_analysis::ensure_sad_parity();
+    let enhance_parity = gpu_available && crate::gpu_analysis::ensure_enhance_parity();
+    let accumulation_parity = gpu_available && crate::gpu_stack::ensure_parity();
+    let mut plan = crate::planetary_planner::build_safe_plan_draft(
+        plan_id,
+        workload,
+        resources,
+        compute_policy,
+        decode_policy,
+        crate::planetary_planner::PlannerCapabilities {
+            gpu_available,
+            preprocess_parity,
+            coarse_sad_parity,
+            enhance_parity,
+            accumulation_parity,
+        },
+    )?;
+    plan.requested_quality_policy = quality_policy;
+    plan.quality_plan = PlanetaryQualityPlan::for_workload(&plan.workload, quality_policy);
+
+    let profile_path = app
+        .path()
+        .app_config_dir()
+        .ok()
+        .map(|directory| crate::planetary_planner::calibration_profile_path(&directory));
+    if let Some(path) = profile_path.as_deref() {
+        for stage in [
+            PlanetaryStage::Decode,
+            PlanetaryStage::Preprocess,
+            PlanetaryStage::CoarseSad,
+            PlanetaryStage::Enhance,
+            PlanetaryStage::Accumulation,
+        ] {
+            let key = crate::planetary_planner::calibration_key(
+                &plan.workload,
+                &plan.resources,
+                stage,
+            );
+            if let Some(observation) =
+                crate::planetary_planner::load_calibration(path, &key, stage)
+            {
+                let _ = crate::planetary_planner::apply_calibration(&mut plan, &observation);
+            }
+        }
+    }
+
+    if descriptor.source_kind.eq_ignore_ascii_case("ffmpeg") {
+        let probe = decode_probe.ok_or("FFmpeg no tiene resultado de preflight de decode")?;
+        // Conservar las tres muestras reales: repetir la mediana convertiría
+        // artificialmente una medición ruidosa en CV=0 y podría seleccionar HW
+        // contra el veredicto del preflight.
+        let cpu_ms = probe.cpu_samples_ms.clone();
+        let accelerated_ms = probe.hardware_samples_ms.clone();
+        let observation = crate::planetary_planner::CalibrationObservation::new(
+            PlanetaryStage::Decode,
+            cpu_ms,
+            accelerated_ms,
+            probe.parity_passed,
+            probe.backend.clone(),
+        );
+        let calibration_deferred = matches!(decode_policy, DecodePolicy::Auto)
+            && probe.deferred_by_pressure;
+        if calibration_deferred {
+            if let Some(mut decision) = plan.stage(PlanetaryStage::Decode).cloned() {
+                let detail = format!(
+                    "presión externa: CPU {}%, RAM disponible {} MB, swap {} MB; calibración nueva diferida para no medir una ruta contaminada",
+                    plan.resources.cpu_load_percent,
+                    plan.resources.ram_available_mb,
+                    plan.resources.swap_used_mb,
+                );
+                decision.reason_detail = Some(match decision.reason_detail.take() {
+                    Some(previous) if decision.calibration_samples >= 3 => {
+                        format!("{previous}; {detail}; se conserva el perfil compatible")
+                    }
+                    _ => detail,
+                });
+                if decision.calibration_samples < 3 {
+                    decision.reason = DecisionReason::SafeDefault;
+                }
+                plan.set_stage(decision)?;
+            }
+        } else {
+            crate::planetary_planner::apply_calibration(&mut plan, &observation)?;
+        }
+        if probe.sample_count >= 3 {
+            if let Some(path) = profile_path.as_deref() {
+                let key = crate::planetary_planner::calibration_key(
+                    &plan.workload,
+                    &plan.resources,
+                    PlanetaryStage::Decode,
+                );
+                if let Err(error) =
+                    crate::planetary_planner::save_calibration(path, &key, observation)
+                {
+                    log_to_front(
+                        app,
+                        "WARN",
+                        &format!("No se pudo persistir la calibración FFmpeg: {error}"),
+                    );
+                }
+            }
+        }
+    }
+    Ok(plan)
+}
+
+fn persist_and_apply_stage_calibration(
+    app: &tauri::AppHandle,
+    plan: &mut PlanetaryExecutionPlan,
+    observation: crate::planetary_planner::CalibrationObservation,
+) -> Result<crate::planetary_planner::CalibrationEvaluation, String> {
+    let stage = observation.stage;
+    let evaluation = crate::planetary_planner::apply_calibration(plan, &observation)?;
+    if evaluation.samples >= 3 {
+        if let Ok(config_dir) = app.path().app_config_dir() {
+            let path = crate::planetary_planner::calibration_profile_path(&config_dir);
+            let key = crate::planetary_planner::calibration_key(
+                &plan.workload,
+                &plan.resources,
+                stage,
+            );
+            if let Err(error) =
+                crate::planetary_planner::save_calibration(&path, &key, observation)
+            {
+                log_to_front(
+                    app,
+                    "WARN",
+                    &format!("No se pudo persistir la calibración de {stage:?}: {error}"),
+                );
+            }
+        }
+    }
+    Ok(evaluation)
+}
+
+fn completed_stage_telemetry(
+    plan: &PlanetaryExecutionPlan,
+    stage: PlanetaryStage,
+    elapsed: std::time::Duration,
+    items: usize,
+) -> StageTelemetry {
+    let decision = plan.stage(stage);
+    StageTelemetry {
+        stage,
+        effective_engine: decision
+            .map(|decision| decision.effective_engine)
+            .unwrap_or(EffectiveEngine::CpuSimd),
+        backend: decision.and_then(|decision| decision.backend.clone()),
+        estimated_ms: decision.and_then(|decision| decision.estimated_ms),
+        elapsed_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
+        wall_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
+        items_done: items,
+        items_total: items,
+        throughput_per_second: (elapsed.as_secs_f64() > 0.0)
+            .then_some(items as f64 / elapsed.as_secs_f64()),
+        scratch_slots: decision.map(|decision| decision.scratch_slots).unwrap_or(0),
+        scratch_high_water: decision.map(|decision| decision.scratch_slots).unwrap_or(0),
+        completed: true,
+        ..StageTelemetry::default()
+    }
+}
+
+/// Converts the first/last timestamps recorded against the same pass origin
+/// into a critical-path envelope. Worker durations remain a separate sum: the
+/// two values must not be added because lanes and the GPU submitter overlap.
+fn telemetry_wall_envelope_ns(
+    first_ns: &std::sync::atomic::AtomicU64,
+    last_ns: &std::sync::atomic::AtomicU64,
+) -> u64 {
+    let first = first_ns.load(Ordering::Acquire);
+    let last = last_ns.load(Ordering::Acquire);
+    if first == u64::MAX {
+        0
+    } else {
+        last.saturating_sub(first)
+    }
+}
+
+fn record_policy_perf_identity(
+    job: u64,
+    requested_compute: ComputePolicy,
+    requested_decode: DecodePolicy,
+    effective_compute: ComputePolicy,
+    effective_decode: DecodePolicy,
+) {
+    // `compute_policy`/`decode_policy` conservan la intención del usuario: son
+    // las dimensiones con las que el reportador calcula el regret de Auto.
+    // Las políticas efectivas explican un reinicio transaccional sin mover la
+    // corrida al grupo manual CPU/Software y ocultar el fallback.
+    crate::perf_trace::job_meta(job, "compute_policy", requested_compute.legacy_value());
+    crate::perf_trace::job_meta(job, "decode_policy", requested_decode.legacy_value());
+    crate::perf_trace::job_meta(
+        job,
+        "effective_compute_policy",
+        effective_compute.legacy_value(),
+    );
+    crate::perf_trace::job_meta(
+        job,
+        "effective_decode_policy",
+        effective_decode.legacy_value(),
+    );
+}
+
+fn record_plan_perf_identity(job: u64, plan: &PlanetaryExecutionPlan) {
+    let compute_backend = plan
+        .stages
+        .iter()
+        .filter(|decision| decision.stage != PlanetaryStage::Decode)
+        .find_map(|decision| decision.backend.clone())
+        .unwrap_or_else(|| "cpu".into());
+    let decode_backend = plan
+        .stage(PlanetaryStage::Decode)
+        .and_then(|decision| decision.backend.clone())
+        .unwrap_or_else(|| {
+            if plan.workload.source_kind == PlanetarySourceKind::Ffmpeg {
+                "ffmpeg-software".into()
+            } else {
+                "native-io".into()
+            }
+        });
+    let device = match (&plan.resources.gpu_name, &plan.resources.cpu_name) {
+        (Some(gpu), Some(cpu)) => format!("{cpu} + {gpu}"),
+        (Some(gpu), None) => gpu.clone(),
+        (None, Some(cpu)) => cpu.clone(),
+        (None, None) => "unknown".into(),
+    };
+    crate::perf_trace::job_meta(job, "backend", format!("decode={decode_backend};compute={compute_backend}"));
+    crate::perf_trace::job_meta(job, "decode_backend", decode_backend);
+    crate::perf_trace::job_meta(job, "compute_backend", compute_backend);
+    crate::perf_trace::job_meta(job, "device", device);
+    crate::perf_trace::job_meta(job, "plan_id", &plan.plan_id);
+    crate::perf_trace::job_meta(job, "plan_schema", &plan.schema_version);
+    crate::perf_trace::job_meta(
+        job,
+        "cpu_load_percent_at_plan",
+        plan.resources.cpu_load_percent,
+    );
+    crate::perf_trace::job_meta(
+        job,
+        "ram_available_mb_at_plan",
+        plan.resources.ram_available_mb,
+    );
+    crate::perf_trace::job_meta(job, "swap_used_mb_at_plan", plan.resources.swap_used_mb);
+}
+
+/// Ejecuta una etapa de análisis GPU como una transacción lógica. El valor
+/// producido por un intento que reporta fallo GPU nunca se devuelve al caller:
+/// Auto/Hybrid repiten una sola vez con CPU y GPU only falla sin publicar el
+/// prefijo calculado. `run_attempt` devuelve `(resultado, fallo_gpu)` para que
+/// las pruebas puedan inyectar el fallo sin depender de hardware físico.
+fn run_analysis_stage_with_retry<T, F>(
+    policy: ComputePolicy,
+    gpu_initially_enabled: bool,
+    mut run_attempt: F,
+) -> Result<(T, bool, bool), String>
+where
+    F: FnMut(bool) -> Result<(T, bool), String>,
+{
+    let mut use_gpu = gpu_initially_enabled;
+    let mut retried_on_cpu = false;
+    loop {
+        let (result, gpu_failed) = run_attempt(use_gpu)?;
+        if use_gpu && gpu_failed {
+            if matches!(policy, ComputePolicy::GpuOnly) {
+                return Err(
+                    "GPU only: el dispositivo falló durante el análisis; el intento parcial fue descartado y no se permite fallback CPU silencioso"
+                        .into(),
+                );
+            }
+            if policy.allows_fallback() && !retried_on_cpu {
+                // `result` se descarta aquí antes de volver a invocar el trabajo
+                // desde frame cero. Ningún score/shift parcial cruza el límite.
+                drop(result);
+                retried_on_cpu = true;
+                use_gpu = false;
+                continue;
+            }
+            return Err(
+                "El análisis GPU falló y no existe un fallback de etapa permitido".into(),
+            );
+        }
+        return Ok((result, use_gpu, retried_on_cpu));
+    }
 }
 
 // PR-2.5: SÍNCRONA (antes async sin ningún .await interno): minutos de
 // cómputo rayon bloqueaban un worker del runtime async de Tauri y retrasaban
 // cualquier otro comando. Los comandos la envuelven en spawn_blocking.
+#[allow(clippy::too_many_arguments)]
 fn perform_standardized_analysis(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, AppState>,
@@ -2148,6 +2949,100 @@ fn perform_standardized_analysis(
     anchor_override: Option<Vec<i32>>,
     progress_prefix: Option<String>,
     compute_policy: ComputePolicy,
+    decode_policy: DecodePolicy,
+    quality_policy: QualityPolicy,
+) -> Result<AnalysisResult, String> {
+    let wrapper_started = std::time::Instant::now();
+    let mut effective_decode_policy = decode_policy;
+    let mut decode_fallback_reason: Option<String> = None;
+    loop {
+        let retry_overhead = if effective_decode_policy != decode_policy {
+            wrapper_started.elapsed()
+        } else {
+            std::time::Duration::ZERO
+        };
+        let result = perform_standardized_analysis_attempt(
+            app,
+            state,
+            request_id,
+            path,
+            is_surface,
+            target_type.clone(),
+            warping_analysis,
+            bayer_override,
+            anchor_override.clone(),
+            progress_prefix.clone(),
+            compute_policy,
+            effective_decode_policy,
+            decode_policy,
+            quality_policy,
+            retry_overhead,
+        );
+        match result {
+            Ok(mut analysis) => {
+                if effective_decode_policy != decode_policy {
+                    if let Some(plan) = analysis.execution_plan.as_mut() {
+                        plan.frozen = false;
+                        plan.requested_decode_policy = decode_policy;
+                        if let Some(mut decode) = plan.stage(PlanetaryStage::Decode).cloned() {
+                            decode.requested_decode_policy = decode_policy;
+                            decode.reason = DecisionReason::Fallback;
+                            decode.reason_detail = decode_fallback_reason.clone();
+                            plan.set_stage(decode)?;
+                        }
+                        plan.freeze()?;
+                        let _ = app.emit("planetary_execution_plan", &*plan);
+                    }
+                    if let Some(decode) = analysis
+                        .stage_telemetry
+                        .iter_mut()
+                        .find(|telemetry| telemetry.stage == PlanetaryStage::Decode)
+                    {
+                        decode.fallback_reason = decode_fallback_reason.clone();
+                    }
+                    let _ = app.emit("planetary_stage_telemetry", &analysis.stage_telemetry);
+                }
+                return Ok(analysis);
+            }
+            Err(error)
+                if error.starts_with(RESTART_DECODE_SOFTWARE_PREFIX)
+                    && matches!(effective_decode_policy, DecodePolicy::Auto) =>
+            {
+                let reason = error
+                    .trim_start_matches(RESTART_DECODE_SOFTWARE_PREFIX)
+                    .to_string();
+                log_to_front(
+                    app,
+                    "WARN",
+                    &format!(
+                        "{reason}. Se descarta el análisis completo y se reinicia desde preflight con FFmpeg software."
+                    ),
+                );
+                decode_fallback_reason = Some(reason);
+                effective_decode_policy = DecodePolicy::Software;
+            }
+            other => return other,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn perform_standardized_analysis_attempt(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    request_id: usize,
+    path: &str,
+    is_surface: bool,
+    target_type: String,
+    warping_analysis: bool,
+    bayer_override: Option<i32>,
+    anchor_override: Option<Vec<i32>>,
+    progress_prefix: Option<String>,
+    compute_policy: ComputePolicy,
+    decode_policy: DecodePolicy,
+    requested_decode_policy: DecodePolicy,
+    quality_policy: QualityPolicy,
+    retry_overhead: std::time::Duration,
 ) -> Result<AnalysisResult, String> {
     let is_surface = is_surface || is_surface_target(&target_type);
     let warping_analysis = zenith_should_warp(&target_type, is_surface, warping_analysis);
@@ -2159,6 +3054,14 @@ fn perform_standardized_analysis(
     // el guard vuelca también en errores/cancelaciones con completed=false).
     let pt = crate::perf_trace::job_start("analysis", path);
     let pt_guard = crate::perf_trace::JobGuard::new(pt);
+    if !retry_overhead.is_zero() {
+        crate::perf_trace::job_meta(
+            pt,
+            "retry_overhead_ms",
+            retry_overhead.as_secs_f64() * 1e3,
+        );
+    }
+    crate::perf_trace::job_meta(pt, "cache_state", "cold");
 
     let prefix_str = progress_prefix.clone().unwrap_or_default();
     let get_msg = |msg: &str| {
@@ -2209,6 +3112,43 @@ fn perform_standardized_analysis(
     let is_color = r.is_color_for(cid);
     let unified_source = std::sync::Arc::new(UnifiedFrameSource::from_input(r.clone(), cid));
     let source_descriptor = unified_source.descriptor();
+    record_policy_perf_identity(
+        pt,
+        compute_policy,
+        requested_decode_policy,
+        compute_policy,
+        decode_policy,
+    );
+    let analysis_decode_probe = if let VideoInput::Ffmpeg(ref reader) = r {
+        emit_progress(
+            app,
+            &get_msg("Calibrando ruta FFmpeg para análisis G16..."),
+            2.0,
+            None,
+        );
+        let decode_profile = app
+            .path()
+            .app_config_dir()
+            .ok()
+            .map(|directory| crate::planetary_planner::calibration_profile_path(&directory));
+        Some(benchmark_ffmpeg_decode_route(
+            &reader.ffmpeg_path,
+            path,
+            &reader.codec_name,
+            cid,
+            tw,
+            th,
+            tf,
+            reader.rotation,
+            source_descriptor.sample_bits,
+            decode_policy,
+            DecodeContract::AnalysisGreen16,
+            Some(&job_token),
+            decode_profile.as_deref(),
+        )?)
+    } else {
+        None
+    };
     let reader_kind = if r.is_ffmpeg() { "FFmpeg" } else { "Rust nativo" };
     log_to_front(
         app,
@@ -2241,6 +3181,55 @@ fn perform_standardized_analysis(
     if ser::ser_color_is_yuv422(cid) {
         requested_roi = align_yuv422_analysis_roi(requested_roi, tw);
     }
+    let (analysis_codec, analysis_ffmpeg_path) = match &r {
+        VideoInput::Ffmpeg(reader) => (
+            Some(reader.codec_name.as_str()),
+            Some(reader.ffmpeg_path.as_str()),
+        ),
+        _ => (None, None),
+    };
+    let mut execution_plan = build_planetary_plan_draft(
+        app,
+        &pipeline_job_id,
+        &source_descriptor,
+        analysis_codec,
+        analysis_ffmpeg_path,
+        &target_type,
+        is_surface,
+        tf,
+        0,
+        0,
+        1.0,
+        false,
+        Some([
+            requested_roi.x.min(u32::MAX as usize) as u32,
+            requested_roi.y.min(u32::MAX as usize) as u32,
+            requested_roi.w.min(u32::MAX as usize) as u32,
+            requested_roi.h.min(u32::MAX as usize) as u32,
+        ]),
+        compute_policy,
+        decode_policy,
+        quality_policy,
+        analysis_decode_probe.as_ref(),
+    )?;
+    record_plan_perf_identity(pt, &execution_plan);
+    let planned_analysis_threads = execution_plan
+        .stage(PlanetaryStage::Preprocess)
+        .map(|decision| decision.compute_threads.max(1))
+        .unwrap_or(1);
+    let planned_analysis_batch = execution_plan
+        .stage(PlanetaryStage::Preprocess)
+        .map(|decision| decision.batch_size.max(1))
+        .unwrap_or(1);
+    let planned_analysis_ring_bytes = execution_plan
+        .stage(PlanetaryStage::Decode)
+        .map(|decision| decision.ring_bytes)
+        .unwrap_or(0);
+    let planned_decode_threads = execution_plan
+        .stage(PlanetaryStage::Decode)
+        .map(|decision| decision.compute_threads.max(1))
+        .unwrap_or(1);
+    crate::set_planetary_ffmpeg_thread_budget(planned_decode_threads);
     let cache_expectation = AnalysisCacheExpectation {
         source_fingerprint,
         resolved_color_id: cid,
@@ -2296,7 +3285,16 @@ fn perform_standardized_analysis(
                     } else {
                         // PR-10: caché de decode primero — la preview del
                         // caché de análisis ya no re-decodifica 0..best_idx.
-                        let raw = match (if let VideoInput::Ffmpeg(ref fr) = r {
+                        let raw = if matches!(decode_policy, DecodePolicy::Hardware)
+                            && r.is_ffmpeg()
+                        {
+                            let backend = analysis_decode_probe
+                                .as_ref()
+                                .and_then(|probe| probe.backend.as_deref())
+                                .ok_or("Decode Hardware strict sin backend para preview")?;
+                            read_exact_source_frame_hardware(&unified_source, bi, backend)?
+                        } else {
+                            match if let VideoInput::Ffmpeg(ref fr) = r {
                             read_selected_from_decode_cache(
                                 path,
                                 &fr.ffmpeg_path,
@@ -2310,7 +3308,7 @@ fn perform_standardized_analysis(
                             )
                         } else {
                             None
-                        }) {
+                            } {
                             Some(mut frames) => frames.pop().unwrap_or_default(),
                             None => {
                                 // PR-22: preview cosmética por seek rápido
@@ -2330,6 +3328,7 @@ fn perform_standardized_analysis(
                                     Some(raw) => raw,
                                     None => read_exact_source_frame(&unified_source, bi)?,
                                 }
+                            }
                             }
                         };
                         let u16_raw = raw_to_u16_buffer(&raw, tw, th, tbp);
@@ -2408,6 +3407,32 @@ fn perform_standardized_analysis(
                         },
                     );
                     crate::perf_trace::job_meta(pt, "cache", "hit");
+                    crate::perf_trace::job_meta(pt, "cache_state", "warm");
+                    if let Some(mut cached_stage) = execution_plan
+                        .stage(PlanetaryStage::Preprocess)
+                        .cloned()
+                    {
+                        cached_stage.reason = DecisionReason::CachedProfile;
+                        cached_stage.reason_detail =
+                            Some("resultado de análisis servido desde caché validada".into());
+                        execution_plan.set_stage(cached_stage)?;
+                    }
+                    execution_plan.freeze()?;
+                    record_plan_perf_identity(pt, &execution_plan);
+                    let elapsed = pipeline_started.elapsed();
+                    let mut cached_telemetry = completed_stage_telemetry(
+                        &execution_plan,
+                        PlanetaryStage::Preprocess,
+                        elapsed,
+                        qg.len(),
+                    );
+                    cached_telemetry.cache_hits = qg.len();
+                    let cached_stage_telemetry = vec![cached_telemetry];
+                    let _ = app.emit("planetary_execution_plan", &execution_plan);
+                    let _ = app.emit(
+                        "planetary_stage_telemetry",
+                        &cached_stage_telemetry,
+                    );
                     let _ = pt_guard.finish_ok();
                     return Ok(AnalysisResult {
                         metadata: VideoMetadata {
@@ -2442,9 +3467,15 @@ fn perform_standardized_analysis(
                         path: path.to_string(),
                         ap_points: vec![],
                         best_frame_idx: bi,
-                    });
+                        execution_plan: Some(execution_plan),
+                        stage_telemetry: cached_stage_telemetry,
+            });
         }
     }
+    // Desde este punto la caché validada no resolvió el trabajo. El tiempo de
+    // apertura, fingerprint, preflight FFmpeg/decode y lookup de caché es I/O
+    // de la etapa Decode; no debe inflar artificialmente Preprocess.
+    let decode_preflight_elapsed = pipeline_started.elapsed();
     // R11: with warping analysis the 40×40 grid scores must cover the FULL
     // frame — the stacking stage maps AP coordinates (full-frame) onto that
     // grid. A cropped analysis ROI would misalign every per-AP lookup.
@@ -2468,12 +3499,43 @@ fn perform_standardized_analysis(
     let (_analysis_ref_idx, analysis_ref_raw) = {
         let _s = crate::perf_trace::span(pt, "ref_select");
         if r.is_ffmpeg() {
-            // PR-22: primero el muestreo por seek (~1 GOP por candidato);
-            // el camino exacto (decodifica 0..tf/2) queda como fallback y
-            // como modo forzable con ZAS_EXACT_ANCHOR=1.
-            match select_signal_frame_fast_seek(&r, path, tw, th, tbp, cid, tf, tf / 2) {
-                Some(anchor) => anchor,
-                None => select_signal_frame_from_source(&unified_source, tw, th, tbp, tf / 2)?,
+            let selected_backend = analysis_decode_probe
+                .as_ref()
+                .filter(|probe| probe.prefer_hardware)
+                .and_then(|probe| probe.backend.clone());
+            if let Some(backend) = selected_backend {
+                match select_signal_frame_from_source_with_hardware(
+                    &unified_source,
+                    tw,
+                    th,
+                    tbp,
+                    tf / 2,
+                    &backend,
+                ) {
+                    Ok(anchor) => anchor,
+                    Err(error) if matches!(decode_policy, DecodePolicy::Auto) => {
+                        let restart = request_full_software_decode_restart(
+                            "Decode HW falló al preparar la referencia del análisis",
+                            error,
+                        );
+                        pt_guard.discard();
+                        return Err(restart);
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                // PR-22: el seek rápido es cosmético para elegir un ancla y
+                // sólo se usa cuando el plan quedó congelado en software.
+                match select_signal_frame_fast_seek(&r, path, tw, th, tbp, cid, tf, tf / 2) {
+                    Some(anchor) => anchor,
+                    None => select_signal_frame_from_source(
+                        &unified_source,
+                        tw,
+                        th,
+                        tbp,
+                        tf / 2,
+                    )?,
+                }
             }
         } else {
             let index = select_signal_frame_index(&r, tw, th, tbp, cid, tf / 2);
@@ -2600,10 +3662,89 @@ fn perform_standardized_analysis(
     // CPU sólo por el tamaño del ROI (sí conserva fallback por paridad/OOM).
     let gpu_analysis_profitable = rw.saturating_mul(rh) >= 300_000
         || matches!(compute_policy, ComputePolicy::Hybrid | ComputePolicy::GpuOnly);
+    // P1: superficie/disco grande ya no tiene una regla universal. La primera
+    // firma desconocida se calibra abajo con tres lotes; las siguientes usan
+    // el ganador persistido. En el M5 observado esto conserva CPU, pero otro
+    // Mac/Windows puede elegir GPU sin cambiar ningún parámetro científico.
+    let persisted_auto_preprocess = matches!(compute_policy, ComputePolicy::Auto)
+        .then(|| execution_plan.stage(PlanetaryStage::Preprocess).cloned())
+        .flatten()
+        // También reutilizar el veredicto CPU de una medición completa pero
+        // ruidosa o sin paridad. Repetirla en cada arranque desperdicia tiempo
+        // y podría oscilar el motor; sólo un perfil invalidado por su firma se
+        // vuelve a medir.
+        .filter(|decision| decision.calibration_samples >= 3);
+    // Un perfil CPU medido con el equipo libre deja de ser representativo si
+    // otros procesos ya ocupan la mayor parte de los núcleos. En ese único
+    // caso Auto puede escoger el pipeline GPU antes de iniciar el pase, siempre
+    // que preprocesado Y coarse SAD conserven paridad y quepa su working-set.
+    // La decisión queda congelada para todo el análisis; no se replanifica a
+    // mitad del vídeo ni se sobrescribe el perfil persistido con esta muestra.
+    let cpu_pressure_gpu_candidate = matches!(compute_policy, ComputePolicy::Auto)
+        && r.is_ffmpeg()
+        && gpu_analysis_profitable
+        && execution_plan.resources.gpu_available
+        && crate::planetary_planner::cpu_pressure_prefers_gpu(&execution_plan.resources);
+    let mut gpu_selected_for_cpu_pressure = false;
     // Motivo del fallback a CPU (visible en la telemetría): el usuario no debe
     // adivinar por qué la etiqueta dice "scoring CPU".
     let mut gpu_off_reason: Option<String> = None;
-    let gpu_analysis_enabled = if !compute_policy.allows_gpu() || !gpu_analysis_profitable {
+    let gpu_analysis_enabled = if cpu_pressure_gpu_candidate {
+        match crate::gpu_stack::gpu_runtime() {
+            Some(rt)
+                if crate::gpu_analysis::ensure_parity()
+                    && crate::gpu_analysis::ensure_sad_parity() =>
+            {
+                match crate::gpu_analysis::validate_recommended_batch(rw, rh) {
+                    Ok(vram) => {
+                        gpu_selected_for_cpu_pressure = true;
+                        log_to_front(
+                            app,
+                            "SUCCESS",
+                            &format!(
+                                "Auto adaptativo: CPU ocupada al {}%; preprocesado y SAD grueso pasan a GPU {} ({}) con {} MB de working-set. La decisión queda congelada para este análisis.",
+                                execution_plan.resources.cpu_load_percent,
+                                rt.backend,
+                                rt.adapter_name,
+                                vram / 1_048_576,
+                            ),
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        gpu_off_reason = Some(format!(
+                            "presión CPU detectada, pero la GPU no admite el lote: {error}"
+                        ));
+                        false
+                    }
+                }
+            }
+            Some(_) => {
+                gpu_off_reason = Some(
+                    "presión CPU detectada, pero la paridad GPU/SAD no está aprobada".into(),
+                );
+                false
+            }
+            None => {
+                gpu_off_reason =
+                    Some("presión CPU detectada, pero no existe GPU compatible".into());
+                false
+            }
+        }
+    } else if let Some(decision) = persisted_auto_preprocess {
+        let uses_gpu = decision.effective_engine.uses_gpu();
+        let detail = format!(
+            "Auto: perfil local reutilizado para preprocesado ({}; n={}, confianza {:.0}%).",
+            if uses_gpu { "GPU" } else { "CPU" },
+            decision.calibration_samples,
+            decision.calibration_confidence.unwrap_or(0.0) * 100.0,
+        );
+        log_to_front(app, "INFO", &detail);
+        if !uses_gpu {
+            gpu_off_reason = Some(detail);
+        }
+        uses_gpu
+    } else if !compute_policy.allows_gpu() || !gpu_analysis_profitable {
         if compute_policy.allows_gpu() && !gpu_analysis_profitable {
             log_to_front(app, "INFO", "Análisis GPU omitido: ROI pequeña; CPU SIMD tiene menor latencia.");
             gpu_off_reason = Some("Auto: ROI pequeña, CPU más rápida".into());
@@ -2739,69 +3880,168 @@ fn perform_standardized_analysis(
                 // real es 2-4× más rápido (medido en M5: 4144×2822 → 26.6
                 // ms/frame en lote de 4 vs ~64 ms/frame de scoring CPU).
                 let probe_batch_len = crate::gpu_analysis::recommended_batch_len(rw, rh);
-                let gpu_t0 = std::time::Instant::now();
-                let gpu_probe = warm.and_then(|_| {
-                    let frames: Vec<Vec<u16>> = (0..probe_batch_len)
-                        .map(|_| analysis_probe_mono.clone())
-                        .collect();
-                    crate::gpu_analysis::process_batch_with_options(
-                        &frames,
-                        rw,
-                        rh,
-                        texture_probe,
-                        warping_analysis,
-                        !texture_probe || cog_assist,
-                        false,
-                    )
-                    .map(|_| ())
-                });
-                let gpu_s = gpu_t0.elapsed().as_secs_f32() / probe_batch_len.max(1) as f32;
+                let probe_frames: Vec<Vec<u16>> = (0..probe_batch_len)
+                    .map(|_| analysis_probe_mono.clone())
+                    .collect();
                 let mut half = vec![0u16; (rw / 2) * (rh / 2)];
                 let mut bt = vec![0u16; half.len()];
                 let mut bo = vec![0u16; half.len()];
                 let mut lo = vec![0u16; half.len()];
-                let cpu_t0 = std::time::Instant::now();
-                let (pw, ph) = crate::alignment::downscale_2x_into(&analysis_probe_mono, rw, rh, &mut half);
-                let _ = enhance_and_score_surface_buffered(&half, pw, ph, &mut bt, &mut bo, &mut lo);
-                if !texture_probe || cog_assist {
-                    let _ = compute_robust_geometric_center(&analysis_probe_mono, rw, rh, 0, 0);
-                }
-                if warping_analysis {
-                    let input = if texture_probe { &bo } else { &half };
-                    let _ = calculate_grid_quality(input, pw, ph, 40, texture_probe);
-                }
-                if let Some(pyr) = a_pyr.as_ref() {
-                    let _ = crate::alignment::find_best_match_sad_pyramid_offset(
-                        &a_mono,
-                        &lo,
-                        pyr,
+                fn run_cpu_preprocess_probe(
+                    input: &[u16],
+                    width: usize,
+                    height: usize,
+                    texture_probe: bool,
+                    want_grid: bool,
+                    want_cog: bool,
+                    half: &mut Vec<u16>,
+                    blur_temp: &mut Vec<u16>,
+                    blurred: &mut Vec<u16>,
+                    laplacian: &mut Vec<u16>,
+                ) -> (Option<(f32, f32)>, Option<Vec<u64>>) {
+                    let (pw, ph) = crate::alignment::downscale_2x_into(
+                        input, width, height, half,
+                    );
+                    // Mismo producto que devuelve la GPU: blur y Laplaciano
+                    // CRUDO. La normalización/score v2 ocurre después y es CPU
+                    // común en ambas rutas, así que no puede sesgar el reloj.
+                    let _ = enhance_and_lap_raw(
+                        half,
                         pw,
                         ph,
-                        pw / 2,
-                        ph / 2,
-                        pw / 4,
-                        ph / 4,
-                        pw / 2,
-                        ph / 2,
-                        64,
-                        2,
-                        16,
-                        0,
-                        0,
+                        blur_temp,
+                        blurred,
+                        laplacian,
                     );
+                    let center = want_cog.then(|| {
+                        compute_robust_geometric_center(input, width, height, 0, 0)
+                    });
+                    let grid = want_grid.then(|| {
+                        let grid_input: &[u16] = if texture_probe { blurred } else { half };
+                        calculate_grid_quality(grid_input, pw, ph, 40, texture_probe)
+                    });
+                    (center, grid)
                 }
-                let cpu_s = cpu_t0.elapsed().as_secs_f32();
-                if let Err(e) = gpu_probe {
+                let want_cog = !texture_probe || cog_assist;
+                // Warm-up CPU separado: los tres valores siguientes son
+                // calientes y comparables con la GPU ya precalentada arriba.
+                let _ = run_cpu_preprocess_probe(
+                    &analysis_probe_mono,
+                    rw,
+                    rh,
+                    texture_probe,
+                    warping_analysis,
+                    want_cog,
+                    &mut half,
+                    &mut bt,
+                    &mut bo,
+                    &mut lo,
+                );
+                let mut gpu_ms = Vec::with_capacity(3);
+                let mut cpu_ms = Vec::with_capacity(3);
+                let mut gpu_probe_error = warm.err();
+                let mut sample_parity_passed = true;
+                if gpu_probe_error.is_none() {
+                    for _ in 0..3 {
+                        let gpu_t0 = std::time::Instant::now();
+                        let gpu_result = crate::gpu_analysis::process_batch_with_options(
+                            &probe_frames,
+                            rw,
+                            rh,
+                            texture_probe,
+                            warping_analysis,
+                            want_cog,
+                            false,
+                        );
+                        match &gpu_result {
+                            Ok(_) => gpu_ms.push(
+                                gpu_t0.elapsed().as_secs_f64() * 1000.0
+                                    / probe_batch_len.max(1) as f64,
+                            ),
+                            Err(error) => {
+                                gpu_probe_error = Some(error.clone());
+                                break;
+                            }
+                        }
+                        let cpu_t0 = std::time::Instant::now();
+                        let (cpu_center, cpu_grid) = run_cpu_preprocess_probe(
+                            &analysis_probe_mono,
+                            rw,
+                            rh,
+                            texture_probe,
+                            warping_analysis,
+                            want_cog,
+                            &mut half,
+                            &mut bt,
+                            &mut bo,
+                            &mut lo,
+                        );
+                        cpu_ms.push(cpu_t0.elapsed().as_secs_f64() * 1000.0);
+                        if let Ok(outputs) = gpu_result {
+                            let grid_close = |gpu: &[u64], cpu: &[u64]| {
+                                gpu.len() == cpu.len()
+                                    && gpu.iter().zip(cpu).all(|(&a, &b)| {
+                                        a.abs_diff(b)
+                                            <= ((b as f64 * 0.002).ceil() as u64).max(4096)
+                                    })
+                            };
+                            sample_parity_passed &= outputs.len() == probe_batch_len
+                                && outputs.iter().all(|output| {
+                                    let half_ok = if texture_probe {
+                                        output.half.is_empty()
+                                    } else {
+                                        output.half == half
+                                    };
+                                    let center_ok = match (output.geometric_center, cpu_center) {
+                                        (Some(gpu), Some(cpu)) => {
+                                            (gpu.0 - cpu.0).abs() <= 0.51
+                                                && (gpu.1 - cpu.1).abs() <= 0.51
+                                        }
+                                        (None, None) => true,
+                                        _ => false,
+                                    };
+                                    let grid_ok =
+                                        match (output.grid_scores.as_deref(), cpu_grid.as_deref()) {
+                                            (Some(gpu), Some(cpu)) => grid_close(gpu, cpu),
+                                            (None, None) => true,
+                                            _ => false,
+                                        };
+                                    half_ok
+                                        && output.blurred == bo
+                                        && output.laplacian == lo
+                                        && center_ok
+                                        && grid_ok
+                                });
+                        }
+                    }
+                }
+                let observation = crate::planetary_planner::CalibrationObservation::new(
+                    crate::pipeline::PlanetaryStage::Preprocess,
+                    cpu_ms,
+                    gpu_ms,
+                    sample_parity_passed && gpu_probe_error.is_none(),
+                    Some(rt.backend.clone()),
+                );
+                let evaluation = persist_and_apply_stage_calibration(
+                    app,
+                    &mut execution_plan,
+                    observation,
+                )?;
+                if let Some(e) = gpu_probe_error {
                     log_to_front(app, "WARN", &format!("Análisis GPU no utilizable ({e}); CPU."));
                     gpu_off_reason = Some("GPU no utilizable en la microprueba".into());
                     false
-                } else if gpu_s < cpu_s {
+                } else if evaluation.accelerated_wins {
                     log_to_front(
                         app,
                         "SUCCESS",
                         &format!(
-                            "Análisis híbrido activo (Auto): GPU {} ({}) {:.2} ms/frame en lote vs CPU {:.2} ms/frame · GPU por lotes para pirámide/Laplaciano/métricas/CoG/SAD/AP + CPU validación y refinamiento.",
-                            rt.backend, rt.adapter_name, gpu_s * 1000.0, cpu_s * 1000.0
+                            "Análisis híbrido activo (Auto): GPU {} ({}) mediana {:.2} ms/frame vs CPU {:.2} ms/frame · {:.2}x, 3 lotes estables, paridad aprobada.",
+                            rt.backend,
+                            rt.adapter_name,
+                            evaluation.accelerated_median_ms,
+                            evaluation.cpu_median_ms,
+                            evaluation.speedup,
                         ),
                     );
                     true
@@ -2810,14 +4050,18 @@ fn perform_standardized_analysis(
                         app,
                         "INFO",
                         &format!(
-                            "Análisis: CPU elegida por benchmark ({:.2} ms vs GPU {:.2} ms/frame en lote); sin regresión por overhead de readback.",
-                            cpu_s * 1000.0, gpu_s * 1000.0
+                            "Análisis: CPU elegida (CPU {:.2} ms, GPU {:.2} ms/frame; speedup {:.2}x, estable={}); Auto exige >=1.15x y variación <=10%.",
+                            evaluation.cpu_median_ms,
+                            evaluation.accelerated_median_ms,
+                            evaluation.speedup,
+                            evaluation.stable,
                         ),
                     );
                     gpu_off_reason = Some(format!(
-                        "Auto eligió CPU ({:.0} ms vs GPU {:.0} ms/frame)",
-                        cpu_s * 1000.0,
-                        gpu_s * 1000.0
+                        "Auto eligió CPU ({:.0} ms vs GPU {:.0} ms/frame; estable={})",
+                        evaluation.cpu_median_ms,
+                        evaluation.accelerated_median_ms,
+                        evaluation.stable,
                     ));
                     false
                 }
@@ -2825,13 +4069,14 @@ fn perform_standardized_analysis(
         }
     };
     let gpu_analysis_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // Motivo actual del scoring CPU para la telemetría: la decisión inicial o,
-    // si la GPU murió a mitad, el fallo en caliente.
+    let analysis_retry_cpu = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Motivo actual del scoring CPU para la telemetría: la decisión inicial o
+    // el reinicio integral de la etapa tras descartar un intento GPU fallido.
     let analysis_cpu_reason = {
-        let failed = gpu_analysis_failed.clone();
+        let retried = analysis_retry_cpu.clone();
         move || -> Option<String> {
-            if failed.load(Ordering::Relaxed) {
-                Some("la GPU falló en un lote; resto en CPU".into())
+            if retried.load(Ordering::Acquire) {
+                Some("reinicio integral de la etapa en CPU tras fallo GPU".into())
             } else {
                 gpu_off_reason.clone()
             }
@@ -2850,7 +4095,17 @@ fn perform_standardized_analysis(
     } else {
         2usize
     };
-    let ffmpeg_analysis_cache_plan: Option<(PathBuf, u64, usize, usize)> = if r.is_ffmpeg() {
+    let analysis_resource_pressure = crate::planetary_planner::should_defer_calibration(
+        crate::planetary_planner::RuntimeResourcePressure {
+            cpu_load_percent: execution_plan.resources.cpu_load_percent,
+            memory_pressure: crate::planetary_planner::resource_memory_pressure(
+                &execution_plan.resources,
+            ),
+        },
+    );
+    let ffmpeg_analysis_cache_plan: Option<(PathBuf, u64, usize, usize)> = if r.is_ffmpeg()
+        && !analysis_resource_pressure
+    {
         let full_frame_decode = rx == 0 && ry == 0 && rw == tw && rh == th;
         let cache_dir = decode_cache_root_dir();
         let _ = std::fs::create_dir_all(&cache_dir);
@@ -2885,12 +4140,31 @@ fn perform_standardized_analysis(
     // El pipe G16 ya es un plano mono terminado; no debe volver a pasar por la
     // lógica RGB/Bayer ni alterar el ColorID contractual del resto del pipeline.
     let analysis_stream_color_id = if ffmpeg_analysis_green { 0 } else { cid };
+    if r.is_ffmpeg() {
+        crate::perf_trace::job_meta(
+            pt,
+            "analysis_stream_contract",
+            if ffmpeg_analysis_green {
+                "green16"
+            } else if ffmpeg_stream_is_color(cid) {
+                "rgb48"
+            } else {
+                "gray16"
+            },
+        );
+        crate::perf_trace::job_meta(
+            pt,
+            "analysis_full_decode_cache",
+            ffmpeg_analysis_cache_plan.is_some(),
+        );
+    }
     let a_pyr_ref = &a_pyr;
     let a_mono_ref = &a_mono;
     let analyze_preprocessed = |i: usize,
                                 raw: &[u8],
                                 bufs: &mut AnalysisBufferSet,
-                                gpu_bundle: Option<(crate::gpu_analysis::AnalysisGpuOutput, Vec<u16>)>|
+                                gpu_bundle: Option<(crate::gpu_analysis::AnalysisGpuOutput, Vec<u16>)>,
+                                attempt_gpu_enabled: bool|
      -> FrameAlignmentData {
         let (gpu, prepared_mono) = match gpu_bundle {
             Some((gpu, mono)) => (Some(gpu), Some(mono)),
@@ -2917,14 +4191,18 @@ fn perform_standardized_analysis(
             ref_cog_cy,
             &target_type, // NEW
             large_disc,
-            gpu_analysis_enabled.then_some(gpu_analysis_failed.as_ref()),
+            attempt_gpu_enabled.then_some(gpu_analysis_failed.as_ref()),
             gpu,
             prepared_mono,
             pt,
         )
     };
-    let analyze_fn = |i: usize, raw: &[u8], bufs: &mut AnalysisBufferSet| -> FrameAlignmentData {
-        analyze_preprocessed(i, raw, bufs, None)
+    let analyze_fn = |i: usize,
+                      raw: &[u8],
+                      bufs: &mut AnalysisBufferSet,
+                      attempt_gpu_enabled: bool|
+     -> FrameAlignmentData {
+        analyze_preprocessed(i, raw, bufs, None, attempt_gpu_enabled)
     };
     // Convierte luma en CPU y entrega 2–3 frames por submit. La conversión del
     // lote siguiente ocurre en el productor de decode mientras este closure
@@ -2974,15 +4252,28 @@ fn perform_standardized_analysis(
     // Lote GPU adaptativo: 6/4/2 frames por submit según presupuesto de VRAM
     // (antes fijo en 3 — las GPUs amplias desperdiciaban amortización).
     let gpu_batch_len = if gpu_analysis_enabled {
-        crate::gpu_analysis::recommended_batch_len(rw, rh)
+        crate::gpu_analysis::recommended_batch_len(rw, rh).min(planned_analysis_batch)
     } else {
-        3
+        3.min(planned_analysis_batch)
     };
     let ana_start = std::time::Instant::now();
     let ana_reader_kind = r.reader_kind_label();
     let ana_sys: std::sync::Arc<std::sync::Mutex<System>> =
         std::sync::Arc::new(std::sync::Mutex::new(System::new()));
-    let mut stats = Vec::new();
+    let preprocess_started = std::time::Instant::now();
+    let analysis_stage_result = run_analysis_stage_with_retry(
+            compute_policy,
+            gpu_analysis_enabled,
+            |attempt_gpu_enabled| -> Result<(Vec<FrameAlignmentData>, bool), String> {
+                // Cada intento parte de un estado vacío. El latch de fallo sólo
+                // pertenece al intento actual y el contador vuelve a frame 0.
+                gpu_analysis_failed.store(false, Ordering::Release);
+                analysis_retry_cpu.store(
+                    gpu_analysis_enabled && !attempt_gpu_enabled,
+                    Ordering::Release,
+                );
+                ctr.store(0, Ordering::Relaxed);
+                let mut stats = Vec::new();
     if r.is_ffmpeg() {
         let bin = match rt {
             VideoInput::Ffmpeg(ref f) => f.ffmpeg_path.as_str(),
@@ -2996,19 +4287,9 @@ fn perform_standardized_analysis(
             4.0,
             None,
         );
-        let decode_probe = {
-            let _s = crate::perf_trace::span(pt, "decode_probe");
-            benchmark_ffmpeg_decode_route(
-                bin,
-                path,
-                rt.codec_name(),
-                cid,
-                tw,
-                th,
-                rt.rotation(),
-                Some(&job_token),
-            )
-        };
+        let decode_probe = analysis_decode_probe
+            .clone()
+            .ok_or("FFmpeg no recibió una selección de decode congelada")?;
         let fmt_probe = |v: Option<f32>| v.map(|s| format!("{:.2}s", s)).unwrap_or_else(|| "falló".into());
         if decode_probe.prefer_hardware {
             log_to_front(
@@ -3044,7 +4325,8 @@ fn perform_standardized_analysis(
                 "Análisis FFmpeg G16 exacto: 66.7% menos transferencia y RAM de ring; el apilado conserva RGB/Bayer completo.",
             );
         }
-        let decode_order = if decode_probe.prefer_hardware { [true, false] } else { [false, true] };
+        let decode_order =
+            ffmpeg_decode_attempt_order(decode_policy, decode_probe.prefer_hardware);
         let expected_is_exact = match &rt {
             VideoInput::Ffmpeg(reader) => reader.frame_count_exact,
             _ => true,
@@ -3109,10 +4391,17 @@ fn perform_standardized_analysis(
             let mut it = match iterator {
                 Ok(iterator) => iterator,
                 Err(error) => {
-                    decode_failures.push(format!(
+                    let failure = format!(
                         "No se pudo iniciar decode {}: {error}",
                         if use_gpu { "GPU" } else { "CPU" }
-                    ));
+                    );
+                    if use_gpu && matches!(decode_policy, DecodePolicy::Auto) {
+                        return Err(request_full_software_decode_restart(
+                            "Decode HW no pudo iniciar el stream de análisis",
+                            failure,
+                        ));
+                    }
+                    decode_failures.push(failure);
                     continue;
                 }
             };
@@ -3152,7 +4441,9 @@ fn perform_standardized_analysis(
                 let sc = job_token.clone();
                 let ac = app_c.clone();
                 let ana_sys_c = ana_sys.clone();
-                let ana_threads_c = ram_aware_analysis_threads(rw, rh, is_color, true);
+                let ana_threads_c = ram_aware_analysis_threads(rw, rh, is_color, true)
+                    .min(planned_analysis_threads)
+                    .max(1);
 
                 // OPT FFMPEG 2.5: TRUE ZERO-ALLOCATION (DUAL RING BUFFER)
                 // Ring dimensionado por hilos y RAM: los 32 slots fijos eran
@@ -3161,11 +4452,14 @@ fn perform_standardized_analysis(
                 // protege a los equipos justos de memoria.
                 let frame_size = rw.saturating_mul(rh).saturating_mul(analysis_stream_bpp);
                 let mut ring_slots = (ana_threads_c * 2 + 2).clamp(8, 32);
-                let ring_budget = {
+                let mut ring_budget = {
                     let mut sys_ring = System::new();
                     sys_ring.refresh_memory();
                     (sys_ring.available_memory() / 4).max(64 * 1024 * 1024)
                 };
+                if planned_analysis_ring_bytes > 0 {
+                    ring_budget = ring_budget.min(planned_analysis_ring_bytes);
+                }
                 while ring_slots > 4
                     && (ring_slots as u64).saturating_mul(frame_size as u64) > ring_budget
                 {
@@ -3260,7 +4554,7 @@ fn perform_standardized_analysis(
                     .num_threads(ana_threads_c)
                     .build()
                     .unwrap();
-                let local_stats: Vec<FrameAlignmentData> = if gpu_analysis_enabled {
+                let local_stats: Vec<FrameAlignmentData> = if attempt_gpu_enabled {
                     let mut stream = rx_full.into_iter();
                     let mut collected = Vec::with_capacity(tf);
                     // A2 (2026-07-17): pipeline software — el preprocesado GPU
@@ -3284,10 +4578,8 @@ fn perform_standardized_analysis(
                                 Ok(outputs) => outputs.into_iter().map(Some).collect(),
                                 Err(e) => {
                                     gpu_analysis_failed.store(true, Ordering::Relaxed);
-                                    log_to_front(
-                                        &ac,
-                                        "WARN",
-                                        &format!("GPU Metal falló en un lote FFmpeg ({e}); continuando en CPU."),
+                                    eprintln!(
+                                        "[analysis-gpu] lote FFmpeg fallido ({e}); el intento se descartará"
                                     );
                                     (0..items.len()).map(|_| None).collect()
                                 }
@@ -3347,7 +4639,8 @@ fn perform_standardized_analysis(
                                                 &pipeline_job_id,
                                                 ana_reader_kind,
                                                 Some(use_gpu && decode_probe.hardware_confirmed),
-                                                !gpu_analysis_failed.load(Ordering::Relaxed),
+                                                attempt_gpu_enabled
+                                                    && !gpu_analysis_failed.load(Ordering::Relaxed),
                                                 analysis_cpu_reason(),
                                                 rw.saturating_mul(rh).saturating_mul(4),
                                                 crate::gpu_analysis::estimated_batch_vram_mb(rw, rh, gpu_batch_len),
@@ -3358,7 +4651,13 @@ fn perform_standardized_analysis(
                                                 &ana_sys_c,
                                             );
                                         }
-                                        let result = analyze_preprocessed(i, &raw, bs, gpu);
+                                        let result = analyze_preprocessed(
+                                            i,
+                                            &raw,
+                                            bs,
+                                            gpu,
+                                            attempt_gpu_enabled,
+                                        );
                                         // PR-2.1: sembrar el caché del apilado.
                                         if let Some(transaction) = ana_cache_attempt.as_ref() {
                                             transaction.write_raw_le_u16(i, &raw);
@@ -3409,6 +4708,11 @@ fn perform_standardized_analysis(
                                 (items, overrides)
                             }
                         });
+                        if gpu_analysis_failed.load(Ordering::Acquire) {
+                            // No consumir ni puntuar más frames de un intento
+                            // que será descartado por completo.
+                            break;
+                        }
                     }
                     collected
                 } else {
@@ -3448,14 +4752,15 @@ fn perform_standardized_analysis(
                                 // (VideoToolbox/NVDEC/D3D11VA) o su fallback CPU.
                                 emit_analysis_telemetry(
                                     &ac, &pipeline_job_id, ana_reader_kind, Some(use_gpu && decode_probe.hardware_confirmed),
-                                    gpu_analysis_enabled && !gpu_analysis_failed.load(Ordering::Relaxed),
+                                    attempt_gpu_enabled
+                                        && !gpu_analysis_failed.load(Ordering::Relaxed),
                                     analysis_cpu_reason(),
                                     rw.saturating_mul(rh).saturating_mul(4),
                                     crate::gpu_analysis::estimated_batch_vram_mb(rw, rh, gpu_batch_len), c, shown_total,
                                     ana_start, ana_threads_c, &ana_sys_c,
                                 );
                             }
-                            let result = analyze_fn(i, &raw, bs);
+                            let result = analyze_fn(i, &raw, bs, attempt_gpu_enabled);
                             // PR-2.1: sembrar el caché del apilado.
                             if let Some(transaction) = ana_cache_attempt.as_ref() {
                                 transaction.write_raw_le_u16(i, &raw);
@@ -3468,11 +4773,15 @@ fn perform_standardized_analysis(
                         .collect())
                 };
 
+                // Un fallo GPU puede cortar el consumidor antes de EOF. Cerrar
+                // el reciclador despierta al productor si espera un buffer y
+                // permite cosechar el proceso FFmpeg antes del reintento CPU.
+                drop(tx_empty);
                 let outcome = producer.join().unwrap_or_else(|_| StreamDecodeOutcome::Failed {
                     decoded: local_stats.len(),
                     error: "panic en el productor de decodificación".into(),
                 });
-                match validate_stream_decode(outcome, tf, expected_is_exact) {
+                let stream_failure = match validate_stream_decode(outcome, tf, expected_is_exact) {
                     Ok(decoded) if local_stats.len() == decoded => {
                         if job_token.is_cancelled() {
                             return Err("Cancelado o sustituido por otro análisis".into());
@@ -3483,7 +4792,7 @@ fn perform_standardized_analysis(
                         stats = local_stats;
                         break;
                     }
-                    Ok(decoded) => decode_failures.push(format!(
+                    Ok(decoded) => Some(format!(
                         "FFmpeg entregó {decoded} frames, pero sólo se analizaron {}",
                         local_stats.len()
                     )),
@@ -3491,19 +4800,44 @@ fn perform_standardized_analysis(
                         if job_token.is_cancelled() {
                             return Err("Cancelado o sustituido por otro análisis".into());
                         }
-                        decode_failures.push(error);
+                        Some(error)
                     }
+                };
+                if let Some(failure) = stream_failure {
+                    // Un fallo de compute corta deliberadamente el consumidor;
+                    // ese caso lo maneja el retry CPU de cómputo. Cualquier
+                    // otro fallo del decoder HW reinicia TODO el análisis en
+                    // software para no mezclar la referencia con otro decoder.
+                    if use_gpu
+                        && matches!(decode_policy, DecodePolicy::Auto)
+                        && !(attempt_gpu_enabled
+                            && gpu_analysis_failed.load(Ordering::Acquire))
+                    {
+                        return Err(request_full_software_decode_restart(
+                            "Decode HW falló durante el stream de análisis",
+                            failure,
+                        ));
+                    }
+                    decode_failures.push(failure);
                 }
         }
-        if stats.is_empty() && !decode_failures.is_empty() {
+        if stats.is_empty()
+            && !decode_failures.is_empty()
+            && !(attempt_gpu_enabled && gpu_analysis_failed.load(Ordering::Acquire))
+        {
             return Err(format!(
                 "No se pudo completar la decodificación sin pérdida de frames: {}",
                 decode_failures.join(" · ")
             ));
         }
     }
+    if attempt_gpu_enabled && gpu_analysis_failed.load(Ordering::Acquire) {
+        return Ok((stats, true));
+    }
     if stats.is_empty() {
-        let threads = ram_aware_analysis_threads(rw, rh, is_color, r.is_ffmpeg());
+        let threads = ram_aware_analysis_threads(rw, rh, is_color, r.is_ffmpeg())
+            .min(planned_analysis_threads)
+            .max(1);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
@@ -3513,7 +4847,7 @@ fn perform_standardized_analysis(
         let ac = app_c.clone();
         let ana_sys_c = ana_sys.clone();
         emit_progress(app, &get_msg("Analizando frames..."), 5.0, None);
-        stats = if gpu_analysis_enabled {
+        stats = if attempt_gpu_enabled {
             let (tx, rx_batches) = crossbeam_channel::bounded::<Result<Vec<(usize, Vec<u8>)>, String>>(2);
             let source = unified_source.clone();
             let producer_token = job_token.clone();
@@ -3556,7 +4890,7 @@ fn perform_standardized_analysis(
                 &pipeline_job_id,
                 ana_reader_kind,
                 None,
-                true,
+                attempt_gpu_enabled,
                 None,
                 rw.saturating_mul(rh).saturating_mul(4),
                 crate::gpu_analysis::estimated_batch_vram_mb(rw, rh, gpu_batch_len),
@@ -3605,15 +4939,16 @@ fn perform_standardized_analysis(
                             Ok(outputs) => outputs.into_iter().map(Some).collect(),
                             Err(e) => {
                                 gpu_analysis_failed.store(true, Ordering::Relaxed);
-                                log_to_front(
-                                    app,
-                                    "WARN",
-                                    &format!("GPU Metal falló en un lote SER/AVI/FITS ({e}); continuando en CPU."),
+                                eprintln!(
+                                    "[analysis-gpu] lote SER/AVI/FITS fallido ({e}); el intento se descartará"
                                 );
                                 (0..items.len()).map(|_| None).collect()
                             }
                         }
                     };
+                if gpu_analysis_failed.load(Ordering::Acquire) {
+                    break;
+                }
                 let score_n = items.len() as u64;
                 let score_t0 = std::time::Instant::now();
                 let batch_stats: Vec<FrameAlignmentData> = pool.install(|| {
@@ -3639,7 +4974,8 @@ fn perform_standardized_analysis(
                                         &pipeline_job_id,
                                         ana_reader_kind,
                                         None,
-                                        !gpu_analysis_failed.load(Ordering::Relaxed),
+                                        attempt_gpu_enabled
+                                            && !gpu_analysis_failed.load(Ordering::Relaxed),
                                         analysis_cpu_reason(),
                                         rw.saturating_mul(rh).saturating_mul(4),
                                         crate::gpu_analysis::estimated_batch_vram_mb(rw, rh, gpu_batch_len),
@@ -3650,7 +4986,13 @@ fn perform_standardized_analysis(
                                         &ana_sys_c,
                                     );
                                 }
-                                analyze_preprocessed(i, &raw, bs, gpu)
+                                analyze_preprocessed(
+                                    i,
+                                    &raw,
+                                    bs,
+                                    gpu,
+                                    attempt_gpu_enabled,
+                                )
                             },
                         )
                         .collect()
@@ -3663,7 +5005,9 @@ fn perform_standardized_analysis(
                     score_n,
                 );
                 collected.extend(batch_stats);
-                if sc.is_cancelled() { break; }
+                if sc.is_cancelled() || gpu_analysis_failed.load(Ordering::Acquire) {
+                    break;
+                }
             }
             drop(rx_batches);
             let _ = producer.join();
@@ -3696,7 +5040,8 @@ fn perform_standardized_analysis(
                             // decode → None (no aplica GPU de decodificacion).
                             emit_analysis_telemetry(
                                 &ac, &pipeline_job_id, ana_reader_kind, None,
-                                gpu_analysis_enabled && !gpu_analysis_failed.load(Ordering::Relaxed),
+                                attempt_gpu_enabled
+                                    && !gpu_analysis_failed.load(Ordering::Relaxed),
                                 analysis_cpu_reason(),
                                 rw.saturating_mul(rh).saturating_mul(4),
                                 crate::gpu_analysis::estimated_batch_vram_mb(rw, rh, gpu_batch_len), c, tf, ana_start,
@@ -3710,7 +5055,7 @@ fn perform_standardized_analysis(
                             ),
                             i,
                         )?;
-                        Ok(analyze_fn(i, &raw, bs))
+                        Ok(analyze_fn(i, &raw, bs, attempt_gpu_enabled))
                         },
                     )
                     .collect()
@@ -3718,17 +5063,29 @@ fn perform_standardized_analysis(
             native_stats?
         };
     }
-    if gpu_analysis_enabled && gpu_analysis_failed.load(Ordering::Relaxed) {
-        if matches!(compute_policy, ComputePolicy::GpuOnly) {
-            return Err(
-                "GPU only: el dispositivo falló durante el preprocesado del análisis; el resultado CPU de respaldo fue descartado."
-                    .into(),
-            );
-        }
+                Ok((
+                    stats,
+                    attempt_gpu_enabled && gpu_analysis_failed.load(Ordering::Acquire),
+                ))
+            },
+        );
+    let (mut stats, final_analysis_gpu_enabled, analysis_gpu_retried) =
+        match analysis_stage_result {
+            Err(error) if error.starts_with(RESTART_DECODE_SOFTWARE_PREFIX) => {
+                // Este intento es una transacción interna que será reemplazada
+                // por el wrapper exterior; no debe aparecer como otro job
+                // incompleto en el reporte de benchmarks.
+                pt_guard.discard();
+                return Err(error);
+            }
+            other => other?,
+        };
+    let preprocess_elapsed = preprocess_started.elapsed();
+    if analysis_gpu_retried {
         log_to_front(
             app,
             "WARN",
-            "La GPU falló durante el análisis; los frames restantes y el frame afectado se procesaron por CPU.",
+            "La GPU falló durante el análisis; se descartó el intento completo y la etapa se repitió desde frame 0 en CPU.",
         );
     }
     if stats.is_empty() {
@@ -3742,6 +5099,7 @@ fn perform_standardized_analysis(
     // par_bridge no promete orden de salida. Canonicalizar por índice antes
     // de construir quality_graph y rechazar huecos/duplicados evita publicar
     // un caché aparentemente válido que luego asocia score al frame equivocado.
+    let quality_selection_started = std::time::Instant::now();
     stats.sort_unstable_by_key(|frame| frame.idx);
     let mut qg: Vec<f32> = stats.iter().map(|s| s.score as f32).collect();
     let mut si: Vec<usize> = (0..stats.len()).collect();
@@ -3782,17 +5140,7 @@ fn perform_standardized_analysis(
             h: rh,
         })),
     };
-    // bincode+LZ4 (el JSON con grid_scores 40×40/frame superaba los 100 MB
-    // en videos largos y se re-parseaba en CADA apilado).
-    publish_analysis_cache_best_effort(
-        app,
-        state,
-        &job_token,
-        &c_path,
-        &cached,
-        &cache_expectation,
-    )?;
-    emit_progress(app, "Finalizando...", 100.0, None);
+    let quality_selection_elapsed = quality_selection_started.elapsed();
     // S6 (2026-07-17): precalentar EN SEGUNDO PLANO el caché de decode con el
     // top-24 por score — los candidatos de la referencia robusta del apilado.
     // ref_decode recorre con select casi todo el vídeo (~1-2 min a 20MP HEVC)
@@ -3806,6 +5154,10 @@ fn perform_standardized_analysis(
     // bytes bajo la misma clave (write_frame deduplica y el commit repara).
     // ZAS_NO_REF_PREWARM=1 lo desactiva.
     if matches!(r, VideoInput::Ffmpeg(_))
+        && !analysis_resource_pressure
+        && !analysis_decode_probe
+            .as_ref()
+            .is_some_and(|probe| probe.prefer_hardware)
         && std::env::var("ZAS_NO_REF_PREWARM").ok().as_deref() != Some("1")
     {
         static REF_PREWARM_ACTIVE: std::sync::atomic::AtomicBool =
@@ -3894,9 +5246,17 @@ fn perform_standardized_analysis(
             });
         }
     }
+    let master_reference_started = std::time::Instant::now();
     let mut buf = Vec::new();
     let raw = {
         let _s = crate::perf_trace::span(pt, "preview_decode");
+        if matches!(decode_policy, DecodePolicy::Hardware) && r.is_ffmpeg() {
+            let backend = analysis_decode_probe
+                .as_ref()
+                .and_then(|probe| probe.backend.as_deref())
+                .ok_or("Decode Hardware strict sin backend para preview")?;
+            read_exact_source_frame_hardware(&unified_source, best_frame_idx, backend)?
+        } else {
         // PR-10: caché de decode primero — evita re-decodificar 0..best_idx
         // cuando el análisis sembró el caché (o una pasada anterior lo dejó).
         let cached = if let VideoInput::Ffmpeg(ref fr) = r {
@@ -3934,6 +5294,7 @@ fn perform_standardized_analysis(
                 }
             }
         }
+        }
     };
     let u16_raw = raw_to_u16_buffer(&raw, tw, th, tbp);
     drop(raw);
@@ -3968,16 +5329,115 @@ fn perform_standardized_analysis(
         .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
         .unwrap();
     }
+    let master_reference_elapsed = master_reference_started.elapsed();
     if job_token.is_cancelled() {
         return Err("Cancelado o sustituido por otro análisis".into());
     }
+    let actual_analysis_gpu = final_analysis_gpu_enabled;
+    for stage in [
+        PlanetaryStage::Preprocess,
+        PlanetaryStage::CoarseSad,
+        PlanetaryStage::Enhance,
+    ] {
+        if let Some(mut decision) = execution_plan.stage(stage).cloned() {
+            if actual_analysis_gpu {
+                decision.effective_engine = if matches!(compute_policy, ComputePolicy::Hybrid) {
+                    EffectiveEngine::HybridPipeline
+                } else {
+                    EffectiveEngine::GpuCompute
+                };
+                decision.backend = execution_plan.resources.gpu_backend.clone();
+                decision.parity_status = ParityStatus::Passed;
+                if gpu_selected_for_cpu_pressure {
+                    decision.reason = DecisionReason::SafeDefault;
+                    decision.reason_detail = Some(format!(
+                        "perfil CPU suspendido para este trabajo: carga externa {}%; GPU aprobada por paridad y memoria antes del pase",
+                        execution_plan.resources.cpu_load_percent,
+                    ));
+                } else if !matches!(decision.reason, DecisionReason::CalibrationWinner) {
+                    decision.reason = DecisionReason::CapabilityGate;
+                }
+            } else {
+                decision.effective_engine = EffectiveEngine::CpuSimd;
+                decision.backend = None;
+                decision.parity_status = ParityStatus::NotApplicable;
+                if analysis_gpu_retried {
+                    decision.reason = DecisionReason::Fallback;
+                    decision.reason_detail = analysis_cpu_reason();
+                } else if decision.reason != DecisionReason::SafeDefault
+                    && decision.reason != DecisionReason::CalibrationWinner
+                {
+                    decision.reason = DecisionReason::Fallback;
+                    decision.reason_detail = analysis_cpu_reason();
+                }
+            }
+            execution_plan.set_stage(decision)?;
+        }
+    }
+    execution_plan.freeze()?;
+    record_plan_perf_identity(pt, &execution_plan);
+    if job_token.is_cancelled() {
+        return Err("Cancelado o sustituido antes de publicar el análisis".into());
+    }
+    // Commit único al final: ni un fallo de preview/plan ni una sustitución
+    // pueden dejar un análisis estable consumible por el apilador. El payload
+    // sigue siendo bincode+LZ4 (el JSON 40×40/frame excedía 100 MB).
+    let publish_started = std::time::Instant::now();
+    publish_analysis_cache_best_effort(
+        app,
+        state,
+        &job_token,
+        &c_path,
+        &cached,
+        &cache_expectation,
+    )?;
+    let publish_elapsed = publish_started.elapsed();
+    let mut preprocess_telemetry = completed_stage_telemetry(
+        &execution_plan,
+        PlanetaryStage::Preprocess,
+        preprocess_elapsed,
+        stats.len(),
+    );
+    if analysis_gpu_retried {
+        preprocess_telemetry.fallback_reason = analysis_cpu_reason();
+    }
+    let stage_telemetry = vec![
+        completed_stage_telemetry(
+            &execution_plan,
+            PlanetaryStage::Decode,
+            decode_preflight_elapsed,
+            stats.len(),
+        ),
+        preprocess_telemetry,
+        completed_stage_telemetry(
+            &execution_plan,
+            PlanetaryStage::QualitySelection,
+            quality_selection_elapsed,
+            stats.len(),
+        ),
+        completed_stage_telemetry(
+            &execution_plan,
+            PlanetaryStage::MasterReference,
+            master_reference_elapsed,
+            1,
+        ),
+        completed_stage_telemetry(
+            &execution_plan,
+            PlanetaryStage::Publish,
+            publish_elapsed,
+            1,
+        ),
+    ];
+    emit_progress(app, "Finalizando...", 100.0, None);
+    let _ = app.emit("planetary_execution_plan", &execution_plan);
+    let _ = app.emit("planetary_stage_telemetry", &stage_telemetry);
     emit_pipeline_telemetry(
         app,
         PipelineTelemetry {
             job_id: pipeline_job_id,
             domain: PipelineDomain::Planetary,
             phase: "complete".into(),
-            engine: if gpu_analysis_enabled && !gpu_analysis_failed.load(Ordering::Relaxed) {
+            engine: if final_analysis_gpu_enabled {
                 "Hybrid GPU por lotes + CPU refinamiento".into()
             } else {
                 format!("CPU {}", simd_backend_label())
@@ -3997,9 +5457,8 @@ fn perform_standardized_analysis(
             io_write_mb: 0.0,
             cache_hits: 0,
             cache_misses: stats.len(),
-            fallback_reason: gpu_analysis_failed
-                .load(Ordering::Relaxed)
-                .then_some("Fallback CPU tras fallo de preprocesado GPU".into()),
+            fallback_reason: analysis_gpu_retried
+                .then_some("Reinicio integral CPU tras fallo de preprocesado GPU".into()),
         },
     );
     let _ = pt_guard.finish_ok();
@@ -4055,6 +5514,8 @@ fn perform_standardized_analysis(
         best_frame_idx,
         path: path.to_string(),
         ap_points: vec![],
+        execution_plan: Some(execution_plan),
+        stage_telemetry,
     })
 }
 
@@ -4086,7 +5547,9 @@ async fn analyze_video_v2(
             bayer_override,
             anchor_override,
             progress_prefix,
-            ComputePolicy::Hybrid,
+            ComputePolicy::Auto,
+            DecodePolicy::Auto,
+            QualityPolicy::Adaptive,
         )
     })
     .await
@@ -4118,6 +5581,8 @@ async fn analyze_planetary(
             request.anchor_override,
             request.progress_prefix,
             request.compute_policy,
+            request.decode_policy,
+            request.quality_policy,
         )
     })
     .await
@@ -4179,6 +5644,10 @@ const DECODE_CACHE_MIN_AUTO_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 const DECODE_CACHE_MAX_AUTO_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 const DECODE_CACHE_ALGORITHM_VERSION: &str = "planetary-ffmpeg-decode-v6-route-crc32";
 const DECODE_CACHE_PAYLOAD_MAGIC: &[u8; 8] = b"ZDCFv5\0\0";
+const IDW_CACHE_ALGORITHM_VERSION: &str = "planetary-idw-exact-v1";
+const IDW_CACHE_PAYLOAD_MAGIC: &[u8; 8] = b"ZIDWv1\0\0";
+const IDW_CACHE_HEADER_BYTES: usize = 64;
+const IDW_CACHE_MAX_ENTRY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 static DECODE_CACHE_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static DECODE_CACHE_PRUNE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
@@ -4211,6 +5680,10 @@ struct DecodeFrameCacheTransaction {
     staged_bytes: std::sync::atomic::AtomicU64,
     expected_indices: Option<std::collections::HashSet<usize>>,
     staged_indices: std::sync::Mutex<std::collections::HashSet<usize>>,
+    // Una vez que el presupuesto o el volumen rechazan una escritura, seguir
+    // comprimiendo frames gigantes sólo para descartarlos multiplica el coste
+    // de P1. El latch hace que el resto de la transacción degrade a no-cache.
+    admission_closed: std::sync::atomic::AtomicBool,
     committed: bool,
 }
 
@@ -4245,6 +5718,7 @@ impl DecodeFrameCacheTransaction {
             staged_bytes: std::sync::atomic::AtomicU64::new(0),
             expected_indices: None,
             staged_indices: std::sync::Mutex::new(std::collections::HashSet::new()),
+            admission_closed: std::sync::atomic::AtomicBool::new(false),
             committed: false,
         })
     }
@@ -4258,7 +5732,9 @@ impl DecodeFrameCacheTransaction {
     }
 
     fn write_frame(&self, idx: usize, frame: &[u16]) {
-        if frame.len() != self.expected_len {
+        if frame.len() != self.expected_len
+            || self.admission_closed.load(Ordering::Acquire)
+        {
             return;
         }
         // PR-14: con admisión por sufijo solo se cachean los índices del
@@ -4274,19 +5750,30 @@ impl DecodeFrameCacheTransaction {
             return;
         }
         let staged_path = decode_cache_frame_path(&self.staging_dir, self.key, idx);
-        let written = write_cached_frame_budgeted(
+        let outcome = write_cached_frame_budgeted(
             &staged_path,
             frame,
             self.used_bytes.as_ref(),
             self.budget_bytes,
         );
-        if written > 0 {
-            self.staged_bytes.fetch_add(written, Ordering::AcqRel);
-            self.staged_indices
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(idx);
+        match outcome {
+            BudgetedCacheWrite::Written(written) => {
+                self.staged_bytes.fetch_add(written, Ordering::AcqRel);
+                self.staged_indices
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(idx);
+            }
+            BudgetedCacheWrite::Skipped => {}
+            BudgetedCacheWrite::Rejected => {
+                self.admission_closed.store(true, Ordering::Release);
+            }
         }
+    }
+
+    #[cfg(test)]
+    fn is_admission_closed(&self) -> bool {
+        self.admission_closed.load(Ordering::Acquire)
     }
 
     fn write_raw_le_u16(&self, idx: usize, raw: &[u8]) {
@@ -4339,8 +5826,11 @@ impl DecodeFrameCacheTransaction {
                 continue;
             };
             let final_path = self.cache_dir.join(name);
+            let staged_len = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
             if read_cached_frame(&final_path, self.expected_len).is_some() {
                 let _ = std::fs::remove_file(&staged);
+                release_cache_budget(self.used_bytes.as_ref(), staged_len);
+                release_cache_budget(&self.staged_bytes, staged_len);
                 continue;
             }
             if final_path.exists() {
@@ -4353,6 +5843,8 @@ impl DecodeFrameCacheTransaction {
                 if read_cached_frame(&final_path, self.expected_len).is_none() {
                     let _ = std::fs::remove_file(&staged);
                 }
+                release_cache_budget(self.used_bytes.as_ref(), staged_len);
+                release_cache_budget(&self.staged_bytes, staged_len);
             }
         }
         let _ = std::fs::remove_dir_all(&self.staging_dir);
@@ -4367,22 +5859,20 @@ impl Drop for DecodeFrameCacheTransaction {
         if self.committed {
             return;
         }
-        let _reservation_guard = DECODE_CACHE_RESERVATION_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let staged_bytes = self.staged_bytes.swap(0, Ordering::AcqRel);
         let _ = std::fs::remove_dir_all(&self.staging_dir);
-        // Reconciliar bajo el mismo mutex que las reservas cubre tanto el
-        // rollback normal como entradas duplicadas retiradas durante commit.
-        self.used_bytes
-            .store(decode_cache_total_bytes(&self.cache_dir), Ordering::Release);
+        // Cada staging posee exactamente su reserva. Liberarla por delta evita
+        // que un rollback sobrescriba reservas todavía en compresión de otra
+        // transacción concurrente.
+        release_cache_budget(self.used_bytes.as_ref(), staged_bytes);
     }
 }
 
 fn is_decode_cache_entry(path: &Path) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    path.extension().and_then(|ext| ext.to_str()) == Some("lz4")
-        && (name.starts_with("f_") || name.starts_with("batch_"))
+    let extension = path.extension().and_then(|ext| ext.to_str());
+    (extension == Some("lz4") && (name.starts_with("f_") || name.starts_with("batch_")))
+        || (extension == Some("idw") && name.starts_with("warp_"))
 }
 
 fn decode_cache_tree_bytes(path: &Path) -> u64 {
@@ -4568,8 +6058,10 @@ fn decode_cache_expected_set(
 
 /// PR-10: sirve índices exactos desde el caché de decode por-frame (sembrado
 /// por el análisis o por una pasada anterior) SIN tocar el códec. La clave
-/// incluye la ruta de decode con la que se sembró; se prueban la CPU y los
-/// backends HW plausibles de la plataforma (stats fallidos ≈ gratis).
+/// incluye la ruta de decode con la que se sembró. Este helper sirve
+/// exclusivamente la referencia software: reutilizar a ciegas un frame creado
+/// por otro decoder mezclaría rutas dentro del mismo resultado. La ruta HW usa
+/// su caché explícita desde el streamer que conoce el backend congelado.
 /// Todo-o-nada: cualquier índice ausente/corrupto devuelve None y el caller
 /// decodifica como siempre. Frames en bytes LE (contrato de read_batch).
 fn read_selected_from_decode_cache(
@@ -4589,17 +6081,7 @@ fn read_selected_from_decode_cache(
     let cache_dir = decode_cache_root_dir();
     let is_color_stream = ffmpeg_stream_is_color(color_id);
     let cached_frame_len = width * height * (if is_color_stream { 3 } else { 1 });
-    let mut routes: Vec<String> = vec![ffmpeg_decode_route_label(ffmpeg_path, None)];
-    let hw_candidates: &[&str] = if cfg!(target_os = "macos") {
-        &["videotoolbox"]
-    } else if cfg!(target_os = "windows") {
-        &["d3d11va", "dxva2", "cuda", "qsv"]
-    } else {
-        &["vaapi", "cuda"]
-    };
-    for backend in hw_candidates {
-        routes.push(ffmpeg_decode_route_label(ffmpeg_path, Some(backend)));
-    }
+    let routes = [ffmpeg_decode_route_label(ffmpeg_path, None)];
     for route in routes {
         let key = ffmpeg_decode_cache_key(
             path, width, height, bpp, color_id, rotation, codec_name, &route,
@@ -4714,6 +6196,277 @@ fn ffmpeg_decode_cache_key(
 
 fn decode_cache_frame_path(dir: &Path, path_hash: u64, idx: usize) -> PathBuf {
     dir.join(format!("f_{:016x}_{:06}.lz4", path_hash, idx))
+}
+
+fn idw_cache_key(
+    width: usize,
+    height: usize,
+    drizzle: f32,
+    roi_offset_x: f32,
+    roi_offset_y: f32,
+    custom_points: &[ApPoint],
+    idw_power: f32,
+    top_k: usize,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    IDW_CACHE_ALGORITHM_VERSION.hash(&mut hasher);
+    width.hash(&mut hasher);
+    height.hash(&mut hasher);
+    drizzle.to_bits().hash(&mut hasher);
+    roi_offset_x.to_bits().hash(&mut hasher);
+    roi_offset_y.to_bits().hash(&mut hasher);
+    idw_power.to_bits().hash(&mut hasher);
+    top_k.hash(&mut hasher);
+    custom_points.len().hash(&mut hasher);
+    // El orden de AP es parte del resultado: warp_indices contiene índices a
+    // esta misma secuencia, no sólo posiciones geométricas intercambiables.
+    for point in custom_points {
+        point.x.to_bits().hash(&mut hasher);
+        point.y.to_bits().hash(&mut hasher);
+        point.size.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn idw_cache_path(dir: &Path, key: u64) -> PathBuf {
+    dir.join(format!("warp_{key:016x}.idw"))
+}
+
+fn idw_cache_layout(
+    width: usize,
+    height: usize,
+    point_count: usize,
+    top_k: usize,
+) -> Option<(usize, usize, u64)> {
+    if width == 0 || height == 0 || point_count == 0 {
+        return None;
+    }
+    let effective_k = top_k.clamp(1, 8).min(point_count);
+    let map_len = width.checked_mul(height)?.checked_mul(effective_k)?;
+    let payload_bytes = map_len.checked_mul(6)?;
+    let file_bytes = IDW_CACHE_HEADER_BYTES.checked_add(payload_bytes)? as u64;
+    Some((effective_k, map_len, file_bytes))
+}
+
+fn idw_header_u32(header: &[u8; IDW_CACHE_HEADER_BYTES], offset: usize) -> u32 {
+    u32::from_le_bytes(header[offset..offset + 4].try_into().expect("campo u32 IDW"))
+}
+
+fn idw_header_u64(header: &[u8; IDW_CACHE_HEADER_BYTES], offset: usize) -> u64 {
+    u64::from_le_bytes(header[offset..offset + 8].try_into().expect("campo u64 IDW"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_exact_idw_cache(
+    path: &Path,
+    width: usize,
+    height: usize,
+    drizzle: f32,
+    roi_offset_x: f32,
+    roi_offset_y: f32,
+    point_count: usize,
+    idw_power: f32,
+    top_k: usize,
+) -> Option<(Vec<u16>, Vec<f32>)> {
+    let (effective_k, map_len, expected_bytes) =
+        idw_cache_layout(width, height, point_count, top_k)?;
+    if expected_bytes > IDW_CACHE_MAX_ENTRY_BYTES {
+        return None;
+    }
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() != expected_bytes {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
+    let mut header = [0u8; IDW_CACHE_HEADER_BYTES];
+    reader.read_exact(&mut header).ok()?;
+    if &header[..8] != IDW_CACHE_PAYLOAD_MAGIC
+        || idw_header_u64(&header, 8) != width as u64
+        || idw_header_u64(&header, 16) != height as u64
+        || idw_header_u64(&header, 24) != map_len as u64
+        || idw_header_u32(&header, 32) != effective_k as u32
+        || idw_header_u32(&header, 36) != point_count as u32
+        || idw_header_u32(&header, 40) != drizzle.to_bits()
+        || idw_header_u32(&header, 44) != roi_offset_x.to_bits()
+        || idw_header_u32(&header, 48) != roi_offset_y.to_bits()
+        || idw_header_u32(&header, 52) != idw_power.to_bits()
+        || idw_header_u32(&header, 56) != top_k as u32
+    {
+        return None;
+    }
+    let expected_crc = idw_header_u32(&header, 60);
+    let mut indices = Vec::new();
+    indices.try_reserve_exact(map_len).ok()?;
+    indices.resize(map_len, 0u16);
+    let mut weights = Vec::new();
+    weights.try_reserve_exact(map_len).ok()?;
+    weights.resize(map_len, 0.0f32);
+    reader.read_exact(bytemuck::cast_slice_mut(&mut indices)).ok()?;
+    reader.read_exact(bytemuck::cast_slice_mut(&mut weights)).ok()?;
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(bytemuck::cast_slice(&indices));
+    crc.update(bytemuck::cast_slice(&weights));
+    if crc.finalize() != expected_crc {
+        return None;
+    }
+    #[cfg(target_endian = "big")]
+    {
+        for value in &mut indices {
+            *value = u16::from_le(*value);
+        }
+        for value in &mut weights {
+            *value = f32::from_bits(u32::from_le(value.to_bits()));
+        }
+    }
+    let file = reader.into_inner();
+    let times = std::fs::FileTimes::new().set_modified(std::time::SystemTime::now());
+    let _ = file.set_times(times);
+    Some((indices, weights))
+}
+
+fn write_idw_payload<W: std::io::Write>(
+    writer: &mut W,
+    indices: &[u16],
+    weights: &[f32],
+) -> std::io::Result<()> {
+    #[cfg(target_endian = "little")]
+    {
+        writer.write_all(bytemuck::cast_slice(indices))?;
+        writer.write_all(bytemuck::cast_slice(weights))?;
+    }
+    #[cfg(target_endian = "big")]
+    {
+        for &value in indices {
+            writer.write_all(&value.to_le_bytes())?;
+        }
+        for &value in weights {
+            writer.write_all(&value.to_bits().to_le_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+fn idw_payload_crc(indices: &[u16], weights: &[f32]) -> u32 {
+    let mut crc = crc32fast::Hasher::new();
+    #[cfg(target_endian = "little")]
+    {
+        crc.update(bytemuck::cast_slice(indices));
+        crc.update(bytemuck::cast_slice(weights));
+    }
+    #[cfg(target_endian = "big")]
+    {
+        for &value in indices {
+            crc.update(&value.to_le_bytes());
+        }
+        for &value in weights {
+            crc.update(&value.to_bits().to_le_bytes());
+        }
+    }
+    crc.finalize()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_exact_idw_cache(
+    dir: &Path,
+    path: &Path,
+    width: usize,
+    height: usize,
+    drizzle: f32,
+    roi_offset_x: f32,
+    roi_offset_y: f32,
+    point_count: usize,
+    idw_power: f32,
+    top_k: usize,
+    indices: &[u16],
+    weights: &[f32],
+    budget_bytes: u64,
+) -> bool {
+    let Some((effective_k, map_len, file_bytes)) =
+        idw_cache_layout(width, height, point_count, top_k)
+    else {
+        return false;
+    };
+    // Una sola tabla no puede secuestrar el caché de frames: máximo 2 GiB y
+    // como máximo 1/4 del presupuesto seguro de este volumen.
+    if indices.len() != map_len
+        || weights.len() != map_len
+        || file_bytes > IDW_CACHE_MAX_ENTRY_BYTES
+        || file_bytes > budget_bytes / 4
+    {
+        return false;
+    }
+    if path.exists() {
+        return true;
+    }
+    let usage = decode_cache_usage_ledger(dir);
+    if !reserve_cache_budget(&usage, budget_bytes, file_bytes) {
+        return false;
+    }
+    let sequence = DECODE_CACHE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let staging_dir = dir.join(format!(
+        ".decode-attempt-{}-{sequence}-{stamp}",
+        std::process::id()
+    ));
+    let staged = staging_dir.join(
+        path.file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("warp-invalid.idw")),
+    );
+    let write_result = (|| -> std::io::Result<()> {
+        std::fs::create_dir(&staging_dir)?;
+        let file = std::fs::File::create(&staged)?;
+        let mut writer = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
+        let mut header = [0u8; IDW_CACHE_HEADER_BYTES];
+        header[..8].copy_from_slice(IDW_CACHE_PAYLOAD_MAGIC);
+        header[8..16].copy_from_slice(&(width as u64).to_le_bytes());
+        header[16..24].copy_from_slice(&(height as u64).to_le_bytes());
+        header[24..32].copy_from_slice(&(map_len as u64).to_le_bytes());
+        header[32..36].copy_from_slice(&(effective_k as u32).to_le_bytes());
+        header[36..40].copy_from_slice(&(point_count as u32).to_le_bytes());
+        header[40..44].copy_from_slice(&drizzle.to_bits().to_le_bytes());
+        header[44..48].copy_from_slice(&roi_offset_x.to_bits().to_le_bytes());
+        header[48..52].copy_from_slice(&roi_offset_y.to_bits().to_le_bytes());
+        header[52..56].copy_from_slice(&idw_power.to_bits().to_le_bytes());
+        header[56..60].copy_from_slice(&(top_k as u32).to_le_bytes());
+        header[60..64].copy_from_slice(&idw_payload_crc(indices, weights).to_le_bytes());
+        writer.write_all(&header)?;
+        write_idw_payload(&mut writer, indices, weights)?;
+        writer.flush()?;
+        let file = writer.into_inner().map_err(|error| error.into_error())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        release_cache_budget(&usage, file_bytes);
+        return false;
+    }
+    if path.exists() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        release_cache_budget(&usage, file_bytes);
+        return true;
+    }
+    if std::fs::rename(&staged, path).is_err() {
+        let won_by_other = path.exists();
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        release_cache_budget(&usage, file_bytes);
+        return won_by_other;
+    }
+    let _ = std::fs::remove_dir(&staging_dir);
+    true
+}
+
+fn remove_invalid_cache_entry(dir: &Path, path: &Path) {
+    let len = std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0);
+    if std::fs::remove_file(path).is_ok() {
+        let usage = decode_cache_usage_ledger(dir);
+        release_cache_budget(&usage, len);
+    }
 }
 
 fn decode_cache_max_file_bytes(expected_len: usize) -> u64 {
@@ -4836,41 +6589,79 @@ fn write_cached_frame(p: &Path, frame: &[u16]) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BudgetedCacheWrite {
+    Written(u64),
+    Skipped,
+    Rejected,
+}
+
+fn release_cache_budget(used_bytes: &std::sync::atomic::AtomicU64, released: u64) {
+    if released == 0 {
+        return;
+    }
+    let _ = used_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        Some(used.saturating_sub(released))
+    });
+}
+
+fn reserve_cache_budget(
+    used_bytes: &std::sync::atomic::AtomicU64,
+    budget_bytes: u64,
+    requested: u64,
+) -> bool {
+    if requested == 0 || requested > budget_bytes {
+        return false;
+    }
+    let _reservation_guard = DECODE_CACHE_RESERVATION_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    used_bytes
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            used.checked_add(requested)
+                .filter(|&next| next <= budget_bytes)
+        })
+        .is_ok()
+}
+
 fn write_cached_frame_budgeted(
     p: &Path,
     frame: &[u16],
     used_bytes: &std::sync::atomic::AtomicU64,
     budget_bytes: u64,
-) -> u64 {
-    if budget_bytes == 0 || p.exists() {
-        return 0;
+) -> BudgetedCacheWrite {
+    if p.exists() {
+        return BudgetedCacheWrite::Skipped;
     }
-    // La admisión all-or-nothing del caller ya descarta selecciones cuyo peor
-    // caso no cabe, antes de llegar aquí. Dentro de una transacción usamos el
-    // tamaño comprimido real: exigir de nuevo el peor caso por frame dejaría
-    // capacidad válida sin usar y rompería presupuestos pequeños pero exactos.
-    // La reserva atómica posterior sigue siendo la autoridad entre writers.
+    // Reservar el peor caso ANTES de LZ4 hace imposible pagar cientos de ms de
+    // compresión para descubrir después que el presupuesto ya estaba lleno.
+    // Tras conocer el tamaño real se devuelve inmediatamente el excedente.
+    let mut reserved = decode_cache_max_file_bytes(frame.len());
+    if !reserve_cache_budget(used_bytes, budget_bytes, reserved) {
+        return BudgetedCacheWrite::Rejected;
+    }
     let Some(compressed) = encode_cached_frame(frame) else {
-        return 0;
+        release_cache_budget(used_bytes, reserved);
+        return BudgetedCacheWrite::Rejected;
     };
     let len = compressed.len() as u64;
-    let _reservation_guard = DECODE_CACHE_RESERVATION_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let reserved = used_bytes
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-            used.checked_add(len).filter(|&next| next <= budget_bytes)
-        })
-        .is_ok();
-    if !reserved {
-        return 0;
+    if len > reserved {
+        let extra = len - reserved;
+        if !reserve_cache_budget(used_bytes, budget_bytes, extra) {
+            release_cache_budget(used_bytes, reserved);
+            return BudgetedCacheWrite::Rejected;
+        }
+        reserved = len;
+    } else {
+        release_cache_budget(used_bytes, reserved - len);
+        reserved = len;
     }
     if !write_cache_bytes_atomically(p, &compressed) {
-        used_bytes.fetch_sub(len, Ordering::AcqRel);
-        0
+        release_cache_budget(used_bytes, reserved);
+        BudgetedCacheWrite::Rejected
     } else {
-        len
+        BudgetedCacheWrite::Written(len)
     }
 }
 
@@ -4904,7 +6695,10 @@ fn prune_decode_cache_to_budget(dir: &Path, max_bytes: u64) {
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let before_cleanup = decode_cache_total_bytes(dir);
     cleanup_orphan_decode_staging(dir);
+    let after_cleanup = decode_cache_total_bytes(dir);
+    release_cache_budget(&usage, before_cleanup.saturating_sub(after_cleanup));
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(_) => return,
@@ -4924,21 +6718,24 @@ fn prune_decode_cache_to_budget(dir: &Path, max_bytes: u64) {
         .collect();
     // Los staging de procesos vivos cuentan contra el presupuesto aunque no
     // sean candidatos de poda. Así nunca quedan invisibles al cálculo global.
-    let mut total = decode_cache_total_bytes(dir);
-    if total <= max_bytes {
-        usage.store(total, Ordering::Release);
+    // El ledger incluye archivos estables, staging y reservas previas a LZ4.
+    // Nunca se sustituye por un scan que no puede ver reservas aún en RAM.
+    let on_disk = decode_cache_total_bytes(dir);
+    usage.fetch_max(on_disk, Ordering::AcqRel);
+    let mut accounted = usage.load(Ordering::Acquire);
+    if accounted <= max_bytes {
         return;
     }
     files.sort_by_key(|f| f.0); // mas viejos primero
     for (_, len, p) in files {
-        if total <= max_bytes {
+        if accounted <= max_bytes {
             break;
         }
         if std::fs::remove_file(&p).is_ok() {
-            total -= len;
+            release_cache_budget(&usage, len);
+            accounted = accounted.saturating_sub(len);
         }
     }
-    usage.store(decode_cache_total_bytes(dir), Ordering::Release);
 }
 
 fn stream_frames_ffmpeg_chunked(
@@ -4956,9 +6753,12 @@ fn stream_frames_ffmpeg_chunked(
     pass_label: &str,
     total_batches: usize,
     cancel: &PlanetaryJobToken,
+    attempt_cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     cache_hits: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
     force_cpu_decode: bool,
     decode_route_hardware: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    decode_probe: &FfmpegDecodeProbe,
+    decode_policy: DecodePolicy,
 ) -> Result<(), String> {
     let cache_dir = decode_cache_root_dir();
     if !cache_dir.exists() {
@@ -4973,29 +6773,16 @@ fn stream_frames_ffmpeg_chunked(
     let cached_frame_len = width * height * (stream_bpp / 2);
     let mut it: Option<FfmpegStreamIterator> = None;
     let mut pos: usize = 0; // next frame index the stream will yield
-    // Reutiliza el mismo micro-benchmark que el análisis: el apilado no vuelve
-    // a asumir que `-hwaccel auto` significa GPU ni que siempre será más rápido.
-    // La clave incluye path/tamaño/mtime/codec, por lo que normalmente es un
-    // lookup en caché y análisis/apilado conservan exactamente la misma ruta.
-    // Si el análisis se saltó (cache), el probe corre AQUI por primera vez:
-    // avisar para que la espera no parezca una barra muerta.
-    emit_progress(
-        app,
-        &format!("{}Midiendo decodificación GPU vs CPU...", pass_label),
-        1.0,
-        None,
-    );
-    let decode_probe = benchmark_ffmpeg_decode_route(
-        &reader.ffmpeg_path,
-        path,
-        &reader.codec_name,
-        color_id,
-        width,
-        height,
-        reader.rotation,
-        Some(cancel),
-    );
-    let use_gpu = !force_cpu_decode && decode_probe.prefer_hardware;
+    // La selección se resuelve una sola vez antes de iniciar el trabajo y se
+    // congela para todas sus pasadas. Sólo Auto puede reiniciar el pase en CPU.
+    let use_gpu = ffmpeg_decode_uses_hardware(
+        decode_policy,
+        decode_probe.prefer_hardware,
+        force_cpu_decode,
+    )?;
+    if use_gpu && decode_probe.backend.is_none() {
+        return Err("La ruta FFmpeg hardware no tiene backend confirmado".into());
+    }
     let decode_route = ffmpeg_decode_route_label(
         &reader.ffmpeg_path,
         use_gpu.then_some(decode_probe.backend.as_deref().unwrap_or("unconfirmed")),
@@ -5158,7 +6945,7 @@ fn stream_frames_ffmpeg_chunked(
     let t_start = std::time::Instant::now();
 
     for (batch_idx, indices) in chunks.iter().enumerate() {
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || attempt_cancel.load(Ordering::Acquire) {
             return Ok(());
         }
         let prefix = format!(
@@ -5290,7 +7077,10 @@ fn stream_frames_ffmpeg_chunked(
             if it.is_none() {
                 let stream_cancel = {
                     let token = cancel.clone();
-                    Arc::new(move || token.is_cancelled()) as FfmpegCancelCheck
+                    let attempt = attempt_cancel.clone();
+                    Arc::new(move || {
+                        token.is_cancelled() || attempt.load(Ordering::Acquire)
+                    }) as FfmpegCancelCheck
                 };
                 let hardware_backend = if use_gpu {
                     decode_probe.backend.as_deref()
@@ -5481,7 +7271,7 @@ fn stream_frames_ffmpeg_chunked(
             return Ok(());
         }
     }
-    if cancel.is_cancelled() {
+    if cancel.is_cancelled() || attempt_cancel.load(Ordering::Acquire) {
         return Ok(());
     }
     if let Some(stream) = it.as_ref() {
@@ -5556,6 +7346,29 @@ fn try_filled_vec<T: Clone>(len: usize, value: T, label: &str) -> Result<Vec<T>,
     })?;
     values.resize(len, value);
     Ok(values)
+}
+
+fn validate_uniform_ap_geometry(points: &[ApPoint], ap_size: usize) -> Result<(), String> {
+    let Some(first) = points.first() else {
+        return Ok(());
+    };
+    if first.size != ap_size {
+        return Err(format!(
+            "La malla AP declara tamaño {}, pero el apilador recibió AP size {ap_size}. Regenera la malla antes de apilar.",
+            first.size
+        ));
+    }
+    if let Some((index, point)) = points
+        .iter()
+        .enumerate()
+        .find(|(_, point)| point.size != first.size)
+    {
+        return Err(format!(
+            "La malla mezcla tamaños AP: el punto #0 usa {} px y el punto #{index} usa {} px. Esta ruta requiere geometría uniforme para no analizar y apilar cajas distintas.",
+            first.size, point.size
+        ));
+    }
+    Ok(())
 }
 
 /// `sysinfo` 0.30 calcula `available_memory()` en macOS como
@@ -6234,6 +8047,9 @@ async fn stack_video_liquid_warping(
     keep_full_frame: Option<bool>, // NEW: no recortar bordes (mantener encuadre completo)
     align_rgb: Option<bool>,       // NEW: alineacion RGB automatica (switch de usuario)
     gpu_mode: Option<String>,      // GPU compute: "auto" | "gpu" | "cpu" (None = auto)
+    compute_policy: Option<String>, // contrato nuevo; prevalece sobre gpu_mode
+    decode_policy: Option<String>, // FFmpeg decode: "auto" | "software" | "hardware"
+    quality_policy: Option<String>, // rigor AP: "standard" | "adaptive" | "maximum"
 ) -> Result<String, String> {
     validate_planetary_stack_parameters(
         &path,
@@ -6245,9 +8061,14 @@ async fn stack_video_liquid_warping(
         anchor_override.as_deref(),
         stacking_roi.as_deref(),
     )?;
+    validate_uniform_ap_geometry(&custom_points, ap_size as usize)?;
+    let compute_policy = ComputePolicy::from_planetary_legacy(
+        compute_policy.as_deref().or(gpu_mode.as_deref()),
+    );
+    let quality_policy = QualityPolicy::from_legacy(quality_policy.as_deref());
     let request_id = begin_planetary_user_job(&state);
     // PR-2.5: pool blocking (ver analyze_video_v2).
-    tauri::async_runtime::spawn_blocking(move || {
+    let response = tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         stack_video_liquid_warping_impl(
             &app,
@@ -6272,11 +8093,14 @@ async fn stack_video_liquid_warping(
             None,
             keep_full_frame,
             align_rgb,
-            gpu_mode,
+            compute_policy,
+            DecodePolicy::from_legacy(decode_policy.as_deref()),
+            quality_policy,
         )
     })
     .await
-    .map_err(|e| format!("El hilo de apilado terminó inesperadamente: {e}"))?
+    .map_err(|e| format!("El hilo de apilado terminó inesperadamente: {e}"))??;
+    Ok(response.preview_src)
 }
 
 /// Contrato tipado del segundo paso planetario. Toda decisión de GPU se delega
@@ -6286,7 +8110,7 @@ async fn run_planetary_stack(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     request: PlanetaryStackRequest,
-) -> Result<String, String> {
+) -> Result<PlanetaryStackResponse, String> {
     request.validate_static()?;
     let request = request.resolved_profile();
     request.validate_static()?;
@@ -6317,7 +8141,9 @@ async fn run_planetary_stack(
             None,
             request.keep_full_frame,
             request.align_rgb,
-            Some(request.compute_policy.legacy_value().into()),
+            request.compute_policy,
+            request.decode_policy,
+            request.quality_policy,
         )
     })
     .await
@@ -6327,9 +8153,66 @@ async fn run_planetary_stack(
 /// Internal engine entry point — callable from other commands (batch mode)
 /// with `&AppHandle`/`&State` (same pattern as perform_standardized_analysis).
 /// `progress_prefix` lets batch mode tag progress messages ("[2/7] …").
+const RESTART_DECODE_SOFTWARE_PREFIX: &str = "__ZAS_RESTART_DECODE_SOFTWARE__:";
+const RESTART_COMPUTE_CPU_PREFIX: &str = "__ZAS_RESTART_COMPUTE_CPU__:";
+
+fn request_full_software_decode_restart(context: &str, error: impl std::fmt::Display) -> String {
+    format!("{RESTART_DECODE_SOFTWARE_PREFIX}{context}: {error}")
+}
+
+fn request_full_cpu_compute_restart(context: &str, error: impl std::fmt::Display) -> String {
+    format!("{RESTART_COMPUTE_CPU_PREFIX}{context}: {error}")
+}
+
+/// Dueño transaccional del productor de frames de una pasada. Al abandonar un
+/// intento (fallback, cancelación o error), primero invalida el productor,
+/// después cierra el receptor para despertar cualquier `send` bloqueado y por
+/// último espera el hilo. Así nunca conviven el decoder del intento descartado
+/// y el del reintento que empieza desde frame cero.
+struct OwnedPlanetaryPrefetch<T> {
+    receiver: Option<std::sync::mpsc::Receiver<T>>,
+    attempt_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    join: Option<std::thread::JoinHandle<Result<(), String>>>,
+}
+
+impl<T> OwnedPlanetaryPrefetch<T> {
+    fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<T, std::sync::mpsc::RecvTimeoutError> {
+        self.receiver
+            .as_ref()
+            .expect("el receptor de prefetch vive hasta cerrar la pasada")
+            .recv_timeout(timeout)
+    }
+
+    /// Espera la confirmación terminal del productor después de consumir
+    /// todos los lotes esperados. Un decoder puede entregar el último frame y
+    /// descubrir sólo al cosechar FFmpeg que `-hwaccel` cayó a software; ese
+    /// veredicto forma parte de la transacción y debe llegar antes de aceptar
+    /// los acumuladores del pase.
+    fn wait_terminal(&mut self) -> Result<(), String> {
+        match self.join.take() {
+            Some(join) => join
+                .join()
+                .map_err(|_| "panic en el productor planetario".to_string())?,
+            None => Ok(()),
+        }
+    }
+}
+
+impl<T> Drop for OwnedPlanetaryPrefetch<T> {
+    fn drop(&mut self) {
+        self.attempt_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.receiver.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-// PR-2.5: SÍNCRONA (antes async sin ningún .await interno) — ver
-// perform_standardized_analysis; los comandos usan spawn_blocking.
 fn stack_video_liquid_warping_impl(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, AppState>,
@@ -6353,8 +8236,181 @@ fn stack_video_liquid_warping_impl(
     progress_prefix: Option<String>,
     keep_full_frame: Option<bool>,
     align_rgb: Option<bool>,
-    gpu_mode: Option<String>,
-) -> Result<String, String> {
+    compute_policy: ComputePolicy,
+    decode_policy: DecodePolicy,
+    quality_policy: QualityPolicy,
+) -> Result<PlanetaryStackResponse, String> {
+    let wrapper_started = std::time::Instant::now();
+    let mut effective_compute_policy = compute_policy;
+    let mut effective_decode_policy = decode_policy;
+    let mut decode_fallback_reason: Option<String> = None;
+    let mut compute_fallback_reason: Option<String> = None;
+    loop {
+        let retry_overhead = if effective_compute_policy != compute_policy
+            || effective_decode_policy != decode_policy
+        {
+            wrapper_started.elapsed()
+        } else {
+            std::time::Duration::ZERO
+        };
+        let result = stack_video_liquid_warping_attempt(
+            app,
+            state,
+            request_id,
+            path.clone(),
+            percent,
+            custom_points.clone(),
+            drizzle,
+            is_surface,
+            bayer_override,
+            ap_size,
+            sharpened,
+            sharpen_intensity,
+            double_pass,
+            warping_analysis,
+            anchor_override.clone(),
+            stacking_roi.clone(),
+            normalize_colors,
+            is_v3,
+            target_type.clone(),
+            progress_prefix.clone(),
+            keep_full_frame,
+            align_rgb,
+            effective_compute_policy,
+            effective_decode_policy,
+            compute_policy,
+            decode_policy,
+            quality_policy,
+            retry_overhead,
+        );
+        match result {
+            Ok(mut response) => {
+                if effective_compute_policy != compute_policy
+                    || effective_decode_policy != decode_policy
+                {
+                    response.execution_plan.frozen = false;
+                    response.execution_plan.requested_compute_policy = compute_policy;
+                    response.execution_plan.requested_decode_policy = decode_policy;
+                    for decision in &mut response.execution_plan.stages {
+                        decision.requested_compute_policy = compute_policy;
+                        decision.requested_decode_policy = decode_policy;
+                        if decision.stage == PlanetaryStage::Decode {
+                            if let Some(reason) = decode_fallback_reason.as_ref() {
+                                decision.reason = DecisionReason::Fallback;
+                                decision.reason_detail = Some(reason.clone());
+                            }
+                        } else if let Some(reason) = compute_fallback_reason.as_ref() {
+                            if matches!(
+                                decision.stage,
+                                PlanetaryStage::Preprocess
+                                    | PlanetaryStage::CoarseSad
+                                    | PlanetaryStage::Enhance
+                                    | PlanetaryStage::Accumulation
+                            ) {
+                                decision.reason = DecisionReason::Fallback;
+                                decision.reason_detail = Some(reason.clone());
+                            }
+                        }
+                    }
+                    response.execution_plan.freeze()?;
+                    for telemetry in &mut response.stage_telemetry {
+                        if telemetry.stage == PlanetaryStage::Decode {
+                            if let Some(reason) = decode_fallback_reason.as_ref() {
+                                telemetry.fallback_reason = Some(reason.clone());
+                            }
+                        } else if compute_fallback_reason.is_some()
+                            && matches!(
+                                telemetry.stage,
+                                PlanetaryStage::Preprocess
+                                    | PlanetaryStage::CoarseSad
+                                    | PlanetaryStage::Enhance
+                                    | PlanetaryStage::Accumulation
+                            )
+                        {
+                            telemetry.fallback_reason = compute_fallback_reason.clone();
+                        }
+                    }
+                    let _ = app.emit("planetary_execution_plan", &response.execution_plan);
+                    let _ = app.emit("planetary_stage_telemetry", &response.stage_telemetry);
+                }
+                return Ok(response);
+            }
+            Err(error)
+                if error.starts_with(RESTART_DECODE_SOFTWARE_PREFIX)
+                    && matches!(effective_decode_policy, DecodePolicy::Auto) =>
+            {
+                log_to_front(
+                    app,
+                    "WARN",
+                    &format!(
+                        "{} Se descarta el intento completo y se reinicia desde preflight con FFmpeg software.",
+                        error.trim_start_matches(RESTART_DECODE_SOFTWARE_PREFIX)
+                    ),
+                );
+                decode_fallback_reason = Some(
+                    error
+                        .trim_start_matches(RESTART_DECODE_SOFTWARE_PREFIX)
+                        .to_string(),
+                );
+                effective_decode_policy = DecodePolicy::Software;
+            }
+            Err(error)
+                if error.starts_with(RESTART_COMPUTE_CPU_PREFIX)
+                    && effective_compute_policy.allows_fallback() =>
+            {
+                log_to_front(
+                    app,
+                    "WARN",
+                    &format!(
+                        "{} Se descarta el intento completo y se reinicia desde preflight con CPU canónica.",
+                        error.trim_start_matches(RESTART_COMPUTE_CPU_PREFIX)
+                    ),
+                );
+                compute_fallback_reason = Some(
+                    error
+                        .trim_start_matches(RESTART_COMPUTE_CPU_PREFIX)
+                        .to_string(),
+                );
+                effective_compute_policy = ComputePolicy::CpuOnly;
+            }
+            other => return other,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+// PR-2.5: SÍNCRONA (antes async sin ningún .await interno) — ver
+// perform_standardized_analysis; los comandos usan spawn_blocking.
+fn stack_video_liquid_warping_attempt(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    request_id: usize,
+    path: String,
+    percent: f32,
+    custom_points: Vec<ApPoint>,
+    drizzle: f32,
+    is_surface: bool,
+    bayer_override: Option<i32>,
+    ap_size: u32,
+    sharpened: bool,
+    sharpen_intensity: f32,
+    double_pass: bool,
+    warping_analysis: bool,
+    anchor_override: Option<Vec<i32>>,
+    stacking_roi: Option<Vec<u32>>,
+    normalize_colors: bool,
+    is_v3: bool,
+    target_type: String,
+    progress_prefix: Option<String>,
+    keep_full_frame: Option<bool>,
+    align_rgb: Option<bool>,
+    compute_policy: ComputePolicy,
+    decode_policy: DecodePolicy,
+    requested_compute_policy: ComputePolicy,
+    requested_decode_policy: DecodePolicy,
+    quality_policy: QualityPolicy,
+    retry_overhead: std::time::Duration,
+) -> Result<PlanetaryStackResponse, String> {
     validate_planetary_stack_parameters(
         &path,
         percent,
@@ -6365,6 +8421,7 @@ fn stack_video_liquid_warping_impl(
         anchor_override.as_deref(),
         stacking_roi.as_deref(),
     )?;
+    validate_uniform_ap_geometry(&custom_points, ap_size as usize)?;
     let app = app.clone();
     let job_token =
         PlanetaryJobToken::for_app(&app, request_id, state.cancel_requested.clone());
@@ -6377,6 +8434,13 @@ fn stack_video_liquid_warping_impl(
     // vuelca también en errores/cancelaciones con completed=false).
     let pt = crate::perf_trace::job_start("stack", &path);
     let pt_guard = crate::perf_trace::JobGuard::new(pt);
+    if !retry_overhead.is_zero() {
+        crate::perf_trace::job_meta(
+            pt,
+            "retry_overhead_ms",
+            retry_overhead.as_secs_f64() * 1e3,
+        );
+    }
     crate::perf_trace::job_meta(pt, "double_pass", double_pass);
     crate::perf_trace::job_meta(pt, "drizzle", drizzle);
     let is_surface = is_surface || is_surface_target(&target_type);
@@ -6496,6 +8560,43 @@ fn stack_video_liquid_warping_impl(
 
     let source_sample_bits = r.sample_bits();
     let source_adu_gain = r.native_sample_to_u16_gain();
+    record_policy_perf_identity(
+        pt,
+        requested_compute_policy,
+        requested_decode_policy,
+        compute_policy,
+        decode_policy,
+    );
+    let stack_decode_probe = if let VideoInput::Ffmpeg(ref reader) = r {
+        emit_progress(
+            &app,
+            "Calibrando ruta FFmpeg para apilado (gray16/RGB48)...",
+            4.0,
+            None,
+        );
+        let decode_profile = app
+            .path()
+            .app_config_dir()
+            .ok()
+            .map(|directory| crate::planetary_planner::calibration_profile_path(&directory));
+        Some(benchmark_ffmpeg_decode_route(
+            &reader.ffmpeg_path,
+            &path,
+            &reader.codec_name,
+            resolved_color_id,
+            w_in,
+            h_in,
+            total,
+            reader.rotation,
+            source_sample_bits,
+            decode_policy,
+            DecodeContract::StackNative16,
+            Some(&job_token),
+            decode_profile.as_deref(),
+        )?)
+    } else {
+        None
+    };
     if source_adu_gain > 1.000_1 {
         log_to_front(
             &app,
@@ -6531,7 +8632,39 @@ fn stack_video_liquid_warping_impl(
             .max_by_key(|f| f.score)
             .map(|f| f.idx)
             .unwrap_or(0);
-        let det_raw = r.get_frame(det_idx, r.color_id());
+        let det_raw = if matches!(r, VideoInput::Ffmpeg(_)) {
+            let detection_source = UnifiedFrameSource::from_input(
+                r.clone(),
+                resolved_color_id,
+            );
+            let selected_backend = stack_decode_probe
+                .as_ref()
+                .filter(|probe| probe.prefer_hardware)
+                .and_then(|probe| probe.backend.as_deref());
+            let batch = if let Some(backend) = selected_backend {
+                match detection_source.read_batch_with_hardware_strict(
+                    &[det_idx],
+                    None,
+                    backend,
+                ) {
+                    Ok(batch) => batch,
+                    Err(error) if matches!(decode_policy, DecodePolicy::Auto) => {
+                        let restart = request_full_software_decode_restart(
+                            "Decode HW falló durante la detección de disco",
+                            error,
+                        );
+                        pt_guard.discard();
+                        return Err(restart);
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                detection_source.read_batch(&[det_idx], None)?
+            };
+            batch.frames.into_iter().next().unwrap_or_default()
+        } else {
+            r.get_frame(det_idx, r.color_id()).into_owned()
+        };
         let mut det = raw_to_u16_buffer(&det_raw, w_in, h_in, r.bpp());
         let px = w_in * h_in;
         if det.len() >= px * 3 {
@@ -6549,6 +8682,7 @@ fn stack_video_liquid_warping_impl(
         category_profile = TargetCategory::PlanetLarge.profile();
     }
 
+    let quality_selection_started = std::time::Instant::now();
     // One contiguous, bit-packed matrix replaces one Vec allocation per frame.
     // The explicit work/RAM preflight fails loudly for configurations that
     // would otherwise run for hours or let the allocator abort the process.
@@ -6669,11 +8803,19 @@ fn stack_video_liquid_warping_impl(
         } else {
             // REGIONAL GRID-VOTING (Optimized for Planet)
             // Porting v4 Adaptive Logic to Planets
-            let mut frequency_map = std::collections::HashMap::new();
-            frequency_map.try_reserve(total).map_err(|error| {
-                format!("No se pudo reservar el mapa de votación AP: {error}")
-            })?;
-            
+            // `CompactFrameAcceptance::try_new` ya validó que cada frame_idx
+            // es único. Los votos pueden por ello vivir en un vector denso por
+            // posición aunque los ids estén desordenados/no sean contiguos.
+            let mut dense_vote_counts = Vec::new();
+            dense_vote_counts
+                .try_reserve_exact(total)
+                .map_err(|error| format!("No se pudo reservar la votación AP densa: {error}"))?;
+            dense_vote_counts.resize(total, 0usize);
+            let mut ap_preselections = Vec::new();
+            ap_preselections
+                .try_reserve_exact(custom_points.len())
+                .map_err(|error| format!("No se pudo reservar la preselección AP: {error}"))?;
+
             // Step 1: Preliminary vote with adaptive quality check
             for (ap_idx, ap) in custom_points.iter().enumerate() {
                 if ap_idx & 0x0f == 0 && job_token.is_cancelled() {
@@ -6692,113 +8834,139 @@ fn stack_video_liquid_warping_impl(
                     } else {
                         f.score
                     };
-                    ap_stats.push((f.idx, s));
+                    ap_stats.push(PlanetaryLocalCandidate {
+                        frame_position,
+                        frame_idx: f.idx,
+                        score: s,
+                    });
                 }
-                let rank_order = |a: &(usize, u64), b: &(usize, u64)| {
-                    b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
-                };
-                if num_to_stack < ap_stats.len() {
-                    ap_stats.select_nth_unstable_by(num_to_stack, rank_order);
-                    ap_stats.truncate(num_to_stack);
-                }
-                ap_stats.sort_unstable_by(rank_order);
+                let preselection = prepare_planetary_ap_preselection(
+                    &mut ap_stats,
+                    num_to_stack,
+                    per_ap_min_keep,
+                )?;
 
                 // Quality cutoff for voting. Planetary APs use a softer floor so
                 // faint moons/transits are not discarded just because they are local.
-                let best_ap_score = if let Some(&(_, s)) = ap_stats.first() { s as f32 } else { 0.0 };
+                let best_ap_score = preselection.best_score as f32;
                 let ap_cutoff = best_ap_score * if is_surface_logic { 0.60 } else { 0.52 };
 
-                for rank in 0..num_to_stack {
-                    if let Some(&(idx, s)) = ap_stats.get(rank) {
-                        if (s as f32) < ap_cutoff { break; }
-                        *frequency_map.entry(idx).or_insert(0) += 1;
+                for candidate in ap_stats.iter().take(num_to_stack) {
+                    if (candidate.score as f32) < ap_cutoff {
+                        break;
                     }
+                    dense_vote_counts[candidate.frame_position] = dense_vote_counts
+                        [candidate.frame_position]
+                        .checked_add(1)
+                        .ok_or("La votación AP excedió el contador direccionable")?;
                 }
+                ap_preselections.push(preselection);
             }
 
             let efficiency_factor = if is_surface_logic { 1.6 } else { 2.0 };
             let global_limit = ((total as f32 * percent / 100.0) * efficiency_factor).ceil() as usize;
             let mut hit_list = Vec::new();
-            hit_list.try_reserve_exact(frequency_map.len()).map_err(|error| {
+            hit_list.try_reserve_exact(total).map_err(|error| {
                 format!("No se pudo reservar el ranking de votos AP: {error}")
             })?;
-            hit_list.extend(frequency_map);
-            hit_list.sort_unstable_by(|a, b| {
-                b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
-            });
-            let mut allowed_indices = std::collections::HashSet::new();
-            allowed_indices
-                .try_reserve(global_limit.min(hit_list.len()))
-                .map_err(|error| format!("No se pudo reservar el filtro global AP: {error}"))?;
-            allowed_indices.extend(
-                hit_list
-                    .into_iter()
-                    .take(global_limit)
-                    .map(|(idx, _)| idx),
+            hit_list.extend(
+                dense_vote_counts
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|&(_, votes)| votes > 0)
+                    .map(|(frame_position, votes)| {
+                        (frame_position, all_stats[frame_position].idx, votes)
+                    }),
             );
+            hit_list.sort_unstable_by(|a, b| {
+                b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1))
+            });
+            let allowed_count = global_limit.min(hit_list.len());
+            let mut allowed_frame_positions = Vec::new();
+            allowed_frame_positions
+                .try_reserve_exact(allowed_count)
+                .map_err(|error| format!("No se pudo reservar el filtro global AP: {error}"))?;
+            let mut allowed_position_mask = Vec::new();
+            allowed_position_mask
+                .try_reserve_exact(total)
+                .map_err(|error| format!("No se pudo reservar la máscara global AP: {error}"))?;
+            allowed_position_mask.resize(total, false);
+            for &(frame_position, _, _) in hit_list.iter().take(allowed_count) {
+                allowed_frame_positions.push(frame_position);
+                allowed_position_mask[frame_position] = true;
+            }
 
             // Step 2: Final Acceptance with Moon Detection
-            for (ap_idx, ap) in custom_points.iter().enumerate() {
+            for (ap_idx, (ap, preselection)) in custom_points
+                .iter()
+                .zip(ap_preselections.iter())
+                .enumerate()
+            {
                 if ap_idx & 0x0f == 0 && job_token.is_cancelled() {
                     return Err("Selección local cancelada o sustituida".into());
                 }
-                let mut ap_stats = Vec::new();
-                ap_stats.try_reserve_exact(total).map_err(|error| {
-                    format!("No se pudo reservar la selección final del AP #{ap_idx}: {error}")
-                })?;
-                for (frame_position, f) in all_stats.iter().enumerate() {
-                    if frame_position & 0x0fff == 0 && job_token.is_cancelled() {
-                        return Err("Selección local cancelada o sustituida".into());
-                    }
-                    let s = if let Some(gs) = &f.grid_scores {
-                        ap_grid_quality(gs, w_in as f32, h_in as f32, ap)
-                    } else {
-                        f.score
-                    };
-                    ap_stats.push((f.idx, s));
-                }
-                let rank_order = |a: &(usize, u64), b: &(usize, u64)| {
-                    b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
-                };
-                let best_ap_score = ap_stats
-                    .iter()
-                    .map(|&(_, score)| score)
-                    .max()
-                    .unwrap_or(0) as f32;
+                // El máximo ya fue medido en la primera pasada. En ésta sólo
+                // materializamos `allowed ∪ protected`: los demás frames no
+                // pueden aceptarse bajo ninguna rama del algoritmo histórico.
+                let best_ap_score = preselection.best_score as f32;
                 let ap_cutoff = best_ap_score * if is_surface_logic { 0.65 } else { 0.55 };
 
-                // The old loop can only accept the first `per_ap_min_keep`
-                // local ranks plus frames admitted by the global vote. Build
-                // exactly that union, then sort it; sorting every rejected
-                // frame for every AP was the dominant large-grid bottleneck.
-                let protected_count = per_ap_min_keep.min(ap_stats.len());
-                if protected_count < ap_stats.len() {
-                    ap_stats.select_nth_unstable_by(protected_count, rank_order);
-                }
-                let protected_ids: Vec<usize> = ap_stats
-                    .iter()
-                    .take(protected_count)
-                    .map(|&(idx, _)| idx)
-                    .collect();
                 let mut eligible = Vec::new();
                 eligible
                     .try_reserve_exact(
-                        allowed_indices
+                        allowed_frame_positions
                             .len()
-                            .saturating_add(protected_count)
-                            .min(ap_stats.len()),
+                            .saturating_add(preselection.protected.len())
+                            .min(total),
                     )
                     .map_err(|error| {
                         format!("No se pudo reservar el filtro final del AP #{ap_idx}: {error}")
                     })?;
-                eligible.extend(ap_stats.into_iter().filter(|&(idx, score)| {
-                    (score as f32) >= ap_cutoff
-                        && (allowed_indices.contains(&idx) || protected_ids.contains(&idx))
-                }));
-                eligible.sort_unstable_by(rank_order);
+
+                for (allowed_rank, &frame_position) in
+                    allowed_frame_positions.iter().enumerate()
+                {
+                    if allowed_rank & 0x0fff == 0 && job_token.is_cancelled() {
+                        return Err("Selección local cancelada o sustituida".into());
+                    }
+                    let candidate = if let Some(saved) = preselection
+                        .protected
+                        .iter()
+                        .find(|candidate| candidate.frame_position == frame_position)
+                    {
+                        *saved
+                    } else {
+                        let frame = &all_stats[frame_position];
+                        let score = if let Some(gs) = &frame.grid_scores {
+                            ap_grid_quality(gs, w_in as f32, h_in as f32, ap)
+                        } else {
+                            frame.score
+                        };
+                        PlanetaryLocalCandidate {
+                            frame_position,
+                            frame_idx: frame.idx,
+                            score,
+                        }
+                    };
+                    if (candidate.score as f32) >= ap_cutoff {
+                        eligible.push(candidate);
+                    }
+                }
+                eligible.extend(
+                    preselection
+                        .protected
+                        .iter()
+                        .filter(|candidate| {
+                            !allowed_position_mask[candidate.frame_position]
+                                && (candidate.score as f32) >= ap_cutoff
+                        })
+                        .copied(),
+                );
+                eligible.sort_unstable_by(planetary_local_rank_order);
 
                 let mut accepted_for_this_ap = 0;
-                for &(idx, s) in &eligible {
+                for candidate in &eligible {
                     // Cobertura local mínima, no una falsa "detección de luna":
                     // el código anterior marcaba TODOS los AP planetarios como
                     // lunas y saltaba el filtro global hasta N/2. Conservamos
@@ -6806,14 +8974,18 @@ fn stack_video_liquid_warping_impl(
                     // posterior garantiza que esos frames no desaparezcan.
                     let locally_protected = accepted_for_this_ap < per_ap_min_keep;
 
-                    if allowed_indices.contains(&idx) || locally_protected {
-                        if (s as f32) < ap_cutoff { break; }
+                    if allowed_position_mask[candidate.frame_position] || locally_protected {
+                        if (candidate.score as f32) < ap_cutoff {
+                            break;
+                        }
 
-                        global_active_indices.insert(idx);
-                        frame_acceptance_masks.set_accepted(idx, ap_idx)?;
+                        global_active_indices.insert(candidate.frame_idx);
+                        frame_acceptance_masks.set_accepted(candidate.frame_idx, ap_idx)?;
                         accepted_for_this_ap += 1;
                     }
-                    if accepted_for_this_ap >= num_to_stack { break; }
+                    if accepted_for_this_ap >= num_to_stack {
+                        break;
+                    }
                 }
             }
         }
@@ -6894,12 +9066,71 @@ fn stack_video_liquid_warping_impl(
         .min_by(|a, b| planetary_frame_quality_order(a, b))
         .map(|f| f.idx)
         .unwrap_or(0);
+    let quality_selection_elapsed = quality_selection_started.elapsed();
+    crate::perf_trace::add_wall_ns(
+        pt,
+        crate::perf_trace::GLOBAL_PASS,
+        "quality_selection_wall",
+        quality_selection_elapsed.as_nanos(),
+        active_frames_data.len() as u64,
+    );
     let bpp = r.bpp();
     let color_id = resolved_color_id;
     let is_color_video = r.is_color_for(color_id);
     // MONO BRANCH: grayscale videos are stacked in a single channel end-to-end
     // (no RGB triplication) and expanded to RGB only for the post pipeline.
     let is_mono_stack = !is_color_video;
+    let total_active = active_frames_data.len();
+    let stack_descriptor = UnifiedFrameSource::from_input(r.clone(), color_id).descriptor();
+    let (stack_codec, stack_ffmpeg_path) = match &r {
+        VideoInput::Ffmpeg(reader) => (
+            Some(reader.codec_name.as_str()),
+            Some(reader.ffmpeg_path.as_str()),
+        ),
+        _ => (None, None),
+    };
+    let plan_roi = stacking_roi.as_deref().and_then(|roi| match roi {
+        [x, y, width, height] => Some([*x, *y, *width, *height]),
+        _ => None,
+    });
+    // El plan se construye ANTES de reservar pools/rings. Las decisiones ya
+    // no son sólo telemetría: acotan el plan de RAM y el número de workers.
+    let mut stack_execution_plan = build_planetary_plan_draft(
+        &app,
+        &pipeline_job_id,
+        &stack_descriptor,
+        stack_codec,
+        stack_ffmpeg_path,
+        &target_type,
+        is_surface_logic || large_disc,
+        total_active,
+        custom_points.len(),
+        ap_size,
+        drizzle,
+        double_pass,
+        plan_roi,
+        compute_policy,
+        decode_policy,
+        quality_policy,
+        stack_decode_probe.as_ref(),
+    )?;
+    record_policy_perf_identity(
+        pt,
+        requested_compute_policy,
+        requested_decode_policy,
+        compute_policy,
+        decode_policy,
+    );
+    record_plan_perf_identity(pt, &stack_execution_plan);
+    let planned_stack_threads = stack_execution_plan
+        .stage(PlanetaryStage::ApAlignment)
+        .map(|decision| decision.compute_threads.max(1))
+        .unwrap_or(1);
+    let planned_decode_threads = stack_execution_plan
+        .stage(PlanetaryStage::Decode)
+        .map(|decision| decision.compute_threads.max(1))
+        .unwrap_or(1);
+    crate::set_planetary_ffmpeg_thread_budget(planned_decode_threads);
 
     // 3. Prepare Master Reference (Low-Noise Stack)
 
@@ -6933,11 +9164,18 @@ fn stack_video_liquid_warping_impl(
         use_warp_map: !custom_points.is_empty(),
         surface_or_large_disc: is_surface_logic || large_disc,
         robust_reference_frames: requested_robust_reference_frames,
-        hardware_threads: hw_threads,
+        hardware_threads: hw_threads.min(planned_stack_threads),
     })?;
     let stack_threads = ram_plan.stack_threads;
-    let frames_per_batch = ram_plan.frames_per_batch;
+    // El ring materializado y las lanes son recursos distintos. El plan RAM ya
+    // presupuesta dos lotes completos; reducirlo a frame_concurrency creó 215
+    // transacciones para 1285 frames y dejó al decoder sin margen de prefetch.
+    // Más abajo cada lote se divide en ondas <= scratch_slots, por lo que un
+    // ring mayor no aumenta la concurrencia ni puede prestar un scratch extra.
+    let frames_per_batch = ram_plan.frames_per_batch.max(1);
     let robust_reference_frames = ram_plan.robust_reference_frames;
+    crate::perf_trace::job_meta(pt, "materialized_batch_frames", frames_per_batch);
+    crate::perf_trace::job_meta(pt, "frame_wave_lanes", stack_threads);
 
     if robust_reference_frames < requested_robust_reference_frames {
         log_to_front(
@@ -6950,7 +9188,6 @@ fn stack_video_liquid_warping_impl(
         );
     }
 
-    let total_active = active_frames_data.len();
     let total_batches = (total_active + frames_per_batch - 1) / frames_per_batch;
 
     emit_progress(
@@ -6977,6 +9214,7 @@ fn stack_video_liquid_warping_impl(
     );
 
     // --- STEP 3: MASTER REFERENCE GENERATION ---
+    let master_reference_started = std::time::Instant::now();
     emit_progress(&app, "Generando Referencia Maestra...", 12.0, None);
 
     // best_idx already correctly computed above as the frame with HIGHEST SCORE
@@ -7007,7 +9245,26 @@ fn stack_video_liquid_warping_impl(
     let (master_u16_best, preloaded_reference_batch) = if prepared_ref_indices.is_empty() {
         // Always use absolute decode position. A timestamp seek can be the wrong
         // B/VFR frame and silently poison every downstream offset.
-        let master_raw = read_exact_source_frame(&master_source, best_idx)?;
+        let selected_backend = stack_decode_probe
+            .as_ref()
+            .filter(|probe| probe.prefer_hardware)
+            .and_then(|probe| probe.backend.clone());
+        let master_raw = if let Some(backend) = selected_backend {
+            match read_exact_source_frame_hardware(&master_source, best_idx, &backend) {
+                Ok(frame) => frame,
+                Err(error) if matches!(decode_policy, DecodePolicy::Auto) => {
+                    let restart = request_full_software_decode_restart(
+                        "Decode HW falló al construir la referencia maestra",
+                        error,
+                    );
+                    pt_guard.discard();
+                    return Err(restart);
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            read_exact_source_frame(&master_source, best_idx)?
+        };
         let master = raw_to_u16_buffer(&master_raw, w_in, h_in, bpp);
         drop(master_raw);
         (master, None)
@@ -7017,18 +9274,25 @@ fn stack_video_liquid_warping_impl(
                 .items(prepared_ref_indices.len() as u64);
             // PR-10: caché de decode por-frame PRIMERO — en re-ejecuciones y
             // cachés admitidos la referencia deja de recorrer el códec.
-            let cached = if let VideoInput::Ffmpeg(ref fr) = r {
-                read_selected_from_decode_cache(
-                    &path,
-                    &fr.ffmpeg_path,
-                    &fr.codec_name,
-                    fr.rotation,
-                    w_in,
-                    h_in,
-                    bpp,
-                    color_id,
-                    &prepared_ref_indices,
-                )
+            let hardware_selected = stack_decode_probe
+                .as_ref()
+                .is_some_and(|probe| probe.prefer_hardware);
+            let cached = if !hardware_selected {
+                if let VideoInput::Ffmpeg(ref fr) = r {
+                    read_selected_from_decode_cache(
+                        &path,
+                        &fr.ffmpeg_path,
+                        &fr.codec_name,
+                        fr.rotation,
+                        w_in,
+                        h_in,
+                        bpp,
+                        color_id,
+                        &prepared_ref_indices,
+                    )
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -7047,35 +9311,30 @@ fn stack_video_liquid_warping_impl(
                     }
                 }
                 None => {
-                    // La sonda HW/CPU está cacheada por fingerprint (el
-                    // análisis ya la corrió, coste ~0 aquí). El recorrido
-                    // select de la referencia decodifica casi todo el vídeo
-                    // aunque solo materialice el top-N: en HEVC 20MP la ruta
-                    // software duplicaba el ref_decode medido.
-                    let ref_hw_backend = if let VideoInput::Ffmpeg(ref fr) = r {
-                        let probe = benchmark_ffmpeg_decode_route(
-                            &fr.ffmpeg_path,
-                            &path,
-                            &fr.codec_name,
-                            color_id,
-                            w_in,
-                            h_in,
-                            fr.rotation,
-                            Some(&job_token),
-                        );
-                        if probe.prefer_hardware {
-                            probe.backend
-                        } else {
-                            None
+                    let ref_hw_backend = stack_decode_probe
+                        .as_ref()
+                        .filter(|probe| probe.prefer_hardware)
+                        .and_then(|probe| probe.backend.clone());
+                    if let Some(backend) = ref_hw_backend {
+                        match master_source.read_batch_with_hardware_strict(
+                            &prepared_ref_indices,
+                            None,
+                            &backend,
+                        ) {
+                            Ok(batch) => batch,
+                            Err(error) if matches!(decode_policy, DecodePolicy::Auto) => {
+                                let restart = request_full_software_decode_restart(
+                                    "Decode HW falló al construir la referencia robusta",
+                                    error,
+                                );
+                                pt_guard.discard();
+                                return Err(restart);
+                            }
+                            Err(error) => return Err(error),
                         }
                     } else {
-                        None
-                    };
-                    master_source.read_batch_with_hardware(
-                        &prepared_ref_indices,
-                        None,
-                        ref_hw_backend.as_deref(),
-                    )?
+                        master_source.read_batch(&prepared_ref_indices, None)?
+                    }
                 }
             }
         };
@@ -7091,6 +9350,7 @@ fn stack_video_liquid_warping_impl(
         return Err("Generación de referencia cancelada o sustituida".into());
     }
 
+    let master_materialization_started = std::time::Instant::now();
     let (master_clean_rgb, ref_mean, _ref_std) = if double_pass || is_v3 {
         emit_progress(
             &app,
@@ -7353,6 +9613,14 @@ fn stack_video_liquid_warping_impl(
         };
         (final_ref_clean, mean, std)
     };
+    let master_materialization_elapsed = master_materialization_started.elapsed();
+    crate::perf_trace::add_wall_ns(
+        pt,
+        crate::perf_trace::GLOBAL_PASS,
+        "master_materialization_wall",
+        master_materialization_elapsed.as_nanos(),
+        robust_reference_frames.max(1) as u64,
+    );
     drop(master_u16_best);
 
     // --- STEP 3b: Alignment reference ---
@@ -7403,6 +9671,14 @@ fn stack_video_liquid_warping_impl(
     // Pre-downscale master edges for pyramidal search
     let mut master_ds_buf = Vec::new();
     let (mut master_ds_w, _master_ds_h) = downscale_4x(&master_edges, w_in, h_in, &mut master_ds_buf);
+    let master_reference_elapsed = master_reference_started.elapsed();
+    crate::perf_trace::add_wall_ns(
+        pt,
+        crate::perf_trace::GLOBAL_PASS,
+        "master_reference_wall",
+        master_reference_elapsed.as_nanos(),
+        robust_reference_frames.max(1) as u64,
+    );
     
     // --- STEP 4: PREPARE STACKING ---
     // Elite V4 / Precision V3: Always allow Multi-point alignment if APs are present.
@@ -7667,7 +9943,10 @@ fn stack_video_liquid_warping_impl(
     // K=8 stays for sparse small-planet grids that need the smoothing.
     let idw_power_v3 = if is_surface_logic || large_disc { 1.55 } else { 1.75 };
     let idw_top_k = if is_surface_logic || large_disc { 4 } else { 8 };
-    let (warp_indices, warp_weights) = compute_idw_map_for_output(
+    let warp_map_started = std::time::Instant::now();
+    let warp_cache_dir = decode_cache_root_dir();
+    let warp_cache_budget = decode_cache_budget_bytes(&warp_cache_dir);
+    let warp_key = idw_cache_key(
         w_out,
         h_out,
         drizzle,
@@ -7676,7 +9955,110 @@ fn stack_video_liquid_warping_impl(
         &custom_points,
         idw_power_v3,
         idw_top_k,
-    )?;
+    );
+    let warp_path = idw_cache_path(&warp_cache_dir, warp_key);
+    let warp_cache_eligible = !custom_points.is_empty()
+        && std::env::var("ZAS_NO_IDW_CACHE").ok().as_deref() != Some("1")
+        && idw_cache_layout(w_out, h_out, custom_points.len(), idw_top_k)
+            .is_some_and(|(_, _, bytes)| {
+                bytes <= IDW_CACHE_MAX_ENTRY_BYTES && bytes <= warp_cache_budget / 4
+            })
+        && std::fs::create_dir_all(&warp_cache_dir).is_ok();
+    let cached_warp = if warp_cache_eligible {
+        let started = std::time::Instant::now();
+        let cached = read_exact_idw_cache(
+            &warp_path,
+            w_out,
+            h_out,
+            drizzle,
+            roi_offset_x,
+            roi_offset_y,
+            custom_points.len(),
+            idw_power_v3,
+            idw_top_k,
+        );
+        crate::perf_trace::add_wall_ns(
+            pt,
+            crate::perf_trace::GLOBAL_PASS,
+            "warp_map_cache_read_wall",
+            started.elapsed().as_nanos(),
+            u64::from(cached.is_some()),
+        );
+        if cached.is_none() && warp_path.exists() {
+            remove_invalid_cache_entry(&warp_cache_dir, &warp_path);
+        }
+        cached
+    } else {
+        None
+    };
+    let warp_cache_hit = cached_warp.is_some();
+    let (warp_indices, warp_weights) = if let Some(cached) = cached_warp {
+        cached
+    } else {
+        let build_started = std::time::Instant::now();
+        let built = compute_idw_map_for_output(
+            w_out,
+            h_out,
+            drizzle,
+            roi_offset_x,
+            roi_offset_y,
+            &custom_points,
+            idw_power_v3,
+            idw_top_k,
+        )?;
+        crate::perf_trace::add_wall_ns(
+            pt,
+            crate::perf_trace::GLOBAL_PASS,
+            "warp_map_build_wall",
+            build_started.elapsed().as_nanos(),
+            custom_points.len() as u64,
+        );
+        if warp_cache_eligible && !built.0.is_empty() {
+            let publish_started = std::time::Instant::now();
+            let published = write_exact_idw_cache(
+                &warp_cache_dir,
+                &warp_path,
+                w_out,
+                h_out,
+                drizzle,
+                roi_offset_x,
+                roi_offset_y,
+                custom_points.len(),
+                idw_power_v3,
+                idw_top_k,
+                &built.0,
+                &built.1,
+                warp_cache_budget,
+            );
+            crate::perf_trace::add_wall_ns(
+                pt,
+                crate::perf_trace::GLOBAL_PASS,
+                "warp_map_cache_publish_wall",
+                publish_started.elapsed().as_nanos(),
+                u64::from(published),
+            );
+        }
+        built
+    };
+    let warp_map_elapsed = warp_map_started.elapsed();
+    crate::perf_trace::add_wall_ns(
+        pt,
+        crate::perf_trace::GLOBAL_PASS,
+        "warp_map_wall",
+        warp_map_elapsed.as_nanos(),
+        (w_out as u64).saturating_mul(h_out as u64),
+    );
+    crate::perf_trace::job_meta(
+        pt,
+        "warp_map_cache",
+        if !warp_cache_eligible {
+            "disabled_or_oversize"
+        } else if warp_cache_hit {
+            "hit"
+        } else {
+            "miss"
+        },
+    );
 
     // Phase-boundary cancel check: master generation and the IDW map are the
     // two long pre-stacking stages — abort here instead of starting the passes.
@@ -7717,7 +10099,7 @@ fn stack_video_liquid_warping_impl(
     let ffmpeg_decode_route_hardware =
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let spawn_prefetcher = |pass_label: String|
-        -> std::sync::mpsc::Receiver<
+        -> OwnedPlanetaryPrefetch<
             Result<std::collections::HashMap<usize, Vec<u16>>, String>,
         > {
         let (tx, rx) = std::sync::mpsc::sync_channel::<
@@ -7737,15 +10119,24 @@ fn stack_video_liquid_warping_impl(
         let pre_cache_hits = tele_cache_hits.clone();
         let pre_force_cpu_decode = ffmpeg_force_cpu_decode.clone();
         let pre_decode_route_hardware = ffmpeg_decode_route_hardware.clone();
+        let pre_decode_probe = stack_decode_probe.clone();
+        let attempt_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pre_attempt_cancel = attempt_cancel.clone();
 
-        std::thread::spawn(move || {
+        let join = std::thread::spawn(move || -> Result<(), String> {
             let _ = &pre_ffmpeg_cmd;
             if let VideoInput::Ffmpeg(ref fr) = pre_r_template {
+                let Some(decode_probe) = pre_decode_probe.as_ref() else {
+                    let error =
+                        "FFmpeg no recibió una selección de decode congelada".to_string();
+                    let _ = tx.send(Err(error.clone()));
+                    return Err(error);
+                };
                 // PERSISTENT STREAM: one sequential decode pass feeds every
                 // batch of this stacking pass (batches are ascending). The old
                 // per-batch loader re-decoded from frame 0 for each batch —
                 // O(N²) work that dominated wall time on compressed videos.
-                if let Err(error) = stream_frames_ffmpeg_chunked(
+                let result = stream_frames_ffmpeg_chunked(
                     fr,
                     &pre_path,
                     &pre_app,
@@ -7758,13 +10149,21 @@ fn stack_video_liquid_warping_impl(
                     &pass_label,
                     pre_total_batches,
                     &pre_cancel,
+                    &pre_attempt_cancel,
                     &pre_cache_hits,
                     pre_force_cpu_decode.load(Ordering::Acquire),
                     &pre_decode_route_hardware,
-                ) {
-                    let _ = tx.send(Err(error));
+                    decode_probe,
+                    decode_policy,
+                );
+                if let Err(error) = result.as_ref() {
+                    // El canal mantiene la notificación temprana para errores
+                    // antes del último lote. `wait_terminal` es la autoridad
+                    // final y cubre también el fallo detectado al cosechar el
+                    // proceso después de publicar ese último lote.
+                    let _ = tx.send(Err(error.clone()));
                 }
-                return;
+                return result;
             }
 
             // PR-11: lectores nativos PERSISTENTES por pasada. El diseño
@@ -7780,14 +10179,15 @@ fn stack_video_liquid_warping_impl(
             {
                 Ok(readers) => readers,
                 Err(error) => {
-                    let _ = tx.send(Err(format!(
+                    let error = format!(
                         "No se pudo abrir el lector nativo persistente: {error}"
-                    )));
-                    return;
+                    );
+                    let _ = tx.send(Err(error.clone()));
+                    return Err(error);
                 }
             };
             for (batch_idx, indices_to_load) in pre_chunks.into_iter().enumerate() {
-                if pre_cancel.is_cancelled() {
+                if pre_cancel.is_cancelled() || pre_attempt_cancel.load(Ordering::Acquire) {
                     break; // cancelado: no cargar mas lotes
                 }
                 let load_prefix = format!(
@@ -7820,7 +10220,9 @@ fn stack_video_liquid_warping_impl(
                             for &idx in group {
                                 // SER cancel: without this, cancelling mid-load
                                 // waited for the whole batch to finish reading.
-                                if pre_cancel.is_cancelled() {
+                                if pre_cancel.is_cancelled()
+                                    || pre_attempt_cancel.load(Ordering::Acquire)
+                                {
                                     break;
                                 }
                                 let raw = r_local.get_frame(idx, pre_color_id);
@@ -7844,19 +10246,25 @@ fn stack_video_liquid_warping_impl(
                 if frame_map.len() != indices_to_load.len()
                     || indices_to_load.iter().any(|idx| !frame_map.contains_key(idx))
                 {
-                    let _ = tx.send(Err(format!(
+                    let error = format!(
                         "El lector nativo entregó un lote incompleto: {}/{} frames",
                         frame_map.len(),
                         indices_to_load.len()
-                    )));
-                    return;
+                    );
+                    let _ = tx.send(Err(error.clone()));
+                    return Err(error);
                 }
                 if tx.send(Ok(frame_map)).is_err() {
                     break;
                 }
             }
+            Ok(())
         });
-        rx
+        OwnedPlanetaryPrefetch {
+            receiver: Some(rx),
+            attempt_cancel,
+            join: Some(join),
+        }
     };
 
     // --- STEP 4b: V3 AP PRE-STATS (Scintillation Normalization) ---
@@ -7992,21 +10400,26 @@ fn stack_video_liquid_warping_impl(
     // self-test de PARIDAD numerica GPU-vs-CPU esta en verde. Cualquier "no"
     // se registra con su motivo, y la ruta CPU queda intacta como siempre.
     let drop_size_pass: f32 = if drizzle > 1.01 { 0.75 } else { 1.0 };
-    let mut gpu_disabled_this_stack = false;
-    // Compatibilidad: durante una version seguimos aceptando los strings
-    // historicos, pero toda decision interna usa el contrato ComputePolicy.
+    let gpu_disabled_this_stack = false;
     // GpuOnly omite solamente el umbral de rentabilidad: nunca omite paridad,
-    // limites del dispositivo ni presupuesto de VRAM.
-    let compute_policy = ComputePolicy::from_legacy(gpu_mode.as_deref());
+    // límites del dispositivo ni presupuesto de VRAM. La compatibilidad con
+    // los strings legacy se resuelve antes de entrar al motor común.
     // La búsqueda SAD gruesa por AP usa buffers 4× mucho menores que la
     // acumulación de lienzo completo. Antes se desactivaba junto con Metal
     // cuando el acumulador no cabía (caso 20 MP), obligando a CPU a explorar
     // toda la ventana de ~1 700 AP por frame. Son decisiones independientes.
+    let planned_sad_gpu = stack_execution_plan
+        .stage(PlanetaryStage::CoarseSad)
+        .is_some_and(|decision| decision.effective_engine.uses_gpu());
     let gpu_sad_enabled = std::sync::atomic::AtomicBool::new(
-        compute_policy.allows_gpu() && crate::gpu_analysis::ensure_parity(),
+        planned_sad_gpu && crate::gpu_analysis::ensure_sad_parity(),
     );
-    let gpu_rt: Option<&'static crate::gpu_stack::GpuRuntime> = if !compute_policy.allows_gpu() {
-        log_to_front(&app, "INFO", "GPU compute desactivada por ajustes del usuario — acumulacion en CPU.");
+    let gpu_sad_failed = std::sync::atomic::AtomicBool::new(false);
+    let planned_accumulation_gpu = stack_execution_plan
+        .stage(PlanetaryStage::Accumulation)
+        .is_some_and(|decision| decision.effective_engine.uses_gpu());
+    let gpu_rt: Option<&'static crate::gpu_stack::GpuRuntime> = if !planned_accumulation_gpu {
+        log_to_front(&app, "INFO", "El plan congelado eligió acumulación CPU para esta carga.");
         None
     } else {
         use crate::gpu_stack as g;
@@ -8158,15 +10571,26 @@ fn stack_video_liquid_warping_impl(
                     VideoInput::Ffmpeg(ref fr) => (fr.codec_name.clone(), fr.rotation),
                     _ => ("native".to_string(), 0),
                 };
+                let planes_decode_route = match &r {
+                    VideoInput::Ffmpeg(fr) => {
+                        let backend = stack_decode_probe
+                            .as_ref()
+                            .filter(|probe| probe.prefer_hardware)
+                            .and_then(|probe| probe.backend.as_deref());
+                        ffmpeg_decode_route_label(&fr.ffmpeg_path, backend)
+                    }
+                    _ => "native-io".to_string(),
+                };
                 // La "ruta" separa estos blobs de los frames de decode y
                 // versiona la matemática del enhance y sus entradas escalares.
                 let planes_route = format!(
-                    "align-planes-v1|{}|a{:08x}|p{:08x}",
+                    "align-planes-v2|{}|{}|a{:08x}|p{:08x}",
                     if is_surface_logic || large_disc {
                         "surface"
                     } else {
                         "planet"
                     },
+                    planes_decode_route,
                     align_amount.to_bits(),
                     surface_ref_p90.to_bits(),
                 );
@@ -8199,10 +10623,98 @@ fn stack_video_liquid_warping_impl(
     // mayor coste CPU del pase 1 (387 ms/frame, ~497 s sumados a 20MP).
     // Cualquier fallo GPU latchéa este apilado a la ruta CPU completa.
     // ZAS_NO_GPU_ENHANCE=1 lo desactiva.
-    let gpu_enhance_enabled = compute_policy.allows_gpu()
+    let planned_enhance_gpu = stack_execution_plan
+        .stage(PlanetaryStage::Enhance)
+        .is_some_and(|decision| decision.effective_engine.uses_gpu());
+    let gpu_enhance_enabled = planned_enhance_gpu
         && std::env::var("ZAS_NO_GPU_ENHANCE").ok().as_deref() != Some("1")
         && crate::gpu_analysis::ensure_enhance_parity();
+    if matches!(compute_policy, ComputePolicy::GpuOnly) && !gpu_enhance_enabled {
+        return Err(
+            "GPU only: enhance GPU no está apto o fue desactivado; no se permite fallback CPU silencioso"
+                .into(),
+        );
+    }
+    for (stage, gpu_enabled, hybrid_stage) in [
+        (
+            PlanetaryStage::Preprocess,
+            gpu_enhance_enabled,
+            true,
+        ),
+        (
+            PlanetaryStage::CoarseSad,
+            gpu_sad_enabled.load(Ordering::Relaxed),
+            false,
+        ),
+        (PlanetaryStage::Enhance, gpu_enhance_enabled, true),
+        (PlanetaryStage::Accumulation, gpu_rt.is_some(), false),
+    ] {
+        if let Some(mut decision) = stack_execution_plan.stage(stage).cloned() {
+            if gpu_enabled {
+                decision.effective_engine = if hybrid_stage {
+                    EffectiveEngine::HybridPipeline
+                } else {
+                    EffectiveEngine::GpuCompute
+                };
+                decision.backend = stack_execution_plan.resources.gpu_backend.clone();
+                decision.parity_status = ParityStatus::Passed;
+                if !matches!(decision.reason, DecisionReason::CalibrationWinner) {
+                    decision.reason = DecisionReason::CapabilityGate;
+                }
+            } else {
+                decision.effective_engine = EffectiveEngine::CpuSimd;
+                decision.backend = None;
+                decision.parity_status = ParityStatus::NotApplicable;
+                if decision.reason != DecisionReason::SafeDefault
+                    && decision.reason != DecisionReason::CalibrationWinner
+                {
+                    decision.reason = DecisionReason::Fallback;
+                }
+            }
+            stack_execution_plan.set_stage(decision)?;
+        }
+    }
+    stack_execution_plan.freeze()?;
+    record_plan_perf_identity(pt, &stack_execution_plan);
+    let _ = app.emit("planetary_execution_plan", &stack_execution_plan);
+    let quality_skip_inactive_aps = !matches!(quality_policy, QualityPolicy::Standard);
+    let quality_force_full_pyramid = stack_execution_plan
+        .quality_plan
+        .confidence
+        .full_pyramid_recheck;
+    let quality_lk_min_improvement = stack_execution_plan
+        .quality_plan
+        .confidence
+        .min_lk_objective_improvement;
+    let quality_min_runner_up_margin = stack_execution_plan
+        .quality_plan
+        .confidence
+        .min_runner_up_margin;
+    let quality_recheck_low_texture = stack_execution_plan
+        .quality_plan
+        .confidence
+        .recheck_low_texture;
+    // El filtro actual expresa tolerancia en píxeles, no en unidades MAD.
+    // Mantener Adaptive bit-compatible; Standard relaja el gate económico y
+    // Maximum lo endurece sin fingir una normalización estadística inexistente.
+    let quality_spatial_tolerance = stack_execution_plan
+        .quality_plan
+        .confidence
+        .spatial_mad_limit
+        + if is_surface_logic || large_disc { 1.5 } else { 0.0 };
     let gpu_enhance_failed = std::sync::atomic::AtomicBool::new(false);
+    let mut scratch_retry_count = 0usize;
+    // Un único latch por JOB, no por pasada: si la primera pasada necesita el
+    // reintento defensivo, las siguientes nacen ya con AP serial. Así nunca se
+    // publican dos warnings ni `scratch_retry_count` puede superar uno.
+    let mut scratch_retry = ScratchPassRetry::default();
+    let mut stack_align_ns_total = 0u64;
+    let mut stack_align_wall_ns_total = 0u64;
+    let mut stack_pass_wall_ns_total = 0u64;
+    let mut stack_accum_ns_total = 0u64;
+    let mut stack_accum_wall_ns_total = 0u64;
+    let mut stack_decode_wait_ns_total = 0u64;
+    let mut stack_upload_bytes_total = 0u64;
     for pass in 0..total_passes {
     let pass_label = if total_passes > 1 {
         format!("[Pasada {}/{}] ", pass + 1, total_passes)
@@ -8224,7 +10736,7 @@ fn stack_video_liquid_warping_impl(
     // al de una corrida 100% CPU (misma seleccion y misma matematica).
     'pass_attempt: loop {
     let use_gpu_pass = gpu_rt.is_some() && !gpu_disabled_this_stack;
-    let rx = spawn_prefetcher(pass_label.clone());
+    let mut prefetch = spawn_prefetcher(pass_label.clone());
     // perf_trace: pase 1-based; el span "total" cubre el intento completo.
     let ptag = (pass + 1) as u8;
     let _pass_span = crate::perf_trace::span_pass(pt, ptag, "total");
@@ -8233,10 +10745,18 @@ fn stack_video_liquid_warping_impl(
     // ===== TELEMETRIA EN VIVO del pase (evento "stack_telemetry") =====
     let tele_pass_start = std::time::Instant::now();
     let tele_align_ns = std::sync::atomic::AtomicU64::new(0);
+    let tele_align_first_ns = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let tele_align_last_ns = std::sync::atomic::AtomicU64::new(0);
     let tele_accum_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let tele_accum_first_ns =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let tele_accum_last_ns =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let tele_decode_wait_ns = std::sync::atomic::AtomicU64::new(0);
     let tele_upload_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let tele_vram = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let tele_sys = std::sync::Mutex::new(System::new());
+    let scratch_retry_active = scratch_retry.is_serial_retry();
     let tele_mode = if use_gpu_pass {
         gpu_rt
             .map(|rt| format!("GPU {} ({})", rt.backend, rt.adapter_name))
@@ -8277,13 +10797,34 @@ fn stack_video_liquid_warping_impl(
     let acc_r_sh = StripedAccum::new(mk_acc(cpu_acc && !is_mono_stack)?, n_bands);
     let acc_g_sh = StripedAccum::new(mk_acc(cpu_acc)?, n_bands);
     let acc_b_sh = StripedAccum::new(mk_acc(cpu_acc && !is_mono_stack)?, n_bands);
-    // Reserva fallible ANTES del paralelo: `vec!` dentro de cada worker podía
-    // abortar todo el proceso si el estado de RAM cambió después del plan.
+    // Scheduler P2: el presupuesto de RAM ya fijó `stack_threads`. Se reserva
+    // exactamente un scratch por slot ANTES de iniciar Rayon y cada onda lo
+    // presta por índice a una lane; no existe adquisición dinámica ni espera.
+    // Así `frame_concurrency`, `scratch_slots` y `ap_workers` son controles
+    // separados aunque compartan el mismo pool acotado de compute.
+    let scratch_slots = stack_threads.max(1);
+    let wave_scheduler = PlanetaryWaveScheduler::new(
+        stack_threads,
+        scratch_slots,
+        custom_points.len(),
+        scratch_retry.is_serial_retry(),
+    )?;
+    crate::perf_trace::job_meta(
+        pt,
+        "scheduler",
+        format!(
+            "compute_threads={};frame_concurrency={};scratch_slots={};ap_workers={}",
+            wave_scheduler.compute_threads,
+            wave_scheduler.frame_concurrency,
+            wave_scheduler.scratch_slots,
+            wave_scheduler.ap_workers,
+        ),
+    );
     let mut scratch_buffers = Vec::new();
     scratch_buffers
-        .try_reserve_exact(stack_threads)
+        .try_reserve_exact(wave_scheduler.scratch_slots)
         .map_err(|error| format!("No se pudo reservar el pool de scratch planetario: {error}"))?;
-    for _ in 0..stack_threads {
+    for _ in 0..wave_scheduler.scratch_slots {
         scratch_buffers.push(LiquidScratch::try_new(
             w_in,
             h_in,
@@ -8293,8 +10834,6 @@ fn stack_video_liquid_warping_impl(
             !use_gpu_pass,
         )?);
     }
-    let scratch_pool_mx: std::sync::Mutex<Vec<LiquidScratch>> =
-        std::sync::Mutex::new(scratch_buffers);
 
     // ============== SUBMITTER GPU (un hilo posee el acumulador wgpu) ==============
     // Los workers rayon alinean y ENCOLAN jobs (canal acotado = backpressure
@@ -8369,9 +10908,12 @@ fn stack_video_liquid_warping_impl(
                             "GPU only fallo al subir los limites de sigma-clip: {e}"
                         ));
                     }
-                    log_to_front(&app, "WARN", &format!("GPU: fallo subiendo bounds ({e}) — pase en CPU."));
-                    gpu_disabled_this_stack = true;
-                    continue 'pass_attempt;
+                    let restart = request_full_cpu_compute_restart(
+                        "La acumulación GPU falló al subir límites sigma-clip",
+                        e,
+                    );
+                    pt_guard.discard();
+                    return Err(restart);
                 }
                 let (tx, rx_jobs) =
                     std::sync::mpsc::sync_channel::<crate::gpu_stack::GpuFrameJob>(3);
@@ -8384,7 +10926,10 @@ fn stack_video_liquid_warping_impl(
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 let t_accum = tele_accum_ns.clone();
+                let t_accum_first = tele_accum_first_ns.clone();
+                let t_accum_last = tele_accum_last_ns.clone();
                 let t_upload = tele_upload_bytes.clone();
+                let pass_origin = tele_pass_start;
                 let handle = std::thread::spawn(move || -> Option<crate::gpu_stack::GpuDownload> {
                     let mut acc = acc;
                     while let Ok(job) = rx_jobs.recv() {
@@ -8393,6 +10938,13 @@ fn stack_video_liquid_warping_impl(
                         {
                             continue; // drenar sin trabajar
                         }
+                        t_accum_first.fetch_min(
+                            pass_origin
+                                .elapsed()
+                                .as_nanos()
+                                .min(u64::MAX as u128) as u64,
+                            Ordering::AcqRel,
+                        );
                         let t0 = std::time::Instant::now();
                         let job_bytes = (job.pixels.len() * 2
                             + job.apq.len() * 16
@@ -8414,6 +10966,13 @@ fn stack_video_liquid_warping_impl(
                                 fail.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
+                        t_accum_last.fetch_max(
+                            pass_origin
+                                .elapsed()
+                                .as_nanos()
+                                .min(u64::MAX as u128) as u64,
+                            Ordering::AcqRel,
+                        );
                     }
                     if fail.load(std::sync::atomic::Ordering::Relaxed)
                         || cancel2.is_cancelled()
@@ -8440,9 +10999,12 @@ fn stack_video_liquid_warping_impl(
                         "GPU only no pudo inicializar el acumulador de este pase: {e}"
                     ));
                 }
-                log_to_front(&app, "WARN", &format!("GPU no disponible para este pase ({e}) — usando CPU."));
-                gpu_disabled_this_stack = true;
-                continue 'pass_attempt;
+                let restart = request_full_cpu_compute_restart(
+                    "No se pudo inicializar el acumulador GPU del pase",
+                    e,
+                );
+                pt_guard.discard();
+                return Err(restart);
             }
         }
     } else {
@@ -8452,7 +11014,7 @@ fn stack_video_liquid_warping_impl(
     // PERF: master-side AP statistics are constant within a pass — compute
     // once instead of per frame × AP (recomputed per pass: the double-pass
     // rebuilds the master from the pass-1 stack).
-    let (ap_master_contrast, ap_master_lap) = {
+    let (ap_master_contrast, ap_master_lap, ap_lk_reference) = {
         let _s = crate::perf_trace::span_pass(pt, (pass + 1) as u8, "ap_master_stats");
         precompute_ap_master_stats(
             &master_edges,
@@ -8484,6 +11046,7 @@ fn stack_video_liquid_warping_impl(
 
     let mut prefetch_error: Option<String> = None;
     let mut worker_error: Option<String> = None;
+    let mut strict_gpu_error: Option<String> = None;
     for (_batch_idx, chunk) in active_frames_data.chunks(frames_per_batch).enumerate() {
         if job_token.is_cancelled() {
             break; // cancelado por el usuario
@@ -8493,7 +11056,7 @@ fn stack_video_liquid_warping_impl(
         // bloqueante hasta que el lote entero terminara de decodificarse).
         let dw_t0 = std::time::Instant::now();
         let frame_map = loop {
-            match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            match prefetch.recv_timeout(std::time::Duration::from_millis(250)) {
                 Ok(Ok(m)) => break Some(m),
                 Ok(Err(error)) => {
                     prefetch_error = Some(error);
@@ -8515,7 +11078,12 @@ fn stack_video_liquid_warping_impl(
                 }
             }
         };
-        crate::perf_trace::add_ns(pt, ptag, "decode_wait", dw_t0.elapsed().as_nanos(), 1);
+        let decode_wait = dw_t0.elapsed();
+        tele_decode_wait_ns.fetch_add(
+            decode_wait.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        crate::perf_trace::add_ns(pt, ptag, "decode_wait", decode_wait.as_nanos(), 1);
         let Some(frame_map) = frame_map else { break };
         if frame_map.is_empty() {
             prefetch_error = Some("El cargador publicó un lote de frames vacío".to_string());
@@ -8528,7 +11096,11 @@ fn stack_video_liquid_warping_impl(
         // Telemetria: refs para el worker (medicion + emision cada 25 frames).
         let tele_start_ref = &tele_pass_start;
         let tele_align_ref = &tele_align_ns;
+        let tele_align_first_ref = &tele_align_first_ns;
+        let tele_align_last_ref = &tele_align_last_ns;
         let tele_accum_ref = &tele_accum_ns;
+        let tele_accum_first_ref = tele_accum_first_ns.as_ref();
+        let tele_accum_last_ref = tele_accum_last_ns.as_ref();
         let tele_upload_ref = &tele_upload_bytes;
         let tele_vram_ref = &tele_vram;
         let tele_sys_ref = &tele_sys;
@@ -8541,29 +11113,32 @@ fn stack_video_liquid_warping_impl(
         let limb_normal_ref = &ap_limb_normal;
         let ap_mc_ref = &ap_master_contrast;
         let ap_ml_ref = &ap_master_lap;
+        let ap_lk_ref = &ap_lk_reference;
         // Sigma-clip bounds: None in pass 1 (statistics being gathered),
         // Some(...) in pass 2 (winsorized accumulation).
         let clip_r_ref = clip_r.as_ref();
         let clip_g_ref = clip_g.as_ref();
         let clip_b_ref = clip_b.as_ref();
 
-        let scratch_starved = std::sync::atomic::AtomicBool::new(false);
-        let run_batch = || chunk.par_iter().for_each(|frame_data| {
+        // Ondas deterministas: lane N siempre recibe el frame N de esta onda y
+        // su scratch N ya está prestado mediante `par_iter_mut`, antes de que
+        // Rayon ejecute trabajo. No hay Mutex/try_take ni starvation posible.
+        let frame_wave_width = wave_scheduler.frame_wave_width_for_batch(chunk.len());
+        for frame_wave in chunk.chunks(frame_wave_width) {
+            if let Err(error) = wave_scheduler.validate_wave(frame_wave.len()) {
+                worker_error = Some(error);
+                break;
+            }
+            let ap_workers_for_wave = wave_scheduler.ap_workers_for_wave(frame_wave.len());
+            let lane_scratches = &mut scratch_buffers[..frame_wave.len()];
+            let run_wave = || {
+                lane_scratches
+                    .par_iter_mut()
+                    .zip(frame_wave.par_iter())
+                    .for_each(|(sc, frame_data)| {
                 if job_token.is_cancelled() {
                     return; // cancelado: no procesar mas frames
                 }
-                // Un lease por frame evita que un estado `for_each_init`
-                // sobreviva a un split de Rayon. Nunca se bloquea esperando
-                // scratch: si una invariancia futura rompe el pool acotado,
-                // se descarta el pase completo con Err en vez de panic/deadlock.
-                let Some(mut lease) = ScratchLease::try_take(&scratch_pool_mx) else {
-                    scratch_starved.store(true, Ordering::Release);
-                    return;
-                };
-                let Some(sc) = lease.sc.as_mut() else {
-                    scratch_starved.store(true, Ordering::Release);
-                    return;
-                };
                 let completed = counter_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let t_frame_start = std::time::Instant::now();
                 if completed % 25 == 0 {
@@ -8651,12 +11226,22 @@ fn stack_video_liquid_warping_impl(
                             io_write_mb,
                             cache_hits: tele_hits_ref.load(std::sync::atomic::Ordering::Relaxed),
                             cache_misses: completed.saturating_sub(tele_hits_ref.load(std::sync::atomic::Ordering::Relaxed)),
-                            fallback_reason: None,
+                            fallback_reason: scratch_retry_active.then_some(
+                                "scratch_starved: pase reiniciado desde frame 0 con AP serial"
+                                    .into(),
+                            ),
                         },
                     );
                 }
 
                 if let Some(u16_data) = frame_map.get(&frame_data.idx) {
+                    tele_align_first_ref.fetch_min(
+                        tele_start_ref
+                            .elapsed()
+                            .as_nanos()
+                            .min(u64::MAX as u128) as u64,
+                        Ordering::AcqRel,
+                    );
                     // --- ALIGNMENT LOGIC (Unified '+' convention: Target = Ref + Shift) ---
                     // Shift convention: global_dx = SourcePos - MasterPos
                     let mut render_dx = frame_data.x_shift - ref_dx;
@@ -8859,6 +11444,21 @@ fn stack_video_liquid_warping_impl(
                             }
                         }
 
+                        // La selección por AP ya está congelada para este
+                        // frame. Adaptive/Maximum evitan alinear APs que nunca
+                        // contribuirán; Standard conserva la ruta histórica.
+                        // Los q=0 quedan excluidos también como vecinos por el
+                        // filtro espacial, evitando contaminar APs activos.
+                        let combined_ap_mask: Vec<bool> = (0..custom_points.len())
+                            .map(|i| {
+                                let frame_ok = acceptance_ref
+                                    .accepts(frame_data.idx, i)
+                                    .unwrap_or(true);
+                                let signal_ok = signal_valid_ref.get(i).copied().unwrap_or(true);
+                                frame_ok && signal_ok
+                            })
+                            .collect();
+
                         // SAD GRUESO POR AP EN GPU: una sola subida de los dos
                         // mapas 4× y un dispatch para toda la malla. Los AP sin
                         // señal/textura se desactivan antes del kernel. Ante
@@ -8880,7 +11480,12 @@ fn stack_video_liquid_warping_impl(
                                     let enabled = signal_valid_ref.get(ap_i).copied().unwrap_or(true)
                                         && (ap_lap_floor <= 0.0
                                             || ap_ml_ref.get(ap_i).copied().unwrap_or(f32::MAX)
-                                                >= ap_lap_floor);
+                                                >= ap_lap_floor)
+                                        && (!quality_skip_inactive_aps
+                                            || combined_ap_mask
+                                                .get(ap_i)
+                                                .copied()
+                                                .unwrap_or(true));
                                     let fx = (ap.x + render_dx).round() as i32;
                                     let fy = (ap.y + render_dy).round() as i32;
                                     crate::gpu_analysis::SadPoint::new(
@@ -8904,6 +11509,7 @@ fn stack_video_liquid_warping_impl(
                             ) {
                                 Ok(v) => Some(v),
                                 Err(e) => {
+                                    gpu_sad_failed.store(true, Ordering::Release);
                                     if gpu_sad_enabled.swap(false, Ordering::Relaxed) {
                                         eprintln!(
                                             "[gpu] fallo SAD batched por AP ({e}); refinamiento CPU exacto"
@@ -8934,6 +11540,7 @@ fn stack_video_liquid_warping_impl(
                             &master_edges,
                             ap_mc_ref,
                             ap_ml_ref,
+                            ap_lk_ref,
                             &master_ds_buf,
                             master_ds_w,
                             &sc.f_edges,
@@ -8942,6 +11549,8 @@ fn stack_video_liquid_warping_impl(
                             w_in,
                             h_in,
                             &custom_points,
+                            Some(&combined_ap_mask),
+                            quality_skip_inactive_aps,
                             signal_valid_ref,
                             dark_ratio_ref,
                             limb_normal_ref,
@@ -8956,13 +11565,16 @@ fn stack_video_liquid_warping_impl(
                             is_surface_logic || large_disc,
                             limb_protect,
                             ap_lap_floor,
-                            // Con work-stealing el par_iter anidado es ~gratis
-                            // cuando todos los workers están ocupados, y deja
-                            // que los ociosos roben APs de los frames rezagados.
-                            // El gate antiguo (chunk < hilos) lo apagaba justo
-                            // en lotes llenos: con lote==hilos y ~5882 APs en
-                            // serie el apilado medía 2.2 núcleos efectivos.
-                            custom_points.len() >= 128,
+                            quality_lk_min_improvement,
+                            quality_min_runner_up_margin,
+                            quality_recheck_low_texture,
+                            quality_spatial_tolerance,
+                            quality_force_full_pyramid,
+                            // Sólo repartir APs cuando el lote exterior deja
+                            // workers ociosos. En lotes llenos el paralelismo
+                            // anidado puede reentrar en otro frame conservando
+                            // el lease actual y agotar el pool de scratch.
+                            ap_workers_for_wave,
                             gpu_coarse_shifts.as_deref(),
                             pass1_seed
                                 .as_ref()
@@ -8978,16 +11590,6 @@ fn stack_video_liquid_warping_impl(
                                 );
                         }
                         crate::perf_trace::add_ns(pt, ptag, "local_shifts", t_ls.elapsed().as_nanos(), 1);
-
-                        let combined_ap_mask: Vec<bool> = (0..custom_points.len())
-                            .map(|i| {
-                                let frame_ok = acceptance_ref
-                                    .accepts(frame_data.idx, i)
-                                    .unwrap_or(true);
-                                let signal_ok = signal_valid_ref.get(i).copied().unwrap_or(true);
-                                frame_ok && signal_ok
-                            })
-                            .collect();
 
                         let drop_size = if drizzle > 1.01 { 0.75f32 } else { 1.0f32 };
                         // Dense-quality registration (CPU/GPU identica): primero
@@ -9016,6 +11618,13 @@ fn stack_video_liquid_warping_impl(
                         tele_align_ref.fetch_add(
                             t_frame_start.elapsed().as_nanos() as u64,
                             std::sync::atomic::Ordering::Relaxed,
+                        );
+                        tele_align_last_ref.fetch_max(
+                            tele_start_ref
+                                .elapsed()
+                                .as_nanos()
+                                .min(u64::MAX as u128) as u64,
+                            Ordering::AcqRel,
                         );
 
                         // ===== RAMA GPU: el warp+acumulacion de este frame va al
@@ -9062,6 +11671,13 @@ fn stack_video_liquid_warping_impl(
                             return;
                         }
 
+                        tele_accum_first_ref.fetch_min(
+                            tele_start_ref
+                                .elapsed()
+                                .as_nanos()
+                                .min(u64::MAX as u128) as u64,
+                            Ordering::AcqRel,
+                        );
                         let t_acc = std::time::Instant::now();
                         if is_mono_stack {
                             sc.wg.fill(0.0);
@@ -9118,19 +11734,78 @@ fn stack_video_liquid_warping_impl(
                             acc_g_sh.accumulate(&sc.wg, &sc.ww, d_quality, dq_w, dq_h, q_off_x, q_off_y, q_weight, frame_data.idx, coverage_weighting);
                             acc_b_sh.accumulate(&sc.wb, &sc.ww, d_quality, dq_w, dq_h, q_off_x, q_off_y, q_weight, frame_data.idx, coverage_weighting);
                         }
+                        tele_accum_ref.fetch_add(
+                            t_acc.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                            Ordering::Relaxed,
+                        );
+                        tele_accum_last_ref.fetch_max(
+                            tele_start_ref
+                                .elapsed()
+                                .as_nanos()
+                                .min(u64::MAX as u128) as u64,
+                            Ordering::AcqRel,
+                        );
                         crate::perf_trace::add_ns(pt, ptag, "warp_accum_cpu", t_acc.elapsed().as_nanos(), 1);
                     }
                 }
+                    });
+            };
+            // Ejecutar exclusivamente en el pool que respeta el plan de RAM.
+            // AP-parallel sólo ocurre en ondas de un frame; en cualquier onda
+            // multi-frame `ap_workers_for_wave == 1`, evitando nested Rayon.
+            stack_pool.install(run_wave);
+            if compute_policy.allows_fallback() {
+                if gpu_enhance_failed.load(Ordering::Acquire) {
+                    strict_gpu_error = Some(request_full_cpu_compute_restart(
+                        "Enhance GPU falló durante el pase",
+                        "se prohíbe mezclar frames GPU y CPU dentro de la misma salida",
+                    ));
+                    break;
+                }
+                if gpu_sad_failed.load(Ordering::Acquire) {
+                    strict_gpu_error = Some(request_full_cpu_compute_restart(
+                        "Coarse SAD GPU falló durante el pase",
+                        "se prohíbe continuar el pase con coarse SAD CPU",
+                    ));
+                    break;
+                }
             }
-        );
-        // Ejecutar exclusivamente en el pool que respeta el plan de RAM.
-        stack_pool.install(run_batch);
-        if scratch_starved.load(Ordering::Acquire) {
-            worker_error = Some(
-                "El pool planetario agotó su scratch acotado; el pase parcial fue descartado"
-                    .to_string(),
-            );
+            if matches!(compute_policy, ComputePolicy::GpuOnly) {
+                if gpu_enhance_failed.load(Ordering::Acquire) {
+                    strict_gpu_error = Some(
+                        "GPU only: enhance GPU falló durante la etapa; el pase parcial fue descartado y no se permite fallback CPU silencioso"
+                            .to_string(),
+                    );
+                    break;
+                }
+                if !gpu_sad_enabled.load(Ordering::Acquire) {
+                    strict_gpu_error = Some(
+                        "GPU only: coarse SAD GPU falló durante la etapa; el pase parcial fue descartado y no se permite fallback CPU silencioso"
+                            .to_string(),
+                    );
+                    break;
+                }
+            }
+            if job_token.is_cancelled() {
+                break;
+            }
+        }
+        if worker_error.is_some() || strict_gpu_error.is_some() {
             break;
+        }
+    }
+
+    // Aunque ya se hayan recibido todos los lotes, el productor conserva una
+    // última obligación: validar/cosechar el decoder y confirmar el commit de
+    // caché. No aceptar el pase hasta recibir ese estado terminal evita que un
+    // fallback HW->software detectado tras el último frame quede oculto.
+    if prefetch_error.is_none()
+        && worker_error.is_none()
+        && strict_gpu_error.is_none()
+        && !job_token.is_cancelled()
+    {
+        if let Err(error) = prefetch.wait_terminal() {
+            prefetch_error = Some(error);
         }
     }
 
@@ -9142,23 +11817,60 @@ fn stack_video_liquid_warping_impl(
             None => None,
         }
     };
-    if let Some(error) = worker_error {
+    // El readback final forma parte de la pared de acumulación GPU, aunque no
+    // sea trabajo de un worker individual. El agregado `worker_ms` conserva
+    // sólo los dispatches medidos por el submitter.
+    if use_gpu_pass && gpu_download.is_some() {
+        tele_accum_last_ns.fetch_max(
+            tele_pass_start
+                .elapsed()
+                .as_nanos()
+                .min(u64::MAX as u128) as u64,
+            Ordering::AcqRel,
+        );
+    }
+    if let Some(error) = strict_gpu_error {
+        if error.starts_with(RESTART_COMPUTE_CPU_PREFIX)
+            || error.starts_with(RESTART_DECODE_SOFTWARE_PREFIX)
+        {
+            pt_guard.discard();
+        }
         return Err(error);
     }
-    if let Some(error) = prefetch_error {
-        if r.is_ffmpeg()
-            && ffmpeg_decode_route_hardware.load(Ordering::Acquire)
-            && !ffmpeg_force_cpu_decode.swap(true, Ordering::AcqRel)
-            && !job_token.is_cancelled()
-        {
+    if let Some(error) = worker_error {
+        if !job_token.is_cancelled() && scratch_retry.begin_serial_retry() {
+            scratch_retry_count += 1;
             log_to_front(
                 &app,
                 "WARN",
                 &format!(
-                    "Decode hardware falló ({error}); descartando la pasada completa y reintentando desde frame 0 por CPU."
+                    "{pass_label}El scheduler planetario detectó una violación del presupuesto de scratch; se descartó el intento completo y se reinicia desde frame 0 con AP serial (reintento único)."
                 ),
             );
+            // `gpu_download`, acumuladores striped, scratch y receptor de
+            // prefetch pertenecen a esta iteración. `continue` los descarta
+            // antes de crear el siguiente intento: nada parcial se publica.
             continue 'pass_attempt;
+        }
+        if job_token.is_cancelled() {
+            return Err("Cancelado o sustituido por otro apilado".into());
+        }
+        return Err(format!(
+            "{error}; el reintento único desde frame 0 con AP serial volvió a violar el presupuesto de scratch"
+        ));
+    }
+    if let Some(error) = prefetch_error {
+        if r.is_ffmpeg()
+            && matches!(decode_policy, DecodePolicy::Auto)
+            && ffmpeg_decode_route_hardware.load(Ordering::Acquire)
+            && !job_token.is_cancelled()
+        {
+            let restart = request_full_software_decode_restart(
+                "Decode HW falló durante el stream de apilado",
+                error,
+            );
+            pt_guard.discard();
+            return Err(restart);
         }
         return Err(format!(
             "No se pudo completar la carga exacta de frames; el pase parcial fue descartado: {error}"
@@ -9174,17 +11886,12 @@ fn stack_video_liquid_warping_impl(
                     .to_string(),
             );
         }
-        // FALLBACK EN CALIENTE: el pase completo se repite en CPU. El cache
-        // de decode por-frame hace el reintento barato, y el resultado es el
-        // de una corrida 100% CPU.
-        log_to_front(
-            &app,
-            "WARN",
-            "GPU fallo durante el pase — reiniciando el pase en CPU (los frames se re-sirven del cache).",
+        let restart = request_full_cpu_compute_restart(
+            "La acumulación GPU perdió el dispositivo durante el pase",
+            "device loss, OOM o error de descarga",
         );
-        let _ = gpu_failed.load(std::sync::atomic::Ordering::Relaxed);
-        gpu_disabled_this_stack = true;
-        continue 'pass_attempt;
+        pt_guard.discard();
+        return Err(restart);
     }
 
     // Collect the shared accumulators for this pass (acceso exclusivo de
@@ -9227,7 +11934,29 @@ fn stack_video_liquid_warping_impl(
         acc_grad_g = acc_g_sh.into_inner();
         acc_grad_b = acc_b_sh.into_inner();
     }
-    drop(scratch_pool_mx);
+    stack_align_ns_total = stack_align_ns_total
+        .saturating_add(tele_align_ns.load(Ordering::Relaxed));
+    stack_align_wall_ns_total = stack_align_wall_ns_total.saturating_add(
+        telemetry_wall_envelope_ns(&tele_align_first_ns, &tele_align_last_ns),
+    );
+    stack_accum_ns_total = stack_accum_ns_total
+        .saturating_add(tele_accum_ns.load(Ordering::Relaxed));
+    stack_accum_wall_ns_total = stack_accum_wall_ns_total.saturating_add(
+        telemetry_wall_envelope_ns(
+            tele_accum_first_ns.as_ref(),
+            tele_accum_last_ns.as_ref(),
+        ),
+    );
+    stack_decode_wait_ns_total = stack_decode_wait_ns_total
+        .saturating_add(tele_decode_wait_ns.load(Ordering::Relaxed));
+    stack_upload_bytes_total = stack_upload_bytes_total
+        .saturating_add(tele_upload_bytes.load(Ordering::Relaxed));
+    stack_pass_wall_ns_total = stack_pass_wall_ns_total.saturating_add(
+        tele_pass_start
+            .elapsed()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64,
+    );
     break 'pass_attempt;
     } // fin 'pass_attempt
 
@@ -9340,6 +12069,7 @@ fn stack_video_liquid_warping_impl(
     if job_token.is_cancelled() {
         return Err("Cancelado por el usuario".into());
     }
+    let postprocess_started = std::time::Instant::now();
 
     // Elite V4: High-Fidelity Multi-Point Stack
     // (Poisson gradient stacking removed for this path: it smoothed surface
@@ -9461,7 +12191,15 @@ fn stack_video_liquid_warping_impl(
     // so surface stacks skip this stage entirely. Large lunar discs skip it for
     // the same reason (crater rims/rilles ARE 1-2 px detail) — and it saves a
     // full pass over a potentially 20-Mpx canvas.
-    if !is_surface_logic && !large_disc {
+    // La doble pasada ya hizo rechazo TEMPORAL sigma por píxel. Aplicar
+    // después un filtro espacial 3×3 no añade evidencia temporal y sí puede
+    // sustituir detalle real aislado (lunas, festones o borde de planeta).
+    if should_reject_spatial_outliers(
+        is_surface_logic,
+        large_disc,
+        sigma_clip_enabled,
+        stack_execution_plan.quality_plan.spatial_final_filter,
+    ) {
         emit_progress(&app, "Eliminando pixeles calientes y ruido residual...", 92.0, None);
         reject_spatial_outliers_u16(&mut final_u16, w_out, h_out);
     }
@@ -9538,6 +12276,15 @@ fn stack_video_liquid_warping_impl(
     if job_token.is_cancelled() {
         return Err("Cancelado o sustituido por otro apilado".into());
     }
+    let postprocess_elapsed = postprocess_started.elapsed();
+    crate::perf_trace::add_wall_ns(
+        pt,
+        crate::perf_trace::GLOBAL_PASS,
+        "postprocess_wall",
+        postprocess_elapsed.as_nanos(),
+        1,
+    );
+    let publish_started = std::time::Instant::now();
     emit_progress(&app, "Guardando resultado...", 98.0, None);
     let preview_src = {
         // PREVIEW FIDELITY: the stack DATA is already normalized upstream
@@ -9585,6 +12332,14 @@ fn stack_video_liquid_warping_impl(
         state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
         state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
+    let publish_elapsed = publish_started.elapsed();
+    crate::perf_trace::add_wall_ns(
+        pt,
+        crate::perf_trace::GLOBAL_PASS,
+        "publish_wall",
+        publish_elapsed.as_nanos(),
+        1,
+    );
 
     // CACHE DE DECODE PERSISTENTE: ya NO se borra al terminar — re-apilar el
     // mismo video (otro %, otra malla, otro drizzle) sirve los frames desde
@@ -9617,6 +12372,176 @@ fn stack_video_liquid_warping_impl(
     if job_token.is_cancelled() {
         return Err("Cancelado o sustituido por otro apilado".into());
     }
+    let final_fallback_reason = match (gpu_disabled_this_stack, scratch_retry_count) {
+        (true, 0) => Some("GPU no rentable, sin paridad o fallback operativo".into()),
+        (false, 0) => None,
+        (false, retries) => Some(format!(
+            "scratch_starved: {retries} pase(s) reiniciado(s) desde frame 0 con AP serial"
+        )),
+        (true, retries) => Some(format!(
+            "GPU no rentable, sin paridad o fallback operativo; scratch_starved: {retries} pase(s) reiniciado(s) con AP serial"
+        )),
+    };
+    crate::perf_trace::job_meta(
+        pt,
+        "cache_state",
+        if total_active > 0 && tele_cache_hits.load(Ordering::Relaxed) >= total_active {
+            "warm"
+        } else {
+            "cold"
+        },
+    );
+    let pipeline_elapsed = pipeline_started.elapsed();
+    let decode_elapsed = std::time::Duration::from_nanos(stack_decode_wait_ns_total);
+    let align_worker_elapsed = std::time::Duration::from_nanos(stack_align_ns_total);
+    let alignment_wall_elapsed = std::time::Duration::from_nanos(stack_align_wall_ns_total);
+    let accum_worker_elapsed = std::time::Duration::from_nanos(stack_accum_ns_total);
+    let accumulation_wall_elapsed = std::time::Duration::from_nanos(stack_accum_wall_ns_total);
+    crate::perf_trace::add_wall_ns(
+        pt,
+        crate::perf_trace::GLOBAL_PASS,
+        "stack_passes_wall",
+        stack_pass_wall_ns_total as u128,
+        total_passes as u64,
+    );
+    let decode_hardware_effective = r.is_ffmpeg()
+        && ffmpeg_decode_route_hardware.load(Ordering::Acquire)
+        && !ffmpeg_force_cpu_decode.load(Ordering::Acquire);
+    let mut stage_telemetry: Vec<StageTelemetry> = PlanetaryStage::ORDERED
+        .iter()
+        .copied()
+        .map(|stage| {
+            let elapsed = match stage {
+                PlanetaryStage::Decode => decode_elapsed,
+                PlanetaryStage::QualitySelection => quality_selection_elapsed,
+                PlanetaryStage::MasterReference => master_reference_elapsed,
+                PlanetaryStage::ApAlignment => alignment_wall_elapsed,
+                PlanetaryStage::WarpMap => warp_map_elapsed,
+                PlanetaryStage::Accumulation => accumulation_wall_elapsed,
+                PlanetaryStage::Postprocess => postprocess_elapsed,
+                PlanetaryStage::Publish => publish_elapsed,
+                _ => std::time::Duration::ZERO,
+            };
+            completed_stage_telemetry(&stack_execution_plan, stage, elapsed, total_active)
+        })
+        .collect();
+    if let Some(decode) = stage_telemetry
+        .iter_mut()
+        .find(|telemetry| telemetry.stage == PlanetaryStage::Decode)
+    {
+        decode.effective_engine = if !r.is_ffmpeg() {
+            EffectiveEngine::NativeIo
+        } else if decode_hardware_effective {
+            EffectiveEngine::FfmpegHardware
+        } else {
+            EffectiveEngine::FfmpegSoftware
+        };
+        decode.backend = decode_hardware_effective
+            .then(|| stack_decode_probe.as_ref().and_then(|probe| probe.backend.clone()))
+            .flatten();
+        decode.cache_hits = tele_cache_hits.load(Ordering::Relaxed);
+        decode.cache_misses = total_active.saturating_sub(decode.cache_hits);
+        decode.io_read_bytes = (final_io_read_mb * 1_048_576.0).max(0.0) as u64;
+        decode.io_write_bytes = (final_io_write_mb * 1_048_576.0).max(0.0) as u64;
+        if r.is_ffmpeg()
+            && stack_decode_probe
+                .as_ref()
+                .is_some_and(|probe| probe.prefer_hardware)
+            && !decode_hardware_effective
+        {
+            decode.fallback_reason = Some(
+                "La decodificación hardware falló; Auto reinició el pase completo por FFmpeg software"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(alignment) = stage_telemetry
+        .iter_mut()
+        .find(|telemetry| telemetry.stage == PlanetaryStage::ApAlignment)
+    {
+        alignment.effective_engine = EffectiveEngine::CpuSimd;
+        alignment.backend = None;
+        alignment.worker_ms = align_worker_elapsed
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        alignment.scratch_retry_count = scratch_retry_count.min(u32::MAX as usize) as u32;
+        if scratch_retry_count > 0 {
+            alignment.fallback_reason = Some(format!(
+                "scratch_starved: {scratch_retry_count} pase(s) descartado(s) y reiniciado(s) desde frame 0 con AP serial"
+            ));
+        }
+    }
+    if let Some(fine_sad) = stage_telemetry
+        .iter_mut()
+        .find(|telemetry| telemetry.stage == PlanetaryStage::FineSad)
+    {
+        // La referencia científica fine SAD permanece entera y canónica en CPU.
+        fine_sad.effective_engine = EffectiveEngine::RequiredCpu;
+        fine_sad.backend = None;
+    }
+    if let Some(enhance) = stage_telemetry
+        .iter_mut()
+        .find(|telemetry| telemetry.stage == PlanetaryStage::Enhance)
+    {
+        let used_gpu = gpu_enhance_enabled && !gpu_enhance_failed.load(Ordering::Acquire);
+        enhance.effective_engine = if used_gpu {
+            EffectiveEngine::HybridPipeline
+        } else {
+            EffectiveEngine::CpuSimd
+        };
+        enhance.backend = used_gpu
+            .then(|| stack_execution_plan.resources.gpu_backend.clone())
+            .flatten();
+        if gpu_enhance_failed.load(Ordering::Acquire) {
+            enhance.fallback_reason = Some(
+                "Enhance GPU falló; Auto/Hybrid conservaron la matemática canónica en CPU"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(coarse_sad) = stage_telemetry
+        .iter_mut()
+        .find(|telemetry| telemetry.stage == PlanetaryStage::CoarseSad)
+    {
+        let used_gpu = gpu_sad_enabled.load(Ordering::Acquire);
+        coarse_sad.effective_engine = if used_gpu {
+            EffectiveEngine::GpuCompute
+        } else {
+            EffectiveEngine::CpuSimd
+        };
+        coarse_sad.backend = used_gpu
+            .then(|| stack_execution_plan.resources.gpu_backend.clone())
+            .flatten();
+    }
+    if let Some(accumulation) = stage_telemetry
+        .iter_mut()
+        .find(|telemetry| telemetry.stage == PlanetaryStage::Accumulation)
+    {
+        accumulation.worker_ms = accum_worker_elapsed
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let used_gpu = gpu_rt.is_some() && !gpu_disabled_this_stack;
+        accumulation.effective_engine = if used_gpu {
+            EffectiveEngine::GpuCompute
+        } else {
+            EffectiveEngine::CpuSimd
+        };
+        accumulation.backend = used_gpu
+            .then(|| stack_execution_plan.resources.gpu_backend.clone())
+            .flatten();
+        accumulation.vram_peak_mb = stack_peak_vram.load(Ordering::Relaxed) / (1024 * 1024);
+        accumulation.io_write_bytes = stack_upload_bytes_total;
+        if gpu_disabled_this_stack {
+            accumulation.fallback_reason = Some(
+                "La acumulación GPU fue descartada y Auto/Hybrid reinició el pase completo en CPU"
+                    .to_string(),
+            );
+        }
+    }
+    for telemetry in &mut stage_telemetry {
+        telemetry.ram_peak_mb = final_ram_mb;
+    }
+    let _ = app.emit("planetary_stage_telemetry", &stage_telemetry);
     emit_pipeline_telemetry(
         &app,
         PipelineTelemetry {
@@ -9632,7 +12557,7 @@ fn stack_video_liquid_warping_impl(
             eta_seconds: Some(0.0),
             items_done: total_active,
             items_total: total_active,
-            throughput: Some(total_active as f32 / pipeline_started.elapsed().as_secs_f32().max(0.001)),
+            throughput: Some(total_active as f32 / pipeline_elapsed.as_secs_f32().max(0.001)),
             cpu_percent: final_cpu_percent,
             gpu_percent: None,
             ram_mb: final_ram_mb,
@@ -9641,17 +12566,66 @@ fn stack_video_liquid_warping_impl(
             io_write_mb: final_io_write_mb,
             cache_hits: tele_cache_hits.load(std::sync::atomic::Ordering::Relaxed),
             cache_misses: total_active.saturating_sub(tele_cache_hits.load(std::sync::atomic::Ordering::Relaxed)),
-            fallback_reason: gpu_disabled_this_stack.then_some("GPU no rentable, sin paridad o fallback operativo".into()),
+            fallback_reason: final_fallback_reason,
         },
     );
 
     let _ = pt_guard.finish_ok();
-    Ok(preview_src)
+    Ok(PlanetaryStackResponse {
+        preview_src,
+        quality_plan: stack_execution_plan.quality_plan.clone(),
+        sequence_plan: stack_execution_plan.sequence_plan.clone(),
+        execution_plan: stack_execution_plan,
+        stage_telemetry,
+    })
 }
 
 /// Per-AP statistics of the master that are constant across frames.
 /// PERF: these were recomputed for every frame × AP (two full box scans
 /// each) — precomputing them once per pass removes ~40% of the AP-loop cost.
+fn get_area_local_variance(
+    data: &[u16],
+    w: usize,
+    h: usize,
+    cx: usize,
+    cy: usize,
+    box_size: usize,
+) -> f32 {
+    let Some(image_len) = w.checked_mul(h) else {
+        return 0.0;
+    };
+    if w == 0 || h == 0 || data.len() < image_len || box_size == 0 {
+        return 0.0;
+    }
+    let half = box_size / 2;
+    let start_x = cx.saturating_sub(half).min(w);
+    let start_y = cy.saturating_sub(half).min(h);
+    let end_x = cx.saturating_add(half).min(w);
+    let end_y = cy.saturating_add(half).min(h);
+
+    // Welford evita cancelación catastrófica en capturas 16-bit brillantes y
+    // mide textura local real; el valor anterior restaba una constante 100 y
+    // confundía nivel DC con contraste del AP.
+    let mut count = 0u64;
+    let mut mean = 0.0f64;
+    let mut m2 = 0.0f64;
+    for y in start_y..end_y {
+        let row = y * w;
+        for x in start_x..end_x {
+            let value = data[row + x] as f64;
+            count += 1;
+            let delta = value - mean;
+            mean += delta / count as f64;
+            m2 += delta * (value - mean);
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        (m2 / count as f64) as f32
+    }
+}
+
 fn precompute_ap_master_stats(
     master_edges: &[u16],
     master_mono: &[u16],
@@ -9659,22 +12633,43 @@ fn precompute_ap_master_stats(
     h: usize,
     points: &[ApPoint],
     box_size: usize,
-) -> (Vec<f32>, Vec<f32>) {
-    // PR-24: cada AP es independiente — par_iter + unzip conserva el orden
-    // (bit-exacto). Con miles de APs a 20MP esto corre por pasada.
-    points
+) -> (
+    Vec<f32>,
+    Vec<f32>,
+    Vec<Option<crate::alignment::LucasKanadeReference>>,
+) {
+    // PR-24/P2: cada AP es independiente. El collect indexado conserva el
+    // orden; después se separan los tres descriptores sin recomputar cajas.
+    let stats: Vec<_> = points
         .par_iter()
         .map(|ap| {
             (
-                get_area_complexity(
-                    master_edges, w, h, ap.x as usize, ap.y as usize, box_size, 100.0,
+                get_area_local_variance(
+                    master_edges, w, h, ap.x as usize, ap.y as usize, box_size,
                 ),
                 get_area_quality_laplacian(
                     master_mono, w, h, ap.x as usize, ap.y as usize, box_size,
                 ),
+                crate::alignment::precompute_lucas_kanade_reference(
+                    master_edges,
+                    w,
+                    h,
+                    ap.x as usize,
+                    ap.y as usize,
+                    box_size,
+                ),
             )
         })
-        .unzip()
+        .collect();
+    let mut contrast = Vec::with_capacity(stats.len());
+    let mut laplacian = Vec::with_capacity(stats.len());
+    let mut lk_reference = Vec::with_capacity(stats.len());
+    for (ap_contrast, ap_laplacian, ap_lk_reference) in stats {
+        contrast.push(ap_contrast);
+        laplacian.push(ap_laplacian);
+        lk_reference.push(ap_lk_reference);
+    }
+    (contrast, laplacian, lk_reference)
 }
 
 /// Estimates the per-AP residual shifts of ONE frame against the master.
@@ -9686,6 +12681,7 @@ fn compute_frame_local_shifts(
     master_edges: &[u16],
     ap_master_contrast: &[f32],
     ap_master_lap: &[f32],
+    ap_lk_reference: &[Option<crate::alignment::LucasKanadeReference>],
     master_ds: &[u16],
     master_ds_w: usize,
     f_edges: &[u16],
@@ -9694,6 +12690,8 @@ fn compute_frame_local_shifts(
     w_in: usize,
     h_in: usize,
     custom_points: &[ApPoint],
+    frame_ap_acceptance: Option<&[bool]>,
+    skip_inactive_aps: bool,
     ap_signal_valid: &[bool],
     ap_dark_ratio: &[f32],
     ap_limb_normal: &[Option<(f32, f32)>],
@@ -9708,9 +12706,15 @@ fn compute_frame_local_shifts(
     // TEXTURE-TRUST GATE: Laplaciano minimo del master para que un AP mida
     // (0.0 = gate apagado). Ver el comentario en el setup del pase.
     ap_lap_floor: f32,
-    // Sólo activa AP-parallel cuando el lote no tiene suficientes frames para
-    // ocupar el pool exterior. Nunca crea nuevos scratches.
-    parallel_aps: bool,
+    lk_min_objective_improvement: f32,
+    min_runner_up_margin: f32,
+    recheck_low_texture: bool,
+    spatial_tolerance: f32,
+    force_full_pyramid_recheck: bool,
+    // Presupuesto de workers AP de esta onda. El scheduler sólo entrega >1
+    // cuando hay exactamente un frame activo, por lo que nunca se anidan las
+    // dimensiones frame y AP ni se crean scratches adicionales.
+    ap_workers: usize,
     // Semillas gruesas 4× calculadas por wgpu. None conserva la ruta CPU
     // completa; cada entrada None cae localmente al matcher piramidal CPU.
     gpu_coarse: Option<&[Option<crate::gpu_analysis::SadMatch>]>,
@@ -9721,11 +12725,18 @@ fn compute_frame_local_shifts(
     // pasada 1 → búsqueda normal para ese AP.
     pass1_prior: Option<(f32, f32, &[(f32, f32, f32)])>,
 ) -> Vec<(f32, f32, f32)> {
-    // En lotes normales se paraleliza sólo por frame. En capturas muy cortas,
-    // el caller puede repartir los APs entre los workers ociosos; el lease es
-    // por frame y los trabajos AP no toman scratch, por lo que no hay ciclo de
-    // espera ni sobreasignación. Ambos caminos son indexados y conservan orden.
+    // En ondas normales se paraleliza sólo por frame. Una onda de un frame
+    // puede repartir APs entre el pool acotado; ambos caminos son indexados y
+    // conservan exactamente el mismo orden de salida.
     let compute_ap = |(ap_i, ap): (usize, &ApPoint)| {
+        if skip_inactive_aps
+            && !frame_ap_acceptance
+                .and_then(|mask| mask.get(ap_i))
+                .copied()
+                .unwrap_or(true)
+        {
+            return (0.0, 0.0, 0.0);
+        }
         if ap_i < ap_signal_valid.len() && !ap_signal_valid[ap_i] {
             return (0.0, 0.0, 0.0);
         }
@@ -9760,7 +12771,8 @@ fn compute_frame_local_shifts(
                     ))
                 })
             });
-            let (dx, dy, sad) = if let Some((sdx, sdy)) = prior_seed {
+            let mut used_local_refinement = false;
+            let (mut dx, mut dy, mut sad) = if let Some((sdx, sdy)) = prior_seed {
                 // PR-23 FIX: la semilla (sdx, sdy) ya está en píxeles de
                 // resolución COMPLETA (posición del match de la pasada 1
                 // re-expresada respecto al centro de esta pasada), así que
@@ -9793,6 +12805,7 @@ fn compute_frame_local_shifts(
                         master_ds, f_ds, master_ds_w,
                     )
                 } else {
+                    used_local_refinement = true;
                     (rdx, rdy, rsad)
                 }
             } else if let Some(seed) = gpu_coarse
@@ -9800,6 +12813,7 @@ fn compute_frame_local_shifts(
                 .copied()
                 .flatten()
             {
+                used_local_refinement = true;
                 crate::alignment::refine_best_match_sad_from_coarse(
                     master_edges,
                     f_edges,
@@ -9822,6 +12836,132 @@ fn compute_frame_local_shifts(
                     master_ds, f_ds, master_ds_w,
                 )
             };
+            // Maximum revalida las semillas aceleradas contra la pirámide CPU
+            // completa. Standard/Adaptive conservan el refino local exacto y
+            // sólo pagan el fallback cuando la ventana se satura.
+            if force_full_pyramid_recheck && used_local_refinement {
+                (dx, dy, sad) = find_best_match_sad_pyramid_fast(
+                    master_edges,
+                    f_edges,
+                    w_in,
+                    h_in,
+                    ax as usize,
+                    ay as usize,
+                    fx_i as usize,
+                    fy_i as usize,
+                    box_size,
+                    search_r,
+                    master_ds,
+                    f_ds,
+                    master_ds_w,
+                );
+            }
+
+            // CONFIDENCE GATE SAD (Adaptive/Maximum): no repetimos una
+            // búsqueda exhaustiva para todos los AP/frame. Primero marcamos
+            // como sospechoso un mínimo pegado al borde o un patch de textura
+            // débil/1-D; después un sondeo de hasta 24 SAD decide si merece el
+            // diagnóstico exacto mejor/runner-up. Sólo ese subconjunto paga el
+            // barrido adicional. Las semillas aceleradas sospechosas se
+            // revalidan con la pirámide CPU antes de descartarlas.
+            if min_runner_up_margin > 0.0 && search_r >= 2 {
+                let mut best_ix = dx.round() as i32;
+                let mut best_iy = dy.round() as i32;
+                let low_texture = recheck_low_texture
+                    && (ap_lk_reference
+                        .get(ap_i)
+                        .and_then(|reference| reference.as_ref())
+                        .is_none()
+                        || (ap_lap_floor > 0.0
+                            && ap_master_lap.get(ap_i).copied().unwrap_or(f32::MAX)
+                                <= ap_lap_floor * 2.0));
+                let touches_search_border =
+                    best_ix.abs() >= search_r || best_iy.abs() >= search_r;
+                let suspicious = touches_search_border || low_texture;
+                if suspicious
+                    && crate::alignment::sad_match_needs_exact_diagnostics(
+                        master_edges,
+                        f_edges,
+                        w_in,
+                        ax as usize,
+                        ay as usize,
+                        fx_i as usize,
+                        fy_i as usize,
+                        box_size,
+                        search_r,
+                        best_ix,
+                        best_iy,
+                        min_runner_up_margin,
+                    )
+                {
+                    let mut diagnostic = crate::alignment::diagnose_sad_match(
+                        master_edges,
+                        f_edges,
+                        w_in,
+                        ax as usize,
+                        ay as usize,
+                        fx_i as usize,
+                        fy_i as usize,
+                        box_size,
+                        search_r,
+                        best_ix,
+                        best_iy,
+                    );
+                    let alternative_is_better = diagnostic
+                        .runner_up_sad
+                        .map(|runner| runner < diagnostic.best_sad)
+                        .unwrap_or(false);
+                    if used_local_refinement
+                        && (alternative_is_better
+                            || diagnostic.touches_search_border
+                            || diagnostic.normalized_margin < min_runner_up_margin)
+                    {
+                        (dx, dy, sad) = find_best_match_sad_pyramid_fast(
+                            master_edges,
+                            f_edges,
+                            w_in,
+                            h_in,
+                            ax as usize,
+                            ay as usize,
+                            fx_i as usize,
+                            fy_i as usize,
+                            box_size,
+                            search_r,
+                            master_ds,
+                            f_ds,
+                            master_ds_w,
+                        );
+                        best_ix = dx.round() as i32;
+                        best_iy = dy.round() as i32;
+                        diagnostic = crate::alignment::diagnose_sad_match(
+                            master_edges,
+                            f_edges,
+                            w_in,
+                            ax as usize,
+                            ay as usize,
+                            fx_i as usize,
+                            fy_i as usize,
+                            box_size,
+                            search_r,
+                            best_ix,
+                            best_iy,
+                        );
+                    }
+                    let alternative_is_better = diagnostic
+                        .runner_up_sad
+                        .map(|runner| runner < diagnostic.best_sad)
+                        .unwrap_or(false);
+                    if diagnostic.best_sad == u64::MAX
+                        || alternative_is_better
+                        || diagnostic.touches_search_border
+                        || diagnostic.normalized_margin < min_runner_up_margin
+                    {
+                        // q=0 hace que el filtro espacial use vecinos válidos;
+                        // el match ambiguo jamás deforma directamente el warp.
+                        return (0.0, 0.0, 0.0);
+                    }
+                }
+            }
             // CRITICAL SUB-PIXEL FIX: the matcher measures the shift relative
             // to the ROUNDED search center (fx_i, fy_i), but the warp applies
             // it on top of the UNROUNDED (ax + render). The dropped rounding
@@ -9836,18 +12976,23 @@ fn compute_frame_local_shifts(
             // re-expresa como residuo local. Con patch plano, borde 1-D puro
             // (aperture problem) o divergencia devuelve None y el estimado SAD
             // queda intacto — LK nunca re-decide el matching, solo lo afina.
-            let (dx, dy) = match refine_shift_lucas_kanade(
-                master_edges,
-                f_edges,
-                w_in,
-                h_in,
-                ax as usize,
-                ay as usize,
-                render_dx + dx,
-                render_dy + dy,
-                box_size,
-                3,
-            ) {
+            let lk_refined = ap_lk_reference
+                .get(ap_i)
+                .and_then(|reference| reference.as_ref())
+                .and_then(|reference| {
+                    crate::alignment::refine_shift_lucas_kanade_precomputed_with_gate(
+                        master_edges,
+                        f_edges,
+                        w_in,
+                        h_in,
+                        reference,
+                        render_dx + dx,
+                        render_dy + dy,
+                        3,
+                        lk_min_objective_improvement,
+                    )
+                });
+            let (dx, dy) = match lk_refined {
                 Some((tdx, tdy)) => (tdx - render_dx, tdy - render_dy),
                 None => (dx, dy),
             };
@@ -9856,8 +13001,19 @@ fn compute_frame_local_shifts(
             let sensitivity = (m_contrast / 1000.0).clamp(0.5, 5.0) * 3500.0;
             let base_q = (-(avg_diff / sensitivity)).exp().clamp(0.001, 1.0);
 
-            let local_lap =
-                get_area_quality_laplacian(f_mono, w_in, h_in, ax as usize, ay as usize, box_size);
+            // La textura regional pertenece al patch REALMENTE emparejado en
+            // el frame, no a la coordenada fija del master. Con tracking o
+            // seeing local, medir (ax, ay) calificaba otra zona y podía dar
+            // peso alto a un match malo o castigar un filamento correcto.
+            let matched_x = (ax + render_dx + dx)
+                .round()
+                .clamp(0.0, w_in.saturating_sub(1) as f32) as usize;
+            let matched_y = (ay + render_dy + dy)
+                .round()
+                .clamp(0.0, h_in.saturating_sub(1) as f32) as usize;
+            let local_lap = get_area_quality_laplacian(
+                f_mono, w_in, h_in, matched_x, matched_y, box_size,
+            );
             let master_lap = ap_master_lap.get(ap_i).copied().unwrap_or(1.0);
             let regional_boost = (local_lap / master_lap.max(1.0)).clamp(0.1, 1.4);
             // Limb APs: project the measured shift onto the edge-normal — the
@@ -9881,7 +13037,7 @@ fn compute_frame_local_shifts(
             (0.0, 0.0, 0.0)
         }
         };
-    let mut local_shifts: Vec<(f32, f32, f32)> = if parallel_aps {
+    let mut local_shifts: Vec<(f32, f32, f32)> = if ap_workers > 1 {
         custom_points
             .par_iter()
             .enumerate()
@@ -9894,13 +13050,32 @@ fn compute_frame_local_shifts(
     if !local_shifts.is_empty() {
         let (valid_mask, fallback_vectors) = if is_surface {
             crate::alignment::filter_ap_shifts_spatial_with_options(
-                &local_shifts, custom_points, box_size, 5.0, 1.35, 1.0,
+                &local_shifts,
+                custom_points,
+                box_size,
+                spatial_tolerance,
+                1.35,
+                1.0,
             )
         } else {
-            crate::alignment::filter_ap_shifts_spatial(&local_shifts, custom_points, box_size, 3.5)
+            crate::alignment::filter_ap_shifts_spatial(
+                &local_shifts,
+                custom_points,
+                box_size,
+                spatial_tolerance,
+            )
         };
         for i in 0..local_shifts.len() {
-            if i < ap_signal_valid.len() && !ap_signal_valid[i] {
+            if skip_inactive_aps
+                && !frame_ap_acceptance
+                    .and_then(|mask| mask.get(i))
+                    .copied()
+                    .unwrap_or(true)
+            {
+                // Mantener el contrato explícito del scheduler: un AP omitido
+                // no se convierte en un vector fallback aparentemente medido.
+                local_shifts[i] = (0.0, 0.0, 0.0);
+            } else if i < ap_signal_valid.len() && !ap_signal_valid[i] {
                 local_shifts[i] = (0.0, 0.0, 0.0);
             } else if !valid_mask[i] {
                 local_shifts[i].0 = fallback_vectors[i].0;
@@ -10295,6 +13470,15 @@ fn compute_low_coverage_crop(
 }
 
 /// Spatial sigma-clipping: detects pixels >2.5sigma from neighborhood median.
+fn should_reject_spatial_outliers(
+    is_surface: bool,
+    large_disc: bool,
+    sigma_clip_enabled: bool,
+    quality_plan_allows: bool,
+) -> bool {
+    quality_plan_allows && !is_surface && !large_disc && !sigma_clip_enabled
+}
+
 fn reject_spatial_outliers_u16(img: &mut [u16], w: usize, h: usize) {
     let npix = w * h;
     if npix < 9 { return; }
@@ -11276,29 +14460,115 @@ impl LiquidScratch {
     }
 }
 
-/// Bounded lease pool: workers borrow a LiquidScratch and return it on drop,
-/// so live scratches never exceed the real thread concurrency (rayon's
-/// fold/for_each_init would otherwise allocate one per work-split).
-struct ScratchLease<'a> {
-    pool: &'a std::sync::Mutex<Vec<LiquidScratch>>,
-    sc: Option<LiquidScratch>,
+/// Per-pass state for the one safe fallback after a scheduler invariant error.
+///
+/// The wave scheduler below makes scratch starvation impossible during normal
+/// execution: every frame receives its lane's scratch before Rayon starts.
+/// This latch is retained as the P0 defence-in-depth contract: if a future
+/// change ever violates the preflight invariant, the partial pass is discarded
+/// and exactly one frame-zero retry runs with AP parallelism disabled.
+#[derive(Debug, Default)]
+struct ScratchPassRetry {
+    serial_aps: bool,
 }
 
-impl<'a> ScratchLease<'a> {
-    fn try_take(pool: &'a std::sync::Mutex<Vec<LiquidScratch>>) -> Option<Self> {
-        let sc = pool
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop()?;
-        Some(Self { pool, sc: Some(sc) })
+impl ScratchPassRetry {
+    fn begin_serial_retry(&mut self) -> bool {
+        if self.serial_aps {
+            false
+        } else {
+            self.serial_aps = true;
+            true
+        }
+    }
+
+    fn is_serial_retry(&self) -> bool {
+        self.serial_aps
     }
 }
 
-impl<'a> Drop for ScratchLease<'a> {
-    fn drop(&mut self) {
-        if let Some(sc) = self.sc.take() {
-            self.pool.lock().unwrap_or_else(|e| e.into_inner()).push(sc);
+/// Resource contract for one-dimensional planetary scheduling.
+///
+/// `compute_threads`, `frame_concurrency`, `scratch_slots` and `ap_workers`
+/// are deliberately independent values. A wave with more than one frame uses
+/// frame parallelism and exactly one AP worker per frame. Only a one-frame wave
+/// may use the remaining compute workers for APs. Therefore Rayon never nests
+/// AP parallelism below concurrent frame jobs and no worker can retain one
+/// scratch while trying to acquire another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlanetaryWaveScheduler {
+    compute_threads: usize,
+    frame_concurrency: usize,
+    scratch_slots: usize,
+    ap_workers: usize,
+}
+
+impl PlanetaryWaveScheduler {
+    fn new(
+        compute_threads: usize,
+        scratch_slots: usize,
+        ap_count: usize,
+        force_serial_aps: bool,
+    ) -> Result<Self, String> {
+        let compute_threads = compute_threads.max(1);
+        if scratch_slots == 0 {
+            return Err("El scheduler planetario no dispone de slots de scratch".to_string());
         }
+        let frame_concurrency = compute_threads.min(scratch_slots).max(1);
+        let ap_workers = if !force_serial_aps && ap_count >= 128 {
+            compute_threads.min(ap_count).max(1)
+        } else {
+            1
+        };
+        Ok(Self {
+            compute_threads,
+            frame_concurrency,
+            scratch_slots,
+            ap_workers,
+        })
+    }
+
+    /// Only one parallel dimension is active in a wave. Multi-frame waves use
+    /// one AP worker per frame; a one-frame tail may occupy the pool by AP.
+    fn ap_workers_for_wave(self, wave_len: usize) -> usize {
+        if wave_len == 1 {
+            self.ap_workers
+        } else {
+            1
+        }
+    }
+
+    /// Restores the P0 threshold without restoring nested Rayon: an underfull
+    /// batch with at least 128 APs is split into one-frame waves, then APs use
+    /// the compute pool. Full batches remain frame-parallel with serial APs.
+    fn frame_wave_width_for_batch(self, batch_len: usize) -> usize {
+        if batch_len < self.compute_threads && self.ap_workers > 1 {
+            1
+        } else {
+            self.frame_concurrency
+        }
+    }
+
+    fn validate_wave(self, wave_len: usize) -> Result<(), String> {
+        if wave_len == 0 {
+            return Ok(());
+        }
+        if wave_len > self.frame_concurrency || wave_len > self.scratch_slots {
+            return Err(format!(
+                "scratch_starved: onda de {wave_len} frames excede concurrencia {} o slots {}",
+                self.frame_concurrency, self.scratch_slots
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn wave_ranges(self, total_frames: usize) -> Vec<std::ops::Range<usize>> {
+        let wave_width = self.frame_wave_width_for_batch(total_frames);
+        (0..total_frames)
+            .step_by(wave_width)
+            .map(|start| start..(start + wave_width).min(total_frames))
+            .collect()
     }
 }
 
@@ -12688,6 +15958,567 @@ fn warp_frame_lanczos3(frame: &[f32], w: usize, h: usize, warp: &[f32]) -> Vec<f
 mod zas_v3_tests {
     use super::*;
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct SyntheticPlanetarySelection {
+        allowed: Vec<usize>,
+        accepted_by_ap: Vec<Vec<usize>>,
+        global_active: Vec<usize>,
+        second_pass_evaluations: usize,
+    }
+
+    /// Oráculo directo del algoritmo previo: votos HashMap y segunda pasada
+    /// sobre todos los frames. Sólo se usa para probar bit-exactitud del plan
+    /// denso; no participa en producción.
+    fn reference_planetary_local_selection(
+        frame_ids: &[usize],
+        scores_by_ap: &[Vec<u64>],
+        num_to_stack: usize,
+        global_limit: usize,
+        per_ap_min_keep: usize,
+    ) -> SyntheticPlanetarySelection {
+        let mut votes = std::collections::HashMap::<usize, usize>::new();
+        for scores in scores_by_ap {
+            let mut ranked: Vec<PlanetaryLocalCandidate> = frame_ids
+                .iter()
+                .copied()
+                .zip(scores.iter().copied())
+                .enumerate()
+                .map(|(frame_position, (frame_idx, score))| PlanetaryLocalCandidate {
+                    frame_position,
+                    frame_idx,
+                    score,
+                })
+                .collect();
+            if num_to_stack < ranked.len() {
+                ranked.select_nth_unstable_by(num_to_stack, planetary_local_rank_order);
+                ranked.truncate(num_to_stack);
+            }
+            ranked.sort_unstable_by(planetary_local_rank_order);
+            let cutoff = ranked.first().map_or(0.0, |candidate| candidate.score as f32) * 0.52;
+            for candidate in ranked.iter().take(num_to_stack) {
+                if (candidate.score as f32) < cutoff {
+                    break;
+                }
+                *votes.entry(candidate.frame_idx).or_default() += 1;
+            }
+        }
+        let mut hit_list: Vec<(usize, usize)> = votes.into_iter().collect();
+        hit_list.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let allowed: Vec<usize> = hit_list
+            .into_iter()
+            .take(global_limit)
+            .map(|(idx, _)| idx)
+            .collect();
+        let allowed_set: std::collections::HashSet<usize> = allowed.iter().copied().collect();
+
+        let mut accepted_by_ap = Vec::new();
+        let mut global_active = std::collections::BTreeSet::new();
+        let mut second_pass_evaluations = 0usize;
+        for scores in scores_by_ap {
+            let mut ranked: Vec<PlanetaryLocalCandidate> = frame_ids
+                .iter()
+                .copied()
+                .zip(scores.iter().copied())
+                .enumerate()
+                .map(|(frame_position, (frame_idx, score))| PlanetaryLocalCandidate {
+                    frame_position,
+                    frame_idx,
+                    score,
+                })
+                .collect();
+            second_pass_evaluations += ranked.len();
+            let cutoff = ranked
+                .iter()
+                .map(|candidate| candidate.score)
+                .max()
+                .unwrap_or(0) as f32
+                * 0.55;
+            let protected_count = per_ap_min_keep.min(ranked.len());
+            if protected_count < ranked.len() {
+                ranked.select_nth_unstable_by(protected_count, planetary_local_rank_order);
+            }
+            let protected: Vec<usize> = ranked
+                .iter()
+                .take(protected_count)
+                .map(|candidate| candidate.frame_idx)
+                .collect();
+            let mut eligible: Vec<_> = ranked
+                .into_iter()
+                .filter(|candidate| {
+                    (candidate.score as f32) >= cutoff
+                        && (allowed_set.contains(&candidate.frame_idx)
+                            || protected.contains(&candidate.frame_idx))
+                })
+                .collect();
+            eligible.sort_unstable_by(planetary_local_rank_order);
+            let mut accepted = Vec::new();
+            for candidate in eligible {
+                let locally_protected = accepted.len() < per_ap_min_keep;
+                if allowed_set.contains(&candidate.frame_idx) || locally_protected {
+                    if (candidate.score as f32) < cutoff {
+                        break;
+                    }
+                    accepted.push(candidate.frame_idx);
+                    global_active.insert(candidate.frame_idx);
+                }
+                if accepted.len() >= num_to_stack {
+                    break;
+                }
+            }
+            accepted_by_ap.push(accepted);
+        }
+        SyntheticPlanetarySelection {
+            allowed,
+            accepted_by_ap,
+            global_active: global_active.into_iter().collect(),
+            second_pass_evaluations,
+        }
+    }
+
+    /// Modelo puro de la ruta de producción: votos por posición y segunda
+    /// pasada limitada a allowed+protected, reutilizando el score protegido.
+    fn optimized_planetary_local_selection(
+        frame_ids: &[usize],
+        scores_by_ap: &[Vec<u64>],
+        num_to_stack: usize,
+        global_limit: usize,
+        per_ap_min_keep: usize,
+    ) -> SyntheticPlanetarySelection {
+        let mut dense_votes = vec![0usize; frame_ids.len()];
+        let mut preselections = Vec::new();
+        for scores in scores_by_ap {
+            let mut ranked: Vec<PlanetaryLocalCandidate> = frame_ids
+                .iter()
+                .copied()
+                .zip(scores.iter().copied())
+                .enumerate()
+                .map(|(frame_position, (frame_idx, score))| PlanetaryLocalCandidate {
+                    frame_position,
+                    frame_idx,
+                    score,
+                })
+                .collect();
+            let preselection = prepare_planetary_ap_preselection(
+                &mut ranked,
+                num_to_stack,
+                per_ap_min_keep,
+            )
+            .unwrap();
+            let cutoff = preselection.best_score as f32 * 0.52;
+            for candidate in ranked.iter().take(num_to_stack) {
+                if (candidate.score as f32) < cutoff {
+                    break;
+                }
+                dense_votes[candidate.frame_position] += 1;
+            }
+            preselections.push(preselection);
+        }
+        let mut hit_positions: Vec<(usize, usize, usize)> = dense_votes
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, votes)| votes > 0)
+            .map(|(position, votes)| (position, frame_ids[position], votes))
+            .collect();
+        hit_positions.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+        let allowed_positions: Vec<usize> = hit_positions
+            .into_iter()
+            .take(global_limit)
+            .map(|(position, _, _)| position)
+            .collect();
+        let mut allowed_mask = vec![false; frame_ids.len()];
+        for &position in &allowed_positions {
+            allowed_mask[position] = true;
+        }
+        let allowed = allowed_positions
+            .iter()
+            .map(|&position| frame_ids[position])
+            .collect();
+
+        let mut accepted_by_ap = Vec::new();
+        let mut global_active = std::collections::BTreeSet::new();
+        let mut second_pass_evaluations = 0usize;
+        for (scores, preselection) in scores_by_ap.iter().zip(preselections.iter()) {
+            let cutoff = preselection.best_score as f32 * 0.55;
+            let mut eligible = Vec::new();
+            for &position in &allowed_positions {
+                let candidate = if let Some(saved) = preselection
+                    .protected
+                    .iter()
+                    .find(|candidate| candidate.frame_position == position)
+                {
+                    *saved
+                } else {
+                    second_pass_evaluations += 1;
+                    PlanetaryLocalCandidate {
+                        frame_position: position,
+                        frame_idx: frame_ids[position],
+                        score: scores[position],
+                    }
+                };
+                if (candidate.score as f32) >= cutoff {
+                    eligible.push(candidate);
+                }
+            }
+            eligible.extend(
+                preselection
+                    .protected
+                    .iter()
+                    .filter(|candidate| {
+                        !allowed_mask[candidate.frame_position]
+                            && (candidate.score as f32) >= cutoff
+                    })
+                    .copied(),
+            );
+            eligible.sort_unstable_by(planetary_local_rank_order);
+            let mut accepted = Vec::new();
+            for candidate in eligible {
+                let locally_protected = accepted.len() < per_ap_min_keep;
+                if allowed_mask[candidate.frame_position] || locally_protected {
+                    accepted.push(candidate.frame_idx);
+                    global_active.insert(candidate.frame_idx);
+                }
+                if accepted.len() >= num_to_stack {
+                    break;
+                }
+            }
+            accepted_by_ap.push(accepted);
+        }
+        SyntheticPlanetarySelection {
+            allowed,
+            accepted_by_ap,
+            global_active: global_active.into_iter().collect(),
+            second_pass_evaluations,
+        }
+    }
+
+    #[test]
+    fn dense_planetary_selection_is_bit_exact_with_shuffled_frame_ids() {
+        // Los ids son deliberadamente no contiguos y no ordenados. La matriz
+        // compacta permite este contrato siempre que sean únicos.
+        let frame_ids = [91, 7, 44, 3, 120, 18, 62, 1, 205, 33, 74, 9];
+        let scores_by_ap = vec![
+            vec![100, 91, 82, 73, 64, 55, 46, 37, 28, 19, 10, 1],
+            vec![80, 80, 80, 75, 70, 55, 40, 10, 95, 93, 60, 55],
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 65, 55],
+            vec![100, 20, 88, 18, 76, 16, 64, 14, 52, 12, 40, 10],
+            vec![25, 100, 24, 90, 23, 80, 22, 70, 21, 60, 20, 50],
+        ];
+        let reference = reference_planetary_local_selection(
+            &frame_ids,
+            &scores_by_ap,
+            5,
+            5,
+            2,
+        );
+        let optimized = optimized_planetary_local_selection(
+            &frame_ids,
+            &scores_by_ap,
+            5,
+            5,
+            2,
+        );
+        assert_eq!(optimized.allowed, reference.allowed);
+        assert_eq!(optimized.accepted_by_ap, reference.accepted_by_ap);
+        assert_eq!(optimized.global_active, reference.global_active);
+        assert!(
+            optimized.second_pass_evaluations < reference.second_pass_evaluations,
+            "la segunda pasada debe omitir frames imposibles: {} vs {}",
+            optimized.second_pass_evaluations,
+            reference.second_pass_evaluations,
+        );
+    }
+
+    #[test]
+    fn ap_master_variance_is_invariant_to_dc_brightness() {
+        let (w, h) = (48usize, 40usize);
+        let mut dark = vec![0u16; w * h];
+        let mut bright = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let texture = ((x * 37 + y * 61 + (x * y) % 17) % 900) as u16;
+                dark[y * w + x] = 1_000 + texture;
+                bright[y * w + x] = 31_000 + texture;
+            }
+        }
+        let a = get_area_local_variance(&dark, w, h, 24, 20, 24);
+        let b = get_area_local_variance(&bright, w, h, 24, 20, 24);
+        assert!(
+            (a - b).abs() <= a.max(1.0) * 1.0e-6,
+            "la varianza local no debe depender del nivel DC: {a} vs {b}"
+        );
+    }
+
+    #[test]
+    fn ap_geometry_rejects_mixed_or_mismatched_sizes() {
+        let uniform = vec![
+            ApPoint { x: 20.0, y: 20.0, size: 32 },
+            ApPoint { x: 41.0, y: 20.0, size: 32 },
+        ];
+        assert!(validate_uniform_ap_geometry(&uniform, 32).is_ok());
+        assert!(validate_uniform_ap_geometry(&uniform, 48).is_err());
+        let mut mixed = uniform;
+        mixed[1].size = 48;
+        let error = validate_uniform_ap_geometry(&mixed, 32).unwrap_err();
+        assert!(error.contains("mezcla tamaños AP"), "{error}");
+    }
+
+    #[test]
+    fn spatial_outlier_filter_respects_temporal_rejection_and_quality_plan() {
+        assert!(should_reject_spatial_outliers(false, false, false, true));
+        assert!(!should_reject_spatial_outliers(false, false, true, true));
+        assert!(!should_reject_spatial_outliers(false, false, false, false));
+        assert!(!should_reject_spatial_outliers(true, false, false, true));
+        assert!(!should_reject_spatial_outliers(false, true, false, true));
+    }
+
+    #[test]
+    fn analysis_gpu_failure_discards_partial_attempt_and_restarts_cpu() {
+        for policy in [ComputePolicy::Auto, ComputePolicy::Hybrid] {
+            let mut attempts = Vec::new();
+            let (result, used_gpu, retried) =
+                run_analysis_stage_with_retry(policy, true, |use_gpu| {
+                    attempts.push(use_gpu);
+                    if use_gpu {
+                        // Fault injection determinista: estos resultados simulan
+                        // el prefijo ya calculado cuando el dispositivo falla.
+                        Ok((vec!["gpu-0", "gpu-1"], true))
+                    } else {
+                        Ok((vec!["cpu-0", "cpu-1", "cpu-2"], false))
+                    }
+                })
+                .unwrap();
+
+            assert_eq!(attempts, vec![true, false], "policy={policy:?}");
+            assert!(!used_gpu, "policy={policy:?}");
+            assert!(retried, "policy={policy:?}");
+            assert_eq!(result, vec!["cpu-0", "cpu-1", "cpu-2"]);
+            assert!(result.iter().all(|value| value.starts_with("cpu-")));
+        }
+    }
+
+    #[test]
+    fn analysis_gpu_only_discards_partial_attempt_without_cpu_retry() {
+        let mut attempts = Vec::new();
+        let error = run_analysis_stage_with_retry(
+            ComputePolicy::GpuOnly,
+            true,
+            |use_gpu| -> Result<(Vec<&'static str>, bool), String> {
+                attempts.push(use_gpu);
+                Ok((vec!["gpu-partial"], true))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(attempts, vec![true]);
+        assert!(error.contains("GPU only"));
+        assert!(error.contains("intento parcial fue descartado"));
+    }
+
+    fn encode_u16_frames(frames: &[&[u16]]) -> (Vec<u8>, usize) {
+        let frame_bytes = frames.first().map_or(0, |frame| frame.len() * 2);
+        let bytes = frames
+            .iter()
+            .flat_map(|frame| frame.iter().flat_map(|value| value.to_le_bytes()))
+            .collect();
+        (bytes, frame_bytes)
+    }
+
+    #[test]
+    fn decode_policy_attempts_never_hide_strict_fallbacks() {
+        assert_eq!(
+            ffmpeg_decode_attempt_order(DecodePolicy::Software, true),
+            vec![false]
+        );
+        assert_eq!(
+            ffmpeg_decode_attempt_order(DecodePolicy::Hardware, false),
+            vec![true]
+        );
+        assert_eq!(
+            ffmpeg_decode_attempt_order(DecodePolicy::Auto, true),
+            vec![true, false]
+        );
+        assert_eq!(
+            ffmpeg_decode_attempt_order(DecodePolicy::Auto, false),
+            vec![false]
+        );
+        assert!(ffmpeg_decode_uses_hardware(DecodePolicy::Hardware, true, true).is_err());
+        assert!(!ffmpeg_decode_uses_hardware(DecodePolicy::Software, true, false).unwrap());
+        assert!(!ffmpeg_decode_uses_hardware(DecodePolicy::Auto, true, true).unwrap());
+    }
+
+    #[test]
+    fn prefetch_owner_joins_a_blocked_producer_before_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let live = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_live = std::sync::Arc::new(AtomicUsize::new(0));
+        for _attempt in 0..2 {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(1);
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let attempt_cancel = std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            );
+            let live_thread = live.clone();
+            let max_thread = max_live.clone();
+            let join = std::thread::spawn(move || -> Result<(), String> {
+                let now = live_thread.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+                max_thread.fetch_max(now, AtomicOrdering::AcqRel);
+                let _ = ready_tx.send(());
+                // El segundo envío queda bloqueado hasta que el dueño cierre
+                // el receptor al descartar este intento.
+                let _ = tx.send(1);
+                let _ = tx.send(2);
+                live_thread.fetch_sub(1, AtomicOrdering::AcqRel);
+                Ok(())
+            });
+            ready_rx.recv().unwrap();
+            let prefetch = OwnedPlanetaryPrefetch {
+                receiver: Some(rx),
+                attempt_cancel,
+                join: Some(join),
+            };
+            drop(prefetch);
+            assert_eq!(live.load(AtomicOrdering::Acquire), 0);
+        }
+        assert_eq!(max_live.load(AtomicOrdering::Acquire), 1);
+    }
+
+    #[test]
+    fn prefetch_terminal_failure_after_last_batch_is_not_lost() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<usize, String>>(1);
+        let attempt_cancel = std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        );
+        let join = std::thread::spawn(move || -> Result<(), String> {
+            tx.send(Ok(7)).unwrap();
+            // Simula `validate_hardware_route`: todos los bytes llegaron, pero
+            // el log terminal demuestra que FFmpeg usó software.
+            Err("backend hardware no confirmado al cosechar FFmpeg".into())
+        });
+        let mut prefetch = OwnedPlanetaryPrefetch {
+            receiver: Some(rx),
+            attempt_cancel,
+            join: Some(join),
+        };
+
+        assert_eq!(
+            prefetch
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            7
+        );
+        let error = prefetch.wait_terminal().unwrap_err();
+        assert!(error.contains("hardware no confirmado"), "{error}");
+    }
+
+    #[test]
+    fn decode_parity_enforces_source_lsb_rmse_max_and_frame_ranking() {
+        // 12-bit source expanded to u16: 1 source LSB == 16 ADU16. One exact
+        // boundary error among 16 samples gives RMSE=4 (0.25 LSB) and passes.
+        let frames: [&[u16]; 4] = [
+            &[0, 0, 0, 0],
+            &[0, 1_000, 0, 1_000],
+            &[0, 2_000, 0, 2_000],
+            &[0, 3_000, 0, 3_000],
+        ];
+        let (cpu, frame_bytes) = encode_u16_frames(&frames);
+        let mut boundary = cpu.clone();
+        let last = boundary.len() - 2;
+        boundary[last..].copy_from_slice(&3_016u16.to_le_bytes());
+        assert!(decode_sample_parity_passes(
+            &cpu,
+            &boundary,
+            12,
+            frame_bytes
+        ));
+
+        let mut over_max = boundary.clone();
+        over_max[last..].copy_from_slice(&3_017u16.to_le_bytes());
+        assert!(!decode_sample_parity_passes(
+            &cpu,
+            &over_max,
+            12,
+            frame_bytes
+        ));
+
+        let mut over_rmse = cpu.clone();
+        for sample in [10usize, 14] {
+            let offset = sample * 2;
+            let value = u16::from_le_bytes([over_rmse[offset], over_rmse[offset + 1]]);
+            over_rmse[offset..offset + 2]
+                .copy_from_slice(&value.saturating_add(16).to_le_bytes());
+        }
+        assert!(!decode_sample_parity_passes(
+            &cpu,
+            &over_rmse,
+            12,
+            frame_bytes
+        ));
+
+        // Aunque el error radiométrico sea pequeño, invertir el ranking lucky
+        // invalida la ruta acelerada.
+        let (rank_cpu, rank_frame_bytes) =
+            encode_u16_frames(&[&[0, 100, 100, 100], &[0, 105, 105, 105]]);
+        let mut rank_changed = rank_cpu.clone();
+        rank_changed[2..4].copy_from_slice(&108u16.to_le_bytes());
+        assert!(!decode_sample_parity_passes(
+            &rank_cpu,
+            &rank_changed,
+            12,
+            rank_frame_bytes
+        ));
+        assert!(!decode_sample_parity_passes(&[], &[], 12, frame_bytes));
+        assert!(!decode_sample_parity_passes(
+            &cpu,
+            &cpu[..cpu.len() - 2],
+            12,
+            frame_bytes
+        ));
+        assert!(!decode_sample_parity_passes(&cpu, &cpu, 12, 0));
+        assert!(!decode_sample_parity_passes(
+            &cpu,
+            &cpu,
+            12,
+            frame_bytes + 2
+        ));
+    }
+
+    #[test]
+    fn persisted_decode_profile_requires_stable_samples_parity_and_same_backend() {
+        let winning = crate::planetary_planner::CalibrationObservation::new(
+            PlanetaryStage::Decode,
+            vec![120.0, 121.0, 119.0],
+            vec![100.0, 101.0, 99.0],
+            true,
+            Some("videotoolbox".into()),
+        );
+        let probe = decode_probe_from_persisted_observation(&winning, "videotoolbox")
+            .expect("perfil estable");
+        assert!(probe.prefer_hardware);
+        assert_eq!(probe.sample_count, 3);
+
+        let cpu_winner = crate::planetary_planner::CalibrationObservation::new(
+            PlanetaryStage::Decode,
+            vec![100.0, 101.0, 99.0],
+            vec![105.0, 106.0, 104.0],
+            true,
+            Some("videotoolbox".into()),
+        );
+        assert!(!decode_probe_from_persisted_observation(&cpu_winner, "videotoolbox")
+            .unwrap()
+            .prefer_hardware);
+        assert!(decode_probe_from_persisted_observation(&winning, "d3d11va").is_none());
+
+        let mut parity_failed = winning.clone();
+        parity_failed.parity_passed = false;
+        assert!(decode_probe_from_persisted_observation(&parity_failed, "videotoolbox").is_none());
+        let mut unstable = winning;
+        unstable.cpu_ms = vec![50.0, 120.0, 200.0];
+        assert!(decode_probe_from_persisted_observation(&unstable, "videotoolbox").is_none());
+    }
+
     #[test]
     fn decode_cache_expected_set_admits_full_suffix_or_nothing() {
         let sel: Vec<usize> = (0..1000).map(|i| i * 2).collect();
@@ -13014,10 +16845,144 @@ mod zas_v3_tests {
     }
 
     #[test]
-    fn empty_scratch_pool_is_an_error_path_not_a_panic() {
-        let pool: std::sync::Mutex<Vec<LiquidScratch>> =
-            std::sync::Mutex::new(Vec::new());
-        assert!(ScratchLease::try_take(&pool).is_none());
+    fn wave_scheduler_separates_resources_and_never_nests_parallel_dimensions() {
+        let scheduler = PlanetaryWaveScheduler::new(8, 3, 128, false).unwrap();
+        assert_eq!(scheduler.compute_threads, 8);
+        assert_eq!(scheduler.frame_concurrency, 3);
+        assert_eq!(scheduler.scratch_slots, 3);
+        assert_eq!(scheduler.ap_workers, 8);
+        assert_eq!(scheduler.ap_workers_for_wave(3), 1);
+        assert_eq!(scheduler.ap_workers_for_wave(2), 1);
+        assert_eq!(scheduler.ap_workers_for_wave(1), 8);
+        assert_eq!(scheduler.frame_wave_width_for_batch(7), 1);
+        assert_eq!(scheduler.frame_wave_width_for_batch(8), 3);
+        assert_eq!(
+            scheduler.wave_ranges(7),
+            vec![0..1, 1..2, 2..3, 3..4, 4..5, 5..6, 6..7]
+        );
+        assert_eq!(scheduler.wave_ranges(8), vec![0..3, 3..6, 6..8]);
+        assert!(PlanetaryWaveScheduler::new(8, 0, 128, false).is_err());
+
+        let serial = PlanetaryWaveScheduler::new(8, 3, 10_000, true).unwrap();
+        assert_eq!(serial.ap_workers_for_wave(1), 1);
+        assert_eq!(serial.frame_wave_width_for_batch(7), 3);
+
+        let below_p0_threshold = PlanetaryWaveScheduler::new(8, 3, 127, false).unwrap();
+        assert_eq!(below_p0_threshold.frame_wave_width_for_batch(7), 3);
+    }
+
+    #[test]
+    fn stage_wall_envelope_is_distinct_from_overlapping_worker_sum() {
+        let first = std::sync::atomic::AtomicU64::new(u64::MAX);
+        let last = std::sync::atomic::AtomicU64::new(0);
+        assert_eq!(telemetry_wall_envelope_ns(&first, &last), 0);
+        first.fetch_min(100, Ordering::AcqRel);
+        first.fetch_min(80, Ordering::AcqRel);
+        last.fetch_max(180, Ordering::AcqRel);
+        last.fetch_max(240, Ordering::AcqRel);
+        assert_eq!(telemetry_wall_envelope_ns(&first, &last), 160);
+        // Dos workers pueden sumar 220 ns dentro de una pared de 160 ns.
+        // Esta desigualdad es precisamente por qué ambos campos se publican.
+        let worker_sum = 90u64 + 130u64;
+        assert!(worker_sum > telemetry_wall_envelope_ns(&first, &last));
+    }
+
+    #[test]
+    fn scratch_retry_is_single_and_latches_ap_serial() {
+        let mut retry = ScratchPassRetry::default();
+        assert!(retry.begin_serial_retry());
+        assert!(retry.is_serial_retry());
+        assert!(
+            !retry.begin_serial_retry(),
+            "un segundo scratch_starved no debe crear un bucle de reintentos"
+        );
+        let scheduler = PlanetaryWaveScheduler::new(32, 32, 10_000, retry.is_serial_retry())
+            .unwrap();
+        assert_eq!(scheduler.ap_workers_for_wave(1), 1);
+    }
+
+    #[test]
+    fn wave_scheduler_stress_has_one_preassigned_scratch_per_lane() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        for threads in [2usize, 4, 8, 16, 32] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for ap_count in [127usize, 128] {
+                let scheduler =
+                    PlanetaryWaveScheduler::new(threads, threads, ap_count, false).unwrap();
+                for total_frames in [threads, threads + 1, threads * 4] {
+                    // 5 topologías × 2 densidades AP × 3 tamaños × 64 = 1,920
+                    // pases completos: suficiente para que este gate supere
+                    // mil interleavings sin convertir cada suite en un soak.
+                    for _ in 0..64 {
+                        let seen: Vec<AtomicUsize> = (0..total_frames)
+                            .map(|_| AtomicUsize::new(0))
+                            .collect();
+                        let lane_busy: Vec<AtomicUsize> = (0..scheduler.scratch_slots)
+                            .map(|_| AtomicUsize::new(0))
+                            .collect();
+                        let mut scratch_owner = vec![usize::MAX; scheduler.scratch_slots];
+
+                        for range in scheduler.wave_ranges(total_frames) {
+                            let wave_len = range.len();
+                            scheduler.validate_wave(wave_len).unwrap();
+                            let ap_workers = scheduler.ap_workers_for_wave(wave_len);
+                            assert!(wave_len == 1 || ap_workers == 1);
+                            let start = range.start;
+                            let owners = &mut scratch_owner[..wave_len];
+                            pool.install(|| {
+                                owners
+                                    .par_iter_mut()
+                                    .zip(range.into_par_iter())
+                                    .for_each(|(owner, frame_index)| {
+                                    let lane = frame_index - start;
+                                    assert_eq!(
+                                        lane_busy[lane].compare_exchange(
+                                            0,
+                                            1,
+                                            AtomicOrdering::AcqRel,
+                                            AtomicOrdering::Acquire,
+                                        ),
+                                        Ok(0),
+                                        "dos frames compartieron scratch lane {lane}"
+                                    );
+                                    *owner = frame_index;
+                                    if ap_workers > 1 {
+                                        // Única dimensión paralela: la onda
+                                        // contiene un frame y sólo los APs se
+                                        // distribuyen por Rayon.
+                                        let ap_visits = AtomicUsize::new(0);
+                                        (0..ap_count).into_par_iter().for_each(|_| {
+                                            ap_visits.fetch_add(1, AtomicOrdering::Relaxed);
+                                        });
+                                        assert_eq!(
+                                            ap_visits.load(AtomicOrdering::Relaxed),
+                                            ap_count
+                                        );
+                                    }
+                                    seen[frame_index].fetch_add(1, AtomicOrdering::Relaxed);
+                                    lane_busy[lane].store(0, AtomicOrdering::Release);
+                                });
+                            });
+                            for (lane, owner) in owners.iter().copied().enumerate() {
+                                assert_eq!(owner, start + lane);
+                            }
+                            owners.fill(usize::MAX);
+                        }
+
+                        assert!(seen
+                            .iter()
+                            .all(|visits| visits.load(AtomicOrdering::Relaxed) == 1));
+                        assert!(lane_busy
+                            .iter()
+                            .all(|busy| busy.load(AtomicOrdering::Relaxed) == 0));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -13337,6 +17302,7 @@ mod zas_v3_tests {
                 roi,
             )
         );
+        assert!(base.contains("_a11_"));
         assert!(base.contains("_c8_roi10-20-300-240_anc155x141_"));
     }
 
@@ -13391,7 +17357,7 @@ mod zas_v3_tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("capture.ser_planet_a10.analysis_v2");
+        let target = dir.join("capture.ser_planet_a11.analysis_v2");
         let target_s = target.to_string_lossy().into_owned();
         let first = stage_cached_analysis(&target_s, &cached).unwrap();
         let second = stage_cached_analysis(&target_s, &cached).unwrap();
@@ -13451,7 +17417,7 @@ mod zas_v3_tests {
             .as_nanos();
         let primary = std::env::temp_dir()
             .join(format!("zas-readonly-source-{nonce}"))
-            .join("capture.ser_planet_a10.analysis_v2")
+            .join("capture.ser_planet_a11.analysis_v2")
             .to_string_lossy()
             .into_owned();
         let fallback = get_analysis_cache_fallback_path(&primary);
@@ -14069,6 +18035,115 @@ mod zas_v3_tests {
     }
 
     #[test]
+    fn decode_cache_budget_rejection_latches_before_compression_work_repeats() {
+        let dir = std::env::temp_dir().join(format!(
+            "zas_dcache_admission_latch_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let frame = vec![17u16; 4096];
+        let budget = decode_cache_max_file_bytes(frame.len()).saturating_sub(1);
+        let tx = DecodeFrameCacheTransaction::new(&dir, 0xA11CE, frame.len(), budget)
+            .expect("staging");
+        tx.write_frame(0, &frame);
+        assert!(tx.is_admission_closed());
+        tx.write_frame(1, &frame);
+        assert!(std::fs::read_dir(&tx.staging_dir)
+            .unwrap()
+            .flatten()
+            .next()
+            .is_none());
+        drop(tx);
+        assert_eq!(decode_cache_total_bytes(&dir), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_idw_cache_roundtrip_validates_full_contract_and_crc() {
+        let dir = std::env::temp_dir().join(format!(
+            "zas_idw_cache_roundtrip_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let points = vec![
+            ApPoint { x: 3.0, y: 4.0, size: 24 },
+            ApPoint { x: 17.0, y: 5.0, size: 24 },
+            ApPoint { x: 9.0, y: 19.0, size: 24 },
+        ];
+        let (indices, weights) =
+            compute_idw_map_for_output(32, 24, 1.0, 0.0, 0.0, &points, 1.55, 3)
+                .unwrap();
+        let key = idw_cache_key(32, 24, 1.0, 0.0, 0.0, &points, 1.55, 3);
+        assert_ne!(
+            key,
+            idw_cache_key(32, 24, 1.0, 0.0, 0.0, &points, 1.75, 3),
+            "la potencia IDW debe invalidar la tabla"
+        );
+        let path = idw_cache_path(&dir, key);
+        assert!(write_exact_idw_cache(
+            &dir,
+            &path,
+            32,
+            24,
+            1.0,
+            0.0,
+            0.0,
+            points.len(),
+            1.55,
+            3,
+            &indices,
+            &weights,
+            64 * 1024 * 1024,
+        ));
+        let cached = read_exact_idw_cache(
+            &path,
+            32,
+            24,
+            1.0,
+            0.0,
+            0.0,
+            points.len(),
+            1.55,
+            3,
+        )
+        .expect("tabla exacta legible");
+        assert_eq!(cached.0, indices);
+        assert_eq!(cached.1, weights);
+        assert!(read_exact_idw_cache(
+            &path,
+            32,
+            24,
+            1.0,
+            1.0,
+            0.0,
+            points.len(),
+            1.55,
+            3,
+        )
+        .is_none());
+
+        let mut corrupted = std::fs::read(&path).unwrap();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 1;
+        std::fs::write(&path, corrupted).unwrap();
+        assert!(read_exact_idw_cache(
+            &path,
+            32,
+            24,
+            1.0,
+            0.0,
+            0.0,
+            points.len(),
+            1.55,
+            3,
+        )
+        .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_decode_cache_expected_set_never_commits_a_partial_video() {
         let dir = std::env::temp_dir().join(format!(
             "zas_dcache_complete_set_{}",
@@ -14181,8 +18256,7 @@ mod zas_v3_tests {
         let frame: Vec<u16> = (0..8192)
             .map(|i| ((i * 4051 + i * i * 17) & 0xffff) as u16)
             .collect();
-        let one = encode_cached_frame(&frame).unwrap().len() as u64;
-        let budget = one + 32;
+        let budget = decode_cache_max_file_bytes(frame.len()) + 32;
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let workers: Vec<_> = [0x1111u64, 0x2222u64]
             .into_iter()
@@ -14310,12 +18384,18 @@ mod zas_v3_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let frame_a: Vec<u16> = (0..4096).map(|i| (i * 37) as u16).collect();
         let frame_b: Vec<u16> = (0..4096).map(|i| (i * 91 + 7) as u16).collect();
-        let one_len = encode_cached_frame(&frame_a).unwrap().len() as u64;
+        let budget = decode_cache_max_file_bytes(frame_a.len());
         let used = std::sync::atomic::AtomicU64::new(0);
         let p_a = dir.join("a.lz4");
         let p_b = dir.join("b.lz4");
-        write_cached_frame_budgeted(&p_a, &frame_a, &used, one_len);
-        write_cached_frame_budgeted(&p_b, &frame_b, &used, one_len);
+        assert!(matches!(
+            write_cached_frame_budgeted(&p_a, &frame_a, &used, budget),
+            BudgetedCacheWrite::Written(_)
+        ));
+        assert_eq!(
+            write_cached_frame_budgeted(&p_b, &frame_b, &used, budget),
+            BudgetedCacheWrite::Rejected
+        );
         assert!(p_a.exists(), "el primer frame que cabe debe persistir");
         assert!(!p_b.exists(), "el presupuesto no puede sobrepasarse");
         assert_eq!(read_cached_frame(&p_a, frame_a.len()).unwrap(), frame_a);
@@ -15103,9 +19183,18 @@ mod zas_v3_tests {
                 luma[y * w + x] = 300.0; // wide dark filament (interior)
             }
         }
+        // Fibrillas interiores de 1 y 2 px: aunque sean más oscuras que el
+        // cielo, no están conectadas al borde y deben seguir siendo señal.
+        for x in 18..110 {
+            luma[96 * w + x] = 250.0;
+            luma[101 * w + x] = 250.0;
+            luma[102 * w + x] = 250.0;
+        }
         let mask = compute_border_connected_sky_mask(&luma, w, h, 10);
         assert!(mask[4 * w + 64] < 0.5, "sky must be background");
         assert!(mask[67 * w + 64] > 0.5, "wide dark filament must stay signal");
+        assert!(mask[96 * w + 64] > 0.5, "1px fibril must stay signal");
+        assert!(mask[101 * w + 64] > 0.5, "2px fibril must stay signal");
         assert!(mask[110 * w + 64] > 0.5, "bright disk must stay signal");
     }
 
@@ -15163,7 +19252,7 @@ mod zas_v3_tests {
         let master_edges = enhance_for_alignment_with_amount(&master, w, h, 4.0);
         let mut master_ds = Vec::new();
         let (mds_w, _) = downscale_4x(&master_edges, w, h, &mut master_ds);
-        let (ap_mc, ap_ml) =
+        let (ap_mc, ap_ml, ap_lk) =
             precompute_ap_master_stats(&master_edges, &master, w, h, &points, ap_size);
 
         let mut rng: u64 = 0xC0FF_EE00;
@@ -15186,16 +19275,46 @@ mod zas_v3_tests {
         let _ = downscale_4x(&f_edges, w, h, &mut f_ds);
 
         let full = compute_frame_local_shifts(
-            &master_edges, &ap_mc, &ap_ml, &master_ds, mds_w,
+            &master_edges, &ap_mc, &ap_ml, &ap_lk, &master_ds, mds_w,
             &f_edges, &frame, &f_ds, w, h,
-            &points, &all_valid, &no_dark, &no_normals,
-            gx, gy, ap_size, 12, true, true, 0.0, false, None, None,
+            &points, None, false, &all_valid, &no_dark, &no_normals,
+            gx, gy, ap_size, 12, true, true, 0.0, 0.0, 0.0, false, 5.0, false, 1, None,
+            None,
         );
-        let seeded = compute_frame_local_shifts(
-            &master_edges, &ap_mc, &ap_ml, &master_ds, mds_w,
+        let full_parallel = compute_frame_local_shifts(
+            &master_edges, &ap_mc, &ap_ml, &ap_lk, &master_ds, mds_w,
             &f_edges, &frame, &f_ds, w, h,
-            &points, &all_valid, &no_dark, &no_normals,
-            gx, gy, ap_size, 12, true, true, 0.0, false, None,
+            &points, None, false, &all_valid, &no_dark, &no_normals,
+            gx, gy, ap_size, 12, true, true, 0.0, 0.0, 0.0, false, 5.0, false, 4, None,
+            None,
+        );
+        assert_eq!(
+            full, full_parallel,
+            "AP serial y AP paralelo deben producir shifts bit-exactos"
+        );
+        let acceptance: Vec<bool> = (0..n_aps).map(|index| index % 4 != 0).collect();
+        let adaptive = compute_frame_local_shifts(
+            &master_edges, &ap_mc, &ap_ml, &ap_lk, &master_ds, mds_w,
+            &f_edges, &frame, &f_ds, w, h,
+            &points, Some(&acceptance), true, &all_valid, &no_dark, &no_normals,
+            gx, gy, ap_size, 12, true, true, 0.0, 0.0, 0.0, false, 5.0, false, 1, None,
+            None,
+        );
+        for index in 0..n_aps {
+            if acceptance[index] {
+                assert_eq!(
+                    adaptive[index], full[index],
+                    "omitir AP inactivo no debe alterar el vector activo #{index}"
+                );
+            } else {
+                assert_eq!(adaptive[index], (0.0, 0.0, 0.0));
+            }
+        }
+        let seeded = compute_frame_local_shifts(
+            &master_edges, &ap_mc, &ap_ml, &ap_lk, &master_ds, mds_w,
+            &f_edges, &frame, &f_ds, w, h,
+            &points, None, false, &all_valid, &no_dark, &no_normals,
+            gx, gy, ap_size, 12, true, true, 0.0, 0.0, 0.0, false, 5.0, false, 1, None,
             Some((gx, gy, full.as_slice())),
         );
         let mut worst = 0.0f32;
@@ -15297,15 +19416,20 @@ mod zas_v3_tests {
             let mut f_ds = Vec::new();
             downscale_4x(&f_edges, w, h, &mut f_ds);
 
-            let (ap_mc, ap_ml) =
+            let (ap_mc, ap_ml, ap_lk) =
                 precompute_ap_master_stats(&master_edges, &master, w, h, &points, ap_size);
             let shifts = compute_frame_local_shifts(
-                &master_edges, &ap_mc, &ap_ml, &master_ds, mds_w,
+                &master_edges, &ap_mc, &ap_ml, &ap_lk, &master_ds, mds_w,
                 &f_edges, &frame, &f_ds, w, h,
-                &points, &all_valid, &no_dark, &no_normals,
+                &points, None, false, &all_valid, &no_dark, &no_normals,
                 gx, gy, ap_size, 12, true, true,
                 0.0, // gate de textura apagado: el harness mide TODOS los APs
+                0.0,
+                0.0,
                 false,
+                5.0,
+                false,
+                1,
                 None,
                 None, // PR-23: sin semillas de pasada previa en el harness
             );
@@ -15335,6 +19459,7 @@ mod zas_v3_tests {
         shift_errs.sort_by(f32::total_cmp);
         let median_err = shift_errs[shift_errs.len() / 2];
         let p90_err = shift_errs[shift_errs.len() * 9 / 10];
+        let p95_err = shift_errs[shift_errs.len() * 95 / 100];
 
         let margin = 28usize;
         let mut se_stack = 0.0f64;
@@ -15354,12 +19479,16 @@ mod zas_v3_tests {
         let rmse_stack = (se_stack / count).sqrt();
         let rmse_unaligned = (se_unaligned / count).sqrt();
         println!(
-            "E2E: median_shift_err={median_err:.3}px p90={p90_err:.3}px rmse_stack={rmse_stack:.1} rmse_unaligned={rmse_unaligned:.1}"
+            "E2E: median_shift_err={median_err:.3}px p90={p90_err:.3}px p95={p95_err:.3}px rmse_stack={rmse_stack:.1} rmse_unaligned={rmse_unaligned:.1}"
         );
 
         assert!(
             median_err < 0.35,
             "median AP shift error too high: {median_err:.3}px (p90 {p90_err:.3}px)"
+        );
+        assert!(
+            p95_err <= 0.35,
+            "p95 AP shift error too high: {p95_err:.3}px (median {median_err:.3}px)"
         );
         assert!(
             rmse_stack < rmse_unaligned * 0.35,
