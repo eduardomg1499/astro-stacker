@@ -1153,6 +1153,23 @@ fn ds_validate_flat_pedestal_policy(
     policy: pipeline::DeepSkyCalibrationPolicy,
     inputs: crate::deepsky_calibration_contract::FlatPedestalInputs,
 ) -> Result<(), String> {
+    // Sin NINGUNA calibración de pedestal disponible (ni dark-flat ni bias):
+    // práctica válida y habitual — el pedestal se normaliza con la respuesta
+    // óptica. Se avisa en ambas políticas en vez de bloquear el máster.
+    if !inputs.raw_dark_flat && !inputs.bias {
+        log_to_front(
+            app,
+            "INFO",
+            &format!(
+                "Flat '{}' sin dark-flat ni bias: pedestal normalizado como parte de la respuesta óptica (registrado en la receta).",
+                std::path::Path::new(path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            ),
+        );
+        return Ok(());
+    }
     match crate::deepsky_calibration_contract::validate_flat_pedestal(inputs) {
         Ok(_) => Ok(()),
         Err(reason) if matches!(policy, pipeline::DeepSkyCalibrationPolicy::Strict) => {
@@ -8937,18 +8954,22 @@ fn ds_prepare_calibration_decisions(
             // already calibrated.  Therefore an absent list is not a benign
             // "not supplied" state: every light needs its own exact dark and
             // flat, and every selected flat needs its own exact raw dark-flat.
-            if selected_dark.is_empty() {
+            // BLOQUEANTE sólo cuando el rol fue CARGADO y nada coincide: la
+            // ausencia total de un rol es una elección del usuario (los avisos
+            // globales del plan ya la señalan) y no degrada cada decisión.
+            if !darks.is_empty() && selected_dark.is_empty() {
                 reasons.push(
                     "dark: ninguno de los darks coincide con este light (exposición, gain, temperatura o binning distintos); revisa el lote o usa la asignación manual"
                         .into(),
                 );
             }
-            if selected_flat.is_empty() {
+            if !flats.is_empty() && selected_flat.is_empty() {
                 reasons.push(
                     "flat: ninguno de los flats coincide con este light (filtro, gain o binning distintos); revisa el lote o usa la asignación manual"
                         .into(),
                 );
             }
+            let mut notes: Vec<String> = Vec::new();
             let flats_without_dark_flat = dark_flats_per_flat
                 .iter()
                 .filter(|matches| matches.is_empty())
@@ -8957,30 +8978,29 @@ fn ds_prepare_calibration_decisions(
                 // Un solo aviso con conteo: enumerar cada flat inundaba el
                 // panel. Los dark-flats son calibración OPCIONAL: sin ellos el
                 // pedestal del flat queda sin restar, no es un fallo.
-                reasons.push(format!(
+                notes.push(format!(
                     "dark-flat: {flats_without_dark_flat} de {} flats sin dark-flat de la misma exposición/temperatura (los dark-flats son opcionales; puedes ligarlos manualmente o silenciar este aviso)",
                     selected_flat.len()
                 ));
             }
 
+            // bias y dark-flat son calibración OPCIONAL: si se cargaron y no
+            // coinciden se OMITEN con nota (no bloquean la decisión).
             for (label, supplied, selected) in [
                 ("bias", !bias.is_empty(), !selected_bias.is_empty()),
-                ("dark", !darks.is_empty(), !selected_dark.is_empty()),
-                ("flat", !flats.is_empty(), !selected_flat.is_empty()),
                 (
                     "dark-flat",
                     !dark_flats.is_empty(),
                     !selected_dark_flat.is_empty(),
                 ),
             ] {
-                // Sin duplicar: si el rol ya tiene un motivo específico arriba
-                // (dark:/flat:/dark-flat:), el genérico no aporta nada.
-                let already_explained = reasons
+                let already_explained = notes
                     .iter()
+                    .chain(reasons.iter())
                     .any(|reason| reason.starts_with(&format!("{label}:")));
                 if supplied && !selected && !already_explained {
-                    reasons.push(format!(
-                        "{label}: no existe candidato con firma exacta para este light"
+                    notes.push(format!(
+                        "{label}: sin candidato compatible; se omite (calibración opcional)"
                     ));
                 }
             }
@@ -8995,7 +9015,10 @@ fn ds_prepare_calibration_decisions(
                     },
                 );
                 if let Err(reason) = pedestal {
-                    reasons.push(reason);
+                    // Convención de pedestal no ideal: se DIVULGA (receta y
+                    // matriz) pero no degrada — con solo flats el pedestal se
+                    // normaliza como parte de la respuesta óptica.
+                    notes.push(format!("pedestal del flat: {reason}"));
                 }
             }
 
@@ -9007,6 +9030,7 @@ fn ds_prepare_calibration_decisions(
                     "Strict bloquea la ejecución".into()
                 }
             });
+            reasons.extend(notes);
             let bias_paths = selected_bias
                 .iter()
                 .map(|probe| probe.path.clone())
@@ -9972,17 +9996,12 @@ fn prepare_deepsky_stack_impl(
             .filter(|probe| probe.ok)
             .collect();
         if dark_flat_probes.is_empty() && request.bias.is_empty() {
-            let message = "Los flats no tienen dark-flats ni bias: el pedestal se normalizaría como parte de la respuesta óptica".to_string();
-            if matches!(
-                request.calibration_policy,
-                pipeline::DeepSkyCalibrationPolicy::Strict
-            ) {
-                errors.push(message);
-            } else {
-                warnings.push(format!(
-                    "{message}; AllowDegraded conservará el pedestal y lo declarará"
-                ));
-            }
+            // AVISO, no bloqueo: con solo flats el pedestal queda dentro de la
+            // respuesta óptica normalizada — práctica habitual, divulgada en
+            // receta. Añadir dark-flats o bias lo elimina.
+            warnings.push(
+                "Los flats no tienen dark-flats ni bias: el pedestal se normaliza como parte de la respuesta óptica (válido y registrado; añade dark-flats o bias para eliminarlo)".into(),
+            );
         }
         if !dark_flat_probes.is_empty() {
             for flat in &flat_probes {
@@ -10085,8 +10104,19 @@ fn prepare_deepsky_stack_impl(
         })
         .map(|p| p.name.as_str())
         .collect();
-    let mut scientific_eligible = nonlinear_inputs.is_empty() && !signature_degraded;
-    if !scientific_eligible {
+    // Elegibilidad NF/EIDR PERMISIVA y explicada: lights lineales + flats y
+    // darks emparejados bastan. bias/dark-flats son opcionales y la metadata
+    // ausente sólo se divulga. Cada carencia produce una razón accionable.
+    let mut scientific_eligibility_reasons: Vec<String> = Vec::new();
+    if !nonlinear_inputs.is_empty() {
+        scientific_eligibility_reasons.push(format!(
+            "{} light(s) PNG/JPEG sin linealidad demostrable: usa FITS o TIFF lineal",
+            nonlinear_inputs.len()
+        ));
+    }
+    let mut scientific_eligible = nonlinear_inputs.is_empty();
+    let _ = signature_degraded;
+    if !nonlinear_inputs.is_empty() {
         let shown = nonlinear_inputs
             .iter()
             .take(3)
@@ -10173,7 +10203,6 @@ fn prepare_deepsky_stack_impl(
         let mut degraded_counts: BTreeMap<String, usize> = BTreeMap::new();
         for decision in &calibration_decisions {
             if decision.degraded {
-                scientific_eligible = false;
                 *degraded_counts
                     .entry(decision.reasons.join("; "))
                     .or_default() += 1;
@@ -10195,6 +10224,40 @@ fn prepare_deepsky_stack_impl(
             }
         }
     }
+    // Cobertura de calibración para los motores científicos: cada light (que
+    // el usuario no haya omitido a propósito) necesita SU flat y SU dark. Lo
+    // demás — bias, dark-flats, metadata extendida — no condiciona.
+    if request.flats.is_empty() {
+        scientific_eligibility_reasons.push(
+            "añade FLATS: NebulaFusion y EIDR requieren corrección de viñeteo/PRNU".into(),
+        );
+    } else {
+        let lights_missing_flat = calibration_decisions
+            .iter()
+            .filter(|decision| !decision.manual && decision.flat_master_path.is_none())
+            .count();
+        if lights_missing_flat > 0 {
+            scientific_eligibility_reasons.push(format!(
+                "{lights_missing_flat} light(s) sin flat emparejado: revisa el lote o usa el ligado manual"
+            ));
+        }
+    }
+    if request.darks.is_empty() {
+        scientific_eligibility_reasons.push(
+            "añade DARKS: NebulaFusion y EIDR requieren corrección térmica".into(),
+        );
+    } else {
+        let lights_missing_dark = calibration_decisions
+            .iter()
+            .filter(|decision| !decision.manual && decision.dark_master_path.is_none())
+            .count();
+        if lights_missing_dark > 0 {
+            scientific_eligibility_reasons.push(format!(
+                "{lights_missing_dark} light(s) sin dark emparejado: revisa el lote o usa el ligado manual"
+            ));
+        }
+    }
+    scientific_eligible = scientific_eligibility_reasons.is_empty();
     if !scientific_eligible
         && !matches!(
             request.resolved_integration_method(),
@@ -10205,10 +10268,10 @@ fn prepare_deepsky_stack_impl(
             pipeline::DeepSkyCalibrationPolicy::AllowDegraded
         )
     {
-        warnings.push(
-            "Fallback efectivo: calibración degradada deshabilita NebulaFusion/EIDR; se ejecutará Classic no científico"
-                .into(),
-        );
+        warnings.push(format!(
+            "Fallback efectivo: NebulaFusion/EIDR no puede ejecutarse ({}); se ejecutará Classic",
+            scientific_eligibility_reasons.join(" · ")
+        ));
     }
 
     // Asesor de muestreo (F2): FWHM mediana de un light representativo (el
@@ -10281,9 +10344,6 @@ fn prepare_deepsky_stack_impl(
             if !selection.blocking_reasons.is_empty() {
                 errors.extend(selection.blocking_reasons.iter().cloned());
             }
-            if selection.degraded {
-                scientific_eligible = false;
-            }
             if kind == "flats" {
                 flat_sessions_for_map = selection
                     .sessions
@@ -10343,9 +10403,6 @@ fn prepare_deepsky_stack_impl(
         );
         errors.extend(dark_flat_selection.blocking_reasons.iter().cloned());
         warnings.extend(dark_flat_selection.warnings.iter().cloned());
-        if dark_flat_selection.degraded {
-            scientific_eligible = false;
-        }
         if !request.dark_flats.is_empty() {
             warnings.push(format!(
                 "Selección efectiva · {}",
@@ -10890,6 +10947,7 @@ fn prepare_deepsky_stack_impl(
         stages,
         normalization_model,
         scientific_eligible,
+        scientific_eligibility_reasons,
         sampling_advisor,
     }
 }
@@ -14802,25 +14860,28 @@ async fn stack_deepsky_impl(
         "dark-flats",
         calibration_policy,
     );
-    let mut calibration_contract_errors = light_probes
-        .iter()
-        .filter(|probe| probe.ok)
-        .filter_map(|probe| {
-            let mut missing = probe.signature_missing.clone();
-            if probe.store_layout.is_none() {
-                missing.push("storeLayout/CFA phase".into());
-            }
-            missing.sort();
-            missing.dedup();
-            (!missing.is_empty()).then(|| {
-                format!(
-                    "Light '{}': metadata obligatoria ausente: {}",
-                    probe.name,
-                    missing.join(", ")
-                )
+    // La metadata ausente se DIVULGA (preflight agrupado + receta) pero no es
+    // un error de contrato: alinear el runtime con el preflight — antes un
+    // OFFSET ausente bloqueaba aquí lo que el plan ya había aceptado.
+    let mut calibration_contract_errors: Vec<String> = Vec::new();
+    {
+        let lights_missing_metadata = light_probes
+            .iter()
+            .filter(|probe| probe.ok)
+            .filter(|probe| {
+                !probe.signature_missing.is_empty() || probe.store_layout.is_none()
             })
-        })
-        .collect::<Vec<_>>();
+            .count();
+        if lights_missing_metadata > 0 {
+            log_to_front(
+                &app,
+                "WARN",
+                &format!(
+                    "{lights_missing_metadata} light(s) sin metadata crítica completa: el emparejado usa los campos disponibles y queda registrado en la receta."
+                ),
+            );
+        }
+    }
     calibration_contract_errors.extend(
         [
             &bias_selection,
@@ -19338,17 +19399,20 @@ mod ds_tests {
             pipeline::DeepSkyCalibrationPolicy::Strict,
         );
         assert_eq!(decisions.len(), 1);
-        assert!(decisions[0].degraded);
-        assert!(!decisions[0].compatible);
+        // Contrato 2026-07-21: la AUSENCIA total de un rol es una elección
+        // del usuario (los avisos globales y la elegibilidad NF/EIDR la
+        // señalan); no degrada cada decisión ni bloquea el apilado clásico.
+        assert!(!decisions[0].degraded);
+        assert!(decisions[0].compatible);
         assert_eq!(
             decisions[0].pedestal_state,
             pipeline::PedestalState::RawIncludesBias
         );
-        assert!(decisions[0]
+        assert!(!decisions[0]
             .reasons
             .iter()
             .any(|reason| reason.starts_with("dark:")));
-        assert!(decisions[0]
+        assert!(!decisions[0]
             .reasons
             .iter()
             .any(|reason| reason.starts_with("flat:")));
@@ -20607,7 +20671,9 @@ mod ds_tests {
             pipeline::DeepSkyCalibrationPolicy::Strict,
         );
         assert_eq!(bias_only_decisions.len(), 1);
-        assert!(bias_only_decisions[0].degraded);
+        // Contrato 2026-07-21: la convención de pedestal no ideal se DIVULGA
+        // como nota (receta y matriz) sin degradar la decisión.
+        assert!(!bias_only_decisions[0].degraded);
         assert!(bias_only_decisions[0]
             .reasons
             .iter()

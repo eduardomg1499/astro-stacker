@@ -1005,6 +1005,8 @@
         }
     },
     "deepsky": {
+        "method_needs": "To enable NebulaFusion/EIDR:",
+        "guide_engines_off": "NebulaFusion/EIDR disabled",
         "guide_title": "Guide",
         "guide_pending": "{{n}} to resolve",
         "guide_all_clear": "no blockers",

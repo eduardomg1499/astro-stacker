@@ -9823,14 +9823,14 @@ function dsFormatSessionPreflight(plan) {
         .filter(group => !(silenceable && dsSilencedAlerts.has(group.key)))
         .map(group => {
             const silenceBtn = silenceable
-                ? `<button type="button" class="ds-silence-alert" data-alert-key="${escapeHtml(group.key)}" title="${tr("deepsky.alert_silence_hint", "Ocultar este aviso durante esta sesión")}" style="float:right;background:none;border:1px solid rgba(148,163,184,.25);color:#64748b;border-radius:6px;font-size:.56rem;padding:1px 8px;cursor:pointer;">${tr("deepsky.alert_silence", "Silenciar")}</button>`
+                ? `<button type="button" class="ds-mini-btn ds-silence-alert" data-alert-key="${escapeHtml(group.key)}" title="${tr("deepsky.alert_silence_hint", "Ocultar este aviso durante esta sesión")}" style="float:right;margin-left:8px;">${tr("deepsky.alert_silence", "Silenciar")}</button>`
                 : "";
             if (group.items.length === 1) {
                 return `<div class="ds-alert ${cssClass}">${silenceBtn}${escapeHtml(group.items[0])}</div>`;
             }
             const detail = group.items.map(item => `<div style="color:#94a3b8;margin-top:3px;">${escapeHtml(item)}</div>`).join("");
             return `<details class="ds-alert ${cssClass}">
-                <summary style="cursor:pointer;list-style:none;">${silenceBtn}<b>×${group.items.length}</b> ${escapeHtml(group.key)} <span style="color:#64748b;">(${tr("deepsky.alert_expand", "ver detalle")})</span></summary>
+                <summary style="cursor:pointer;list-style:none;">${silenceBtn}<b>×${group.items.length}</b> ${escapeHtml(group.items[0])} <span style="color:#64748b;">(${tr("deepsky.alert_expand", "ver detalle")})</span></summary>
                 <div style="margin-top:4px;max-height:160px;overflow:auto;border-left:2px solid rgba(148,163,184,.2);padding-left:8px;">${detail}</div>
             </details>`;
         }).join("");
@@ -10046,14 +10046,16 @@ function dsFormatPreflight(plan) {
         .filter(group => !(silenceable && dsSilencedAlerts.has(group.key)))
         .map(group => {
             const silenceBtn = silenceable
-                ? `<button type="button" class="ds-silence-alert" data-alert-key="${escapeHtml(group.key)}" title="${tr("deepsky.alert_silence_hint", "Ocultar este aviso durante esta sesión")}" style="margin-left:auto;flex:0 0 auto;background:none;border:1px solid rgba(148,163,184,.25);color:#64748b;border-radius:6px;font-size:.56rem;padding:1px 8px;cursor:pointer;">${tr("deepsky.alert_silence", "Silenciar")}</button>`
+                ? `<button type="button" class="ds-mini-btn ds-silence-alert" data-alert-key="${escapeHtml(group.key)}" title="${tr("deepsky.alert_silence_hint", "Ocultar este aviso durante esta sesión")}" style="margin-left:auto;flex:0 0 auto;">${tr("deepsky.alert_silence", "Silenciar")}</button>`
                 : "";
             if (group.items.length === 1) {
-                return `<div style="color:${color};display:flex;gap:5px;align-items:flex-start;">${alertIcon(icon)}<span>${escapeHtml(group.items[0])}</span>${silenceBtn}</div>`;
+                return `<div style="color:${color};display:flex;gap:5px;align-items:flex-start;">${alertIcon(icon)}<span style="flex:1;">${escapeHtml(group.items[0])}</span>${silenceBtn}</div>`;
             }
+            // El resumen muestra el PRIMER mensaje real (legible), nunca la
+            // clave enmascarada del agrupador.
             const detail = group.items.map(item => `<div style="color:#94a3b8;">${escapeHtml(item)}</div>`).join("");
             return `<details style="color:${color};">
-                <summary style="cursor:pointer;display:flex;gap:5px;align-items:flex-start;list-style:none;">${alertIcon(icon)}<span><b>×${group.items.length}</b> ${escapeHtml(group.key)} <span style="color:#64748b;">(${tr("deepsky.alert_expand", "ver detalle")})</span></span>${silenceBtn}</summary>
+                <summary style="cursor:pointer;display:flex;gap:5px;align-items:flex-start;list-style:none;">${alertIcon(icon)}<span style="flex:1;"><b>×${group.items.length}</b> ${escapeHtml(group.items[0])} <span style="color:#64748b;">(${tr("deepsky.alert_expand", "ver detalle")})</span></span>${silenceBtn}</summary>
                 <div style="margin:4px 0 6px 22px;max-height:160px;overflow:auto;border-left:2px solid rgba(148,163,184,.2);padding-left:8px;">${detail}</div>
             </details>`;
         }).join("");
@@ -10061,7 +10063,7 @@ function dsFormatPreflight(plan) {
     const proceedOffer = !plan.valid && policySelect?.value === "strict"
         ? `<div style="margin:7px 0;padding:7px 9px;border:1px solid rgba(251,191,36,.35);border-radius:8px;background:rgba(120,53,15,.08);color:#fcd34d;">
             ${tr("deepsky.proceed_hint", "La política Estricta bloquea al primer incumplimiento del contrato. Puedes continuar en modo degradado: el apilado procede, cada concesión queda registrada y el resultado se marca como no científico si aplica.")}
-            <button type="button" id="btn-ds-proceed-degraded" class="secondary" style="margin-top:6px;display:block;font-size:.62rem;padding:4px 12px;border-radius:8px;">${tr("deepsky.proceed_degraded", "Continuar en modo degradado")}</button>
+            <button type="button" id="btn-ds-proceed-degraded" class="ds-mini-btn" style="margin-top:6px;">${tr("deepsky.proceed_degraded", "Continuar en modo degradado")}</button>
         </div>`
         : "";
     const alerts = [
@@ -10168,9 +10170,10 @@ function dsGuideItems(plan) {
     if (!plan) return items;
     const errors = plan.errors || [];
     for (const group of dsGroupAlertMessages(errors).slice(0, 4)) {
+        const sample = group.items[0].length > 160 ? `${group.items[0].slice(0, 157)}…` : group.items[0];
         const item = {
             kind: "error",
-            text: (group.items.length > 1 ? `×${group.items.length} · ` : "") + group.key,
+            text: (group.items.length > 1 ? `×${group.items.length} · ` : "") + sample,
         };
         if (/flat|dark|bias|calibraci/i.test(group.key)) {
             item.actionLabel = tr("deepsky.guide_fix_linker", "Ligar calibración");
@@ -10183,6 +10186,20 @@ function dsGuideItems(plan) {
             item.run = () => { dsSetWizardStep(1, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("ds-preflight-inspection"))); };
         }
         items.push(item);
+    }
+    const eligibility = dsCollectEligibility(plan);
+    if (!eligibility.eligible && eligibility.reasons.length) {
+        const firstReason = eligibility.reasons[0];
+        items.push({
+            kind: "warn",
+            text: `${tr("deepsky.guide_engines_off", "NebulaFusion/EIDR desactivados")}: ${firstReason}`,
+            actionLabel: /flat|dark/i.test(firstReason)
+                ? (/añade/i.test(firstReason) ? tr("deepsky.guide_go_data", "Ir a Datos") : tr("deepsky.guide_fix_linker", "Ligar calibración"))
+                : tr("deepsky.guide_go_data", "Ir a Datos"),
+            run: /añade|PNG|JPEG/i.test(firstReason)
+                ? () => { dsSetWizardStep(0, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("ds-sections"))); }
+                : dsOpenLinkerAndSpotlight,
+        });
     }
     if (!plan.valid && document.getElementById("sel-ds-calibration-policy")?.value === "strict") {
         items.push({
@@ -10234,7 +10251,7 @@ function dsRenderGuide(plan) {
             <span style="color:#94a3b8;">${blockers
                 ? trFormat("deepsky.guide_pending", { n: blockers }, `${blockers} por resolver`)
                 : tr("deepsky.guide_all_clear", "sin bloqueos")}</span>
-            <button type="button" id="ds-guide-toggle" title="${tr("deepsky.guide_toggle", "Mostrar u ocultar la guía")}">${dsGuideCollapsed ? "▲" : "▼"}</button>
+            <button type="button" id="ds-guide-toggle" class="ds-mini-btn" title="${tr("deepsky.guide_toggle", "Mostrar u ocultar la guía")}">${dsGuideCollapsed ? "▲" : "▼"}</button>
         </div>
         <div class="ds-guide-body">
             ${items.map((item, index) => `
@@ -10251,6 +10268,16 @@ function dsRenderGuide(plan) {
     card.querySelectorAll(".ds-guide-action").forEach(button => {
         button.addEventListener("click", () => items[Number(button.dataset.guide)]?.run?.());
     });
+}
+
+// Elegibilidad NF/EIDR del plan actual (stack simple o sesión): estado y
+// razones únicas, para el selector de método, la caja explicativa y la guía.
+function dsCollectEligibility(plan) {
+    const sessionPlans = plan?.sessionId ? (plan.groups || []).map(g => g.plan).filter(Boolean) : [];
+    const plans = sessionPlans.length ? sessionPlans : [plan].filter(Boolean);
+    const eligible = plans.length ? plans.every(p => p?.scientificEligible !== false) : true;
+    const reasons = [...new Set(plans.flatMap(p => p?.scientificEligibilityReasons || []))];
+    return { eligible, reasons };
 }
 
 function dsApplyPreparedPlan(plan) {
@@ -10289,19 +10316,25 @@ function dsApplyPreparedPlan(plan) {
     // científicamente (p. ej. entradas no lineales), EIDR/NebulaFusion no
     // pueden ejecutarse — se deshabilitan las opciones SIN revertir la
     // selección del usuario (el preflight ya publica el error bloqueante).
-    const sessionPlans = (plan?.groups || []).map(group => group.plan).filter(Boolean);
-    const scientificEligible = sessionPlans.length
-        ? sessionPlans.every(p => p?.scientificEligible !== false)
-        : plan?.scientificEligible !== false;
+    const { eligible: scientificEligible, reasons: eligibilityReasons } = dsCollectEligibility(plan);
     const methodSelect = document.getElementById("sel-ds-method");
     if (methodSelect) {
         for (const value of ["nebula_fusion", "nebula_fusion_full", "nebula_fusion_struct", "eidr"]) {
             const option = methodSelect.querySelector(`option[value="${value}"]`);
             if (option) option.disabled = !scientificEligible;
         }
-        methodSelect.title = scientificEligible
-            ? ""
-            : tr("deepsky.method_blocked_nonlinear", "EIDR y NebulaFusion requieren entradas científicas lineales (FITS/TIFF); revisa los avisos del plan.");
+        methodSelect.title = scientificEligible ? "" : eligibilityReasons.join(" · ");
+    }
+    // Caja "para activar NF/EIDR falta…": razones accionables junto al método.
+    const eligibilityBox = document.getElementById("ds-method-eligibility");
+    if (eligibilityBox) {
+        if (!scientificEligible && eligibilityReasons.length) {
+            eligibilityBox.style.display = "block";
+            eligibilityBox.innerHTML = `<b>${tr("deepsky.method_needs", "Para activar NebulaFusion/EIDR:")}</b> ${eligibilityReasons.map(reason => escapeHtml(reason)).join(" · ")}`;
+        } else {
+            eligibilityBox.style.display = "none";
+            eligibilityBox.innerHTML = "";
+        }
     }
     // El re-render de los paneles no debe mover al usuario: se captura el
     // scroll del asistente y de cada panel y se restaura tras pintar.

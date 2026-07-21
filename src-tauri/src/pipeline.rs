@@ -2431,6 +2431,10 @@ pub struct PreparedStackPlan {
     /// con gamma/cuantización de display). El motor clásico los sigue
     /// aceptando; los motores científicos (NebulaFusion/EIDR) los bloquearán.
     pub scientific_eligible: bool,
+    /// Qué falta EXACTAMENTE para activar NF/EIDR (vacío si elegible): la UI
+    /// lo muestra junto al selector de método y en la guía interactiva.
+    #[serde(default)]
+    pub scientific_eligibility_reasons: Vec<String>,
     /// Diagnóstico de muestreo (None si no se pudieron medir estrellas).
     pub sampling_advisor: Option<SamplingAdvisorReport>,
 }

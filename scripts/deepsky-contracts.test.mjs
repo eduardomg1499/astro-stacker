@@ -112,7 +112,9 @@ test("inspection consumes the typed report with dither prediction and pattern", 
 });
 
 test("experimental engines are gated by scientific eligibility", () => {
-    assert.match(main, /plan\?\.scientificEligible !== false/);
+    assert.match(main, /function dsCollectEligibility\(plan\)/);
+    assert.match(main, /scientificEligibilityReasons/);
+    assert.match(main, /ds-method-eligibility/);
     assert.match(
         main,
         /\["nebula_fusion", "nebula_fusion_full", "nebula_fusion_struct", "eidr"\]/,
