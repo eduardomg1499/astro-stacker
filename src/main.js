@@ -1,4 +1,10 @@
 import "./styles.css";
+// Chart.js EMPAQUETADO localmente: el arranque no puede depender de un CDN —
+// un <script defer> externo colgado bloqueaba `load` y congelaba el splash
+// (y la app debe funcionar sin red en el campo).
+import { Chart } from "chart.js/auto";
+import annotationPlugin from "chartjs-plugin-annotation";
+Chart.register(annotationPlugin);
 import { MosaicManager } from "./mosaic_manager.js";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-shell"; // CORRECT IMPORT
@@ -2284,7 +2290,13 @@ function enhanceRangeInputs() {
     });
 }
 
-window.addEventListener("load", () => {
+// Arranque RESILIENTE: la secuencia se dispara con `load`, pero si un recurso
+// se queda colgado (red, disco lento) un fallback tras DOMContentLoaded+4s la
+// ejecuta igualmente — la app nunca puede quedarse en el splash para siempre.
+let zasStartupRan = false;
+function zasStartupSequence() {
+    if (zasStartupRan) return;
+    zasStartupRan = true;
     console.log("Zenith: Startup content loaded.");
 
     // Populate the hardware-acceleration label (progress overlay + header badge).
@@ -2407,7 +2419,16 @@ window.addEventListener("load", () => {
     loadSystemFonts();
     checkLicenseAtStartup();
     checkForAppUpdates(true);
-});
+}
+window.addEventListener("load", zasStartupSequence);
+// Fallback anti-cuelgue: si `load` no dispara en 4 s tras tener el DOM
+// (recurso de red/disco estancado), el arranque procede igualmente.
+document.addEventListener("DOMContentLoaded", () => setTimeout(zasStartupSequence, 4000));
+if (document.readyState === "complete") {
+    zasStartupSequence();
+} else if (document.readyState === "interactive") {
+    setTimeout(zasStartupSequence, 4000);
+}
 
 async function loadSystemFonts() {
     try {
@@ -7989,7 +8010,7 @@ function drawChart(data, cutVal, isSorted) {
                 borderWidth: 1.5,
                 borderDash: [3, 4],
                 label: {
-                    content: `⭐ ${analysisSuggestedPct.toFixed(0)}%`,
+                    content: `★ ${analysisSuggestedPct.toFixed(0)}%`,
                     display: true,
                     position: 'end',
                     backgroundColor: 'rgba(120, 53, 15, 0.85)',

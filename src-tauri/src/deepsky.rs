@@ -1187,6 +1187,10 @@ fn ds_precalibrate_flat(
     bias_probe: Option<&DsProbe>,
     dark_flats: &[DsRawDarkFlatMaster],
     policy: pipeline::DeepSkyCalibrationPolicy,
+    // AllowDegraded: se marca cuando el flat calibrado NO es válido — el
+    // llamador debe degradar la corrida (Classic + no científico) para que la
+    // promesa del WARN se cumpla de verdad (auditoría 2026-07-20).
+    data_degraded: &std::sync::atomic::AtomicBool,
 ) -> Result<(), String> {
     let exposure = ds_probe_exptime(path);
     let exact_dark_flat = flat_probe.and_then(|probe| {
@@ -1310,6 +1314,7 @@ fn ds_precalibrate_flat(
         if matches!(policy, pipeline::DeepSkyCalibrationPolicy::Strict) {
             return Err(reason.into());
         }
+        data_degraded.store(true, std::sync::atomic::Ordering::Relaxed);
         log_to_front(
             app,
             "WARN",
@@ -1325,6 +1330,7 @@ fn ds_precalibrate_flat(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ds_build_calibrated_flat_master(
     app: &tauri::AppHandle,
     paths: &[String],
@@ -1335,6 +1341,7 @@ fn ds_build_calibrated_flat_master(
     policy: pipeline::DeepSkyCalibrationPolicy,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     work_root: Option<&std::path::Path>,
+    data_degraded: &std::sync::atomic::AtomicBool,
 ) -> Result<Option<DsCalibrationMaster>, String> {
     let flat_probes = deepsky_probe(paths.to_vec())
         .into_iter()
@@ -1422,6 +1429,7 @@ fn ds_build_calibrated_flat_master(
             bias_probe,
             dark_flats,
             policy,
+            data_degraded,
         )
     };
     let mut master = ds_build_master_preprocessed(
@@ -14943,6 +14951,10 @@ async fn stack_deepsky_impl(
     // un master flat POR NOCHE y cada light usa el de la suya. Con una sola
     // sesión el vector tiene un elemento y el flujo es idéntico al histórico.
     let mut flat_masters: Vec<(Option<String>, DsCalibrationMaster)> = Vec::new();
+    // Degradación DE DATOS descubierta al construir los masters de flat
+    // (AllowDegraded): se recoge aquí y tras la construcción degrada método y
+    // elegibilidad científica — la promesa del WARN deja de ser solo un log.
+    let flat_data_degraded_flag = std::sync::atomic::AtomicBool::new(false);
     if !flat_selection.sessions.is_empty() {
         for (night, paths) in &flat_selection.sessions {
             cancellation_checkpoint(cancel.as_ref(), "construcción de master flats por sesión")?;
@@ -14956,6 +14968,7 @@ async fn stack_deepsky_impl(
                 calibration_policy,
                 &cancel,
                 work_root.as_deref(),
+                &flat_data_degraded_flag,
             )? {
                 flat_masters.push((Some(night.clone()), f));
             }
@@ -14987,10 +15000,37 @@ async fn stack_deepsky_impl(
             calibration_policy,
             &cancel,
             work_root.as_deref(),
+            &flat_data_degraded_flag,
         )? {
             flat_masters.push((None, f));
         }
     }
+    // Cumplimiento de la promesa AllowDegraded: un flat calibrado inválido
+    // degrada la corrida — NF/EIDR caen a Classic con razón visible y el
+    // resultado deja de ser elegible como científico.
+    let flat_data_degraded =
+        flat_data_degraded_flag.load(std::sync::atomic::Ordering::Relaxed);
+    if flat_data_degraded
+        && calibration_method_fallback.is_none()
+        && !matches!(
+            requested_integration_method,
+            pipeline::DeepSkyIntegrationMethod::Classic(_)
+        )
+    {
+        let reason = format!(
+            "Flat calibrado inválido con AllowDegraded: {} no puede ejecutarse como científico; fallback efectivo a Classic",
+            requested_integration_method.label()
+        );
+        calibration_method_fallback = Some(reason.clone());
+        log_to_front(&app, "WARN", &reason);
+        integration_method = Some(pipeline::DeepSkyIntegrationMethod::Classic(
+            pipeline::ClassicIntegrationConfig {
+                version: 1,
+                legacy_local_fwhm: local_weighting,
+            },
+        ));
+    }
+    let calibration_degraded = calibration_degraded || flat_data_degraded;
     // Noche de cada light: solo se sondea cuando hay flats multi-sesión.
     let light_nights: std::collections::HashMap<String, Option<String>> =
         if flat_masters.iter().any(|(night, _)| night.is_some()) {

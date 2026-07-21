@@ -71,6 +71,24 @@ tiled, ambos con y sin grids de calidad) y los contratos Node
   preset Equilibrado sincerado (Winsorized), i18n reconciliada (+22/−15
   claves), GPU/receta visibles, iconos del sprite en marcas de estado.
 
+### Adenda 2026-07-21 (arranque + consistencia)
+
+- **Splash colgado al abrir la app (crítico)**: `index.html` cargaba Chart.js
+  y su plugin de anotaciones desde cdn.jsdelivr.net con `<script defer>`; si
+  la petición al CDN se estancaba (DNS/firewall/sin red), `window.load` no
+  disparaba nunca y el splash quedaba congelado al 30% (diagnóstico con
+  beacons de arranque en el webview real). Fix doble: Chart.js y el plugin
+  ahora van EMPAQUETADOS localmente (npm + import; la app arranca sin red) y
+  la secuencia de arranque tiene fallback anti-cuelgue (DOMContentLoaded+4 s)
+  para que ningún recurso estancado pueda volver a congelar el splash.
+- **AllowDegraded cumple su promesa**: un flat calibrado inválido (>0.1% de
+  muestras no válidas) ya no es solo un WARN — degrada la corrida de verdad:
+  NF/EIDR caen a Classic con razón visible y `calibration_degraded` /
+  elegibilidad científica lo reflejan (era el hallazgo medium pendiente de la
+  auditoría del 20).
+- Emoji `⭐` de la etiqueta de la gráfica de calidad sustituido por el glifo
+  monocromo `★` (regla del proyecto).
+
 ### Backlog que este cierre NO resuelve (además de la lista original)
 
 - Migrar la ruta GPU deep-sky del `take_gpu_error` destructivo a la API por
