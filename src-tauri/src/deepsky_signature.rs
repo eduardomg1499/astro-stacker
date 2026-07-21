@@ -355,6 +355,12 @@ pub(crate) fn signature_from_headers(
     }
 }
 
+/// Campos FÍSICOS cuya ausencia impide verificar el emparejamiento de
+/// calibración. Su falta degrada la elegibilidad científica (con divulgación)
+/// pero NO bloquea el apilado. La identidad extendida (sensor, readMode, roi,
+/// adcBits, whiteLevelAdu, opticalTrain) vive en
+/// `missing_extended_signature_fields`: su ausencia es lo habitual en FITS de
+/// captura y sólo se anota.
 pub(crate) fn missing_required_signature_fields(
     signature: &CalibrationSignature,
     role: CalibrationRole,
@@ -365,16 +371,10 @@ pub(crate) fn missing_required_signature_fields(
             missing.push(label);
         }
     };
-    required(signature.camera.is_some(), "camera");
-    required(signature.sensor.is_some(), "sensor");
-    required(signature.read_mode.is_some(), "readMode");
     required(signature.gain.is_some() || signature.iso.is_some(), "gainOrIso");
     required(signature.offset.is_some(), "offset");
     required(signature.binning_x.is_some(), "binningX");
     required(signature.binning_y.is_some(), "binningY");
-    required(signature.roi.is_some(), "roi");
-    required(signature.adc_bits.is_some(), "adcBits");
-    required(signature.white_level_adu.is_some(), "whiteLevelAdu");
     if signature.cfa_pattern.is_some() {
         required(signature.cfa_phase.is_some(), "cfaPhase");
     }
@@ -386,9 +386,29 @@ pub(crate) fn missing_required_signature_fields(
         }
         CalibrationRole::Flat => {
             required(signature.filter.is_some(), "filter");
-            required(signature.optical_train.is_some(), "opticalTrain");
         }
     }
+    missing
+}
+
+/// Identidad extendida ausente: no bloquea ni degrada; se agrupa en un único
+/// aviso informativo y queda registrada en receta/decisiones.
+pub(crate) fn missing_extended_signature_fields(
+    signature: &CalibrationSignature,
+) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    let mut note = |present: bool, label| {
+        if !present {
+            missing.push(label);
+        }
+    };
+    note(signature.camera.is_some(), "camera");
+    note(signature.sensor.is_some(), "sensor");
+    note(signature.read_mode.is_some(), "readMode");
+    note(signature.roi.is_some(), "roi");
+    note(signature.adc_bits.is_some(), "adcBits");
+    note(signature.white_level_adu.is_some(), "whiteLevelAdu");
+    note(signature.optical_train.is_some(), "opticalTrain");
     missing
 }
 
@@ -527,11 +547,18 @@ mod tests {
             },
         );
         let missing = missing_required_signature_fields(&out.signature, CalibrationRole::Dark);
-        assert!(missing.contains(&"camera"));
-        assert!(missing.contains(&"sensor"));
+        // Crítico (física): sin fabricar nada, se enumera lo que falta.
         assert!(missing.contains(&"offset"));
         assert!(missing.contains(&"temperatureC"));
-        assert!(missing.contains(&"roi"));
+        assert!(missing.contains(&"gainOrIso"));
+        // Identidad extendida: ausente es lo habitual; se anota aparte y no
+        // bloquea ni degrada por sí sola.
+        assert!(!missing.contains(&"camera"));
+        assert!(!missing.contains(&"roi"));
+        let extended = missing_extended_signature_fields(&out.signature);
+        assert!(extended.contains(&"camera"));
+        assert!(extended.contains(&"sensor"));
+        assert!(extended.contains(&"roi"));
     }
 
     #[test]

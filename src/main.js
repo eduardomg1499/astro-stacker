@@ -1,10 +1,11 @@
 import "./styles.css";
-// Chart.js EMPAQUETADO localmente: el arranque no puede depender de un CDN —
-// un <script defer> externo colgado bloqueaba `load` y congelaba el splash
-// (y la app debe funcionar sin red en el campo).
-import { Chart } from "chart.js/auto";
-import annotationPlugin from "chartjs-plugin-annotation";
-Chart.register(annotationPlugin);
+// Chart.js sigue EMPAQUETADO localmente (la app debe funcionar sin red en el
+// campo), pero se carga BAJO DEMANDA, fuera del camino critico de arranque.
+// Importarlo arriba lo metia en la inicializacion del modulo: cualquier fallo
+// suyo —o el orden de evaluacion que elija el bundler entre chart.js y su
+// plugin— tumbaba main.js ENTERO antes de que registrara nada, y la app se
+// quedaba congelada en el splash. Una libreria de graficas no puede impedir
+// que el programa abra. Se usa en un unico sitio (drawChart).
 import { MosaicManager } from "./mosaic_manager.js";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-shell"; // CORRECT IMPORT
@@ -297,7 +298,19 @@ function initCustomSelect() {
             sel.value = saved;
             sel.dispatchEvent(new Event('change'));
             zasCategoryProgrammatic = false;
-            applyZenithUltimateFlow();
+            // NO llamar a applyZenithUltimateFlow() aqui, por el mismo motivo
+            // que applyCacheLocation() (ver el selector de cache mas abajo):
+            // initCustomSelect() corre SINCRONO al cargar el modulo —el
+            // <script type="module"> es diferido, asi que readyState ya no es
+            // 'loading'— y esta funcion lee ZENITH_ULTIMATE_NAME y
+            // currentAnalysisMode, declaradas MUCHO mas abajo. En ese instante
+            // estan en zona muerta temporal: ReferenceError que aborta el
+            // modulo ENTERO, con lo que no se registra el arranque, la ventana
+            // no crece, ningun boton queda enlazado y la licencia no se
+            // verifica. Solo saltaba con una categoria guardada distinta de la
+            // por defecto, que es justo lo que tiene cualquier usuario real.
+            // Se aplica en cuanto el modulo termina de evaluarse.
+            queueMicrotask(applyZenithUltimateFlow);
         }
         sel.addEventListener('change', () => {
             if (zasCategoryProgrammatic) return;
@@ -2330,66 +2343,107 @@ function zasStartupSequence() {
         finishSplash();
     }
 
-    async function finishSplash() {
-        if (splash) {
-            // PASO 1: El Banner se desvanece
-            splash.style.opacity = "0"; 
-            console.log("Zenith: Loading complete. Transitions initiated...");
-
-            // PASO 2: Expansión Animada de la Ventana
-            try {
-                if (appWindow && typeof appWindow.setSize === 'function') {
-                    // 2a. Eliminar restricciones de tamaño mínimo temporalmente
-                    if (typeof appWindow.setMinSize === 'function') {
-                        await appWindow.setMinSize(new LogicalSize(0, 0));
-                    }
-
-                    // 2b. Animación de expansión suave
-                    // Usamos una transición controlada para evitar saltos bruscos
-                    const targetWidth = 1280;
-                    const targetHeight = 900;
-                    
-                    await animateWindowExpansion(targetWidth, targetHeight, 450);
-                    
-                    console.log("Zenith: Window expansion complete.");
-                }
-            } catch(e) { 
-                console.error("Zenith: Startup Expansion failed:", e); 
-                // Fallback: Salto instantáneo en caso de error
-                try {
-                   await appWindow.setSize(new LogicalSize(1280, 900));
-                   await appWindow.center();
-                } catch(e2) {}
-            }
-
-            // PASO 3: Revelar Interfaz Principal (Sincronizado)
-            setTimeout(() => {
-                document.body.classList.add("ready");
-                // Restaurar restricciones de tamaño final para la UI principal
-                if (appWindow && typeof appWindow.setMinSize === 'function') {
-                    appWindow.setMinSize(new LogicalSize(1000, 700)).catch(() => {});
-                }
-            }, 100);
-
-            // PASO 4: Limpieza total del splash
-            setTimeout(() => { 
-                splash.style.display = "none";
-            }, 1500);
-        } else {
-            document.body.classList.add("ready"); 
+    // El revelado de la interfaz NO puede depender de la animacion de ventana.
+    // `animateWindowExpansion` se apoya en requestAnimationFrame —que el WebView
+    // PAUSA si la ventana esta ocluida, minimizada o en otro Space— y en IPC de
+    // Tauri. Si cualquiera de los dos se queda sin resolver, la promesa nunca se
+    // cumple; y `try/catch` no lo detecta, porque una promesa que no se cumple
+    // tampoco se rechaza. Resultado: `body.ready` no se ponia nunca y la app se
+    // quedaba en el splash para siempre (toda la UI vive en opacity:0 hasta esa
+    // clase). Ahora el revelado esta garantizado y la expansion tiene plazo.
+    function revealUi() {
+        if (document.body.classList.contains("ready")) return;
+        document.body.classList.add("ready");
+        // Restaurar restricciones de tamano finales para la UI principal
+        if (appWindow && typeof appWindow.setMinSize === 'function') {
+            appWindow.setMinSize(new LogicalSize(1000, 700)).catch(() => {});
         }
     }
 
+    async function finishSplash() {
+        if (!splash) {
+            revealUi();
+            return;
+        }
+
+        // PASO 1: El Banner se desvanece
+        splash.style.opacity = "0";
+        console.log("Zenith: Loading complete. Transitions initiated...");
+
+        // PASO 2: Expansion de la ventana, acotada por plazo.
+        await Promise.race([
+            expandWindow(),
+            new Promise((resolve) => setTimeout(resolve, 3000)),
+        ]);
+
+        // PASO 3: Revelar Interfaz Principal — se ejecuta pase lo que pase.
+        revealUi();
+
+        // PASO 4: Limpieza total del splash
+        setTimeout(() => {
+            splash.style.display = "none";
+        }, 1500);
+    }
+
+    // Expuesta para la red de seguridad de index.html: si esta revela la UI por
+    // watchdog, la ventana debe crecer igualmente en vez de quedarse en 650x400.
+    window.__zasExpandWindow = expandWindow;
+
+    async function expandWindow() {
+        if (!appWindow || typeof appWindow.setSize !== 'function') return;
+        try {
+            // Eliminar restricciones de tamano minimo temporalmente
+            if (typeof appWindow.setMinSize === 'function') {
+                await appWindow.setMinSize(new LogicalSize(0, 0));
+            }
+            await animateWindowExpansion(1280, 900, 450);
+            console.log("Zenith: Window expansion complete.");
+        } catch (e) {
+            console.error("Zenith: Startup Expansion failed:", e);
+        }
+        // Salto directo de garantia: si la animacion quedo a medias (rAF pausado)
+        // o fallo, la ventana termina igualmente en su tamano final.
+        try {
+            await appWindow.setSize(new LogicalSize(1280, 900));
+            await appWindow.center();
+        } catch (_) {}
+    }
+
     /**
-     * Función auxiliar para animar el tamaño de la ventana de Tauri
+     * Funcion auxiliar para animar el tamano de la ventana de Tauri.
+     * Siempre resuelve: ni rAF pausado ni una IPC lenta pueden dejarla colgada.
      */
     async function animateWindowExpansion(targetW, targetH, duration) {
-        const startSize = await appWindow.innerSize();
-        // Convertir PhysicalSize a Logical (asumiendo DPI estándar si no se puede obtener el factor)
-        // En Tauri v2, es mejor trabajar con LogicalSize consistentemente.
-        const factor = await appWindow.scaleFactor();
-        const startW = startSize.width / factor;
-        const startH = startSize.height / factor;
+        // rAF se pausa con la ventana ocluida; el setTimeout gemelo garantiza
+        // que la animacion sigue avanzando y termina en cualquier caso.
+        const nextFrame = (fn) => {
+            let fired = false;
+            const once = () => {
+                if (fired) return;
+                fired = true;
+                fn(performance.now());
+            };
+            requestAnimationFrame(once);
+            setTimeout(once, 32);
+        };
+
+        // Tamano de partida: si la IPC tarda, usamos el de tauri.conf.json.
+        let startW = 650;
+        let startH = 400;
+        try {
+            const measured = await Promise.race([
+                (async () => {
+                    const size = await appWindow.innerSize();
+                    const factor = await appWindow.scaleFactor();
+                    return { w: size.width / factor, h: size.height / factor };
+                })(),
+                new Promise((resolve) => setTimeout(() => resolve(null), 500)),
+            ]);
+            if (measured) {
+                startW = measured.w;
+                startH = measured.h;
+            }
+        } catch (_) {}
 
         const startTime = performance.now();
 
@@ -2397,22 +2451,24 @@ function zasStartupSequence() {
             function step(currentTime) {
                 const elapsed = currentTime - startTime;
                 const progress = Math.min(elapsed / duration, 1);
-                
+
                 // Easing: easeOutCubic
                 const ease = 1 - Math.pow(1 - progress, 3);
-                
+
                 const currentW = Math.round(startW + (targetW - startW) * ease);
                 const currentH = Math.round(startH + (targetH - startH) * ease);
 
                 appWindow.setSize(new LogicalSize(currentW, currentH)).catch(() => {});
-                
+
                 if (progress < 1) {
-                    requestAnimationFrame(step);
+                    nextFrame(step);
                 } else {
-                    appWindow.center().then(resolve).catch(resolve);
+                    // Resolvemos ya: `center()` no puede retener el arranque.
+                    appWindow.center().catch(() => {});
+                    resolve();
                 }
             }
-            requestAnimationFrame(step);
+            nextFrame(step);
         });
     }
 
@@ -7953,13 +8009,51 @@ function updateChartViz() {
         dataToShow = currentGraphData;
     }
 
-    drawChart(dataToShow, currentRecommendedPct, isSorted);
+    // drawChart es asincrono (carga la libreria bajo demanda); nadie espera su
+    // resultado, asi que absorbemos aqui cualquier fallo para no generar un
+    // rechazo sin gestionar.
+    drawChart(dataToShow, currentRecommendedPct, isSorted).catch((e) => {
+        console.error("Zenith: fallo al dibujar la grafica de calidad —", e);
+    });
 }
 
-function drawChart(data, cutVal, isSorted) {
+// Carga perezosa de Chart.js + su plugin de anotaciones. El import dinamico
+// resuelve contra un chunk local del bundle: sigue sin haber ninguna peticion
+// de red. Se cachea la promesa para no reimportar en cada redibujado.
+let chartLibPromise = null;
+function loadChartLib() {
+    if (!chartLibPromise) {
+        chartLibPromise = Promise.all([
+            import("chart.js/auto"),
+            import("chartjs-plugin-annotation"),
+        ]).then(([chartMod, annotationMod]) => {
+            const ChartCtor = chartMod.Chart || chartMod.default;
+            ChartCtor.register(annotationMod.default || annotationMod);
+            return ChartCtor;
+        }).catch((e) => {
+            // Que no quede cacheada una promesa rechazada: reintentar en el
+            // proximo redibujado en vez de dejar la grafica muerta para siempre.
+            chartLibPromise = null;
+            throw e;
+        });
+    }
+    return chartLibPromise;
+}
+
+async function drawChart(data, cutVal, isSorted) {
     const canvas = document.getElementById('qualityChart');
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
+
+    let Chart;
+    try {
+        Chart = await loadChartLib();
+    } catch (e) {
+        // La grafica es prescindible: si la libreria no carga se pierde el
+        // dibujo, no el analisis ni el resto de la interfaz.
+        console.error("Zenith: no se pudo cargar Chart.js —", e);
+        return;
+    }
 
     if (chartInstance) chartInstance.destroy();
 
@@ -9639,6 +9733,16 @@ function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
         localWeighting: checked("chk-ds-localw", false),
         workDir: localStorage.getItem("zas_ds_workdir") || null,
         pedestal: parseFloat(pedestalRaw) || null,
+        // Asignación manual estilo PixInsight: lotes forzados que sustituyen
+        // al emparejamiento automático (lights vacío = todos los lights).
+        calibrationOverrides: [
+            ...(value("sel-ds-manual-darks", "auto") === "all"
+                ? [{ lights: [], darks: dsCalibrationForIntegration("darks", filter).map(f => f.path), flats: [] }]
+                : []),
+            ...(value("sel-ds-manual-flats", "auto") === "all"
+                ? [{ lights: [], darks: [], flats: dsCalibrationForIntegration("flats", filter).map(f => f.path) }]
+                : []),
+        ],
     };
 }
 
@@ -9738,8 +9842,10 @@ function dsFormatCalibrationDecisions(decisions) {
     const rows = visible.map(decision => {
         const ok = decision.compatible && !decision.degraded;
         const reasons = (decision.reasons || []).join(" · ");
-        const status = ok ? "Exacta" : decision.degraded ? "Degradada" : "Bloqueada";
-        const color = ok ? "#6ee7b7" : decision.degraded ? "#fcd34d" : "#fca5a5";
+        const status = decision.manual
+            ? tr("deepsky.decision_manual", "Manual")
+            : ok ? "Exacta" : decision.degraded ? "Degradada" : "Bloqueada";
+        const color = decision.manual ? "#7dd3fc" : ok ? "#6ee7b7" : decision.degraded ? "#fcd34d" : "#fca5a5";
         return `<tr style="border-top:1px solid rgba(148,163,184,.1);">
             <td style="padding:4px 8px;color:#e2e8f0;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(decision.framePath || "")}">${escapeHtml(pathBaseName(decision.framePath || ""))}</td>
             <td style="padding:4px 8px;color:${color};font-weight:700;">${status}</td>
@@ -9792,6 +9898,19 @@ function dsFormatSamplingAdvisor(advisor) {
     </div>`;
 }
 
+// Agrupa mensajes que solo difieren en el nombre citado ('...') para
+// presentarlos como una línea con contador + detalle desplegable.
+function dsGroupAlertMessages(messages) {
+    const groups = new Map();
+    for (const raw of messages || []) {
+        const text = String(raw);
+        const key = text.replace(/'[^']*'/g, "'…'");
+        if (!groups.has(key)) groups.set(key, { key, items: [] });
+        groups.get(key).items.push(text);
+    }
+    return [...groups.values()];
+}
+
 function dsFormatPreflight(plan) {
     if (!plan) return `<span style="color:#94a3b8;">Preparando plan…</span>`;
     if (plan.sessionId) return dsFormatSessionPreflight(plan);
@@ -9809,9 +9928,30 @@ function dsFormatPreflight(plan) {
         <span style="color:#64748b;"> · ${escapeHtml(g.bayerPattern || g.filter || "mono/RGB")} · ${escapeHtml(g.filter || "sin filtro")} · ${g.exposureSeconds ?? "?"} s · gain ${g.gain ?? "?"} · bin ${g.binning ?? "?"} · ${g.temperatureC ?? "?"} °C</span>
     </div>`).join("");
     const alertIcon = (icon) => `<svg class="zas-icon zas-icon-inline" style="margin-top:2px;"><use href="#icon-${icon}"></use></svg>`;
+    // Mensajes idénticos salvo el nombre entre comillas se agrupan en UNA
+    // línea con contador y detalle desplegable: 50 tomas con el mismo problema
+    // no deben inundar el panel.
+    const renderAlerts = (messages, color, icon) => dsGroupAlertMessages(messages).map(group => {
+        if (group.items.length === 1) {
+            return `<div style="color:${color};display:flex;gap:5px;align-items:flex-start;">${alertIcon(icon)}<span>${escapeHtml(group.items[0])}</span></div>`;
+        }
+        const detail = group.items.map(item => `<div style="color:#94a3b8;">${escapeHtml(item)}</div>`).join("");
+        return `<details style="color:${color};">
+            <summary style="cursor:pointer;display:flex;gap:5px;align-items:flex-start;list-style:none;">${alertIcon(icon)}<span><b>×${group.items.length}</b> ${escapeHtml(group.key)} <span style="color:#64748b;">(${tr("deepsky.alert_expand", "ver detalle")})</span></span></summary>
+            <div style="margin:4px 0 6px 22px;max-height:160px;overflow:auto;border-left:2px solid rgba(148,163,184,.2);padding-left:8px;">${detail}</div>
+        </details>`;
+    }).join("");
+    const policySelect = document.getElementById("sel-ds-calibration-policy");
+    const proceedOffer = !plan.valid && policySelect?.value === "strict"
+        ? `<div style="margin:7px 0;padding:7px 9px;border:1px solid rgba(251,191,36,.35);border-radius:8px;background:rgba(120,53,15,.08);color:#fcd34d;">
+            ${tr("deepsky.proceed_hint", "La política Estricta bloquea al primer incumplimiento del contrato. Puedes continuar en modo degradado: el apilado procede, cada concesión queda registrada y el resultado se marca como no científico si aplica.")}
+            <button type="button" id="btn-ds-proceed-degraded" class="secondary" style="margin-top:6px;display:block;font-size:.62rem;padding:4px 12px;border-radius:8px;">${tr("deepsky.proceed_degraded", "Continuar en modo degradado")}</button>
+        </div>`
+        : "";
     const alerts = [
-        ...errors.map(e => `<div style="color:#fca5a5;display:flex;gap:5px;align-items:flex-start;">${alertIcon("cross")}<span>${escapeHtml(e)}</span></div>`),
-        ...warnings.map(w => `<div style="color:#fcd34d;display:flex;gap:5px;align-items:flex-start;">${alertIcon("warning")}<span>${escapeHtml(w)}</span></div>`),
+        renderAlerts(errors, "#fca5a5", "cross"),
+        proceedOffer,
+        renderAlerts(warnings, "#fcd34d", "warning"),
         ...(plan.scientificEligible === false
             ? [`<div style="color:#fcd34d;display:flex;gap:5px;align-items:flex-start;">${alertIcon("warning")}<span>${escapeHtml(tr("deepsky.method_blocked_nonlinear", "EIDR y NebulaFusion requieren entradas científicas lineales (FITS/TIFF); revisa los avisos del plan."))}</span></div>`]
             : []),
@@ -9906,6 +10046,16 @@ function dsApplyPreparedPlan(plan) {
         panel.dataset.state = plan?.valid ? "ok" : "error";
         panel.innerHTML = dsFormatPreflight(plan)
             + (id === "ds-preflight-review" ? dsFormatInspectionDiagnostics() : "");
+        // "Continuar en modo degradado": cambia la política y re-prepara. La
+        // decisión es del usuario y queda divulgada en el plan y la receta.
+        panel.querySelector("#btn-ds-proceed-degraded")?.addEventListener("click", () => {
+            const policy = document.getElementById("sel-ds-calibration-policy");
+            if (policy) {
+                policy.value = "allowDegraded";
+                policy.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            dsSchedulePreflight(true);
+        });
     }
     const run = document.getElementById("btn-deepsky-run");
     if (run) {
@@ -11352,7 +11502,7 @@ function dsLoadUxFixtureIfRequested(modal) {
     ["sel-ds-oiii-mix", "sel-ds-crosstalk", "sel-ds-session-palette"].forEach(id => {
         document.getElementById(id)?.addEventListener("change", () => dsSchedulePreflight(true));
     });
-    ["sel-ds-capture-mode", "sel-ds-calibration-policy"].forEach(id => {
+    ["sel-ds-capture-mode", "sel-ds-calibration-policy", "sel-ds-manual-darks", "sel-ds-manual-flats"].forEach(id => {
         document.getElementById(id)?.addEventListener("change", () => dsSchedulePreflight(true));
     });
     document.getElementById("chk-ds-cosmetic")?.addEventListener("change", (e) => { e.target.dataset.touched = "1"; });
@@ -12962,3 +13112,12 @@ window._clearStackingRoi = function () {
         });
     }
 })();
+
+// Senal de vida para la red de seguridad de index.html. Va al FINAL a
+// proposito: significa "el modulo se evaluo ENTERO", que es la unica garantia
+// de que la secuencia de arranque quedo registrada y los manejadores enlazados.
+// Puesta al principio mentia — un ReferenceError a media evaluacion (TDZ)
+// dejaba la bandera en true, la red daba el arranque por bueno y destapaba una
+// interfaz completa donde ningun boton respondia. Aqui, si el modulo muere a
+// medias, la bandera se queda en false y sale el panel de fallo con la pila.
+window.__zasBootOk = true;

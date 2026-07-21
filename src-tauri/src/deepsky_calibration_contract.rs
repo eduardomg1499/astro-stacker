@@ -27,17 +27,24 @@ pub(crate) struct CalibrationCompatibility {
     pub reasons: Vec<String>,
 }
 
+// La AUSENCIA de un campo en la cabecera NO es una incompatibilidad física:
+// es un desconocido. Un mismatch de dos valores PRESENTES sí lo es. Los
+// desconocidos se registran en `unverified` y el veredicto decide su peso:
+// campos físicos (gain/offset/binning/exposición/temperatura/CFA/filtro) sin
+// verificar degradan la elegibilidad científica; la identidad extendida
+// (sensor, readMode, roi, adcBits, whiteLevelAdu…) ausente es lo habitual en
+// FITS de captura y sólo se anota.
 fn required_equal<T: PartialEq + std::fmt::Debug>(
     label: &str,
     reference: &Option<T>,
     candidate: &Option<T>,
-    missing: &mut Vec<String>,
+    unverified: &mut Vec<String>,
     mismatched: &mut Vec<String>,
 ) {
     match (reference, candidate) {
         (Some(a), Some(b)) if a == b => {}
         (Some(a), Some(b)) => mismatched.push(format!("{label}: {a:?} != {b:?}")),
-        _ => missing.push(label.to_string()),
+        _ => unverified.push(label.to_string()),
     }
 }
 
@@ -46,7 +53,7 @@ fn required_float_equal(
     reference: Option<f32>,
     candidate: Option<f32>,
     abs_tolerance: f32,
-    missing: &mut Vec<String>,
+    unverified: &mut Vec<String>,
     mismatched: &mut Vec<String>,
 ) {
     match (reference, candidate) {
@@ -55,14 +62,14 @@ fn required_float_equal(
                 mismatched.push(format!("{label}: {a:.4} != {b:.4}"));
             }
         }
-        _ => missing.push(label.to_string()),
+        _ => unverified.push(label.to_string()),
     }
 }
 
 fn required_exposure_equal(
     reference: Option<f64>,
     candidate: Option<f64>,
-    missing: &mut Vec<String>,
+    unverified: &mut Vec<String>,
     mismatched: &mut Vec<String>,
 ) {
     match (reference, candidate) {
@@ -73,7 +80,7 @@ fn required_exposure_equal(
                 mismatched.push(format!("exposureSeconds: {a:.6} != {b:.6}"));
             }
         }
-        _ => missing.push("exposureSeconds".to_string()),
+        _ => unverified.push("exposureSeconds".to_string()),
     }
 }
 
@@ -86,28 +93,31 @@ pub(crate) fn compare_calibration_signatures(
     role: CalibrationRole,
     policy: DeepSkyCalibrationPolicy,
 ) -> CalibrationCompatibility {
-    let mut missing = Vec::new();
+    // Física sin verificar (degrada) vs identidad extendida sin verificar
+    // (sólo nota) vs mismatch real (incompatible/degradado según política).
+    let mut unverified_critical = Vec::new();
+    let mut unverified_extended = Vec::new();
     let mut mismatched = Vec::new();
 
     required_equal(
         "camera",
         &reference.camera,
         &candidate.camera,
-        &mut missing,
+        &mut unverified_extended,
         &mut mismatched,
     );
     required_equal(
         "sensor",
         &reference.sensor,
         &candidate.sensor,
-        &mut missing,
+        &mut unverified_extended,
         &mut mismatched,
     );
     required_equal(
         "readMode",
         &reference.read_mode,
         &candidate.read_mode,
-        &mut missing,
+        &mut unverified_extended,
         &mut mismatched,
     );
     if reference.gain.is_some() || candidate.gain.is_some() {
@@ -116,52 +126,54 @@ pub(crate) fn compare_calibration_signatures(
             reference.gain,
             candidate.gain,
             1.0e-3,
-            &mut missing,
+            &mut unverified_critical,
             &mut mismatched,
         );
-    } else {
+    } else if reference.iso.is_some() || candidate.iso.is_some() {
         required_equal(
             "iso",
             &reference.iso,
             &candidate.iso,
-            &mut missing,
+            &mut unverified_critical,
             &mut mismatched,
         );
+    } else {
+        unverified_critical.push("gainOrIso".into());
     }
     required_float_equal(
         "offset",
         reference.offset,
         candidate.offset,
         1.0e-3,
-        &mut missing,
+        &mut unverified_critical,
         &mut mismatched,
     );
     required_equal(
         "binningX",
         &reference.binning_x,
         &candidate.binning_x,
-        &mut missing,
+        &mut unverified_critical,
         &mut mismatched,
     );
     required_equal(
         "binningY",
         &reference.binning_y,
         &candidate.binning_y,
-        &mut missing,
+        &mut unverified_critical,
         &mut mismatched,
     );
     required_equal(
         "roi",
         &reference.roi,
         &candidate.roi,
-        &mut missing,
+        &mut unverified_extended,
         &mut mismatched,
     );
     required_equal(
         "adcBits",
         &reference.adc_bits,
         &candidate.adc_bits,
-        &mut missing,
+        &mut unverified_extended,
         &mut mismatched,
     );
     required_float_equal(
@@ -169,7 +181,7 @@ pub(crate) fn compare_calibration_signatures(
         reference.white_level_adu,
         candidate.white_level_adu,
         1.0,
-        &mut missing,
+        &mut unverified_extended,
         &mut mismatched,
     );
 
@@ -178,14 +190,14 @@ pub(crate) fn compare_calibration_signatures(
             "cfaPattern",
             &reference.cfa_pattern,
             &candidate.cfa_pattern,
-            &mut missing,
+            &mut unverified_critical,
             &mut mismatched,
         );
         required_equal(
             "cfaPhase",
             &reference.cfa_phase,
             &candidate.cfa_phase,
-            &mut missing,
+            &mut unverified_critical,
             &mut mismatched,
         );
     }
@@ -196,7 +208,7 @@ pub(crate) fn compare_calibration_signatures(
             required_exposure_equal(
                 reference.exposure_seconds,
                 candidate.exposure_seconds,
-                &mut missing,
+                &mut unverified_critical,
                 &mut mismatched,
             );
             match (reference.temperature_c, candidate.temperature_c) {
@@ -205,14 +217,14 @@ pub(crate) fn compare_calibration_signatures(
                         mismatched.push(format!("temperatureC: {a:.2} vs {b:.2} (>1 C)"));
                     }
                 }
-                _ => missing.push("temperatureC".into()),
+                _ => unverified_critical.push("temperatureC".into()),
             }
         }
         CalibrationRole::DarkFlat => {
             required_exposure_equal(
                 reference.exposure_seconds,
                 candidate.exposure_seconds,
-                &mut missing,
+                &mut unverified_critical,
                 &mut mismatched,
             );
             required_float_equal(
@@ -220,7 +232,7 @@ pub(crate) fn compare_calibration_signatures(
                 reference.temperature_c,
                 candidate.temperature_c,
                 0.1,
-                &mut missing,
+                &mut unverified_critical,
                 &mut mismatched,
             );
         }
@@ -229,49 +241,91 @@ pub(crate) fn compare_calibration_signatures(
                 "filter",
                 &reference.filter,
                 &candidate.filter,
-                &mut missing,
+                &mut unverified_critical,
                 &mut mismatched,
             );
             required_equal(
                 "opticalTrain",
                 &reference.optical_train,
                 &candidate.optical_train,
-                &mut missing,
+                &mut unverified_extended,
                 &mut mismatched,
             );
         }
     }
 
-    let mut reasons = Vec::new();
-    if !missing.is_empty() {
-        missing.sort();
-        missing.dedup();
-        reasons.push(format!("metadata obligatoria ausente: {}", missing.join(", ")));
-    }
-    reasons.extend(mismatched.iter().cloned());
-
-    if reasons.is_empty() {
-        return CalibrationCompatibility {
-            compatible: true,
-            degraded: false,
-            scientific_eligible: true,
-            reasons,
+    // 1) Mismatch físico real: se conserva el comportamiento fail-closed.
+    if !mismatched.is_empty() {
+        let mut reasons = mismatched;
+        for list in [&mut unverified_critical, &mut unverified_extended] {
+            if !list.is_empty() {
+                list.sort();
+                list.dedup();
+                reasons.push(format!("sin verificar (cabecera ausente): {}", list.join(", ")));
+            }
+        }
+        return match policy {
+            DeepSkyCalibrationPolicy::Strict => CalibrationCompatibility {
+                compatible: false,
+                degraded: false,
+                scientific_eligible: false,
+                reasons,
+            },
+            DeepSkyCalibrationPolicy::AllowDegraded => CalibrationCompatibility {
+                compatible: true,
+                degraded: true,
+                scientific_eligible: false,
+                reasons,
+            },
         };
     }
 
-    match policy {
-        DeepSkyCalibrationPolicy::Strict => CalibrationCompatibility {
-            compatible: false,
-            degraded: false,
-            scientific_eligible: false,
-            reasons,
-        },
-        DeepSkyCalibrationPolicy::AllowDegraded => CalibrationCompatibility {
+    // 2) Física sin verificar: el máster se acepta con divulgación explícita,
+    //    pero el resultado deja de ser elegible para los motores científicos.
+    if !unverified_critical.is_empty() {
+        unverified_critical.sort();
+        unverified_critical.dedup();
+        let mut reasons = vec![format!(
+            "sin verificar (cabecera ausente): {} — el emparejamiento usa los campos disponibles; el resultado no será científico-elegible",
+            unverified_critical.join(", ")
+        )];
+        if !unverified_extended.is_empty() {
+            unverified_extended.sort();
+            unverified_extended.dedup();
+            reasons.push(format!(
+                "metadata extendida ausente: {}",
+                unverified_extended.join(", ")
+            ));
+        }
+        return CalibrationCompatibility {
             compatible: true,
             degraded: true,
             scientific_eligible: false,
             reasons,
-        },
+        };
+    }
+
+    // 3) Sólo identidad extendida ausente: lo habitual en FITS de captura.
+    //    Compatible y científico; queda anotado en la decisión y la receta.
+    if !unverified_extended.is_empty() {
+        unverified_extended.sort();
+        unverified_extended.dedup();
+        return CalibrationCompatibility {
+            compatible: true,
+            degraded: false,
+            scientific_eligible: true,
+            reasons: vec![format!(
+                "metadata extendida ausente (habitual): {}",
+                unverified_extended.join(", ")
+            )],
+        };
+    }
+
+    CalibrationCompatibility {
+        compatible: true,
+        degraded: false,
+        scientific_eligible: true,
+        reasons: Vec::new(),
     }
 }
 

@@ -1982,8 +1982,24 @@ pub struct PreparedCalibrationDecision {
     pub pedestal_state: PedestalState,
     pub compatible: bool,
     pub degraded: bool,
+    /// true cuando el usuario forzó la calibración con una asignación manual
+    /// (estilo PixInsight): la elección queda registrada, nunca bloquea.
+    #[serde(default)]
+    pub manual: bool,
     pub fallback: Option<String>,
     pub reasons: Vec<String>,
+}
+
+/// Asignación MANUAL de calibración: para los lights listados, los ficheros
+/// indicados sustituyen al emparejamiento automático por firma. `lights`
+/// vacío = todos los lights del request. La responsabilidad del emparejado es
+/// del usuario y queda divulgada en decisiones y receta.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DeepSkyCalibrationOverride {
+    pub lights: Vec<String>,
+    pub darks: Vec<String>,
+    pub flats: Vec<String>,
 }
 
 impl Default for PreparedCalibrationDecision {
@@ -2001,6 +2017,7 @@ impl Default for PreparedCalibrationDecision {
             pedestal_state: PedestalState::RawIncludesBias,
             compatible: false,
             degraded: false,
+            manual: false,
             fallback: None,
             reasons: Vec::new(),
         }
@@ -2156,6 +2173,9 @@ pub struct DeepSkyStackRequest {
     /// mapas ni degradar silenciosamente a un master sin trazabilidad.
     #[serde(default = "default_true")]
     pub scientific_products: bool,
+    /// Asignaciones manuales de calibración (opcional, estilo PixInsight).
+    #[serde(default)]
+    pub calibration_overrides: Vec<DeepSkyCalibrationOverride>,
 }
 
 impl Default for DeepSkyStackRequest {
@@ -2188,6 +2208,7 @@ impl Default for DeepSkyStackRequest {
             work_dir: None,
             integration_method: None,
             scientific_products: true,
+            calibration_overrides: Vec::new(),
         }
     }
 }

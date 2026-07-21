@@ -8172,7 +8172,7 @@ fn inspect_deepsky_frames(
                             (native, image.w, image.h)
                         };
                     let (_, pattern_noise) = ds_bg_noise(&plane);
-                    if let Some(report) = crate::deepsky_noise::analyze_detector_pattern(
+                    if let Some(report) = crate::deepsky_noise::analyze_detector_pattern_raw(
                         &plane,
                         plane_w,
                         plane_h,
@@ -8882,20 +8882,20 @@ fn ds_prepare_calibration_decisions(
             // flat, and every selected flat needs its own exact raw dark-flat.
             if selected_dark.is_empty() {
                 reasons.push(
-                    "dark: se requiere un candidato exacto; no existe contrato de light pre-calibrado"
+                    "dark: ninguno de los darks coincide con este light (exposición, gain, temperatura o binning distintos); revisa el lote o usa la asignación manual"
                         .into(),
                 );
             }
             if selected_flat.is_empty() {
                 reasons.push(
-                    "flat: se requiere un candidato exacto; no existe contrato de light pre-calibrado"
+                    "flat: ninguno de los flats coincide con este light (filtro, gain o binning distintos); revisa el lote o usa la asignación manual"
                         .into(),
                 );
             }
             for (flat, matches) in selected_flat.iter().zip(&dark_flats_per_flat) {
                 if matches.is_empty() {
                     reasons.push(format!(
-                        "dark-flat: el flat '{}' no tiene candidato exacto por cámara/read mode/gain/offset/exposición/temperatura/binning/ROI/CFA",
+                        "dark-flat: el flat '{}' no tiene dark-flat con la misma exposición y temperatura",
                         flat.name
                     ));
                 }
@@ -9471,6 +9471,49 @@ fn ds_apply_auto_profile(
     ds_resolve_auto_recipe(request, &signals, pressure, ram_2x_fits)
 }
 
+/// Aplica las asignaciones manuales a la matriz de decisiones: la elección
+/// explícita del usuario sustituye al emparejamiento automático de darks y
+/// flats para los lights afectados y NUNCA cuenta como error de contrato.
+fn ds_apply_manual_overrides_to_decisions(
+    decisions: &mut [pipeline::PreparedCalibrationDecision],
+    overrides: &[pipeline::DeepSkyCalibrationOverride],
+) {
+    for over in overrides {
+        if over.darks.is_empty() && over.flats.is_empty() {
+            continue;
+        }
+        let applies =
+            |path: &str| over.lights.is_empty() || over.lights.iter().any(|l| l == path);
+        for decision in decisions.iter_mut() {
+            if !applies(&decision.frame_path) {
+                continue;
+            }
+            decision.manual = true;
+            if !over.darks.is_empty() {
+                decision.reasons.retain(|reason| !reason.starts_with("dark:"));
+                decision.dark_master_path =
+                    Some(format!("manual://{} darks", over.darks.len()));
+                decision.dark_scale = Some(1.0);
+            }
+            if !over.flats.is_empty() {
+                decision.reasons.retain(|reason| !reason.starts_with("flat:"));
+                decision.flat_master_path =
+                    Some(format!("manual://{} flats", over.flats.len()));
+            }
+            decision
+                .reasons
+                .push("asignación manual del usuario".into());
+            // Sin motivos automáticos restantes, la decisión no bloquea; los
+            // problemas de bias/dark-flat (si quedan) conservan su degradación.
+            let blocking_left = decision.reasons.iter().any(|reason| {
+                reason.starts_with("bias") || reason.starts_with("dark-flat")
+            });
+            decision.compatible = true;
+            decision.degraded = decision.degraded && blocking_left;
+        }
+    }
+}
+
 fn prepare_deepsky_stack_impl(
     request: DeepSkyStackRequest,
     with_advisor: bool,
@@ -9657,33 +9700,50 @@ fn prepare_deepsky_stack_impl(
 
     let valid_probes: Vec<&DsProbe> = probes.iter().filter(|p| p.ok).collect();
     let mut signature_degraded = false;
-    for probe in &valid_probes {
-        for warning in &probe.signature_warnings {
-            warnings.push(format!("{}: {warning}", probe.name));
-        }
-        if !probe.signature_missing.is_empty() || probe.store_layout.is_none() {
+    {
+        // AGRUPADO, nunca una línea por toma: con 50+ lights el panel se
+        // inundaba con el mismo mensaje repetido. La ausencia de cabeceras NO
+        // bloquea el apilado: lo crítico degrada la elegibilidad científica
+        // con divulgación; lo extendido es sólo una nota (es lo habitual).
+        let mut probe_warning_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut critical_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut extended_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for probe in &valid_probes {
+            for warning in &probe.signature_warnings {
+                *probe_warning_counts.entry(warning.clone()).or_default() += 1;
+            }
             let mut missing = probe.signature_missing.clone();
             if probe.store_layout.is_none() {
                 missing.push("storeLayout/CFA phase".into());
             }
-            missing.sort();
-            missing.dedup();
-            let message = format!(
-                "Light '{}': metadata obligatoria ausente: {}",
-                probe.name,
-                missing.join(", ")
-            );
-            if matches!(
-                request.calibration_policy,
-                pipeline::DeepSkyCalibrationPolicy::Strict
-            ) {
-                errors.push(message);
-            } else {
-                warnings.push(format!(
-                    "AllowDegraded: {message}; el resultado será Classic no científico"
-                ));
-                signature_degraded = true;
+            if !missing.is_empty() {
+                missing.sort();
+                missing.dedup();
+                *critical_counts.entry(missing.join(", ")).or_default() += 1;
             }
+            let extended =
+                crate::deepsky_signature::missing_extended_signature_fields(&probe.signature);
+            if !extended.is_empty() {
+                *extended_counts.entry(extended.join(", ")).or_default() += 1;
+            }
+        }
+        for (text, count) in probe_warning_counts {
+            warnings.push(if count > 1 {
+                format!("{count} lights: {text}")
+            } else {
+                text
+            });
+        }
+        for (fields, count) in critical_counts {
+            warnings.push(format!(
+                "{count} light(s) sin metadata crítica en cabecera ({fields}): el emparejamiento no puede verificarse del todo — el apilado continúa, el resultado no será elegible como científico y quedará divulgado en la receta."
+            ));
+            signature_degraded = true;
+        }
+        for (fields, count) in extended_counts {
+            warnings.push(format!(
+                "{count} light(s) sin metadata extendida ({fields}): es lo habitual en FITS de captura; el emparejamiento usa los campos disponibles (cámara, gain, offset, binning, exposición, temperatura)."
+            ));
         }
     }
     let mut filters = BTreeSet::new();
@@ -10001,7 +10061,7 @@ fn prepare_deepsky_stack_impl(
         "dark-flats",
         request.calibration_policy,
     );
-    let calibration_decisions = ds_prepare_calibration_decisions(
+    let mut calibration_decisions = ds_prepare_calibration_decisions(
         &probes,
         &ds_selected_probes(&preflight_bias_probes, &preflight_bias_selection),
         &ds_selected_probes(&preflight_dark_probes, &preflight_dark_selection),
@@ -10012,22 +10072,43 @@ fn prepare_deepsky_stack_impl(
         ),
         request.calibration_policy,
     );
-    for decision in &calibration_decisions {
-        if decision.degraded {
-            scientific_eligible = false;
+    ds_apply_manual_overrides_to_decisions(
+        &mut calibration_decisions,
+        &request.calibration_overrides,
+    );
+    if request
+        .calibration_overrides
+        .iter()
+        .any(|over| !over.darks.is_empty() || !over.flats.is_empty())
+    {
+        warnings.push(
+            "Asignación manual de calibración activa: los lotes forzados sustituyen al emparejamiento automático y quedan registrados en decisiones y receta.".into(),
+        );
+    }
+    {
+        // AGRUPADO por motivo: el detalle por light vive en la matriz de
+        // calibración tipada (abajo); aquí solo el resumen accionable. Antes
+        // se emitía un error POR LIGHT y 50 tomas inundaban el panel.
+        let mut degraded_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for decision in &calibration_decisions {
+            if decision.degraded {
+                scientific_eligible = false;
+                *degraded_counts
+                    .entry(decision.reasons.join("; "))
+                    .or_default() += 1;
+            }
+        }
+        for (text, count) in degraded_counts {
             let message = format!(
-                "Decisión de calibración '{}': {}",
-                std::path::Path::new(&decision.frame_path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy(),
-                decision.reasons.join("; ")
+                "{count} light(s) con calibración degradada — {text}. Detalle por toma en la matriz de calibración."
             );
             if matches!(
                 request.calibration_policy,
                 pipeline::DeepSkyCalibrationPolicy::Strict
             ) {
-                errors.push(message);
+                errors.push(format!(
+                    "{message} Con la política AllowDegraded el apilado continúa marcando el resultado como no científico."
+                ));
             } else {
                 warnings.push(format!("AllowDegraded: {message}"));
             }
@@ -10716,6 +10797,7 @@ async fn run_deepsky_stack(
         Some(effective_method),
         Some(request.capture_mode),
         Some(request.calibration_policy),
+        Some(request.calibration_overrides),
     )
     .await?;
     let result = state.deep_sky_result.lock().unwrap();
@@ -11751,6 +11833,7 @@ async fn run_deepsky_session(
             Some(group_method),
             Some(resolved.capture_mode),
             Some(resolved.calibration_policy),
+            Some(resolved.calibration_overrides.clone()),
         )
         .await?;
         let result = state
@@ -14359,6 +14442,7 @@ async fn stack_deepsky(
     integration_method: Option<pipeline::DeepSkyIntegrationMethod>,
     capture_mode: Option<pipeline::DeepSkyCaptureMode>,
     calibration_policy: Option<pipeline::DeepSkyCalibrationPolicy>,
+    calibration_overrides: Option<Vec<pipeline::DeepSkyCalibrationOverride>>,
 ) -> Result<String, String> {
     ds_begin_user_action(&state);
     stack_deepsky_impl(
@@ -14391,6 +14475,7 @@ async fn stack_deepsky(
         integration_method,
         capture_mode,
         calibration_policy,
+        calibration_overrides,
     )
     .await
 }
@@ -14426,6 +14511,7 @@ async fn stack_deepsky_impl(
     integration_method: Option<pipeline::DeepSkyIntegrationMethod>,
     capture_mode: Option<pipeline::DeepSkyCaptureMode>,
     calibration_policy: Option<pipeline::DeepSkyCalibrationPolicy>,
+    calibration_overrides: Option<Vec<pipeline::DeepSkyCalibrationOverride>>,
 ) -> Result<String, String> {
     let ds_run_started = std::time::Instant::now();
     let ds_result_id = new_job_id("ds-result");
@@ -14461,6 +14547,13 @@ async fn stack_deepsky_impl(
     // el motor streaming κσ CPU la aplica en esta fase; se anuncia cuando se
     // ignora (rechazo por-píxel o GPU streaming).
     let local_weighting = local_weighting.unwrap_or(false);
+    // Asignaciones manuales (estilo PixInsight): validadas contra las listas
+    // del request; una regla sin lights afectados o sin ficheros se ignora.
+    let calibration_overrides: Vec<pipeline::DeepSkyCalibrationOverride> = calibration_overrides
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|over| !over.darks.is_empty() || !over.flats.is_empty())
+        .collect();
     let mut integration_method = integration_method;
     let requested_integration_method = integration_method.clone().unwrap_or_else(|| {
         pipeline::DeepSkyIntegrationMethod::Classic(pipeline::ClassicIntegrationConfig {
@@ -14531,6 +14624,7 @@ async fn stack_deepsky_impl(
         &effective_dark_flat_probes,
         calibration_policy,
     );
+    ds_apply_manual_overrides_to_decisions(&mut calibration_decisions, &calibration_overrides);
     calibration_contract_errors.extend(
         calibration_decisions
             .iter()
@@ -14944,6 +15038,83 @@ async fn stack_deepsky_impl(
             ),
         );
     }
+    // Masters de DARKS forzados por asignación manual: se construyen aparte y
+    // se usan con k=1 para los lights afectados, con divulgación en el log y
+    // en la matriz de decisiones (la responsabilidad del lote es del usuario).
+    let mut override_dark_masters: Vec<Option<DsDarkMaster>> = Vec::new();
+    let mut manual_dark_for_light: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (over_idx, over) in calibration_overrides.iter().enumerate() {
+        if over.darks.is_empty() {
+            override_dark_masters.push(None);
+            continue;
+        }
+        cancellation_checkpoint(cancel.as_ref(), "master dark manual")?;
+        let label = format!("dark manual {}", over_idx + 1);
+        let calibration_probe = match ds_single_master_representative(
+            &over.darks,
+            crate::deepsky_calibration_contract::CalibrationRole::Dark,
+            &label,
+        ) {
+            Ok(probe) => probe,
+            Err(reason) => {
+                log_to_front(
+                    &app,
+                    "WARN",
+                    &format!(
+                        "Lote manual de darks con firmas mezcladas ({reason}); se usa igualmente con k=1."
+                    ),
+                );
+                None
+            }
+        };
+        let built = ds_build_master(&app, &over.darks, &label, false, &cancel, work_root.as_deref())?
+            .map(|mut d| {
+                let mut bias_subtracted = false;
+                if let Some(b) = master_bias.as_ref() {
+                    if ds_master_is_compatible(&d.image, &b.image) {
+                        for (dv, bv) in d.image.data.iter_mut().zip(b.image.data.iter()) {
+                            *dv -= *bv;
+                        }
+                        bias_subtracted = true;
+                    }
+                }
+                let glow = ds_dark_has_amp_glow(&d.image);
+                DsDarkMaster {
+                    exposure: calibration_probe.as_ref().and_then(|p| p.exptime),
+                    master: d,
+                    amp_glow: glow,
+                    bias_subtracted,
+                    calibration_probe,
+                    source_paths: over.darks.clone(),
+                }
+            });
+        if built.is_some() {
+            let affected = if over.lights.is_empty() {
+                lights.clone()
+            } else {
+                lights
+                    .iter()
+                    .filter(|p| over.lights.iter().any(|l| l == *p))
+                    .cloned()
+                    .collect()
+            };
+            log_to_front(
+                &app,
+                "INFO",
+                &format!(
+                    "Asignación manual {}: {} darks forzados para {} light(s) (k=1).",
+                    over_idx + 1,
+                    over.darks.len(),
+                    affected.len()
+                ),
+            );
+            for path in affected {
+                manual_dark_for_light.insert(path, over_idx);
+            }
+        }
+        override_dark_masters.push(built);
+    }
     // Flats ya llegan filtrados por geometría/Bayer/gain/binning/filtro; nunca
     // se usa el grupo mayor de otro filtro como fallback silencioso.
     // FLATS POR SESIÓN (WBPP-style): cada noche tiene su propio panel de
@@ -15031,6 +15202,55 @@ async fn stack_deepsky_impl(
         ));
     }
     let calibration_degraded = calibration_degraded || flat_data_degraded;
+    // Masters de FLATS forzados por asignación manual: uno por regla; los
+    // lights afectados los usan en lugar del flat de su sesión.
+    let mut override_flat_masters: Vec<Option<DsCalibrationMaster>> = Vec::new();
+    let mut manual_flat_for_light: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (over_idx, over) in calibration_overrides.iter().enumerate() {
+        if over.flats.is_empty() {
+            override_flat_masters.push(None);
+            continue;
+        }
+        cancellation_checkpoint(cancel.as_ref(), "master flat manual")?;
+        let built = ds_build_calibrated_flat_master(
+            &app,
+            &over.flats,
+            &format!("flat manual {}", over_idx + 1),
+            master_bias.as_ref(),
+            master_bias_probe.as_ref(),
+            &dark_flat_masters,
+            calibration_policy,
+            &cancel,
+            work_root.as_deref(),
+            &flat_data_degraded_flag,
+        )?;
+        if built.is_some() {
+            let affected = if over.lights.is_empty() {
+                lights.clone()
+            } else {
+                lights
+                    .iter()
+                    .filter(|p| over.lights.iter().any(|l| l == *p))
+                    .cloned()
+                    .collect()
+            };
+            log_to_front(
+                &app,
+                "INFO",
+                &format!(
+                    "Asignación manual {}: {} flats forzados para {} light(s).",
+                    over_idx + 1,
+                    over.flats.len(),
+                    affected.len()
+                ),
+            );
+            for path in affected {
+                manual_flat_for_light.insert(path, over_idx);
+            }
+        }
+        override_flat_masters.push(built);
+    }
     // Noche de cada light: solo se sondea cuando hay flats multi-sesión.
     let light_nights: std::collections::HashMap<String, Option<String>> =
         if flat_masters.iter().any(|(night, _)| night.is_some()) {
@@ -15047,6 +15267,14 @@ async fn stack_deepsky_impl(
     // Flat de la misma sesión del light. Strict nunca usa el flat de una noche
     // "cercana": polvo, rotación o tren óptico pueden cambiar entre sesiones.
     let flat_for_light = |path: &str| -> Result<Option<&DsCalibrationMaster>, String> {
+        if let Some(&over_idx) = manual_flat_for_light.get(path) {
+            if let Some(master) = override_flat_masters
+                .get(over_idx)
+                .and_then(|m| m.as_ref())
+            {
+                return Ok(Some(master));
+            }
+        }
         if flat_masters.is_empty() {
             return Ok(None);
         }
@@ -15445,20 +15673,29 @@ async fn stack_deepsky_impl(
                 .filter(|master| core_compatible(master))
                 .next(),
         };
-        let exact_dark = current_light_probe.and_then(|light| {
-            dark_masters.iter().find(|master| {
-                master.calibration_probe.as_ref().is_some_and(|dark| {
-                    ds_compare_probe_calibration(
-                        light,
-                        dark,
-                        crate::deepsky_calibration_contract::CalibrationRole::Dark,
-                        pipeline::DeepSkyCalibrationPolicy::Strict,
-                    )
-                    .compatible
+        // La asignación manual gana a la selección automática: dark forzado
+        // con k=1, sin escalado y sin el bloqueo Strict por falta de exacto.
+        let manual_dark: Option<&DsDarkMaster> = manual_dark_for_light
+            .get(p.as_str())
+            .and_then(|&over_idx| override_dark_masters.get(over_idx))
+            .and_then(|master| master.as_ref());
+        let exact_dark = manual_dark.or_else(|| {
+            current_light_probe.and_then(|light| {
+                dark_masters.iter().find(|master| {
+                    master.calibration_probe.as_ref().is_some_and(|dark| {
+                        ds_compare_probe_calibration(
+                            light,
+                            dark,
+                            crate::deepsky_calibration_contract::CalibrationRole::Dark,
+                            pipeline::DeepSkyCalibrationPolicy::Strict,
+                        )
+                        .compatible
+                    })
                 })
             })
         });
-        if exact_dark.is_none()
+        if manual_dark.is_none()
+            && exact_dark.is_none()
             && !dark_masters.is_empty()
             && matches!(
             calibration_policy,
@@ -20145,6 +20382,7 @@ mod ds_tests {
             flats: Vec::new(),
             dark_flats: Vec::new(),
             bias: Vec::new(),
+            calibration_overrides: Vec::new(),
             capture_mode: pipeline::DeepSkyCaptureMode::Auto,
             calibration_policy: pipeline::DeepSkyCalibrationPolicy::AllowDegraded,
             compute_policy: ComputePolicy::CpuOnly,

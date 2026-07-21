@@ -1005,6 +1005,16 @@
         }
     },
     "deepsky": {
+        "manual_darks_label": "Darks forzados (manual)",
+        "manual_flats_label": "Flats forzados (manual)",
+        "manual_auto": "Automático (por firma)",
+        "manual_all_darks": "Forzar todos los darks cargados",
+        "manual_all_flats": "Forzar todos los flats cargados",
+        "manual_hint": "La asignación manual queda registrada en la matriz de decisiones y en la receta; la responsabilidad del lote es tuya.",
+        "proceed_degraded": "Continuar en modo degradado",
+        "proceed_hint": "La política Estricta bloquea al primer incumplimiento del contrato. Puedes continuar en modo degradado: el apilado procede, cada concesión queda registrada y el resultado se marca como no científico si aplica.",
+        "alert_expand": "ver detalle",
+        "decision_manual": "Manual",
         "preset_auto": "Auto",
         "profile_auto_note": "Mide tus datos (nº de lights, filtro, dithering, gradiente, fondo) y fija la receta óptima; cada decisión y su motivo quedan visibles en el plan.",
         "resolved_recipe_title": "Receta resuelta (AUTO)",

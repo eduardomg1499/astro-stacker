@@ -89,6 +89,36 @@ tiled, ambos con y sin grids de calidad) y los contratos Node
 - Emoji `⭐` de la etiqueta de la gráfica de calidad sustituido por el glifo
   monocromo `★` (regla del proyecto).
 
+### Adenda 2026-07-21 (2ª tanda: UX de calibración con datos reales)
+
+Primer contacto del flujo con el dataset real del usuario (53 lights SV220
+multi-noche). Cambios:
+
+- **La ausencia de cabecera dejó de ser incompatibilidad**: el contrato ahora
+  distingue física sin verificar (gain/offset/binning/CFA/exposición/
+  temperatura → degrada elegibilidad científica con divulgación, no bloquea)
+  de identidad extendida ausente (sensor, readMode, roi, adcBits,
+  whiteLevelAdu, opticalTrain → nota informativa; es lo habitual en FITS de
+  captura). Un mismatch de valores PRESENTES conserva el fail-closed.
+- **Fin de la inundación de mensajes**: metadata y decisiones degradadas se
+  agrupan por motivo con contador (backend) y los mensajes idénticos salvo el
+  nombre de fichero se pliegan con detalle desplegable (frontend). El detalle
+  por toma vive en la matriz de calibración, que para eso existe.
+- **Botón "Continuar en modo degradado"** cuando Strict bloquea: cambia la
+  política, re-prepara y el usuario decide; cada concesión queda registrada.
+- **Asignación manual estilo PixInsight** (`calibrationOverrides` en el
+  contrato v4): lotes de darks/flats forzados por regla (lights vacío = todos)
+  con masters propios (k=1 en darks), estado "Manual" en la matriz y registro
+  en receta. UI v1: selects "Forzar todos los darks/flats cargados" en el
+  grupo Calibración; el contrato ya soporta subconjuntos por light para una
+  UI por sesión futura.
+- **Banding sin falso positivo en inspección**: la variante para tomas crudas
+  aplica doble high-pass con recorte de bordes a los perfiles fila/columna —
+  el viñeteo/gradiente (que disparaba "banding detectado" con lag-1≈1.0) ya
+  no se confunde con patrón del detector; test sintético viñeteo vs banding.
+- Con esto, datasets FITS reales con cabeceras normales vuelven a ser
+  elegibles científicamente y **NebulaFusion/EIDR quedan seleccionables**.
+
 ### Backlog que este cierre NO resuelve (además de la lista original)
 
 - Migrar la ruta GPU deep-sky del `take_gpu_error` destructivo a la API por

@@ -21,6 +21,7 @@
     "core:window:allow-show",
     "core:window:allow-hide",
     "core:window:allow-set-size",
+    "core:window:allow-set-min-size",
     "core:window:allow-center",
     "dialog:default",
     "dialog:allow-open",

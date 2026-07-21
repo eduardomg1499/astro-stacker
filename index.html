@@ -18,7 +18,123 @@
         }
     </script>
 
-    <link rel="stylesheet" href="./styles.css">
+    <!--
+      RED DE SEGURIDAD DE ARRANQUE — deliberadamente FUERA de main.js.
+      Toda la interfaz vive en opacity:0 hasta que `body.ready` existe, y esa
+      clase la pone main.js. Si el modulo muere en su nivel superior (error de
+      sintaxis, import que no resuelve, excepcion antes de registrar sus propios
+      fallbacks) no queda NADIE que revele la UI: la app se queda en el splash
+      para siempre. Ya ha pasado dos veces (TDZ en initCustomSelect, Chart.js
+      por CDN). Un fallback dentro del modulo que falla no se llega a registrar
+      nunca, asi que este vive aqui, en un script clasico en linea que se
+      ejecuta al parsear y no depende de ningun recurso externo.
+    -->
+    <script>
+        (function () {
+            var revealed = false;
+            function reveal(reason) {
+                if (revealed || !document.body) return;
+                if (document.body.classList.contains("ready")) { revealed = true; return; }
+                revealed = true;
+                document.body.classList.add("ready");
+                var splash = document.getElementById("splash-screen");
+                if (splash) {
+                    splash.style.opacity = "0";
+                    setTimeout(function () { splash.style.display = "none"; }, 800);
+                }
+                // Si main.js sigue vivo, que la ventana crezca igualmente.
+                if (typeof window.__zasExpandWindow === "function") {
+                    try { window.__zasExpandWindow(); } catch (e) {}
+                }
+                console.warn("Zenith: UI revelada por la red de seguridad (" + reason + ")");
+            }
+            window.__zasRevealFallback = reveal;
+
+            // Primer fallo capturado, con su pila, para el diagnostico.
+            var fatal = null;
+
+            // A los 12 s la secuencia se da por colgada. Pero el desenlace
+            // depende de si main.js llego a arrancar:
+            //
+            //   - vivo  -> destapar la UI es correcto: los manejadores estan
+            //              puestos y solo se atasco el revelado.
+            //   - muerto-> destapar seria MENTIR. Sale una interfaz completa en
+            //              la que NINGUN boton responde, la ventana se queda del
+            //              tamano del splash y la licencia nunca se verifica,
+            //              porque nada de eso llego a enlazarse. Mas vale un
+            //              error claro que una aplicacion fantasma.
+            setTimeout(function () {
+                if (window.__zasBootOk) reveal("watchdog 12s");
+                else showBootFailure();
+            }, 12000);
+
+            function showBootFailure() {
+                if (document.getElementById("zas-boot-failure")) return;
+                var box = document.createElement("div");
+                box.id = "zas-boot-failure";
+                box.setAttribute("style", [
+                    "position:fixed", "inset:0", "z-index:10001",
+                    "display:flex", "align-items:center", "justify-content:center",
+                    "background:#020617", "padding:24px",
+                    "font-family:ui-monospace,SFMono-Regular,Menlo,monospace",
+                    "pointer-events:auto"
+                ].join(";"));
+                var detail = fatal
+                    ? (fatal.message + "\n\n" + (fatal.stack || "(sin pila)"))
+                    : "El modulo principal no llego a iniciarse y no se capturo ningun error.";
+                var inner = document.createElement("div");
+                inner.setAttribute("style", "max-width:900px;width:100%;color:#e2e8f0");
+                var h = document.createElement("div");
+                h.setAttribute("style", "color:#f87171;font-size:15px;font-weight:700;letter-spacing:.08em;margin-bottom:10px");
+                h.textContent = "FALLO DE ARRANQUE";
+                var p = document.createElement("div");
+                p.setAttribute("style", "color:#94a3b8;font-size:12px;line-height:1.6;margin-bottom:14px");
+                p.textContent = "La interfaz no se ha cargado, asi que los botones no responderian. "
+                    + "Este es el error exacto (se puede seleccionar y copiar):";
+                var pre = document.createElement("pre");
+                pre.setAttribute("style", "white-space:pre-wrap;word-break:break-word;background:#0f172a;"
+                    + "border:1px solid #1e293b;border-radius:8px;padding:14px;font-size:11.5px;"
+                    + "line-height:1.55;color:#fca5a5;max-height:55vh;overflow:auto;user-select:text");
+                pre.textContent = detail;
+                inner.appendChild(h); inner.appendChild(p); inner.appendChild(pre);
+                box.appendChild(inner);
+                document.body.appendChild(box);
+                console.error("Zenith: FALLO DE ARRANQUE —", detail);
+            }
+
+            // Esto SOLO registra el fallo; no revela ni oculta nada por su
+            // cuenta. Revelar desde aqui destapaba la interfaz a mitad de
+            // arranque, antes de que main.js terminara de enlazar los botones.
+            function onFatal(err, detail) {
+                // Si el modulo esta vivo, el revela la UI por su camino normal.
+                // Un rechazo suelto de una tarea de fondo —el actualizador sin
+                // red, por ejemplo— no es un fallo de arranque y no debe alarmar.
+                if (window.__zasBootOk) return;
+                if (!fatal) {
+                    fatal = {
+                        message: String(detail),
+                        stack: (err && err.stack) ? String(err.stack) : ""
+                    };
+                }
+                var sub = document.querySelector(".splash-subtitle");
+                if (sub) sub.textContent = "Error de arranque: " + detail;
+                console.error("Zenith: fallo de arranque —", detail, err);
+            }
+            window.addEventListener("error", function (e) {
+                onFatal(e && e.error, (e && e.message) || "error desconocido");
+            });
+            window.addEventListener("unhandledrejection", function (e) {
+                var r = e && e.reason;
+                onFatal(r, (r && (r.message || r)) || "promesa rechazada");
+            });
+        })();
+    </script>
+
+    <!-- ./styles.css NO existe en la raiz: los estilos entran por el bundle,
+         via `import "./styles.css"` de src/main.js (= src/styles.css). El
+         <link> apuntaba a un fichero inexistente y en la app empaquetada daba
+         404 -> el WebView respondia el index.html y saltaba "Did not parse
+         stylesheet ... non CSS MIME types are not allowed in strict mode". -->
     <link rel="stylesheet" href="./src/film_roll.css">
 
     <style>
@@ -1511,6 +1627,21 @@
                                 <option value="500">500 ADU</option>
                             </select>
                         </label>
+                        <label class="ds-row" title="Asignación manual estilo PixInsight: fuerza que TODOS los darks cargados calibren todos los lights (k=1, sin escalado), aunque la firma de cabecera no coincida. Útil cuando la detección automática no liga bien el lote.">
+                            <span data-i18n="deepsky.manual_darks_label">Darks forzados (manual)</span>
+                            <select id="sel-ds-manual-darks" class="ds-sel">
+                                <option value="auto" selected data-i18n="deepsky.manual_auto">Automático (por firma)</option>
+                                <option value="all" data-i18n="deepsky.manual_all_darks">Forzar todos los darks cargados</option>
+                            </select>
+                        </label>
+                        <label class="ds-row" title="Asignación manual estilo PixInsight: fuerza que TODOS los flats cargados calibren todos los lights, ignorando el emparejado por sesión/firma. Útil cuando la detección automática no liga bien el lote.">
+                            <span data-i18n="deepsky.manual_flats_label">Flats forzados (manual)</span>
+                            <select id="sel-ds-manual-flats" class="ds-sel">
+                                <option value="auto" selected data-i18n="deepsky.manual_auto">Automático (por firma)</option>
+                                <option value="all" data-i18n="deepsky.manual_all_flats">Forzar todos los flats cargados</option>
+                            </select>
+                        </label>
+                        <div style="font-size:.58rem;color:#64748b;margin:-2px 0 6px 2px;" data-i18n="deepsky.manual_hint">La asignación manual queda registrada en la matriz de decisiones y en la receta; la responsabilidad del lote es tuya.</div>
                     </div>
 
                     <!-- REGISTRO -->

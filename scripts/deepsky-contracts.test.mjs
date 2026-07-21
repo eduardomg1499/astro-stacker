@@ -172,6 +172,33 @@ test("session request excludes manual discards and drops emptied groups", () => 
     assert.match(main, /\.filter\(group => group\.files\.length > 0\)/);
 });
 
+test("manual calibration assignment is wired end to end", () => {
+    assert.ok(requestBuilder, "dsBuildStackRequest must remain identifiable");
+    assert.match(requestBuilder, /calibrationOverrides:\s*\[/);
+    assert.match(requestBuilder, /sel-ds-manual-darks/);
+    assert.match(requestBuilder, /sel-ds-manual-flats/);
+    assert.match(html, /id="sel-ds-manual-darks"[\s\S]*?<option value="auto" selected/);
+    assert.match(html, /id="sel-ds-manual-flats"[\s\S]*?<option value="auto" selected/);
+    assert.match(main, /decision\.manual/);
+    for (const locale of [en, es]) {
+        assert.ok(locale.deepsky.manual_darks_label);
+        assert.ok(locale.deepsky.manual_flats_label);
+        assert.ok(locale.deepsky.manual_hint);
+        assert.ok(locale.deepsky.decision_manual);
+    }
+});
+
+test("preflight floods are grouped and strict offers a degraded path", () => {
+    assert.match(main, /function dsGroupAlertMessages\(messages\)/);
+    assert.match(main, /btn-ds-proceed-degraded/);
+    assert.match(main, /policy\.value = "allowDegraded"/);
+    for (const locale of [en, es]) {
+        assert.ok(locale.deepsky.proceed_degraded);
+        assert.ok(locale.deepsky.proceed_hint);
+        assert.ok(locale.deepsky.alert_expand);
+    }
+});
+
 test("dynamic UI strings resolve through both locales", () => {
     for (const locale of [en, es]) {
         assert.ok(locale.deepsky.reclassify);

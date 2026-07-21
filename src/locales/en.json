@@ -1005,6 +1005,16 @@
         }
     },
     "deepsky": {
+        "manual_darks_label": "Forced darks (manual)",
+        "manual_flats_label": "Forced flats (manual)",
+        "manual_auto": "Automatic (by signature)",
+        "manual_all_darks": "Force all loaded darks",
+        "manual_all_flats": "Force all loaded flats",
+        "manual_hint": "Manual assignment is recorded in the decision matrix and the recipe; the batch choice is your responsibility.",
+        "proceed_degraded": "Continue in degraded mode",
+        "proceed_hint": "Strict policy blocks on the first contract breach. You can continue in degraded mode: stacking proceeds, every concession is recorded, and the result is flagged as non-scientific where it applies.",
+        "alert_expand": "show detail",
+        "decision_manual": "Manual",
         "preset_auto": "Auto",
         "profile_auto_note": "Measures your data (light count, filter, dithering, gradient, background) and sets the optimal recipe; every decision and its reason stay visible in the plan.",
         "resolved_recipe_title": "Resolved recipe (AUTO)",
