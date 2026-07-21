@@ -9819,10 +9819,24 @@ function dsBuildSessionRequest() {
 }
 
 function dsFormatSessionPreflight(plan) {
+    const sessionGroupedAlerts = (messages, cssClass, silenceable) => dsGroupAlertMessages(messages)
+        .filter(group => !(silenceable && dsSilencedAlerts.has(group.key)))
+        .map(group => {
+            const silenceBtn = silenceable
+                ? `<button type="button" class="ds-silence-alert" data-alert-key="${escapeHtml(group.key)}" title="${tr("deepsky.alert_silence_hint", "Ocultar este aviso durante esta sesión")}" style="float:right;background:none;border:1px solid rgba(148,163,184,.25);color:#64748b;border-radius:6px;font-size:.56rem;padding:1px 8px;cursor:pointer;">${tr("deepsky.alert_silence", "Silenciar")}</button>`
+                : "";
+            if (group.items.length === 1) {
+                return `<div class="ds-alert ${cssClass}">${silenceBtn}${escapeHtml(group.items[0])}</div>`;
+            }
+            const detail = group.items.map(item => `<div style="color:#94a3b8;margin-top:3px;">${escapeHtml(item)}</div>`).join("");
+            return `<details class="ds-alert ${cssClass}">
+                <summary style="cursor:pointer;list-style:none;">${silenceBtn}<b>×${group.items.length}</b> ${escapeHtml(group.key)} <span style="color:#64748b;">(${tr("deepsky.alert_expand", "ver detalle")})</span></summary>
+                <div style="margin-top:4px;max-height:160px;overflow:auto;border-left:2px solid rgba(148,163,184,.2);padding-left:8px;">${detail}</div>
+            </details>`;
+        }).join("");
     const alerts = [
-        ...(plan.errors || []).map(error => `<div class="ds-alert error">${escapeHtml(error)}</div>`),
-        ...(plan.warnings || []).filter(warning => !warning.startsWith("Sesión multibanda"))
-            .map(warning => `<div class="ds-alert warn">${escapeHtml(warning)}</div>`),
+        sessionGroupedAlerts(plan.errors || [], "error", false),
+        sessionGroupedAlerts((plan.warnings || []).filter(warning => !warning.startsWith("Sesión multibanda")), "warn", true),
     ].join("");
     const groups = (plan.groups || []).map(group => {
         const p = group.plan || {};
@@ -9962,6 +9976,7 @@ function dsFormatCalibrationLinker(plan) {
         const assignment = dsCalibAssignments.get(entry.night) || { flats: "auto", darks: "auto" };
         return `<tr style="border-top:1px solid rgba(148,163,184,.1);">
             <td style="padding:5px 8px;color:#e2e8f0;white-space:nowrap;">${escapeHtml(entry.night)} <span style="color:#64748b;">· ${entry.lights} lights</span></td>
+            <td style="padding:5px 8px;color:#67e8f9;white-space:nowrap;">${escapeHtml(dsFilterLabel(entry.filter || "") || entry.filter || "—")}</td>
             <td style="padding:5px 8px;"><select class="ds-sel" style="width:100%;min-width:150px;" data-ds-assign="${escapeHtml(entry.night)}" data-kind="flats">${options("flats", flatBatches, assignment.flats)}</select></td>
             <td style="padding:5px 8px;"><select class="ds-sel" style="width:100%;min-width:150px;" data-ds-assign="${escapeHtml(entry.night)}" data-kind="darks">${options("darks", darkBatches, assignment.darks)}</select></td>
         </tr>`;
@@ -9975,7 +9990,7 @@ function dsFormatCalibrationLinker(plan) {
         <div style="margin-top:5px;color:#94a3b8;font-size:.6rem;">${tr("deepsky.linker_hint", "Liga un lote concreto a los lights de cada noche, u omite flats/darks para esa noche. Desmarca un lote para excluirlo por completo. Todo queda registrado en la matriz y la receta.")}</div>
         <div style="overflow:auto;border:1px solid rgba(148,163,184,.12);border-radius:8px;margin-top:5px;">
         <table style="width:100%;border-collapse:collapse;font-size:.6rem;min-width:520px;">
-            <thead style="background:#111827;color:#94a3b8;"><tr><th style="padding:4px 8px;text-align:left;">${tr("deepsky.linker_night", "Noche (lights)")}</th><th style="padding:4px 8px;text-align:left;">Flats</th><th style="padding:4px 8px;text-align:left;">Darks</th></tr></thead>
+            <thead style="background:#111827;color:#94a3b8;"><tr><th style="padding:4px 8px;text-align:left;">${tr("deepsky.linker_night", "Noche (lights)")}</th><th style="padding:4px 8px;text-align:left;">${tr("deepsky.linker_filter", "Filtro")}</th><th style="padding:4px 8px;text-align:left;">Flats</th><th style="padding:4px 8px;text-align:left;">Darks</th></tr></thead>
             <tbody>${rows}</tbody>
         </table></div>
         ${batchChips ? `<div style="margin-top:6px;font-size:.6rem;"><b style="color:#a5b4fc;">${tr("deepsky.linker_batches", "Lotes detectados")}:</b><div style="margin-top:3px;">${batchChips}</div></div>` : ""}
@@ -9988,12 +10003,20 @@ function dsGroupAlertMessages(messages) {
     const groups = new Map();
     for (const raw of messages || []) {
         const text = String(raw);
-        const key = text.replace(/'[^']*'/g, "'…'");
+        const key = text
+            .replace(/'[^']*'/g, "'…'")
+            .replace(/"[^"]*"/g, '"…"')
+            .replace(/\d{4}-\d{2}-\d{2}/g, "····-··-··")
+            .replace(/\b\d+\b/g, "N");
         if (!groups.has(key)) groups.set(key, { key, items: [] });
         groups.get(key).items.push(text);
     }
     return [...groups.values()];
 }
+
+// Avisos silenciados por el usuario en ESTA sesión (clave = patrón agrupado).
+// Los errores bloqueantes nunca se silencian.
+const dsSilencedAlerts = new Set();
 
 function dsFormatPreflight(plan) {
     if (!plan) return `<span style="color:#94a3b8;">Preparando plan…</span>`;
@@ -10015,16 +10038,21 @@ function dsFormatPreflight(plan) {
     // Mensajes idénticos salvo el nombre entre comillas se agrupan en UNA
     // línea con contador y detalle desplegable: 50 tomas con el mismo problema
     // no deben inundar el panel.
-    const renderAlerts = (messages, color, icon) => dsGroupAlertMessages(messages).map(group => {
-        if (group.items.length === 1) {
-            return `<div style="color:${color};display:flex;gap:5px;align-items:flex-start;">${alertIcon(icon)}<span>${escapeHtml(group.items[0])}</span></div>`;
-        }
-        const detail = group.items.map(item => `<div style="color:#94a3b8;">${escapeHtml(item)}</div>`).join("");
-        return `<details style="color:${color};">
-            <summary style="cursor:pointer;display:flex;gap:5px;align-items:flex-start;list-style:none;">${alertIcon(icon)}<span><b>×${group.items.length}</b> ${escapeHtml(group.key)} <span style="color:#64748b;">(${tr("deepsky.alert_expand", "ver detalle")})</span></span></summary>
-            <div style="margin:4px 0 6px 22px;max-height:160px;overflow:auto;border-left:2px solid rgba(148,163,184,.2);padding-left:8px;">${detail}</div>
-        </details>`;
-    }).join("");
+    const renderAlerts = (messages, color, icon, silenceable = false) => dsGroupAlertMessages(messages)
+        .filter(group => !(silenceable && dsSilencedAlerts.has(group.key)))
+        .map(group => {
+            const silenceBtn = silenceable
+                ? `<button type="button" class="ds-silence-alert" data-alert-key="${escapeHtml(group.key)}" title="${tr("deepsky.alert_silence_hint", "Ocultar este aviso durante esta sesión")}" style="margin-left:auto;flex:0 0 auto;background:none;border:1px solid rgba(148,163,184,.25);color:#64748b;border-radius:6px;font-size:.56rem;padding:1px 8px;cursor:pointer;">${tr("deepsky.alert_silence", "Silenciar")}</button>`
+                : "";
+            if (group.items.length === 1) {
+                return `<div style="color:${color};display:flex;gap:5px;align-items:flex-start;">${alertIcon(icon)}<span>${escapeHtml(group.items[0])}</span>${silenceBtn}</div>`;
+            }
+            const detail = group.items.map(item => `<div style="color:#94a3b8;">${escapeHtml(item)}</div>`).join("");
+            return `<details style="color:${color};">
+                <summary style="cursor:pointer;display:flex;gap:5px;align-items:flex-start;list-style:none;">${alertIcon(icon)}<span><b>×${group.items.length}</b> ${escapeHtml(group.key)} <span style="color:#64748b;">(${tr("deepsky.alert_expand", "ver detalle")})</span></span>${silenceBtn}</summary>
+                <div style="margin:4px 0 6px 22px;max-height:160px;overflow:auto;border-left:2px solid rgba(148,163,184,.2);padding-left:8px;">${detail}</div>
+            </details>`;
+        }).join("");
     const policySelect = document.getElementById("sel-ds-calibration-policy");
     const proceedOffer = !plan.valid && policySelect?.value === "strict"
         ? `<div style="margin:7px 0;padding:7px 9px;border:1px solid rgba(251,191,36,.35);border-radius:8px;background:rgba(120,53,15,.08);color:#fcd34d;">
@@ -10035,7 +10063,7 @@ function dsFormatPreflight(plan) {
     const alerts = [
         renderAlerts(errors, "#fca5a5", "cross"),
         proceedOffer,
-        renderAlerts(warnings, "#fcd34d", "warning"),
+        renderAlerts(warnings, "#fcd34d", "warning", true),
         ...(plan.scientificEligible === false
             ? [`<div style="color:#fcd34d;display:flex;gap:5px;align-items:flex-start;">${alertIcon("warning")}<span>${escapeHtml(tr("deepsky.method_blocked_nonlinear", "EIDR y NebulaFusion requieren entradas científicas lineales (FITS/TIFF); revisa los avisos del plan."))}</span></div>`]
             : []),
@@ -10145,9 +10173,14 @@ function dsApplyPreparedPlan(plan) {
             ? ""
             : tr("deepsky.method_blocked_nonlinear", "EIDR y NebulaFusion requieren entradas científicas lineales (FITS/TIFF); revisa los avisos del plan.");
     }
+    // El re-render de los paneles no debe mover al usuario: se captura el
+    // scroll del asistente y de cada panel y se restaura tras pintar.
+    const wizardScroller = document.getElementById("ds-wizard-scroll");
+    const wizardScrollTop = wizardScroller ? wizardScroller.scrollTop : 0;
     for (const id of ["ds-preflight-inspection", "ds-preflight-review"]) {
         const panel = document.getElementById(id);
         if (!panel) continue;
+        panel.classList.remove("ds-refreshing");
         panel.dataset.state = plan?.valid ? "ok" : "error";
         panel.innerHTML = dsFormatPreflight(plan)
             + (id === "ds-preflight-review" ? dsFormatInspectionDiagnostics() : "");
@@ -10180,11 +10213,22 @@ function dsApplyPreparedPlan(plan) {
                 dsSchedulePreflight(true);
             });
         });
+        panel.querySelectorAll(".ds-silence-alert").forEach(button => {
+            button.addEventListener("click", (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                dsSilencedAlerts.add(button.dataset.alertKey);
+                dsApplyPreparedPlan(dsPreparedPlan);
+            });
+        });
     }
     const run = document.getElementById("btn-deepsky-run");
     if (run) {
         run.disabled = !plan?.valid;
         run.style.opacity = plan?.valid ? "1" : ".5";
+    }
+    if (wizardScroller) {
+        requestAnimationFrame(() => { wizardScroller.scrollTop = wizardScrollTop; });
     }
     dsSyncWizard();
 }
@@ -10338,8 +10382,8 @@ async function dsOpenFramePreview(row, allRows) {
     const reason = row.rejectionReason
         ? escapeHtml(row.rejectionReason)
         : (row.rejectable ? "Métricas fuera de la mediana del lote" : "Sin observaciones: métricas dentro del lote");
-    overlay.innerHTML = `<div style="background:#0f172a;border:1px solid rgba(148,163,184,.25);border-radius:14px;max-width:min(980px,94vw);max-height:92vh;display:flex;flex-direction:column;overflow:hidden;">
-        <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid rgba(148,163,184,.15);">
+    overlay.innerHTML = `<div class="ds-viewer-shell">
+        <div class="ds-viewer-bar top">
             <button id="ds-viewer-prev" class="secondary" style="font-size:.62rem;padding:4px 10px;border-radius:8px;" ${rowIndex > 0 ? "" : "disabled"} title="Toma anterior (flecha izquierda)">‹</button>
             <button id="ds-viewer-next" class="secondary" style="font-size:.62rem;padding:4px 10px;border-radius:8px;" ${rowIndex >= 0 && rowIndex < rows.length - 1 ? "" : "disabled"} title="Toma siguiente (flecha derecha)">›</button>
             <b style="color:#e2e8f0;font-size:.72rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(row.path)}">${escapeHtml(row.name)}</b>
@@ -10348,8 +10392,8 @@ async function dsOpenFramePreview(row, allRows) {
             <button id="ds-viewer-discard" class="secondary" style="font-size:.62rem;padding:4px 12px;border-radius:8px;">${isDiscarded() ? "Restaurar" : "Descartar del apilado"}</button>
             <button id="ds-viewer-close" class="secondary" style="font-size:.62rem;padding:4px 12px;border-radius:8px;">Cerrar</button>
         </div>
-        <div id="ds-viewer-body" style="flex:1;min-height:280px;display:flex;align-items:center;justify-content:center;background:#020617;color:#94a3b8;font-size:.66rem;">Cargando y estirando la toma…</div>
-        <div style="padding:9px 14px;border-top:1px solid rgba(148,163,184,.15);display:flex;gap:14px;flex-wrap:wrap;color:#cbd5e1;font-size:.62rem;">
+        <div id="ds-viewer-body" class="ds-viewer-body">Cargando y estirando la toma…</div>
+        <div class="ds-viewer-bar bottom">
             <span>Estrellas <b>${row.stars}</b></span>
             <span>FWHM <b>${Number(row.fwhm || 0).toFixed(2)}</b></span>
             <span>Ruido <b>${Math.round(row.noise || 0)}</b></span>
@@ -10460,7 +10504,16 @@ async function dsPreparePlan() {
     }
     for (const id of ["ds-preflight-inspection", "ds-preflight-review"]) {
         const panel = document.getElementById(id);
-        if (panel) { panel.dataset.state = "idle"; panel.textContent = "Leyendo cabeceras y preparando el plan…"; }
+        if (!panel) continue;
+        // Con un plan previo visible NO se borra el contenido (borrarlo
+        // colapsaba la altura y el scroll saltaba al inicio): se atenúa hasta
+        // que llegue el plan nuevo.
+        if (dsPreparedPlan) {
+            panel.classList.add("ds-refreshing");
+        } else {
+            panel.dataset.state = "idle";
+            panel.textContent = "Leyendo cabeceras y preparando el plan…";
+        }
     }
     try {
         const multiband = dsIsMultibandSession();
@@ -11571,8 +11624,8 @@ function dsLoadUxFixtureIfRequested(modal) {
         effectiveEngine: "Hybrid CPU+GPU · Apple M5 (Metal)", effectiveRejection: "winsorized",
         estimatedSeconds: seconds, warnings: [], errors: [],
         sessionMap: [
-            { night: `2026-03-0${tag}`, lights: Math.ceil(frames / 2), exposureSeconds: 21000, flatNight: null, flatCount: 0, flatDistanceDays: 0, darks: "darks: 600s", lightPaths: Array.from({ length: Math.ceil(frames / 2) }, (_, i) => `/ux-fixture/L${tag}a_${i}.fits`) },
-            { night: `2026-05-1${tag}`, lights: Math.floor(frames / 2), exposureSeconds: 19000, flatNight: null, flatCount: 0, flatDistanceDays: 0, darks: "darks: 600s", lightPaths: Array.from({ length: Math.floor(frames / 2) }, (_, i) => `/ux-fixture/L${tag}b_${i}.fits`) },
+            { night: `2026-03-0${tag}`, lights: Math.ceil(frames / 2), exposureSeconds: 21000, flatNight: null, flatCount: 0, flatDistanceDays: 0, darks: "darks: 600s", filter: "HA_OIII", lightPaths: Array.from({ length: Math.ceil(frames / 2) }, (_, i) => `/ux-fixture/L${tag}a_${i}.fits`) },
+            { night: `2026-05-1${tag}`, lights: Math.floor(frames / 2), exposureSeconds: 19000, flatNight: null, flatCount: 0, flatDistanceDays: 0, darks: "darks: 600s", filter: "HA_OIII", lightPaths: Array.from({ length: Math.floor(frames / 2) }, (_, i) => `/ux-fixture/L${tag}b_${i}.fits`) },
         ],
         calibrationBatches: {
             flats: [

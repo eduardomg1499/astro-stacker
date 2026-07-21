@@ -1005,6 +1005,9 @@
         }
     },
     "deepsky": {
+        "linker_filter": "Filtro",
+        "alert_silence": "Silenciar",
+        "alert_silence_hint": "Ocultar este aviso durante esta sesión",
         "linker_title": "LIGAR CALIBRACIÓN (MANUAL)",
         "linker_hint": "Liga un lote concreto a los lights de cada noche, u omite flats/darks para esa noche. Desmarca un lote para excluirlo por completo. Todo queda registrado en la matriz y la receta.",
         "linker_night": "Noche (lights)",

@@ -1406,6 +1406,24 @@
         #deepsky-modal .ds-advanced > summary { padding:11px 14px; color:#c4b5fd; background:rgba(124,58,237,.06); cursor:pointer; font-size:.72rem; font-weight:700; }
         #deepsky-modal .ds-advanced .ds-opts { padding:12px; margin:0; }
         #deepsky-modal .ds-preflight { min-height:80px; padding:14px 16px; margin-bottom:12px; border-radius:12px; border:1px solid #334155; background:rgba(15,23,42,.72); font-size:.74rem; color:#cbd5e1; line-height:1.58; overflow-wrap:anywhere; }
+        /* Re-preparación en curso: atenuar sin borrar (el contenido conserva
+           su altura y el scroll del asistente no salta). */
+        #deepsky-modal .ds-preflight.ds-refreshing { opacity:.55; pointer-events:none; transition:opacity .15s ease; }
+        /* Visor de tomas: columna flex; la imagen nunca queda tapada en
+           pantallas altas. En pantallas BAJAS las barras se superponen con
+           fondo translúcido para cederle toda la altura a la imagen. */
+        #ds-frame-viewer .ds-viewer-shell { background:#0f172a; border:1px solid rgba(148,163,184,.25); border-radius:14px; width:min(1280px,96vw); max-height:94vh; display:flex; flex-direction:column; overflow:hidden; position:relative; }
+        #ds-frame-viewer .ds-viewer-bar { display:flex; align-items:center; gap:10px; padding:10px 14px; flex:0 0 auto; }
+        #ds-frame-viewer .ds-viewer-bar.top { border-bottom:1px solid rgba(148,163,184,.15); }
+        #ds-frame-viewer .ds-viewer-bar.bottom { border-top:1px solid rgba(148,163,184,.15); flex-wrap:wrap; gap:14px; color:#cbd5e1; font-size:.62rem; }
+        #ds-frame-viewer .ds-viewer-body { flex:1 1 auto; min-height:280px; display:flex; align-items:center; justify-content:center; background:#020617; color:#94a3b8; font-size:.66rem; overflow:hidden; }
+        @media (max-height: 720px) {
+            #ds-frame-viewer .ds-viewer-shell { height:96vh; }
+            #ds-frame-viewer .ds-viewer-body { position:absolute; inset:0; min-height:0; }
+            #ds-frame-viewer .ds-viewer-bar { position:absolute; left:0; right:0; z-index:2; background:rgba(2,6,23,.82); backdrop-filter:blur(6px); }
+            #ds-frame-viewer .ds-viewer-bar.top { top:0; border-bottom:none; }
+            #ds-frame-viewer .ds-viewer-bar.bottom { bottom:0; border-top:none; }
+        }
         #deepsky-modal .ds-preflight[data-state="error"] { border-color:rgba(248,113,113,.55); background:rgba(127,29,29,.12); }
         #deepsky-modal .ds-preflight[data-state="ok"] { border-color:rgba(52,211,153,.35); background:rgba(6,78,59,.10); }
         #deepsky-modal .ds-wizard-footer {

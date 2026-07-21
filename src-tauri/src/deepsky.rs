@@ -1538,7 +1538,7 @@ fn ds_probe_exptime(path: &str) -> Option<f32> {
 /// para las longitudes habituales (±1-8 h de UTC) el desfase nunca cruza el
 /// mediodía en tomas nocturnas, así que la partición por noche es estable.
 fn ds_session_night_id(path: &str, date_obs: Option<&str>) -> Option<String> {
-    use chrono::{DateTime, Duration, Local, NaiveDateTime, Timelike};
+    use chrono::{DateTime, Datelike, Duration, Local, NaiveDateTime, Timelike};
     let parsed = date_obs.and_then(|raw| {
         let s = raw.trim();
         let s = &s[..s.len().min(19)];
@@ -1546,9 +1546,37 @@ fn ds_session_night_id(path: &str, date_obs: Option<&str>) -> Option<String> {
             .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
             .ok()
     });
-    let stamp = match parsed {
-        Some(dt) => dt,
-        None => {
+    // Testigo cruzado: los programas de captura nombran "YYYY-MM-DD_HH-MM-SS_…"
+    // con el reloj del host. Si la cabecera y el nombre discrepan mucho —el
+    // caso típico es el AÑO mal configurado en la cámara (mismo mes/día, año
+    // distinto)— el nombre es más fiable y evita que un lote entero de flats
+    // caiga en una "noche" inexistente que rompe el emparejado por sesión.
+    let filename_stamp = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|name| {
+            let head: String = name.chars().take(19).collect();
+            NaiveDateTime::parse_from_str(&head, "%Y-%m-%d_%H-%M-%S").ok()
+        });
+    let stamp = match (parsed, filename_stamp) {
+        (Some(header), Some(named)) => {
+            let far_apart = (header.date() - named.date()).num_days().abs() > 2;
+            let year_swap_matches = {
+                let mut reheaded = header;
+                if let Some(fixed) = header.date().with_year(named.date().year()) {
+                    reheaded = fixed.and_time(header.time());
+                }
+                (reheaded.date() - named.date()).num_days().abs() <= 2
+            };
+            if far_apart && year_swap_matches {
+                named
+            } else {
+                header
+            }
+        }
+        (Some(header), None) => header,
+        (None, Some(named)) => named,
+        (None, None) => {
             DateTime::<Local>::from(std::fs::metadata(path).ok()?.modified().ok()?).naive_local()
         }
     };
@@ -7932,6 +7960,13 @@ fn deepsky_probe(paths: Vec<String>) -> Vec<DsProbe> {
                                 ds_signature_extraction_for_hdu(&hdu, w, h, ch.min(3));
                             let signature_missing =
                                 ds_missing_light_signature_fields(&extraction.signature);
+                            let mut signature = extraction.signature;
+                            // La sesión de la firma usa la MISMA noche
+                            // reconciliada (cabecera + nombre) que el
+                            // emparejado de flats: una sola definición.
+                            signature.session =
+                                ds_session_night_id(&base.path, date_obs.as_deref())
+                                    .or(signature.session);
                             DsProbe {
                                 w,
                                 h,
@@ -7943,7 +7978,7 @@ fn deepsky_probe(paths: Vec<String>) -> Vec<DsProbe> {
                                 binning,
                                 filter,
                                 date_obs,
-                                signature: extraction.signature,
+                                signature,
                                 store_layout: extraction.layout,
                                 signature_warnings: extraction.warnings,
                                 signature_missing,
@@ -8549,6 +8584,11 @@ fn ds_select_calibration_group(
         groups.entry(key).or_default().push(probe);
     }
     let mut selected = Vec::<&DsProbe>::new();
+    // Motivos AGRUPADOS por patrón: enumerar cada archivo con el mismo
+    // problema inundaba el panel (500 flats → 500 líneas). Cada patrón guarda
+    // (nº de archivos, nombre de ejemplo).
+    let mut mismatch_groups: std::collections::BTreeMap<(String, bool), (usize, String)> =
+        std::collections::BTreeMap::new();
     for probe in probes.iter().filter(|probe| probe.ok) {
         let exact = references.iter().filter(|reference| reference.ok).any(|reference| {
             ds_compare_probe_calibration(
@@ -8584,23 +8624,31 @@ fn ds_select_calibration_group(
             })
             .min_by_key(Vec::len)
             .unwrap_or_else(|| vec!["sin firma de referencia".into()]);
+        if scalable_dark
+            && matches!(policy, pipeline::DeepSkyCalibrationPolicy::AllowDegraded)
+        {
+            selected.push(probe);
+        }
+        let entry = mismatch_groups
+            .entry((best_reasons.join("; "), scalable_dark))
+            .or_insert((0, probe.name.clone()));
+        entry.0 += 1;
+        if matches!(policy, pipeline::DeepSkyCalibrationPolicy::AllowDegraded) {
+            degraded = true;
+        }
+    }
+    for ((reasons_text, scalable), (count, sample)) in &mismatch_groups {
         let reason = format!(
-            "{kind} '{}': {}",
-            probe.name,
-            best_reasons.join("; ")
+            "{kind}: {count} archivo(s) sin coincidencia con los lights (p. ej. '{sample}') — {reasons_text}"
         );
         if matches!(policy, pipeline::DeepSkyCalibrationPolicy::Strict) {
             blocking_reasons.push(reason);
+        } else if *scalable {
+            warnings.push(format!(
+                "AllowDegraded: {reason}; se conservan sólo como candidatos a escalado sujeto a evidencia"
+            ));
         } else {
-            degraded = true;
-            if scalable_dark {
-                selected.push(probe);
-                warnings.push(format!(
-                    "AllowDegraded: {reason}; se conserva sólo como candidato a escalado sujeto a evidencia"
-                ));
-            } else {
-                warnings.push(format!("AllowDegraded: {reason}; se omite"));
-            }
+            warnings.push(format!("AllowDegraded: {reason}; se omiten"));
         }
     }
     selected.sort_by(|a, b| a.path.cmp(&b.path));
@@ -8892,13 +8940,18 @@ fn ds_prepare_calibration_decisions(
                         .into(),
                 );
             }
-            for (flat, matches) in selected_flat.iter().zip(&dark_flats_per_flat) {
-                if matches.is_empty() {
-                    reasons.push(format!(
-                        "dark-flat: el flat '{}' no tiene dark-flat con la misma exposición y temperatura",
-                        flat.name
-                    ));
-                }
+            let flats_without_dark_flat = dark_flats_per_flat
+                .iter()
+                .filter(|matches| matches.is_empty())
+                .count();
+            if flats_without_dark_flat > 0 && !selected_flat.is_empty() {
+                // Un solo aviso con conteo: enumerar cada flat inundaba el
+                // panel. Los dark-flats son calibración OPCIONAL: sin ellos el
+                // pedestal del flat queda sin restar, no es un fallo.
+                reasons.push(format!(
+                    "dark-flat: {flats_without_dark_flat} de {} flats sin dark-flat de la misma exposición/temperatura (los dark-flats son opcionales; puedes ligarlos manualmente o silenciar este aviso)",
+                    selected_flat.len()
+                ));
             }
 
             for (label, supplied, selected) in [
@@ -10317,6 +10370,14 @@ fn prepare_deepsky_stack_impl(
                     })
                     .map(|p| p.path.clone())
                     .collect(),
+                filter: valid_probes
+                    .iter()
+                    .find(|p| {
+                        ds_session_night_id(&p.path, p.date_obs.as_deref())
+                            .unwrap_or_else(|| "?".into())
+                            == *night
+                    })
+                    .and_then(|p| ds_probe_filter_id(p)),
             }
         })
         .collect();
@@ -19794,6 +19855,33 @@ mod ds_tests {
         signals.dithering_rms_px = Some(1.1);
         let (resolved, _, _) = ds_resolve_auto_recipe(auto_request("l"), &signals, 10, true);
         assert_eq!(resolved.drizzle, 1.0);
+    }
+
+    #[test]
+    fn test_ds_session_night_id_reconciles_wrong_clock_year_with_filename() {
+        let dir = std::env::temp_dir().join("zas_night_reconcile_test");
+        let _ = std::fs::create_dir_all(&dir);
+        // Nombre del software de captura con el año correcto; cabecera con el
+        // reloj de la cámara un año atrás (mismo mes/día): gana el nombre.
+        let named = dir.join("2026-04-26_19-47-56_SV220_flat_0001.fits");
+        let _ = std::fs::write(&named, b"x");
+        assert_eq!(
+            ds_session_night_id(named.to_str().unwrap(), Some("2025-04-26T19:47:56")),
+            Some("2026-04-26".into())
+        );
+        // Discrepancia pequeña (cabecera un día después, misma sesión UTC):
+        // gana la cabecera, como siempre.
+        assert_eq!(
+            ds_session_night_id(named.to_str().unwrap(), Some("2026-04-27T03:10:00")),
+            Some("2026-04-26".into())
+        );
+        // Sin patrón de fecha en el nombre: la cabecera manda.
+        let plain = dir.join("flat_sin_fecha.fits");
+        let _ = std::fs::write(&plain, b"x");
+        assert_eq!(
+            ds_session_night_id(plain.to_str().unwrap(), Some("2025-04-26T19:47:56")),
+            Some("2025-04-26".into())
+        );
     }
 
     #[test]

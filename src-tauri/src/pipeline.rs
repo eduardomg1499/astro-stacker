@@ -2350,6 +2350,10 @@ pub struct SessionMapEntry {
     /// asignaciones manuales por sesión (ligar lotes → estos lights).
     #[serde(default)]
     pub light_paths: Vec<String>,
+    /// Filtro de los lights de la noche (id estable o "?"), para que la fila
+    /// del ligado manual identifique QUÉ lights son.
+    #[serde(default)]
+    pub filter: Option<String>,
 }
 
 /// Lote de calibración detectado (flats por noche/filtro, darks por
