@@ -1436,7 +1436,9 @@
         #deepsky-modal .ds-session-time { color:#7dd3fc!important; white-space:nowrap; }
         #deepsky-modal .ds-resource-grid { display:flex; flex-wrap:wrap; gap:8px 20px; margin-bottom:11px; color:#94a3b8; }
         #deepsky-modal .ds-resource-grid b { color:#e2e8f0; }
-        #deepsky-modal .ds-session-groups { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:9px; }
+        /* Columna única: cada grupo contiene tablas anchas (matriz, ligado) y
+           a dos columnas quedaban paneles altísimos y medio vacíos. */
+        #deepsky-modal .ds-session-groups { display:grid; grid-template-columns:1fr; gap:9px; }
         #deepsky-modal .ds-session-group { padding:11px 12px; border-radius:11px; border:1px solid rgba(124,58,237,.22); background:rgba(124,58,237,.05); min-width:0; }
         #deepsky-modal .ds-session-group-head, #deepsky-modal .ds-quality-head { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
         #deepsky-modal .ds-session-group-head > div, #deepsky-modal .ds-quality-head > div { display:flex; flex-direction:column; min-width:0; }

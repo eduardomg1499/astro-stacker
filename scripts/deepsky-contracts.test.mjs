@@ -174,9 +174,9 @@ test("session request excludes manual discards and drops emptied groups", () => 
 
 test("manual calibration assignment is wired end to end", () => {
     assert.ok(requestBuilder, "dsBuildStackRequest must remain identifiable");
-    assert.match(requestBuilder, /calibrationOverrides:\s*\[/);
-    assert.match(requestBuilder, /sel-ds-manual-darks/);
-    assert.match(requestBuilder, /sel-ds-manual-flats/);
+    assert.match(requestBuilder, /calibrationOverrides:\s*dsBuildCalibrationOverrides\(/);
+    assert.match(main, /sel-ds-manual-darks/);
+    assert.match(main, /sel-ds-manual-flats/);
     assert.match(html, /id="sel-ds-manual-darks"[\s\S]*?<option value="auto" selected/);
     assert.match(html, /id="sel-ds-manual-flats"[\s\S]*?<option value="auto" selected/);
     assert.match(main, /decision\.manual/);
@@ -186,6 +186,29 @@ test("manual calibration assignment is wired end to end", () => {
         assert.ok(locale.deepsky.manual_hint);
         assert.ok(locale.deepsky.decision_manual);
     }
+});
+
+test("manual calibration linking works per night with skippable batches", () => {
+    assert.match(main, /function dsFormatCalibrationLinker\(plan\)/);
+    assert.match(main, /plan\?\.calibrationBatches/);
+    assert.match(main, /entry\.lightPaths/);
+    assert.match(main, /data-ds-assign/);
+    assert.match(main, /data-ds-batch/);
+    assert.match(main, /skipFlats/);
+    assert.match(main, /skipDarks/);
+    assert.match(main, /function dsBuildCalibrationOverrides\(/);
+    for (const locale of [en, es]) {
+        assert.ok(locale.deepsky.linker_title);
+        assert.ok(locale.deepsky.linker_hint);
+        assert.ok(locale.deepsky.linker_skip_flats);
+    }
+});
+
+test("frame viewer overlays the deep-sky modal", () => {
+    const viewer = main.match(/ds-frame-viewer[\s\S]{0,400}?z-index:(\d+)/);
+    assert.ok(viewer, "viewer overlay style must be identifiable");
+    assert.ok(Number(viewer[1]) > 10000,
+        "el visor debe quedar por ENCIMA del modal (modal-overlay usa z-index 10000)");
 });
 
 test("preflight floods are grouped and strict offers a degraded path", () => {

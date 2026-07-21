@@ -9621,6 +9621,15 @@ let dsPreparedPlan = null;
 let dsPreflightSerial = 0;
 let dsPreflightTimer = null;
 let dsFrameInspection = [];
+// Ligado MANUAL de calibración por sesión: noche → { flats, darks } con
+// valores "auto" | id de lote | "skip". Los lotes desactivados no viajan al
+// backend. Índices reconstruidos con cada plan (id de lote → paths, noche →
+// paths de lights) para emitir overrides exactos.
+const dsCalibAssignments = new Map();
+const dsDisabledCalibBatches = new Set();
+let dsBatchIndex = new Map();
+let dsNightPaths = new Map();
+
 // Diagnósticos globales de la última inspección: predicción de dithering
 // (walking noise) y patrón de detector. Los publica inspect_deepsky_frames.
 let dsInspectionDiagnostics = null;
@@ -9640,7 +9649,15 @@ const DS_PRESETS = {
 };
 
 function dsCalibrationForIntegration(kind, filter) {
-    const pool = dsMatchedCalib(kind);
+    let pool = dsMatchedCalib(kind);
+    // Lotes excluidos a mano en el ligado de calibración: fuera del request.
+    if (dsDisabledCalibBatches.size && (kind === "flats" || kind === "darks")) {
+        const excluded = new Set();
+        for (const id of dsDisabledCalibBatches) {
+            if (id.startsWith(`${kind}:`)) (dsBatchIndex.get(id) || []).forEach(p => excluded.add(p));
+        }
+        if (excluded.size) pool = pool.filter(file => !excluded.has(file.path));
+    }
     if (kind !== "flats" || !filter || filter === "BROADBAND") return pool;
     const exact = pool.filter(file => dsFilterOfFile(file) === filter);
     return exact.length ? exact : pool;
@@ -9733,17 +9750,41 @@ function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
         localWeighting: checked("chk-ds-localw", false),
         workDir: localStorage.getItem("zas_ds_workdir") || null,
         pedestal: parseFloat(pedestalRaw) || null,
-        // Asignación manual estilo PixInsight: lotes forzados que sustituyen
-        // al emparejamiento automático (lights vacío = todos los lights).
-        calibrationOverrides: [
-            ...(value("sel-ds-manual-darks", "auto") === "all"
-                ? [{ lights: [], darks: dsCalibrationForIntegration("darks", filter).map(f => f.path), flats: [] }]
-                : []),
-            ...(value("sel-ds-manual-flats", "auto") === "all"
-                ? [{ lights: [], darks: [], flats: dsCalibrationForIntegration("flats", filter).map(f => f.path) }]
-                : []),
-        ],
+        calibrationOverrides: dsBuildCalibrationOverrides(lights, filter, value),
     };
+}
+
+// Overrides de calibración manual del request: reglas por noche (ligado de
+// lotes u omisión) + los forzados globales de los selects avanzados. Los
+// lotes desactivados ya se filtraron de las listas de flats/darks.
+function dsBuildCalibrationOverrides(lights, filter, value) {
+    const lightPaths = new Set(lights.map(f => f.path));
+    const overrides = [];
+    for (const [night, assignment] of dsCalibAssignments) {
+        const nightPaths = (dsNightPaths.get(night) || []).filter(p => lightPaths.has(p));
+        if (!nightPaths.length) continue;
+        const entry = { lights: nightPaths, darks: [], flats: [], skipFlats: false, skipDarks: false };
+        let meaningful = false;
+        for (const kind of ["flats", "darks"]) {
+            const choice = assignment[kind] || "auto";
+            if (choice === "auto") continue;
+            if (choice === "skip") {
+                entry[kind === "flats" ? "skipFlats" : "skipDarks"] = true;
+                meaningful = true;
+            } else if (dsBatchIndex.has(choice)) {
+                entry[kind] = dsBatchIndex.get(choice);
+                meaningful = true;
+            }
+        }
+        if (meaningful) overrides.push(entry);
+    }
+    if (value("sel-ds-manual-darks", "auto") === "all") {
+        overrides.push({ lights: [], darks: dsCalibrationForIntegration("darks", filter).map(f => f.path), flats: [], skipFlats: false, skipDarks: false });
+    }
+    if (value("sel-ds-manual-flats", "auto") === "all") {
+        overrides.push({ lights: [], darks: [], flats: dsCalibrationForIntegration("flats", filter).map(f => f.path), skipFlats: false, skipDarks: false });
+    }
+    return overrides;
 }
 
 function dsIsMultibandSession() {
@@ -9800,6 +9841,7 @@ function dsFormatSessionPreflight(plan) {
             <div class="ds-component-flow"><span>Salidas:</span>${components || `<span class="ds-component-chip">Máster</span>`}</div>
             ${dsFormatSamplingAdvisor(p.samplingAdvisor)}
             ${dsFormatSessionMap(p.sessionMap)}
+            ${dsFormatCalibrationLinker(p)}
             ${dsFormatCalibrationDecisions(p.calibrationDecisions)}
         </article>`;
     }).join("");
@@ -9857,9 +9899,9 @@ function dsFormatCalibrationDecisions(decisions) {
         </tr>`;
     }).join("");
     const omitted = decisions.length - visible.length;
-    return `<details style="margin-top:10px;" ${decisions.some(decision => decision.degraded || !decision.compatible) ? "open" : ""}>
+    return `<details style="margin-top:10px;" ${decisions.some(decision => !decision.compatible) ? "open" : ""}>
         <summary style="cursor:pointer;color:#a5b4fc;font-size:.62rem;font-weight:700;letter-spacing:.05em;">MATRIZ DE CALIBRACIÓN · ${decisions.length} LIGHTS</summary>
-        <div style="overflow:auto;border:1px solid rgba(148,163,184,.12);border-radius:8px;margin-top:4px;">
+        <div style="overflow:auto;max-height:260px;border:1px solid rgba(148,163,184,.12);border-radius:8px;margin-top:4px;">
         <table style="width:100%;border-collapse:collapse;font-size:.58rem;min-width:980px;">
             <thead style="background:#111827;color:#94a3b8;"><tr><th style="padding:4px 8px;text-align:left;">Light</th><th style="padding:4px 8px;text-align:left;">Estado</th><th style="padding:4px 8px;text-align:left;">Bias</th><th style="padding:4px 8px;text-align:left;">Dark</th><th style="padding:4px 8px;text-align:left;">Dark-flat</th><th style="padding:4px 8px;text-align:left;">Flat</th><th style="padding:4px 8px;text-align:left;">Razón / fallback</th></tr></thead>
             <tbody>${rows}</tbody>
@@ -9896,6 +9938,48 @@ function dsFormatSamplingAdvisor(advisor) {
             <div><span style="color:${classColor};font-weight:700;">${escapeHtml(classLabel)}</span> · ${recommendation}</div>
         </div>
     </div>`;
+}
+
+// Tarjeta de LIGADO MANUAL: una fila por noche de lights con selects de
+// flats/darks (Auto · lote concreto · Omitir) y la lista de lotes detectados
+// con casilla "usar". Cada cambio re-prepara el plan al instante.
+function dsFormatCalibrationLinker(plan) {
+    const batches = plan?.calibrationBatches || {};
+    const flatBatches = batches.flats || [];
+    const darkBatches = batches.darks || [];
+    const nights = (plan?.sessionMap || []).filter(entry => (entry.lightPaths || []).length);
+    if (!nights.length || (!flatBatches.length && !darkBatches.length)) return "";
+    const options = (kind, list, current) => {
+        const opts = [`<option value="auto"${current === "auto" ? " selected" : ""}>${tr("deepsky.linker_auto", "Auto (por firma)")}</option>`];
+        for (const batch of list) {
+            if (dsDisabledCalibBatches.has(batch.id)) continue;
+            opts.push(`<option value="${escapeHtml(batch.id)}"${current === batch.id ? " selected" : ""}>${escapeHtml(batch.label)}</option>`);
+        }
+        opts.push(`<option value="skip"${current === "skip" ? " selected" : ""}>${kind === "flats" ? tr("deepsky.linker_skip_flats", "Omitir flats") : tr("deepsky.linker_skip_darks", "Omitir darks")}</option>`);
+        return opts.join("");
+    };
+    const rows = nights.map(entry => {
+        const assignment = dsCalibAssignments.get(entry.night) || { flats: "auto", darks: "auto" };
+        return `<tr style="border-top:1px solid rgba(148,163,184,.1);">
+            <td style="padding:5px 8px;color:#e2e8f0;white-space:nowrap;">${escapeHtml(entry.night)} <span style="color:#64748b;">· ${entry.lights} lights</span></td>
+            <td style="padding:5px 8px;"><select class="ds-sel" style="width:100%;min-width:150px;" data-ds-assign="${escapeHtml(entry.night)}" data-kind="flats">${options("flats", flatBatches, assignment.flats)}</select></td>
+            <td style="padding:5px 8px;"><select class="ds-sel" style="width:100%;min-width:150px;" data-ds-assign="${escapeHtml(entry.night)}" data-kind="darks">${options("darks", darkBatches, assignment.darks)}</select></td>
+        </tr>`;
+    }).join("");
+    const batchChips = [...flatBatches, ...darkBatches].map(batch => `<label style="display:inline-flex;align-items:center;gap:5px;margin:2px 10px 2px 0;color:#cbd5e1;cursor:pointer;">
+        <input type="checkbox" data-ds-batch="${escapeHtml(batch.id)}" ${dsDisabledCalibBatches.has(batch.id) ? "" : "checked"} style="width:auto;">
+        <span>${escapeHtml(batch.label)}</span>
+    </label>`).join("");
+    return `<details style="margin-top:10px;" ${dsCalibAssignments.size || dsDisabledCalibBatches.size ? "open" : ""}>
+        <summary style="cursor:pointer;color:#a5b4fc;font-size:.62rem;font-weight:700;letter-spacing:.05em;">${tr("deepsky.linker_title", "LIGAR CALIBRACIÓN (MANUAL)")}</summary>
+        <div style="margin-top:5px;color:#94a3b8;font-size:.6rem;">${tr("deepsky.linker_hint", "Liga un lote concreto a los lights de cada noche, u omite flats/darks para esa noche. Desmarca un lote para excluirlo por completo. Todo queda registrado en la matriz y la receta.")}</div>
+        <div style="overflow:auto;border:1px solid rgba(148,163,184,.12);border-radius:8px;margin-top:5px;">
+        <table style="width:100%;border-collapse:collapse;font-size:.6rem;min-width:520px;">
+            <thead style="background:#111827;color:#94a3b8;"><tr><th style="padding:4px 8px;text-align:left;">${tr("deepsky.linker_night", "Noche (lights)")}</th><th style="padding:4px 8px;text-align:left;">Flats</th><th style="padding:4px 8px;text-align:left;">Darks</th></tr></thead>
+            <tbody>${rows}</tbody>
+        </table></div>
+        ${batchChips ? `<div style="margin-top:6px;font-size:.6rem;"><b style="color:#a5b4fc;">${tr("deepsky.linker_batches", "Lotes detectados")}:</b><div style="margin-top:3px;">${batchChips}</div></div>` : ""}
+    </details>`;
 }
 
 // Agrupa mensajes que solo difieren en el nombre citado ('...') para
@@ -10007,12 +10091,33 @@ function dsFormatPreflight(plan) {
     <div style="margin:0 0 8px;padding:7px 9px;border:1px solid rgba(34,211,238,.2);border-radius:8px;background:rgba(8,145,178,.06);color:#a5f3fc;">
         <b>Perfil recomendado: ${escapeHtml(recommendedLabel)}</b>
         ${recommendation ? `<div style="margin-top:3px;color:#94a3b8;line-height:1.45;">${recommendation}</div>` : ""}
-    </div>${resolvedBlock}${dsFormatSamplingAdvisor(plan.samplingAdvisor)}${alerts}${groupRows}${dsFormatSessionMap(plan.sessionMap)}${dsFormatCalibrationDecisions(plan.calibrationDecisions)}<div style="margin-top:8px;">${stages}</div>
+    </div>${resolvedBlock}${dsFormatSamplingAdvisor(plan.samplingAdvisor)}${alerts}${groupRows}${dsFormatSessionMap(plan.sessionMap)}${dsFormatCalibrationLinker(plan)}${dsFormatCalibrationDecisions(plan.calibrationDecisions)}<div style="margin-top:8px;">${stages}</div>
     ${normModel ? `<details style="margin-top:7px;"><summary style="cursor:pointer;color:#a5f3fc;">Modelo de normalización a inspeccionar</summary><div style="padding-top:5px;">${normModel}</div></details>` : ""}`;
 }
 
 function dsApplyPreparedPlan(plan) {
     dsPreparedPlan = plan;
+    // Reconstruir los índices del ligado manual con los datos del plan; las
+    // asignaciones de noches que ya no existen se descartan.
+    {
+        const plans = plan?.sessionId ? (plan.groups || []).map(g => g.plan).filter(Boolean) : [plan].filter(Boolean);
+        dsBatchIndex = new Map();
+        dsNightPaths = new Map();
+        for (const p of plans) {
+            for (const batch of [...(p?.calibrationBatches?.flats || []), ...(p?.calibrationBatches?.darks || [])]) {
+                dsBatchIndex.set(batch.id, batch.paths || []);
+            }
+            for (const entry of p?.sessionMap || []) {
+                if ((entry.lightPaths || []).length) dsNightPaths.set(entry.night, entry.lightPaths);
+            }
+        }
+        for (const night of [...dsCalibAssignments.keys()]) {
+            if (!dsNightPaths.has(night)) dsCalibAssignments.delete(night);
+        }
+        for (const id of [...dsDisabledCalibBatches]) {
+            if (!dsBatchIndex.has(id)) dsDisabledCalibBatches.delete(id);
+        }
+    }
     const firstSessionPlan = plan?.groups?.[0]?.plan;
     const recommendedProfile = plan?.recommendedProfile || firstSessionPlan?.recommendedProfile;
     const recommendedPreset = recommendedProfile === "maximum_quality" ? "max" : recommendedProfile;
@@ -10055,6 +10160,25 @@ function dsApplyPreparedPlan(plan) {
                 policy.dispatchEvent(new Event("change", { bubbles: true }));
             }
             dsSchedulePreflight(true);
+        });
+        // Ligado manual: cada cambio actualiza el estado y re-prepara.
+        panel.querySelectorAll("select[data-ds-assign]").forEach(select => {
+            select.addEventListener("change", () => {
+                const night = select.dataset.dsAssign;
+                const current = dsCalibAssignments.get(night) || { flats: "auto", darks: "auto" };
+                current[select.dataset.kind] = select.value;
+                if (current.flats === "auto" && current.darks === "auto") dsCalibAssignments.delete(night);
+                else dsCalibAssignments.set(night, current);
+                dsSchedulePreflight(true);
+            });
+        });
+        panel.querySelectorAll("input[data-ds-batch]").forEach(checkbox => {
+            checkbox.addEventListener("change", () => {
+                const id = checkbox.dataset.dsBatch;
+                if (checkbox.checked) dsDisabledCalibBatches.delete(id);
+                else dsDisabledCalibBatches.add(id);
+                dsSchedulePreflight(true);
+            });
         });
     }
     const run = document.getElementById("btn-deepsky-run");
@@ -10207,7 +10331,7 @@ async function dsOpenFramePreview(row, allRows) {
     if (overlay) overlay.remove();
     overlay = document.createElement("div");
     overlay.id = "ds-frame-viewer";
-    overlay.style.cssText = "position:fixed;inset:0;z-index:2600;background:rgba(2,6,23,.88);display:flex;align-items:center;justify-content:center;padding:24px;";
+    overlay.style.cssText = "position:fixed;inset:0;z-index:12000;background:rgba(2,6,23,.88);display:flex;align-items:center;justify-content:center;padding:24px;";
     const isDiscarded = () => dsDiscardedPaths.has(row.path);
     const rows = allRows || dsFrameInspection;
     const rowIndex = rows.indexOf(row);
@@ -11442,18 +11566,29 @@ function dsLoadUxFixtureIfRequested(modal) {
     dsPreflightSerial += 1;
     dsInspectionSerial += 1;
     dsSyncWizard();
-    const groupPlan = (frames, seconds) => ({
+    const groupPlan = (frames, seconds, tag) => ({
         valid: true, groups: [{ frameCount: frames }], recommendedProfile: "maximum_quality",
         effectiveEngine: "Hybrid CPU+GPU · Apple M5 (Metal)", effectiveRejection: "winsorized",
         estimatedSeconds: seconds, warnings: [], errors: [],
+        sessionMap: [
+            { night: `2026-03-0${tag}`, lights: Math.ceil(frames / 2), exposureSeconds: 21000, flatNight: null, flatCount: 0, flatDistanceDays: 0, darks: "darks: 600s", lightPaths: Array.from({ length: Math.ceil(frames / 2) }, (_, i) => `/ux-fixture/L${tag}a_${i}.fits`) },
+            { night: `2026-05-1${tag}`, lights: Math.floor(frames / 2), exposureSeconds: 19000, flatNight: null, flatCount: 0, flatDistanceDays: 0, darks: "darks: 600s", lightPaths: Array.from({ length: Math.floor(frames / 2) }, (_, i) => `/ux-fixture/L${tag}b_${i}.fits`) },
+        ],
+        calibrationBatches: {
+            flats: [
+                { id: `flats:2026-03-0${tag} · HA_OIII`, label: `2026-03-0${tag} · HA_OIII · 90 flats`, count: 90, paths: Array.from({ length: 3 }, (_, i) => `/ux-fixture/F${tag}a_${i}.fits`) },
+                { id: `flats:2026-05-1${tag} · HA_OIII`, label: `2026-05-1${tag} · HA_OIII · 90 flats`, count: 90, paths: Array.from({ length: 3 }, (_, i) => `/ux-fixture/F${tag}b_${i}.fits`) },
+            ],
+            darks: [{ id: "darks:600 s", label: "600 s · 20 darks", count: 20, paths: Array.from({ length: 3 }, (_, i) => `/ux-fixture/D_${i}.fits`) }],
+        },
     });
     dsApplyPreparedPlan({
         sessionId: "ux-session", valid: true, totalFrames: 125,
         estimatedRamMb: 620, estimatedVramMb: 410, estimatedDiskMb: 11800, estimatedSeconds: 86,
         componentFilters: ["HA", "OIII", "SII"], warnings: ["Sesión multibanda: 2 integraciones separadas y coordinadas"], errors: [],
         groups: [
-            { id: "ha_oiii", label: "Ha + OIII · 53 lights", filterProfile: "HA_OIII", componentFilters: ["HA", "OIII"], plan: groupPlan(53, 38) },
-            { id: "sii_oiii", label: "SII + OIII · 72 lights", filterProfile: "SII_OIII", componentFilters: ["SII", "OIII"], plan: groupPlan(72, 48) },
+            { id: "ha_oiii", label: "Ha + OIII · 53 lights", filterProfile: "HA_OIII", componentFilters: ["HA", "OIII"], plan: groupPlan(53, 38, 1) },
+            { id: "sii_oiii", label: "SII + OIII · 72 lights", filterProfile: "SII_OIII", componentFilters: ["SII", "OIII"], plan: groupPlan(72, 48, 2) },
         ],
     });
     dsRenderFrameInspection([

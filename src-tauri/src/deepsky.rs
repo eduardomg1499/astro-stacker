@@ -9479,7 +9479,8 @@ fn ds_apply_manual_overrides_to_decisions(
     overrides: &[pipeline::DeepSkyCalibrationOverride],
 ) {
     for over in overrides {
-        if over.darks.is_empty() && over.flats.is_empty() {
+        if over.darks.is_empty() && over.flats.is_empty() && !over.skip_flats && !over.skip_darks
+        {
             continue;
         }
         let applies =
@@ -9489,13 +9490,26 @@ fn ds_apply_manual_overrides_to_decisions(
                 continue;
             }
             decision.manual = true;
-            if !over.darks.is_empty() {
+            if over.skip_darks {
+                decision.reasons.retain(|reason| !reason.starts_with("dark:"));
+                decision.dark_master_path = None;
+                decision.dark_scale = None;
+                decision
+                    .reasons
+                    .push("dark omitido por decisión del usuario".into());
+            } else if !over.darks.is_empty() {
                 decision.reasons.retain(|reason| !reason.starts_with("dark:"));
                 decision.dark_master_path =
                     Some(format!("manual://{} darks", over.darks.len()));
                 decision.dark_scale = Some(1.0);
             }
-            if !over.flats.is_empty() {
+            if over.skip_flats {
+                decision.reasons.retain(|reason| !reason.starts_with("flat:"));
+                decision.flat_master_path = None;
+                decision
+                    .reasons
+                    .push("flat omitido por decisión del usuario".into());
+            } else if !over.flats.is_empty() {
                 decision.reasons.retain(|reason| !reason.starts_with("flat:"));
                 decision.flat_master_path =
                     Some(format!("manual://{} flats", over.flats.len()));
@@ -10294,6 +10308,15 @@ fn prepare_deepsky_stack_impl(
                 flat_count: flat.map(|(_, flat_count)| flat_count).unwrap_or(0),
                 flat_distance_days,
                 darks: darks_desc_for_map.clone(),
+                light_paths: valid_probes
+                    .iter()
+                    .filter(|p| {
+                        ds_session_night_id(&p.path, p.date_obs.as_deref())
+                            .unwrap_or_else(|| "?".into())
+                            == *night
+                    })
+                    .map(|p| p.path.clone())
+                    .collect(),
             }
         })
         .collect();
@@ -10676,8 +10699,51 @@ fn prepare_deepsky_stack_impl(
         "coeficientes y rango local se guardan por frame en la receta".into(),
     );
 
+    // Lotes visibles para el ligado manual: flats por noche/filtro y darks
+    // por grupo de exposición, con sus paths para construir overrides exactos.
+    let calibration_batches = {
+        let mut flats_by_key: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for probe in preflight_flat_probes.iter().filter(|p| p.ok) {
+            let night = ds_session_night_id(&probe.path, probe.date_obs.as_deref())
+                .unwrap_or_else(|| "sin fecha".into());
+            let filter = ds_probe_filter_id(probe).unwrap_or_else(|| "?".into());
+            flats_by_key
+                .entry(format!("{night} · {filter}"))
+                .or_default()
+                .push(probe.path.clone());
+        }
+        let flats = flats_by_key
+            .into_iter()
+            .map(|(key, paths)| crate::pipeline::CalibrationBatchInfo {
+                id: format!("flats:{key}"),
+                label: format!("{key} · {} flats", paths.len()),
+                count: paths.len(),
+                paths,
+            })
+            .collect();
+        let darks = ds_group_darks_by_exposure(
+            &request.darks,
+            crate::deepsky_calibration_contract::CalibrationRole::Dark,
+        )
+        .into_iter()
+        .map(|(exposure, paths)| {
+            let exposure_label = exposure
+                .map(|seconds| format!("{seconds:.0} s"))
+                .unwrap_or_else(|| "sin EXPTIME".into());
+            crate::pipeline::CalibrationBatchInfo {
+                id: format!("darks:{exposure_label}"),
+                label: format!("{exposure_label} · {} darks", paths.len()),
+                count: paths.len(),
+                paths,
+            }
+        })
+        .collect();
+        crate::pipeline::CalibrationBatches { flats, darks }
+    };
+
     PreparedStackPlan {
         session_map,
+        calibration_batches,
         calibration_decisions,
         plan_id,
         valid: errors.is_empty(),
@@ -14552,8 +14618,38 @@ async fn stack_deepsky_impl(
     let calibration_overrides: Vec<pipeline::DeepSkyCalibrationOverride> = calibration_overrides
         .unwrap_or_default()
         .into_iter()
-        .filter(|over| !over.darks.is_empty() || !over.flats.is_empty())
+        .filter(|over| {
+            !over.darks.is_empty() || !over.flats.is_empty() || over.skip_flats || over.skip_darks
+        })
         .collect();
+    // Omisiones explícitas por light (skip): sin flat/dark para esos lights,
+    // sin error de contrato y con divulgación en decisiones y receta.
+    let mut manual_skip_flats: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut manual_skip_darks: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for over in &calibration_overrides {
+        if !over.skip_flats && !over.skip_darks {
+            continue;
+        }
+        let affected: Vec<String> = if over.lights.is_empty() {
+            lights.clone()
+        } else {
+            lights
+                .iter()
+                .filter(|p| over.lights.iter().any(|l| l == *p))
+                .cloned()
+                .collect()
+        };
+        for path in affected {
+            if over.skip_flats {
+                manual_skip_flats.insert(path.clone());
+            }
+            if over.skip_darks {
+                manual_skip_darks.insert(path);
+            }
+        }
+    }
     let mut integration_method = integration_method;
     let requested_integration_method = integration_method.clone().unwrap_or_else(|| {
         pipeline::DeepSkyIntegrationMethod::Classic(pipeline::ClassicIntegrationConfig {
@@ -15267,6 +15363,9 @@ async fn stack_deepsky_impl(
     // Flat de la misma sesión del light. Strict nunca usa el flat de una noche
     // "cercana": polvo, rotación o tren óptico pueden cambiar entre sesiones.
     let flat_for_light = |path: &str| -> Result<Option<&DsCalibrationMaster>, String> {
+        if manual_skip_flats.contains(path) {
+            return Ok(None);
+        }
         if let Some(&over_idx) = manual_flat_for_light.get(path) {
             if let Some(master) = override_flat_masters
                 .get(over_idx)
@@ -15675,26 +15774,38 @@ async fn stack_deepsky_impl(
         };
         // La asignación manual gana a la selección automática: dark forzado
         // con k=1, sin escalado y sin el bloqueo Strict por falta de exacto.
-        let manual_dark: Option<&DsDarkMaster> = manual_dark_for_light
-            .get(p.as_str())
-            .and_then(|&over_idx| override_dark_masters.get(over_idx))
-            .and_then(|master| master.as_ref());
-        let exact_dark = manual_dark.or_else(|| {
-            current_light_probe.and_then(|light| {
-                dark_masters.iter().find(|master| {
-                    master.calibration_probe.as_ref().is_some_and(|dark| {
-                        ds_compare_probe_calibration(
-                            light,
-                            dark,
-                            crate::deepsky_calibration_contract::CalibrationRole::Dark,
-                            pipeline::DeepSkyCalibrationPolicy::Strict,
-                        )
-                        .compatible
+        let manual_skip_dark = manual_skip_darks.contains(p.as_str());
+        let manual_dark: Option<&DsDarkMaster> = if manual_skip_dark {
+            None
+        } else {
+            manual_dark_for_light
+                .get(p.as_str())
+                .and_then(|&over_idx| override_dark_masters.get(over_idx))
+                .and_then(|master| master.as_ref())
+        };
+        let exact_dark = if manual_skip_dark {
+            // Omisión explícita del usuario: sin dark para este light y sin
+            // caer al emparejado automático ni al escalado por cercanía.
+            None
+        } else {
+            manual_dark.or_else(|| {
+                current_light_probe.and_then(|light| {
+                    dark_masters.iter().find(|master| {
+                        master.calibration_probe.as_ref().is_some_and(|dark| {
+                            ds_compare_probe_calibration(
+                                light,
+                                dark,
+                                crate::deepsky_calibration_contract::CalibrationRole::Dark,
+                                pipeline::DeepSkyCalibrationPolicy::Strict,
+                            )
+                            .compatible
+                        })
                     })
                 })
             })
-        });
-        if manual_dark.is_none()
+        };
+        if !manual_skip_dark
+            && manual_dark.is_none()
             && exact_dark.is_none()
             && !dark_masters.is_empty()
             && matches!(
@@ -15718,7 +15829,7 @@ async fn stack_deepsky_impl(
         let mut dark_k = exact_dark.map(|_| 1.0).unwrap_or(1.0);
         let mut scaling_measurement: Option<DsDarkScalingMeasurement> = None;
         let mut dark_scaling_failure: Option<String> = None;
-        if selected_dark.is_none() {
+        if selected_dark.is_none() && !manual_skip_dark {
             if let Some(candidate) = nearest_dark {
                 if !use_dark_opt {
                     dark_scaling_failure = Some(

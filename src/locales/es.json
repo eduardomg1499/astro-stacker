@@ -1005,6 +1005,13 @@
         }
     },
     "deepsky": {
+        "linker_title": "LIGAR CALIBRACIÓN (MANUAL)",
+        "linker_hint": "Liga un lote concreto a los lights de cada noche, u omite flats/darks para esa noche. Desmarca un lote para excluirlo por completo. Todo queda registrado en la matriz y la receta.",
+        "linker_night": "Noche (lights)",
+        "linker_auto": "Auto (por firma)",
+        "linker_skip_flats": "Omitir flats",
+        "linker_skip_darks": "Omitir darks",
+        "linker_batches": "Lotes detectados",
         "manual_darks_label": "Darks forzados (manual)",
         "manual_flats_label": "Flats forzados (manual)",
         "manual_auto": "Automático (por firma)",

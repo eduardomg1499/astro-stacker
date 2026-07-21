@@ -1005,6 +1005,13 @@
         }
     },
     "deepsky": {
+        "linker_title": "LINK CALIBRATION (MANUAL)",
+        "linker_hint": "Link a specific batch to each night's lights, or skip flats/darks for that night. Untick a batch to exclude it entirely. Everything is recorded in the matrix and the recipe.",
+        "linker_night": "Night (lights)",
+        "linker_auto": "Auto (by signature)",
+        "linker_skip_flats": "Skip flats",
+        "linker_skip_darks": "Skip darks",
+        "linker_batches": "Detected batches",
         "manual_darks_label": "Forced darks (manual)",
         "manual_flats_label": "Forced flats (manual)",
         "manual_auto": "Automatic (by signature)",

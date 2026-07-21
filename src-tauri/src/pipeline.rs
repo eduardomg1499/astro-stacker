@@ -2000,6 +2000,10 @@ pub struct DeepSkyCalibrationOverride {
     pub lights: Vec<String>,
     pub darks: Vec<String>,
     pub flats: Vec<String>,
+    /// No aplicar NINGÚN flat/dark a estos lights (decisión explícita del
+    /// usuario; queda registrada y no produce error de contrato).
+    pub skip_flats: bool,
+    pub skip_darks: bool,
 }
 
 impl Default for PreparedCalibrationDecision {
@@ -2342,6 +2346,28 @@ pub struct SessionMapEntry {
     pub flat_count: usize,
     pub flat_distance_days: i64,
     pub darks: String,
+    /// Paths de los lights de esta noche: la UI los usa para construir
+    /// asignaciones manuales por sesión (ligar lotes → estos lights).
+    #[serde(default)]
+    pub light_paths: Vec<String>,
+}
+
+/// Lote de calibración detectado (flats por noche/filtro, darks por
+/// exposición) que la UI puede ligar manualmente o excluir.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationBatchInfo {
+    pub id: String,
+    pub label: String,
+    pub count: usize,
+    pub paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationBatches {
+    pub flats: Vec<CalibrationBatchInfo>,
+    pub darks: Vec<CalibrationBatchInfo>,
 }
 
 /// Asesor de muestreo (F2): FWHM mediana medida en un light representativo y
@@ -2389,6 +2415,8 @@ pub struct PreparedStackPlan {
     /// Matriz de calibración por sesión (vacía cuando no hay metadatos de
     /// fecha o el plan no es válido).
     pub session_map: Vec<SessionMapEntry>,
+    /// Lotes de calibración detectados, para la UI de ligado manual.
+    pub calibration_batches: CalibrationBatches,
     /// Decisión exacta por light/grupo: masters efectivos, compatibilidad,
     /// escala, pedestal y razones. No se codifica dentro de warnings porque
     /// la UI y la receta deben poder auditarla de forma tipada.
