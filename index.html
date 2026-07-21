@@ -1351,7 +1351,7 @@
         #deepsky-modal .ds-wizard-box {
             width: 1220px; max-width: 98vw; height: min(94vh, 860px); max-height: 96vh;
             overflow: clip; padding: 0; display: flex; flex-direction: column; overscroll-behavior: none;
-        }
+         position:relative; }
         #deepsky-modal .ds-wizard-shell {
             width: 100%; height: 100%; min-height: 0; box-sizing: border-box;
             display: flex; flex-direction: column; padding: 22px 28px 18px; text-align: left;
@@ -1409,6 +1409,19 @@
         /* Re-preparación en curso: atenuar sin borrar (el contenido conserva
            su altura y el scroll del asistente no salta). */
         #deepsky-modal .ds-preflight.ds-refreshing { opacity:.55; pointer-events:none; transition:opacity .15s ease; }
+        /* Guía interactiva flotante: bloqueos actuales con salto al control. */
+        #ds-guide { position:absolute; right:16px; bottom:74px; z-index:60; width:min(380px,86%); background:rgba(10,14,26,.97); border:1px solid rgba(124,58,237,.4); border-radius:12px; padding:9px 11px; box-shadow:0 14px 44px rgba(0,0,0,.55); font-size:.62rem; }
+        #ds-guide .ds-guide-head { display:flex; align-items:center; gap:7px; color:#e2e8f0; }
+        #ds-guide .ds-guide-head b { letter-spacing:.04em; }
+        #ds-guide #ds-guide-toggle { margin-left:auto; background:none; border:1px solid rgba(148,163,184,.3); color:#94a3b8; border-radius:6px; font-size:.56rem; padding:1px 8px; cursor:pointer; width:auto; }
+        #ds-guide.collapsed .ds-guide-body { display:none; }
+        #ds-guide .ds-guide-item { display:flex; gap:8px; align-items:flex-start; margin-top:7px; color:#cbd5e1; line-height:1.45; }
+        #ds-guide .ds-guide-dot { flex:0 0 auto; width:8px; height:8px; border-radius:50%; margin-top:4px; }
+        #ds-guide .ds-guide-action { flex:0 0 auto; background:rgba(124,58,237,.16); border:1px solid rgba(167,139,250,.4); color:#c4b5fd; border-radius:7px; font-size:.56rem; padding:2px 9px; cursor:pointer; width:auto; white-space:nowrap; }
+        #ds-guide .ds-guide-action:hover { background:rgba(124,58,237,.3); }
+        /* Resalte pulsante del control al que la guía lleva al usuario. */
+        .ds-spotlight { outline:2px solid rgba(167,139,250,.9) !important; outline-offset:3px; border-radius:10px; animation:dsSpotPulse 1.3s ease-in-out 2; }
+        @keyframes dsSpotPulse { 0%,100% { outline-color:rgba(167,139,250,.95); } 50% { outline-color:rgba(167,139,250,.15); } }
         /* Visor de tomas: columna flex; la imagen nunca queda tapada en
            pantallas altas. En pantallas BAJAS las barras se superponen con
            fondo translúcido para cederle toda la altura a la imagen. */

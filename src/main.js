@@ -9651,7 +9651,7 @@ const DS_PRESETS = {
 function dsCalibrationForIntegration(kind, filter) {
     let pool = dsMatchedCalib(kind);
     // Lotes excluidos a mano en el ligado de calibración: fuera del request.
-    if (dsDisabledCalibBatches.size && (kind === "flats" || kind === "darks")) {
+    if (dsDisabledCalibBatches.size && ["flats", "darks", "darkFlats", "bias"].includes(kind)) {
         const excluded = new Set();
         for (const id of dsDisabledCalibBatches) {
             if (id.startsWith(`${kind}:`)) (dsBatchIndex.get(id) || []).forEach(p => excluded.add(p));
@@ -9962,7 +9962,9 @@ function dsFormatCalibrationLinker(plan) {
     const flatBatches = batches.flats || [];
     const darkBatches = batches.darks || [];
     const nights = (plan?.sessionMap || []).filter(entry => (entry.lightPaths || []).length);
-    if (!nights.length || (!flatBatches.length && !darkBatches.length)) return "";
+    const anyBatches = flatBatches.length || darkBatches.length
+        || (batches.darkFlats || []).length || (batches.bias || []).length;
+    if (!nights.length || !anyBatches) return "";
     const options = (kind, list, current) => {
         const opts = [`<option value="auto"${current === "auto" ? " selected" : ""}>${tr("deepsky.linker_auto", "Auto (por firma)")}</option>`];
         for (const batch of list) {
@@ -9981,7 +9983,9 @@ function dsFormatCalibrationLinker(plan) {
             <td style="padding:5px 8px;"><select class="ds-sel" style="width:100%;min-width:150px;" data-ds-assign="${escapeHtml(entry.night)}" data-kind="darks">${options("darks", darkBatches, assignment.darks)}</select></td>
         </tr>`;
     }).join("");
-    const batchChips = [...flatBatches, ...darkBatches].map(batch => `<label style="display:inline-flex;align-items:center;gap:5px;margin:2px 10px 2px 0;color:#cbd5e1;cursor:pointer;">
+    const darkFlatBatches = batches.darkFlats || [];
+    const biasBatches = batches.bias || [];
+    const batchChips = [...flatBatches, ...darkBatches, ...darkFlatBatches, ...biasBatches].map(batch => `<label style="display:inline-flex;align-items:center;gap:5px;margin:2px 10px 2px 0;color:#cbd5e1;cursor:pointer;">
         <input type="checkbox" data-ds-batch="${escapeHtml(batch.id)}" ${dsDisabledCalibBatches.has(batch.id) ? "" : "checked"} style="width:auto;">
         <span>${escapeHtml(batch.label)}</span>
     </label>`).join("");
@@ -10123,6 +10127,132 @@ function dsFormatPreflight(plan) {
     ${normModel ? `<details style="margin-top:7px;"><summary style="cursor:pointer;color:#a5f3fc;">Modelo de normalización a inspeccionar</summary><div style="padding-top:5px;">${normModel}</div></details>` : ""}`;
 }
 
+// ============ GUÍA INTERACTIVA: qué falta para poder apilar ============
+// Tarjeta flotante dentro del asistente: lista los bloqueos ACTUALES y cada
+// uno lleva al control exacto (paso + scroll + resalte pulsante). Con el plan
+// válido se convierte en el atajo "Ir a Revisar y apilar".
+let dsGuideCollapsed = false;
+
+function dsSpotlight(target) {
+    if (!target) return;
+    target.scrollIntoView({ block: "center", behavior: "smooth" });
+    target.classList.add("ds-spotlight");
+    setTimeout(() => target.classList.remove("ds-spotlight"), 2800);
+}
+
+function dsOpenLinkerAndSpotlight() {
+    dsSetWizardStep(1, true);
+    requestAnimationFrame(() => {
+        const details = [...document.querySelectorAll(".ds-wizard-page[data-step='1'] details")]
+            .find(d => d.textContent.includes(tr("deepsky.linker_title", "LIGAR CALIBRACIÓN (MANUAL)")));
+        if (details) {
+            details.open = true;
+            dsSpotlight(details);
+        } else {
+            dsSpotlight(document.getElementById("ds-preflight-inspection"));
+        }
+    });
+}
+
+function dsGuideItems(plan) {
+    const items = [];
+    if (!dsActiveLights().length) {
+        items.push({
+            kind: "error",
+            text: tr("deepsky.guide_add_lights", "Añade lights para empezar"),
+            actionLabel: tr("deepsky.guide_go_data", "Ir a Datos"),
+            run: () => { dsSetWizardStep(0, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("ds-sections"))); },
+        });
+        return items;
+    }
+    if (!plan) return items;
+    const errors = plan.errors || [];
+    for (const group of dsGroupAlertMessages(errors).slice(0, 4)) {
+        const item = {
+            kind: "error",
+            text: (group.items.length > 1 ? `×${group.items.length} · ` : "") + group.key,
+        };
+        if (/flat|dark|bias|calibraci/i.test(group.key)) {
+            item.actionLabel = tr("deepsky.guide_fix_linker", "Ligar calibración");
+            item.run = dsOpenLinkerAndSpotlight;
+        } else if (/light|lineal|PNG|JPEG/i.test(group.key)) {
+            item.actionLabel = tr("deepsky.guide_go_data", "Ir a Datos");
+            item.run = () => { dsSetWizardStep(0, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("ds-sections"))); };
+        } else {
+            item.actionLabel = tr("deepsky.guide_view", "Ver detalle");
+            item.run = () => { dsSetWizardStep(1, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("ds-preflight-inspection"))); };
+        }
+        items.push(item);
+    }
+    if (!plan.valid && document.getElementById("sel-ds-calibration-policy")?.value === "strict") {
+        items.push({
+            kind: "warn",
+            text: tr("deepsky.guide_strict", "La política Estricta bloquea al primer incumplimiento; puedes continuar en modo degradado (queda registrado)"),
+            actionLabel: tr("deepsky.proceed_degraded", "Continuar en modo degradado"),
+            run: () => {
+                const policy = document.getElementById("sel-ds-calibration-policy");
+                if (policy) {
+                    policy.value = "allowDegraded";
+                    policy.dispatchEvent(new Event("change", { bubbles: true }));
+                }
+                dsSchedulePreflight(true);
+            },
+        });
+    }
+    if (plan.valid) {
+        items.push({
+            kind: "ok",
+            text: tr("deepsky.guide_ready", "Plan válido: todo listo para apilar"),
+            actionLabel: tr("deepsky.guide_go_run", "Ir a Revisar y apilar"),
+            run: () => { dsSetWizardStep(3, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("btn-deepsky-run"))); },
+        });
+    }
+    return items;
+}
+
+function dsRenderGuide(plan) {
+    const host = document.querySelector("#deepsky-modal .ds-wizard-box");
+    if (!host) return;
+    let card = document.getElementById("ds-guide");
+    const items = dsGuideItems(plan);
+    if (!items.length) {
+        card?.remove();
+        return;
+    }
+    if (!card) {
+        card = document.createElement("div");
+        card.id = "ds-guide";
+        host.appendChild(card);
+    }
+    const blockers = items.filter(item => item.kind === "error").length;
+    const dotColor = { error: "#f87171", warn: "#fbbf24", ok: "#34d399" };
+    card.classList.toggle("collapsed", dsGuideCollapsed);
+    card.innerHTML = `
+        <div class="ds-guide-head">
+            <svg class="zas-icon zas-icon-inline" style="color:#a78bfa;"><use href="#icon-${blockers ? "warning" : "check"}"></use></svg>
+            <b>${tr("deepsky.guide_title", "Guía")}</b>
+            <span style="color:#94a3b8;">${blockers
+                ? trFormat("deepsky.guide_pending", { n: blockers }, `${blockers} por resolver`)
+                : tr("deepsky.guide_all_clear", "sin bloqueos")}</span>
+            <button type="button" id="ds-guide-toggle" title="${tr("deepsky.guide_toggle", "Mostrar u ocultar la guía")}">${dsGuideCollapsed ? "▲" : "▼"}</button>
+        </div>
+        <div class="ds-guide-body">
+            ${items.map((item, index) => `
+                <div class="ds-guide-item">
+                    <span class="ds-guide-dot" style="background:${dotColor[item.kind]};"></span>
+                    <span style="flex:1;">${escapeHtml(item.text)}</span>
+                    ${item.run ? `<button type="button" class="ds-guide-action" data-guide="${index}">${escapeHtml(item.actionLabel)}</button>` : ""}
+                </div>`).join("")}
+        </div>`;
+    card.querySelector("#ds-guide-toggle")?.addEventListener("click", () => {
+        dsGuideCollapsed = !dsGuideCollapsed;
+        dsRenderGuide(plan);
+    });
+    card.querySelectorAll(".ds-guide-action").forEach(button => {
+        button.addEventListener("click", () => items[Number(button.dataset.guide)]?.run?.());
+    });
+}
+
 function dsApplyPreparedPlan(plan) {
     dsPreparedPlan = plan;
     // Reconstruir los índices del ligado manual con los datos del plan; las
@@ -10230,6 +10360,7 @@ function dsApplyPreparedPlan(plan) {
     if (wizardScroller) {
         requestAnimationFrame(() => { wizardScroller.scrollTop = wizardScrollTop; });
     }
+    dsRenderGuide(plan);
     dsSyncWizard();
 }
 

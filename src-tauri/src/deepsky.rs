@@ -8411,9 +8411,18 @@ fn ds_compare_probe_calibration(
             {
                 None
             }
-            (Some(reference_session), Some(candidate_session)) => Some(format!(
-                "session: {reference_session:?} != {candidate_session:?}"
-            )),
+            (Some(reference_session), Some(candidate_session)) => {
+                // Práctica real: los flats se disparan al atardecer siguiente o
+                // al amanecer — la noche ADYACENTE (Δ1 día) es la misma sesión
+                // óptica (el tren no cambia). Más lejos sí es otra sesión.
+                if ds_night_distance(Some(reference_session), Some(candidate_session)) <= 1 {
+                    None
+                } else {
+                    Some(format!(
+                        "session: {reference_session:?} != {candidate_session:?}"
+                    ))
+                }
+            }
             _ => Some("metadata obligatoria ausente: session".into()),
         }
     } else {
@@ -8964,7 +8973,12 @@ fn ds_prepare_calibration_decisions(
                     !selected_dark_flat.is_empty(),
                 ),
             ] {
-                if supplied && !selected {
+                // Sin duplicar: si el rol ya tiene un motivo específico arriba
+                // (dark:/flat:/dark-flat:), el genérico no aporta nada.
+                let already_explained = reasons
+                    .iter()
+                    .any(|reason| reason.starts_with(&format!("{label}:")));
+                if supplied && !selected && !already_explained {
                     reasons.push(format!(
                         "{label}: no existe candidato con firma exacta para este light"
                     ));
@@ -10348,7 +10362,19 @@ fn prepare_deepsky_stack_impl(
             let flat = flat_sessions_for_map
                 .iter()
                 .find(|(flat_night, _)| flat_night == night)
-                .cloned();
+                .cloned()
+                .or_else(|| {
+                    // Noche adyacente (Δ1 día): misma sesión óptica.
+                    flat_sessions_for_map
+                        .iter()
+                        .filter(|(flat_night, _)| {
+                            ds_night_distance(Some(night), Some(flat_night)) <= 1
+                        })
+                        .min_by_key(|(flat_night, _)| {
+                            ds_night_distance(Some(night), Some(flat_night))
+                        })
+                        .cloned()
+                });
             let flat_distance_days = flat
                 .as_ref()
                 .map(|(flat_night, _)| ds_night_distance(Some(night), Some(flat_night)))
@@ -10799,7 +10825,45 @@ fn prepare_deepsky_stack_impl(
             }
         })
         .collect();
-        crate::pipeline::CalibrationBatches { flats, darks }
+        let dark_flats = ds_group_darks_by_exposure(
+            &request.dark_flats,
+            crate::deepsky_calibration_contract::CalibrationRole::DarkFlat,
+        )
+        .into_iter()
+        .map(|(exposure, paths)| {
+            let exposure_label = exposure
+                .map(|seconds| {
+                    if seconds < 1.0 {
+                        format!("{seconds:.2} s")
+                    } else {
+                        format!("{seconds:.0} s")
+                    }
+                })
+                .unwrap_or_else(|| "sin EXPTIME".into());
+            crate::pipeline::CalibrationBatchInfo {
+                id: format!("darkFlats:{exposure_label}"),
+                label: format!("dark-flats {exposure_label} · {}", paths.len()),
+                count: paths.len(),
+                paths,
+            }
+        })
+        .collect();
+        let bias = if request.bias.is_empty() {
+            Vec::new()
+        } else {
+            vec![crate::pipeline::CalibrationBatchInfo {
+                id: "bias:todos".into(),
+                label: format!("bias · {}", request.bias.len()),
+                count: request.bias.len(),
+                paths: request.bias.clone(),
+            }]
+        };
+        crate::pipeline::CalibrationBatches {
+            flats,
+            darks,
+            dark_flats,
+            bias,
+        }
     };
 
     PreparedStackPlan {
@@ -15445,6 +15509,19 @@ async fn stack_deepsky_impl(
         if let Some((_, flat)) = flat_masters
             .iter()
             .find(|(master_night, _)| master_night.as_deref() == night.as_deref())
+        {
+            return Ok(Some(flat));
+        }
+        // Sin flat de la MISMA noche: el de la noche adyacente (Δ1 día) es la
+        // misma sesión óptica (flats del atardecer siguiente o del amanecer).
+        if let Some((_, flat)) = flat_masters
+            .iter()
+            .filter(|(master_night, _)| {
+                ds_night_distance(night.as_deref(), master_night.as_deref()) <= 1
+            })
+            .min_by_key(|(master_night, _)| {
+                ds_night_distance(night.as_deref(), master_night.as_deref())
+            })
         {
             return Ok(Some(flat));
         }

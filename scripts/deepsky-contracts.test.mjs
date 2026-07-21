@@ -211,6 +211,25 @@ test("frame viewer overlays the deep-sky modal", () => {
         "el visor debe quedar por ENCIMA del modal (modal-overlay usa z-index 10000)");
 });
 
+test("interactive guide points the user at every blocker", () => {
+    assert.match(main, /function dsRenderGuide\(plan\)/);
+    assert.match(main, /function dsSpotlight\(target\)/);
+    assert.match(main, /ds-guide-action/);
+    assert.match(main, /dsRenderGuide\(plan\);/);
+    for (const locale of [en, es]) {
+        assert.ok(locale.deepsky.guide_title);
+        assert.ok(locale.deepsky.guide_ready);
+        assert.ok(locale.deepsky.guide_fix_linker);
+        assert.ok(locale.deepsky.guide_strict);
+    }
+});
+
+test("all four calibration batch kinds are detectable and excludable", () => {
+    assert.match(main, /batches\.darkFlats/);
+    assert.match(main, /batches\.bias/);
+    assert.match(main, /\["flats", "darks", "darkFlats", "bias"\]\.includes\(kind\)/);
+});
+
 test("preflight floods are grouped and strict offers a degraded path", () => {
     assert.match(main, /function dsGroupAlertMessages\(messages\)/);
     assert.match(main, /btn-ds-proceed-degraded/);

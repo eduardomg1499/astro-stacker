@@ -2372,6 +2372,8 @@ pub struct CalibrationBatchInfo {
 pub struct CalibrationBatches {
     pub flats: Vec<CalibrationBatchInfo>,
     pub darks: Vec<CalibrationBatchInfo>,
+    pub dark_flats: Vec<CalibrationBatchInfo>,
+    pub bias: Vec<CalibrationBatchInfo>,
 }
 
 /// Asesor de muestreo (F2): FWHM mediana medida en un light representativo y

@@ -1005,6 +1005,17 @@
         }
     },
     "deepsky": {
+        "guide_title": "Guide",
+        "guide_pending": "{{n}} to resolve",
+        "guide_all_clear": "no blockers",
+        "guide_toggle": "Show or hide the guide",
+        "guide_add_lights": "Add lights to get started",
+        "guide_go_data": "Go to Data",
+        "guide_fix_linker": "Link calibration",
+        "guide_view": "View detail",
+        "guide_strict": "Strict policy blocks on the first breach; you can continue in degraded mode (recorded)",
+        "guide_ready": "Plan valid: ready to stack",
+        "guide_go_run": "Go to Review & stack",
         "linker_filter": "Filter",
         "alert_silence": "Mute",
         "alert_silence_hint": "Hide this warning for this session",

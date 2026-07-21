@@ -1005,6 +1005,17 @@
         }
     },
     "deepsky": {
+        "guide_title": "Guía",
+        "guide_pending": "{{n}} por resolver",
+        "guide_all_clear": "sin bloqueos",
+        "guide_toggle": "Mostrar u ocultar la guía",
+        "guide_add_lights": "Añade lights para empezar",
+        "guide_go_data": "Ir a Datos",
+        "guide_fix_linker": "Ligar calibración",
+        "guide_view": "Ver detalle",
+        "guide_strict": "La política Estricta bloquea al primer incumplimiento; puedes continuar en modo degradado (queda registrado)",
+        "guide_ready": "Plan válido: todo listo para apilar",
+        "guide_go_run": "Ir a Revisar y apilar",
         "linker_filter": "Filtro",
         "alert_silence": "Silenciar",
         "alert_silence_hint": "Ocultar este aviso durante esta sesión",
