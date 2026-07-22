@@ -16,6 +16,8 @@ import { relaunch } from '@tauri-apps/plugin-process';
 import { getVersion } from '@tauri-apps/api/app';
 import { i18n } from "./i18n.js";
 import { tutorialManager } from "./tutorial_manager.js";
+import { PostProcessSession } from "./postprocess_session.js";
+import { ZenithGuide } from "./zenith_guide.js";
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import {
     BATCH_OUTPUT_POLICY_SINGLE_DIRECTORY,
@@ -53,6 +55,13 @@ try {
 }
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => document.querySelectorAll(selector);
+
+document.addEventListener("dragstart", (event) => {
+    if (event.target instanceof HTMLImageElement) event.preventDefault();
+});
+document.addEventListener("selectstart", (event) => {
+    if (!event.target.closest?.("input, textarea, [contenteditable='true']")) event.preventDefault();
+});
 
 function normalizeBackendText(value) {
     if (value === null || value === undefined) return "";
@@ -1401,9 +1410,23 @@ let isLocalOperation = false;
 let isCancellationRequested = false;
 let pipelineRequestId = 0;
 let lastProcessedParams = "";
+const postProcessSession = new PostProcessSession({ limit: 50 });
+let currentPostprocessResultId = 0;
+let suppressPostprocessEvents = false;
+let historyPlaybackRequestId = 0;
+let pendingHistoryCommit = null;
+let postCompareActive = false;
+let postEyedropperActive = false;
+let lastPostHistogram = null;
+let lastArtifactSuggestion = null;
+let zenithGuide = null;
+let postHistogramRequestId = 0;
+let postBeginNonce = 0;
 window.resetPipelineState = () => {
-    pipelineRequestId = 0;
+    clearTimeout(updateTimer);
+    pipelineRequestId += 1;
     lastProcessedParams = "";
+    pendingHistoryCommit = null;
 };
 let currentAnalysisMode = "global";
 let currentBestFrame = 0; // NEW: Store Ref Frame
@@ -2303,6 +2326,187 @@ function enhanceRangeInputs() {
     });
 }
 
+// ============================================================
+// ESQUEMAS DE WAVELETS (presets estilo RegiStax, en localStorage)
+// Guardan la configuración COMPLETA del panel de post-procesado y la
+// re-aplican con un clic (los listeners num→slider hacen el resto y el
+// pipeline se re-lanza con su debounce normal).
+// ============================================================
+const WAVELET_PRESETS_KEY = "zas_wavelet_presets_v1";
+
+function waveletPresetsLoad() {
+    try { return JSON.parse(localStorage.getItem(WAVELET_PRESETS_KEY)) || {}; }
+    catch (_) { return {}; }
+}
+function waveletPresetsSave(all) {
+    try { localStorage.setItem(WAVELET_PRESETS_KEY, JSON.stringify(all)); } catch (_) { }
+}
+
+function refreshWaveletPresetList(selectName) {
+    const sel = document.getElementById("wavelet-preset-select");
+    if (!sel) return;
+    const all = waveletPresetsLoad();
+    sel.innerHTML = "";
+    const ph = document.createElement("option");
+    ph.value = "";
+    ph.textContent = tr("wavelets.presets.placeholder", "— Esquemas guardados —");
+    sel.appendChild(ph);
+    Object.keys(all).sort().forEach((name) => {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        sel.appendChild(opt);
+    });
+    if (selectName) sel.value = selectName;
+}
+
+function rgbUnitToHex(rgb) {
+    return `#${(rgb || [1, 1, 1]).map((value) => Math.round(Math.max(0, Math.min(1, value)) * 255).toString(16).padStart(2, "0")).join("")}`;
+}
+
+function applyAdvancedParamsToUi(advanced = {}) {
+    const mapping = {
+        levelsBlack: advanced.levelsBlack ?? 0,
+        levelsMid: advanced.levelsMid ?? 1,
+        levelsWhite: advanced.levelsWhite ?? 1,
+        exposure: advanced.exposure ?? 0,
+        shadows: advanced.shadows ?? 0,
+        highlights: advanced.highlights ?? 0,
+        whites: advanced.whites ?? 0,
+        blacks: advanced.blacks ?? 0,
+        vibrance: advanced.vibrance ?? 0,
+        temperature: advanced.temperature ?? 0,
+        tint: advanced.tint ?? 0,
+    };
+    Object.entries(mapping).forEach(([name, value]) => {
+        const control = document.querySelector(`[data-advanced-control="${name}"]`);
+        if (!control) return;
+        const scale = parseFloat(control.dataset.scale || "1") || 1;
+        control.value = String(value * scale);
+        updateAdvancedControlOutput(control);
+    });
+    document.querySelectorAll("[data-hsl-index]").forEach((control) => {
+        const index = parseInt(control.dataset.hslIndex, 10);
+        control.value = String((advanced.hslSaturation?.[index] || 0) * 100);
+        updateAdvancedControlOutput(control);
+    });
+    document.querySelectorAll("[data-grade-amount]").forEach((control) => {
+        const index = parseInt(control.dataset.gradeAmount, 10);
+        control.value = String((advanced.gradingAmounts?.[index] || 0) * 100);
+        updateAdvancedControlOutput(control);
+    });
+    const colors = {
+        shadows: advanced.gradingShadows,
+        midtones: advanced.gradingMidtones,
+        highlights: advanced.gradingHighlights,
+    };
+    Object.entries(colors).forEach(([name, rgb]) => {
+        const control = document.querySelector(`[data-grade-color="${name}"]`);
+        if (control) control.value = rgbUnitToHex(rgb);
+    });
+    updateLevelMarkers();
+}
+
+function applyWaveletPreset(p, { trigger = true } = {}) {
+    const setNum = (id, val) => {
+        const el = document.getElementById("num-" + id);
+        if (!el || val === undefined || val === null || isNaN(val)) return;
+        el.value = val;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+    };
+    (p.u || []).forEach((v, i) => setNum("u" + (i + 1), v));
+    (p.w || []).forEach((v, i) => setNum("w" + (i + 1), v));
+    (p.d || []).forEach((v, i) => setNum("d" + (i + 1), v));
+    setNum("crisp", p.crisp);
+    if (p.deconv) {
+        setNum("deconv-sigma", p.deconv.s); setNum("deconv-iter", p.deconv.i);
+        setNum("vc-sigma", p.deconv.vs); setNum("vc-iter", p.deconv.vi);
+    }
+    if (p.usm) { setNum("usm-amt", p.usm.a); setNum("usm-rad", p.usm.r); }
+    setNum("lce-amt", p.lce);
+    setNum("master-denoise", p.masterDenoise);
+    setNum("denoise-detail", p.denoiseDetail);
+    setNum("denoise-chroma", p.denoiseChroma);
+    if (p.color) {
+        setNum("gamma", p.color.g); setNum("sat", p.color.s);
+        setNum("contrast", p.color.c); setNum("brightness", p.color.b);
+        setNum("r-bal", p.color.rb); setNum("b-bal", p.color.bb);
+    }
+    if (p.dr) {
+        setNum("dr-rad", p.dr.rad); setNum("dr-dark", p.dr.dark); setNum("dr-light", p.dr.light);
+        if (ui.selDrMode) { ui.selDrMode.value = String(p.dr.mode ?? 0); ui.selDrMode.dispatchEvent(new Event("change", { bubbles: true })); }
+        if (ui.chkDrMask) ui.chkDrMask.checked = !!p.dr.mask;
+    }
+    if (p.shift) {
+        [["rx", p.shift.rx], ["ry", p.shift.ry], ["bx", p.shift.bx], ["by", p.shift.by]].forEach(([k, v]) => {
+            if (ui[k] && v !== undefined) { ui[k].value = v; ui[k].dispatchEvent(new Event("input", { bubbles: true })); }
+        });
+    }
+    if (p.blend !== undefined && ui.blendSlider) {
+        ui.blendSlider.value = p.blend;
+        ui.blendSlider.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    const selSharp = document.getElementById("sel-sharpen-mode");
+    if (selSharp && p.useRgbSharpening !== undefined) {
+        selSharp.value = p.useRgbSharpening ? "rgb" : "luminance";
+        selSharp.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    if (p.advanced) applyAdvancedParamsToUi(p.advanced);
+    if (trigger) triggerUpdate();
+}
+
+function initWaveletPresets() {
+    const sel = document.getElementById("wavelet-preset-select");
+    const nameInput = document.getElementById("wavelet-preset-name");
+    const btnSave = document.getElementById("btn-wavelet-preset-save");
+    const btnDel = document.getElementById("btn-wavelet-preset-del");
+    if (!sel || !btnSave) return;
+
+    refreshWaveletPresetList();
+
+    btnSave.addEventListener("click", () => {
+        const name = (nameInput?.value || sel.value || "").trim();
+        if (!name) {
+            log("WARN", tr("wavelets.presets.need_name", "Escribe un nombre para guardar el esquema."));
+            return;
+        }
+        const all = waveletPresetsLoad();
+        all[name] = getPipelineParams();
+        waveletPresetsSave(all);
+        refreshWaveletPresetList(name);
+        if (nameInput) nameInput.value = "";
+        log("SUCCESS", tr("wavelets.presets.saved", "Esquema guardado: ") + name);
+    });
+
+    btnDel?.addEventListener("click", () => {
+        const name = sel.value;
+        if (!name) return;
+        const all = waveletPresetsLoad();
+        delete all[name];
+        waveletPresetsSave(all);
+        refreshWaveletPresetList();
+        log("INFO", tr("wavelets.presets.deleted", "Esquema borrado: ") + name);
+    });
+
+    sel.addEventListener("change", () => {
+        const name = sel.value;
+        if (!name) return;
+        const all = waveletPresetsLoad();
+        if (all[name]) {
+            suppressPostprocessEvents = true;
+            try {
+                applyWaveletPreset(all[name], { trigger: false });
+            } finally {
+                suppressPostprocessEvents = false;
+            }
+            triggerUpdate();
+            queuePostHistoryCommit(`Esquema: ${name}`);
+            log("INFO", tr("wavelets.presets.applied", "Esquema aplicado: ") + name);
+        }
+    });
+}
+
 // Arranque RESILIENTE: la secuencia se dispara con `load`, pero si un recurso
 // se queda colgado (red, disco lento) un fallback tras DOMContentLoaded+4s la
 // ejecuta igualmente — la app nunca puede quedarse en el splash para siempre.
@@ -2893,8 +3097,8 @@ const ui = {
     d1: $("#d1"), d2: $("#d2"), d3: $("#d3"), d4: $("#d4"), d5: $("#d5"), d6: $("#d6"),
 
     slCrisp: $("#sl-crisp"), valCrisp: $("#num-crisp"),
-    slGamma: $("#sl-gamma"), valGamma: $("#num-gamma"),
-    slSat: $("#sl-sat"), valSat: $("#num-sat"),
+    slGamma: $("#sl-gamma"), valGamma: $("#num-gamma"), numGamma: $("#num-gamma"),
+    slSat: $("#sl-sat"), valSat: $("#num-sat"), numSat: $("#num-sat"),
     slContrast: $("#sl-contrast"), numContrast: $("#num-contrast"),
     slBrightness: $("#sl-brightness"), numBrightness: $("#num-brightness"),
     slRBal: $("#sl-r-bal"), numRBal: $("#num-r-bal"),
@@ -4667,9 +4871,6 @@ if (ui.btnConfirmCrop) {
         const iw = Math.round(cropSelection.w);
         const ih = Math.round(cropSelection.h);
 
-        // Guardar parámetros actuales antes del recorte
-        const hadProcessing = lastProcessedParams !== null && lastProcessedParams !== "{}";
-
         ui.btnConfirmCrop.disabled = true;
         showProcessing("RECORTANDO...");
 
@@ -4677,17 +4878,7 @@ if (ui.btnConfirmCrop) {
             const b64 = await invoke("crop_stacked_image", { x: ix, y: iy, w: iw, h: ih });
             await setImageAndWait(ui.imgResult, b64, true);
 
-            // Solo resetear si no había procesamiento previo
-            if (!hadProcessing) {
-                resetProcessingParams();
-            } else {
-                // Reaplicar los parámetros guardados automáticamente
-                log("INFO", "Reaplicando parámetros de post-procesamiento...");
-                // Los parámetros ya están en los controles UI, solo trigger update
-                // Forzar actualización limpiando lastProcessedParams para que detecte cambio
-                lastProcessedParams = null;
-                triggerUpdate();
-            }
+            await beginNewPostprocessResult(b64, "crop");
 
             log("SUCCESS", `Recorte aplicado: ${iw}x${ih}`);
             ui.btnCancelCrop.click();
@@ -4806,7 +4997,7 @@ if (ui.chkDeringing) ui.chkDeringing.addEventListener("change", triggerUpdate);
     if (el) el.addEventListener("change", triggerUpdate);
 });
 
-function resetProcessingParams() {
+function resetProcessingParams({ updateMemo = true } = {}) {
     const zeroIds = [
         "u1", "u2", "u3", "u4", "u5",
         "w1", "w2", "w3", "w4", "w5", "w6",
@@ -4869,15 +5060,22 @@ function resetProcessingParams() {
         ui.selDrMode.value = "0"; // Disabled by default
         if (ui.panelDrManual) ui.panelDrManual.style.display = "none";
     }
-    if (ui.slDrRad) ui.slDrRad.value = 10;
+    if (ui.slDrRad) ui.slDrRad.value = 100;
     if (ui.numDrRad) ui.numDrRad.value = 10;
-    if (ui.slDrDark) ui.slDrDark.value = 50;
-    if (ui.numDrDark) ui.numDrDark.value = 50;
+    if (ui.slDrDark) ui.slDrDark.value = 500;
+    if (ui.numDrDark) ui.numDrDark.value = 0.5;
     if (ui.slDrLight) ui.slDrLight.value = 0;
     if (ui.numDrLight) ui.numDrLight.value = 0;
     if (ui.chkDrMask) ui.chkDrMask.checked = false;
 
-    lastProcessedParams = JSON.stringify(getPipelineParams());
+    document.querySelectorAll("[data-advanced-control], [data-hsl-index], [data-grade-amount]").forEach((control) => {
+        control.value = control.dataset.default ?? "0";
+        updateAdvancedControlOutput(control);
+    });
+    document.querySelectorAll("[data-grade-color]").forEach((control) => { control.value = "#ffffff"; });
+    updateLevelMarkers();
+
+    if (updateMemo) lastProcessedParams = JSON.stringify(getPipelineParams());
 }
 
 if (ui.selDrMode) {
@@ -4977,6 +5175,49 @@ function drawHistogram(imgEl) {
     } catch (e) { /* getPipelineParams no disponible aún */ }
 }
 
+function hexToRgbUnit(hex) {
+    const value = String(hex || "#ffffff").replace("#", "").padEnd(6, "f").slice(0, 6);
+    return [0, 2, 4].map((offset) => parseInt(value.slice(offset, offset + 2), 16) / 255);
+}
+
+function getAdvancedPostprocessParams() {
+    const byParam = (name, fallback = 0) => {
+        const control = document.querySelector(`[data-advanced-control="${name}"]`);
+        if (!control) return fallback;
+        const scale = parseFloat(control.dataset.scale || "1") || 1;
+        const value = parseFloat(control.value);
+        return Number.isFinite(value) ? value / scale : fallback;
+    };
+    const hslSaturation = Array(8).fill(0);
+    document.querySelectorAll("[data-hsl-index]").forEach((control) => {
+        const index = parseInt(control.dataset.hslIndex, 10);
+        if (index >= 0 && index < 8) hslSaturation[index] = (parseFloat(control.value) || 0) / 100;
+    });
+    const gradingAmounts = Array(3).fill(0);
+    document.querySelectorAll("[data-grade-amount]").forEach((control) => {
+        const index = parseInt(control.dataset.gradeAmount, 10);
+        if (index >= 0 && index < 3) gradingAmounts[index] = (parseFloat(control.value) || 0) / 100;
+    });
+    return {
+        levelsBlack: byParam("levelsBlack", 0),
+        levelsMid: byParam("levelsMid", 1),
+        levelsWhite: byParam("levelsWhite", 1),
+        exposure: byParam("exposure", 0),
+        shadows: byParam("shadows", 0),
+        highlights: byParam("highlights", 0),
+        whites: byParam("whites", 0),
+        blacks: byParam("blacks", 0),
+        vibrance: byParam("vibrance", 0),
+        temperature: byParam("temperature", 0),
+        tint: byParam("tint", 0),
+        hslSaturation,
+        gradingShadows: hexToRgbUnit(document.querySelector('[data-grade-color="shadows"]')?.value),
+        gradingMidtones: hexToRgbUnit(document.querySelector('[data-grade-color="midtones"]')?.value),
+        gradingHighlights: hexToRgbUnit(document.querySelector('[data-grade-color="highlights"]')?.value),
+        gradingAmounts,
+    };
+}
+
 function getPipelineParams() {
     const getVal = (id) => parseFloat($(`#num-${id}`)?.value) || 0;
     return {
@@ -5027,7 +5268,8 @@ function getPipelineParams() {
             black: parseFloat($(`#num-levels-black`)?.value) || 0,
             white: parseFloat($(`#num-levels-white`)?.value) || 1,
             gamma: parseFloat($(`#num-levels-gamma`)?.value) || 1
-        }
+        },
+        advanced: getAdvancedPostprocessParams()
     };
 }
 window.getPipelineParams = getPipelineParams;
@@ -5049,7 +5291,13 @@ function isPostConfigNeutral(p) {
         && zero(p.shift.rx) && zero(p.shift.ry) && zero(p.shift.bx) && zero(p.shift.by)
         && Math.abs(p.blend - 100) < 0.001
         && p.dr.mode === 0
-        && zero(p.levels.black) && one(p.levels.white) && one(p.levels.gamma);
+        && zero(p.levels.black) && one(p.levels.white) && one(p.levels.gamma)
+        && zero(p.advanced.levelsBlack) && one(p.advanced.levelsMid) && one(p.advanced.levelsWhite)
+        && zero(p.advanced.exposure) && zero(p.advanced.shadows) && zero(p.advanced.highlights)
+        && zero(p.advanced.whites) && zero(p.advanced.blacks) && zero(p.advanced.vibrance)
+        && zero(p.advanced.temperature) && zero(p.advanced.tint)
+        && p.advanced.hslSaturation.every(zero)
+        && p.advanced.gradingAmounts.every(zero);
 }
 
 // Preview en vivo: la vista actual está en baja resolución (render rápido de
@@ -5058,7 +5306,613 @@ let previewIsDownscaled = false;
 let lastFastPreview = 0;
 const FAST_PREVIEW_MS = 110;
 
+function updateAdvancedControlOutput(control) {
+    if (!control) return;
+    const raw = parseFloat(control.value) || 0;
+    const scale = parseFloat(control.dataset.scale || "1") || 1;
+    const value = raw / scale;
+    const name = control.dataset.advancedControl || "";
+    let output = control.closest("label")?.querySelector("output")
+        || control.previousElementSibling?.querySelector?.("output")
+        || null;
+    if (name === "levelsBlack") output = document.getElementById("out-level-black") || output;
+    if (name === "levelsMid") output = document.getElementById("out-level-mid") || output;
+    if (name === "levelsWhite") output = document.getElementById("out-level-white") || output;
+    if (!output) return;
+
+    if (name === "levelsBlack" || name === "levelsWhite") {
+        output.textContent = Math.round(raw).toString();
+    } else if (name === "levelsMid") {
+        output.textContent = value.toFixed(2);
+    } else if (name === "exposure") {
+        output.textContent = `${value.toFixed(2)} EV`;
+    } else if (control.dataset.hslIndex !== undefined || control.dataset.gradeAmount !== undefined) {
+        output.textContent = Math.round(raw).toString();
+    } else {
+        const displayScale = parseFloat(control.dataset.displayScale || "1") || 1;
+        const displayed = value * displayScale;
+        output.textContent = Math.abs(displayed - Math.round(displayed)) < 0.005
+            ? Math.round(displayed).toString()
+            : displayed.toFixed(2);
+    }
+}
+
+function constrainLevelControls(changedControl) {
+    const black = document.getElementById("sl-level-black");
+    const white = document.getElementById("sl-level-white");
+    if (!black || !white) return;
+    const minimumGap = 256;
+    if (parseFloat(black.value) > parseFloat(white.value) - minimumGap) {
+        if (changedControl === black) black.value = String(Math.max(0, parseFloat(white.value) - minimumGap));
+        else white.value = String(Math.min(65535, parseFloat(black.value) + minimumGap));
+        updateAdvancedControlOutput(changedControl);
+    }
+}
+
+function updateLevelMarkers() {
+    const black = parseFloat(document.getElementById("sl-level-black")?.value || "0") / 65535;
+    const white = parseFloat(document.getElementById("sl-level-white")?.value || "65535") / 65535;
+    const mid = parseFloat(document.getElementById("sl-level-mid")?.value || "100") / 100;
+    const blackMarker = document.getElementById("histogram-black-marker");
+    const whiteMarker = document.getElementById("histogram-white-marker");
+    const midMarker = document.getElementById("histogram-mid-marker");
+    if (blackMarker) blackMarker.style.left = `${Math.max(0, Math.min(100, black * 100))}%`;
+    if (whiteMarker) {
+        whiteMarker.style.left = `${Math.max(0, Math.min(100, white * 100))}%`;
+        whiteMarker.style.right = "auto";
+    }
+    if (midMarker) {
+        const position = black + (white - black) * Math.pow(0.5, mid);
+        midMarker.style.left = `${Math.max(0, Math.min(100, position * 100))}%`;
+    }
+}
+
+function postAdjustmentLabel(target) {
+    const moduleTitle = target.closest("details")?.querySelector("summary span")?.textContent?.trim();
+    if (moduleTitle) return moduleTitle;
+    const directLabel = target.closest("label")?.textContent?.replace(/[-+]?\d+(\.\d+)?(\s?EV)?/g, "")?.trim();
+    if (directLabel) return directLabel.slice(0, 42);
+    return "Ajuste de postprocesado";
+}
+
+function updatePostHistoryUi() {
+    const state = postProcessSession.getState();
+    const undo = document.getElementById("btn-post-undo");
+    const redo = document.getElementById("btn-post-redo");
+    const label = document.getElementById("post-history-state");
+    if (undo) undo.disabled = !state.canUndo;
+    if (redo) redo.disabled = !state.canRedo;
+    if (label) {
+        const current = postProcessSession.current();
+        label.textContent = current ? `${state.index + 1}/${state.length} · ${current.label}` : "Sin resultado";
+    }
+    refreshPostCompareReference();
+}
+
+function refreshPostCompareReference() {
+    const layer = document.getElementById("post-compare-layer");
+    const image = document.getElementById("img-result-before");
+    const selector = document.getElementById("post-compare-reference");
+    if (!layer || !image) return;
+    const reference = postProcessSession.getCompareEntry(selector?.value || "previous");
+    if (reference?.preview) image.src = reference.preview;
+    layer.hidden = !postCompareActive || !reference?.preview;
+}
+
+function setPostCompareActive(active) {
+    postCompareActive = !!active && !!postProcessSession.current();
+    const button = document.getElementById("btn-post-compare");
+    const splitWrap = document.getElementById("post-compare-split-wrap");
+    if (button) button.setAttribute("aria-pressed", String(postCompareActive));
+    if (splitWrap) splitWrap.hidden = !postCompareActive;
+    refreshPostCompareReference();
+}
+
+function finishPendingHistoryCommit(paramsString, preview) {
+    if (!pendingHistoryCommit || pendingHistoryCommit.paramsString !== paramsString) return false;
+    postProcessSession.commit(JSON.parse(paramsString), {
+        label: pendingHistoryCommit.label,
+        preview: preview || ui.imgResult?.src || "",
+    });
+    pendingHistoryCommit = null;
+    updatePostHistoryUi();
+    return true;
+}
+
+function queuePostHistoryCommit(label = "Ajuste") {
+    if (suppressPostprocessEvents || !postProcessSession.current()) return;
+    const recipe = getPipelineParams();
+    const paramsString = JSON.stringify(recipe);
+    pendingHistoryCommit = { paramsString, label };
+    if (paramsString === lastProcessedParams && ui.imgResult?.src) {
+        finishPendingHistoryCommit(paramsString, ui.imgResult.src);
+    }
+}
+
+async function applyPostHistoryEntry(entry) {
+    if (!entry) return;
+    pendingHistoryCommit = null;
+    suppressPostprocessEvents = true;
+    try {
+        applyWaveletPreset(entry.recipe, { trigger: false });
+        updateAdcPadFromInputs();
+    } finally {
+        suppressPostprocessEvents = false;
+    }
+    if (entry.preview && ui.imgResult) {
+        const viewport = captureViewportState();
+        await setImageAndWait(ui.imgResult, entry.preview, false);
+        restoreViewportState(viewport);
+    }
+    updatePostHistoryUi();
+    const paramsString = JSON.stringify(entry.recipe);
+    lastProcessedParams = "";
+    const requestId = ++pipelineRequestId;
+    historyPlaybackRequestId = requestId;
+    showLocalProcessing("Restaurando historial...");
+    showImgLoader();
+    processPipeline(requestId, paramsString);
+}
+
+async function beginNewPostprocessResult(preview, source = "stack") {
+    const nonce = ++postBeginNonce;
+    window.resetPipelineState();
+    let generation;
+    try {
+        generation = await invoke("reset_postprocess_state");
+    } catch (error) {
+        generation = Date.now();
+        console.warn("Postprocess backend session unavailable; using local generation.", error);
+    }
+    if (nonce !== postBeginNonce) return currentPostprocessResultId;
+    currentPostprocessResultId = Number(generation) || Date.now();
+    suppressPostprocessEvents = true;
+    try {
+        resetProcessingParams({ updateMemo: false });
+    } finally {
+        suppressPostprocessEvents = false;
+    }
+    const recipe = getPipelineParams();
+    lastProcessedParams = JSON.stringify(recipe);
+    lastArtifactSuggestion = null;
+    lastPostHistogram = null;
+    const artifactSummary = document.getElementById("artifact-analysis-summary");
+    const artifactApply = document.getElementById("btn-apply-artifact-suggestion");
+    if (artifactSummary) artifactSummary.textContent = "Sin análisis todavía.";
+    if (artifactApply) artifactApply.hidden = true;
+    postProcessSession.beginResult({
+        generation: currentPostprocessResultId,
+        source,
+        recipe,
+        preview: preview || ui.imgResult?.src || "",
+        label: source === "mosaic" ? "Mosaico original" : "Apilado original",
+    });
+    setPostCompareActive(false);
+    updatePostHistoryUi();
+    updateAdcPadFromInputs();
+    await refreshPostHistogram(false);
+    updateZenithGuide();
+    log("INFO", `Nueva sesión de postprocesado 16-bit (${source}); ajustes e historial reiniciados.`);
+    return currentPostprocessResultId;
+}
+window.beginNewPostprocessResult = beginNewPostprocessResult;
+
+function drawPostHistogram(histogram) {
+    const canvas = document.getElementById("post-histogram");
+    if (!canvas) return;
+    const bounds = canvas.getBoundingClientRect();
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const width = Math.max(280, Math.round(bounds.width || 360));
+    const height = Math.max(120, Math.round(bounds.height || 150));
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    const context = canvas.getContext("2d");
+    context.setTransform(dpr, 0, 0, dpr, 0, 0);
+    context.clearRect(0, 0, width, height);
+
+    const all = histogram.isMono
+        ? [histogram.luminance]
+        : [histogram.red, histogram.green, histogram.blue, histogram.luminance];
+    const maximum = Math.max(1, ...all.flat().map((value) => Math.log1p(Number(value) || 0)));
+    const drawSeries = (values, color, fill = false) => {
+        context.beginPath();
+        values.forEach((count, index) => {
+            const x = index / Math.max(1, values.length - 1) * width;
+            const y = height - (Math.log1p(Number(count) || 0) / maximum) * (height - 5);
+            if (index === 0) context.moveTo(x, y);
+            else context.lineTo(x, y);
+        });
+        if (fill) {
+            context.lineTo(width, height);
+            context.lineTo(0, height);
+            context.closePath();
+            const gradient = context.createLinearGradient(0, 0, 0, height);
+            gradient.addColorStop(0, color.replace("1)", "0.26)"));
+            gradient.addColorStop(1, color.replace("1)", "0.01)"));
+            context.fillStyle = gradient;
+            context.fill();
+        }
+        context.strokeStyle = color;
+        context.lineWidth = fill ? 1.2 : 1;
+        context.stroke();
+    };
+    drawSeries(histogram.luminance, "rgba(226,232,240,1)", true);
+    if (!histogram.isMono) {
+        drawSeries(histogram.red, "rgba(251,113,133,1)");
+        drawSeries(histogram.green, "rgba(74,222,128,1)");
+        drawSeries(histogram.blue, "rgba(96,165,250,1)");
+    }
+}
+
+function setPostColorControlsForMono(isMono) {
+    const colorControls = document.querySelectorAll(
+        '.color-module [data-advanced-control], .color-module [data-hsl-index], .color-module [data-grade-amount], .color-module [data-grade-color]'
+    );
+    colorControls.forEach((control) => { control.disabled = !!isMono; });
+    [ui.slSat, ui.numSat, ui.slRBal, ui.numRBal, ui.slBBal, ui.numBBal].forEach((control) => {
+        if (control) control.disabled = !!isMono;
+    });
+    document.querySelector(".color-module")?.classList.toggle("mono-disabled", !!isMono);
+    const mode = document.getElementById("sel-sharpen-mode");
+    if (mode) {
+        mode.disabled = !!isMono;
+        if (isMono) mode.value = "luminance";
+    }
+}
+
+async function refreshPostHistogram(preferProcessed = true) {
+    if (!postProcessSession.current()) return null;
+    const request = ++postHistogramRequestId;
+    try {
+        const histogram = await invoke("postprocess_histogram", { preferProcessed });
+        if (request !== postHistogramRequestId) return null;
+        lastPostHistogram = histogram;
+        drawPostHistogram(histogram);
+        const setText = (id, value) => { const node = document.getElementById(id); if (node) node.textContent = value; };
+        setText("hist-min", histogram.minimum.toLocaleString());
+        setText("hist-median", histogram.median.toLocaleString());
+        setText("hist-max", histogram.maximum.toLocaleString());
+        setText("post-histogram-source", histogram.source === "processed" ? "VISTA PROCESADA · 16-BIT" : "MASTER · 16-BIT");
+        const clip = document.getElementById("hist-clip-status");
+        const shadowPct = histogram.shadowClip * 100;
+        const highlightPct = histogram.highlightClip * 100;
+        if (clip) {
+            const clipped = shadowPct > 0.01 || highlightPct > 0.01;
+            clip.classList.toggle("has-clipping", clipped);
+            clip.classList.toggle("is-clean", !clipped);
+            clip.textContent = clipped
+                ? `Recorte S ${shadowPct.toFixed(2)}% · L ${highlightPct.toFixed(2)}%`
+                : "Sin recorte relevante";
+        }
+        setPostColorControlsForMono(histogram.isMono);
+        updateZenithGuide();
+        return histogram;
+    } catch (error) {
+        const clip = document.getElementById("hist-clip-status");
+        if (clip) clip.textContent = "Histograma no disponible";
+        console.warn("Histogram refresh failed:", error);
+        return null;
+    }
+}
+
+function updateZenithGuide(extra = {}) {
+    if (!zenithGuide) return;
+    zenithGuide.update({
+        hasSource: !!currentFilePath,
+        hasAnalysis: !!currentFileMetadata,
+        hasResult: !!postProcessSession.current(),
+        isMono: !!lastPostHistogram?.isMono,
+        shadowClip: Number(lastPostHistogram?.shadowClip || 0),
+        highlightClip: Number(lastPostHistogram?.highlightClip || 0),
+        ...extra,
+    });
+}
+
+function initAdvancedPostprocessControls() {
+    const advancedControls = document.querySelectorAll(
+        "[data-advanced-control], [data-hsl-index], [data-grade-amount], [data-grade-color]"
+    );
+    advancedControls.forEach((control) => {
+        updateAdvancedControlOutput(control);
+        const eventName = control.type === "color" ? "input" : "input";
+        control.addEventListener(eventName, () => {
+            if (control.dataset.advancedControl?.startsWith("levels")) {
+                constrainLevelControls(control);
+                updateLevelMarkers();
+            }
+            updateAdvancedControlOutput(control);
+            if (!suppressPostprocessEvents) triggerUpdate();
+        });
+        control.addEventListener("change", () => {
+            if (!suppressPostprocessEvents) queuePostHistoryCommit(postAdjustmentLabel(control));
+        });
+        if (control.type === "range") {
+            control.addEventListener("dblclick", () => {
+                control.value = control.dataset.default ?? "0";
+                updateAdvancedControlOutput(control);
+                if (control.dataset.advancedControl?.startsWith("levels")) updateLevelMarkers();
+                triggerUpdate();
+                queuePostHistoryCommit(postAdjustmentLabel(control));
+            });
+        }
+    });
+    updateLevelMarkers();
+
+    const panel = document.getElementById("panel-wavelets");
+    panel?.addEventListener("change", (event) => {
+        if (suppressPostprocessEvents || event.target.matches("[data-advanced-control], [data-hsl-index], [data-grade-amount], [data-grade-color]")) return;
+        if (event.target.matches("input, select")) queuePostHistoryCommit(postAdjustmentLabel(event.target));
+    });
+
+    document.getElementById("btn-refresh-histogram")?.addEventListener("click", () => refreshPostHistogram(true));
+    document.getElementById("btn-post-undo")?.addEventListener("click", () => applyPostHistoryEntry(postProcessSession.undo()));
+    document.getElementById("btn-post-redo")?.addEventListener("click", () => applyPostHistoryEntry(postProcessSession.redo()));
+    document.getElementById("btn-post-compare")?.addEventListener("click", () => setPostCompareActive(!postCompareActive));
+    document.getElementById("post-compare-reference")?.addEventListener("change", refreshPostCompareReference);
+    document.getElementById("post-compare-split")?.addEventListener("input", (event) => {
+        const split = Math.max(0, Math.min(100, parseFloat(event.target.value) || 0));
+        const layer = document.getElementById("post-compare-layer");
+        const divider = layer?.querySelector(".compare-divider");
+        if (layer) layer.style.clipPath = `inset(0 ${100 - split}% 0 0)`;
+        if (divider) divider.style.left = `${split}%`;
+    });
+}
+
+initAdvancedPostprocessControls();
+
+function clampRgbShift(value) {
+    return Math.max(-6, Math.min(6, Number(value) || 0));
+}
+
+function updateAdcPadFromInputs() {
+    const values = {
+        r: { x: clampRgbShift(ui.rx?.value), y: clampRgbShift(ui.ry?.value) },
+        b: { x: clampRgbShift(ui.bx?.value), y: clampRgbShift(ui.by?.value) },
+    };
+    Object.entries(values).forEach(([channel, shift]) => {
+        const node = document.getElementById(`adc-node-${channel}`);
+        if (!node) return;
+        node.style.left = `${50 + (shift.x / 6) * 42}%`;
+        node.style.top = `${50 + (shift.y / 6) * 42}%`;
+        const bothCentered = Math.abs(shift.x) < 0.001 && Math.abs(shift.y) < 0.001;
+        node.style.transform = bothCentered
+            ? `translate(${channel === "r" ? -6 : 6}px, ${channel === "r" ? -4 : 4}px)`
+            : "none";
+    });
+}
+
+function setRgbShiftValues(channel, x, y, { process = true, commit = false, label = "Alineación RGB" } = {}) {
+    const xInput = channel === "r" ? ui.rx : ui.bx;
+    const yInput = channel === "r" ? ui.ry : ui.by;
+    if (!xInput || !yInput) return;
+    xInput.value = clampRgbShift(x).toFixed(2);
+    yInput.value = clampRgbShift(y).toFixed(2);
+    updateAdcPadFromInputs();
+    if (process && !suppressPostprocessEvents) triggerUpdate();
+    if (commit && !suppressPostprocessEvents) queuePostHistoryCommit(label);
+}
+
+function initAtmosphericCorrectionUi() {
+    updateAdcPadFromInputs();
+    [ui.rx, ui.ry, ui.bx, ui.by].forEach((input) => {
+        input?.addEventListener("input", updateAdcPadFromInputs);
+        input?.addEventListener("change", () => queuePostHistoryCommit("Corrección atmosférica"));
+    });
+
+    let drag = null;
+    const moveNode = (event) => {
+        if (!drag) return;
+        const pad = document.getElementById("adc-pad");
+        const bounds = pad?.getBoundingClientRect();
+        if (!bounds?.width || !bounds?.height) return;
+        const normalizedX = (event.clientX - bounds.left) / bounds.width;
+        const normalizedY = (event.clientY - bounds.top) / bounds.height;
+        const x = ((normalizedX - 0.5) / 0.42) * 6;
+        const y = ((normalizedY - 0.5) / 0.42) * 6;
+        setRgbShiftValues(drag, x, y, { process: true });
+    };
+    ["r", "b"].forEach((channel) => {
+        const node = document.getElementById(`adc-node-${channel}`);
+        node?.addEventListener("pointerdown", (event) => {
+            event.preventDefault();
+            drag = channel;
+            node.setPointerCapture?.(event.pointerId);
+            moveNode(event);
+        });
+        node?.addEventListener("keydown", (event) => {
+            const delta = event.shiftKey ? 0.05 : 0.2;
+            let x = channel === "r" ? clampRgbShift(ui.rx?.value) : clampRgbShift(ui.bx?.value);
+            let y = channel === "r" ? clampRgbShift(ui.ry?.value) : clampRgbShift(ui.by?.value);
+            if (event.key === "ArrowLeft") x -= delta;
+            else if (event.key === "ArrowRight") x += delta;
+            else if (event.key === "ArrowUp") y -= delta;
+            else if (event.key === "ArrowDown") y += delta;
+            else return;
+            event.preventDefault();
+            setRgbShiftValues(channel, x, y, { process: true, commit: true });
+        });
+    });
+    window.addEventListener("pointermove", moveNode);
+    window.addEventListener("pointerup", () => {
+        if (!drag) return;
+        drag = null;
+        queuePostHistoryCommit("Corrección atmosférica visual");
+    });
+
+    document.getElementById("btn-reset-rgb-align")?.addEventListener("click", () => {
+        suppressPostprocessEvents = true;
+        setRgbShiftValues("r", 0, 0, { process: false });
+        setRgbShiftValues("b", 0, 0, { process: false });
+        suppressPostprocessEvents = false;
+        triggerUpdate();
+        queuePostHistoryCommit("Centrar canales RGB");
+        const status = document.getElementById("adc-status");
+        if (status) status.textContent = "Canales centrados · G es la referencia";
+    });
+
+    document.getElementById("btn-auto-rgb-align")?.addEventListener("click", async () => {
+        const button = document.getElementById("btn-auto-rgb-align");
+        const status = document.getElementById("adc-status");
+        if (button) button.disabled = true;
+        if (status) status.textContent = "Midiendo estructura RGB en el master 16-bit...";
+        try {
+            const estimate = await invoke("estimate_postprocess_rgb_alignment");
+            if (!estimate.applicable) {
+                if (status) status.textContent = estimate.reason;
+                return;
+            }
+            suppressPostprocessEvents = true;
+            setRgbShiftValues("r", estimate.redX, estimate.redY, { process: false });
+            setRgbShiftValues("b", estimate.blueX, estimate.blueY, { process: false });
+            suppressPostprocessEvents = false;
+            triggerUpdate();
+            queuePostHistoryCommit("Alineación RGB automática");
+            if (status) {
+                status.textContent = `R ${estimate.redX.toFixed(2)}, ${estimate.redY.toFixed(2)} · B ${estimate.blueX.toFixed(2)}, ${estimate.blueY.toFixed(2)} · confianza ${Math.round(estimate.confidence * 100)}%`;
+            }
+        } catch (error) {
+            if (status) status.textContent = `No fue posible medir: ${normalizeBackendText(error)}`;
+            log("ERROR", `Alineación RGB: ${error}`);
+        } finally {
+            if (button) button.disabled = false;
+        }
+    });
+}
+
+function initPostEyedropper() {
+    const button = document.getElementById("btn-post-eyedropper");
+    button?.addEventListener("click", () => {
+        postEyedropperActive = !postEyedropperActive;
+        button.classList.toggle("active", postEyedropperActive);
+        button.setAttribute("aria-pressed", String(postEyedropperActive));
+        document.getElementById("view-result")?.classList.toggle("eyedropper-active", postEyedropperActive);
+        const sample = document.getElementById("post-eyedropper-sample");
+        if (sample && postEyedropperActive) sample.textContent = "Haz clic en un punto que deba ser neutro";
+    });
+
+    document.getElementById("view-result")?.addEventListener("click", async (event) => {
+        if (!postEyedropperActive || event.target.closest?.(".view-label")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const image = ui.imgResult;
+        const bounds = image?.getBoundingClientRect();
+        if (!image?.naturalWidth || !bounds?.width || !bounds?.height) return;
+        const x = Math.max(0, Math.min(image.naturalWidth - 1, Math.floor((event.clientX - bounds.left) / bounds.width * image.naturalWidth)));
+        const y = Math.max(0, Math.min(image.naturalHeight - 1, Math.floor((event.clientY - bounds.top) / bounds.height * image.naturalHeight)));
+        try {
+            const pixel = await invoke("sample_postprocess_pixel", { x, y, preferProcessed: true });
+            const sample = document.getElementById("post-eyedropper-sample");
+            if (sample) sample.textContent = `(${pixel.x}, ${pixel.y}) · R ${pixel.red} · G ${pixel.green} · B ${pixel.blue}`;
+            const swatch = document.getElementById("post-eyedropper-swatch");
+            if (swatch) swatch.style.background = `rgb(${Math.round(pixel.redNormalized * 255)}, ${Math.round(pixel.greenNormalized * 255)}, ${Math.round(pixel.blueNormalized * 255)})`;
+            if (!pixel.isMono) {
+                const average = (pixel.redNormalized + pixel.greenNormalized + pixel.blueNormalized) / 3 || 1;
+                const temperature = Math.max(-1, Math.min(1, (pixel.blueNormalized - pixel.redNormalized) / average * 0.55));
+                const tint = Math.max(-1, Math.min(1, (pixel.greenNormalized - (pixel.redNormalized + pixel.blueNormalized) * 0.5) / average * 0.7));
+                const tempControl = document.querySelector('[data-advanced-control="temperature"]');
+                const tintControl = document.querySelector('[data-advanced-control="tint"]');
+                if (tempControl && tintControl) {
+                    tempControl.value = String(temperature * 100);
+                    tintControl.value = String(tint * 100);
+                    updateAdvancedControlOutput(tempControl);
+                    updateAdvancedControlOutput(tintControl);
+                    triggerUpdate();
+                    queuePostHistoryCommit("Balance con cuentagotas");
+                }
+            }
+        } catch (error) {
+            log("ERROR", `Cuentagotas: ${error}`);
+        } finally {
+            postEyedropperActive = false;
+            button?.classList.remove("active");
+            button?.setAttribute("aria-pressed", "false");
+            document.getElementById("view-result")?.classList.remove("eyedropper-active");
+        }
+    }, true);
+}
+
+function setLinkedNumber(id, value) {
+    const input = document.getElementById(`num-${id}`);
+    if (!input) return;
+    input.value = String(value);
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function initArtifactRepairUi() {
+    document.getElementById("btn-analyze-artifacts")?.addEventListener("click", async () => {
+        const button = document.getElementById("btn-analyze-artifacts");
+        const summary = document.getElementById("artifact-analysis-summary");
+        if (button) button.disabled = true;
+        if (summary) summary.textContent = "Analizando señal, vecindades y canales...";
+        try {
+            const analysis = await invoke("analyze_postprocess_artifacts", { preferProcessed: true });
+            lastArtifactSuggestion = analysis;
+            if (summary) {
+                summary.innerHTML = `<strong>${analysis.summary}</strong><br>Halos ${analysis.ringingScore.toFixed(2)} · fringing ${analysis.colorFringeScore.toFixed(2)} · calientes ${analysis.hotPixels} · muertos ${analysis.deadPixels} · muestra ${analysis.sampledPixels.toLocaleString()}`;
+            }
+            const apply = document.getElementById("btn-apply-artifact-suggestion");
+            if (apply) apply.hidden = false;
+        } catch (error) {
+            if (summary) summary.textContent = `Análisis no disponible: ${normalizeBackendText(error)}`;
+            log("ERROR", `Artefactos: ${error}`);
+        } finally {
+            if (button) button.disabled = false;
+        }
+    });
+
+    document.getElementById("btn-apply-artifact-suggestion")?.addEventListener("click", async () => {
+        if (!lastArtifactSuggestion) return;
+        const confirmed = await showCustomChoice(
+            "Aplicar corrección sugerida",
+            `${lastArtifactSuggestion.summary}\n\nSe aplicará de forma reversible y podrás compararla con A/B.`,
+            "Aplicar",
+            "Cancelar"
+        );
+        if (!confirmed) return;
+        suppressPostprocessEvents = true;
+        try {
+            if (ui.selDrMode) {
+                ui.selDrMode.value = String(lastArtifactSuggestion.suggestedDeringingMode);
+                ui.selDrMode.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            setLinkedNumber("dr-rad", lastArtifactSuggestion.suggestedDeringingRadius.toFixed(2));
+            setLinkedNumber("dr-dark", lastArtifactSuggestion.suggestedDeringingDark.toFixed(2));
+            setLinkedNumber("dr-light", lastArtifactSuggestion.suggestedDeringingLight.toFixed(2));
+            if (lastArtifactSuggestion.suggestedDenoise > 0.1) {
+                setLinkedNumber("master-denoise", lastArtifactSuggestion.suggestedDenoise.toFixed(1));
+            }
+        } finally {
+            suppressPostprocessEvents = false;
+        }
+        triggerUpdate();
+        queuePostHistoryCommit("Corrección inteligente de artefactos");
+    });
+}
+
+function initZenithGuideUi() {
+    const panel = document.getElementById("zenith-guide-panel");
+    zenithGuide = new ZenithGuide({
+        panel,
+        list: document.getElementById("zenith-guide-list"),
+        status: document.getElementById("zenith-guide-status"),
+    });
+    const setOpen = (open) => {
+        panel?.classList.toggle("open", open);
+        panel?.setAttribute("aria-hidden", String(!open));
+        document.getElementById("btn-toggle-guide")?.setAttribute("aria-pressed", String(open));
+    };
+    document.getElementById("btn-toggle-guide")?.addEventListener("click", () => setOpen(!panel?.classList.contains("open")));
+    document.getElementById("btn-close-guide")?.addEventListener("click", () => setOpen(false));
+    updateZenithGuide();
+}
+
+initAtmosphericCorrectionUi();
+initPostEyedropper();
+initArtifactRepairUi();
+initZenithGuideUi();
+
 function triggerUpdate() {
+    if (suppressPostprocessEvents) return;
     const currentParams = JSON.stringify(getPipelineParams());
     if (currentParams === lastProcessedParams && !previewIsDownscaled) return;
 
@@ -5105,7 +5959,7 @@ function triggerUpdate() {
 }
 
 async function processPipeline(requestId, paramsString, downscale = 1) {
-    if (!currentFilePath) { hideImgLoader(); hideLocalProcessing(); return; }
+    if (!currentFilePath && !postProcessSession.current()) { hideImgLoader(); hideLocalProcessing(); return; }
     const p = JSON.parse(paramsString);
     const msg = $("#local-msg");
     if (msg) msg.textContent = "Calculando...";
@@ -5145,7 +5999,9 @@ async function processPipeline(requestId, paramsString, downscale = 1) {
             gpuMode: getGpuMode(),
             levelsBlack: p.levels.black,
             levelsWhite: p.levels.white,
-            levelsGamma: p.levels.gamma
+            levelsGamma: p.levels.gamma,
+            advanced: p.advanced,
+            resultId: currentPostprocessResultId || null,
         });
 
         if (requestId !== pipelineRequestId) { console.log("Descartado."); return; }
@@ -5153,6 +6009,7 @@ async function processPipeline(requestId, paramsString, downscale = 1) {
         // (downscale) marca la vista como baja-res para forzar luego el full.
         if (downscale === 1) lastProcessedParams = paramsString;
         previewIsDownscaled = (downscale !== 1);
+        if (downscale === 1) postProcessSession.setPreview(b64);
 
         if (ui.imgResult) {
             if (msg) msg.textContent = "Renderizando...";
@@ -5163,8 +6020,21 @@ async function processPipeline(requestId, paramsString, downscale = 1) {
 
             if (ui.statusText) { ui.statusText.textContent = "Vista actualizada."; ui.statusText.style.color = "#94a3b8"; }
         }
+        // El historial y el histograma científico sólo aceptan el render 1:1;
+        // el preview rápido durante el arrastre es deliberadamente transitorio.
+        if (downscale === 1) {
+            if (historyPlaybackRequestId === requestId) {
+                postProcessSession.updateCurrentPreview(b64);
+                historyPlaybackRequestId = 0;
+            } else {
+                finishPendingHistoryCommit(paramsString, b64);
+            }
+            updatePostHistoryUi();
+            await refreshPostHistogram(true);
+        }
     } catch (e) {
-        if (!e.toString().includes("Cancelled")) { log("ERROR", "Pipeline: " + e); }
+        const errorText = e.toString();
+        if (!errorText.includes("Cancelled") && !errorText.includes("Resultado sustituido")) { log("ERROR", "Pipeline: " + e); }
     } finally {
         if (requestId === pipelineRequestId) { hideImgLoader(); hideLocalProcessing(); }
     }
@@ -5176,6 +6046,13 @@ async function processPipeline(requestId, paramsString, downscale = 1) {
 
 function resetDataAcquisitionUI() {
     console.log("Resetting Data Acquisition UI...");
+    postBeginNonce += 1;
+    window.resetPipelineState();
+    postProcessSession.clear();
+    currentPostprocessResultId = 0;
+    lastPostHistogram = null;
+    setPostCompareActive(false);
+    updatePostHistoryUi();
     clearMosaicInfoOverlay();
 
     // Limpieza agresiva de memoria en el backend (soluciona el problema de ralentización entre videos)
@@ -5271,6 +6148,7 @@ function resetDataAcquisitionUI() {
     isCropping = false;
     cropSelection = { x: 0, y: 0, w: 0, h: 0 };
     manualAnchorPoint = null; // Reset Anchor
+    updateZenithGuide({ hasResult: false, hasAnalysis: false });
 }
 
 function updateStackButtonState() {
@@ -5323,6 +6201,7 @@ function updateStackButtonState() {
             ? tr("batch.execution.ready_tooltip", "Ejecutar lote")
             : (hasFiles ? tip : tr("batch.execution.load_files_tooltip", "Carga archivos primero"));
     }
+    updateZenithGuide({ hasAnalysis });
 }
 
 // Listener para cambio de modo
@@ -5812,8 +6691,7 @@ if ($("#btn-mosaic-mode")) {
             triggerStackSuccessEffect();
         }
 
-        resetProcessingParams();
-        lastProcessedParams = null;
+        await beginNewPostprocessResult(result.preview_base64, "derotation");
     }
 
     async function loadDerotationPreflight(path, logPath = state.logPath || "") {
@@ -6266,8 +7144,7 @@ if ($("#btn-mosaic-mode")) {
                 triggerStackSuccessEffect();
             }
 
-            resetProcessingParams();
-            lastProcessedParams = null;
+            await beginNewPostprocessResult(result.preview_base64, "derotation");
             log(
                 "SUCCESS",
                 trFormat(
@@ -6594,7 +7471,8 @@ if (ui.btnBatchRun) {
                         decodePolicy: frozenBatchContract.decodePolicy,
                         qualityPolicy: frozenBatchContract.qualityPolicy,
                         sequencePlan: batchSequencePlan,
-                        normalizedApPoints: batchNormalizedApPoints
+                        normalizedApPoints: batchNormalizedApPoints,
+                        advanced: p.advanced
                     });
 
                     // ASSET PROTOCOL: guardar la RUTA (string diminuto) en vez del
@@ -7605,18 +8483,6 @@ if (ui.btnStack) {
                     fitToScreen(); // Recenter the viewport symmetrically to feature both images
                 }
 
-                // RE-APLICAR POST-PROCESADO AL NUEVO STACK: el resultado recién
-                // apilado llega CRUDO y lastProcessedParams aún guarda los del
-                // stack anterior — sin esto, la configuración en curso (wavelets,
-                // deconv, color...) no se re-aplicaba hasta tocar un slider (y si
-                // nada cambiaba, ni así). Se resetea el memo y, si hay config
-                // activa (no-neutra), se relanza el pipeline automáticamente.
-                lastProcessedParams = null;
-                if (!isPostConfigNeutral(getPipelineParams())) {
-                    log("INFO", tr("wavelets.reapplying", "Re-aplicando post-procesado al nuevo apilado..."));
-                    triggerUpdate();
-                }
-
                 // PERSISTENCE: Mantener paneles de análisis e info visibles para permitir re-apilado rápido
                 if (ui.panelAnalysis) ui.panelAnalysis.style.display = "block";
                 if (ui.panelInfo) ui.panelInfo.style.display = "block";
@@ -7633,10 +8499,7 @@ if (ui.btnStack) {
                     if (btnArr) btnArr.style.display = "none";
                     if (chkGuideWrap) chkGuideWrap.style.display = "none";
 
-                    // HIDE Deringing UI in Stacking Flow (if we ever reuse this for mosaic, but mostly for safety)
-                    if (ui.selDrMode) ui.selDrMode.parentElement.style.display = "none";
-                } else {
-                    // SHOW Deringing UI in Standard Stacking Flow
+                    // Artifact repair is part of every post-processing flow.
                     if (ui.selDrMode) ui.selDrMode.parentElement.style.display = "block";
                 }
 
@@ -7673,7 +8536,7 @@ if (ui.btnStack) {
                     if (pBatchReanalyze) pBatchReanalyze.style.display = "block";
                 }
 
-                resetProcessingParams();
+                await beginNewPostprocessResult(b64, isBatchMode ? "batch" : "stack");
 
                 hideProcessing();
                 const totalTime = (Date.now() - startTime) / 1000;
@@ -7825,7 +8688,8 @@ async function fn_save(format_idx) {
                 autoMask: p.autoMask,
                 levelsBlack: p.levels.black,
                 levelsWhite: p.levels.white,
-                levelsGamma: p.levels.gamma
+                levelsGamma: p.levels.gamma,
+                advanced: p.advanced
             });
             log("SUCCESS", normalizeBackendText(msg)); showCustomAlert(tr("general.saved", "Guardado"), normalizeBackendText(msg));
         } catch (e) { log("ERROR", "Save: " + e); showCustomAlert("Error", "Error guardando: " + e); }
@@ -7838,7 +8702,30 @@ if (ui.btnSaveTiff) ui.btnSaveTiff.addEventListener("click", () => fn_save(1));
 // F3: FITS 16-bit de salida (WinJUPOS/derotación, fotometría).
 if (ui.btnSaveFits) ui.btnSaveFits.addEventListener("click", () => fn_save(2));
 
-if (ui.btnToggleLog) ui.btnToggleLog.addEventListener("click", () => ui.consolePanel.classList.toggle("open"));
+function setLogPanelOpen(open) {
+    ui.consolePanel?.classList.toggle("open", !!open);
+    ui.consolePanel?.setAttribute("aria-hidden", String(!open));
+    ui.btnToggleLog?.setAttribute("aria-pressed", String(!!open));
+}
+
+if (ui.btnToggleLog) ui.btnToggleLog.addEventListener("click", () => setLogPanelOpen(!ui.consolePanel?.classList.contains("open")));
+document.getElementById("btn-close-logs")?.addEventListener("click", () => setLogPanelOpen(false));
+document.getElementById("btn-clear-logs")?.addEventListener("click", () => {
+    ui.logContainer?.replaceChildren();
+    const count = document.getElementById("log-entry-count");
+    if (count) count.textContent = "0 eventos";
+});
+document.getElementById("btn-copy-logs")?.addEventListener("click", async () => {
+    const text = Array.from(ui.logContainer?.querySelectorAll(".log-entry") || [])
+        .map((entry) => `[${entry.querySelector(".log-time")?.textContent || ""}] [${entry.dataset.level || "INFO"}] ${entry.querySelector(".log-message")?.textContent || ""}`)
+        .join("\n");
+    try {
+        await navigator.clipboard.writeText(text);
+        if (ui.statusText) ui.statusText.textContent = "Registro copiado.";
+    } catch (error) {
+        log("ERROR", `No se pudo copiar el registro: ${error}`);
+    }
+});
 
 if (ui.btnAnimExport) {
     ui.btnAnimExport.addEventListener("click", async () => {
@@ -7984,12 +8871,26 @@ function log(level, msg) {
         }
     }
 
+    const normalizedLevel = String(level || "INFO").toUpperCase();
     const d = document.createElement("div");
-    d.className = "log-entry"; if (level === "ERROR") d.className += " log-err";
-    d.textContent = `[${new Date().toLocaleTimeString()}] [${level}] ${msg}`;
-    
+    d.className = "log-entry";
+    d.dataset.level = normalizedLevel;
+    if (normalizedLevel === "ERROR") d.className += " log-err";
+    const time = document.createElement("span");
+    time.className = "log-time";
+    time.textContent = new Date().toLocaleTimeString();
+    const levelNode = document.createElement("span");
+    levelNode.className = "log-level";
+    levelNode.textContent = normalizedLevel;
+    const message = document.createElement("span");
+    message.className = "log-message";
+    message.textContent = String(msg);
+    d.append(time, levelNode, message);
+
     ui.logContainer.appendChild(d);
     ui.logContainer.scrollTop = ui.logContainer.scrollHeight;
+    const count = document.getElementById("log-entry-count");
+    if (count) count.textContent = `${ui.logContainer.children.length} eventos`;
 }
 window.log = log;
 

@@ -727,6 +727,36 @@ fn run_processing_pipeline(
 ) -> Vec<u16> {
     let size = width * height;
 
+    // A neutral recipe is an exact identity contract. Besides avoiding an
+    // expensive wavelet decomposition, this prevents the final soft-clipping
+    // stage and RGB↔YUV round-trip from altering a master when the user resets,
+    // undoes back to Original, or starts a new stack.
+    let near_zero = |value: f32| value.abs() <= 1e-6;
+    let neutral_recipe = u_amts.iter().all(|value| near_zero(*value))
+        && w_amts.iter().all(|value| near_zero(*value))
+        && d_amts.iter().all(|value| near_zero(*value))
+        && (gamma - 1.0).abs() <= 1e-6
+        && (saturation - 1.0).abs() <= 1e-6
+        && [r_x, r_y, b_x, b_y].iter().all(|value| near_zero(*value))
+        && deringing_mode == 0
+        && near_zero(crisp)
+        && deconv_iter == 0
+        && vc_iter == 0
+        && near_zero(usm_amount)
+        && near_zero(lce_amount)
+        && (contrast - 1.0).abs() <= 1e-6
+        && near_zero(brightness)
+        && near_zero(r_bal)
+        && near_zero(b_bal)
+        && near_zero(master_denoise);
+    if neutral_recipe {
+        if check_cancel(state, req_id) {
+            return Vec::new();
+        }
+        emit_progress(app, "Receta neutra · master 16-bit", 100.0, None);
+        return original.data.clone();
+    }
+
     // === NORMALIZATION: Detect actual image signal range ===
     // This is the core fix for bit-depth artifacts. Instead of using hardcoded
     // absolute delta limits (which blow up on low-signal images), we compute the
@@ -1426,8 +1456,6 @@ fn run_processing_pipeline(
 
     final_u16
 }
-
-
 #[cfg(test)]
 mod edge_aware_tests {
     use super::*;

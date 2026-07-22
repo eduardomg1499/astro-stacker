@@ -3995,6 +3995,7 @@ async fn process_batch_entry(
     levels_black: Option<f32>,         // Niveles: punto negro (0..1)
     levels_white: Option<f32>,         // Niveles: punto blanco (0..1)
     levels_gamma: Option<f32>,         // Niveles: gamma medios (0.1..5)
+    advanced: Option<AdvancedColorParams>,
 ) -> Result<BatchEntryResult, String> {
     state.license_manager.check_access()?;
     // El flag se rearma una sola vez al iniciar la sesión mediante
@@ -4478,7 +4479,6 @@ async fn process_batch_entry(
         }
     }
     let (safe_w, safe_h) = (cw, ch);
-
     let temp_res = StackResult {
         data: pre_processed, // NOW using the enhanced base
         width: safe_w,
@@ -4503,7 +4503,7 @@ async fn process_batch_entry(
     // Batch: la descomposición GPU interactiva no aplica aquí (el apilado ya usa
     // su propio motor GPU de acumulación); el post se re-aplica en CPU.
     let gpu_allowed = false;
-    let processed = run_processing_pipeline(
+    let mut processed = run_processing_pipeline(
         &app,
         &state,
         batch_postprocess_request_id,
@@ -4553,6 +4553,9 @@ async fn process_batch_entry(
 
     if processed.is_empty() {
         return Err("Cancelado por el usuario".to_string());
+    }
+    if let Some(ref advanced_params) = advanced {
+        apply_advanced_postprocess(&mut processed, temp_res.is_mono, advanced_params);
     }
     planetary_derotation_checkpoint(&batch_postprocess_token, "el postprocesado batch")?;
     let mut staged_prepared = StagedPlanetaryArtifact::encode_rgb16_png(
@@ -6274,8 +6277,16 @@ async fn apply_wavelets(
     levels_black: Option<f32>,         // Niveles: punto negro (0..1)
     levels_white: Option<f32>,         // Niveles: punto blanco (0..1)
     levels_gamma: Option<f32>,         // Niveles: gamma medios (0.1..5)
+    advanced: Option<AdvancedColorParams>,
+    result_id: Option<usize>,
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
+    if let Some(expected) = result_id {
+        let current = state.result_generation.load(Ordering::SeqCst);
+        if expected != current {
+            return Err("Resultado sustituido: se descartó una solicitud de postprocesado antigua.".into());
+        }
+    }
     let backend_request_id = begin_planetary_user_job(&state);
     let original = {
         let s = state.stacked_image.lock().unwrap_or_else(|e| e.into_inner());
@@ -6323,7 +6334,7 @@ async fn apply_wavelets(
         && gpu_mode.as_deref().map(|m| m != "cpu").unwrap_or(true)
         && crate::gpu_stack::gpu_runtime().is_some();
 
-    let final_u16 = run_processing_pipeline(
+    let mut final_u16 = run_processing_pipeline(
         &app,
         &state,
         backend_request_id,
@@ -6376,6 +6387,31 @@ async fn apply_wavelets(
     }
     if check_cancel(&state, backend_request_id) {
         return Err("Cancelled".into());
+    }
+
+    if let Some(ref advanced_params) = advanced {
+        apply_advanced_postprocess(&mut final_u16, original.is_mono, advanced_params);
+    }
+
+    if let Some(expected) = result_id {
+        let current = state.result_generation.load(Ordering::SeqCst);
+        if expected != current {
+            return Err("Resultado sustituido: se descartó una vista calculada fuera de sesión.".into());
+        }
+    }
+
+    // El preview de arrastre puede estar reducido; no debe sustituir el búfer
+    // 16-bit de tamaño completo que consumen histograma, cuentagotas y export.
+    // Al soltar el control llega el render 1:1 y entonces sí se publica.
+    if !use_ds {
+        let mut processed = state.processed_image.lock().unwrap();
+        *processed = Some(StackResult {
+            data: final_u16.clone(),
+            width: original.width,
+            height: original.height,
+            is_mono: original.is_mono,
+            is_surface: original.is_surface,
+        });
     }
 
     emit_progress(&app, "Generando vista...", 97.0, None);
@@ -6505,6 +6541,7 @@ async fn save_final_image(
     levels_black: Option<f32>,         // Niveles: punto negro (0..1)
     levels_white: Option<f32>,         // Niveles: punto blanco (0..1)
     levels_gamma: Option<f32>,         // Niveles: gamma medios (0.1..5)
+    advanced: Option<AdvancedColorParams>,
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
     let export_request_id = begin_planetary_user_job(&state);
@@ -6539,7 +6576,7 @@ async fn save_final_image(
 
     // Export: siempre CPU (render final exacto, sin dependencia de GPU).
     let gpu_allowed = false;
-    let final_u16 = run_processing_pipeline(
+    let mut final_u16 = run_processing_pipeline(
         &app,
         &state,
         export_request_id,
@@ -6595,6 +6632,10 @@ async fn save_final_image(
     }
     if check_cancel(&state, export_request_id) {
         return Err("Error en el procesado (Cancelado)".into());
+    }
+
+    if let Some(ref advanced_params) = advanced {
+        apply_advanced_postprocess(&mut final_u16, original.is_mono, advanced_params);
     }
 
     emit_progress(&app, "Guardando...", 97.0, None);
@@ -11421,15 +11462,25 @@ fn apply_advanced_color_magic(
         }
     }
 
-    // --- 3. Contrast as an S-curve anchored at the image midtone ------------
-    // Neutral 1.0. Pivots on the actual signal midtone (great for astro frames
-    // that are mostly dark) and preserves both endpoints -> no hard clipping.
+    // --- 3. Contrast on luminance, with hue and pivot preserved --------------
+    // Applying the S-curve to each RGB channel independently changes colour and
+    // can look like a brightness lift. Transforming luminance once and scaling
+    // RGB by the same factor makes contrast behave as contrast.
     if (contrast - 1.0).abs() > 0.001 {
         let pivot = (contrast_pivot * INV_N).clamp(0.05, 0.95);
         let k = contrast.clamp(0.1, 3.0);
-        rn = s_curve_contrast(rn, pivot, k);
-        gn = s_curve_contrast(gn, pivot, k);
-        bn = s_curve_contrast(bn, pivot, k);
+        let luma = 0.2126 * rn + 0.7152 * gn + 0.0722 * bn;
+        let contrasted_luma = s_curve_contrast(luma, pivot, k);
+        if luma > 1e-7 {
+            let scale = contrasted_luma / luma;
+            rn *= scale;
+            gn *= scale;
+            bn *= scale;
+        } else {
+            rn = contrasted_luma;
+            gn = contrasted_luma;
+            bn = contrasted_luma;
+        }
     }
 
     // --- 4. Gamma (midtone power curve over the FULL range) -----------------
@@ -11857,8 +11908,13 @@ fn clear_app_memory(state: tauri::State<'_, AppState>) {
         &state.active_req_id,
         state.cancel_requested.as_ref(),
         || {
+            state.result_generation.fetch_add(1, Ordering::AcqRel);
             *state
                 .stacked_image
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+            *state
+                .processed_image
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()) = None;
             state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -11884,8 +11940,13 @@ fn clear_stack_memory(state: tauri::State<'_, AppState>) {
         &state.planetary_generation_gate,
         &state.active_req_id,
         || {
+            state.result_generation.fetch_add(1, Ordering::AcqRel);
             *state
                 .stacked_image
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+            *state
+                .processed_image
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()) = None;
             state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -11998,6 +12059,7 @@ fn main() {
             app.manage(AppState {
                 stacked_image: Mutex::new(None),
                 deep_sky_result: Mutex::new(None),
+                processed_image: Mutex::new(None),
                 deconv_cache: Mutex::new(Vec::new()),
                 wavelet_cache: Mutex::new(Vec::new()),
                 filter_cache: Mutex::new(Vec::new()),
@@ -12005,6 +12067,7 @@ fn main() {
                 batch_anchor_dims: Mutex::new((0, 0)),
                 planetary_generation_gate: Mutex::new(()),
                 active_req_id: AtomicUsize::new(0),
+                result_generation: AtomicUsize::new(0),
                 cancel_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 job_registry: pipeline::JobRegistry::new(),
                 license_manager,
@@ -12016,6 +12079,11 @@ fn main() {
             preview_video,
             stack_video,
             apply_wavelets,
+            reset_postprocess_state,
+            postprocess_histogram,
+            sample_postprocess_pixel,
+            estimate_postprocess_rgb_alignment,
+            analyze_postprocess_artifacts,
             save_final_image,
             export_mosaic_result,
             generate_grid,

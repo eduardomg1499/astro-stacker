@@ -3000,6 +3000,10 @@ struct AppState {
     /// Máster lineal float32 y mapas científicos de cielo profundo. Se mantiene
     /// separado del resultado planetario u16 para no perder headroom.
     deep_sky_result: Mutex<Option<DeepSkyLinearResult>>,
+    /// Last rendered 16-bit result for histogram, sampling and export parity.
+    /// It is always derived again from `stacked_image`, never used as the base
+    /// of the next edit, so adjustments cannot accumulate destructively.
+    processed_image: Mutex<Option<StackResult>>,
     deconv_cache: Mutex<Vec<DeconvCache>>,
     wavelet_cache: Mutex<Vec<WaveletLayers>>,
     filter_cache: Mutex<Vec<FilterCache>>,
@@ -3010,6 +3014,9 @@ struct AppState {
     /// transición atómica de propietario queda protegida.
     planetary_generation_gate: Mutex<()>,
     active_req_id: AtomicUsize,
+    /// Monotonic identity for the result currently open in post-processing.
+    /// Late async requests from a previous stack are rejected.
+    result_generation: AtomicUsize,
     // Cancelacion cooperativa de analisis/apilado. Arc para poder clonarlo a
     // los hilos productores (decoder FFmpeg, prefetcher) que sobreviven al
     // scope del comando. Se resetea al INICIAR una operacion de usuario, y lo
@@ -3029,6 +3036,53 @@ struct StackResult {
     height: usize,
     is_mono: bool,
     is_surface: bool, // Support for V2 surface handling
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct AdvancedColorParams {
+    /// Input/output levels in normalised linear 16-bit space.
+    levels_black: f32,
+    levels_mid: f32,
+    levels_white: f32,
+    /// Exposure is expressed in stops; the remaining tone controls use -1..1.
+    exposure: f32,
+    shadows: f32,
+    highlights: f32,
+    whites: f32,
+    blacks: f32,
+    vibrance: f32,
+    temperature: f32,
+    tint: f32,
+    /// Red, orange, yellow, green, aqua, blue, purple and magenta.
+    hsl_saturation: [f32; 8],
+    grading_shadows: [f32; 3],
+    grading_midtones: [f32; 3],
+    grading_highlights: [f32; 3],
+    grading_amounts: [f32; 3],
+}
+
+impl Default for AdvancedColorParams {
+    fn default() -> Self {
+        Self {
+            levels_black: 0.0,
+            levels_mid: 1.0,
+            levels_white: 1.0,
+            exposure: 0.0,
+            shadows: 0.0,
+            highlights: 0.0,
+            whites: 0.0,
+            blacks: 0.0,
+            vibrance: 0.0,
+            temperature: 0.0,
+            tint: 0.0,
+            hsl_saturation: [0.0; 8],
+            grading_shadows: [1.0, 1.0, 1.0],
+            grading_midtones: [1.0, 1.0, 1.0],
+            grading_highlights: [1.0, 1.0, 1.0],
+            grading_amounts: [0.0; 3],
+        }
+    }
 }
 
 const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 11;
