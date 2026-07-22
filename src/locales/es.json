@@ -1005,6 +1005,10 @@
         }
     },
     "deepsky": {
+        "view_unavailable": "Vista no disponible",
+        "view_requires": "La vista \"{{view}}\" solo se genera al apilar con {{engine}}. Este máster se integró con otro motor: usa Reintegrar y elige ese método para producirla.",
+        "spcc_seed_title": "SPCC: apuntado del campo",
+        "spcc_seed_hint": "La cabecera FITS no trae RA/Dec ni escala. Indica el centro aproximado del campo y la escala de tu equipo.",
         "method_needs": "Para activar NebulaFusion/EIDR:",
         "guide_engines_off": "NebulaFusion/EIDR desactivados",
         "guide_title": "Guía",
@@ -1119,7 +1123,7 @@
         "hoo": "HOO dual-band",
         "hoo_running": "Combinando HOO…",
         "hoo_done": "HOO aplicado (Ha→R, OIII→G/B).",
-        "hoo_hint": "Combina el máster OSC dual-band en HOO: Ha→R, OIII→G y B. Convierte el verde crudo en la imagen roja/turquesa. Reintegra para volver al RGB.",
+        "hoo_hint": "Vista HOO derivada del máster dual-band: Ha→R, OIII→G y B (fondo neutralizado). Solo cambia la VISTA — el máster lineal float32 (SCI/VAR/NEFF/DQ) queda intacto; Reintegrar o cambiar de vista vuelve al RGB original.",
         "spcc": "SPCC color",
         "spcc_running": "Calibrando color…",
         "spcc_hint": "Calibración de color fotométrica contra Gaia DR3 (banda ancha OSC/RGB, requiere internet). Para banda estrecha/dual-band usa HOO/SHO.",

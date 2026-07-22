@@ -296,7 +296,7 @@ struct SpccRequest {
 /// queries Gaia, plate-solves by matching to detected stars, measures per-channel
 /// flux, solves and applies a solar-anchored white balance IN PLACE.
 #[tauri::command]
-fn spcc_calibrate(
+async fn spcc_calibrate(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     req: SpccRequest,

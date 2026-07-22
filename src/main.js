@@ -10538,6 +10538,44 @@ function dsPreserveInspectionScroll(panel, action) {
     if (newTable) newTable.scrollTop = tableTop;
 }
 
+// Diálogo propio para el seed de SPCC (RA / Dec / escala): el webview de
+// Tauri no implementa window.prompt. Devuelve {ra, dec, scale} o null.
+function dsPromptSpccSeed() {
+    return new Promise(resolve => {
+        document.getElementById("ds-spcc-seed")?.remove();
+        const overlay = document.createElement("div");
+        overlay.id = "ds-spcc-seed";
+        overlay.style.cssText = "position:fixed;inset:0;z-index:12500;background:rgba(2,6,23,.82);display:flex;align-items:center;justify-content:center;padding:24px;";
+        overlay.innerHTML = `<div style="background:#0f172a;border:1px solid rgba(124,58,237,.4);border-radius:14px;width:min(420px,92vw);padding:18px;">
+            <b style="color:#e2e8f0;font-size:.82rem;">${tr("deepsky.spcc_seed_title", "SPCC: apuntado del campo")}</b>
+            <div style="color:#94a3b8;font-size:.64rem;margin:6px 0 12px;line-height:1.5;">${tr("deepsky.spcc_seed_hint", "La cabecera FITS no trae RA/Dec ni escala. Indica el centro aproximado del campo y la escala de tu equipo.")}</div>
+            <label style="display:block;color:#cbd5e1;font-size:.66rem;margin-bottom:8px;">${tr("deepsky.spcc_ra", "RA del objetivo (p.ej. 18 18 48 o 274.7)")}<input id="spcc-seed-ra" type="text" style="width:100%;margin-top:3px;" placeholder="18 18 48"></label>
+            <label style="display:block;color:#cbd5e1;font-size:.66rem;margin-bottom:8px;">${tr("deepsky.spcc_dec", "Dec del objetivo (p.ej. -13 49 00 o -13.8)")}<input id="spcc-seed-dec" type="text" style="width:100%;margin-top:3px;" placeholder="-13 49 00"></label>
+            <label style="display:block;color:#cbd5e1;font-size:.66rem;margin-bottom:14px;">${tr("deepsky.spcc_scale", "Escala (arcsec/píxel, p.ej. 1.30)")}<input id="spcc-seed-scale" type="text" style="width:100%;margin-top:3px;" placeholder="1.30"></label>
+            <div style="display:flex;gap:9px;justify-content:flex-end;">
+                <button type="button" id="spcc-seed-cancel" class="secondary" style="width:auto;font-size:.66rem;padding:7px 16px;border-radius:9px;">${tr("general.cancel", "Cancelar")}</button>
+                <button type="button" id="spcc-seed-ok" style="width:auto;font-size:.66rem;padding:7px 18px;border-radius:9px;background:linear-gradient(135deg,#2563eb,#7c3aed);color:white;">${tr("general.accept", "Aceptar")}</button>
+            </div>
+        </div>`;
+        const done = (value) => { overlay.remove(); resolve(value); };
+        overlay.addEventListener("click", (e) => { if (e.target === overlay) done(null); });
+        overlay.querySelector("#spcc-seed-cancel").addEventListener("click", () => done(null));
+        overlay.querySelector("#spcc-seed-ok").addEventListener("click", () => {
+            const ra = overlay.querySelector("#spcc-seed-ra").value.trim();
+            const dec = overlay.querySelector("#spcc-seed-dec").value.trim();
+            const scale = parseFloat(overlay.querySelector("#spcc-seed-scale").value.trim());
+            if (!ra || !dec) return;
+            done({ ra, dec, scale: Number.isFinite(scale) ? scale : null });
+        });
+        overlay.addEventListener("keydown", (e) => {
+            if (e.key === "Escape") done(null);
+            else if (e.key === "Enter") overlay.querySelector("#spcc-seed-ok").click();
+        });
+        document.body.appendChild(overlay);
+        requestAnimationFrame(() => overlay.querySelector("#spcc-seed-ra").focus());
+    });
+}
+
 // Visor de una toma individual: imagen estirada (deepsky_frame_preview) +
 // métricas + motivo + descarte reversible, en un overlay ligero.
 async function dsOpenFramePreview(row, allRows) {
@@ -11333,7 +11371,25 @@ async function dsShowResultView(kind) {
         const image = await invoke("deepsky_result_view", { kind });
         if (ui.imgResult) await setImageAndWait(ui.imgResult, image, false);
     } catch (e) {
-        log("ERROR", `Vista diagnóstica: ${e}`);
+        // Explicar QUÉ produce cada vista en vez de fallar en silencio: los
+        // mapas científicos dependen del motor con el que se integró.
+        const requirement = {
+            variance: "NebulaFusion (Lite o Full)",
+            neff: "NebulaFusion (Lite o Full)",
+            dq: "NebulaFusion (Lite o Full)",
+            struct: "NebulaFusion Full + STRUCT",
+            struct_residual: "NebulaFusion Full + STRUCT",
+            recoverability: "EIDR",
+        }[kind];
+        const label = selector?.selectedOptions?.[0]?.textContent?.trim() || kind;
+        showCustomAlert(
+            tr("deepsky.view_unavailable", "Vista no disponible"),
+            requirement
+                ? trFormat("deepsky.view_requires", { view: label, engine: requirement },
+                    `La vista "${label}" solo se genera al apilar con ${requirement}. Este máster se integró con otro motor: usa Reintegrar y elige ese método para producirla.`)
+                : `${label}: ${normalizeBackendText(String(e))}`,
+        );
+        log("WARN", `Vista diagnóstica '${kind}' no disponible: ${e}`);
         dsResultView = "master";
         if (selector) selector.value = "master";
         if (hist) hist.style.display = "block";
@@ -11450,7 +11506,9 @@ function dsBuildHistogramPanel() {
     // bottom clears the STF control bar even when it wraps to 2 rows (its top is
     // ~112px), and z-index sits ABOVE the bar so the histogram is never hidden.
     // dsPositionHistogram() refines the offset to the bar's real height on show.
-    panel.style.cssText = "position:fixed; bottom:132px; left:50%; transform:translateX(-50%); z-index:501; width:260px; padding:8px 10px 6px; background:rgba(15,23,42,0.94); border:1px solid rgba(124,58,237,0.35); border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(6px);";
+    // Anclado al COSTADO derecho: centrado se encimaba con los botones de la
+    // barra STF cuando la tarjeta crece (calidad + patrón de detector).
+    panel.style.cssText = "position:fixed; bottom:132px; right:18px; z-index:501; width:280px; padding:8px 10px 6px; background:rgba(15,23,42,0.94); border:1px solid rgba(124,58,237,0.35); border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(6px);";
     const cv = document.createElement("canvas");
     cv.width = 240; cv.height = 66;
     cv.style.cssText = "width:100%; height:66px; display:block; background:rgba(2,6,23,0.6); border-radius:6px;";
@@ -11693,7 +11751,7 @@ function dsShowStretchBar() {
         btnHoo.type = "button";
         btnHoo.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-palette"></use></svg>${tr("deepsky.hoo", "HOO dual-band")}`;
         btnHoo.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; align-items:center; display:inline-flex;";
-        btnHoo.title = tr("deepsky.hoo_hint", "Combina el máster OSC dual-band en HOO: Ha→R, OIII→G y B. Convierte el verde crudo en la imagen roja/turquesa. Reintegra para volver al RGB.");
+        btnHoo.title = tr("deepsky.hoo_hint", "Vista HOO derivada del máster dual-band: Ha→R, OIII→G y B (fondo neutralizado). Solo cambia la VISTA — el máster lineal float32 (SCI/VAR/NEFF/DQ) queda intacto; Reintegrar o cambiar de vista vuelve al RGB original.");
         btnHoo.addEventListener("click", async (ev) => {
             ev.stopPropagation();
             const prev = btnHoo.innerHTML;
@@ -11732,13 +11790,12 @@ function dsShowStretchBar() {
                 } catch (e) {
                     const msg = String(e);
                     if (/RA\/Dec|apuntado|escala|RA, Dec/i.test(msg)) {
-                        const ra = window.prompt(tr("deepsky.spcc_ra", "RA del objetivo (p.ej. 18 18 48 o 274.7):"), "");
-                        if (ra === null) throw new Error(tr("general.cancelled", "Cancelado"));
-                        const dec = window.prompt(tr("deepsky.spcc_dec", "Dec del objetivo (p.ej. -13 49 00 o -13.8):"), "");
-                        if (dec === null) throw new Error(tr("general.cancelled", "Cancelado"));
-                        const scale = window.prompt(tr("deepsky.spcc_scale", "Escala (arcsec/píxel, p.ej. 1.30):"), "");
-                        if (scale === null) throw new Error(tr("general.cancelled", "Cancelado"));
-                        res = await run({ ra, dec, scaleArcsecPx: parseFloat(scale) || null });
+                        // window.prompt NO existe en el webview de Tauri
+                        // (devolvía null → "Cancelado" instantáneo): diálogo
+                        // propio con los tres campos.
+                        const seed = await dsPromptSpccSeed();
+                        if (!seed) throw new Error(tr("general.cancelled", "Cancelado"));
+                        res = await run({ ra: seed.ra, dec: seed.dec, scaleArcsecPx: seed.scale });
                     } else { throw e; }
                 }
                 if (ui.imgResult && res && res.preview) await setImageAndWait(ui.imgResult, res.preview, false);

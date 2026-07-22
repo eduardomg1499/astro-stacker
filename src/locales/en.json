@@ -1005,6 +1005,10 @@
         }
     },
     "deepsky": {
+        "view_unavailable": "View not available",
+        "view_requires": "The \"{{view}}\" view is only produced when stacking with {{engine}}. This master used a different engine: use Reintegrate and pick that method to produce it.",
+        "spcc_seed_title": "SPCC: field pointing",
+        "spcc_seed_hint": "The FITS header has no RA/Dec or scale. Enter the approximate field centre and your rig's pixel scale.",
         "method_needs": "To enable NebulaFusion/EIDR:",
         "guide_engines_off": "NebulaFusion/EIDR disabled",
         "guide_title": "Guide",
@@ -1119,7 +1123,7 @@
         "hoo": "HOO dual-band",
         "hoo_running": "Combining HOO…",
         "hoo_done": "HOO applied (Ha→R, OIII→G/B).",
-        "hoo_hint": "Combines the OSC dual-band master into HOO: Ha→R, OIII→G and B. Turns the raw green into the red/teal image. Re-stack to go back to RGB.",
+        "hoo_hint": "Derived HOO view of the dual-band master: Ha→R, OIII→G and B (background neutralized). Only the VIEW changes — the linear float32 master (SCI/VAR/NEFF/DQ) stays intact; Reintegrate or switch views to return to the original RGB.",
         "spcc": "SPCC color",
         "spcc_running": "Calibrating color…",
         "spcc_hint": "Photometric color calibration against Gaia DR3 (broadband OSC/RGB, needs internet). For narrowband/dual-band use HOO/SHO.",
