@@ -1005,6 +1005,9 @@
         }
     },
     "deepsky": {
+        "spcc_reference": "White reference",
+        "spcc_ref_asg": "Average spiral galaxy (PixInsight-style)",
+        "spcc_ref_g2v": "G2V (solar-type star)",
         "view_unavailable": "View not available",
         "view_requires": "The \"{{view}}\" view is only produced when stacking with {{engine}}. This master used a different engine: use Reintegrate and pick that method to produce it.",
         "spcc_seed_title": "SPCC: field pointing",

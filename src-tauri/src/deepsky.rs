@@ -6766,7 +6766,7 @@ fn deepsky_export_float32(
     let stem = format!("ZenithDeepSky_{}", result.id);
     let master = parent.join(format!("{stem}_linear_float32.fits"));
     let recipe = parent.join(format!("{stem}_recipe.json"));
-    let master_metadata = vec![
+    let mut master_metadata = vec![
         ("ZASVER", "'hybrid-v2-2026.07'".to_string()),
         ("ZASJOB", format!("'{}'", result.id)),
         ("ZASENG", format!("'{}'", result.engine)),
@@ -6782,6 +6782,29 @@ fn deepsky_export_float32(
             ),
         ),
     ];
+    // WCS resuelta por SPCC (TAN por similitud contra Gaia): keywords estándar
+    // para que PixInsight/Siril/astropy puedan anotar y reproyectar el máster.
+    if let Some(wcs) = result.recipe.get("wcs") {
+        let num = |key: &str| wcs.get(key).and_then(|v| v.as_f64());
+        if let (Some(crval1), Some(crval2), Some(crpix1), Some(crpix2), Some(cd11), Some(cd12), Some(cd21), Some(cd22)) = (
+            num("crval1"), num("crval2"), num("crpix1"), num("crpix2"),
+            num("cd11"), num("cd12"), num("cd21"), num("cd22"),
+        ) {
+            master_metadata.push(("CTYPE1", "'RA---TAN'".to_string()));
+            master_metadata.push(("CTYPE2", "'DEC--TAN'".to_string()));
+            master_metadata.push(("CUNIT1", "'deg'".to_string()));
+            master_metadata.push(("CUNIT2", "'deg'".to_string()));
+            master_metadata.push(("CRVAL1", format!("{crval1:>20.10}")));
+            master_metadata.push(("CRVAL2", format!("{crval2:>20.10}")));
+            master_metadata.push(("CRPIX1", format!("{crpix1:>20.4}")));
+            master_metadata.push(("CRPIX2", format!("{crpix2:>20.4}")));
+            master_metadata.push(("CD1_1", format!("{cd11:>20.10E}")));
+            master_metadata.push(("CD1_2", format!("{cd12:>20.10E}")));
+            master_metadata.push(("CD2_1", format!("{cd21:>20.10E}")));
+            master_metadata.push(("CD2_2", format!("{cd22:>20.10E}")));
+            master_metadata.push(("RADESYS", "'ICRS'".to_string()));
+        }
+    }
     cancellation_checkpoint(cancel.as_ref(), "exportación FITS float32")?;
     ds_save_float32_fits_cancellable(
         &master,

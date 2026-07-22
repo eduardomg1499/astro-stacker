@@ -1005,6 +1005,9 @@
         }
     },
     "deepsky": {
+        "spcc_reference": "Referencia blanca",
+        "spcc_ref_asg": "Galaxia espiral promedio (estilo PixInsight)",
+        "spcc_ref_g2v": "G2V (estrella solar)",
         "view_unavailable": "Vista no disponible",
         "view_requires": "La vista \"{{view}}\" solo se genera al apilar con {{engine}}. Este máster se integró con otro motor: usa Reintegrar y elige ese método para producirla.",
         "spcc_seed_title": "SPCC: apuntado del campo",

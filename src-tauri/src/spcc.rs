@@ -248,6 +248,114 @@ fn spcc_channel_flux(plane: &[f32], w: usize, h: usize, x: f32, y: f32, bg: f32)
 /// Anchored to solar-type stars (bp_rp≈0.82, G2V): those must come out neutral,
 /// so gain_c = median(G_flux / c_flux) over the solar-colour subset. Falls back
 /// to a robust grey-world over all matched stars if too few solar-type stars.
+/// Ajuste lineal y = a + b·x con recorte sigma iterativo (3 pasadas, 2.5σ).
+/// Devuelve (a, b, rms, n_usadas).
+fn spcc_fit_line_sigma_clipped(points: &[(f64, f64)]) -> Option<(f64, f64, f64, usize)> {
+    let mut keep: Vec<(f64, f64)> = points
+        .iter()
+        .copied()
+        .filter(|p| p.0.is_finite() && p.1.is_finite())
+        .collect();
+    if keep.len() < 8 {
+        return None;
+    }
+    let fit = |pts: &[(f64, f64)]| -> Option<(f64, f64, f64)> {
+        let n = pts.len() as f64;
+        let sx: f64 = pts.iter().map(|p| p.0).sum();
+        let sy: f64 = pts.iter().map(|p| p.1).sum();
+        let sxx: f64 = pts.iter().map(|p| p.0 * p.0).sum();
+        let sxy: f64 = pts.iter().map(|p| p.0 * p.1).sum();
+        let det = n * sxx - sx * sx;
+        if det.abs() < 1e-9 {
+            return None;
+        }
+        let b = (n * sxy - sx * sy) / det;
+        let a = (sy - b * sx) / n;
+        let rms = (pts
+            .iter()
+            .map(|p| {
+                let r = p.1 - (a + b * p.0);
+                r * r
+            })
+            .sum::<f64>()
+            / n)
+            .sqrt();
+        Some((a, b, rms))
+    };
+    let mut result = fit(&keep)?;
+    for _ in 0..3 {
+        let (a, b, rms) = result;
+        let sigma = rms.max(1e-6);
+        let filtered: Vec<(f64, f64)> = keep
+            .iter()
+            .copied()
+            .filter(|p| (p.1 - (a + b * p.0)).abs() <= 2.5 * sigma)
+            .collect();
+        if filtered.len() == keep.len() || filtered.len() < 8 {
+            break;
+        }
+        keep = filtered;
+        result = fit(&keep)?;
+    }
+    let (a, b, rms) = result;
+    Some((a, b, rms, keep.len()))
+}
+
+/// Diagnóstico del ajuste fotométrico por regresión.
+struct SpccFitInfo {
+    stars: usize,
+    slope_r: f64,
+    slope_b: f64,
+    scatter_r_mag: f64,
+    scatter_b_mag: f64,
+}
+
+/// Balance por REGRESIÓN sobre todo el locus estelar (estilo PCC/SPCC de
+/// PixInsight): ajusta color instrumental (−2.5·log10 F_c/F_G) contra BP−RP
+/// de Gaia con TODAS las estrellas emparejadas y evalúa la recta en el color
+/// de la referencia blanca. Mucho más estable que anclarse a las ~solares
+/// (que pueden escasear) y sin el sesgo del color medio del campo.
+fn spcc_solve_gains_regression(
+    samples: &[(f64, f64, f64, f64)],
+    reference_bp_rp: f64,
+) -> Option<(f64, f64, f64, SpccFitInfo)> {
+    let points_r: Vec<(f64, f64)> = samples
+        .iter()
+        .filter(|s| s.1 > 0.0 && s.2 > 0.0)
+        .map(|s| (s.0, -2.5 * (s.1 / s.2).log10()))
+        .collect();
+    let points_b: Vec<(f64, f64)> = samples
+        .iter()
+        .filter(|s| s.3 > 0.0 && s.2 > 0.0)
+        .map(|s| (s.0, -2.5 * (s.3 / s.2).log10()))
+        .collect();
+    if points_r.len() < 12 || points_b.len() < 12 {
+        return None;
+    }
+    let (ar, br, rms_r, n_r) = spcc_fit_line_sigma_clipped(&points_r)?;
+    let (ab, bb, rms_b, n_b) = spcc_fit_line_sigma_clipped(&points_b)?;
+    // Color instrumental predicho de una estrella con el color de la
+    // referencia blanca; neutralizarla define las ganancias.
+    let color_r = ar + br * reference_bp_rp;
+    let color_b = ab + bb * reference_bp_rp;
+    let gain_r = 10f64.powf(0.4 * color_r);
+    let gain_b = 10f64.powf(0.4 * color_b);
+    let (gain_r, gain_g, gain_b) = (gain_r, 1.0f64, gain_b);
+    let geo = (gain_r * gain_g * gain_b).cbrt().max(1e-9);
+    Some((
+        gain_r / geo,
+        gain_g / geo,
+        gain_b / geo,
+        SpccFitInfo {
+            stars: n_r.min(n_b),
+            slope_r: br,
+            slope_b: bb,
+            scatter_r_mag: rms_r,
+            scatter_b_mag: rms_b,
+        },
+    ))
+}
+
 fn spcc_solve_gains(samples: &[(f64, f64, f64, f64)]) -> Option<(f64, f64, f64, usize)> {
     // samples: (bp_rp, flux_r, flux_g, flux_b)
     let solar: Vec<&(f64, f64, f64, f64)> = samples
@@ -288,6 +396,10 @@ struct SpccRequest {
     dec: Option<String>,
     scale_arcsec_px: Option<f64>,
     mag_limit: Option<f64>,
+    /// Referencia blanca: "averageSpiral" (default, ~galaxia espiral promedio)
+    /// o "g2v" (estrella solar). Con la regresión de color, la referencia es
+    /// el color BP-RP en el que se evalúa la recta ajustada.
+    white_reference: Option<String>,
     work_dir: Option<String>,
 }
 
@@ -407,8 +519,38 @@ async fn spcc_calibrate(
             samples.push((s.bp_rp, fr, fg, fb));
         }
     }
-    let (gain_r, gain_g, gain_b, anchor) = spcc_solve_gains(&samples)
-        .ok_or("SPCC: muy pocas estrellas catalogadas medidas para resolver el balance.")?;
+    let white_reference = req.white_reference.as_deref().unwrap_or("averageSpiral");
+    let (reference_bp_rp, reference_label) = match white_reference {
+        "g2v" | "sun" => (0.82, "G2V (estrella solar)"),
+        // Aproximación del color efectivo BP-RP de la referencia "galaxia
+        // espiral promedio" de PixInsight (no su espectro completo).
+        _ => (0.88, "Galaxia espiral promedio"),
+    };
+    let regression = spcc_solve_gains_regression(&samples, reference_bp_rp);
+    let (gain_r, gain_g, gain_b, anchor, fit_note) = match regression {
+        Some((gr, gg, gb, fit)) => {
+            let note = format!(
+                "regresión de color con {} estrellas (pendientes R {:+.3}, B {:+.3} mag/mag; dispersión {:.0}/{:.0} mmag)",
+                fit.stars,
+                fit.slope_r,
+                fit.slope_b,
+                fit.scatter_r_mag * 1000.0,
+                fit.scatter_b_mag * 1000.0
+            );
+            (gr, gg, gb, fit.stars, note)
+        }
+        None => {
+            let (gr, gg, gb, anchor) = spcc_solve_gains(&samples)
+                .ok_or("SPCC: muy pocas estrellas catalogadas medidas para resolver el balance.")?;
+            (
+                gr,
+                gg,
+                gb,
+                anchor,
+                format!("mediana anclada a {anchor} estrellas cuasi-solares (pocas muestras para regresión)"),
+            )
+        }
+    };
 
     // --- 5. Apply the per-channel gains to the linear master (in place) ---
     for i in 0..npx {
@@ -422,6 +564,43 @@ async fn spcc_calibrate(
             let r = guard.as_mut().ok_or("El máster desapareció durante SPCC.")?;
             r.data = data.clone();
             r.method = format!("{} + SPCC", r.method);
+            // WCS de la solución (TAN aproximada por similitud): persiste en la
+            // receta y el export FITS float32 la escribe como keywords para que
+            // PixInsight/Siril puedan anotar/reproyectar el máster.
+            let sign = if handed { -1.0f64 } else { 1.0f64 };
+            let s = seed.scale_arcsec_px;
+            // M = L · diag(1/s, sign/s): (ξ,η) arcsec → Δpíxel imagen.
+            let m11 = transform.h[0] / s;
+            let m12 = transform.h[1] * sign / s;
+            let m21 = transform.h[3] / s;
+            let m22 = transform.h[4] * sign / s;
+            let det = m11 * m22 - m12 * m21;
+            if det.abs() > 1e-12 {
+                // CD = M⁻¹/3600 (deg/píxel).
+                let cd11 = m22 / det / 3600.0;
+                let cd12 = -m12 / det / 3600.0;
+                let cd21 = -m21 / det / 3600.0;
+                let cd22 = m11 / det / 3600.0;
+                let (px0, py0) = transform.forward(cx as f32, cy as f32);
+                if let Some(recipe) = r.recipe.as_object_mut() {
+                    recipe.insert(
+                        "wcs".into(),
+                        serde_json::json!({
+                            "ctype": "TAN",
+                            "crval1": seed.ra_deg,
+                            "crval2": seed.dec_deg,
+                            "crpix1": px0 as f64 + 1.0,
+                            "crpix2": py0 as f64 + 1.0,
+                            "cd11": cd11,
+                            "cd12": cd12,
+                            "cd21": cd21,
+                            "cd22": cd22,
+                            "rmsPx": rms,
+                            "source": "spcc-gaia-similarity",
+                        }),
+                    );
+                }
+            }
         }
         // Rebuild the u16 mirror + STF preview so the UI reflects the calibration.
         let mut rgb16 = vec![0u16; npx * 3];
@@ -458,8 +637,8 @@ async fn spcc_calibrate(
         &app,
         "SUCCESS",
         &format!(
-            "SPCC: {} estrellas Gaia emparejadas (inliers {}, RMS {:.2} px), ancla {} solares · ganancias R/G/B = {:.3}/{:.3}/{:.3}.",
-            samples.len(), inliers, rms, anchor, gain_r, gain_g, gain_b
+            "SPCC: {} estrellas Gaia emparejadas (inliers {}, RMS {:.2} px) · {} · referencia blanca: {} · ganancias R/G/B = {:.3}/{:.3}/{:.3} · WCS guardada en la receta.",
+            samples.len(), inliers, rms, fit_note, reference_label, gain_r, gain_g, gain_b
         ),
     );
     Ok(SpccResult {
@@ -473,7 +652,9 @@ async fn spcc_calibrate(
         solved_scale_arcsec_px: seed.scale_arcsec_px,
         rms_px: rms,
         preview,
-        note: "Balance fotométrico (anclado a estrellas solares Gaia). Para banda estrecha/dual-band usa HOO/SHO.".into(),
+        note: format!(
+            "Balance fotométrico Gaia por {fit_note}. Referencia blanca: {reference_label}. WCS TAN aproximada guardada (se escribe en el FITS float32 exportado). Para banda estrecha/dual-band usa HOO/SHO."
+        ),
     })
 }
 
@@ -502,6 +683,43 @@ mod spcc_tests {
         assert!(xi.abs() < 1e-6 && eta.abs() < 1e-6);
         let (xi, _) = spcc_gnomonic(181.0, 0.0, 180.0, 0.0, false).unwrap();
         assert!((xi - 3600.0).abs() < 5.0, "xi {xi}");
+    }
+
+    #[test]
+    fn test_spcc_regression_recovers_known_color_law_with_outliers() {
+        // Ley sintética conocida: color_R = -0.30 + 0.50·(BP-RP), color_B =
+        // 0.20 - 0.40·(BP-RP) (en mag). Estrellas de todo el locus 0.2..2.2 +
+        // 10% de outliers groseros. La regresión debe recuperar la recta y
+        // neutralizar la referencia dentro del 1%.
+        let mut samples = Vec::new();
+        for k in 0..60 {
+            let x = 0.2 + 2.0 * (k as f64) / 59.0;
+            let color_r = -0.30 + 0.50 * x;
+            let color_b = 0.20 - 0.40 * x;
+            let fg = 2000.0 + (k as f64) * 13.0;
+            let fr = fg * 10f64.powf(-0.4 * color_r);
+            let fb = fg * 10f64.powf(-0.4 * color_b);
+            samples.push((x, fr, fg, fb));
+        }
+        for k in 0..6 {
+            // Outliers: flujo R multiplicado por 3 (p. ej. estrella variable).
+            let x = 0.4 + (k as f64) * 0.3;
+            samples.push((x, 9000.0, 2500.0, 2500.0));
+        }
+        let reference = 0.88;
+        let (gr, gg, gb, fit) = spcc_solve_gains_regression(&samples, reference).unwrap();
+        assert!(fit.stars >= 55, "clip debe conservar el locus ({})", fit.stars);
+        assert!((fit.slope_r - 0.50).abs() < 0.02, "pendiente R {}", fit.slope_r);
+        assert!((fit.slope_b + 0.40).abs() < 0.02, "pendiente B {}", fit.slope_b);
+        // Una estrella exactamente en la referencia debe quedar neutra.
+        let color_r = -0.30 + 0.50 * reference;
+        let color_b = 0.20 - 0.40 * reference;
+        let fg = 3000.0;
+        let fr = fg * 10f64.powf(-0.4 * color_r);
+        let fb = fg * 10f64.powf(-0.4 * color_b);
+        let (r, g, b) = (fr * gr, fg * gg, fb * gb);
+        assert!((r / g - 1.0).abs() < 0.01, "R/G {}", r / g);
+        assert!((b / g - 1.0).abs() < 0.01, "B/G {}", b / g);
     }
 
     #[test]

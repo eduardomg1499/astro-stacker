@@ -10551,7 +10551,11 @@ function dsPromptSpccSeed() {
             <div style="color:#94a3b8;font-size:.64rem;margin:6px 0 12px;line-height:1.5;">${tr("deepsky.spcc_seed_hint", "La cabecera FITS no trae RA/Dec ni escala. Indica el centro aproximado del campo y la escala de tu equipo.")}</div>
             <label style="display:block;color:#cbd5e1;font-size:.66rem;margin-bottom:8px;">${tr("deepsky.spcc_ra", "RA del objetivo (p.ej. 18 18 48 o 274.7)")}<input id="spcc-seed-ra" type="text" style="width:100%;margin-top:3px;" placeholder="18 18 48"></label>
             <label style="display:block;color:#cbd5e1;font-size:.66rem;margin-bottom:8px;">${tr("deepsky.spcc_dec", "Dec del objetivo (p.ej. -13 49 00 o -13.8)")}<input id="spcc-seed-dec" type="text" style="width:100%;margin-top:3px;" placeholder="-13 49 00"></label>
-            <label style="display:block;color:#cbd5e1;font-size:.66rem;margin-bottom:14px;">${tr("deepsky.spcc_scale", "Escala (arcsec/píxel, p.ej. 1.30)")}<input id="spcc-seed-scale" type="text" style="width:100%;margin-top:3px;" placeholder="1.30"></label>
+            <label style="display:block;color:#cbd5e1;font-size:.66rem;margin-bottom:8px;">${tr("deepsky.spcc_scale", "Escala (arcsec/píxel, p.ej. 1.30)")}<input id="spcc-seed-scale" type="text" style="width:100%;margin-top:3px;" placeholder="1.30"></label>
+            <label style="display:block;color:#cbd5e1;font-size:.66rem;margin-bottom:14px;">${tr("deepsky.spcc_reference", "Referencia blanca")}<select id="spcc-seed-ref" class="ds-sel" style="width:100%;margin-top:3px;">
+                <option value="averageSpiral" selected>${tr("deepsky.spcc_ref_asg", "Galaxia espiral promedio (estilo PixInsight)")}</option>
+                <option value="g2v">${tr("deepsky.spcc_ref_g2v", "G2V (estrella solar)")}</option>
+            </select></label>
             <div style="display:flex;gap:9px;justify-content:flex-end;">
                 <button type="button" id="spcc-seed-cancel" class="secondary" style="width:auto;font-size:.66rem;padding:7px 16px;border-radius:9px;">${tr("general.cancel", "Cancelar")}</button>
                 <button type="button" id="spcc-seed-ok" style="width:auto;font-size:.66rem;padding:7px 18px;border-radius:9px;background:linear-gradient(135deg,#2563eb,#7c3aed);color:white;">${tr("general.accept", "Aceptar")}</button>
@@ -10564,8 +10568,10 @@ function dsPromptSpccSeed() {
             const ra = overlay.querySelector("#spcc-seed-ra").value.trim();
             const dec = overlay.querySelector("#spcc-seed-dec").value.trim();
             const scale = parseFloat(overlay.querySelector("#spcc-seed-scale").value.trim());
+            const reference = overlay.querySelector("#spcc-seed-ref").value;
             if (!ra || !dec) return;
-            done({ ra, dec, scale: Number.isFinite(scale) ? scale : null });
+            localStorage.setItem("zas_spcc_reference", reference);
+            done({ ra, dec, scale: Number.isFinite(scale) ? scale : null, reference });
         });
         overlay.addEventListener("keydown", (e) => {
             if (e.key === "Escape") done(null);
@@ -11786,7 +11792,7 @@ function dsShowStretchBar() {
             try {
                 let res;
                 try {
-                    res = await run({});
+                    res = await run({ whiteReference: localStorage.getItem("zas_spcc_reference") || "averageSpiral" });
                 } catch (e) {
                     const msg = String(e);
                     if (/RA\/Dec|apuntado|escala|RA, Dec/i.test(msg)) {
@@ -11795,7 +11801,7 @@ function dsShowStretchBar() {
                         // propio con los tres campos.
                         const seed = await dsPromptSpccSeed();
                         if (!seed) throw new Error(tr("general.cancelled", "Cancelado"));
-                        res = await run({ ra: seed.ra, dec: seed.dec, scaleArcsecPx: seed.scale });
+                        res = await run({ ra: seed.ra, dec: seed.dec, scaleArcsecPx: seed.scale, whiteReference: seed.reference });
                     } else { throw e; }
                 }
                 if (ui.imgResult && res && res.preview) await setImageAndWait(ui.imgResult, res.preview, false);
