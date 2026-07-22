@@ -10071,7 +10071,13 @@ function dsFormatPreflight(plan) {
         proceedOffer,
         renderAlerts(warnings, "#fcd34d", "warning", true),
         ...(plan.scientificEligible === false
-            ? [`<div style="color:#fcd34d;display:flex;gap:5px;align-items:flex-start;">${alertIcon("warning")}<span>${escapeHtml(tr("deepsky.method_blocked_nonlinear", "EIDR y NebulaFusion requieren entradas científicas lineales (FITS/TIFF); revisa los avisos del plan."))}</span></div>`]
+            ? [(() => {
+                const reasons = plan.scientificEligibilityReasons || [];
+                const text = reasons.length
+                    ? `${tr("deepsky.method_needs", "Para activar NebulaFusion/EIDR:")} ${reasons.join(" · ")}`
+                    : tr("deepsky.method_blocked_nonlinear", "EIDR y NebulaFusion requieren entradas científicas lineales (FITS/TIFF); revisa los avisos del plan.");
+                return `<div style="color:#fcd34d;display:flex;gap:5px;align-items:flex-start;">${alertIcon("warning")}<span>${escapeHtml(text)}</span></div>`;
+            })()]
             : []),
     ].join("");
     const recommendedKey = plan.recommendedProfile || "balanced";

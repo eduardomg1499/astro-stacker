@@ -16663,6 +16663,30 @@ async fn stack_deepsky_impl(
     let mut worst_ecc = (0.0f32, String::new()); // (ecc, name) para avisar
     let mut quality_exclusions: std::collections::BTreeMap<usize, String> =
         std::collections::BTreeMap::new();
+    // Límite de holdout ADAPTATIVO al muestreo real: la precisión del
+    // centroide escala con la FWHM. Un límite absoluto de 0.20 px excluía
+    // TODOS los frames de un campo ancho con FWHM ~5 px cuyo registro a
+    // 0.3-0.8 px es excelente (fracción pequeña de la estrella). Piso 0.20 px
+    // (muestreo fino) y techo 1.0 px; queda registrado en log y receta.
+    let holdout_limit_px = {
+        let mut fwhms: Vec<f32> = frames
+            .iter()
+            .map(|(_, _, fwhm, _, _)| *fwhm)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .collect();
+        fwhms.sort_by(|a, b| a.total_cmp(b));
+        let median_fwhm = fwhms.get(fwhms.len() / 2).copied().unwrap_or(0.0);
+        (0.15 * median_fwhm).clamp(0.20, 1.0)
+    };
+    if holdout_limit_px > 0.20 {
+        log_to_front(
+            &app,
+            "INFO",
+            &format!(
+                "Límite de registro adaptado al seeing: holdout p95 ≤ {holdout_limit_px:.2} px (0.15 × FWHM mediana)."
+            ),
+        );
+    }
     let mut registered: Vec<(usize, DsTransform, f64)> = Vec::with_capacity(frames.len());
     for (i, transform) in transforms.iter().enumerate() {
         let Some(reg) = *transform else {
@@ -16673,11 +16697,11 @@ async fn stack_deepsky_impl(
             );
             continue;
         };
-        if reg.holdout_count > 0 && reg.holdout_p95 > 0.20 {
+        if reg.holdout_count > 0 && reg.holdout_p95 > holdout_limit_px {
             quality_exclusions.insert(
                 i,
                 format!(
-                    "registro no publicable: holdout p95 {:.3} px excede 0.20 px",
+                    "registro no publicable: holdout p95 {:.3} px excede {holdout_limit_px:.2} px",
                     reg.holdout_p95
                 ),
             );
@@ -16759,7 +16783,22 @@ async fn stack_deepsky_impl(
         let _ = app.emit("ds-report", &report);
     }
     if registered.is_empty() {
-        return Err("El registro estelar fallo en todos los frames (¿campos distintos?).".into());
+        // Diagnóstico REAL agrupado, no una suposición: qué motivo excluyó
+        // cuántos frames, para que el usuario sepa qué corregir.
+        let mut reason_counts: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for reason in quality_exclusions.values() {
+            *reason_counts.entry(reason.as_str()).or_default() += 1;
+        }
+        let breakdown = reason_counts
+            .iter()
+            .map(|(reason, count)| format!("×{count} {reason}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        return Err(format!(
+            "El registro estelar falló en los {} frames. Motivos: {breakdown}. Requisitos: ≥8 estrellas por toma, campo compartido (la escala puede variar hasta 2× — focales mezcladas soportadas) y residuo de holdout dentro del límite adaptativo.",
+            frames.len()
+        ));
     }
     if frames.len() > 1 && registered.len() < 2 {
         let capture = if matches!(capture_mode, pipeline::DeepSkyCaptureMode::MonoNarrowband) {
