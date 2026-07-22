@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test": "node --test tests/*.test.mjs",
     "preview": "vite preview",
     "release:latest-json": "node scripts/release/generate-latest-json.mjs",
     "release:mac": "bash scripts/release/build-macos-release.sh",
@@ -15,7 +16,7 @@
     "tauri:build": "tauri build",
     "tauri:build:debug": "tauri build --debug",
     "rust:check": "cargo check --manifest-path src-tauri/Cargo.toml",
-    "check": "npm run build && npm run rust:check"
+    "check": "npm run test && npm run build && npm run rust:check"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

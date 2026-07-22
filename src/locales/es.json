@@ -530,6 +530,7 @@
   "export": {
     "save_png": "💾 Guardar PNG",
     "save_tiff": "💾 Guardar TIFF",
+    "save_fits": "Guardar FITS 16-bit",
     "pro_title": "Función PRO",
     "tiff_requires_pro": "El guardado en TIFF 16-bit requiere licencia anual o periodo de prueba activo.\n\nPor favor activa tu licencia."
   },

@@ -1502,7 +1502,7 @@ async fn process_batch_entry(
     deconv_sigma: f32,
     vc_iter: usize,
     vc_sigma: f32,
-    _usm_amount: f32,
+    usm_amount: f32,
     usm_radius: f32,
     lce_amount: f32,
     blend: f32,
@@ -1528,6 +1528,7 @@ async fn process_batch_entry(
     ap_grid_size: Option<u32>,  // R13: AP size del flujo Zenith (32 por defecto)
     ap_threshold: Option<f32>,  // R13: umbral de malla del flujo Zenith
     align_rgb: Option<bool>,    // switch de alineacion RGB automatica
+    advanced: Option<AdvancedColorParams>,
 ) -> Result<BatchEntryResult, String> {
     state.license_manager.check_access()?;
     // Nueva entrada del lote: limpiar cancelaciones previas. Si el usuario
@@ -1923,7 +1924,7 @@ async fn process_batch_entry(
     // sharpening (doble aplicacion) y dependian del master legacy: eliminados.
     let pre_processed = centered_data;
     let (safe_w, safe_h) = (cw, ch);
-    let usm_amount = if is_surface_batch { 0.0 } else { _usm_amount.max(0.0) };
+    let usm_amount = usm_amount.max(0.0);
 
 
     let temp_res = StackResult {
@@ -1938,27 +1939,11 @@ async fn process_batch_entry(
     let (use_d_iter, use_d_sigma, use_v_iter, use_v_sigma) =
         (deconv_iter, deconv_sigma, vc_iter, vc_sigma);
 
-    // PHASE 36 FIX: Improved detection for Surface/Solar (including v2 variations)
-    // "Unbeatable" preset: Sharpen 0.5 + LCE 15.0
-    // Logic matching stack_video_liquid_warping
-    let (usm_amount, usm_radius, lce_amount) =
-        if is_surface_batch {
-            let (u_amt, u_rad) = if usm_amount <= 0.01 {
-                (0.5, 1.5)
-            } else {
-                (usm_amount, usm_radius)
-            };
-            let l_amt = if lce_amount <= 0.01 { 15.0 } else { lce_amount };
-            (u_amt, u_rad, l_amt)
-        } else {
-            (usm_amount, usm_radius, lce_amount)
-        };
-
     // FIX: Force Neutral WB for Mono Purity
     let is_mono = cid == 0 || cid == 12;
     let (r_bal, b_bal) = if is_mono { (0.0, 0.0) } else { (r_bal, b_bal) };
 
-    let processed = run_processing_pipeline(
+    let mut processed = run_processing_pipeline(
         &app,
         &state,
         0,
@@ -1997,6 +1982,10 @@ async fn process_batch_entry(
         master_denoise_chroma,
         use_rgb_sharpening, // PHASE 15
     );
+
+    if let Some(ref advanced_params) = advanced {
+        apply_advanced_postprocess(&mut processed, is_mono, advanced_params);
+    }
 
     // --- FINAL EXPORT: High Quality 16-bit PNG (Matches save_final_image) ---
     // Usamos el codificador de 16 bits para preservar todo el procesado del pipeline.
@@ -3603,8 +3592,16 @@ async fn apply_wavelets(
     master_denoise_detail: f32,
     master_denoise_chroma: f32,
     use_rgb_sharpening: bool,
+    advanced: Option<AdvancedColorParams>,
+    result_id: Option<usize>,
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
+    if let Some(expected) = result_id {
+        let current = state.result_generation.load(Ordering::SeqCst);
+        if expected != current {
+            return Err("Resultado sustituido: se descartó una solicitud de postprocesado antigua.".into());
+        }
+    }
     state.active_req_id.store(req_id, Ordering::Relaxed);
     let original = {
         let s = state.stacked_image.lock().unwrap();
@@ -3614,19 +3611,6 @@ async fn apply_wavelets(
         }
     };
 
-    // FIX: Apply Smart Defaults for Single Stacking View if unset (Unbeatable Surface)
-    let (usm_amount, usm_radius, lce_amount) = if original.is_mono && original.is_surface {
-        let (u_amt, u_rad) = if usm_amount <= 0.01 {
-            (0.5, 1.5)
-        } else {
-            (usm_amount, usm_radius)
-        };
-        let l_amt = if lce_amount <= 0.01 { 15.0 } else { lce_amount };
-        (u_amt, u_rad, l_amt)
-    } else {
-        (usm_amount, usm_radius, lce_amount)
-    };
-
     // FIX: Force Neutral WB for Mono Purity. 0.0 is neutral.
     let (r_bal, b_bal) = if original.is_mono {
         (0.0, 0.0)
@@ -3634,7 +3618,7 @@ async fn apply_wavelets(
         (r_bal, b_bal)
     };
 
-    let final_u16 = run_processing_pipeline(
+    let mut final_u16 = run_processing_pipeline(
         &app,
         &state,
         req_id,
@@ -3676,6 +3660,28 @@ async fn apply_wavelets(
 
     if final_u16.is_empty() {
         return Err("Cancelled".into());
+    }
+
+    if let Some(ref advanced_params) = advanced {
+        apply_advanced_postprocess(&mut final_u16, original.is_mono, advanced_params);
+    }
+
+    if let Some(expected) = result_id {
+        let current = state.result_generation.load(Ordering::SeqCst);
+        if expected != current {
+            return Err("Resultado sustituido: se descartó una vista calculada fuera de sesión.".into());
+        }
+    }
+
+    {
+        let mut processed = state.processed_image.lock().unwrap();
+        *processed = Some(StackResult {
+            data: final_u16.clone(),
+            width: original.width,
+            height: original.height,
+            is_mono: original.is_mono,
+            is_surface: original.is_surface,
+        });
     }
 
     emit_progress(&app, "Generando vista...", 97.0, None);
@@ -3763,7 +3769,7 @@ async fn save_final_image(
     deringing_radius: f32,
     deringing_dark: f32,
     deringing_light: f32,
-    _deringing_mask: bool,
+    deringing_mask: bool,
     crisp: f32,
     deconv_iter: usize,
     deconv_sigma: f32,
@@ -3780,6 +3786,7 @@ async fn save_final_image(
     master_denoise_detail: f32,
     master_denoise_chroma: f32,
     use_rgb_sharpening: bool,
+    advanced: Option<AdvancedColorParams>,
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
     state.active_req_id.store(0, Ordering::Relaxed);
@@ -3798,7 +3805,7 @@ async fn save_final_image(
     };
     emit_progress(&app, "Procesando final...", 0.0, None);
 
-    let final_u16 = run_processing_pipeline(
+    let mut final_u16 = run_processing_pipeline(
         &app,
         &state,
         0,
@@ -3818,7 +3825,7 @@ async fn save_final_image(
         deringing_radius,
         deringing_dark,
         deringing_light,
-        false, // deringing_mask (Force OFF for export)
+        deringing_mask,
         crisp,
         deconv_iter,
         deconv_sigma,
@@ -3842,15 +3849,25 @@ async fn save_final_image(
         return Err("Error en el procesado (Cancelado)".into());
     }
 
+    if let Some(ref advanced_params) = advanced {
+        apply_advanced_postprocess(&mut final_u16, original.is_mono, advanced_params);
+    }
+
     emit_progress(&app, "Guardando...", 97.0, None);
 
     if format_idx == 0 {
         // PNG 16-BIT EXPORT (Requested: "tal cual" 16-bit preservation)
-        let name = format!("{}_Final.png", path);
+        let name = processed_export_path(&path, "_Final.png");
         // PNG standard requires Big Endian for 16-bit
         let mut raw_bytes_be = Vec::with_capacity(final_u16.len() * 2);
-        for v in &final_u16 {
-            raw_bytes_be.extend_from_slice(&v.to_be_bytes());
+        if original.is_mono {
+            for pixel in final_u16.chunks_exact(3) {
+                raw_bytes_be.extend_from_slice(&pixel[1].to_be_bytes());
+            }
+        } else {
+            for v in &final_u16 {
+                raw_bytes_be.extend_from_slice(&v.to_be_bytes());
+            }
         }
 
         let f = File::create(&name).map_err(|e| e.to_string())?;
@@ -3862,32 +3879,52 @@ async fn save_final_image(
                 &raw_bytes_be,
                 original.width as u32,
                 original.height as u32,
-                image::ColorType::Rgb16,
+                if original.is_mono { image::ColorType::L16 } else { image::ColorType::Rgb16 },
             )
             .map_err(|e| e.to_string())?;
 
         emit_progress(&app, "Listo", 100.0, None);
-        return Ok(format!("PNG 16-bit Guardado: {}", name));
-    } else {
-        let name = format!("{}_Final_16bit.tiff", path);
+        return Ok(format!("PNG 16-bit Guardado: {}", name.display()));
+    } else if format_idx == 1 {
+        let name = processed_export_path(&path, "_Final_16bit.tiff");
         let f = File::create(&name).map_err(|e| e.to_string())?;
         let ref_writer = BufWriter::new(f);
         let encoder = image::codecs::tiff::TiffEncoder::new(ref_writer);
         let mut raw_bytes = Vec::with_capacity(final_u16.len() * 2);
-        for v in &final_u16 {
-            raw_bytes.extend_from_slice(&v.to_ne_bytes());
+        if original.is_mono {
+            for pixel in final_u16.chunks_exact(3) {
+                raw_bytes.extend_from_slice(&pixel[1].to_ne_bytes());
+            }
+        } else {
+            for v in &final_u16 {
+                raw_bytes.extend_from_slice(&v.to_ne_bytes());
+            }
         }
         encoder
             .encode(
                 &raw_bytes,
                 original.width as u32,
                 original.height as u32,
-                image::ColorType::Rgb16,
+                if original.is_mono { image::ColorType::L16 } else { image::ColorType::Rgb16 },
             )
             .map_err(|e| e.to_string())?;
         emit_progress(&app, "Listo", 100.0, None);
-        return Ok(format!("TIFF 16-bit Guardado: {}", name));
+        return Ok(format!("TIFF 16-bit Guardado: {}", name.display()));
+    } else if format_idx == 2 {
+        let name = processed_export_path(&path, "_Final_16bit.fits");
+        let fits_image = StackResult {
+            data: final_u16,
+            width: original.width,
+            height: original.height,
+            is_mono: original.is_mono,
+            is_surface: original.is_surface,
+        };
+        write_fits_u16_atomic(&name, &fits_image)?;
+        emit_progress(&app, "Listo", 100.0, None);
+        return Ok(format!("FITS 16-bit Guardado: {}", name.display()));
     }
+
+    Err(format!("Formato de exportación no soportado: {}", format_idx))
 }
 
 #[tauri::command]
@@ -6499,13 +6536,7 @@ async fn stitch_mosaic(
     let preview_ref = format!("file_path:{}", path_preview_clean);
 
     // Update Global State StackResult (for Wavelets)
-    let is_mono_detected = if raw_u16.len() > 3 {
-        let mid = raw_u16.len() / 2;
-        let mid = mid - (mid % 3); // Align R
-        raw_u16[mid] == raw_u16[mid + 1] && raw_u16[mid + 1] == raw_u16[mid + 2]
-    } else {
-        false
-    };
+    let is_mono_detected = rgb16_buffer_is_monochrome(raw_u16);
 
     {
         let mut locked = state.stacked_image.lock().unwrap();
@@ -6526,10 +6557,14 @@ async fn stitch_mosaic(
             height: cv_h as usize,
             frame_count: tiles.len(),
             bpp: 16,
-            color_id: 0,
-            pattern_name: "Mosaic Blind".to_string(),
+            color_id: if is_mono_detected { 0 } else { 100 },
+            pattern_name: if is_mono_detected {
+                "MONO Mosaic".to_string()
+            } else {
+                "RGB Mosaic".to_string()
+            },
             file_size_mb: 0.0,
-            is_color: true,
+            is_color: !is_mono_detected,
         },
         best_frame_idx: 0,
         stats: VideoStats {
@@ -6763,15 +6798,25 @@ fn apply_advanced_color_magic(
         }
     }
 
-    // --- 3. Contrast as an S-curve anchored at the image midtone ------------
-    // Neutral 1.0. Pivots on the actual signal midtone (great for astro frames
-    // that are mostly dark) and preserves both endpoints -> no hard clipping.
+    // --- 3. Contrast on luminance, with hue and pivot preserved --------------
+    // Applying the S-curve to each RGB channel independently changes colour and
+    // can look like a brightness lift. Transforming luminance once and scaling
+    // RGB by the same factor makes contrast behave as contrast.
     if (contrast - 1.0).abs() > 0.001 {
         let pivot = (contrast_pivot * INV_N).clamp(0.05, 0.95);
         let k = contrast.clamp(0.1, 3.0);
-        rn = s_curve_contrast(rn, pivot, k);
-        gn = s_curve_contrast(gn, pivot, k);
-        bn = s_curve_contrast(bn, pivot, k);
+        let luma = 0.2126 * rn + 0.7152 * gn + 0.0722 * bn;
+        let contrasted_luma = s_curve_contrast(luma, pivot, k);
+        if luma > 1e-7 {
+            let scale = contrasted_luma / luma;
+            rn *= scale;
+            gn *= scale;
+            bn *= scale;
+        } else {
+            rn = contrasted_luma;
+            gn = contrasted_luma;
+            bn = contrasted_luma;
+        }
     }
 
     // --- 4. Gamma (midtone power curve over the FULL range) -----------------
@@ -7189,12 +7234,14 @@ fn apply_advanced_deringing(
 #[tauri::command]
 fn clear_app_memory(state: tauri::State<'_, AppState>) {
     *state.stacked_image.lock().unwrap() = None;
+    *state.processed_image.lock().unwrap() = None;
     state.deconv_cache.lock().unwrap().clear();
     state.wavelet_cache.lock().unwrap().clear();
     state.filter_cache.lock().unwrap().clear();
     *state.batch_anchor.lock().unwrap() = None;
     *state.batch_anchor_dims.lock().unwrap() = (0, 0);
-    state.active_req_id.store(0, std::sync::atomic::Ordering::Relaxed);
+    state.active_req_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state.result_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// R13: limpieza ligera POR ARCHIVO dentro de un lote. A diferencia de
@@ -7204,10 +7251,12 @@ fn clear_app_memory(state: tauri::State<'_, AppState>) {
 #[tauri::command]
 fn clear_stack_memory(state: tauri::State<'_, AppState>) {
     *state.stacked_image.lock().unwrap() = None;
+    *state.processed_image.lock().unwrap() = None;
     state.deconv_cache.lock().unwrap().clear();
     state.wavelet_cache.lock().unwrap().clear();
     state.filter_cache.lock().unwrap().clear();
-    state.active_req_id.store(0, std::sync::atomic::Ordering::Relaxed);
+    state.active_req_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state.result_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[tauri::command]
@@ -7264,12 +7313,14 @@ fn main() {
             let license_manager = Arc::new(LicenseManager::new(app_data_dir));
             app.manage(AppState {
                 stacked_image: Mutex::new(None),
+                processed_image: Mutex::new(None),
                 deconv_cache: Mutex::new(Vec::new()),
                 wavelet_cache: Mutex::new(Vec::new()),
                 filter_cache: Mutex::new(Vec::new()),
                 batch_anchor: Mutex::new(None),
                 batch_anchor_dims: Mutex::new((0, 0)),
                 active_req_id: AtomicUsize::new(0),
+                result_generation: AtomicUsize::new(0),
                 cancel_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 license_manager,
             });
@@ -7280,6 +7331,11 @@ fn main() {
             preview_video,
             stack_video,
             apply_wavelets,
+            reset_postprocess_state,
+            postprocess_histogram,
+            sample_postprocess_pixel,
+            estimate_postprocess_rgb_alignment,
+            analyze_postprocess_artifacts,
             save_final_image,
             export_mosaic_result,
             generate_grid,

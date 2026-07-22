@@ -580,7 +580,7 @@ export class MosaicManager {
 
         if (window.showProcessing) window.showProcessing(`APILANDO ${videos.length} TESELAS...`);
 
-        // Use global pipeline params but force deringing OFF
+        // Reuse the same non-destructive 16-bit recipe as the individual flow.
         const p = typeof window.getPipelineParams === "function" ? window.getPipelineParams() : null;
 
         // Output folder logic: Use the directory of the first video
@@ -635,22 +635,24 @@ export class MosaicManager {
                     u1: p?.u[0] || 0, u2: p?.u[1] || 0, u3: p?.u[2] || 0, u4: p?.u[3] || 0, u5: p?.u[4] || 0,
                     w1: p?.w[0] || 0, w2: p?.w[1] || 0, w3: p?.w[2] || 0, w4: p?.w[3] || 0, w5: p?.w[4] || 0, w6: p?.w[5] || 0,
                     d1: p?.d[0] || 0, d2: p?.d[1] || 0, d3: p?.d[2] || 0, d4: p?.d[3] || 0, d5: p?.d[4] || 0, d6: p?.d[5] || 0,
-                    gamma: p?.color.g || 1.0, saturation: p?.color.s || 1.0,
-                    contrast: p?.color.c || 1.0, brightness: p?.color.b || 1.0,
-                    rBal: p?.color.rb || 1.0, bBal: p?.color.bb || 1.0,
+                    gamma: p?.color.g ?? 1.0, saturation: p?.color.s ?? 1.0,
+                    contrast: p?.color.c ?? 1.0, brightness: p?.color.b ?? 0.0,
+                    rBal: p?.color.rb ?? 0.0, bBal: p?.color.bb ?? 0.0,
                     rX: p?.shift.rx || 0, rY: p?.shift.ry || 0, bX: p?.shift.bx || 0, bY: p?.shift.by || 0,
 
-                    deringingMode: 0,
-                    deringingRadius: p?.dr.rad || 2.0,
-                    deringingDark: p?.dr.dark || 0.1,
-                    deringingLight: p?.dr.light || 0.1,
-                    deringingMask: false,
+                    deringingMode: p?.dr.mode ?? 0,
+                    deringingRadius: p?.dr.rad ?? 10.0,
+                    deringingDark: p?.dr.dark ?? 0.5,
+                    deringingLight: p?.dr.light ?? 0.0,
+                    deringingMask: p?.dr.mask ?? false,
 
                     crisp: p?.crisp || 0,
                     deconvIter: p?.deconv.i || 0, deconvSigma: p?.deconv.s || 1.0,
                     vcIter: p?.deconv.vi || 0, vcSigma: p?.deconv.vs || 1.0,
                     usmAmount: p?.usm.a || 0, usmRadius: p?.usm.r || 1.0, lceAmount: p?.lce || 0,
                     masterDenoise: p?.masterDenoise || 0,
+                    masterDenoiseDetail: p?.denoiseDetail ?? 70,
+                    masterDenoiseChroma: p?.denoiseChroma ?? 55,
                     blend: (p?.blend || 100) / 100.0,
                     useRgbSharpening: p?.useRgbSharpening || false,
                     batchMode: mode,
@@ -665,6 +667,7 @@ export class MosaicManager {
                     isV3: flow.isV3,
                     apGridSize: flow.apSize,
                     apThreshold: flow.apThreshold,
+                    advanced: p?.advanced || null,
                     progressPrefix: `[Mosaico ${displayIdx}/${videos.length}]`
                 });
 
@@ -1308,7 +1311,7 @@ export class MosaicManager {
         if (btnArr) btnArr.style.display = "block";
     }
 
-    sendToWavelets(path) {
+    async sendToWavelets(path) {
         console.log("MosaicManager: Switching to Wavelets View...");
         const targetPath = path || window.getCurrentFilePath?.() || window.currentFilePath || "";
         if (targetPath) {
@@ -1333,12 +1336,10 @@ export class MosaicManager {
         const panelWavelets = document.getElementById("panel-wavelets");
         if (panelWavelets) panelWavelets.style.display = "block";
 
-        // HIDE Deringing UI in Mosaic Flow transition
+        // Artifact repair is shared by individual, batch and mosaic results.
         const selDr = document.getElementById("sel-deringing-mode");
         if (selDr) {
-            selDr.parentElement.style.display = "none";
-            const panelDr = document.getElementById("panel-deringing-manual");
-            if (panelDr) panelDr.style.display = "none";
+            selDr.parentElement.style.display = "block";
         }
 
         // MANAGE VIEWPORT: Show Result, Hide Source
@@ -1383,7 +1384,11 @@ export class MosaicManager {
 
         // UPDATE GLOBALS for Wavelets/Saving to work
         if (targetPath && window.setCurrentFilePath) window.setCurrentFilePath(targetPath);
-        if (window.resetPipelineState) window.resetPipelineState();
+        if (window.beginNewPostprocessResult && imgResult?.src) {
+            await window.beginNewPostprocessResult(imgResult.src, "mosaic");
+        } else if (window.resetPipelineState) {
+            window.resetPipelineState();
+        }
 
         // Also hide overlay
         this.toggleOverlay(false);

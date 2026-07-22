@@ -22,7 +22,6 @@
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"
         defer></script>
 
-    <link rel="stylesheet" href="./styles.css">
     <link rel="stylesheet" href="./src/film_roll.css">
 
     <style>
@@ -66,8 +65,22 @@
         body.ready .main-layout,
         body.ready .status-bar {
             opacity: 1;
-            pointer-events: auto;
             transform: scale(1);
+        }
+
+        body.ready #console-panel {
+            opacity: 1;
+        }
+
+        body.ready .custom-titlebar,
+        body.ready header,
+        body.ready .main-layout,
+        body.ready .status-bar {
+            pointer-events: auto;
+        }
+
+        body.ready #console-panel.open {
+            pointer-events: auto;
         }
 
         .derot-modal-header {
@@ -890,7 +903,7 @@
             <circle cx="10" cy="12" r="2"></circle>
             <polyline points="15 17 12 14 7 19"></polyline>
         </symbol>
-        <symbol id="icon-magic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        <symbol id="icon-sparkles" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
             stroke-linecap="round" stroke-linejoin="round">
             <path
                 d="m21.64 3.64-1.28-1.28a1.21 1.21 0 0 0-1.72 0L2.36 18.64a1.21 1.21 0 0 0 0 1.72l1.28 1.28a1.2 1.2 0 0 0 1.72 0L21.64 5.36a1.2 1.2 0 0 0 0-1.72Z" />
@@ -1015,6 +1028,23 @@
             stroke-linecap="round" stroke-linejoin="round">
             <polyline points="9 14 4 9 9 4"></polyline>
             <path d="M20 20v-7a4 4 0 0 0-4-4H4"></path>
+        </symbol>
+        <symbol id="icon-redo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="15 14 20 9 15 4"></polyline>
+            <path d="M4 20v-7a4 4 0 0 1 4-4h12"></path>
+        </symbol>
+        <symbol id="icon-compare" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+            <path d="M12 3v18"></path>
+            <path d="M7 8h2M7 12h2M15 8h2M15 12h2"></path>
+        </symbol>
+        <symbol id="icon-eyedropper" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="m19 3 2 2-11.5 11.5-3-3z"></path>
+            <path d="m14 6 4 4"></path>
+            <path d="M6.5 13.5 3 17v4h4l3.5-3.5"></path>
         </symbol>
         <symbol id="icon-palette" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
             stroke-linecap="round" stroke-linejoin="round">
@@ -2353,7 +2383,8 @@
                     <!-- Sugerencia inteligente del análisis (clic para aplicarla) -->
                     <div id="suggested-pct-badge" title="Aplicar el porcentaje sugerido por el análisis"
                         style="display:none; cursor:pointer; margin:2px 0 4px; font-size:0.72rem; color:#f59e0b; user-select:none;">
-                        ⭐ <span data-i18n="analysis.suggested">Sugerido</span>: <span id="suggested-pct-value">20%</span>
+                        <svg class="zas-icon suggested-star-icon" aria-hidden="true"><use href="#icon-star"></use></svg>
+                        <span data-i18n="analysis.suggested">Sugerido</span>: <span id="suggested-pct-value">20%</span>
                     </div>
                     <input type="range" id="stack-slider" min="1" max="100" value="20">
                 </div>
@@ -2614,9 +2645,9 @@
                         data-i18n="wavelets.title">
                         <span style="color:#60a5fa;">⚡</span> Procesamiento de Señal
                     </h2>
-                    <span
+                    <span class="precision-contract-badge"
                         style="font-size:0.6rem; color:#64748b; border:1px solid #334155; padding:2px 4px; border-radius:4px; letter-spacing:0.05em; background:rgba(0,0,0,0.2);">
-                        32-BIT FLOAT
+                        MASTER · SALIDA 16-BIT
                     </span>
                 </div>
 
@@ -2790,6 +2821,41 @@
                     <div class="group-header">
                         <h3 data-i18n="wavelets.post_processing_fine">Post-Procesado Fino</h3>
                     </div>
+                    <section id="post-histogram-card" class="post-histogram-card" aria-label="Histograma de 16 bits">
+                        <div class="post-module-heading">
+                            <div>
+                                <strong>Histograma RGB</strong>
+                                <small id="post-histogram-source">MASTER 16-BIT</small>
+                            </div>
+                            <button id="btn-refresh-histogram" type="button" class="post-icon-button"
+                                title="Actualizar histograma" aria-label="Actualizar histograma">
+                                <svg class="zas-icon"><use href="#icon-refresh"></use></svg>
+                            </button>
+                        </div>
+                        <div class="histogram-stage">
+                            <canvas id="post-histogram" width="360" height="150"></canvas>
+                            <div id="histogram-black-marker" class="histogram-marker marker-black"></div>
+                            <div id="histogram-mid-marker" class="histogram-marker marker-mid"></div>
+                            <div id="histogram-white-marker" class="histogram-marker marker-white"></div>
+                        </div>
+                        <div class="histogram-stats" aria-live="polite">
+                            <span>Mín <b id="hist-min">—</b></span>
+                            <span>Mediana <b id="hist-median">—</b></span>
+                            <span>Máx <b id="hist-max">—</b></span>
+                            <span id="hist-clip-status">Sin recorte</span>
+                        </div>
+                        <div class="levels-control-grid">
+                            <label for="sl-level-black"><span>Negro</span><output id="out-level-black">0</output></label>
+                            <input id="sl-level-black" type="range" min="0" max="65000" step="16" value="0"
+                                data-advanced-control="levelsBlack" data-scale="65535" data-default="0">
+                            <label for="sl-level-mid"><span>Medios</span><output id="out-level-mid">1.00</output></label>
+                            <input id="sl-level-mid" type="range" min="10" max="400" step="1" value="100"
+                                data-advanced-control="levelsMid" data-scale="100" data-default="100">
+                            <label for="sl-level-white"><span>Blanco</span><output id="out-level-white">65535</output></label>
+                            <input id="sl-level-white" type="range" min="511" max="65535" step="16" value="65535"
+                                data-advanced-control="levelsWhite" data-scale="65535" data-default="65535">
+                        </div>
+                    </section>
                     <div class="control-row"
                         style="margin-bottom: 8px; background: rgba(56, 189, 248, 0.05); padding: 8px; border-radius: 6px; border: 1px dashed rgba(56, 189, 248, 0.3);">
                         <label style="color:#38bdf8; font-weight:bold; width:100px;"
@@ -2870,6 +2936,69 @@
                                 class="input-val">
                         </div>
 
+                        <details class="post-module" open>
+                            <summary><span>Tono profesional</span><small>luminancia 16-bit</small></summary>
+                            <div class="advanced-slider-list">
+                                <label for="sl-adv-exposure"><span>Exposición</span><output>0.00 EV</output></label>
+                                <input id="sl-adv-exposure" type="range" min="-400" max="400" value="0"
+                                    data-advanced-control="exposure" data-scale="100" data-default="0" data-suffix=" EV">
+                                <label for="sl-adv-shadows"><span>Sombras</span><output>0</output></label>
+                                <input id="sl-adv-shadows" type="range" min="-100" max="100" value="0"
+                                    data-advanced-control="shadows" data-scale="100" data-display-scale="100" data-default="0">
+                                <label for="sl-adv-highlights"><span>Altas luces</span><output>0</output></label>
+                                <input id="sl-adv-highlights" type="range" min="-100" max="100" value="0"
+                                    data-advanced-control="highlights" data-scale="100" data-display-scale="100" data-default="0">
+                                <label for="sl-adv-whites"><span>Blancos</span><output>0</output></label>
+                                <input id="sl-adv-whites" type="range" min="-100" max="100" value="0"
+                                    data-advanced-control="whites" data-scale="100" data-display-scale="100" data-default="0">
+                                <label for="sl-adv-blacks"><span>Negros</span><output>0</output></label>
+                                <input id="sl-adv-blacks" type="range" min="-100" max="100" value="0"
+                                    data-advanced-control="blacks" data-scale="100" data-display-scale="100" data-default="0">
+                                <label for="sl-adv-vibrance"><span>Intensidad</span><output>0</output></label>
+                                <input id="sl-adv-vibrance" type="range" min="-100" max="100" value="0"
+                                    data-advanced-control="vibrance" data-scale="100" data-display-scale="100" data-default="0">
+                            </div>
+                        </details>
+
+                        <details class="post-module color-module" open>
+                            <summary><span>Colorimetría</span><small>balance, HSL y grading</small></summary>
+                            <div class="advanced-slider-list color-temperature-grid">
+                                <label for="sl-adv-temperature"><span>Temperatura</span><output>0</output></label>
+                                <input id="sl-adv-temperature" type="range" min="-100" max="100" value="0"
+                                    data-advanced-control="temperature" data-scale="100" data-display-scale="100" data-default="0">
+                                <label for="sl-adv-tint"><span>Matiz</span><output>0</output></label>
+                                <input id="sl-adv-tint" type="range" min="-100" max="100" value="0"
+                                    data-advanced-control="tint" data-scale="100" data-display-scale="100" data-default="0">
+                            </div>
+                            <div class="eyedropper-row">
+                                <button id="btn-post-eyedropper" type="button" class="secondary compact-button">
+                                    <svg class="zas-icon"><use href="#icon-eyedropper"></use></svg>
+                                    Cuentagotas
+                                </button>
+                                <span id="post-eyedropper-sample">Selecciona un píxel del resultado</span>
+                                <span id="post-eyedropper-swatch" aria-hidden="true"></span>
+                            </div>
+                            <div class="hsl-editor" aria-label="Saturación por color">
+                                <h4>Saturación por color</h4>
+                                <div class="hsl-sliders">
+                                    <label class="hsl-red">Rojo<input type="range" min="-100" max="100" value="0" data-hsl-index="0" data-default="0"><output>0</output></label>
+                                    <label class="hsl-orange">Naranja<input type="range" min="-100" max="100" value="0" data-hsl-index="1" data-default="0"><output>0</output></label>
+                                    <label class="hsl-yellow">Amarillo<input type="range" min="-100" max="100" value="0" data-hsl-index="2" data-default="0"><output>0</output></label>
+                                    <label class="hsl-green">Verde<input type="range" min="-100" max="100" value="0" data-hsl-index="3" data-default="0"><output>0</output></label>
+                                    <label class="hsl-aqua">Aqua<input type="range" min="-100" max="100" value="0" data-hsl-index="4" data-default="0"><output>0</output></label>
+                                    <label class="hsl-blue">Azul<input type="range" min="-100" max="100" value="0" data-hsl-index="5" data-default="0"><output>0</output></label>
+                                    <label class="hsl-purple">Púrpura<input type="range" min="-100" max="100" value="0" data-hsl-index="6" data-default="0"><output>0</output></label>
+                                    <label class="hsl-magenta">Magenta<input type="range" min="-100" max="100" value="0" data-hsl-index="7" data-default="0"><output>0</output></label>
+                                </div>
+                            </div>
+                            <div class="color-grading-grid">
+                                <h4>Color grading</h4>
+                                <label>Sombras<input id="grade-shadow-color" type="color" value="#ffffff" data-grade-color="shadows"><input type="range" min="0" max="100" value="0" data-grade-amount="0" data-default="0"><output>0</output></label>
+                                <label>Medios<input id="grade-mid-color" type="color" value="#ffffff" data-grade-color="midtones"><input type="range" min="0" max="100" value="0" data-grade-amount="1" data-default="0"><output>0</output></label>
+                                <label>Luces<input id="grade-high-color" type="color" value="#ffffff" data-grade-color="highlights"><input type="range" min="0" max="100" value="0" data-grade-amount="2" data-default="0"><output>0</output></label>
+                            </div>
+                        </details>
+
                         <div style="margin-top:8px; border-top:1px solid #334155; padding-top:8px;">
                             <div class="control-row">
                                 <label data-i18n="wavelets.post.white_balance_r">White Balance (R)</label>
@@ -2886,33 +3015,47 @@
                                     class="input-val">
                             </div>
                         </div>
-                        <div style="margin-top:10px;">
-                            <label data-i18n="wavelets.post.atmospheric_correction">Correccion Atmosferica (Alineacion RGB)</label>
-                            <div
-                                style="font-size:0.7em; color:#64748b; margin-bottom:4px; display:flex; justify-content:space-between;">
-                                <span data-i18n="wavelets.post.channel">Canal</span>
-                                <span data-i18n="wavelets.post.horizontal">Horizontal (X)</span>
-                                <span data-i18n="wavelets.post.vertical">Vertical (Y)</span>
+                        <details class="post-module atmospheric-module" open>
+                            <summary><span>Corrección atmosférica</span><small>Alineación RGB visual</small></summary>
+                            <p class="module-help">Arrastra R y B respecto al canal verde o usa la medición automática subpíxel.</p>
+                            <div id="adc-pad" class="adc-pad" role="application" aria-label="Alineación visual de canales RGB">
+                                <div class="adc-grid"></div>
+                                <div class="adc-node adc-green" aria-hidden="true">G</div>
+                                <button id="adc-node-r" class="adc-node adc-red" type="button" aria-label="Desplazar canal rojo">R</button>
+                                <button id="adc-node-b" class="adc-node adc-blue" type="button" aria-label="Desplazar canal azul">B</button>
                             </div>
-                            <div class="rgb-grid">
-                                <span class="lbl-r">R</span> <input type="number" id="rx" placeholder="X" step="0.1"
-                                    value="0">
-                                <input type="number" id="ry" placeholder="Y" step="0.1" value="0">
-                                <span class="lbl-b">B</span> <input type="number" id="bx" placeholder="X" step="0.1"
-                                    value="0">
-                                <input type="number" id="by" placeholder="Y" step="0.1" value="0">
+                            <div class="adc-actions">
+                                <button id="btn-auto-rgb-align" type="button" class="primary compact-button">
+                                    <svg class="zas-icon"><use href="#icon-magic"></use></svg> Medir automáticamente
+                                </button>
+                                <button id="btn-reset-rgb-align" type="button" class="secondary compact-button">Centrar</button>
                             </div>
-                        </div>
+                            <div id="adc-status" class="module-status">G es la referencia · rango ±6 px</div>
+                            <div class="rgb-grid adc-number-grid">
+                                <span class="lbl-r">R</span> <input type="number" id="rx" aria-label="Rojo X" step="0.05" min="-6" max="6" value="0">
+                                <input type="number" id="ry" aria-label="Rojo Y" step="0.05" min="-6" max="6" value="0">
+                                <span class="lbl-b">B</span> <input type="number" id="bx" aria-label="Azul X" step="0.05" min="-6" max="6" value="0">
+                                <input type="number" id="by" aria-label="Azul Y" step="0.05" min="-6" max="6" value="0">
+                            </div>
+                        </details>
                         <div class="control-row" style="margin-top:15px;">
                             <label data-i18n="wavelets.post.blend">Mezcla (Blend)</label>
                             <input type="range" id="blend-slider" min="0" max="100" value="100">
                             <span id="blend-display"
                                 style="font-size:0.8em; width:35px; text-align:right; color:#aaa;">100%</span>
                         </div>
-                        <div style="margin-top:10px; border-top:1px solid #334155; padding-top:8px;">
+                        <div id="artifact-repair-card" class="artifact-repair-card">
                             <label style="font-size:0.85rem; color:#94a3b8; font-weight:bold;"
                                 data-i18n="wavelets.post.deringing">Reduccion de Artefactos
                                 (Deringing)</label>
+                            <p class="module-help">Analiza halos, píxeles defectuosos, recorte y fringing antes de corregir.</p>
+                            <div class="artifact-actions">
+                                <button id="btn-analyze-artifacts" type="button" class="secondary compact-button">
+                                    <svg class="zas-icon"><use href="#icon-chart"></use></svg> Analizar imperfecciones
+                                </button>
+                                <button id="btn-apply-artifact-suggestion" type="button" class="primary compact-button" hidden>Aplicar sugerencia</button>
+                            </div>
+                            <div id="artifact-analysis-summary" class="artifact-summary" aria-live="polite">Sin análisis todavía.</div>
                             <div style="margin-top:5px;">
                                 <select id="sel-deringing-mode" class="input-val"
                                     style="width:100%; margin-bottom:8px;">
@@ -2961,8 +3104,8 @@
                     <button id="btn-arrange-mosaic" class="primary" style="flex:1;">🖐 Organizar</button>
                 </div>
                 <div id="chk-mosaic-guided-wrapper" style="margin-top:8px; display:flex; align-items:center; gap:5px;">
-                    <input type="checkbox" id="chk-mosaic-guided" checked>
-                    <label for="chk-mosaic-guided" style="font-size:0.8rem; color:#cbd5e1; cursor:pointer;"
+                    <input type="checkbox" id="chk-post-mosaic-guided" checked>
+                    <label for="chk-post-mosaic-guided" style="font-size:0.8rem; color:#cbd5e1; cursor:pointer;"
                         title="Usa la posicion manual como ayuda si falla el automatico">Alineacion Asistida
                         (Guiado)</label>
                 </div>
@@ -2973,6 +3116,7 @@
                     <button id="btn-save-tiff" class="primary" style="flex:1;"><span
                             data-i18n="export.save_tiff">💾 Guardar TIFF</span> <small class="pro-tag"
                             style="color:#f59e0b; display:none; margin-left:5px;">PRO</small></button>
+                    <button id="btn-save-fits" class="primary" style="flex:1;"><span data-i18n="export.save_fits">Guardar FITS 16-bit</span></button>
                 </div>
             </div>
         </div>
@@ -3014,6 +3158,26 @@
                 <div class="view-label"
                     style="color:var(--success); display:flex; align-items:center; gap:12px; pointer-events:auto !important; width:auto; max-width:none;">
                     <span data-i18n="viewer.processed_result">Resultado Procesado</span>
+                    <div class="result-history-toolbar" role="toolbar" aria-label="Historial y comparación">
+                        <button id="btn-post-undo" type="button" disabled title="Deshacer" aria-label="Deshacer">
+                            <svg class="zas-icon"><use href="#icon-undo"></use></svg>
+                        </button>
+                        <button id="btn-post-redo" type="button" disabled title="Rehacer" aria-label="Rehacer">
+                            <svg class="zas-icon"><use href="#icon-redo"></use></svg>
+                        </button>
+                        <button id="btn-post-compare" type="button" aria-pressed="false" title="Activar comparación A/B">
+                            <svg class="zas-icon"><use href="#icon-compare"></use></svg><span>A/B</span>
+                        </button>
+                        <select id="post-compare-reference" aria-label="Referencia de comparación" title="Referencia A">
+                            <option value="previous">A: ajuste anterior</option>
+                            <option value="source">A: resultado original</option>
+                        </select>
+                        <label id="post-compare-split-wrap" class="compare-split-wrap" hidden>
+                            <span>División</span>
+                            <input id="post-compare-split" type="range" min="0" max="100" value="50">
+                        </label>
+                        <span id="post-history-state" class="post-history-state">Original</span>
+                    </div>
                     <button id="btn-toggle-source"
                         style="display:none; width:auto; flex-shrink:0; background:rgba(0,0,0,0.4); border:1px solid #334155; color:#cbd5e1; cursor:pointer; font-size:0.7rem; padding:2px 10px; border-radius:12px; backdrop-filter:blur(4px); white-space:nowrap; line-height:1.2; box-shadow:0 1px 2px rgba(0,0,0,0.2); pointer-events:auto;" data-i18n="viewer.hide_source">Ocultar
                         Fuente</button>
@@ -3038,6 +3202,11 @@
                 <div class="zoom-target-container">
                     <div class="zoom-content">
                         <img id="img-result" alt="">
+                        <div id="post-compare-layer" class="post-compare-layer" hidden aria-hidden="true">
+                            <img id="img-result-before" alt="Referencia A">
+                            <span class="compare-label compare-label-a">A</span>
+                            <span class="compare-divider"></span>
+                        </div>
                         <div id="crop-box">
                             <div class="crop-grid-v v1"></div>
                             <div class="crop-grid-v v2"></div>
@@ -3058,15 +3227,38 @@
         </div>
     </div>
 
-    <div id="console-panel">
-        <div class="console-header"><span>REGISTRO DEL SISTEMA</span><span style="cursor:pointer;"
-                onclick="document.getElementById('console-panel').classList.remove('open')">▼</span></div>
-        <div id="log-container"></div>
+    <aside id="zenith-guide-panel" aria-label="Guía inteligente" aria-hidden="true">
+        <div class="guide-panel-header">
+            <div>
+                <span class="guide-kicker">ZENITH GUIDE</span>
+                <h3>Asistente contextual</h3>
+            </div>
+            <button id="btn-close-guide" type="button" aria-label="Cerrar guía">×</button>
+        </div>
+        <div id="zenith-guide-list" class="guide-list"></div>
+        <p class="guide-privacy-note">Las sugerencias se calculan localmente a partir del paso y del resultado activo.</p>
+    </aside>
+
+    <div id="console-panel" aria-hidden="true">
+        <div class="console-header">
+            <div><span>REGISTRO DEL SISTEMA</span><small id="log-entry-count">0 eventos</small></div>
+            <div class="console-actions">
+                <button id="btn-copy-logs" type="button">Copiar</button>
+                <button id="btn-clear-logs" type="button">Limpiar</button>
+                <button id="btn-close-logs" type="button" aria-label="Ocultar registro">×</button>
+            </div>
+        </div>
+        <div class="log-table-header"><span>Hora</span><span>Nivel</span><span>Evento</span></div>
+        <div id="log-container" role="log" aria-live="polite"></div>
     </div>
 
     <div class="status-bar">
         <div style="display:flex; gap:10px; align-items:center;">
             <button id="btn-toggle-log">📋 LOGS</button>
+            <button id="btn-toggle-guide" class="guide-launcher" type="button">
+                <svg class="zas-icon"><use href="#icon-star"></use></svg>
+                <span id="zenith-guide-status">Guía</span>
+            </button>
             <span id="status-text" style="color:var(--text-muted);">Listo.</span>
         </div>
         <div id="progress-container">
