@@ -1376,9 +1376,14 @@
         }
         #deepsky-modal .ds-wizard-step > span:last-child { min-width:0; overflow-wrap:normal; }
         #deepsky-modal .ds-wizard-step .ds-step-n {
-            width: 21px; height: 21px; display: inline-grid; place-items: center; border-radius: 50%;
-            background: #1e293b; color: #94a3b8; font-size: .62rem;
+            /* flex:0 0 auto: sin él, el círculo se ENCOGÍA con etiquetas
+               largas y quedaba ovalado. */
+            flex: 0 0 21px; width: 21px; height: 21px; display: inline-grid; place-items: center;
+            border-radius: 50%; background: #1e293b; color: #94a3b8; font-size: .62rem;
+            transition: background .2s ease, color .2s ease;
         }
+        #deepsky-modal .ds-wizard-step.done .ds-step-n { background: rgba(6,95,70,.55); color: #6ee7b7; }
+        #deepsky-modal .ds-wizard-step.done { color: #94d3b8; color: #94a3b8; }
         #deepsky-modal .ds-wizard-step.active {
             color: #f5f3ff; background: rgba(124,58,237,.22); border-color: rgba(167,139,250,.38);
         }
@@ -1423,9 +1428,14 @@
         #ds-guide .ds-guide-head b { letter-spacing:.04em; }
         #ds-guide #ds-guide-toggle { margin-left:auto; background:none; border:1px solid rgba(148,163,184,.3); color:#94a3b8; border-radius:6px; font-size:.56rem; padding:1px 8px; cursor:pointer; width:auto; }
         #ds-guide.collapsed .ds-guide-body { display:none; }
-        #ds-guide .ds-guide-item { display:flex; gap:8px; align-items:flex-start; margin-top:7px; color:#cbd5e1; line-height:1.45; }
-        #ds-guide .ds-guide-dot { flex:0 0 auto; width:8px; height:8px; border-radius:50%; margin-top:4px; }
-        #ds-guide .ds-guide-action { flex:0 0 auto; background:rgba(124,58,237,.16); border:1px solid rgba(167,139,250,.4); color:#c4b5fd; border-radius:7px; font-size:.56rem; padding:2px 9px; cursor:pointer; width:auto; white-space:nowrap; }
+        #ds-guide .ds-guide-body { max-height:44vh; overflow-y:auto; overscroll-behavior:contain; padding-right:2px; }
+        /* Rejilla punto|texto y el botón SIEMPRE en su propia línea alineado a
+           la derecha: antes botón y texto competían y se cortaban. */
+        #ds-guide .ds-guide-item { display:grid; grid-template-columns:8px 1fr; gap:3px 8px; align-items:start; margin-top:8px; padding-bottom:8px; border-bottom:1px solid rgba(148,163,184,.08); color:#cbd5e1; line-height:1.45; }
+        #ds-guide .ds-guide-item:last-child { border-bottom:none; padding-bottom:0; }
+        #ds-guide .ds-guide-dot { width:8px; height:8px; border-radius:50%; margin-top:5px; }
+        #ds-guide .ds-guide-text { display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
+        #ds-guide .ds-guide-action { grid-column:2; justify-self:end; background:rgba(124,58,237,.16); border:1px solid rgba(167,139,250,.4); color:#c4b5fd; border-radius:7px; font-size:.56rem; padding:2px 10px; cursor:pointer; width:auto; white-space:nowrap; min-height:0; }
         #ds-guide .ds-guide-action:hover { background:rgba(124,58,237,.3); }
         /* Resalte pulsante del control al que la guía lleva al usuario. */
         .ds-spotlight { outline:2px solid rgba(167,139,250,.9) !important; outline-offset:3px; border-radius:10px; animation:dsSpotPulse 1.3s ease-in-out 2; }
@@ -1874,7 +1884,14 @@
         /* Cielo animado del progreso deepsky: SOLO CSS (compositor GPU, sin JS,
            sin rAF) — no roba ni un ms al apilado. Interactivo: al pasar el
            cursor la nebulosa se acerca suavemente. */
-        .ds-sky { position:relative; height:74px; margin:-6px 0 12px; border-radius:10px; overflow:hidden; background:radial-gradient(120% 140% at 20% 0%, #1e1b4b 0%, #0b1020 55%, #020617 100%); border:1px solid rgba(124,58,237,.2); }
+        .ds-sky { position:relative; height:92px; margin:-6px 0 12px; border-radius:10px; overflow:hidden; background:radial-gradient(120% 140% at 20% 0%, #1e1b4b 0%, #0b1020 55%, #020617 100%); border:1px solid rgba(124,58,237,.2); }
+        /* Parallax: el puntero desplaza cada capa a distinta profundidad (JS
+           fija los transform); la deriva lenta da vida cuando no hay puntero. */
+        .ds-sky-neb-wrap { position:absolute; inset:0; transition:transform .45s ease-out; will-change:transform; }
+        .ds-sky-drift { position:absolute; inset:0; animation:dsDrift 26s ease-in-out infinite alternate; }
+        .ds-sky-drift .ds-sky-stars { transition:transform .35s ease-out; will-change:transform; }
+        .ds-sky-horizon { position:absolute; left:0; right:0; bottom:0; height:26px; background:linear-gradient(180deg, transparent, rgba(124,58,237,.10)); pointer-events:none; }
+        @keyframes dsDrift { from { transform:translateX(-9px); } to { transform:translateX(9px); } }
         .ds-sky-nebula { position:absolute; inset:-40%; background:
             radial-gradient(35% 45% at 30% 55%, rgba(124,58,237,.32), transparent 70%),
             radial-gradient(28% 38% at 68% 40%, rgba(219,39,119,.22), transparent 70%),
@@ -1895,8 +1912,17 @@
             100% { opacity:0; }
         }
         @media (prefers-reduced-motion: reduce) {
-            .ds-sky-nebula, .ds-sky-stars, .ds-sky-meteor { animation: none; }
+            .ds-sky-nebula, .ds-sky-stars, .ds-sky-meteor, .ds-sky-drift { animation: none; }
+            .ds-sky-neb-wrap, .ds-sky-drift .ds-sky-stars { transition: none; }
         }
+        /* Filas de fase: estados visuales claros (pendiente/activa/completada). */
+        #ds-prog-steps .ds-ph-row { display:flex; align-items:center; gap:9px; padding:5px 9px; border-radius:8px; font-size:.72rem; color:#94a3b8; border-left:2px solid transparent; transition:background .25s ease, color .25s ease, border-color .25s ease; }
+        #ds-prog-steps .ds-ph-row.active { color:#f5f3ff; background:rgba(124,58,237,.12); border-left-color:#a78bfa; }
+        #ds-prog-steps .ds-ph-row.active .ds-ph-mark { color:#c4b5fd; animation:dsPhasePulse 1.4s ease-in-out infinite; }
+        #ds-prog-steps .ds-ph-row.done { color:#7dd3fc00; color:#94a3b8; }
+        #ds-prog-steps .ds-ph-row.done .ds-ph-mark { color:#34d399; }
+        #ds-prog-steps .ds-ph-row.done .ds-ph-label { color:#64748b; }
+        @keyframes dsPhasePulse { 0%,100% { opacity:1; } 50% { opacity:.35; } }
     </style>
     <div id="ds-progress" class="modal-overlay donation-modal" style="display:none; z-index:905;"
         role="dialog" aria-modal="true" aria-labelledby="ds-progress-title">
@@ -1906,13 +1932,16 @@
                 <h2 id="ds-progress-title" style="font-size:0.95rem; margin:0; color:#e2e8f0;" data-i18n="deepsky.prog_title">Apilado de Cielo Profundo</h2>
                 <span id="ds-prog-elapsed" style="margin-left:auto; font-size:0.75rem; color:#94a3b8; font-family:'Courier New',monospace;">00:00</span>
             </div>
-            <!-- Cielo animado (CSS puro, no consume CPU del apilado) -->
-            <div class="ds-sky" aria-hidden="true">
-                <div class="ds-sky-nebula"></div>
-                <div class="ds-sky-stars s1"></div>
-                <div class="ds-sky-stars s2"></div>
-                <div class="ds-sky-stars s3"></div>
+            <!-- Cielo animado (CSS puro + parallax de puntero; no consume CPU del apilado) -->
+            <div class="ds-sky" id="ds-sky" aria-hidden="true">
+                <div class="ds-sky-neb-wrap"><div class="ds-sky-nebula"></div></div>
+                <div class="ds-sky-drift">
+                    <div class="ds-sky-stars s1"></div>
+                    <div class="ds-sky-stars s2"></div>
+                    <div class="ds-sky-stars s3"></div>
+                </div>
                 <div class="ds-sky-meteor"></div>
+                <div class="ds-sky-horizon"></div>
             </div>
             <!-- Barra global -->
             <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">

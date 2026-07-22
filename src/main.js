@@ -10263,7 +10263,7 @@ function dsRenderGuide(plan) {
             ${items.map((item, index) => `
                 <div class="ds-guide-item">
                     <span class="ds-guide-dot" style="background:${dotColor[item.kind]};"></span>
-                    <span style="flex:1;">${escapeHtml(item.text)}</span>
+                    <span class="ds-guide-text" title="${escapeHtml(item.text)}">${escapeHtml(item.text)}</span>
                     ${item.run ? `<button type="button" class="ds-guide-action" data-guide="${index}">${escapeHtml(item.actionLabel)}</button>` : ""}
                 </div>`).join("")}
         </div>`;
@@ -11052,7 +11052,7 @@ function dsProgressStart() {
         dsVisiblePhases.forEach(ph => {
             const row = document.createElement("div");
             row.id = `ds-ph-${ph.id}`;
-            row.style.cssText = "display:flex; align-items:center; gap:9px; padding:4px 6px; border-radius:8px; font-size:0.72rem; color:#94a3b8;";
+            row.className = "ds-ph-row";
             row.innerHTML = `<span class="ds-ph-mark" style="width:16px; text-align:center;">○</span><span class="ds-ph-label" style="flex:1;">${ph.label}</span><span class="ds-ph-time" style="font-family:'Courier New',monospace; font-size:0.66rem; color:#475569;"></span>`;
             steps.appendChild(row);
         });
@@ -11060,7 +11060,15 @@ function dsProgressStart() {
     const bar = document.getElementById("ds-prog-bar"); if (bar) { bar.style.width = "0%"; bar.setAttribute("aria-valuenow", "0"); }
     const pct = document.getElementById("ds-prog-pct"); if (pct) pct.textContent = "0%";
     const cur = document.getElementById("ds-prog-current"); if (cur) cur.textContent = "";
-    const resources = document.getElementById("ds-prog-resources"); if (resources) { resources.style.display = "none"; resources.innerHTML = ""; }
+    // Chips de recursos visibles desde el arranque (con marcadores): la
+    // telemetría real los reemplaza en cuanto llega el primer evento.
+    const resources = document.getElementById("ds-prog-resources");
+    if (resources) {
+        resources.style.display = "grid";
+        resources.innerHTML = ["Motor", "Velocidad", "CPU", "RAM", "VRAM", "Caché"]
+            .map(label => `<span>${label} <b style="color:#64748b;">—</b></span>`)
+            .join("");
+    }
     const warning = document.getElementById("ds-prog-warning"); if (warning) { warning.style.display = "none"; warning.textContent = ""; }
     const ov = document.getElementById("ds-progress");
     if (ov) {
@@ -11072,6 +11080,38 @@ function dsProgressStart() {
         const el = document.getElementById("ds-prog-elapsed");
         if (el) el.textContent = dsFmtClock(Date.now() - dsProgStart);
     }, 1000);
+    dsAttachSkyParallax();
+}
+
+// Parallax de puntero sobre el cielo del progreso: cada capa se desplaza a
+// distinta profundidad (nebulosa > estrellas cercanas > lejanas). Ligado una
+// sola vez; respeta prefers-reduced-motion.
+function dsAttachSkyParallax() {
+    const sky = document.getElementById("ds-sky");
+    if (!sky || sky.dataset.parallax) return;
+    sky.dataset.parallax = "1";
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    const box = sky.closest(".donation-modal-box") || sky;
+    const layers = () => ({
+        neb: sky.querySelector(".ds-sky-neb-wrap"),
+        s1: sky.querySelector(".ds-sky-stars.s1"),
+        s2: sky.querySelector(".ds-sky-stars.s2"),
+        s3: sky.querySelector(".ds-sky-stars.s3"),
+    });
+    const apply = (dx, dy) => {
+        const { neb, s1, s2, s3 } = layers();
+        if (neb) neb.style.transform = `translate3d(${dx * 14}px, ${dy * 8}px, 0)`;
+        if (s1) s1.style.transform = `translate3d(${dx * 10}px, ${dy * 6}px, 0)`;
+        if (s2) s2.style.transform = `translate3d(${dx * 6}px, ${dy * 3.5}px, 0)`;
+        if (s3) s3.style.transform = `translate3d(${dx * 3}px, ${dy * 2}px, 0)`;
+    };
+    box.addEventListener("pointermove", (event) => {
+        const rect = sky.getBoundingClientRect();
+        const dx = ((event.clientX - rect.left) / Math.max(1, rect.width) - 0.5) * 2;
+        const dy = ((event.clientY - rect.top) / Math.max(1, rect.height) - 0.5) * 2;
+        apply(Math.max(-1.5, Math.min(1.5, dx)), Math.max(-1.5, Math.min(1.5, dy)));
+    });
+    box.addEventListener("pointerleave", () => apply(0, 0));
 }
 
 function dsProgressUpdate(step, pct) {
@@ -11124,13 +11164,18 @@ function dsProgressPhaseUpdate(step, complete = false) {
         const time = row.querySelector(".ds-ph-time");
         if (i < active) {
             if (!dsPhaseTimes[ph.id]) dsPhaseTimes[ph.id] = Date.now();
-            mark.textContent = "✓"; mark.style.color = "#34d399";
-            row.style.color = "#94a3b8";
+            mark.textContent = "✓";
+            row.classList.add("done");
+            row.classList.remove("active");
+            row.style.background = "transparent";
             if (time && dsPhaseTimes[ph.id + "_start"]) time.textContent = dsFmtClock(dsPhaseTimes[ph.id] - dsPhaseTimes[ph.id + "_start"]);
         } else if (i === active) {
             if (!dsPhaseTimes[ph.id + "_start"]) dsPhaseTimes[ph.id + "_start"] = Date.now();
-            mark.textContent = "▸"; mark.style.color = "#c4b5fd";
-            row.style.color = "#e2e8f0"; row.style.background = "rgba(124,58,237,0.08)";
+            mark.textContent = "▸";
+            row.classList.add("active");
+            row.classList.remove("done");
+        } else {
+            row.classList.remove("active", "done");
         }
     });
 }
@@ -11763,6 +11808,11 @@ async function dsScanFolder() {
 
 // Fixture visual reproducible para auditoría responsive. Sólo existe en Vite
 // dev y nunca sustituye lecturas FITS ni respuestas del backend en release.
+if (import.meta.env.DEV) {
+    // Hook de QA visual: permite abrir la ventana de progreso sin apilar.
+    window.__dsProgressDemo = () => { dsProgressStart(); dsProgressUpdate("Registro PSF + RANSAC", 42); };
+}
+
 function dsLoadUxFixtureIfRequested(modal) {
     if (!import.meta.env.DEV || new URLSearchParams(window.location.search).get("ux-fixture") !== "multiband") return;
     const probe = (name, filter, exptime, temp = -8) => ({
