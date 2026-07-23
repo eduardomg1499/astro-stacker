@@ -3200,10 +3200,15 @@ impl StagedPlanetaryDirectory {
             ));
         }
         // Cada PNG/TIFF ya fue flush+fsync. El fsync del directorio es una
-        // barrera adicional disponible en APFS/NTFS, pero exFAT y algunos
-        // volúmenes de red devuelven EINVAL/ENOTSUP. No debe invalidar horas
-        // de cómputo cuando la publicación atómica por rename sí es viable.
-        #[cfg(not(target_os = "windows"))]
+        // barrera adicional en plataformas que lo soportan, pero exFAT y
+        // algunos volúmenes de red devuelven EINVAL/ENOTSUP. No debe invalidar
+        // horas de cómputo cuando la publicación atómica por rename sí es viable.
+        // En macOS, abrir una carpeta gestionada por File Provider (por ejemplo
+        // Escritorio/iCloud) puede bloquear indefinidamente dentro de `open(2)`.
+        // Los archivos ya fueron flush+fsync y el rename sigue siendo atómico;
+        // reservamos el fsync de directorio para Unix donde esta barrera es
+        // fiable y no congela el comando/UI.
+        #[cfg(all(unix, not(target_os = "macos")))]
         if let Ok(directory) = File::open(&self.temporary_dir) {
             let _ = directory.sync_all();
         }
@@ -4555,7 +4560,13 @@ async fn process_batch_entry(
         return Err("Cancelado por el usuario".to_string());
     }
     if let Some(ref advanced_params) = advanced {
-        apply_advanced_postprocess(&mut processed, temp_res.is_mono, advanced_params);
+        apply_advanced_postprocess(
+            &mut processed,
+            temp_res.width,
+            temp_res.height,
+            temp_res.is_mono,
+            advanced_params,
+        );
     }
     planetary_derotation_checkpoint(&batch_postprocess_token, "el postprocesado batch")?;
     let mut staged_prepared = StagedPlanetaryArtifact::encode_rgb16_png(
@@ -6390,7 +6401,13 @@ async fn apply_wavelets(
     }
 
     if let Some(ref advanced_params) = advanced {
-        apply_advanced_postprocess(&mut final_u16, original.is_mono, advanced_params);
+        apply_advanced_postprocess(
+            &mut final_u16,
+            pw,
+            ph,
+            original.is_mono,
+            advanced_params,
+        );
     }
 
     if let Some(expected) = result_id {
@@ -6439,15 +6456,18 @@ async fn apply_wavelets(
     // un data-URL base64 a resolución completa por IPC en CADA render
     // (decenas de MB por tick en mosaicos 4K, retenidos en el heap del
     // WebView). Archivo temporal + asset protocol como el apilado; nombre
-    // único por render (el WebView cachea por URL) con poda agresiva de los
-    // previews de editor anteriores. Fallback a base64 si el temp falla.
-    prune_editor_previews_to_latest();
-    Ok(save_preview_png_to_temp(&png, "editor").unwrap_or_else(|| {
+    // único por render (el WebView cachea por URL). Los previews 1:1 se
+    // conservan para deshacer/A-B; los reducidos de arrastre son transitorios.
+    // Fallback a base64 si el temp falla.
+    let preview_tag = if use_ds { "editor_fast" } else { "editor" };
+    let preview = save_preview_png_to_temp(&png, preview_tag).unwrap_or_else(|| {
         format!(
             "data:image/png;base64,{}",
             general_purpose::STANDARD.encode(&png)
         )
-    }))
+    });
+    prune_editor_previews();
+    Ok(preview)
 }
 
 #[tauri::command]
@@ -6635,7 +6655,13 @@ async fn save_final_image(
     }
 
     if let Some(ref advanced_params) = advanced {
-        apply_advanced_postprocess(&mut final_u16, original.is_mono, advanced_params);
+        apply_advanced_postprocess(
+            &mut final_u16,
+            original.width,
+            original.height,
+            original.is_mono,
+            advanced_params,
+        );
     }
 
     emit_progress(&app, "Guardando...", 97.0, None);
@@ -7673,12 +7699,17 @@ fn derot_unique_tiff_path(parent: &Path, prefix: &str) -> PathBuf {
 }
 
 fn sync_parent_directory(path: &Path) {
-    #[cfg(not(target_os = "windows"))]
+    // APFS/File Provider puede dejar `File::open(parent)` bloqueado aun después
+    // de que el rename y los fsync de archivo terminaron. Esa barrera adicional
+    // no debe mantener el gate generacional ni la interfaz esperando al 98 %.
+    #[cfg(all(unix, not(target_os = "macos")))]
     if let Some(parent) = path.parent() {
         if let Ok(directory) = File::open(parent) {
             let _ = directory.sync_all();
         }
     }
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let _ = path;
 }
 
 /// A TIFF is fully encoded and synced before it becomes visible at its final
@@ -11541,6 +11572,7 @@ fn apply_smart_sharpen_bilateral(
     radius: f32,
     amt: f32,
     img_scale: f32,
+    auto_mask: f32,
 ) -> Vec<f32> {
     // FIX: If radius is 0 (default slider pos), use an intelligent default (1.5)
     // allowing "One Slider" operation as requested.
@@ -11552,6 +11584,18 @@ fn apply_smart_sharpen_bilateral(
     // FIX: Initialize with input to ensure we don't return black if loop fails or logic errors
     let mut out = chan.clone();
     let threshold = 50.0;
+    let mask_strength = auto_mask.clamp(0.0, 1.0);
+    let confidence = if mask_strength > 0.001 {
+        let detail: Vec<f32> = chan
+            .iter()
+            .zip(blurred.iter())
+            .map(|(value, smooth)| value - smooth)
+            .collect();
+        let noise = estimate_noise_mad(&detail);
+        Some(detail_confidence_map(&detail, w, h, noise))
+    } else {
+        None
+    };
 
     for i in 0..chan.len() {
         let diff = chan[i] - blurred[i];
@@ -11561,6 +11605,9 @@ fn apply_smart_sharpen_bilateral(
             let factor = (diff.abs() / threshold).powf(2.0);
             diff * amt * factor
         };
+        if let Some(ref map) = confidence {
+            added *= 1.0 - mask_strength * (1.0 - map[i]);
+        }
 
         let limit = img_scale * 8000.0;
         if added > limit {

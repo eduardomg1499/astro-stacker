@@ -135,6 +135,7 @@ fn reset_postprocess_state(state: State<'_, AppState>) -> Result<usize, String> 
     state.deconv_cache.lock().unwrap().clear();
     state.wavelet_cache.lock().unwrap().clear();
     state.filter_cache.lock().unwrap().clear();
+    clear_editor_previews();
     Ok(state.result_generation.fetch_add(1, Ordering::SeqCst) + 1)
 }
 
@@ -437,7 +438,116 @@ fn rgb_hue(r: f32, g: f32, b: f32) -> f32 {
     hue / 6.0
 }
 
-fn apply_advanced_postprocess(data: &mut [u16], is_mono: bool, params: &AdvancedColorParams) {
+#[inline]
+fn interpolate_hue_control(values: &[f32; 8], hue: f32) -> f32 {
+    const CENTRES: [f32; 8] = [0.0, 1.0 / 12.0, 1.0 / 6.0, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75, 5.0 / 6.0];
+    let mut weighted = 0.0f32;
+    let mut total = 0.0f32;
+    for (index, centre) in CENTRES.iter().enumerate() {
+        let distance = (hue - centre).abs().min(1.0 - (hue - centre).abs());
+        let weight = (1.0 - distance / (1.0 / 6.0)).max(0.0).powi(2);
+        weighted += values[index].clamp(-1.0, 1.0) * weight;
+        total += weight;
+    }
+    if total > 1e-6 { weighted / total } else { 0.0 }
+}
+
+#[inline]
+fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let maximum = r.max(g).max(b);
+    let minimum = r.min(g).min(b);
+    let delta = maximum - minimum;
+    let lightness = (maximum + minimum) * 0.5;
+    let saturation = if delta <= 1e-6 {
+        0.0
+    } else {
+        delta / (1.0 - (2.0 * lightness - 1.0).abs()).max(1e-6)
+    };
+    (rgb_hue(r, g, b), saturation.clamp(0.0, 1.0), lightness.clamp(0.0, 1.0))
+}
+
+#[inline]
+fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> (f32, f32, f32) {
+    let h = hue.rem_euclid(1.0);
+    let s = saturation.clamp(0.0, 1.0);
+    let l = lightness.clamp(0.0, 1.0);
+    let chroma = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let sector = h * 6.0;
+    let x = chroma * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match sector.floor() as i32 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    let match_value = l - chroma * 0.5;
+    (r1 + match_value, g1 + match_value, b1 + match_value)
+}
+
+fn build_local_contrast_delta(
+    data: &[u16],
+    width: usize,
+    height: usize,
+    texture: f32,
+    clarity: f32,
+) -> Option<Vec<f32>> {
+    if width == 0 || height == 0 || data.len() != width * height * 3 {
+        return None;
+    }
+    let texture = texture.clamp(-1.0, 1.0);
+    let clarity = clarity.clamp(-1.0, 1.0);
+    if texture.abs() <= 1e-6 && clarity.abs() <= 1e-6 {
+        return None;
+    }
+    let luma: Vec<f32> = data
+        .par_chunks_exact(3)
+        .map(|pixel| {
+            (0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32)
+                / 65535.0
+        })
+        .collect();
+    let fine = if texture.abs() > 1e-6 {
+        Some(apply_gaussian_blur(&luma, width, height, 1.15))
+    } else {
+        None
+    };
+    let broad = if clarity.abs() > 1e-6 {
+        Some(apply_gaussian_blur(&luma, width, height, 4.5))
+    } else {
+        None
+    };
+    Some(
+        luma.par_iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                let fine_detail = fine.as_ref().map(|blur| value - blur[index]).unwrap_or(0.0);
+                let broad_detail = broad.as_ref().map(|blur| value - blur[index]).unwrap_or(0.0);
+                let structure = fine_detail.abs() + broad_detail.abs() * 0.55;
+                let confidence = post_smoothstep(0.0012, 0.012, structure);
+                let signal_gate = post_smoothstep(0.006, 0.065, value)
+                    * (1.0 - post_smoothstep(0.88, 0.995, value));
+                let positive_gate = if texture > 0.0 || clarity > 0.0 {
+                    0.12 + confidence * 0.88
+                } else {
+                    1.0
+                };
+                (fine_detail * texture * 1.15 + broad_detail * clarity * 0.82)
+                    * signal_gate
+                    * positive_gate
+            })
+            .collect(),
+    )
+}
+
+fn apply_advanced_postprocess(
+    data: &mut [u16],
+    width: usize,
+    height: usize,
+    is_mono: bool,
+    params: &AdvancedColorParams,
+) {
     let black = params.levels_black.clamp(0.0, 0.98);
     let white = params.levels_white.clamp(black + 0.005, 1.0);
     let mid = params.levels_mid.clamp(0.1, 4.0);
@@ -449,8 +559,13 @@ fn apply_advanced_postprocess(data: &mut [u16], is_mono: bool, params: &Advanced
     let vibrance = params.vibrance.clamp(-1.0, 1.0);
     let temperature = params.temperature.clamp(-1.0, 1.0);
     let tint = params.tint.clamp(-1.0, 1.0);
+    let scnr_green = params.scnr_green.clamp(0.0, 1.0);
+    let hsl_active = params.hsl_hue.iter().any(|value| value.abs() > 1e-6)
+        || params.hsl_saturation.iter().any(|value| value.abs() > 1e-6)
+        || params.hsl_luminance.iter().any(|value| value.abs() > 1e-6);
+    let local_delta = build_local_contrast_delta(data, width, height, params.texture, params.clarity);
 
-    data.par_chunks_exact_mut(3).for_each(|pixel| {
+    data.par_chunks_exact_mut(3).enumerate().for_each(|(pixel_index, pixel)| {
         let mut r = (pixel[0] as f32 / 65535.0 - black) / (white - black);
         let mut g = (pixel[1] as f32 / 65535.0 - black) / (white - black);
         let mut b = (pixel[2] as f32 / 65535.0 - black) / (white - black);
@@ -467,7 +582,7 @@ fn apply_advanced_postprocess(data: &mut [u16], is_mono: bool, params: &Advanced
             + highlights * highlight_weight * 0.22
             + blacks * black_weight * 0.12
             + whites * white_weight * 0.12;
-        let new_luma = (luma + tone_delta).max(0.0);
+        let new_luma = (luma + tone_delta + local_delta.as_ref().map(|delta| delta[pixel_index]).unwrap_or(0.0)).max(0.0);
         if luma > 1e-6 {
             let scale = new_luma / luma;
             r *= scale;
@@ -504,18 +619,26 @@ fn apply_advanced_postprocess(data: &mut [u16], is_mono: bool, params: &Advanced
             g = luma_after_wb + (g - luma_after_wb) * vibrance_factor;
             b = luma_after_wb + (b - luma_after_wb) * vibrance_factor;
 
-            if chroma > 1e-6 {
-                let hue_position = rgb_hue(r, g, b) * 8.0;
-                let first = hue_position.floor() as usize % 8;
-                let second = (first + 1) % 8;
-                let fraction = hue_position.fract();
-                let adjustment = params.hsl_saturation[first] * (1.0 - fraction)
-                    + params.hsl_saturation[second] * fraction;
-                let hsl_factor = (1.0 + adjustment.clamp(-1.0, 1.0)).max(0.0);
-                let hsl_luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                r = hsl_luma + (r - hsl_luma) * hsl_factor;
-                g = hsl_luma + (g - hsl_luma) * hsl_factor;
-                b = hsl_luma + (b - hsl_luma) * hsl_factor;
+            if hsl_active && chroma > 1e-6 {
+                let (hue, saturation, lightness) = rgb_to_hsl(r, g, b);
+                let hue_adjustment = interpolate_hue_control(&params.hsl_hue, hue) / 12.0;
+                let saturation_adjustment = interpolate_hue_control(&params.hsl_saturation, hue);
+                let luminance_adjustment = interpolate_hue_control(&params.hsl_luminance, hue);
+                let adjusted_saturation = if saturation_adjustment >= 0.0 {
+                    saturation + saturation_adjustment * (1.0 - saturation)
+                } else {
+                    saturation * (1.0 + saturation_adjustment)
+                };
+                let adjusted_lightness = if luminance_adjustment >= 0.0 {
+                    lightness + luminance_adjustment * (1.0 - lightness) * 0.42
+                } else {
+                    lightness * (1.0 + luminance_adjustment * 0.42)
+                };
+                (r, g, b) = hsl_to_rgb(
+                    hue + hue_adjustment,
+                    adjusted_saturation,
+                    adjusted_lightness,
+                );
             }
 
             let grade_luma = (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0);
@@ -541,6 +664,12 @@ fn apply_advanced_postprocess(data: &mut [u16], is_mono: bool, params: &Advanced
                 r += (color[0] - color_luma) * amount;
                 g += (color[1] - color_luma) * amount;
                 b += (color[2] - color_luma) * amount;
+            }
+
+            if scnr_green > 1e-6 {
+                let neutral_green = (r + b) * 0.5;
+                let green_excess = (g - neutral_green).max(0.0);
+                g -= green_excess * scnr_green;
             }
         } else {
             let mono = 0.2126 * r + 0.7152 * g + 0.0722 * b;
@@ -732,7 +861,7 @@ mod postprocess_io_tests {
         params.tint = -1.0;
         params.hsl_saturation = [1.0; 8];
         params.exposure = 0.25;
-        apply_advanced_postprocess(&mut data, true, &params);
+        apply_advanced_postprocess(&mut data, 2, 1, true, &params);
         for pixel in data.chunks_exact(3) {
             assert_eq!(pixel[0], pixel[1]);
             assert_eq!(pixel[1], pixel[2]);
@@ -743,8 +872,54 @@ mod postprocess_io_tests {
     fn neutral_advanced_recipe_is_identity() {
         let mut data = color_image().data;
         let original = data.clone();
-        apply_advanced_postprocess(&mut data, false, &AdvancedColorParams::default());
+        apply_advanced_postprocess(&mut data, 2, 1, false, &AdvancedColorParams::default());
         assert_eq!(data, original);
+    }
+
+    #[test]
+    fn local_detail_controls_preserve_mono_and_ignore_a_flat_field() {
+        let (width, height) = (16usize, 16usize);
+        let mut flat = vec![24000u16; width * height * 3];
+        let original = flat.clone();
+        let mut params = AdvancedColorParams::default();
+        params.texture = 0.8;
+        params.clarity = 0.65;
+        apply_advanced_postprocess(&mut flat, width, height, true, &params);
+        assert_eq!(flat, original, "un campo plano no debe inventar textura");
+
+        let mut structured = vec![12000u16; width * height * 3];
+        for y in 5..11 {
+            for x in 5..11 {
+                let index = (y * width + x) * 3;
+                structured[index..index + 3].fill(36000);
+            }
+        }
+        let before = structured.clone();
+        apply_advanced_postprocess(&mut structured, width, height, true, &params);
+        assert_ne!(structured, before, "la estructura real debe responder a textura/claridad");
+        for pixel in structured.chunks_exact(3) {
+            assert_eq!(pixel[0], pixel[1]);
+            assert_eq!(pixel[1], pixel[2]);
+        }
+    }
+
+    #[test]
+    fn hsl_hue_and_luminance_are_selective_and_scnr_only_reduces_green_excess() {
+        let mut red = vec![52000u16, 9000, 7000];
+        let mut hsl = AdvancedColorParams::default();
+        hsl.hsl_hue[0] = 1.0;
+        hsl.hsl_luminance[0] = 0.4;
+        apply_advanced_postprocess(&mut red, 1, 1, false, &hsl);
+        assert!(red[1] > 9000, "el matiz rojo positivo debe desplazarse hacia naranja");
+        assert!(red.iter().copied().max().unwrap() > 52000, "la luminancia selectiva debe elevar el sector rojo");
+
+        let mut green = vec![10000u16, 42000, 12000];
+        let mut scnr = AdvancedColorParams::default();
+        scnr.scnr_green = 1.0;
+        apply_advanced_postprocess(&mut green, 1, 1, false, &scnr);
+        assert!(green[1] <= 12000, "SCNR debe limitar el exceso verde a la referencia R/B");
+        assert_eq!(green[0], 10000);
+        assert_eq!(green[2], 12000);
     }
 
     #[test]

@@ -23,6 +23,16 @@ function recipesEqual(left, right) {
   return JSON.stringify(stableValue(left)) === JSON.stringify(stableValue(right));
 }
 
+/**
+ * Backend previews normally arrive as an absolute path, while mosaic previews
+ * may use the explicit `file_path:` envelope. Keep the stored reference raw so
+ * the UI can convert it with Tauri's asset protocol at display time.
+ */
+function unwrapPreviewReference(preview) {
+  const value = String(preview || "");
+  return value.startsWith("file_path:") ? value.slice("file_path:".length) : value;
+}
+
 function makeEntry(recipe, preview, label, timestamp = Date.now()) {
   return Object.freeze({
     recipe: cloneValue(recipe),
@@ -124,9 +134,12 @@ export class PostProcessSession {
   }
 
   getCompareEntry(mode = "previous") {
-    if (this.index < 0) return null;
+    // At the original state there is no meaningful A/B comparison. Returning
+    // the same entry used to enable A/B as "1/1" and made a missing preview look
+    // like a broken previous version.
+    if (this.index <= 0) return null;
     if (mode === "source") return cloneValue(this.entries[0]);
-    return cloneValue(this.entries[Math.max(0, this.index - 1)]);
+    return cloneValue(this.entries[this.index - 1]);
   }
 
   getState() {
@@ -137,8 +150,9 @@ export class PostProcessSession {
       length: this.entries.length,
       canUndo: this.canUndo(),
       canRedo: this.canRedo(),
+      canCompare: this.index > 0,
     };
   }
 }
 
-export { cloneValue, recipesEqual };
+export { cloneValue, recipesEqual, unwrapPreviewReference };

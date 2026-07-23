@@ -3431,6 +3431,11 @@
                             </option>
                         </select>
                     </div>
+                    <div class="deconv-preset-row" role="group" aria-label="Puntos de partida de deconvolución">
+                        <button type="button" data-deconv-preset="gentle">Suave</button>
+                        <button type="button" data-deconv-preset="balanced">Equilibrada</button>
+                        <button type="button" data-deconv-preset="detail">Detalle fino</button>
+                    </div>
                     <div style="margin-bottom:8px;">
                         <span style="font-size:0.7em; color:#aaa; font-weight:bold;"
                             data-i18n="wavelets.deconvolution.adaptive_restoration">RESTAURACION
@@ -3443,9 +3448,9 @@
                         </div>
                         <div class="control-row">
                             <label data-i18n="wavelets.deconvolution.iterations">Iteraciones</label>
-                            <input type="range" id="sl-deconv-iter" min="0" max="10" value="0" step="1"
+                            <input type="range" id="sl-deconv-iter" min="0" max="40" value="0" step="1"
                                 class="slider-blue">
-                            <input type="number" id="num-deconv-iter" value="0" class="input-val">
+                            <input type="number" id="num-deconv-iter" value="0" min="0" max="40" step="1" class="input-val">
                         </div>
                     </div>
                     <div style="border-top:1px dashed #334155; padding-top:6px;">
@@ -3460,9 +3465,9 @@
                         </div>
                         <div class="control-row">
                             <label data-i18n="wavelets.deconvolution.iterations">Iteraciones</label>
-                            <input type="range" id="sl-vc-iter" min="0" max="10" value="0" step="1"
+                            <input type="range" id="sl-vc-iter" min="0" max="20" value="0" step="1"
                                 class="slider-purple">
-                            <input type="number" id="num-vc-iter" value="0" class="input-val">
+                            <input type="number" id="num-vc-iter" value="0" min="0" max="20" step="1" class="input-val">
                         </div>
                     </div>
                     <!-- A: PSF medida del limbo -->
@@ -3473,6 +3478,7 @@
                             <input type="checkbox" id="chk-psf-limb">
                             <span class="slider round"></span></span></label>
                     </div>
+                    <div id="deconv-module-status" class="module-status">Desactivada · el máster permanece intacto</div>
                 </div>
 
                 <div class="control-group" style="border-left: 3px solid #f472b6;">
@@ -3528,7 +3534,7 @@
                     <!-- Sharpening ADAPTATIVO: modula el realce por SNR local (anti ruido "wormy") -->
                     <div class="control-row" style="margin-bottom:8px;">
                         <label data-i18n="wavelets.auto_mask"
-                            title="Máscara adaptativa: amplifica el detalle solo donde hay estructura real y frena el realce sobre ruido plano. 0 = desactivado. Supera al sharpening uniforme de RegiStax/WaveSharp.">Auto-máscara
+                            title="Máscara adaptativa: amplifica el detalle sólo donde hay estructura real y frena el realce sobre ruido plano. 0 = desactivado. Compárala con A/B antes de conservar el ajuste.">Auto-máscara
                             (adaptativo)</label>
                         <input type="range" id="sl-auto-mask" min="0" max="100" value="0" step="1"
                             class="slider-green">
@@ -3578,36 +3584,6 @@
                     </div>
                 </div>
 
-                <!-- Histograma + Niveles (estiramiento por histograma estilo RegiStax) -->
-                <div class="control-group" style="border-left: 3px solid #a78bfa;">
-                    <div class="group-header">
-                        <h3 data-i18n="wavelets.levels.title">Histograma y Niveles</h3>
-                    </div>
-                    <canvas id="hist-canvas" width="256" height="80"
-                        style="width:100%; height:80px; display:block; background:#0b1220; border-radius:6px; margin-bottom:8px;"></canvas>
-                    <div class="control-row">
-                        <label data-i18n="wavelets.levels.black"
-                            title="Punto negro de entrada: todo lo más oscuro que esto se vuelve negro.">Punto Negro</label>
-                        <input type="range" id="sl-levels-black" min="0" max="900" value="0" step="1"
-                            class="slider-cyan">
-                        <input type="number" id="num-levels-black" value="0" class="input-val">
-                    </div>
-                    <div class="control-row">
-                        <label data-i18n="wavelets.levels.gamma"
-                            title="Gamma de medios tonos: sube para aclarar los medios, baja para oscurecerlos.">Medios (γ)</label>
-                        <input type="range" id="sl-levels-gamma" min="10" max="300" value="100" step="1"
-                            class="slider-yellow">
-                        <input type="number" id="num-levels-gamma" value="1" class="input-val">
-                    </div>
-                    <div class="control-row">
-                        <label data-i18n="wavelets.levels.white"
-                            title="Punto blanco de entrada: todo lo más brillante que esto se vuelve blanco.">Punto Blanco</label>
-                        <input type="range" id="sl-levels-white" min="100" max="1000" value="1000" step="1"
-                            class="slider-pink">
-                        <input type="number" id="num-levels-white" value="1" class="input-val">
-                    </div>
-                </div>
-
                 <div class="control-group" style="border-left: 3px solid #fbbf24;">
                     <div class="group-header">
                         <h3 data-i18n="wavelets.post_processing_fine">Post-Procesado Fino</h3>
@@ -3618,10 +3594,16 @@
                                 <strong>Histograma RGB</strong>
                                 <small id="post-histogram-source">MASTER 16-BIT</small>
                             </div>
-                            <button id="btn-refresh-histogram" type="button" class="post-icon-button"
-                                title="Actualizar histograma" aria-label="Actualizar histograma">
-                                <svg class="zas-icon"><use href="#icon-refresh"></use></svg>
-                            </button>
+                            <div class="post-heading-actions">
+                                <button id="btn-toggle-post-scopes" type="button" class="post-icon-button"
+                                    title="Mostrar gráficas flotantes" aria-label="Mostrar gráficas flotantes" aria-pressed="false">
+                                    <svg class="zas-icon"><use href="#icon-chart"></use></svg>
+                                </button>
+                                <button id="btn-refresh-histogram" type="button" class="post-icon-button"
+                                    title="Actualizar histograma" aria-label="Actualizar histograma">
+                                    <svg class="zas-icon"><use href="#icon-refresh"></use></svg>
+                                </button>
+                            </div>
                         </div>
                         <div class="histogram-stage">
                             <canvas id="post-histogram" width="360" height="150"></canvas>
@@ -3647,6 +3629,8 @@
                                 data-advanced-control="levelsWhite" data-scale="65535" data-default="65535">
                         </div>
                     </section>
+                    <details id="post-detail-module" class="post-module" open>
+                        <summary><span>Restauración y detalle fino</span><small>ruido, enfoque y microcontraste</small></summary>
                     <div class="control-row"
                         style="margin-bottom: 8px; background: rgba(56, 189, 248, 0.05); padding: 8px; border-radius: 6px; border: 1px dashed rgba(56, 189, 248, 0.3);">
                         <label style="color:#38bdf8; font-weight:bold; width:100px;"
@@ -3699,6 +3683,16 @@
                             class="slider-purple">
                         <input type="number" id="num-lce-amt" value="0.0" step="0.1" class="input-val">
                     </div>
+                    <div class="advanced-slider-list presence-controls">
+                        <label for="sl-adv-texture"><span>Textura</span><output>0</output></label>
+                        <input id="sl-adv-texture" type="range" min="-100" max="100" value="0"
+                            data-advanced-control="texture" data-scale="100" data-display-scale="100" data-default="0">
+                        <label for="sl-adv-clarity"><span>Claridad local</span><output>0</output></label>
+                        <input id="sl-adv-clarity" type="range" min="-100" max="100" value="0"
+                            data-advanced-control="clarity" data-scale="100" data-display-scale="100" data-default="0">
+                    </div>
+                    <p class="module-help">Textura trabaja escalas finas; Claridad actúa sobre estructura media con protección de sombras y luces.</p>
+                    </details>
                     <div style="border-top:1px solid #334155; margin-top:10px; padding-top:10px;">
                         <div class="control-row">
                             <label data-i18n="wavelets.post.gamma">Gamma</label>
@@ -3727,8 +3721,16 @@
                                 class="input-val">
                         </div>
 
-                        <details class="post-module" open>
+                        <details id="post-tone-module" class="post-module" open>
                             <summary><span>Tono profesional</span><small>luminancia 16-bit</small></summary>
+                            <div class="tone-curve-preview">
+                                <canvas id="post-tone-curve-inline" width="360" height="150" aria-label="Curva tonal de la receta"></canvas>
+                                <div class="tone-preset-row" role="group" aria-label="Ajustes rápidos de curva">
+                                    <button type="button" data-tone-preset="linear">Lineal</button>
+                                    <button type="button" data-tone-preset="soft-contrast">Contraste suave</button>
+                                    <button type="button" data-tone-preset="shadow-recovery">Recuperar sombras</button>
+                                </div>
+                            </div>
                             <div class="advanced-slider-list">
                                 <label for="sl-adv-exposure"><span>Exposición</span><output>0.00 EV</output></label>
                                 <input id="sl-adv-exposure" type="range" min="-400" max="400" value="0"
@@ -3769,43 +3771,79 @@
                                 <span id="post-eyedropper-sample">Selecciona un píxel del resultado</span>
                                 <span id="post-eyedropper-swatch" aria-hidden="true"></span>
                             </div>
-                            <div class="hsl-editor" aria-label="Saturación por color">
-                                <h4>Saturación por color</h4>
-                                <div class="hsl-sliders">
-                                    <label class="hsl-red">Rojo<input type="range" min="-100" max="100" value="0" data-hsl-index="0" data-default="0"><output>0</output></label>
-                                    <label class="hsl-orange">Naranja<input type="range" min="-100" max="100" value="0" data-hsl-index="1" data-default="0"><output>0</output></label>
-                                    <label class="hsl-yellow">Amarillo<input type="range" min="-100" max="100" value="0" data-hsl-index="2" data-default="0"><output>0</output></label>
-                                    <label class="hsl-green">Verde<input type="range" min="-100" max="100" value="0" data-hsl-index="3" data-default="0"><output>0</output></label>
-                                    <label class="hsl-aqua">Aqua<input type="range" min="-100" max="100" value="0" data-hsl-index="4" data-default="0"><output>0</output></label>
-                                    <label class="hsl-blue">Azul<input type="range" min="-100" max="100" value="0" data-hsl-index="5" data-default="0"><output>0</output></label>
-                                    <label class="hsl-purple">Púrpura<input type="range" min="-100" max="100" value="0" data-hsl-index="6" data-default="0"><output>0</output></label>
-                                    <label class="hsl-magenta">Magenta<input type="range" min="-100" max="100" value="0" data-hsl-index="7" data-default="0"><output>0</output></label>
-                                </div>
+                            <div class="hsl-editor" aria-label="Mezclador HSL por color">
+                                <h4>Mezclador HSL por color</h4>
+                                <details open>
+                                    <summary>Saturación</summary>
+                                    <div class="hsl-sliders">
+                                        <label class="hsl-red">Rojo<input type="range" min="-100" max="100" value="0" data-hsl-component="saturation" data-hsl-index="0" data-default="0"><output>0</output></label>
+                                        <label class="hsl-orange">Naranja<input type="range" min="-100" max="100" value="0" data-hsl-component="saturation" data-hsl-index="1" data-default="0"><output>0</output></label>
+                                        <label class="hsl-yellow">Amarillo<input type="range" min="-100" max="100" value="0" data-hsl-component="saturation" data-hsl-index="2" data-default="0"><output>0</output></label>
+                                        <label class="hsl-green">Verde<input type="range" min="-100" max="100" value="0" data-hsl-component="saturation" data-hsl-index="3" data-default="0"><output>0</output></label>
+                                        <label class="hsl-aqua">Aqua<input type="range" min="-100" max="100" value="0" data-hsl-component="saturation" data-hsl-index="4" data-default="0"><output>0</output></label>
+                                        <label class="hsl-blue">Azul<input type="range" min="-100" max="100" value="0" data-hsl-component="saturation" data-hsl-index="5" data-default="0"><output>0</output></label>
+                                        <label class="hsl-purple">Púrpura<input type="range" min="-100" max="100" value="0" data-hsl-component="saturation" data-hsl-index="6" data-default="0"><output>0</output></label>
+                                        <label class="hsl-magenta">Magenta<input type="range" min="-100" max="100" value="0" data-hsl-component="saturation" data-hsl-index="7" data-default="0"><output>0</output></label>
+                                    </div>
+                                </details>
+                                <details>
+                                    <summary>Matiz</summary>
+                                    <div class="hsl-sliders">
+                                        <label class="hsl-red">Rojo<input type="range" min="-100" max="100" value="0" data-hsl-component="hue" data-hsl-index="0" data-default="0"><output>0</output></label>
+                                        <label class="hsl-orange">Naranja<input type="range" min="-100" max="100" value="0" data-hsl-component="hue" data-hsl-index="1" data-default="0"><output>0</output></label>
+                                        <label class="hsl-yellow">Amarillo<input type="range" min="-100" max="100" value="0" data-hsl-component="hue" data-hsl-index="2" data-default="0"><output>0</output></label>
+                                        <label class="hsl-green">Verde<input type="range" min="-100" max="100" value="0" data-hsl-component="hue" data-hsl-index="3" data-default="0"><output>0</output></label>
+                                        <label class="hsl-aqua">Aqua<input type="range" min="-100" max="100" value="0" data-hsl-component="hue" data-hsl-index="4" data-default="0"><output>0</output></label>
+                                        <label class="hsl-blue">Azul<input type="range" min="-100" max="100" value="0" data-hsl-component="hue" data-hsl-index="5" data-default="0"><output>0</output></label>
+                                        <label class="hsl-purple">Púrpura<input type="range" min="-100" max="100" value="0" data-hsl-component="hue" data-hsl-index="6" data-default="0"><output>0</output></label>
+                                        <label class="hsl-magenta">Magenta<input type="range" min="-100" max="100" value="0" data-hsl-component="hue" data-hsl-index="7" data-default="0"><output>0</output></label>
+                                    </div>
+                                </details>
+                                <details>
+                                    <summary>Luminancia</summary>
+                                    <div class="hsl-sliders">
+                                        <label class="hsl-red">Rojo<input type="range" min="-100" max="100" value="0" data-hsl-component="luminance" data-hsl-index="0" data-default="0"><output>0</output></label>
+                                        <label class="hsl-orange">Naranja<input type="range" min="-100" max="100" value="0" data-hsl-component="luminance" data-hsl-index="1" data-default="0"><output>0</output></label>
+                                        <label class="hsl-yellow">Amarillo<input type="range" min="-100" max="100" value="0" data-hsl-component="luminance" data-hsl-index="2" data-default="0"><output>0</output></label>
+                                        <label class="hsl-green">Verde<input type="range" min="-100" max="100" value="0" data-hsl-component="luminance" data-hsl-index="3" data-default="0"><output>0</output></label>
+                                        <label class="hsl-aqua">Aqua<input type="range" min="-100" max="100" value="0" data-hsl-component="luminance" data-hsl-index="4" data-default="0"><output>0</output></label>
+                                        <label class="hsl-blue">Azul<input type="range" min="-100" max="100" value="0" data-hsl-component="luminance" data-hsl-index="5" data-default="0"><output>0</output></label>
+                                        <label class="hsl-purple">Púrpura<input type="range" min="-100" max="100" value="0" data-hsl-component="luminance" data-hsl-index="6" data-default="0"><output>0</output></label>
+                                        <label class="hsl-magenta">Magenta<input type="range" min="-100" max="100" value="0" data-hsl-component="luminance" data-hsl-index="7" data-default="0"><output>0</output></label>
+                                    </div>
+                                </details>
                             </div>
+                            <div class="advanced-slider-list scnr-control">
+                                <label for="sl-adv-scnr-green"><span>Neutralizar verde</span><output>0</output></label>
+                                <input id="sl-adv-scnr-green" type="range" min="0" max="100" value="0"
+                                    data-advanced-control="scnrGreen" data-scale="100" data-display-scale="100" data-default="0">
+                            </div>
+                            <p class="module-help">Reduce exceso verde sólo donde supera a la referencia rojo/azul; no se aplica a señal mono.</p>
                             <div class="color-grading-grid">
                                 <h4>Color grading</h4>
                                 <label>Sombras<input id="grade-shadow-color" type="color" value="#ffffff" data-grade-color="shadows"><input type="range" min="0" max="100" value="0" data-grade-amount="0" data-default="0"><output>0</output></label>
                                 <label>Medios<input id="grade-mid-color" type="color" value="#ffffff" data-grade-color="midtones"><input type="range" min="0" max="100" value="0" data-grade-amount="1" data-default="0"><output>0</output></label>
                                 <label>Luces<input id="grade-high-color" type="color" value="#ffffff" data-grade-color="highlights"><input type="range" min="0" max="100" value="0" data-grade-amount="2" data-default="0"><output>0</output></label>
                             </div>
+                            <details class="channel-gain-expert">
+                                <summary>Ganancias lineales de canal <small>experto</small></summary>
+                                <p class="module-help">Ajuste técnico independiente de R y B. Para uso normal, prefiere Temperatura, Matiz o el cuentagotas.</p>
+                                <div class="control-row">
+                                    <label data-i18n="wavelets.post.white_balance_r">Ganancia R</label>
+                                    <input type="range" id="sl-r-bal" min="-1000" max="1000" value="0"
+                                        class="slider-yellow">
+                                    <input type="number" id="num-r-bal" value="0" step="0.01" min="-1.00" max="1.00"
+                                        class="input-val">
+                                </div>
+                                <div class="control-row">
+                                    <label data-i18n="wavelets.post.white_balance_b">Ganancia B</label>
+                                    <input type="range" id="sl-b-bal" min="-1000" max="1000" value="0"
+                                        class="slider-yellow">
+                                    <input type="number" id="num-b-bal" value="0" step="0.01" min="-1.00" max="1.00"
+                                        class="input-val">
+                                </div>
+                            </details>
                         </details>
-
-                        <div style="margin-top:8px; border-top:1px solid #334155; padding-top:8px;">
-                            <div class="control-row">
-                                <label data-i18n="wavelets.post.white_balance_r">White Balance (R)</label>
-                                <input type="range" id="sl-r-bal" min="-1000" max="1000" value="0"
-                                    class="slider-yellow">
-                                <input type="number" id="num-r-bal" value="0" step="0.01" min="-1.00" max="1.00"
-                                    class="input-val">
-                            </div>
-                            <div class="control-row">
-                                <label data-i18n="wavelets.post.white_balance_b">White Balance (B)</label>
-                                <input type="range" id="sl-b-bal" min="-1000" max="1000" value="0"
-                                    class="slider-yellow">
-                                <input type="number" id="num-b-bal" value="0" step="0.01" min="-1.00" max="1.00"
-                                    class="input-val">
-                            </div>
-                        </div>
                         <details class="post-module atmospheric-module" open>
                             <summary><span>Corrección atmosférica</span><small>Alineación RGB visual</small></summary>
                             <p class="module-help">Arrastra R y B respecto al canal verde o usa la medición automática subpíxel.</p>
@@ -3956,10 +3994,10 @@
                         <button id="btn-post-redo" type="button" disabled title="Rehacer" aria-label="Rehacer">
                             <svg class="zas-icon"><use href="#icon-redo"></use></svg>
                         </button>
-                        <button id="btn-post-compare" type="button" aria-pressed="false" title="Activar comparación A/B">
+                        <button id="btn-post-compare" type="button" disabled aria-pressed="false" title="Activar comparación A/B">
                             <svg class="zas-icon"><use href="#icon-compare"></use></svg><span>A/B</span>
                         </button>
-                        <select id="post-compare-reference" aria-label="Referencia de comparación" title="Referencia A">
+                        <select id="post-compare-reference" disabled aria-label="Referencia de comparación" title="Referencia A">
                             <option value="previous">A: ajuste anterior</option>
                             <option value="source">A: resultado original</option>
                         </select>
@@ -3995,9 +4033,10 @@
                         <img id="img-result" alt="">
                         <div id="post-compare-layer" class="post-compare-layer" hidden aria-hidden="true">
                             <img id="img-result-before" alt="Referencia A">
-                            <span class="compare-label compare-label-a">A</span>
+                            <span id="post-compare-label-a" class="compare-label compare-label-a">A · Anterior</span>
                             <span class="compare-divider"></span>
                         </div>
+                        <span id="post-compare-label-b" class="compare-label compare-label-b" hidden>B · Actual</span>
                         <div id="crop-box">
                             <div class="crop-grid-v v1"></div>
                             <div class="crop-grid-v v2"></div>
@@ -4018,16 +4057,47 @@
         </div>
     </div>
 
-    <aside id="zenith-guide-panel" aria-label="Guía inteligente" aria-hidden="true">
+    <aside id="zenith-guide-panel" aria-label="Asistente inteligente" aria-hidden="true">
         <div class="guide-panel-header">
             <div>
-                <span class="guide-kicker">ZENITH GUIDE</span>
-                <h3>Asistente contextual</h3>
+                <span class="guide-kicker">ANÁLISIS LOCAL 16-BIT</span>
+                <h3>Asistente inteligente</h3>
             </div>
-            <button id="btn-close-guide" type="button" aria-label="Cerrar guía">×</button>
+            <button id="btn-close-guide" type="button" aria-label="Cerrar asistente">
+                <svg class="zas-icon"><use href="#icon-cross"></use></svg>
+            </button>
         </div>
+        <div id="intelligent-assistant-summary" class="assistant-summary">Preparación · sin resultado</div>
+        <button id="btn-assistant-analyze" type="button" class="assistant-analyze-button">
+            <svg class="zas-icon"><use href="#icon-chart"></use></svg>
+            Diagnosticar resultado activo
+        </button>
         <div id="zenith-guide-list" class="guide-list"></div>
-        <p class="guide-privacy-note">Las sugerencias se calculan localmente a partir del paso y del resultado activo.</p>
+        <p class="guide-privacy-note">Las recomendaciones se calculan localmente a partir del flujo, histograma, artefactos e historial activo.</p>
+    </aside>
+
+    <aside id="post-scopes-panel" aria-label="Gráficas de postprocesado" aria-hidden="true">
+        <div id="post-scopes-drag-handle" class="scopes-panel-header">
+            <div>
+                <span class="guide-kicker">SCOPES 16-BIT</span>
+                <h3>Diagnóstico visual</h3>
+            </div>
+            <button id="btn-close-post-scopes" type="button" aria-label="Ocultar gráficas">
+                <svg class="zas-icon"><use href="#icon-cross"></use></svg>
+            </button>
+        </div>
+        <section class="scope-card">
+            <header><strong>Histograma RGB</strong><span id="floating-histogram-source">Master</span></header>
+            <canvas id="post-histogram-floating" width="420" height="170"></canvas>
+        </section>
+        <section class="scope-card">
+            <header><strong>Curva tonal</strong><span>entrada → salida</span></header>
+            <canvas id="post-tone-curve" width="420" height="170"></canvas>
+        </section>
+        <section class="scope-card">
+            <header><strong>Respuesta de detalle</strong><span>escala espacial</span></header>
+            <canvas id="post-detail-curve" width="420" height="150"></canvas>
+        </section>
     </aside>
 
     <div id="console-panel" aria-hidden="true">
@@ -4048,7 +4118,7 @@
             <button id="btn-toggle-log">📋 LOGS</button>
             <button id="btn-toggle-guide" class="guide-launcher" type="button">
                 <svg class="zas-icon"><use href="#icon-star"></use></svg>
-                <span id="zenith-guide-status">Guía</span>
+                <span id="zenith-guide-status">Asistente inteligente</span>
             </button>
             <span id="status-text" style="color:var(--text-muted);">Listo.</span>
         </div>

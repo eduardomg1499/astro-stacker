@@ -16,8 +16,8 @@ import { relaunch } from '@tauri-apps/plugin-process';
 import { getVersion } from '@tauri-apps/api/app';
 import { i18n } from "./i18n.js";
 import { tutorialManager } from "./tutorial_manager.js";
-import { PostProcessSession } from "./postprocess_session.js";
-import { ZenithGuide } from "./zenith_guide.js";
+import { PostProcessSession, unwrapPreviewReference } from "./postprocess_session.js";
+import { IntelligentAssistant } from "./zenith_guide.js";
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import {
     BATCH_OUTPUT_POLICY_SINGLE_DIRECTORY,
@@ -1416,6 +1416,7 @@ let suppressPostprocessEvents = false;
 let historyPlaybackRequestId = 0;
 let pendingHistoryCommit = null;
 let postCompareActive = false;
+let postCompareLoadId = 0;
 let postEyedropperActive = false;
 let lastPostHistogram = null;
 let lastArtifactSuggestion = null;
@@ -2059,18 +2060,18 @@ async function checkAvx2Status() {
 // duplicaba el pico de RAM del WebView en canvases grandes. Acepta ambos
 // formatos para no romper los comandos que siguen devolviendo base64.
 function toDisplaySrc(src) {
+    const normalized = unwrapPreviewReference(src);
     // `setImageAndWait` is the single normalization point, but a few older
     // callers already hand us an asset/blob URL. Converting one of those a
     // second time produces an invalid `asset://.../asset://...` URL and left
     // the processed-result pane completely black after a successful stack.
     if (
-        typeof src === "string" &&
-        src &&
-        !/^(?:data:|asset:|blob:|https?:)/i.test(src)
+        normalized &&
+        !/^(?:data:|asset:|blob:|https?:)/i.test(normalized)
     ) {
-        return convertFileSrc(src);
+        return convertFileSrc(normalized);
     }
-    return src;
+    return normalized;
 }
 window.toDisplaySrc = toDisplaySrc;
 
@@ -2377,6 +2378,9 @@ function applyAdvancedParamsToUi(advanced = {}) {
         vibrance: advanced.vibrance ?? 0,
         temperature: advanced.temperature ?? 0,
         tint: advanced.tint ?? 0,
+        texture: advanced.texture ?? 0,
+        clarity: advanced.clarity ?? 0,
+        scnrGreen: advanced.scnrGreen ?? 0,
     };
     Object.entries(mapping).forEach(([name, value]) => {
         const control = document.querySelector(`[data-advanced-control="${name}"]`);
@@ -2387,7 +2391,13 @@ function applyAdvancedParamsToUi(advanced = {}) {
     });
     document.querySelectorAll("[data-hsl-index]").forEach((control) => {
         const index = parseInt(control.dataset.hslIndex, 10);
-        control.value = String((advanced.hslSaturation?.[index] || 0) * 100);
+        const component = control.dataset.hslComponent || "saturation";
+        const values = component === "hue"
+            ? advanced.hslHue
+            : component === "luminance"
+                ? advanced.hslLuminance
+                : advanced.hslSaturation;
+        control.value = String((values?.[index] || 0) * 100);
         updateAdvancedControlOutput(control);
     });
     document.querySelectorAll("[data-grade-amount]").forEach((control) => {
@@ -2438,6 +2448,12 @@ function applyWaveletPreset(p, { trigger = true } = {}) {
         if (ui.selDrMode) { ui.selDrMode.value = String(p.dr.mode ?? 0); ui.selDrMode.dispatchEvent(new Event("change", { bubbles: true })); }
         if (ui.chkDrMask) ui.chkDrMask.checked = !!p.dr.mask;
     }
+    const edgeAware = document.getElementById("chk-edge-wavelets");
+    const psfFromLimb = document.getElementById("chk-psf-limb");
+    if (edgeAware && p.edgeAwareWavelets !== undefined) edgeAware.checked = !!p.edgeAwareWavelets;
+    if (psfFromLimb && p.psfFromLimb !== undefined) psfFromLimb.checked = !!p.psfFromLimb;
+    setNum("edge-strength", p.edgeAwareStrength ?? 50);
+    setNum("auto-mask", p.autoMask ?? 0);
     if (p.shift) {
         [["rx", p.shift.rx], ["ry", p.shift.ry], ["bx", p.shift.bx], ["by", p.shift.by]].forEach(([k, v]) => {
             if (ui[k] && v !== undefined) { ui[k].value = v; ui[k].dispatchEvent(new Event("input", { bubbles: true })); }
@@ -2453,6 +2469,8 @@ function applyWaveletPreset(p, { trigger = true } = {}) {
         selSharp.dispatchEvent(new Event("change", { bubbles: true }));
     }
     if (p.advanced) applyAdvancedParamsToUi(p.advanced);
+    updateDeconvolutionStatus();
+    drawPostprocessScopes();
     if (trigger) triggerUpdate();
 }
 
@@ -4940,10 +4958,6 @@ linkControl("#sl-denoise-chroma", "#num-denoise-chroma", 1.0);
 // B+: intensidad edge-aware · auto-máscara adaptativa (ambos 0..100 enteros)
 linkControl("#sl-edge-strength", "#num-edge-strength", 1.0);
 linkControl("#sl-auto-mask", "#num-auto-mask", 1.0);
-// Niveles: negro/blanco en [0..1] (slider ×1000), gamma medios en [0.1..3] (×100)
-linkControl("#sl-levels-black", "#num-levels-black", 1000.0);
-linkControl("#sl-levels-white", "#num-levels-white", 1000.0);
-linkControl("#sl-levels-gamma", "#num-levels-gamma", 100.0);
 // linkControl("#sl-gamma", "#num-gamma", 100.0);
 // Custom Inverted Gamma Logic for Post-Processing
 const slGamma = $("#sl-gamma");
@@ -5068,12 +5082,27 @@ function resetProcessingParams({ updateMemo = true } = {}) {
     if (ui.numDrLight) ui.numDrLight.value = 0;
     if (ui.chkDrMask) ui.chkDrMask.checked = false;
 
+    const edgeAware = document.getElementById("chk-edge-wavelets");
+    const psfFromLimb = document.getElementById("chk-psf-limb");
+    const sharpenMode = document.getElementById("sel-sharpen-mode");
+    if (edgeAware) edgeAware.checked = false;
+    if (psfFromLimb) psfFromLimb.checked = false;
+    if (sharpenMode) sharpenMode.value = "luminance";
+    [["sl-edge-strength", "50"], ["num-edge-strength", "50"], ["sl-auto-mask", "0"], ["num-auto-mask", "0"]]
+        .forEach(([id, value]) => {
+            const control = document.getElementById(id);
+            if (control) control.value = value;
+        });
+
     document.querySelectorAll("[data-advanced-control], [data-hsl-index], [data-grade-amount]").forEach((control) => {
         control.value = control.dataset.default ?? "0";
         updateAdvancedControlOutput(control);
     });
     document.querySelectorAll("[data-grade-color]").forEach((control) => { control.value = "#ffffff"; });
     updateLevelMarkers();
+    updateModeGlow();
+    updateDeconvolutionStatus();
+    drawPostprocessScopes();
 
     if (updateMemo) lastProcessedParams = JSON.stringify(getPipelineParams());
 }
@@ -5123,58 +5152,6 @@ function updateModeGlow() {
     }
 }
 
-// Histograma RGB del resultado actual (256 bins/canal, escala log para ver las
-// colas) + marcadores de los puntos negro/blanco de niveles. Se dibuja tras cada
-// render del pipeline. El resultado interactivo es un data-URL (mismo origen), así
-// que getImageData no contamina el canvas; con rutas asset-protocol podría fallar
-// → try/catch silencioso.
-function drawHistogram(imgEl) {
-    const canvas = document.getElementById("hist-canvas");
-    if (!canvas || !imgEl || !imgEl.naturalWidth) return;
-    const sw = 256;
-    const sh = Math.max(1, Math.round(256 * imgEl.naturalHeight / imgEl.naturalWidth));
-    const off = drawHistogram._off || (drawHistogram._off = document.createElement("canvas"));
-    off.width = sw; off.height = sh;
-    const octx = off.getContext("2d", { willReadFrequently: true });
-    let data;
-    try {
-        octx.drawImage(imgEl, 0, 0, sw, sh);
-        data = octx.getImageData(0, 0, sw, sh).data;
-    } catch (e) { return; }
-    const binsR = new Float32Array(256), binsG = new Float32Array(256), binsB = new Float32Array(256);
-    for (let i = 0; i < data.length; i += 4) { binsR[data[i]]++; binsG[data[i + 1]]++; binsB[data[i + 2]]++; }
-    let peak = 1;
-    for (let k = 0; k < 256; k++) { peak = Math.max(peak, binsR[k], binsG[k], binsB[k]); }
-    const ctx = canvas.getContext("2d");
-    const W = canvas.width, H = canvas.height;
-    ctx.clearRect(0, 0, W, H);
-    const invLogPeak = 1 / Math.log(1 + peak);
-    const drawChannel = (bins, color) => {
-        ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.beginPath();
-        for (let k = 0; k < 256; k++) {
-            const x = k / 255 * (W - 1);
-            const h = Math.log(1 + bins[k]) * invLogPeak * (H - 2);
-            ctx.moveTo(x, H); ctx.lineTo(x, H - h);
-        }
-        ctx.stroke();
-    };
-    ctx.globalCompositeOperation = "lighter";
-    drawChannel(binsR, "rgba(248,113,113,0.75)");
-    drawChannel(binsG, "rgba(74,222,128,0.75)");
-    drawChannel(binsB, "rgba(96,165,250,0.75)");
-    ctx.globalCompositeOperation = "source-over";
-    // Marcadores de niveles negro/blanco.
-    try {
-        const p = getPipelineParams();
-        const mark = (v) => {
-            const x = Math.max(0, Math.min(1, v)) * (W - 1);
-            ctx.strokeStyle = "rgba(226,232,240,0.55)"; ctx.lineWidth = 1;
-            ctx.setLineDash([3, 2]); ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); ctx.setLineDash([]);
-        };
-        mark(p.levels.black); mark(p.levels.white);
-    } catch (e) { /* getPipelineParams no disponible aún */ }
-}
-
 function hexToRgbUnit(hex) {
     const value = String(hex || "#ffffff").replace("#", "").padEnd(6, "f").slice(0, 6);
     return [0, 2, 4].map((offset) => parseInt(value.slice(offset, offset + 2), 16) / 255);
@@ -5188,10 +5165,17 @@ function getAdvancedPostprocessParams() {
         const value = parseFloat(control.value);
         return Number.isFinite(value) ? value / scale : fallback;
     };
-    const hslSaturation = Array(8).fill(0);
+    const hsl = {
+        hue: Array(8).fill(0),
+        saturation: Array(8).fill(0),
+        luminance: Array(8).fill(0),
+    };
     document.querySelectorAll("[data-hsl-index]").forEach((control) => {
         const index = parseInt(control.dataset.hslIndex, 10);
-        if (index >= 0 && index < 8) hslSaturation[index] = (parseFloat(control.value) || 0) / 100;
+        const component = control.dataset.hslComponent || "saturation";
+        if (index >= 0 && index < 8 && hsl[component]) {
+            hsl[component][index] = (parseFloat(control.value) || 0) / 100;
+        }
     });
     const gradingAmounts = Array(3).fill(0);
     document.querySelectorAll("[data-grade-amount]").forEach((control) => {
@@ -5210,7 +5194,12 @@ function getAdvancedPostprocessParams() {
         vibrance: byParam("vibrance", 0),
         temperature: byParam("temperature", 0),
         tint: byParam("tint", 0),
-        hslSaturation,
+        texture: byParam("texture", 0),
+        clarity: byParam("clarity", 0),
+        scnrGreen: byParam("scnrGreen", 0),
+        hslHue: hsl.hue,
+        hslSaturation: hsl.saturation,
+        hslLuminance: hsl.luminance,
         gradingShadows: hexToRgbUnit(document.querySelector('[data-grade-color="shadows"]')?.value),
         gradingMidtones: hexToRgbUnit(document.querySelector('[data-grade-color="midtones"]')?.value),
         gradingHighlights: hexToRgbUnit(document.querySelector('[data-grade-color="highlights"]')?.value),
@@ -5262,13 +5251,9 @@ function getPipelineParams() {
         // B+: intensidad edge-aware (0..100, 50 = histórico) · auto-máscara adaptativa por SNR (0..100)
         edgeAwareStrength: parseFloat($(`#num-edge-strength`)?.value ?? "50"),
         autoMask: getVal("auto-mask"),
-        // Niveles (estiramiento por histograma estilo RegiStax): negro/blanco de
-        // entrada [0..1] + gamma de medios tonos. Neutro: 0 / 1 / 1.
-        levels: {
-            black: parseFloat($(`#num-levels-black`)?.value) || 0,
-            white: parseFloat($(`#num-levels-white`)?.value) || 1,
-            gamma: parseFloat($(`#num-levels-gamma`)?.value) || 1
-        },
+        // El backend histórico conserva estos argumentos por compatibilidad,
+        // pero la única UI de niveles es el módulo científico 16-bit avanzado.
+        levels: { black: 0, white: 1, gamma: 1 },
         advanced: getAdvancedPostprocessParams()
     };
 }
@@ -5296,7 +5281,10 @@ function isPostConfigNeutral(p) {
         && zero(p.advanced.exposure) && zero(p.advanced.shadows) && zero(p.advanced.highlights)
         && zero(p.advanced.whites) && zero(p.advanced.blacks) && zero(p.advanced.vibrance)
         && zero(p.advanced.temperature) && zero(p.advanced.tint)
+        && zero(p.advanced.texture) && zero(p.advanced.clarity) && zero(p.advanced.scnrGreen)
+        && p.advanced.hslHue.every(zero)
         && p.advanced.hslSaturation.every(zero)
+        && p.advanced.hslLuminance.every(zero)
         && p.advanced.gradingAmounts.every(zero);
 }
 
@@ -5379,33 +5367,77 @@ function updatePostHistoryUi() {
     const state = postProcessSession.getState();
     const undo = document.getElementById("btn-post-undo");
     const redo = document.getElementById("btn-post-redo");
+    const compare = document.getElementById("btn-post-compare");
+    const compareReference = document.getElementById("post-compare-reference");
     const label = document.getElementById("post-history-state");
     if (undo) undo.disabled = !state.canUndo;
     if (redo) redo.disabled = !state.canRedo;
+    if (compare) compare.disabled = !state.canCompare;
+    if (compareReference) compareReference.disabled = !state.canCompare;
+    if (!state.canCompare && postCompareActive) setPostCompareActive(false);
     if (label) {
         const current = postProcessSession.current();
         label.textContent = current ? `${state.index + 1}/${state.length} · ${current.label}` : "Sin resultado";
     }
-    refreshPostCompareReference();
+    void refreshPostCompareReference();
+    updateZenithGuide();
 }
 
-function refreshPostCompareReference() {
+function loadComparisonPreview(image, preview, loadId) {
+    return new Promise((resolve) => {
+        image.classList.remove("loaded");
+        image.onload = null;
+        image.onerror = null;
+        const finish = (ok) => {
+            if (loadId !== postCompareLoadId) return resolve(false);
+            if (ok) image.classList.add("loaded");
+            resolve(ok);
+        };
+        image.onload = () => finish(image.naturalWidth > 0 && image.naturalHeight > 0);
+        image.onerror = () => finish(false);
+        image.src = toDisplaySrc(preview);
+        if (image.complete) queueMicrotask(() => finish(image.naturalWidth > 0 && image.naturalHeight > 0));
+    });
+}
+
+async function refreshPostCompareReference() {
     const layer = document.getElementById("post-compare-layer");
     const image = document.getElementById("img-result-before");
     const selector = document.getElementById("post-compare-reference");
+    const labelA = document.getElementById("post-compare-label-a");
+    const labelB = document.getElementById("post-compare-label-b");
     if (!layer || !image) return;
     const reference = postProcessSession.getCompareEntry(selector?.value || "previous");
-    if (reference?.preview) image.src = reference.preview;
-    layer.hidden = !postCompareActive || !reference?.preview;
+    const canShow = postCompareActive && !!reference?.preview;
+    layer.hidden = true;
+    layer.setAttribute("aria-hidden", "true");
+    if (labelB) labelB.hidden = !canShow;
+    if (labelA) labelA.textContent = selector?.value === "source" ? "A · Original" : "A · Anterior";
+    if (!canShow) return;
+
+    const loadId = ++postCompareLoadId;
+    const loaded = await loadComparisonPreview(image, reference.preview, loadId);
+    if (loadId !== postCompareLoadId || !postCompareActive) return;
+    if (!loaded) {
+        postCompareActive = false;
+        document.getElementById("btn-post-compare")?.setAttribute("aria-pressed", "false");
+        document.getElementById("post-compare-split-wrap")?.setAttribute("hidden", "");
+        if (labelB) labelB.hidden = true;
+        log("WARN", "A/B: la vista de referencia ya no estaba disponible; se conservaron el historial y la receta.");
+        return;
+    }
+    layer.hidden = false;
+    layer.setAttribute("aria-hidden", "false");
 }
 
 function setPostCompareActive(active) {
-    postCompareActive = !!active && !!postProcessSession.current();
+    const canCompare = postProcessSession.getState().canCompare;
+    postCompareActive = !!active && canCompare;
     const button = document.getElementById("btn-post-compare");
     const splitWrap = document.getElementById("post-compare-split-wrap");
     if (button) button.setAttribute("aria-pressed", String(postCompareActive));
     if (splitWrap) splitWrap.hidden = !postCompareActive;
-    refreshPostCompareReference();
+    void refreshPostCompareReference();
 }
 
 function finishPendingHistoryCommit(paramsString, preview) {
@@ -5457,6 +5489,17 @@ async function applyPostHistoryEntry(entry) {
 async function beginNewPostprocessResult(preview, source = "stack") {
     const nonce = ++postBeginNonce;
     window.resetPipelineState();
+    postCompareLoadId += 1;
+    postEyedropperActive = false;
+    document.getElementById("btn-post-eyedropper")?.classList.remove("active");
+    document.getElementById("view-result")?.classList.remove("eyedropper-active");
+    const compareSelector = document.getElementById("post-compare-reference");
+    const compareSplit = document.getElementById("post-compare-split");
+    const compareLayer = document.getElementById("post-compare-layer");
+    if (compareSelector) compareSelector.value = "previous";
+    if (compareSplit) compareSplit.value = "50";
+    if (compareLayer) compareLayer.style.clipPath = "inset(0 50% 0 0)";
+    compareLayer?.querySelector(".compare-divider")?.style.setProperty("left", "50%");
     let generation;
     try {
         generation = await invoke("reset_postprocess_state");
@@ -5485,9 +5528,16 @@ async function beginNewPostprocessResult(preview, source = "stack") {
         source,
         recipe,
         preview: preview || ui.imgResult?.src || "",
-        label: source === "mosaic" ? "Mosaico original" : "Apilado original",
+        label: source === "mosaic" ? "Mosaico original" : source === "batch" ? "Lote original" : "Apilado original",
     });
     setPostCompareActive(false);
+    const compareImage = document.getElementById("img-result-before");
+    if (compareImage) {
+        compareImage.onload = null;
+        compareImage.onerror = null;
+        compareImage.classList.remove("loaded");
+        compareImage.removeAttribute("src");
+    }
     updatePostHistoryUi();
     updateAdcPadFromInputs();
     await refreshPostHistogram(false);
@@ -5497,18 +5547,36 @@ async function beginNewPostprocessResult(preview, source = "stack") {
 }
 window.beginNewPostprocessResult = beginNewPostprocessResult;
 
-function drawPostHistogram(histogram) {
-    const canvas = document.getElementById("post-histogram");
-    if (!canvas) return;
+function prepareScopeCanvas(canvas, minimumWidth = 280, minimumHeight = 120) {
     const bounds = canvas.getBoundingClientRect();
     const dpr = Math.min(2, window.devicePixelRatio || 1);
-    const width = Math.max(280, Math.round(bounds.width || 360));
-    const height = Math.max(120, Math.round(bounds.height || 150));
+    const width = Math.max(minimumWidth, Math.round(bounds.width || canvas.width || 360));
+    const height = Math.max(minimumHeight, Math.round(bounds.height || canvas.height || 150));
     canvas.width = Math.round(width * dpr);
     canvas.height = Math.round(height * dpr);
     const context = canvas.getContext("2d");
     context.setTransform(dpr, 0, 0, dpr, 0, 0);
     context.clearRect(0, 0, width, height);
+    return { context, width, height };
+}
+
+function drawScopeGrid(context, width, height) {
+    context.fillStyle = "#020617";
+    context.fillRect(0, 0, width, height);
+    context.strokeStyle = "rgba(148,163,184,.1)";
+    context.lineWidth = 1;
+    for (let index = 1; index < 4; index += 1) {
+        const x = index * width / 4;
+        const y = index * height / 4;
+        context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height); context.stroke();
+        context.beginPath(); context.moveTo(0, y); context.lineTo(width, y); context.stroke();
+    }
+}
+
+function drawHistogramCanvas(canvas, histogram) {
+    if (!canvas || !histogram) return;
+    const { context, width, height } = prepareScopeCanvas(canvas);
+    drawScopeGrid(context, width, height);
 
     const all = histogram.isMono
         ? [histogram.luminance]
@@ -5542,6 +5610,97 @@ function drawPostHistogram(histogram) {
         drawSeries(histogram.green, "rgba(74,222,128,1)");
         drawSeries(histogram.blue, "rgba(96,165,250,1)");
     }
+
+    const params = getAdvancedPostprocessParams();
+    [params.levelsBlack, params.levelsWhite].forEach((value, index) => {
+        const x = Math.max(0, Math.min(1, value)) * width;
+        context.strokeStyle = index === 0 ? "rgba(34,211,238,.9)" : "rgba(251,191,36,.9)";
+        context.setLineDash([4, 3]);
+        context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height); context.stroke();
+        context.setLineDash([]);
+    });
+}
+
+function drawPostHistogram(histogram) {
+    drawHistogramCanvas(document.getElementById("post-histogram"), histogram);
+    drawHistogramCanvas(document.getElementById("post-histogram-floating"), histogram);
+}
+
+function toneCurveOutput(input, params) {
+    const black = Math.max(0, Math.min(.98, params.levelsBlack));
+    const white = Math.max(black + .005, Math.min(1, params.levelsWhite));
+    let value = Math.max(0, Math.min(1, (input - black) / (white - black)));
+    value = Math.pow(value, 1 / Math.max(.1, params.levelsMid)) * Math.pow(2, params.exposure);
+    const smooth = (a, b, x) => {
+        const t = Math.max(0, Math.min(1, (x - a) / Math.max(1e-6, b - a)));
+        return t * t * (3 - 2 * t);
+    };
+    const shadow = Math.pow(1 - smooth(.05, .62, value), 2);
+    const highlight = Math.pow(smooth(.38, .95, value), 2);
+    const blackWeight = 1 - smooth(0, .28, value);
+    const whiteWeight = smooth(.72, 1, value);
+    value += params.shadows * shadow * .22 + params.highlights * highlight * .22
+        + params.blacks * blackWeight * .12 + params.whites * whiteWeight * .12;
+    return Math.max(0, Math.min(1, value));
+}
+
+function drawToneCurveCanvas(canvas, params) {
+    if (!canvas) return;
+    const { context, width, height } = prepareScopeCanvas(canvas);
+    drawScopeGrid(context, width, height);
+    context.strokeStyle = "rgba(100,116,139,.55)";
+    context.setLineDash([5, 4]);
+    context.beginPath(); context.moveTo(0, height); context.lineTo(width, 0); context.stroke();
+    context.setLineDash([]);
+    const gradient = context.createLinearGradient(0, 0, width, 0);
+    gradient.addColorStop(0, "#22d3ee"); gradient.addColorStop(.55, "#a78bfa"); gradient.addColorStop(1, "#fbbf24");
+    context.strokeStyle = gradient;
+    context.lineWidth = 2;
+    context.beginPath();
+    for (let index = 0; index <= 160; index += 1) {
+        const input = index / 160;
+        const x = input * width;
+        const y = height - toneCurveOutput(input, params) * height;
+        if (index === 0) context.moveTo(x, y); else context.lineTo(x, y);
+    }
+    context.stroke();
+}
+
+function drawDetailResponseCanvas(canvas, pipeline) {
+    if (!canvas) return;
+    const { context, width, height } = prepareScopeCanvas(canvas, 280, 110);
+    drawScopeGrid(context, width, height);
+    const bands = [...pipeline.w.map((value) => value / 5), ...pipeline.u.map((value) => value / 10)];
+    const texture = Number(pipeline.advanced.texture || 0);
+    const clarity = Number(pipeline.advanced.clarity || 0);
+    context.strokeStyle = "#34d399";
+    context.fillStyle = "rgba(52,211,153,.16)";
+    context.lineWidth = 2;
+    context.beginPath();
+    for (let index = 0; index <= 160; index += 1) {
+        const frequency = index / 160;
+        let response = 1;
+        bands.forEach((amount, band) => {
+            const center = (band + 1) / (bands.length + 1);
+            const spread = .045 + band * .006;
+            response += amount * Math.exp(-Math.pow(frequency - center, 2) / (2 * spread * spread)) * .18;
+        });
+        response += texture * Math.exp(-Math.pow(frequency - .72, 2) / .035) * .22;
+        response += clarity * Math.exp(-Math.pow(frequency - .32, 2) / .05) * .18;
+        response -= Number(pipeline.masterDenoise || 0) / 100 * frequency * .45;
+        const x = frequency * width;
+        const y = height - Math.max(0, Math.min(2, response)) / 2 * height;
+        if (index === 0) context.moveTo(x, y); else context.lineTo(x, y);
+    }
+    context.stroke();
+}
+
+function drawPostprocessScopes() {
+    const advanced = getAdvancedPostprocessParams();
+    drawToneCurveCanvas(document.getElementById("post-tone-curve-inline"), advanced);
+    drawToneCurveCanvas(document.getElementById("post-tone-curve"), advanced);
+    drawDetailResponseCanvas(document.getElementById("post-detail-curve"), getPipelineParams());
+    if (lastPostHistogram) drawPostHistogram(lastPostHistogram);
 }
 
 function setPostColorControlsForMono(isMono) {
@@ -5573,6 +5732,7 @@ async function refreshPostHistogram(preferProcessed = true) {
         setText("hist-median", histogram.median.toLocaleString());
         setText("hist-max", histogram.maximum.toLocaleString());
         setText("post-histogram-source", histogram.source === "processed" ? "VISTA PROCESADA · 16-BIT" : "MASTER · 16-BIT");
+        setText("floating-histogram-source", histogram.source === "processed" ? "Procesada 16-bit" : "Máster 16-bit");
         const clip = document.getElementById("hist-clip-status");
         const shadowPct = histogram.shadowClip * 100;
         const highlightPct = histogram.highlightClip * 100;
@@ -5585,6 +5745,7 @@ async function refreshPostHistogram(preferProcessed = true) {
                 : "Sin recorte relevante";
         }
         setPostColorControlsForMono(histogram.isMono);
+        drawPostprocessScopes();
         updateZenithGuide();
         return histogram;
     } catch (error) {
@@ -5601,10 +5762,156 @@ function updateZenithGuide(extra = {}) {
         hasSource: !!currentFilePath,
         hasAnalysis: !!currentFileMetadata,
         hasResult: !!postProcessSession.current(),
+        source: postProcessSession.getState().source,
+        histogramAvailable: !!lastPostHistogram,
         isMono: !!lastPostHistogram?.isMono,
         shadowClip: Number(lastPostHistogram?.shadowClip || 0),
         highlightClip: Number(lastPostHistogram?.highlightClip || 0),
+        medianLevel: Number(lastPostHistogram?.median || 0) / 65535,
+        dynamicRange: Math.max(0, Number(lastPostHistogram?.maximum || 0) - Number(lastPostHistogram?.minimum || 0)) / 65535,
+        historyLength: postProcessSession.getState().length,
+        canCompare: postProcessSession.getState().canCompare,
+        hasArtifactAnalysis: !!lastArtifactSuggestion,
+        ringingScore: Number(lastArtifactSuggestion?.ringingScore || 0),
+        colorFringeScore: Number(lastArtifactSuggestion?.colorFringeScore || 0),
         ...extra,
+    });
+}
+
+function setAdvancedControlValue(name, value) {
+    const control = document.querySelector(`[data-advanced-control="${name}"]`);
+    if (!control) return;
+    const scale = parseFloat(control.dataset.scale || "1") || 1;
+    control.value = String(value * scale);
+    updateAdvancedControlOutput(control);
+}
+
+function applyTonePreset(name) {
+    const presets = {
+        linear: { levelsBlack: 0, levelsMid: 1, levelsWhite: 1, exposure: 0, shadows: 0, highlights: 0, whites: 0, blacks: 0 },
+        "soft-contrast": { levelsBlack: .004, levelsMid: .96, levelsWhite: .996, exposure: 0, shadows: .08, highlights: -.08, whites: .05, blacks: -.05 },
+        "shadow-recovery": { levelsBlack: 0, levelsMid: 1.08, levelsWhite: 1, exposure: .1, shadows: .28, highlights: -.12, whites: 0, blacks: .03 },
+    };
+    const preset = presets[name];
+    if (!preset) return;
+    suppressPostprocessEvents = true;
+    try {
+        Object.entries(preset).forEach(([control, value]) => setAdvancedControlValue(control, value));
+        updateLevelMarkers();
+    } finally {
+        suppressPostprocessEvents = false;
+    }
+    drawPostprocessScopes();
+    triggerUpdate();
+    queuePostHistoryCommit(`Curva · ${name === "linear" ? "Lineal" : name === "soft-contrast" ? "Contraste suave" : "Recuperar sombras"}`);
+}
+
+function setLinkedControlValue(id, value, scale = 1) {
+    const slider = document.getElementById(`sl-${id}`);
+    const number = document.getElementById(`num-${id}`);
+    if (slider) slider.value = String(value * scale);
+    if (number) number.value = String(value);
+}
+
+function updateDeconvolutionStatus() {
+    const status = document.getElementById("deconv-module-status");
+    if (!status) return;
+    const rlIterations = parseInt(document.getElementById("num-deconv-iter")?.value || "0", 10);
+    const vcIterations = parseInt(document.getElementById("num-vc-iter")?.value || "0", 10);
+    const rlSigma = parseFloat(document.getElementById("num-deconv-sigma")?.value || "0");
+    const vcSigma = parseFloat(document.getElementById("num-vc-sigma")?.value || "0");
+    if (rlIterations <= 0 && vcIterations <= 0) {
+        status.textContent = "Desactivada · el máster permanece intacto";
+        status.dataset.state = "idle";
+        return;
+    }
+    if ((rlIterations > 0 && rlSigma <= 0) || (vcIterations > 0 && vcSigma <= 0)) {
+        status.textContent = "Revisa el radio PSF: debe ser mayor que cero cuando hay iteraciones.";
+        status.dataset.state = "warning";
+        return;
+    }
+    const modes = [];
+    if (rlIterations > 0) modes.push(`RL ${rlIterations}× · σ ${rlSigma.toFixed(1)}`);
+    if (vcIterations > 0) modes.push(`VC ${vcIterations}× · σ ${vcSigma.toFixed(1)}`);
+    status.textContent = `${modes.join(" + ")} · usa A/B y vigila halos`;
+    status.dataset.state = "active";
+}
+
+function applyDeconvolutionPreset(name) {
+    const presets = {
+        gentle: { rlSigma: 1.4, rlIterations: 6, vcSigma: 0, vcIterations: 0, edge: 35, mask: 30 },
+        balanced: { rlSigma: 1.25, rlIterations: 12, vcSigma: 0, vcIterations: 0, edge: 55, mask: 45 },
+        detail: { rlSigma: 1.05, rlIterations: 18, vcSigma: .8, vcIterations: 3, edge: 70, mask: 60 },
+    };
+    const preset = presets[name];
+    if (!preset) return;
+    suppressPostprocessEvents = true;
+    try {
+        setLinkedControlValue("deconv-sigma", preset.rlSigma, 10);
+        setLinkedControlValue("deconv-iter", preset.rlIterations, 1);
+        setLinkedControlValue("vc-sigma", preset.vcSigma, 10);
+        setLinkedControlValue("vc-iter", preset.vcIterations, 1);
+        setLinkedControlValue("edge-strength", preset.edge, 1);
+        setLinkedControlValue("auto-mask", preset.mask, 1);
+        const edgeAware = document.getElementById("chk-edge-wavelets");
+        if (edgeAware) edgeAware.checked = true;
+    } finally {
+        suppressPostprocessEvents = false;
+    }
+    updateDeconvolutionStatus();
+    drawPostprocessScopes();
+    triggerUpdate();
+    queuePostHistoryCommit(`Deconvolución · ${name === "gentle" ? "Suave" : name === "balanced" ? "Equilibrada" : "Detalle fino"}`);
+}
+
+function setPostScopesOpen(open) {
+    const panel = document.getElementById("post-scopes-panel");
+    const button = document.getElementById("btn-toggle-post-scopes");
+    panel?.classList.toggle("open", !!open);
+    panel?.setAttribute("aria-hidden", String(!open));
+    button?.setAttribute("aria-pressed", String(!!open));
+    if (open) requestAnimationFrame(drawPostprocessScopes);
+}
+
+function initPostScopesUi() {
+    const panel = document.getElementById("post-scopes-panel");
+    const handle = document.getElementById("post-scopes-drag-handle");
+    document.getElementById("btn-toggle-post-scopes")?.addEventListener("click", () => setPostScopesOpen(!panel?.classList.contains("open")));
+    document.getElementById("btn-close-post-scopes")?.addEventListener("click", () => setPostScopesOpen(false));
+    if (!panel || !handle) return;
+    let drag = null;
+    handle.addEventListener("pointerdown", (event) => {
+        if (event.target.closest("button")) return;
+        const rect = panel.getBoundingClientRect();
+        drag = { pointerId: event.pointerId, dx: event.clientX - rect.left, dy: event.clientY - rect.top };
+        panel.style.left = `${rect.left}px`;
+        panel.style.top = `${rect.top}px`;
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+        handle.setPointerCapture(event.pointerId);
+        panel.classList.add("dragging");
+    });
+    handle.addEventListener("pointermove", (event) => {
+        if (!drag || event.pointerId !== drag.pointerId) return;
+        const rect = panel.getBoundingClientRect();
+        const left = Math.max(8, Math.min(window.innerWidth - rect.width - 8, event.clientX - drag.dx));
+        const top = Math.max(8, Math.min(window.innerHeight - rect.height - 44, event.clientY - drag.dy));
+        panel.style.left = `${left}px`;
+        panel.style.top = `${top}px`;
+    });
+    const stop = (event) => {
+        if (!drag || event.pointerId !== drag.pointerId) return;
+        drag = null;
+        panel.classList.remove("dragging");
+    };
+    handle.addEventListener("pointerup", stop);
+    handle.addEventListener("pointercancel", stop);
+    window.addEventListener("resize", () => {
+        if (!panel.classList.contains("open")) return;
+        const rect = panel.getBoundingClientRect();
+        if (rect.right > window.innerWidth) panel.style.left = `${Math.max(8, window.innerWidth - rect.width - 8)}px`;
+        if (rect.bottom > window.innerHeight - 36) panel.style.top = `${Math.max(8, window.innerHeight - rect.height - 44)}px`;
+        drawPostprocessScopes();
     });
 }
 
@@ -5621,6 +5928,7 @@ function initAdvancedPostprocessControls() {
                 updateLevelMarkers();
             }
             updateAdvancedControlOutput(control);
+            drawPostprocessScopes();
             if (!suppressPostprocessEvents) triggerUpdate();
         });
         control.addEventListener("change", () => {
@@ -5645,6 +5953,10 @@ function initAdvancedPostprocessControls() {
     });
 
     document.getElementById("btn-refresh-histogram")?.addEventListener("click", () => refreshPostHistogram(true));
+    document.querySelectorAll("[data-tone-preset]").forEach((button) => button.addEventListener("click", () => applyTonePreset(button.dataset.tonePreset)));
+    document.querySelectorAll("[data-deconv-preset]").forEach((button) => button.addEventListener("click", () => applyDeconvolutionPreset(button.dataset.deconvPreset)));
+    ["sl-deconv-sigma", "num-deconv-sigma", "sl-deconv-iter", "num-deconv-iter", "sl-vc-sigma", "num-vc-sigma", "sl-vc-iter", "num-vc-iter"]
+        .forEach((id) => document.getElementById(id)?.addEventListener("input", updateDeconvolutionStatus));
     document.getElementById("btn-post-undo")?.addEventListener("click", () => applyPostHistoryEntry(postProcessSession.undo()));
     document.getElementById("btn-post-redo")?.addEventListener("click", () => applyPostHistoryEntry(postProcessSession.redo()));
     document.getElementById("btn-post-compare")?.addEventListener("click", () => setPostCompareActive(!postCompareActive));
@@ -5659,6 +5971,7 @@ function initAdvancedPostprocessControls() {
 }
 
 initAdvancedPostprocessControls();
+initPostScopesUi();
 
 function clampRgbShift(value) {
     return Math.max(-6, Math.min(6, Number(value) || 0));
@@ -5838,27 +6151,40 @@ function setLinkedNumber(id, value) {
     input.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
-function initArtifactRepairUi() {
-    document.getElementById("btn-analyze-artifacts")?.addEventListener("click", async () => {
-        const button = document.getElementById("btn-analyze-artifacts");
-        const summary = document.getElementById("artifact-analysis-summary");
-        if (button) button.disabled = true;
-        if (summary) summary.textContent = "Analizando señal, vecindades y canales...";
-        try {
-            const analysis = await invoke("analyze_postprocess_artifacts", { preferProcessed: true });
-            lastArtifactSuggestion = analysis;
-            if (summary) {
-                summary.innerHTML = `<strong>${analysis.summary}</strong><br>Halos ${analysis.ringingScore.toFixed(2)} · fringing ${analysis.colorFringeScore.toFixed(2)} · calientes ${analysis.hotPixels} · muertos ${analysis.deadPixels} · muestra ${analysis.sampledPixels.toLocaleString()}`;
-            }
-            const apply = document.getElementById("btn-apply-artifact-suggestion");
-            if (apply) apply.hidden = false;
-        } catch (error) {
-            if (summary) summary.textContent = `Análisis no disponible: ${normalizeBackendText(error)}`;
-            log("ERROR", `Artefactos: ${error}`);
-        } finally {
-            if (button) button.disabled = false;
+async function analyzeActivePostprocessArtifacts() {
+    const repairButton = document.getElementById("btn-analyze-artifacts");
+    const assistantButton = document.getElementById("btn-assistant-analyze");
+    const summary = document.getElementById("artifact-analysis-summary");
+    [repairButton, assistantButton].forEach((button) => { if (button) button.disabled = true; });
+    if (summary) summary.textContent = "Analizando señal, vecindades y canales...";
+    try {
+        await refreshPostHistogram(true);
+        const analysis = await invoke("analyze_postprocess_artifacts", { preferProcessed: true });
+        lastArtifactSuggestion = analysis;
+        if (summary) {
+            summary.replaceChildren();
+            const heading = document.createElement("strong");
+            heading.textContent = analysis.summary;
+            const metrics = document.createElement("span");
+            metrics.textContent = `Halos ${analysis.ringingScore.toFixed(2)} · fringing ${analysis.colorFringeScore.toFixed(2)} · calientes ${analysis.hotPixels} · muertos ${analysis.deadPixels} · muestra ${analysis.sampledPixels.toLocaleString()}`;
+            summary.append(heading, document.createElement("br"), metrics);
         }
-    });
+        const apply = document.getElementById("btn-apply-artifact-suggestion");
+        if (apply) apply.hidden = false;
+        updateZenithGuide();
+        return analysis;
+    } catch (error) {
+        if (summary) summary.textContent = `Análisis no disponible: ${normalizeBackendText(error)}`;
+        log("ERROR", `Artefactos: ${error}`);
+        return null;
+    } finally {
+        [repairButton, assistantButton].forEach((button) => { if (button) button.disabled = false; });
+    }
+}
+
+function initArtifactRepairUi() {
+    document.getElementById("btn-analyze-artifacts")?.addEventListener("click", analyzeActivePostprocessArtifacts);
+    document.getElementById("btn-assistant-analyze")?.addEventListener("click", analyzeActivePostprocessArtifacts);
 
     document.getElementById("btn-apply-artifact-suggestion")?.addEventListener("click", async () => {
         if (!lastArtifactSuggestion) return;
@@ -5891,10 +6217,11 @@ function initArtifactRepairUi() {
 
 function initZenithGuideUi() {
     const panel = document.getElementById("zenith-guide-panel");
-    zenithGuide = new ZenithGuide({
+    zenithGuide = new IntelligentAssistant({
         panel,
         list: document.getElementById("zenith-guide-list"),
         status: document.getElementById("zenith-guide-status"),
+        summary: document.getElementById("intelligent-assistant-summary"),
     });
     const setOpen = (open) => {
         panel?.classList.toggle("open", open);
@@ -6016,7 +6343,6 @@ async function processPipeline(requestId, paramsString, downscale = 1) {
             const viewportBeforeRender = captureViewportState();
             await setImageAndWait(ui.imgResult, b64, false);
             restoreViewportState(viewportBeforeRender);
-            drawHistogram(ui.imgResult);
 
             if (ui.statusText) { ui.statusText.textContent = "Vista actualizada."; ui.statusText.style.color = "#94a3b8"; }
         }

@@ -281,41 +281,58 @@ fn save_preview_png_to_temp(png_bytes: &[u8], tag: &str) -> Option<String> {
             }
         }
     }
-    let millis = std::time::SystemTime::now()
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
-        .as_millis();
-    let path = dir.join(format!("{}_{}.png", tag, millis));
+        .as_nanos();
+    let path = dir.join(format!("{}_{}_{}.png", tag, std::process::id(), nanos));
     std::fs::write(&path, png_bytes).ok()?;
     Some(clean_windows_path(path))
 }
 
-/// PR-2.5: poda agresiva de los previews del EDITOR (tag "editor_"). Cada
-/// render de sliders escribe un archivo nuevo (el WebView cachea por URL,
-/// reutilizar nombre mostraría la imagen vieja); sin esta poda una sesión
-/// larga de ajustes acumularía cientos de MB en el temp. Se conservan los
-/// de los últimos 60 s (renders aún en vuelo en el visor).
-fn prune_editor_previews_to_latest() {
+/// Keeps the full-resolution previews required by undo/A-B for the active
+/// session, while bounding disk usage. Fast drag previews are transient; full
+/// previews retain a margin above the frontend's 50-entry history limit.
+fn prune_editor_previews() {
     let dir = std::env::temp_dir().join("astro_stacker_previews");
     let Ok(rd) = std::fs::read_dir(&dir) else {
         return;
     };
-    let now = std::time::SystemTime::now();
-    for e in rd.flatten() {
-        let name = e.file_name();
-        let is_editor = name.to_string_lossy().starts_with("editor_");
-        if !is_editor {
-            continue;
-        }
-        let stale = e
+    let mut full = Vec::new();
+    let mut fast = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let modified = entry
             .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| now.duration_since(t).ok())
-            .map(|d| d.as_secs() > 60)
-            .unwrap_or(false);
-        if stale {
-            let _ = std::fs::remove_file(e.path());
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if name.starts_with("editor_fast_") {
+            fast.push((modified, entry.path()));
+        } else if name.starts_with("editor_") {
+            full.push((modified, entry.path()));
+        }
+    }
+    fast.sort_by(|left, right| right.0.cmp(&left.0));
+    for (_, path) in fast.into_iter().skip(2) {
+        let _ = std::fs::remove_file(path);
+    }
+    full.sort_by(|left, right| right.0.cmp(&left.0));
+    for (_, path) in full.into_iter().skip(64) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// A new stack/mosaic/batch result starts a new atomic editor session, so no
+/// preview from the prior result may remain addressable by the new history.
+fn clear_editor_previews() {
+    let dir = std::env::temp_dir().join("astro_stacker_previews");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("editor_") {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }
@@ -1443,4 +1460,3 @@ fn normalize_surface_frame_exposure_inplace(data: &mut [u16], target_p90: f32, i
         *v = (*v as f32 * gain + 0.5).clamp(0.0, 65535.0) as u16;
     }
 }
-

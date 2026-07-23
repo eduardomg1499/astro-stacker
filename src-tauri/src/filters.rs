@@ -1271,7 +1271,13 @@ fn run_processing_pipeline(
             }
             if usm_amount > 0.0 {
                 *ty = apply_smart_sharpen_bilateral(
-                    ty, width, height, usm_radius, usm_amount, img_scale,
+                    ty,
+                    width,
+                    height,
+                    usm_radius,
+                    usm_amount,
+                    img_scale,
+                    auto_amt,
                 );
             }
             if lce_amount > 0.0 {
@@ -1621,5 +1627,67 @@ mod edge_aware_tests {
         }
         eprintln!("bilateral LUT vs exp directo: maxrel {maxrel:.6}");
         assert!(maxrel < 2e-3, "LUT de rango imprecisa: {maxrel}");
+    }
+
+    #[test]
+    fn test_richardson_lucy_increases_blurred_peak_without_instability() {
+        let (width, height) = (48usize, 48usize);
+        let mut truth = vec![1800.0f32; width * height];
+        let centre = height / 2 * width + width / 2;
+        truth[centre] = 52000.0;
+        let observed = apply_gaussian_blur(&truth, width, height, 1.35);
+        let blur = |image: &[f32]| apply_gaussian_blur(image, width, height, 1.35);
+        let restored = richardson_lucy_core(
+            &observed,
+            &observed,
+            width,
+            height,
+            8,
+            1.35,
+            &blur,
+            &|| false,
+            &|_| {},
+        )
+        .expect("RL no debe cancelarse");
+        assert!(restored.iter().all(|value| value.is_finite() && *value >= 0.0 && *value <= 65535.0));
+        assert!(restored[centre] > observed[centre] * 1.03, "RL debe recuperar contraste del pico");
+    }
+
+    #[test]
+    fn test_smart_sharpen_auto_mask_suppresses_flat_noise_more_than_structure() {
+        let (width, height) = (64usize, 64usize);
+        let mut image = vec![12000.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let index = y * width + x;
+                if x < width / 2 {
+                    image[index] += if (x * 17 + y * 13) % 2 == 0 { 90.0 } else { -90.0 };
+                } else {
+                    image[index] = 36000.0;
+                }
+            }
+        }
+        let uniform = apply_smart_sharpen_bilateral(&image, width, height, 1.2, 1.0, 1.0, 0.0);
+        let protected = apply_smart_sharpen_bilateral(&image, width, height, 1.2, 1.0, 1.0, 1.0);
+        let flat_change = |result: &[f32]| -> f32 {
+            let mut total = 0.0;
+            let mut samples = 0usize;
+            for y in 8..height - 8 {
+                for x in 8..width / 2 - 8 {
+                    let index = y * width + x;
+                    total += (result[index] - image[index]).abs();
+                    samples += 1;
+                }
+            }
+            total / samples.max(1) as f32
+        };
+        let uniform_noise = flat_change(&uniform);
+        let protected_noise = flat_change(&protected);
+        assert!(protected_noise < uniform_noise * 0.7, "la auto-máscara debe atenuar ruido plano: {protected_noise} vs {uniform_noise}");
+
+        let edge_index = height / 2 * width + width / 2 - 1;
+        let uniform_edge = (uniform[edge_index] - image[edge_index]).abs();
+        let protected_edge = (protected[edge_index] - image[edge_index]).abs();
+        assert!(protected_edge > uniform_edge * 0.35, "la estructura coherente no debe desaparecer");
     }
 }

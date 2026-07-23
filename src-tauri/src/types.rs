@@ -3054,8 +3054,16 @@ struct AdvancedColorParams {
     vibrance: f32,
     temperature: f32,
     tint: f32,
+    /// Edge-aware local contrast controls. Texture targets finer structure;
+    /// clarity targets wider structure. Both use -1..1.
+    texture: f32,
+    clarity: f32,
+    /// Selective chromatic noise reduction for excess green, 0..1.
+    scnr_green: f32,
     /// Red, orange, yellow, green, aqua, blue, purple and magenta.
+    hsl_hue: [f32; 8],
     hsl_saturation: [f32; 8],
+    hsl_luminance: [f32; 8],
     grading_shadows: [f32; 3],
     grading_midtones: [f32; 3],
     grading_highlights: [f32; 3],
@@ -3076,7 +3084,12 @@ impl Default for AdvancedColorParams {
             vibrance: 0.0,
             temperature: 0.0,
             tint: 0.0,
+            texture: 0.0,
+            clarity: 0.0,
+            scnr_green: 0.0,
+            hsl_hue: [0.0; 8],
             hsl_saturation: [0.0; 8],
+            hsl_luminance: [0.0; 8],
             grading_shadows: [1.0, 1.0, 1.0],
             grading_midtones: [1.0, 1.0, 1.0],
             grading_highlights: [1.0, 1.0, 1.0],
