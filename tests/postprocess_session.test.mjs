@@ -49,6 +49,34 @@ test("undo, redo and divergent edits behave predictably", () => {
   assert.equal(session.getCompareEntry("previous").preview, "b");
 });
 
+test("continuous edits coalesce without losing their A/B baseline", () => {
+  const session = new PostProcessSession();
+  session.beginResult({ generation: 1, recipe: { gamma: 1 }, preview: "original", label: "Apilado original" });
+  session.commit({ gamma: 1.1 }, { preview: "first", label: "Tono profesional" });
+  session.commit({ gamma: 1.2 }, { preview: "second", label: "Tono profesional" });
+
+  assert.equal(session.getState().length, 2);
+  assert.equal(session.current().preview, "second");
+  assert.equal(session.getCompareEntry("previous").preview, "original");
+
+  session.commit({ gamma: 1.2, deconv: 8 }, { preview: "deconv", label: "Deconvolución · Suave" });
+  session.commit({ gamma: 1.3, deconv: 8 }, { preview: "tone-again", label: "Tono profesional" });
+  assert.equal(session.getState().length, 4, "returning to the module later must remain undoable");
+});
+
+test("the immutable stacked source survives history eviction", () => {
+  const session = new PostProcessSession({ limit: 4 });
+  session.beginResult({ generation: 1, recipe: { step: 0 }, preview: "original", label: "Apilado original" });
+  for (let step = 1; step <= 7; step += 1) {
+    session.commit({ step }, { preview: `preview-${step}`, label: `Ajuste ${step}` });
+  }
+
+  assert.equal(session.getState().length, 4);
+  assert.equal(session.getCompareEntry("source").preview, "original");
+  assert.equal(session.current().preview, "preview-7");
+  assert.equal(session.getCompareEntry("previous").preview, "preview-6");
+});
+
 test("A/B is unavailable at the original and accepts Tauri file envelopes", () => {
   const session = new PostProcessSession();
   session.beginResult({ generation: 1, recipe: { gamma: 1 }, preview: "file_path:/tmp/original.png" });
@@ -175,6 +203,12 @@ test("solar curves remain bounded and presets are independent copies", () => {
   const second = cloneSolarPreset("ha-gold");
   first.curvePoints[1][1] = 1;
   assert.notEqual(first.curvePoints[1][1], second.curvePoints[1][1]);
+  for (const name of ["ha-natural", "ha-gold", "ha-inverted", "chromosphere", "prominence", "dual-range", "filaments"]) {
+    const preset = cloneSolarPreset(name);
+    assert.ok(preset.backgroundProtect >= 0.98, `${name} must keep measured sky protected`);
+    assert.ok(preset.highlightCompression > 0 && preset.highlightCompression <= 1);
+    assert.ok(preset.curvePoints.at(-1)[1] < 1, `${name} must retain highlight headroom`);
+  }
 });
 
 test("object finishing presets separate natural and interpretive colour contracts", () => {
@@ -255,9 +289,13 @@ test("only the scientific 16-bit histogram and advanced modules remain in the pa
   assert.equal((html.match(/data-tone-preset=/g) || []).length, 4);
   assert.ok(html.includes('id="solar-mono-module"'));
   assert.ok(html.includes('id="solar-tone-curve"'));
-  assert.equal((html.match(/data-solar-preset=/g) || []).length, 5);
+  assert.equal((html.match(/data-solar-preset=/g) || []).length, 8);
   assert.ok(html.includes('id="sl-solar-background-protect"'));
   assert.ok(html.includes('id="sl-solar-prominence"'));
+  assert.ok(html.includes('id="sl-solar-highlight-compression"'));
+  assert.ok(html.includes('data-deconv-preset="solar"'));
+  assert.ok(html.includes('data-deconv-preset="solar-limb"'));
+  assert.ok(html.includes('id="btn-deconv-compare"'));
   assert.ok(html.includes('id="object-finishing-module"'));
   assert.equal((html.match(/data-object-preset=/g) || []).length, 7);
   assert.ok(html.includes('id="ds-step-assistant"'));

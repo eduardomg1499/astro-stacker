@@ -3087,6 +3087,9 @@ struct SolarMonoParams {
     /// Preserves luminance in the bright solar disk instead of protecting
     /// only the false-colour saturation.
     highlight_protect: f32,
+    /// Rolls the brightest solar values into protected 16-bit headroom instead
+    /// of allowing a curve or palette to flatten them at pure white.
+    highlight_compression: f32,
     /// Keeps the estimated sky/background near its measured black floor.
     background_protect: f32,
     /// Recovers coherent low-signal structures immediately outside the disk.
@@ -3109,6 +3112,7 @@ impl Default for SolarMonoParams {
             highlight_color: [1.0, 0.94, 0.35],
             color_strength: 0.9,
             highlight_protect: 0.65,
+            highlight_compression: 0.62,
             background_protect: 0.72,
             prominence_amount: 0.0,
             filament_amount: 0.0,

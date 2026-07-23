@@ -429,7 +429,12 @@ fn richardson_lucy_core(
     let mask = richardson_lucy_mask(original, width, height, sigma);
 
     let mut ratio_buf = vec![0.0f32; size];
-    let tv_weight = 0.05;
+    // The previous Laplacian term was applied at 5% on every iteration. On
+    // extended solar/lunar texture it could dominate the RL correction and
+    // make "deconvolution" measurably softer. Keep regularisation only as a
+    // very small background stabiliser; signal regions are already protected
+    // by the confidence mask and ratio clamp.
+    let background_regularisation = 0.0025;
 
     for i in 0..iterations {
         if should_cancel() {
@@ -454,7 +459,10 @@ fn richardson_lucy_core(
         // 3. Back-projection (PSF simétrica → mismo kernel que el forward).
         let blurred_ratio = blur(&ratio_buf);
 
-        // 4. Update JACOBI (snapshot) + TV + máscara. Bordes intactos. Paralelo.
+        // 4. Update JACOBI (snapshot) + confidence mask. The multiplicative RL
+        // correction remains the primary operation; background-only
+        // regularisation prevents isolated noise from growing without erasing
+        // real high-frequency texture.
         let est_prev = est.clone();
         est.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
             if y == 0 || y == height - 1 {
@@ -468,11 +476,18 @@ fn richardson_lucy_core(
                 let n4 = est_prev[(y + 1) * width + x];
                 let local_mean = (n1 + n2 + n3 + n4) * 0.25;
                 let tv_gradient = local_mean - est_prev[j];
-                let mut update = est_prev[j] * blurred_ratio[j];
-                update += tv_gradient * tv_weight;
-                let correction_weight = mask[j] * 0.58;
-                let mut final_val =
-                    est_prev[j] * (1.0 - correction_weight) + update * correction_weight;
+                let confidence = mask[j].clamp(0.0, 1.0);
+                let correction_weight = confidence.sqrt() * 0.78;
+                let raw_delta = est_prev[j] * (blurred_ratio[j] - 1.0);
+                // Bound each iteration instead of globally clipping the final
+                // restoration. This keeps strong limbs stable while allowing
+                // coherent texture to accumulate over several iterations.
+                let max_step = (original[j].abs() * 0.22 + 96.0).clamp(96.0, 8_000.0);
+                let rl_delta = raw_delta.clamp(-max_step, max_step) * correction_weight;
+                let noise_regularisation = tv_gradient
+                    * background_regularisation
+                    * (1.0 - confidence).powi(2);
+                let mut final_val = est_prev[j] + rl_delta + noise_regularisation;
                 if final_val.is_nan() || final_val.is_infinite() {
                     final_val = original[j];
                 }
@@ -1409,9 +1424,12 @@ fn run_processing_pipeline(
     (0..size).into_par_iter().for_each(|i| {
         let (mut r, mut g, mut b);
         if effective_rgb_mode {
-            let or = base_channels[0][i];
-            let og = base_channels[1][i];
-            let ob = base_channels[2][i];
+            // "Mezcla" covers the complete restoration chain, including
+            // deconvolution. Using `base_channels` here made 0% keep the RL
+            // result because that buffer is already deconvolved.
+            let or = clean_channels[0][i];
+            let og = clean_channels[1][i];
+            let ob = clean_channels[2][i];
 
             let max_orig = or.max(og).max(ob);
             let p_start = 32000.0;
@@ -1437,7 +1455,7 @@ fn run_processing_pipeline(
             g = blend_restoration(og, filtered_channels[1][i], blend, effective_factor);
             b = blend_restoration(ob, filtered_channels[2][i], blend, effective_factor);
         } else {
-            let oy = base_channels[0][i];
+            let oy = clean_channels[0][i];
             let p_start = 32000.0;
             let p_factor = if oy > p_start {
                 let ov = (oy - p_start) / (65535.0 - p_start);
@@ -1676,6 +1694,73 @@ mod edge_aware_tests {
         .expect("RL no debe cancelarse");
         assert!(restored.iter().all(|value| value.is_finite() && *value >= 0.0 && *value <= 65535.0));
         assert!(restored[centre] > observed[centre] * 1.03, "RL debe recuperar contraste del pico");
+    }
+
+    #[test]
+    fn test_richardson_lucy_restores_extended_texture_instead_of_softening_it() {
+        let (width, height) = (96usize, 80usize);
+        let mut truth = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let xf = x as f32;
+                let yf = y as f32;
+                let fibrils = (xf * 0.53 + (yf * 0.17).sin() * 2.4).sin() * 2_300.0;
+                let cells = (xf * 0.19).cos() * (yf * 0.23).sin() * 1_450.0;
+                let filament = if (x + (y / 5)) % 29 <= 1 { -4_800.0 } else { 0.0 };
+                truth[y * width + x] = (31_000.0 + fibrils + cells + filament)
+                    .clamp(2_000.0, 62_000.0);
+            }
+        }
+        let sigma = 1.25;
+        let observed = apply_gaussian_blur(&truth, width, height, sigma);
+        let blur = |image: &[f32]| apply_gaussian_blur(image, width, height, sigma);
+        let restored = richardson_lucy_core(
+            &observed,
+            &observed,
+            width,
+            height,
+            12,
+            sigma,
+            &blur,
+            &|| false,
+            &|_| {},
+        )
+        .expect("RL no debe cancelarse");
+
+        let mse = |image: &[f32]| {
+            image
+                .iter()
+                .zip(truth.iter())
+                .map(|(value, target)| (value - target).powi(2))
+                .sum::<f32>()
+                / image.len() as f32
+        };
+        let acutance = |image: &[f32]| {
+            let mut total = 0.0f32;
+            let mut count = 0usize;
+            for y in 2..height - 2 {
+                for x in 2..width - 2 {
+                    let index = y * width + x;
+                    total += (image[index + 1] - image[index - 1]).abs()
+                        + (image[index + width] - image[index - width]).abs();
+                    count += 2;
+                }
+            }
+            total / count as f32
+        };
+
+        let observed_mse = mse(&observed);
+        let restored_mse = mse(&restored);
+        let observed_acutance = acutance(&observed);
+        let restored_acutance = acutance(&restored);
+        assert!(
+            restored_mse < observed_mse * 0.94,
+            "RL debe acercar la textura a la señal: MSE {restored_mse} vs {observed_mse}"
+        );
+        assert!(
+            restored_acutance > observed_acutance * 1.05,
+            "RL no puede suavizar la textura: acutancia {restored_acutance} vs {observed_acutance}"
+        );
     }
 
     #[test]

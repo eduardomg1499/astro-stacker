@@ -3464,6 +3464,9 @@
                         <button type="button" data-deconv-preset="gentle">Suave</button>
                         <button type="button" data-deconv-preset="balanced">Equilibrada</button>
                         <button type="button" data-deconv-preset="detail">Detalle fino</button>
+                        <button type="button" data-deconv-preset="solar">Solar H-alpha</button>
+                        <button type="button" data-deconv-preset="solar-limb">Limbo solar</button>
+                        <button type="button" id="btn-deconv-compare">A/B al 100%</button>
                     </div>
                     <div style="margin-bottom:8px;">
                         <span style="font-size:0.7em; color:#aaa; font-weight:bold;"
@@ -3849,9 +3852,12 @@
                                 <p><strong>Derivado solar reversible.</strong> El máster apilado permanece monocromo; la curva y el color se guardan como una etapa del historial.</p>
                             </div>
                             <div class="solar-preset-row" role="group" aria-label="Presets solares">
+                                <button type="button" data-solar-preset="ha-natural">H-alpha natural</button>
                                 <button type="button" data-solar-preset="ha-gold">H-alpha dorado</button>
                                 <button type="button" data-solar-preset="ha-inverted">H-alpha invertido</button>
+                                <button type="button" data-solar-preset="chromosphere">Cromosfera</button>
                                 <button type="button" data-solar-preset="prominence">Prominencias</button>
+                                <button type="button" data-solar-preset="dual-range">Disco + corona</button>
                                 <button type="button" data-solar-preset="filaments">Filamentos mono</button>
                                 <button type="button" data-solar-preset="neutral">Neutral</button>
                             </div>
@@ -3900,6 +3906,8 @@
                                 <input id="sl-solar-color-strength" type="range" min="0" max="100" value="90" step="1" data-default="90">
                                 <label for="sl-solar-highlight-protect"><span>Proteger altas luces</span><output id="out-solar-highlight-protect">65</output></label>
                                 <input id="sl-solar-highlight-protect" type="range" min="0" max="100" value="65" step="1" data-default="65">
+                                <label for="sl-solar-highlight-compression"><span>Compresión de luces</span><output id="out-solar-highlight-compression">62</output></label>
+                                <input id="sl-solar-highlight-compression" type="range" min="0" max="100" value="62" step="1" data-default="62">
                             </div>
                             <div class="solar-color-map">
                                 <div class="solar-color-map-heading">

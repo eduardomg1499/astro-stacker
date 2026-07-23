@@ -2459,6 +2459,7 @@ function getSolarMonoParams() {
         highlightColor: hexToRgbUnit(document.getElementById("solar-highlight-color")?.value || "#fff05a"),
         colorStrength: fraction("sl-solar-color-strength", .9),
         highlightProtect: fraction("sl-solar-highlight-protect", .65),
+        highlightCompression: fraction("sl-solar-highlight-compression", .62),
         backgroundProtect: fraction("sl-solar-background-protect", .72),
         prominenceAmount: fraction("sl-solar-prominence", 0),
         filamentAmount: fraction("sl-solar-filament", 0),
@@ -2474,6 +2475,7 @@ function updateSolarControlOutputs() {
         "out-solar-noise-guard": Math.round(parseFloat(document.getElementById("sl-solar-noise-guard")?.value || "65")).toString(),
         "out-solar-color-strength": Math.round(parseFloat(document.getElementById("sl-solar-color-strength")?.value || "90")).toString(),
         "out-solar-highlight-protect": Math.round(parseFloat(document.getElementById("sl-solar-highlight-protect")?.value || "65")).toString(),
+        "out-solar-highlight-compression": Math.round(parseFloat(document.getElementById("sl-solar-highlight-compression")?.value || "62")).toString(),
         "out-solar-background-protect": Math.round(parseFloat(document.getElementById("sl-solar-background-protect")?.value || "72")).toString(),
         "out-solar-prominence": Math.round(parseFloat(document.getElementById("sl-solar-prominence")?.value || "0")).toString(),
     };
@@ -2529,6 +2531,9 @@ function updateSolarUiState() {
     if (params.backgroundProtect > 0.001) {
         stages.push(`cielo protegido ${Math.round(params.backgroundProtect * 100)}%`);
     }
+    if (params.highlightCompression > 0.001) {
+        stages.push(`luces comprimidas ${Math.round(params.highlightCompression * 100)}%`);
+    }
     status.textContent = `${stages.join(" · ")} · derivado 16-bit reversible`;
     status.dataset.state = "active";
 }
@@ -2556,6 +2561,7 @@ function applySolarParamsToUi(solar = {}, { presetName = "custom" } = {}) {
     setValue("sl-solar-noise-guard", Number(params.noiseGuard ?? .65) * 100);
     setValue("sl-solar-color-strength", Number(params.colorStrength ?? .9) * 100);
     setValue("sl-solar-highlight-protect", Number(params.highlightProtect ?? .65) * 100);
+    setValue("sl-solar-highlight-compression", Number(params.highlightCompression ?? .62) * 100);
     setValue("sl-solar-background-protect", Number(params.backgroundProtect ?? .72) * 100);
     setValue("sl-solar-prominence", Number(params.prominenceAmount || 0) * 100);
     setValue("solar-shadow-color", Array.isArray(params.shadowColor) ? rgbUnitToHex(params.shadowColor) : params.shadowColor);
@@ -2611,7 +2617,7 @@ function initSolarMonoUi() {
             queuePostHistoryCommit(`Solar · ${id === "chk-solar-invert" ? "inversión" : id === "chk-solar-colorize" ? "falso color" : "activar módulo"}`);
         });
     });
-    ["sl-solar-filament", "sl-solar-radius", "sl-solar-noise-guard", "sl-solar-background-protect", "sl-solar-prominence", "sl-solar-color-strength", "sl-solar-highlight-protect"]
+    ["sl-solar-filament", "sl-solar-radius", "sl-solar-noise-guard", "sl-solar-background-protect", "sl-solar-prominence", "sl-solar-color-strength", "sl-solar-highlight-protect", "sl-solar-highlight-compression"]
         .forEach((id) => {
             const control = document.getElementById(id);
             control?.addEventListener("input", () => {
@@ -5698,7 +5704,9 @@ function getPipelineParams() {
             rx: parseFloat(ui.rx.value) || 0, ry: parseFloat(ui.ry.value) || 0,
             bx: parseFloat(ui.bx.value) || 0, by: parseFloat(ui.by.value) || 0
         },
-        blend: parseFloat(ui.blendSlider.value) || 100,
+        blend: Number.isFinite(parseFloat(ui.blendSlider?.value))
+            ? parseFloat(ui.blendSlider.value)
+            : 100,
         // Deringing Params
         dr: {
             mode: parseInt(ui.selDrMode?.value) || 0, // 0=Off, 1=Auto, 2=Manual
@@ -6469,16 +6477,20 @@ function updateDeconvolutionStatus() {
     const modes = [];
     if (rlIterations > 0) modes.push(`RL ${rlIterations}× · σ ${rlSigma.toFixed(1)}`);
     if (vcIterations > 0) modes.push(`VC ${vcIterations}× · σ ${vcSigma.toFixed(1)}`);
-    const gpuPreview = getGpuMode() === "cpu" ? "preview CPU" : "preview GPU si apta";
-    status.textContent = `${modes.join(" + ")} · ${gpuPreview} · final 1:1 CPU exacta · valida con A/B`;
+    const engine = getGpuMode() === "cpu"
+        ? "CPU"
+        : "GPU con prueba de paridad y respaldo CPU";
+    status.textContent = `${modes.join(" + ")} · ${engine} · final 1:1 · valida con A/B`;
     status.dataset.state = "active";
 }
 
 function applyDeconvolutionPreset(name) {
     const presets = {
-        gentle: { rlSigma: 1.4, rlIterations: 6, vcSigma: 0, vcIterations: 0, edge: 35, mask: 30 },
-        balanced: { rlSigma: 1.25, rlIterations: 12, vcSigma: 0, vcIterations: 0, edge: 55, mask: 45 },
-        detail: { rlSigma: 1.05, rlIterations: 18, vcSigma: .8, vcIterations: 3, edge: 70, mask: 60 },
+        gentle: { label: "Suave", rlSigma: 1.35, rlIterations: 8, vcSigma: 0, vcIterations: 0, edge: 32, mask: 38, psf: false },
+        balanced: { label: "Equilibrada", rlSigma: 1.2, rlIterations: 11, vcSigma: 0, vcIterations: 0, edge: 52, mask: 52, psf: false },
+        detail: { label: "Detalle fino", rlSigma: 1.0, rlIterations: 14, vcSigma: .75, vcIterations: 2, edge: 68, mask: 66, psf: false },
+        solar: { label: "Solar H-alpha", rlSigma: 1.0, rlIterations: 14, vcSigma: .75, vcIterations: 2, edge: 74, mask: 70, psf: true },
+        "solar-limb": { label: "Limbo solar", rlSigma: 1.2, rlIterations: 10, vcSigma: 0, vcIterations: 0, edge: 86, mask: 78, psf: true },
     };
     const preset = presets[name];
     if (!preset) return;
@@ -6492,13 +6504,20 @@ function applyDeconvolutionPreset(name) {
         setLinkedControlValue("auto-mask", preset.mask, 1);
         const edgeAware = document.getElementById("chk-edge-wavelets");
         if (edgeAware) edgeAware.checked = true;
+        const measuredPsf = document.getElementById("chk-psf-limb");
+        if (measuredPsf) measuredPsf.checked = preset.psf;
     } finally {
         suppressPostprocessEvents = false;
     }
     updateDeconvolutionStatus();
+    const status = document.getElementById("deconv-module-status");
+    if (status) {
+        status.textContent = `${preset.label} · calculando vista rápida y resultado 1:1…`;
+        status.dataset.state = "processing";
+    }
     drawPostprocessScopes();
-    triggerUpdate();
-    queuePostHistoryCommit(`Deconvolución · ${name === "gentle" ? "Suave" : name === "balanced" ? "Equilibrada" : "Detalle fino"}`);
+    triggerUpdate({ forceFastPreview: true });
+    queuePostHistoryCommit(`Deconvolución · ${preset.label}`);
 }
 
 function applyObjectFinishingPreset(name) {
@@ -6649,6 +6668,34 @@ function initAdvancedPostprocessControls() {
     document.getElementById("btn-refresh-histogram")?.addEventListener("click", () => refreshPostHistogram(true));
     document.querySelectorAll("[data-tone-preset]").forEach((button) => button.addEventListener("click", () => applyTonePreset(button.dataset.tonePreset)));
     document.querySelectorAll("[data-deconv-preset]").forEach((button) => button.addEventListener("click", () => applyDeconvolutionPreset(button.dataset.deconvPreset)));
+    document.getElementById("btn-deconv-compare")?.addEventListener("click", () => {
+        const status = document.getElementById("deconv-module-status");
+        if (!postProcessSession.getState().canCompare) {
+            if (status) {
+                status.textContent = "Espera a que termine el resultado 1:1 para comparar con el paso anterior.";
+                status.dataset.state = "warning";
+            }
+            return;
+        }
+        const selector = document.getElementById("post-compare-reference");
+        if (selector) selector.value = "previous";
+        setPostCompareActive(true);
+        if (ui.imgResult?.naturalWidth && ui.imgResult?.naturalHeight) {
+            prepareZoomSurfaceForImage(ui.imgResult);
+            const viewport = ui.imgResult.closest(".zoom-target-container")?.getBoundingClientRect();
+            if (viewport?.width && viewport?.height) {
+                zoomLevel = 1;
+                panX = (viewport.width - ui.imgResult.naturalWidth) / 2;
+                panY = (viewport.height - ui.imgResult.naturalHeight) / 2;
+                updateTransform();
+            }
+        }
+        if (status) {
+            status.textContent = "A/B activo · paso anterior · zoom 100% · arrastra para inspeccionar otra zona";
+            status.dataset.state = "active";
+        }
+        document.getElementById("view-result")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
     initObjectFinishingUi();
     ["sl-deconv-sigma", "num-deconv-sigma", "sl-deconv-iter", "num-deconv-iter", "sl-vc-sigma", "num-vc-sigma", "sl-vc-iter", "num-vc-iter"]
         .forEach((id) => document.getElementById(id)?.addEventListener("input", updateDeconvolutionStatus));
@@ -7234,8 +7281,14 @@ initPostprocessHelpUi();
 function triggerUpdate(options = {}) {
     if (suppressPostprocessEvents) return;
     const forceFastPreview = !!options?.forceFastPreview;
-    const currentParams = JSON.stringify(getPipelineParams());
+    const pipelineParams = getPipelineParams();
+    const currentParams = JSON.stringify(pipelineParams);
     if (currentParams === lastProcessedParams && !previewIsDownscaled) return;
+    const heavy = pipelineParams.deconv.i > 0 || pipelineParams.deconv.vi > 0
+        || pipelineParams.lce > 0 || pipelineParams.edgeAwareWavelets
+        || pipelineParams.autoMask > 0 || pipelineParams.psfFromLimb
+        || (pipelineParams.advanced?.solar?.enabled
+            && pipelineParams.advanced.solar.filamentAmount > 0);
 
     // PREVIEW RÁPIDO EN VIVO: durante el arrastre (inputs rápidos) render a 1/4
     // de resolución como máximo cada ~110 ms → feedback casi instantáneo; el
@@ -7244,10 +7297,6 @@ function triggerUpdate(options = {}) {
     // PSF), donde el render completo tarda; en ligeras el debounce ya es rápido y
     // así evitamos parpadeo.
     if (currentFilePath) {
-        const pf = getPipelineParams();
-        const heavy = pf.deconv.i > 0 || pf.deconv.vi > 0 || pf.lce > 0
-            || pf.edgeAwareWavelets || pf.autoMask > 0 || pf.psfFromLimb
-            || (pf.advanced?.solar?.enabled && pf.advanced.solar.filamentAmount > 0);
         const nowT = performance.now();
         if ((heavy || forceFastPreview) && nowT - lastFastPreview >= FAST_PREVIEW_MS) {
             lastFastPreview = nowT;
@@ -7279,7 +7328,7 @@ function triggerUpdate(options = {}) {
             if (ui.pBarContainer) { ui.pBarContainer.style.display = "block"; ui.pBarFill.style.width = "0%"; }
             processPipeline(pipelineRequestId, nowParams);
         }
-    }, 300);
+    }, heavy || forceFastPreview ? 760 : 300);
 }
 
 async function processPipeline(requestId, paramsString, downscale = 1) {
@@ -7353,8 +7402,11 @@ async function processPipeline(requestId, paramsString, downscale = 1) {
 
             if (ui.statusText) {
                 const elapsed = Math.max(0, performance.now() - renderStartedAt);
+                const finalEngine = getGpuMode() === "cpu"
+                    ? "CPU exacta"
+                    : "GPU validada · respaldo CPU";
                 ui.statusText.textContent = !previewIsDownscaled
-                    ? `Vista 1:1 actualizada · ${(elapsed / 1000).toFixed(1)} s · CPU exacta`
+                    ? `Vista 1:1 actualizada · ${(elapsed / 1000).toFixed(1)} s · ${finalEngine}`
                     : `Vista rápida 1/${previewDownscaleFactor} · ${(elapsed / 1000).toFixed(1)} s · GPU si es apta`;
                 ui.statusText.style.color = !previewIsDownscaled ? "#94a3b8" : "#67e8f9";
             }
@@ -7369,6 +7421,7 @@ async function processPipeline(requestId, paramsString, downscale = 1) {
                 finishPendingHistoryCommit(paramsString, b64);
             }
             updatePostHistoryUi();
+            updateDeconvolutionStatus();
             await refreshPostHistogram(true);
         }
     } catch (e) {

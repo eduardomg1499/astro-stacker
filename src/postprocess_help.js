@@ -36,6 +36,7 @@ const HELP_BY_ID = {
   "sl-solar-prominence": ["Recuperar protuberancias", "Eleva señal tenue coherente justo por encima del cielo medido.", "Se concentra fuera del fondo y antes del brillo del disco.", "Aumenta después de proteger el cielo para no confundir ruido con señal."],
   "sl-solar-color-strength": ["Fuerza de falso color", "Mezcla gris y la paleta solar elegida.", "0 conserva gris; 100 usa todo el color.", "Es interpretativo y no cambia el máster mono."],
   "sl-solar-highlight-protect": ["Proteger altas luces", "Conserva luminancia y reduce color excesivo en el disco brillante.", "Mezcla la curva hacia la señal original antes de saturar.", "Súbelo si el disco pierde textura o el amarillo se quema."],
+  "sl-solar-highlight-compression": ["Compresión de luces", "Crea margen antes del blanco puro para separar detalle brillante.", "Aplica un hombro suave y monotónico sin invertir tonos.", "Súbelo si el limbo o el disco se ven planos y blancos."],
 };
 
 const HELP_BY_ADVANCED = {

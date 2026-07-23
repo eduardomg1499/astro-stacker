@@ -91,9 +91,35 @@ export class PostProcessSession {
       return this.current();
     }
 
+    // A continuous edit of the same module is one undoable intention, not
+    // dozens of nearly-identical history entries. Replacing the active entry
+    // keeps A/B anchored to the state that existed before the user started
+    // moving that control, while a later visit to the module still creates a
+    // new entry because another label will sit between both edits.
+    if (
+      this.index > 0
+      && this.index === this.entries.length - 1
+      && String(label || "Ajuste") !== "Ajuste"
+      && current.label === String(label || "Ajuste")
+    ) {
+      this.entries.splice(
+        this.index,
+        1,
+        makeEntry(recipe, preview, label, current.timestamp),
+      );
+      this.pendingPreview = preview || "";
+      return this.current();
+    }
+
     this.entries.splice(this.index + 1);
     this.entries.push(makeEntry(recipe, preview, label));
-    if (this.entries.length > this.limit) this.entries.shift();
+    if (this.entries.length > this.limit) {
+      // Entry zero is the immutable stacked source used by "Apilado original".
+      // Never evict it when a long editing session reaches the history cap.
+      const source = this.entries[0];
+      const retainedAdjustments = this.entries.slice(-(this.limit - 1));
+      this.entries = [source, ...retainedAdjustments];
+    }
     this.index = this.entries.length - 1;
     this.pendingPreview = preview || "";
     return this.current();

@@ -5631,6 +5631,18 @@ img {
     margin: -2px 0 10px;
 }
 
+#btn-deconv-compare {
+    color: #a5f3fc;
+    border-color: rgba(34, 211, 238, .38);
+    background: rgba(8, 47, 73, .5);
+}
+
+#btn-deconv-compare:hover {
+    color: #ecfeff;
+    border-color: rgba(34, 211, 238, .72);
+    background: rgba(14, 116, 144, .35);
+}
+
 #deconv-module-status {
     margin-top: 9px;
 }

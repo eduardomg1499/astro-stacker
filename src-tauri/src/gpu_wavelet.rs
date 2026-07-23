@@ -691,11 +691,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n3 = est[j - w];
     let n4 = est[j + w];
     let local_mean = (n1 + n2 + n3 + n4) * 0.25;
-    let tv_gradient = local_mean - est[j];
-    var upd = est[j] * bratio[j];
-    upd = upd + tv_gradient * 0.05;
-    let cw = mask[j] * 0.58;
-    var fv = est[j] * (1.0 - cw) + upd * cw;
+    let confidence = clamp(mask[j], 0.0, 1.0);
+    let correction_weight = sqrt(confidence) * 0.78;
+    let raw_delta = est[j] * (bratio[j] - 1.0);
+    let max_step = clamp(abs(orig[j]) * 0.22 + 96.0, 96.0, 8000.0);
+    let rl_delta = clamp(raw_delta, -max_step, max_step) * correction_weight;
+    let background = 1.0 - confidence;
+    let noise_regularisation =
+        (local_mean - est[j]) * 0.0025 * background * background;
+    var fv = est[j] + rl_delta + noise_regularisation;
     if (!(fv == fv) || abs(fv) > 3.0e38) { fv = orig[j]; }
     fv = clamp(fv, 0.0, 65535.0);
     est_out[j] = fv;

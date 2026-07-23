@@ -744,6 +744,66 @@ fn estimate_solar_background(data: &[u16]) -> Option<(f32, f32)> {
     Some((p05, ceiling))
 }
 
+/// Finds thin, coherent positive off-limb signal without treating a smooth
+/// atmospheric/optical halo as a prominence. This confidence is independent
+/// from the filament amount so the dedicated "Recuperar protuberancias"
+/// control remains effective even when filament sharpening is disabled.
+fn build_solar_prominence_confidence(
+    data: &[u16],
+    width: usize,
+    height: usize,
+    background_ceiling: f32,
+    noise_guard: f32,
+) -> Option<Vec<f32>> {
+    if width == 0 || height == 0 || data.len() != width * height * 3 {
+        return None;
+    }
+    let luma: Vec<f32> = data
+        .par_chunks_exact(3)
+        .map(|pixel| {
+            (0.2126 * pixel[0] as f32
+                + 0.7152 * pixel[1] as f32
+                + 0.0722 * pixel[2] as f32)
+                / 65535.0
+        })
+        .collect();
+    let blurred = apply_gaussian_blur(&luma, width, height, 2.2);
+    let positive_detail: Vec<f32> = luma
+        .par_iter()
+        .zip(blurred.par_iter())
+        .map(|(&source, &low_pass)| (source - low_pass).max(0.0))
+        .collect();
+
+    let stride = (luma.len() / 32_768).max(1);
+    let mut sky_sample: Vec<f32> = luma
+        .iter()
+        .zip(positive_detail.iter())
+        .step_by(stride)
+        .filter_map(|(&source, &detail)| {
+            (source <= background_ceiling * 1.35 + 0.002).then_some(detail)
+        })
+        .collect();
+    if sky_sample.len() < 16 {
+        return None;
+    }
+    sky_sample.sort_by(|left, right| left.total_cmp(right));
+    let noise = (sky_sample[sky_sample.len() / 2] * 1.4826).max(0.000_12);
+    let guard = noise_guard.clamp(0.0, 1.0);
+    let threshold = (noise * (2.2 + guard * 2.8)).max(0.000_28);
+    let upper = threshold * (3.2 + guard * 1.4);
+    let signal_end = (background_ceiling + 0.09).min(0.32);
+
+    Some(
+        luma.par_iter()
+            .zip(positive_detail.par_iter())
+            .map(|(&source, &detail)| {
+                post_smoothstep(threshold, upper, detail)
+                    * post_smoothstep(background_ceiling, signal_end, source)
+            })
+            .collect(),
+    )
+}
+
 #[inline]
 fn interpolate_solar_color(
     value: f32,
@@ -771,6 +831,26 @@ fn interpolate_solar_color(
         (chroma[1] * scale).clamp(0.0, 1.0),
         (chroma[2] * scale).clamp(0.0, 1.0),
     ]
+}
+
+#[inline]
+fn compress_solar_highlights(value: f32, amount: f32) -> f32 {
+    let amount = amount.clamp(0.0, 1.0);
+    let value = value.clamp(0.0, 1.0);
+    if amount <= 1e-6 {
+        return value;
+    }
+    // A continuous, monotonic shoulder. The protected headroom is deliberately
+    // small enough to retain a bright solar limb, but large enough that colour
+    // mapping cannot collapse multiple 16-bit highlight values to pure white.
+    let knee = 0.62;
+    if value <= knee {
+        return value;
+    }
+    let t = (value - knee) / (1.0 - knee);
+    let cap = 1.0 - amount * 0.08;
+    let shaped = t / (1.0 + amount * 0.9 * (1.0 - t));
+    knee + (cap - knee) * shaped
 }
 
 fn apply_advanced_postprocess(
@@ -801,6 +881,65 @@ fn apply_advanced_postprocess(
         build_solar_filament_delta(data, width, height, &params.solar);
     let solar_background = if solar_enabled {
         estimate_solar_background(data)
+    } else {
+        None
+    };
+    // A brightness threshold alone is not enough after an inverted solar
+    // curve: smooth glare around the limb may sit above the measured black
+    // floor and would therefore turn white. Reuse the stacker's
+    // border-connected sky classifier so dark filaments/sunspots remain part
+    // of the disk while the true exterior sky receives a spatial mask.
+    let solar_signal_mask = if solar_enabled && solar_background.is_some() {
+        let source_luma: Vec<f32> = data
+            .par_chunks_exact(3)
+            .map(|pixel| {
+                (0.2126 * pixel[0] as f32
+                    + 0.7152 * pixel[1] as f32
+                    + 0.0722 * pixel[2] as f32)
+                    / 65535.0
+            })
+            .collect();
+        let mask = compute_border_connected_sky_mask(&source_luma, width, height, 10);
+        let stride = (source_luma.len() / 32_768).max(1);
+        let mut signal_sample: Vec<f32> =
+            source_luma.iter().step_by(stride).copied().collect();
+        signal_sample.sort_by(|left, right| left.total_cmp(right));
+        let high_signal_floor = signal_sample
+            .get(signal_sample.len() * 3 / 4)
+            .copied()
+            .unwrap_or(1.0);
+        let mut high_signal_count = 0usize;
+        let mut retained_signal = 0.0f32;
+        for index in (0..source_luma.len()).step_by(stride) {
+            if source_luma[index] >= high_signal_floor {
+                high_signal_count += 1;
+                retained_signal += mask[index];
+            }
+        }
+        let retained_signal_ratio =
+            retained_signal / high_signal_count.max(1) as f32;
+        if mask.iter().all(|&value| value >= 0.999)
+            || retained_signal_ratio < 0.8
+        {
+            None
+        } else {
+            Some(mask)
+        }
+    } else {
+        None
+    };
+    let solar_prominence_confidence = if solar_enabled
+        && params.solar.prominence_amount > 1e-6
+    {
+        solar_background.and_then(|(_, background_ceiling)| {
+            build_solar_prominence_confidence(
+                data,
+                width,
+                height,
+                background_ceiling,
+                params.solar.noise_guard,
+            )
+        })
     } else {
         None
     };
@@ -939,12 +1078,7 @@ fn apply_advanced_postprocess(
             if solar_enabled {
                 let mut solar_luma =
                     evaluate_solar_curve(&solar_curve, &solar_curve_tangents, mono);
-                if let Some((background_floor, background_ceiling)) = solar_background {
-                    let protect = params.solar.background_protect.clamp(0.0, 1.0);
-                    let background_weight =
-                        1.0 - post_smoothstep(background_floor, background_ceiling, source_mono);
-                    solar_luma += (mono - solar_luma) * background_weight * protect;
-
+                if let Some((_background_floor, background_ceiling)) = solar_background {
                     let prominence = params.solar.prominence_amount.clamp(0.0, 1.0);
                     if prominence > 1e-6 {
                         let signal_start = background_ceiling;
@@ -967,6 +1101,10 @@ fn apply_advanced_postprocess(
                 if params.solar.invert {
                     solar_luma = 1.0 - solar_luma;
                 }
+                solar_luma = compress_solar_highlights(
+                    solar_luma,
+                    params.solar.highlight_compression,
+                );
                 if params.solar.colorize {
                     let mapped = interpolate_solar_color(
                         solar_luma,
@@ -985,6 +1123,58 @@ fn apply_advanced_postprocess(
                     r = solar_luma;
                     g = solar_luma;
                     b = solar_luma;
+                }
+
+                // Protect the measured sky *after* inversion and false colour.
+                // Doing this before inversion turned the preserved black sky
+                // into white, which is exactly the pale background seen in the
+                // H-alpha inverted preset.
+                if let Some((background_floor, background_ceiling)) = solar_background {
+                    let intensity_background =
+                        1.0 - post_smoothstep(background_floor, background_ceiling, source_mono);
+                    let spatial_background = solar_signal_mask
+                        .as_ref()
+                        .map(|mask| 1.0 - mask[pixel_index].clamp(0.0, 1.0))
+                        .unwrap_or(0.0);
+                    // Thin positive structures outside the disk (prominences)
+                    // may legitimately live inside the border-connected sky.
+                    // Rescue only coherent high-pass signal already accepted
+                    // by the noise-aware filament detector; smooth glare and
+                    // sky noise do not pass this gate.
+                    let prominence_confidence = solar_prominence_confidence
+                        .as_ref()
+                        .map(|confidence| confidence[pixel_index])
+                        .unwrap_or(0.0)
+                        .max(
+                            solar_filament_delta
+                                .as_ref()
+                                .map(|delta| {
+                                    post_smoothstep(
+                                        0.000_25,
+                                        0.009,
+                                        delta[pixel_index].max(0.0),
+                                    )
+                                })
+                                .unwrap_or(0.0),
+                        );
+                    let prominence_rescue = prominence_confidence
+                        * (0.35
+                            + 0.65
+                                * params
+                                    .solar
+                                    .prominence_amount
+                                    .clamp(0.0, 1.0));
+                    let background_weight = intensity_background
+                        .max(spatial_background)
+                        * (1.0 - prominence_rescue).clamp(0.0, 1.0);
+                    let protect = params.solar.background_protect.clamp(0.0, 1.0);
+                    let weighted_protect = (background_weight * protect).clamp(0.0, 1.0);
+                    let effective_protect =
+                        1.0 - (1.0 - weighted_protect) * (1.0 - weighted_protect);
+                    let measured_sky = source_mono.min(background_ceiling);
+                    r += (measured_sky - r) * effective_protect;
+                    g += (measured_sky - g) * effective_protect;
+                    b += (measured_sky - b) * effective_protect;
                 }
             } else {
                 r = mono;
@@ -1285,6 +1475,95 @@ mod postprocess_io_tests {
                 < (baseline[disk] as i32 - source[disk] as i32).abs(),
             "la protección de luces debe conservar mejor la luminancia del disco"
         );
+    }
+
+    #[test]
+    fn inverted_false_colour_protects_black_sky_after_inversion() {
+        let (width, height) = (64usize, 32usize);
+        let mut data = vec![750u16; width * height * 3];
+        for y in 5..27 {
+            for x in 23..59 {
+                data[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(40_000);
+            }
+        }
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.invert = true;
+        params.solar.colorize = true;
+        params.solar.color_strength = 1.0;
+        params.solar.background_protect = 0.98;
+        params.solar.highlight_compression = 0.72;
+        params.solar.curve_points =
+            vec![[0.0, 0.0], [0.16, 0.09], [0.48, 0.42], [1.0, 1.0]];
+
+        apply_advanced_postprocess(&mut data, width, height, true, &params);
+
+        let sky = (3 * width + 3) * 3;
+        let disk = (16 * width + 42) * 3;
+        let sky_luma = (data[sky] as u32 + data[sky + 1] as u32 + data[sky + 2] as u32) / 3;
+        let disk_luma =
+            (data[disk] as u32 + data[disk + 1] as u32 + data[disk + 2] as u32) / 3;
+        assert!(sky_luma < 3_000, "la inversión no puede convertir el cielo protegido en blanco");
+        assert!(disk_luma > sky_luma * 4, "el disco invertido debe seguir separado del cielo");
+        assert!(
+            data[disk] != data[disk + 1] || data[disk + 1] != data[disk + 2],
+            "el disco debe conservar el falso color"
+        );
+    }
+
+    #[test]
+    fn inverted_spatial_sky_mask_blocks_off_limb_glare() {
+        let (width, height) = (256usize, 160usize);
+        let (center_x, center_y) = (128.0f32, 165.0f32);
+        let mut data = vec![750u16; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let radius =
+                    ((x as f32 - center_x).powi(2) + (y as f32 - center_y).powi(2)).sqrt();
+                let value = if radius <= 120.0 {
+                    40_000
+                } else if radius <= 140.0 {
+                    7_000
+                } else {
+                    750
+                };
+                data[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(value);
+            }
+        }
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.invert = true;
+        params.solar.colorize = true;
+        params.solar.color_strength = 0.8;
+        params.solar.background_protect = 1.0;
+        params.solar.highlight_compression = 0.6;
+        params.solar.curve_points =
+            vec![[0.0, 0.0], [0.18, 0.14], [0.46, 0.4], [0.72, 0.74], [1.0, 0.97]];
+        apply_advanced_postprocess(&mut data, width, height, true, &params);
+
+        let sample_luma = |x: usize, y: usize| {
+            let index = (y * width + x) * 3;
+            (data[index] as u32 + data[index + 1] as u32 + data[index + 2] as u32) / 3
+        };
+        let sky_luma = sample_luma(16, 16);
+        let halo_luma = sample_luma(128, 35);
+        let disk_luma = sample_luma(128, 80);
+        assert!(sky_luma < 3_000);
+        assert!(
+            halo_luma < 10_000,
+            "un halo suave conectado al cielo no puede invertirse a blanco"
+        );
+        assert!(disk_luma > sky_luma * 4);
+    }
+
+    #[test]
+    fn solar_highlight_compression_retains_order_and_headroom() {
+        let low = compress_solar_highlights(0.72, 0.8);
+        let high = compress_solar_highlights(0.98, 0.8);
+        assert!(low < high, "la compresión debe ser monotónica");
+        assert!(high < 0.98, "debe reservar margen antes del recorte");
+        assert_eq!(compress_solar_highlights(0.58, 0.8), 0.58);
+        assert_eq!(compress_solar_highlights(0.98, 0.0), 0.98);
     }
 
     #[test]
