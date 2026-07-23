@@ -80,6 +80,25 @@ test("the assistant exposes A/B as an executable action when history exists", ()
   assert.equal(compare?.activate, true);
 });
 
+test("assistant recommendations are actionable and dismissible per result", () => {
+  const context = {
+    hasSource: true,
+    hasResult: true,
+    histogramAvailable: true,
+    historyLength: 1,
+    canCompare: false,
+    shadowClip: 0.03,
+    highlightClip: 0,
+    robustDynamicRange: 0.7,
+    medianLevel: 0.2,
+  };
+  const clipping = evaluateGuide(context).find((item) => item.id === "clipping");
+  assert.equal(clipping?.applyAction, "protect-range");
+  assert.equal(clipping?.target, "#sl-level-mid");
+  const dismissed = evaluateGuide(context, undefined, new Set(["clipping"]));
+  assert.equal(dismissed.some((item) => item.id === "clipping"), false);
+});
+
 test("only the scientific 16-bit histogram and advanced modules remain in the panel", async () => {
   const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
   assert.equal((html.match(/id="post-histogram"/g) || []).length, 1);
@@ -91,7 +110,28 @@ test("only the scientific 16-bit histogram and advanced modules remain in the pa
   assert.equal((html.match(/data-hsl-component="hue"/g) || []).length, 8);
   assert.equal((html.match(/data-hsl-component="saturation"/g) || []).length, 8);
   assert.equal((html.match(/data-hsl-component="luminance"/g) || []).length, 8);
+  assert.ok(html.includes('id="chk-linked-wavelets"'));
+  assert.ok(html.includes('id="chk-adaptive-usm"'));
+  assert.ok(html.includes('id="detail-response-summary"'));
   assert.equal(html.includes("Supera al sharpening"), false);
+});
+
+test("planetary defaults and mono-only availability are explicit", async () => {
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  assert.match(html, /<option[^>]*value="maximum"[^>]*selected[^>]*>/);
+  assert.ok(html.includes('id="planetary-normalize-option"'));
+  assert.ok(html.includes('id="planetary-rgb-align-option"'));
+  assert.ok(html.includes("planetary-option-availability"));
+});
+
+test("standard stacking, colour grading and mosaic share the corrected contracts", async () => {
+  const main = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+  const mosaic = await readFile(new URL("../src/mosaic_manager.js", import.meta.url), "utf8");
+  assert.match(main, /invoke\("stack_video",[\s\S]*?alignRgb:[\s\S]*?qualityPolicy:/);
+  assert.ok(main.includes('if (control.type === "color") return;'));
+  assert.ok(main.includes("forceFastPreview: true"));
+  assert.ok(mosaic.includes('document.getElementById("chk-rgb-align")'));
+  assert.ok(mosaic.includes("adaptiveUsm: p?.adaptiveUsm"));
 });
 
 test("the 16-bit white-level range can represent the exact neutral endpoint", async () => {

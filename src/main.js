@@ -2086,7 +2086,10 @@ window.toDisplaySrc = toDisplaySrc;
 // elección experta válida y se conserva en aperturas posteriores.
 const PLANETARY_POLICY_PREF_VERSION = "2";
 const PLANETARY_POLICY_PREF_VERSION_KEY = "zas_planetary_policy_version";
-const PLANETARY_QUALITY_PREF_VERSION = "1";
+// v2 changes the user-requested default to Maximum. The versioned migration is
+// intentionally one-shot so this checkout does not remain on the old Adaptive
+// value solely because v1 wrote it to localStorage.
+const PLANETARY_QUALITY_PREF_VERSION = "2";
 const PLANETARY_QUALITY_PREF_VERSION_KEY = "zas_planetary_quality_policy_version";
 
 function migratePlanetaryPolicyPreference() {
@@ -2126,15 +2129,66 @@ window.getDecodePolicy = getDecodePolicy;
 
 function getQualityPolicy() {
     if (localStorage.getItem(PLANETARY_QUALITY_PREF_VERSION_KEY) !== PLANETARY_QUALITY_PREF_VERSION) {
-        localStorage.setItem("zas_planetary_quality_policy", "adaptive");
+        localStorage.setItem("zas_planetary_quality_policy", "maximum");
         localStorage.setItem(PLANETARY_QUALITY_PREF_VERSION_KEY, PLANETARY_QUALITY_PREF_VERSION);
     }
     const value = localStorage.getItem("zas_planetary_quality_policy");
     return (value === "standard" || value === "maximum" || value === "adaptive")
         ? value
-        : "adaptive";
+        : "maximum";
 }
 window.getQualityPolicy = getQualityPolicy;
+
+const planetaryColorOptionPreference = {
+    normalizeColors: false,
+    alignRgb: true,
+};
+
+function setPlanetaryColorOptionsAvailability(isColor) {
+    const options = [
+        {
+            control: document.getElementById("chk-normalize-colors"),
+            wrapper: document.getElementById("planetary-normalize-option"),
+            preference: "normalizeColors",
+        },
+        {
+            control: document.getElementById("chk-rgb-align"),
+            wrapper: document.getElementById("planetary-rgb-align-option"),
+            preference: "alignRgb",
+        },
+    ];
+    options.forEach(({ control, wrapper, preference }) => {
+        if (!control) return;
+        if (isColor === false) {
+            if (!control.disabled) planetaryColorOptionPreference[preference] = !!control.checked;
+            control.checked = false;
+            control.disabled = true;
+        } else {
+            control.disabled = false;
+            control.checked = !!planetaryColorOptionPreference[preference];
+        }
+        const unavailable = isColor === false;
+        wrapper?.classList.toggle("is-unavailable", unavailable);
+        wrapper?.setAttribute("aria-disabled", String(unavailable));
+        const availability = wrapper?.querySelector(".planetary-option-availability");
+        if (availability) availability.textContent = unavailable ? "No aplica a una fuente monocroma" : "";
+        control.title = unavailable
+            ? "Desactivado: la fuente analizada es monocroma."
+            : preference === "normalizeColors"
+                ? "Opt-in: actívalo sólo si deseas neutralizar el color de captura."
+                : "Alinea automáticamente los canales R y B cuando la fuente contiene color.";
+    });
+}
+window.setPlanetaryColorOptionsAvailability = setPlanetaryColorOptionsAvailability;
+
+[
+    ["chk-normalize-colors", "normalizeColors"],
+    ["chk-rgb-align", "alignRgb"],
+].forEach(([id, preference]) => {
+    document.getElementById(id)?.addEventListener("change", (event) => {
+        if (!event.target.disabled) planetaryColorOptionPreference[preference] = !!event.target.checked;
+    });
+});
 
 (async function initGpuUi() {
     try {
@@ -2160,7 +2214,7 @@ window.getQualityPolicy = getQualityPolicy;
             selQuality.addEventListener("change", () => {
                 const value = (selQuality.value === "standard" || selQuality.value === "maximum")
                     ? selQuality.value
-                    : "adaptive";
+                    : (selQuality.value === "adaptive" ? "adaptive" : "maximum");
                 localStorage.setItem("zas_planetary_quality_policy", value);
                 localStorage.setItem(PLANETARY_QUALITY_PREF_VERSION_KEY, PLANETARY_QUALITY_PREF_VERSION);
                 log("INFO", `Rigor planetario por AP: ${value}`);
@@ -2434,6 +2488,22 @@ function applyWaveletPreset(p, { trigger = true } = {}) {
         setNum("vc-sigma", p.deconv.vs); setNum("vc-iter", p.deconv.vi);
     }
     if (p.usm) { setNum("usm-amt", p.usm.a); setNum("usm-rad", p.usm.r); }
+    {
+        const adaptive = p.adaptiveUsm || { enabled: false, amountMin: .15, amountMax: 1, threshold: .12, transition: .18 };
+        const adaptiveToggle = document.getElementById("chk-adaptive-usm");
+        if (adaptiveToggle) adaptiveToggle.checked = !!adaptive.enabled;
+        const adaptiveValues = [
+            ["sl-adaptive-usm-min", adaptive.amountMin, 15],
+            ["sl-adaptive-usm-max", adaptive.amountMax, 100],
+            ["sl-adaptive-usm-threshold", adaptive.threshold, 12],
+            ["sl-adaptive-usm-transition", adaptive.transition, 18],
+        ];
+        adaptiveValues.forEach(([id, value, fallback]) => {
+            const control = document.getElementById(id);
+            if (control) control.value = String(Number.isFinite(Number(value)) ? Number(value) * 100 : fallback);
+        });
+        setAdaptiveUsmUiState(!!adaptive.enabled);
+    }
     setNum("lce-amt", p.lce);
     setNum("master-denoise", p.masterDenoise);
     setNum("denoise-detail", p.denoiseDetail);
@@ -4958,6 +5028,99 @@ linkControl("#sl-denoise-chroma", "#num-denoise-chroma", 1.0);
 // B+: intensidad edge-aware · auto-máscara adaptativa (ambos 0..100 enteros)
 linkControl("#sl-edge-strength", "#num-edge-strength", 1.0);
 linkControl("#sl-auto-mask", "#num-auto-mask", 1.0);
+
+function updateAdaptiveUsmOutputs() {
+    ["min", "max", "threshold", "transition"].forEach((name) => {
+        const control = document.getElementById(`sl-adaptive-usm-${name}`);
+        const output = document.getElementById(`out-adaptive-usm-${name}`);
+        if (control && output) output.textContent = `${Math.round(parseFloat(control.value) || 0)}%`;
+    });
+}
+
+function setAdaptiveUsmUiState(enabled) {
+    const details = document.getElementById("adaptive-usm-module");
+    const controls = document.getElementById("adaptive-usm-controls");
+    controls?.classList.toggle("is-disabled", !enabled);
+    controls?.querySelectorAll("input").forEach((control) => { control.disabled = !enabled; });
+    if (enabled && details) details.open = true;
+    updateAdaptiveUsmOutputs();
+}
+
+function initAdaptiveUsmUi() {
+    const toggle = document.getElementById("chk-adaptive-usm");
+    toggle?.closest(".switch-container")?.addEventListener("click", (event) => event.stopPropagation());
+    toggle?.addEventListener("change", () => {
+        setAdaptiveUsmUiState(toggle.checked);
+        triggerUpdate();
+    });
+    ["min", "max", "threshold", "transition"].forEach((name) => {
+        const control = document.getElementById(`sl-adaptive-usm-${name}`);
+        control?.addEventListener("input", () => {
+            updateAdaptiveUsmOutputs();
+            triggerUpdate();
+        });
+    });
+    setAdaptiveUsmUiState(!!toggle?.checked);
+}
+
+let linkedWaveletAnchor = null;
+
+function updateLinkedWaveletUi() {
+    const enabled = !!document.getElementById("chk-linked-wavelets")?.checked;
+    const decay = document.getElementById("sl-linked-wavelet-decay");
+    if (decay) decay.disabled = !enabled;
+    const output = document.getElementById("out-linked-wavelet-decay");
+    if (decay && output) output.textContent = `${Math.round(parseFloat(decay.value) || 0)}%`;
+    document.querySelector(".linked-wavelet-editor")?.classList.toggle("is-active", enabled);
+}
+
+function propagateLinkedWavelets(family, sourceIndex) {
+    if (!document.getElementById("chk-linked-wavelets")?.checked) return;
+    const source = document.getElementById(`${family}${sourceIndex}`);
+    if (!source) return;
+    const sourceRaw = parseFloat(source.value) || 0;
+    const decay = (parseFloat(document.getElementById("sl-linked-wavelet-decay")?.value) || 0) / 100;
+    const maximumLayer = family === "w" || family === "d" ? 6 : 5;
+    const displayScale = family === "w" ? 5 : 10;
+    for (let index = sourceIndex + 1; index <= maximumLayer; index += 1) {
+        const slider = document.getElementById(`${family}${index}`);
+        const number = document.getElementById(`num-${family}${index}`);
+        if (!slider || !number) continue;
+        const raw = Math.max(parseFloat(slider.min) || 0, Math.min(parseFloat(slider.max) || 50,
+            sourceRaw * Math.pow(decay, index - sourceIndex)));
+        slider.value = String(raw);
+        number.value = Number((raw / displayScale).toFixed(2)).toString();
+    }
+    linkedWaveletAnchor = { family, sourceIndex };
+    drawPostprocessScopes();
+}
+
+function initLinkedWaveletUi() {
+    const toggle = document.getElementById("chk-linked-wavelets");
+    const decay = document.getElementById("sl-linked-wavelet-decay");
+    toggle?.addEventListener("change", updateLinkedWaveletUi);
+    decay?.addEventListener("input", () => {
+        updateLinkedWaveletUi();
+        if (linkedWaveletAnchor) {
+            propagateLinkedWavelets(linkedWaveletAnchor.family, linkedWaveletAnchor.sourceIndex);
+            triggerUpdate();
+        }
+    });
+    ["w", "d"].forEach((family) => {
+        for (let index = 1; index <= 6; index += 1) {
+            document.getElementById(`${family}${index}`)?.addEventListener("input", () => {
+                propagateLinkedWavelets(family, index);
+            });
+            document.getElementById(`num-${family}${index}`)?.addEventListener("change", () => {
+                propagateLinkedWavelets(family, index);
+            });
+        }
+    });
+    updateLinkedWaveletUi();
+}
+
+initAdaptiveUsmUi();
+initLinkedWaveletUi();
 // linkControl("#sl-gamma", "#num-gamma", 100.0);
 // Custom Inverted Gamma Logic for Post-Processing
 const slGamma = $("#sl-gamma");
@@ -5002,7 +5165,9 @@ if (ui.blendSlider) {
     ui.blendSlider.addEventListener("change", triggerUpdate);
 }
 
-[ui.rx, ui.ry, ui.bx, ui.by].forEach(el => { if (el) el.addEventListener("input", triggerUpdate); });
+[ui.rx, ui.ry, ui.bx, ui.by].forEach(el => {
+    if (el) el.addEventListener("input", () => triggerUpdate({ forceFastPreview: true }));
+});
 if (ui.chkDeringing) ui.chkDeringing.addEventListener("change", triggerUpdate);
 
 // B (wavelets edge-aware) y A (PSF del limbo): re-procesar al togglear.
@@ -5037,6 +5202,19 @@ function resetProcessingParams({ updateMemo = true } = {}) {
     if (ui.valUsmAmt) ui.valUsmAmt.value = 0;
     if (ui.slUsmRad) ui.slUsmRad.value = 0;
     if (ui.valUsmRad) ui.valUsmRad.value = 0;
+
+    const adaptiveUsmToggle = document.getElementById("chk-adaptive-usm");
+    if (adaptiveUsmToggle) adaptiveUsmToggle.checked = false;
+    [
+        ["sl-adaptive-usm-min", "15"],
+        ["sl-adaptive-usm-max", "100"],
+        ["sl-adaptive-usm-threshold", "12"],
+        ["sl-adaptive-usm-transition", "18"],
+    ].forEach(([id, value]) => {
+        const control = document.getElementById(id);
+        if (control) control.value = value;
+    });
+    setAdaptiveUsmUiState(false);
 
     if (ui.slLceAmt) ui.slLceAmt.value = 0;
     if (ui.valLceAmt) ui.valLceAmt.value = 0;
@@ -5209,6 +5387,10 @@ function getAdvancedPostprocessParams() {
 
 function getPipelineParams() {
     const getVal = (id) => parseFloat($(`#num-${id}`)?.value) || 0;
+    const getRangeFraction = (id, fallback) => {
+        const value = parseFloat(document.getElementById(id)?.value);
+        return Number.isFinite(value) ? value / 100 : fallback;
+    };
     return {
         u: [getVal("u1"), getVal("u2"), getVal("u3"), getVal("u4"), getVal("u5")],
         w: [getVal("w1"), getVal("w2"), getVal("w3"), getVal("w4"), getVal("w5"), getVal("w6")],
@@ -5219,6 +5401,13 @@ function getPipelineParams() {
             vs: getVal("vc-sigma"), vi: parseInt($(`#num-vc-iter`).value) || 0
         },
         usm: { a: getVal("usm-amt"), r: getVal("usm-rad") },
+        adaptiveUsm: {
+            enabled: document.getElementById("chk-adaptive-usm")?.checked || false,
+            amountMin: getRangeFraction("sl-adaptive-usm-min", .15),
+            amountMax: getRangeFraction("sl-adaptive-usm-max", 1),
+            threshold: getRangeFraction("sl-adaptive-usm-threshold", .12),
+            transition: getRangeFraction("sl-adaptive-usm-transition", .18),
+        },
         lce: getVal("lce-amt"),
         masterDenoise: getVal("master-denoise"),
         denoiseDetail: getVal("denoise-detail"),
@@ -5296,6 +5485,10 @@ const FAST_PREVIEW_MS = 110;
 
 function updateAdvancedControlOutput(control) {
     if (!control) return;
+    // A colour picker shares its label with the numeric grading-strength
+    // slider. Parsing "#rrggbb" produced NaN -> 0 and overwrote that slider's
+    // output even though its thumb/value never moved.
+    if (control.type === "color") return;
     const raw = parseFloat(control.value) || 0;
     const scale = parseFloat(control.dataset.scale || "1") || 1;
     const value = raw / scale;
@@ -5379,6 +5572,13 @@ function updatePostHistoryUi() {
         const current = postProcessSession.current();
         label.textContent = current ? `${state.index + 1}/${state.length} · ${current.label}` : "Sin resultado";
     }
+    if (compare) {
+        compare.title = !state.canCompare
+            ? "Aplica un ajuste para habilitar A/B"
+            : postCompareActive
+                ? "Cerrar comparación A/B"
+                : "Comparar el paso actual con el anterior o con el apilado original";
+    }
     void refreshPostCompareReference();
     updateZenithGuide();
 }
@@ -5426,6 +5626,13 @@ async function refreshPostCompareReference() {
         log("WARN", "A/B: la vista de referencia ya no estaba disponible; se conservaron el historial y la receta.");
         return;
     }
+    // Both images must occupy exactly the same intrinsic canvas. This avoids
+    // the tiny centred reference seen when a flex container measured the A
+    // image before its natural dimensions were available.
+    if (ui.imgResult?.naturalWidth && ui.imgResult?.naturalHeight) {
+        image.style.width = `${ui.imgResult.naturalWidth}px`;
+        image.style.height = `${ui.imgResult.naturalHeight}px`;
+    }
     layer.hidden = false;
     layer.setAttribute("aria-hidden", "false");
 }
@@ -5435,9 +5642,15 @@ function setPostCompareActive(active) {
     postCompareActive = !!active && canCompare;
     const button = document.getElementById("btn-post-compare");
     const splitWrap = document.getElementById("post-compare-split-wrap");
-    if (button) button.setAttribute("aria-pressed", String(postCompareActive));
+    if (button) {
+        button.setAttribute("aria-pressed", String(postCompareActive));
+        button.title = postCompareActive
+            ? "Cerrar comparación A/B"
+            : "Comparar el paso actual con el anterior o con el apilado original";
+    }
     if (splitWrap) splitWrap.hidden = !postCompareActive;
     void refreshPostCompareReference();
+    updateZenithGuide();
 }
 
 function finishPendingHistoryCommit(paramsString, preview) {
@@ -5536,6 +5749,8 @@ async function beginNewPostprocessResult(preview, source = "stack") {
         compareImage.onload = null;
         compareImage.onerror = null;
         compareImage.classList.remove("loaded");
+        compareImage.style.removeProperty("width");
+        compareImage.style.removeProperty("height");
         compareImage.removeAttribute("src");
     }
     updatePostHistoryUi();
@@ -5673,6 +5888,29 @@ function drawDetailResponseCanvas(canvas, pipeline) {
     const bands = [...pipeline.w.map((value) => value / 5), ...pipeline.u.map((value) => value / 10)];
     const texture = Number(pipeline.advanced.texture || 0);
     const clarity = Number(pipeline.advanced.clarity || 0);
+    const usm = Number(pipeline.usm?.a || 0);
+    const usmRadius = Math.max(.25, Number(pipeline.usm?.r || 1));
+    const highPass = Number(pipeline.crisp || 0);
+    const deconv = Math.log2(1 + Number(pipeline.deconv?.i || 0) + Number(pipeline.deconv?.vi || 0));
+    const localContrast = Number(pipeline.lce || 0) / 100;
+    const active = [];
+    if (deconv > 0) active.push("deconvolución");
+    if (pipeline.w.some((value) => Number(value) !== 0) || pipeline.u.some((value) => Number(value) !== 0)) active.push("wavelets");
+    if (highPass > 0) active.push("high pass");
+    if (usm > 0) active.push(pipeline.adaptiveUsm?.enabled ? "USM adaptativo" : "USM");
+    if (localContrast > 0) active.push("LCE");
+    if (Number(pipeline.masterDenoise || 0) > 0) active.push("denoise");
+    const summary = document.getElementById("detail-response-summary");
+    if (summary) summary.textContent = active.length ? active.slice(0, 3).join(" · ") : "receta neutra";
+
+    context.save();
+    context.setLineDash([4, 4]);
+    context.strokeStyle = "rgba(148,163,184,.35)";
+    context.beginPath();
+    context.moveTo(0, height / 2);
+    context.lineTo(width, height / 2);
+    context.stroke();
+    context.restore();
     context.strokeStyle = "#34d399";
     context.fillStyle = "rgba(52,211,153,.16)";
     context.lineWidth = 2;
@@ -5687,6 +5925,10 @@ function drawDetailResponseCanvas(canvas, pipeline) {
         });
         response += texture * Math.exp(-Math.pow(frequency - .72, 2) / .035) * .22;
         response += clarity * Math.exp(-Math.pow(frequency - .32, 2) / .05) * .18;
+        response += deconv * Math.exp(-Math.pow(frequency - .74, 2) / .08) * .06;
+        response += highPass * Math.exp(-Math.pow(frequency - .62, 2) / .035) * .08;
+        response += usm * Math.exp(-Math.pow(frequency - Math.min(.86, .5 + .18 / usmRadius), 2) / .055) * .12;
+        response += localContrast * Math.exp(-Math.pow(frequency - .22, 2) / .08) * .2;
         response -= Number(pipeline.masterDenoise || 0) / 100 * frequency * .45;
         const x = frequency * width;
         const y = height - Math.max(0, Math.min(2, response)) / 2 * height;
@@ -5711,7 +5953,33 @@ function setPostColorControlsForMono(isMono) {
     [ui.slSat, ui.numSat, ui.slRBal, ui.numRBal, ui.slBBal, ui.numBBal].forEach((control) => {
         if (control) control.disabled = !!isMono;
     });
-    document.querySelector(".color-module")?.classList.toggle("mono-disabled", !!isMono);
+    const colorModule = document.querySelector(".color-module");
+    colorModule?.classList.toggle("mono-disabled", !!isMono);
+    colorModule?.setAttribute("aria-disabled", String(!!isMono));
+    const eyedropper = document.getElementById("btn-post-eyedropper");
+    if (eyedropper) eyedropper.disabled = !!isMono;
+    if (isMono && postEyedropperActive) {
+        postEyedropperActive = false;
+        eyedropper?.classList.remove("active");
+        document.getElementById("view-result")?.classList.remove("eyedropper-active");
+    }
+
+    const atmospheric = document.querySelector(".atmospheric-module");
+    atmospheric?.classList.toggle("mono-disabled", !!isMono);
+    atmospheric?.setAttribute("aria-disabled", String(!!isMono));
+    atmospheric?.querySelectorAll("button, input").forEach((control) => {
+        control.disabled = !!isMono;
+    });
+    const adcStatus = document.getElementById("adc-status");
+    if (adcStatus) {
+        if (isMono) {
+            adcStatus.textContent = "No disponible: el resultado activo es monocromo";
+            adcStatus.dataset.state = "idle";
+        } else if (adcStatus.textContent.startsWith("No disponible")) {
+            adcStatus.textContent = "G es la referencia · rango ±6 px";
+            adcStatus.dataset.state = "idle";
+        }
+    }
     const mode = document.getElementById("sel-sharpen-mode");
     if (mode) {
         mode.disabled = !!isMono;
@@ -5758,19 +6026,33 @@ async function refreshPostHistogram(preferProcessed = true) {
 
 function updateZenithGuide(extra = {}) {
     if (!zenithGuide) return;
+    const history = postProcessSession.getState();
+    const medianLevel = Number(lastPostHistogram?.median || 0) / 65535;
+    const percentileLow = Number(lastPostHistogram?.percentileLow ?? lastPostHistogram?.minimum ?? 0) / 65535;
+    const percentileHigh = Number(lastPostHistogram?.percentileHigh ?? lastPostHistogram?.maximum ?? 65535) / 65535;
+    const recommendedExposureEv = medianLevel > 0
+        ? Math.max(0.1, Math.min(1.5, Math.log2(0.18 / Math.max(0.002, medianLevel))))
+        : 0.75;
     zenithGuide.update({
+        generation: history.generation || null,
         hasSource: !!currentFilePath,
         hasAnalysis: !!currentFileMetadata,
         hasResult: !!postProcessSession.current(),
-        source: postProcessSession.getState().source,
+        source: history.source,
         histogramAvailable: !!lastPostHistogram,
         isMono: !!lastPostHistogram?.isMono,
         shadowClip: Number(lastPostHistogram?.shadowClip || 0),
         highlightClip: Number(lastPostHistogram?.highlightClip || 0),
-        medianLevel: Number(lastPostHistogram?.median || 0) / 65535,
+        medianLevel,
+        percentileLow,
+        percentileHigh,
+        recommendedExposureEv,
         dynamicRange: Math.max(0, Number(lastPostHistogram?.maximum || 0) - Number(lastPostHistogram?.minimum || 0)) / 65535,
-        historyLength: postProcessSession.getState().length,
-        canCompare: postProcessSession.getState().canCompare,
+        robustDynamicRange: Math.max(0, percentileHigh - percentileLow),
+        historyLength: history.length,
+        canCompare: history.canCompare,
+        compareActive: postCompareActive,
+        recipe: postProcessSession.current()?.recipe || null,
         hasArtifactAnalysis: !!lastArtifactSuggestion,
         ringingScore: Number(lastArtifactSuggestion?.ringingScore || 0),
         colorFringeScore: Number(lastArtifactSuggestion?.colorFringeScore || 0),
@@ -5833,7 +6115,8 @@ function updateDeconvolutionStatus() {
     const modes = [];
     if (rlIterations > 0) modes.push(`RL ${rlIterations}× · σ ${rlSigma.toFixed(1)}`);
     if (vcIterations > 0) modes.push(`VC ${vcIterations}× · σ ${vcSigma.toFixed(1)}`);
-    status.textContent = `${modes.join(" + ")} · usa A/B y vigila halos`;
+    const gpuPreview = getGpuMode() === "cpu" ? "preview CPU" : "preview GPU si apta";
+    status.textContent = `${modes.join(" + ")} · ${gpuPreview} · final 1:1 CPU exacta · valida con A/B`;
     status.dataset.state = "active";
 }
 
@@ -5870,6 +6153,12 @@ function setPostScopesOpen(open) {
     panel?.classList.toggle("open", !!open);
     panel?.setAttribute("aria-hidden", String(!open));
     button?.setAttribute("aria-pressed", String(!!open));
+    if (button) {
+        const label = button.querySelector("span");
+        if (label) label.textContent = open ? "Ocultar" : "Gráficas";
+        button.title = open ? "Ocultar gráficas flotantes" : "Mostrar gráficas flotantes";
+        button.setAttribute("aria-label", button.title);
+    }
     if (open) requestAnimationFrame(drawPostprocessScopes);
 }
 
@@ -6001,7 +6290,7 @@ function setRgbShiftValues(channel, x, y, { process = true, commit = false, labe
     xInput.value = clampRgbShift(x).toFixed(2);
     yInput.value = clampRgbShift(y).toFixed(2);
     updateAdcPadFromInputs();
-    if (process && !suppressPostprocessEvents) triggerUpdate();
+    if (process && !suppressPostprocessEvents) triggerUpdate({ forceFastPreview: true });
     if (commit && !suppressPostprocessEvents) queuePostHistoryCommit(label);
 }
 
@@ -6215,6 +6504,111 @@ function initArtifactRepairUi() {
     });
 }
 
+function setZenithGuideOpen(open) {
+    const panel = document.getElementById("zenith-guide-panel");
+    panel?.classList.toggle("open", !!open);
+    panel?.setAttribute("aria-hidden", String(!open));
+    document.getElementById("btn-toggle-guide")?.setAttribute("aria-pressed", String(!!open));
+}
+
+function navigateAssistantToControl(target, suggestion = {}) {
+    const element = document.querySelector(target);
+    if (!element) {
+        log("WARN", `Asistente: no se encontró el destino ${target}`);
+        return false;
+    }
+    let ancestor = element;
+    while (ancestor) {
+        if (ancestor.tagName === "DETAILS") ancestor.open = true;
+        ancestor = ancestor.parentElement;
+    }
+    setZenithGuideOpen(false);
+    requestAnimationFrame(() => {
+        element.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+        const focusTarget = element.matches("details") ? element.querySelector("summary") : element;
+        focusTarget?.focus?.({ preventScroll: true });
+        element.classList.add("assistant-target-pulse");
+        window.setTimeout(() => element.classList.remove("assistant-target-pulse"), 1450);
+        if (suggestion.activate && !element.disabled) element.click();
+    });
+    if (ui.statusText) {
+        ui.statusText.textContent = `Asistente · ${suggestion.title || "control localizado"}`;
+        ui.statusText.style.color = "#67e8f9";
+    }
+    return true;
+}
+
+function applyAssistantToneAdjustments(values, label, target = "#post-tone-module") {
+    suppressPostprocessEvents = true;
+    try {
+        Object.entries(values).forEach(([name, value]) => setAdvancedControlValue(name, value));
+        updateLevelMarkers();
+    } finally {
+        suppressPostprocessEvents = false;
+    }
+    drawPostprocessScopes();
+    triggerUpdate();
+    queuePostHistoryCommit(label);
+    navigateAssistantToControl(target, { title: label });
+}
+
+async function applyAssistantRecommendation(action, suggestion, context) {
+    const advanced = getAdvancedPostprocessParams();
+    if (action === "protect-range") {
+        const values = {};
+        if (Number(context.shadowClip || 0) > 0.0001) {
+            values.levelsBlack = 0;
+            values.shadows = Math.max(advanced.shadows, 0.18);
+            values.blacks = Math.max(advanced.blacks, 0.06);
+        }
+        if (Number(context.highlightClip || 0) > 0.0001) {
+            values.levelsWhite = 1;
+            values.highlights = Math.min(advanced.highlights, -0.18);
+            values.whites = Math.min(advanced.whites, -0.08);
+            values.exposure = Math.max(-4, advanced.exposure
+                - Math.min(0.35, 0.1 + Number(context.highlightClip || 0) * 2));
+        }
+        applyAssistantToneAdjustments(values, "Asistente · proteger rango", "#post-histogram-card");
+        return;
+    }
+
+    if (action === "auto-levels") {
+        const low = Math.max(0, Math.min(1, Number(context.percentileLow || 0)));
+        const high = Math.max(low, Math.min(1, Number(context.percentileHigh || 1)));
+        const span = high - low;
+        if (span < 0.003) {
+            log("WARN", "Asistente: el rango medido es demasiado estrecho para expandirlo con seguridad.");
+            return;
+        }
+        const margin = Math.max(0.002, span * 0.035);
+        applyAssistantToneAdjustments({
+            levelsBlack: Math.max(0, low - margin),
+            levelsWhite: Math.min(1, high + margin),
+            levelsMid: 1,
+        }, "Asistente · expandir rango útil", "#post-histogram-card");
+        return;
+    }
+
+    if (action === "lift-midtones") {
+        const addition = Math.max(0.1, Math.min(1.5, Number(context.recommendedExposureEv || 0.5)));
+        applyAssistantToneAdjustments({
+            exposure: Math.min(4, advanced.exposure + addition),
+        }, `Asistente · medios +${addition.toFixed(2)} EV`);
+        return;
+    }
+
+    if (action === "repair-ringing") {
+        navigateAssistantToControl("#artifact-repair-card", suggestion);
+        document.getElementById("btn-apply-artifact-suggestion")?.click();
+        return;
+    }
+
+    if (action === "align-rgb") {
+        navigateAssistantToControl(".atmospheric-module", suggestion);
+        document.getElementById("btn-auto-rgb-align")?.click();
+    }
+}
+
 function initZenithGuideUi() {
     const panel = document.getElementById("zenith-guide-panel");
     zenithGuide = new IntelligentAssistant({
@@ -6222,14 +6616,11 @@ function initZenithGuideUi() {
         list: document.getElementById("zenith-guide-list"),
         status: document.getElementById("zenith-guide-status"),
         summary: document.getElementById("intelligent-assistant-summary"),
+        onNavigate: navigateAssistantToControl,
+        onApply: applyAssistantRecommendation,
     });
-    const setOpen = (open) => {
-        panel?.classList.toggle("open", open);
-        panel?.setAttribute("aria-hidden", String(!open));
-        document.getElementById("btn-toggle-guide")?.setAttribute("aria-pressed", String(open));
-    };
-    document.getElementById("btn-toggle-guide")?.addEventListener("click", () => setOpen(!panel?.classList.contains("open")));
-    document.getElementById("btn-close-guide")?.addEventListener("click", () => setOpen(false));
+    document.getElementById("btn-toggle-guide")?.addEventListener("click", () => setZenithGuideOpen(!panel?.classList.contains("open")));
+    document.getElementById("btn-close-guide")?.addEventListener("click", () => setZenithGuideOpen(false));
     updateZenithGuide();
 }
 
@@ -6238,8 +6629,9 @@ initPostEyedropper();
 initArtifactRepairUi();
 initZenithGuideUi();
 
-function triggerUpdate() {
+function triggerUpdate(options = {}) {
     if (suppressPostprocessEvents) return;
+    const forceFastPreview = !!options?.forceFastPreview;
     const currentParams = JSON.stringify(getPipelineParams());
     if (currentParams === lastProcessedParams && !previewIsDownscaled) return;
 
@@ -6254,10 +6646,12 @@ function triggerUpdate() {
         const heavy = pf.deconv.i > 0 || pf.deconv.vi > 0 || pf.lce > 0
             || pf.edgeAwareWavelets || pf.autoMask > 0 || pf.psfFromLimb;
         const nowT = performance.now();
-        if (heavy && nowT - lastFastPreview >= FAST_PREVIEW_MS) {
+        if ((heavy || forceFastPreview) && nowT - lastFastPreview >= FAST_PREVIEW_MS) {
             lastFastPreview = nowT;
             pipelineRequestId++;
-            processPipeline(pipelineRequestId, currentParams, 4);
+            // RGB sub-pixel alignment needs a little more spatial fidelity than
+            // the heavy-filter preview; 1/2 keeps the drag smooth and visible.
+            processPipeline(pipelineRequestId, currentParams, forceFastPreview ? 2 : 4);
         }
     }
 
@@ -6287,6 +6681,7 @@ function triggerUpdate() {
 
 async function processPipeline(requestId, paramsString, downscale = 1) {
     if (!currentFilePath && !postProcessSession.current()) { hideImgLoader(); hideLocalProcessing(); return; }
+    const renderStartedAt = performance.now();
     const p = JSON.parse(paramsString);
     const msg = $("#local-msg");
     if (msg) msg.textContent = "Calculando...";
@@ -6322,6 +6717,7 @@ async function processPipeline(requestId, paramsString, downscale = 1) {
             psfFromLimb: p.psfFromLimb,
             edgeAwareStrength: p.edgeAwareStrength,
             autoMask: p.autoMask,
+            adaptiveUsm: p.adaptiveUsm,
             previewDownscale: downscale,
             gpuMode: getGpuMode(),
             levelsBlack: p.levels.black,
@@ -6344,7 +6740,13 @@ async function processPipeline(requestId, paramsString, downscale = 1) {
             await setImageAndWait(ui.imgResult, b64, false);
             restoreViewportState(viewportBeforeRender);
 
-            if (ui.statusText) { ui.statusText.textContent = "Vista actualizada."; ui.statusText.style.color = "#94a3b8"; }
+            if (ui.statusText) {
+                const elapsed = Math.max(0, performance.now() - renderStartedAt);
+                ui.statusText.textContent = downscale === 1
+                    ? `Vista 1:1 actualizada · ${(elapsed / 1000).toFixed(1)} s · CPU exacta`
+                    : `Vista rápida 1/${downscale} · ${(elapsed / 1000).toFixed(1)} s · GPU si es apta`;
+                ui.statusText.style.color = downscale === 1 ? "#94a3b8" : "#67e8f9";
+            }
         }
         // El historial y el histograma científico sólo aceptan el render 1:1;
         // el preview rápido durante el arrastre es deliberadamente transitorio.
@@ -6372,6 +6774,7 @@ async function processPipeline(requestId, paramsString, downscale = 1) {
 
 function resetDataAcquisitionUI() {
     console.log("Resetting Data Acquisition UI...");
+    setPlanetaryColorOptionsAvailability(null);
     postBeginNonce += 1;
     window.resetPipelineState();
     postProcessSession.clear();
@@ -7773,6 +8176,7 @@ if (ui.btnBatchRun) {
                         psfFromLimb: p.psfFromLimb,
                         edgeAwareStrength: p.edgeAwareStrength,
                         autoMask: p.autoMask,
+                        adaptiveUsm: p.adaptiveUsm,
                         levelsBlack: p.levels.black,
                         levelsWhite: p.levels.white,
                         levelsGamma: p.levels.gamma,
@@ -8264,15 +8668,10 @@ if (ui.btnRunAnalysis) {
                     }
                 }
 
-                // NORMALIZAR COLORES: sin efecto en video mono — se deshabilita
-                // para evitar confusión del usuario (el backend ya lo ignora).
-                const chkNorm = document.getElementById("chk-normalize-colors");
-                if (chkNorm) {
-                    chkNorm.disabled = !res.metadata.is_color;
-                    // El balance automático altera la fotometría/color físico:
-                    // es opt-in. En mono se apaga porque no tiene significado.
-                    if (!res.metadata.is_color) chkNorm.checked = false;
-                }
+                // Los dos ajustes cromáticos de apilado comparten el mismo
+                // contrato visual y funcional: mono los apaga, bloquea y
+                // explica; una fuente color restaura la preferencia del usuario.
+                setPlanetaryColorOptionsAvailability(!!res.metadata.is_color);
 
                 const shouldAdvanceAfterAnalysis =
                     (tutorialManager?.currentFlowName === 'individual' && tutorialManager.currentStepIndex === 3)
@@ -8779,7 +9178,9 @@ if (ui.btnStack) {
                         targetType: flow.category,
                         gpuMode: getGpuMode(),
                         computePolicy: getComputePolicy(),
-                        decodePolicy: getDecodePolicy()
+                        decodePolicy: getDecodePolicy(),
+                        alignRgb: document.getElementById("chk-rgb-align")?.checked || false,
+                        qualityPolicy: getQualityPolicy()
                     });
                 }
 
@@ -9012,6 +9413,7 @@ async function fn_save(format_idx) {
                 psfFromLimb: p.psfFromLimb,
                 edgeAwareStrength: p.edgeAwareStrength,
                 autoMask: p.autoMask,
+                adaptiveUsm: p.adaptiveUsm,
                 levelsBlack: p.levels.black,
                 levelsWhite: p.levels.white,
                 levelsGamma: p.levels.gamma,

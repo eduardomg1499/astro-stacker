@@ -3997,6 +3997,7 @@ async fn process_batch_entry(
     psf_from_limb: Option<bool>,       // A: deconv con PSF medida
     edge_aware_strength: Option<f32>,  // B+: intensidad edge-aware (0..100)
     auto_mask: Option<f32>,            // Calidad: sharpening adaptativo por SNR
+    adaptive_usm: Option<AdaptiveUsmParams>, // USM adaptativo por luminancia de entrada
     levels_black: Option<f32>,         // Niveles: punto negro (0..1)
     levels_white: Option<f32>,         // Niveles: punto blanco (0..1)
     levels_gamma: Option<f32>,         // Niveles: gamma medios (0.1..5)
@@ -4536,6 +4537,7 @@ async fn process_batch_entry(
         use_v_sigma,
         resolved_post.usm_amount,
         resolved_post.usm_radius,
+        adaptive_usm.unwrap_or_default(),
         resolved_post.lce_amount,
         blend,
         contrast,
@@ -6132,6 +6134,8 @@ async fn stack_video(
     gpu_mode: Option<String>,          // GPU compute: "auto" | "gpu" | "cpu"
     compute_policy: Option<String>,    // contrato nuevo; prevalece sobre gpu_mode
     decode_policy: Option<String>,     // FFmpeg decode independiente
+    align_rgb: Option<bool>,           // respeta el switch también en el motor global
+    quality_policy: Option<String>,    // rigor AP: standard/adaptive/maximum
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
  
@@ -6167,11 +6171,11 @@ async fn stack_video(
         is_v3,
         target_type, // NEW
         keep_full_frame,
-        None, // align_rgb: el legacy usa el default (activado, con gates de seguridad)
+        align_rgb,
         gpu_mode,
         compute_policy,
         decode_policy,
-        None, // quality_policy: el comando legado conserva Adaptive
+        quality_policy,
     )
     .await;
 }
@@ -6283,6 +6287,7 @@ async fn apply_wavelets(
     psf_from_limb: Option<bool>,       // A: deconv con PSF medida
     edge_aware_strength: Option<f32>,  // B+: intensidad edge-aware (0..100)
     auto_mask: Option<f32>,            // Calidad: sharpening adaptativo por SNR
+    adaptive_usm: Option<AdaptiveUsmParams>, // USM adaptativo por luminancia de entrada
     preview_downscale: Option<u32>,    // Interactividad: 2/4 = preview rapido en arrastre
     gpu_mode: Option<String>,          // Velocidad: "auto"|"gpu"|"cpu" (descomposicion GPU)
     levels_black: Option<f32>,         // Niveles: punto negro (0..1)
@@ -6373,6 +6378,7 @@ async fn apply_wavelets(
         vc_sigma,
         resolved_post.usm_amount,
         resolved_post.usm_radius,
+        adaptive_usm.unwrap_or_default(),
         resolved_post.lce_amount,
         blend,
         contrast,
@@ -6558,6 +6564,7 @@ async fn save_final_image(
     psf_from_limb: Option<bool>,       // A: deconv con PSF medida
     edge_aware_strength: Option<f32>,  // B+: intensidad edge-aware (0..100)
     auto_mask: Option<f32>,            // Calidad: sharpening adaptativo por SNR
+    adaptive_usm: Option<AdaptiveUsmParams>, // USM adaptativo por luminancia de entrada
     levels_black: Option<f32>,         // Niveles: punto negro (0..1)
     levels_white: Option<f32>,         // Niveles: punto blanco (0..1)
     levels_gamma: Option<f32>,         // Niveles: gamma medios (0.1..5)
@@ -6627,6 +6634,7 @@ async fn save_final_image(
         vc_sigma,
         resolved_post.usm_amount,
         resolved_post.usm_radius,
+        adaptive_usm.unwrap_or_default(),
         resolved_post.lce_amount,
         blend,
         contrast,
@@ -11573,6 +11581,8 @@ fn apply_smart_sharpen_bilateral(
     amt: f32,
     img_scale: f32,
     auto_mask: f32,
+    adaptive: &AdaptiveUsmParams,
+    input_luminance: Option<&[f32]>,
 ) -> Vec<f32> {
     // FIX: If radius is 0 (default slider pos), use an intelligent default (1.5)
     // allowing "One Slider" operation as requested.
@@ -11596,15 +11606,30 @@ fn apply_smart_sharpen_bilateral(
     } else {
         None
     };
+    let adaptive_enabled = adaptive.enabled
+        && input_luminance.is_some_and(|values| values.len() == chan.len());
+    let adaptive_min = adaptive.amount_min.clamp(0.0, 2.0);
+    let adaptive_max = adaptive.amount_max.clamp(0.0, 2.0);
+    let adaptive_threshold = adaptive.threshold.clamp(0.0, 1.0);
+    let adaptive_width = adaptive.transition.clamp(0.005, 1.0);
+    let transition_low = adaptive_threshold - adaptive_width * 0.5;
+    let transition_high = adaptive_threshold + adaptive_width * 0.5;
 
     for i in 0..chan.len() {
         let diff = chan[i] - blurred[i];
+        let adaptive_scale = if adaptive_enabled {
+            let brightness = input_luminance.expect("validated adaptive luminance")[i];
+            let t = smoothstep(transition_low, transition_high, brightness);
+            adaptive_min + (adaptive_max - adaptive_min) * t
+        } else {
+            1.0
+        };
         let mut added = if diff.abs() > threshold {
             diff * amt
         } else {
             let factor = (diff.abs() / threshold).powf(2.0);
             diff * amt * factor
-        };
+        } * adaptive_scale;
         if let Some(ref map) = confidence {
             added *= 1.0 - mask_strength * (1.0 - map[i]);
         }

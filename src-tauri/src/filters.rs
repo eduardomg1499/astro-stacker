@@ -678,6 +678,11 @@ fn estimate_color_adjust_context(data: &[u16]) -> (f32, f32) {
     (pivot, tone_white)
 }
 
+#[inline]
+fn blend_restoration(base: f32, restored: f32, amount: f32, protection: f32) -> f32 {
+    base + (restored - base) * amount.clamp(0.0, 1.0) * protection.clamp(0.0, 1.0)
+}
+
 fn run_processing_pipeline(
     app: &tauri::AppHandle,
     state: &State<'_, AppState>,
@@ -706,6 +711,7 @@ fn run_processing_pipeline(
     vc_sigma: f32,
     usm_amount: f32,
     usm_radius: f32,
+    adaptive_usm: AdaptiveUsmParams,
     lce_amount: f32,
     blend: f32,
     contrast: f32,
@@ -1156,6 +1162,7 @@ fn run_processing_pipeline(
         master_denoise_chroma,
         usm_amount,
         usm_radius,
+        adaptive_usm: adaptive_usm.clone(),
         lce_amount,
         deringing_mode,
         deringing_radius: if deringing_mode > 0 { deringing_radius } else { 0.0 },
@@ -1264,6 +1271,22 @@ fn run_processing_pipeline(
             );
         }
 
+        // ImPPG-style adaptive USM is keyed to the UNPROCESSED input
+        // luminance, not to each RGB channel independently. One shared map
+        // therefore preserves colour balance when RGB sharpening is enabled
+        // and behaves identically for mono data.
+        let adaptive_usm_reference = adaptive_usm.enabled.then(|| {
+            (0..size)
+                .map(|index| {
+                    let pixel = index * 3;
+                    let luminance = 0.2126 * original.data[pixel] as f32
+                        + 0.7152 * original.data[pixel + 1] as f32
+                        + 0.0722 * original.data[pixel + 2] as f32;
+                    (luminance / img_p99.max(1.0)).clamp(0.0, 1.0)
+                })
+                .collect::<Vec<f32>>()
+        });
+
         let total_filter_channels = work_filter.len().max(1);
         for (ch_idx, ty) in work_filter.iter_mut().enumerate() {
             if crisp > 0.0 {
@@ -1278,6 +1301,8 @@ fn run_processing_pipeline(
                     usm_amount,
                     img_scale,
                     auto_amt,
+                    &adaptive_usm,
+                    adaptive_usm_reference.as_deref(),
                 );
             }
             if lce_amount > 0.0 {
@@ -1408,9 +1433,9 @@ fn run_processing_pipeline(
             };
 
             let effective_factor = p_factor * c_guard;
-            r = or + (filtered_channels[0][i] - or) * blend * effective_factor;
-            g = og + (filtered_channels[1][i] - og) * blend * effective_factor;
-            b = ob + (filtered_channels[2][i] - ob) * blend * effective_factor;
+            r = blend_restoration(or, filtered_channels[0][i], blend, effective_factor);
+            g = blend_restoration(og, filtered_channels[1][i], blend, effective_factor);
+            b = blend_restoration(ob, filtered_channels[2][i], blend, effective_factor);
         } else {
             let oy = base_channels[0][i];
             let p_start = 32000.0;
@@ -1421,7 +1446,7 @@ fn run_processing_pipeline(
                 1.0
             };
 
-            let y_enhanced = oy + (filtered_channels[0][i] - oy) * blend * p_factor;
+            let y_enhanced = blend_restoration(oy, filtered_channels[0][i], blend, p_factor);
             let (tr, tg, tb) = yuv_to_rgb(y_enhanced, render_base_u[i], render_base_v[i]);
             r = tr;
             g = tg;
@@ -1667,8 +1692,28 @@ mod edge_aware_tests {
                 }
             }
         }
-        let uniform = apply_smart_sharpen_bilateral(&image, width, height, 1.2, 1.0, 1.0, 0.0);
-        let protected = apply_smart_sharpen_bilateral(&image, width, height, 1.2, 1.0, 1.0, 1.0);
+        let uniform = apply_smart_sharpen_bilateral(
+            &image,
+            width,
+            height,
+            1.2,
+            1.0,
+            1.0,
+            0.0,
+            &AdaptiveUsmParams::default(),
+            None,
+        );
+        let protected = apply_smart_sharpen_bilateral(
+            &image,
+            width,
+            height,
+            1.2,
+            1.0,
+            1.0,
+            1.0,
+            &AdaptiveUsmParams::default(),
+            None,
+        );
         let flat_change = |result: &[f32]| -> f32 {
             let mut total = 0.0;
             let mut samples = 0usize;
@@ -1689,5 +1734,110 @@ mod edge_aware_tests {
         let uniform_edge = (uniform[edge_index] - image[edge_index]).abs();
         let protected_edge = (protected[edge_index] - image[edge_index]).abs();
         assert!(protected_edge > uniform_edge * 0.35, "la estructura coherente no debe desaparecer");
+    }
+
+    #[test]
+    fn test_high_pass_changes_structure_but_preserves_a_flat_field() {
+        let (width, height) = (48usize, 48usize);
+        let flat = vec![18000.0f32; width * height];
+        let flat_result = apply_high_pass(&flat, width, height, 3.0, 1.5, 1.0);
+        assert!(
+            flat_result
+                .iter()
+                .zip(flat.iter())
+                .all(|(result, source)| (result - source).abs() < 1e-3),
+            "High Pass no debe inventar detalle sobre un campo plano"
+        );
+
+        let mut structured = flat;
+        for y in 18..30 {
+            for x in 18..30 {
+                structured[y * width + x] = 42000.0;
+            }
+        }
+        let result = apply_high_pass(&structured, width, height, 3.0, 1.5, 1.0);
+        let mean_delta = result
+            .iter()
+            .zip(structured.iter())
+            .map(|(after, before)| (after - before).abs())
+            .sum::<f32>()
+            / result.len() as f32;
+        assert!(mean_delta > 25.0, "High Pass debe cambiar estructura real: {mean_delta}");
+    }
+
+    #[test]
+    fn test_adaptive_usm_protects_dark_regions_and_keeps_bright_detail() {
+        let (width, height) = (64usize, 48usize);
+        let mut image = vec![0.0f32; width * height];
+        let mut luminance = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let index = y * width + x;
+                let bright = x >= width / 2;
+                let base = if bright { 42000.0 } else { 5000.0 };
+                let texture = if (x + y) % 2 == 0 { 500.0 } else { -500.0 };
+                image[index] = base + texture;
+                luminance[index] = if bright { 0.82 } else { 0.08 };
+            }
+        }
+        let adaptive = AdaptiveUsmParams {
+            enabled: true,
+            amount_min: 0.05,
+            amount_max: 1.0,
+            threshold: 0.45,
+            transition: 0.2,
+        };
+        let result = apply_smart_sharpen_bilateral(
+            &image,
+            width,
+            height,
+            1.2,
+            1.4,
+            1.0,
+            0.0,
+            &adaptive,
+            Some(&luminance),
+        );
+        let region_delta = |left: usize, right: usize| -> f32 {
+            let mut total = 0.0;
+            let mut count = 0usize;
+            for y in 6..height - 6 {
+                for x in left..right {
+                    let index = y * width + x;
+                    total += (result[index] - image[index]).abs();
+                    count += 1;
+                }
+            }
+            total / count.max(1) as f32
+        };
+        let dark_delta = region_delta(6, width / 2 - 6);
+        let bright_delta = region_delta(width / 2 + 6, width - 6);
+        assert!(
+            bright_delta > dark_delta * 8.0,
+            "USM adaptativo debe proteger señal oscura: oscuro {dark_delta}, brillante {bright_delta}"
+        );
+    }
+
+    #[test]
+    fn test_restoration_blend_has_clear_endpoints_and_clamps() {
+        assert_eq!(blend_restoration(1200.0, 4200.0, 0.0, 1.0), 1200.0);
+        assert_eq!(blend_restoration(1200.0, 4200.0, 1.0, 1.0), 4200.0);
+        assert_eq!(blend_restoration(1200.0, 4200.0, 2.0, 1.0), 4200.0);
+        assert_eq!(blend_restoration(1200.0, 4200.0, 1.0, 0.5), 2700.0);
+    }
+
+    #[test]
+    fn test_rgb_shift_moves_a_signal_in_the_requested_direction() {
+        let (width, height) = (9usize, 7usize);
+        let mut channel = vec![0.0f32; width * height];
+        channel[3 * width + 4] = 50000.0;
+        let shifted = shift_channel(&channel, width, height, 1.0, -1.0);
+        let peak = shifted
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.partial_cmp(right.1).unwrap())
+            .map(|(index, _)| index)
+            .unwrap();
+        assert_eq!((peak % width, peak / width), (5, 2));
     }
 }

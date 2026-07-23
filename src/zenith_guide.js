@@ -9,6 +9,7 @@ const DEFAULT_RULES = [
     target: "#btn-open-file",
     actionLabel: "Elegir fuente",
     activate: true,
+    dismissible: false,
   },
   {
     id: "histogram-unavailable",
@@ -16,10 +17,11 @@ const DEFAULT_RULES = [
     when: (ctx) => ctx.hasResult && ctx.histogramAvailable === false,
     level: "warning",
     title: "Falta el diagnóstico 16-bit",
-    message: "Actualiza el histograma antes de tocar niveles; así evitas decidir sobre una vista incompleta.",
+    message: "Actualiza la medición antes de tocar niveles; no modifica la imagen.",
     target: "#btn-refresh-histogram",
-    actionLabel: "Actualizar diagnóstico",
+    actionLabel: "Actualizar medición",
     activate: true,
+    dismissible: false,
   },
   {
     id: "needs-analysis",
@@ -30,6 +32,7 @@ const DEFAULT_RULES = [
     message: "El análisis detecta calidad, movimiento y el mejor fotograma de referencia.",
     target: "#btn-analyze",
     actionLabel: "Ir al análisis",
+    dismissible: false,
   },
   {
     id: "ready-to-stack",
@@ -40,6 +43,7 @@ const DEFAULT_RULES = [
     message: "Revisa porcentaje, objetivo y método; después inicia el apilado.",
     target: "#btn-stack",
     actionLabel: "Revisar apilado",
+    dismissible: false,
   },
   {
     id: "clipping",
@@ -50,10 +54,13 @@ const DEFAULT_RULES = [
     message: (ctx) => {
       const shadow = (Number(ctx.shadowClip || 0) * 100).toFixed(2);
       const highlight = (Number(ctx.highlightClip || 0) * 100).toFixed(2);
-      return `Recorte medido: sombras ${shadow}% y luces ${highlight}%. Ajusta niveles mirando el histograma.`;
+      return `Recorte medido: sombras ${shadow}% y luces ${highlight}%. Puedo neutralizar niveles agresivos y compensar el extremo afectado.`;
     },
-    target: "#post-histogram-card",
-    actionLabel: "Corregir niveles",
+    target: "#sl-level-mid",
+    actionLabel: "Ver niveles",
+    applyAction: "protect-range",
+    applyLabel: "Aplicar corrección segura",
+    dismissible: true,
   },
   {
     id: "ringing",
@@ -61,9 +68,12 @@ const DEFAULT_RULES = [
     when: (ctx) => ctx.hasArtifactAnalysis && ctx.ringingScore >= 8,
     level: "warning",
     title: "Reduce halos antes de afinar",
-    message: (ctx) => `El análisis de imperfecciones midió halos ${Number(ctx.ringingScore).toFixed(1)}. Aplica deringing moderado y comprueba con A/B.`,
+    message: (ctx) => `El análisis de imperfecciones midió halos ${Number(ctx.ringingScore).toFixed(1)}. Aplica la receta medida y comprueba con A/B.`,
     target: "#artifact-repair-card",
     actionLabel: "Abrir reparación",
+    applyAction: "repair-ringing",
+    applyLabel: "Aplicar sugerencia medida",
+    dismissible: true,
   },
   {
     id: "colour-fringe",
@@ -71,19 +81,29 @@ const DEFAULT_RULES = [
     when: (ctx) => ctx.hasArtifactAnalysis && !ctx.isMono && ctx.colorFringeScore >= 6,
     level: "warning",
     title: "Revisa la alineación RGB",
-    message: (ctx) => `El fringing medido es ${Number(ctx.colorFringeScore).toFixed(1)}. Mide los canales antes de aumentar saturación.`,
+    message: (ctx) => `El fringing medido es ${Number(ctx.colorFringeScore).toFixed(1)}. Zenith puede volver a estimar R y B sobre el máster 16-bit.`,
     target: ".atmospheric-module",
-    actionLabel: "Alinear canales",
+    actionLabel: "Ver corrección",
+    applyAction: "align-rgb",
+    applyLabel: "Medir y alinear",
+    dismissible: true,
   },
   {
     id: "low-dynamic-range",
     priority: 72,
-    when: (ctx) => ctx.hasResult && ctx.histogramAvailable && ctx.dynamicRange < 0.12,
+    when: (ctx) => ctx.hasResult && ctx.histogramAvailable && ctx.robustDynamicRange < 0.12,
     level: "next",
     title: "La señal está comprimida",
-    message: "Amplía el rango con niveles o una curva suave antes de aplicar detalle fino.",
+    message: (ctx) => {
+      const low = Math.round(Number(ctx.percentileLow || 0) * 65535);
+      const high = Math.round(Number(ctx.percentileHigh || 1) * 65535);
+      return `El 99.8% útil ocupa aproximadamente ${low.toLocaleString()}–${high.toLocaleString()}. Puedo expandirlo con margen de seguridad.`;
+    },
     target: "#post-tone-module",
-    actionLabel: "Abrir tono",
+    actionLabel: "Ver tono",
+    applyAction: "auto-levels",
+    applyLabel: "Expandir rango útil",
+    dismissible: true,
   },
   {
     id: "dark-result",
@@ -91,9 +111,15 @@ const DEFAULT_RULES = [
     when: (ctx) => ctx.hasResult && ctx.histogramAvailable && ctx.medianLevel < 0.035 && ctx.shadowClip <= 0.0001,
     level: "next",
     title: "Medios tonos muy bajos",
-    message: "Sube exposición o medios de forma gradual; no muevas primero el punto negro.",
+    message: (ctx) => {
+      const ev = Number(ctx.recommendedExposureEv || 0).toFixed(2);
+      return `La mediana está en ${(Number(ctx.medianLevel || 0) * 100).toFixed(1)}%. Una compensación de ${ev} EV la acerca a una lectura útil sin mover el negro.`;
+    },
     target: "#post-tone-module",
-    actionLabel: "Ajustar medios",
+    actionLabel: "Ver medios tonos",
+    applyAction: "lift-midtones",
+    applyLabel: "Aplicar exposición calculada",
+    dismissible: true,
   },
   {
     id: "mono-color",
@@ -101,20 +127,22 @@ const DEFAULT_RULES = [
     when: (ctx) => ctx.hasResult && ctx.isMono,
     level: "info",
     title: "Señal monocroma protegida",
-    message: "Los controles cromáticos están bloqueados; tono, deconvolución, wavelets y detalle siguen disponibles.",
+    message: "Colorimetría y alineación RGB están bloqueadas; tono, deconvolución, wavelets y detalle siguen disponibles.",
     target: "#post-detail-module",
     actionLabel: "Trabajar detalle",
+    dismissible: true,
   },
   {
     id: "compare-ready",
     priority: 58,
-    when: (ctx) => ctx.hasResult && ctx.canCompare,
+    when: (ctx) => ctx.hasResult && ctx.canCompare && !ctx.compareActive,
     level: "success",
     title: "Ya puedes validar el ajuste",
-    message: "Activa A/B para comparar la versión anterior u original con el mismo zoom y encuadre.",
+    message: "Activa A/B y elige Paso anterior o Apilado original; ambas vistas conservan zoom y encuadre.",
     target: "#btn-post-compare",
-    actionLabel: "Abrir A/B",
+    actionLabel: "Activar A/B",
     activate: true,
+    dismissible: true,
   },
   {
     id: "result-ready",
@@ -125,8 +153,9 @@ const DEFAULT_RULES = [
     message: (ctx) => ctx.historyLength > 1
       ? "El historial está activo. Ajusta un módulo, compara y conserva sólo la mejora visible."
       : "Orden recomendado: niveles y curva, restauración de detalle, ruido y finalmente color.",
-    target: "#post-histogram-card",
-    actionLabel: "Ir al primer paso",
+    target: "#post-tone-module",
+    actionLabel: "Ir a tono y rango",
+    dismissible: true,
   },
 ];
 
@@ -134,9 +163,9 @@ function resolveValue(value, context) {
   return typeof value === "function" ? value(context) : value;
 }
 
-export function evaluateGuide(context, rules = DEFAULT_RULES) {
+export function evaluateGuide(context, rules = DEFAULT_RULES, dismissedIds = new Set()) {
   return rules
-    .filter((rule) => rule.when(context))
+    .filter((rule) => !dismissedIds.has(rule.id) && rule.when(context))
     .sort((left, right) => (right.priority || 0) - (left.priority || 0))
     .slice(0, 4)
     .map(({ when, ...rule }) => ({
@@ -146,28 +175,48 @@ export function evaluateGuide(context, rules = DEFAULT_RULES) {
     }));
 }
 
+function appendSpriteIcon(button, iconId) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "zas-icon");
+  svg.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+  use.setAttribute("href", `#${iconId}`);
+  svg.append(use);
+  button.append(svg);
+}
+
 export class IntelligentAssistant {
-  constructor({ panel, list, status, summary, onNavigate } = {}) {
+  constructor({ panel, list, status, summary, onNavigate, onApply } = {}) {
     this.panel = panel || null;
     this.list = list || null;
     this.status = status || null;
     this.summary = summary || null;
-    this.onNavigate = onNavigate || ((target, suggestion = {}) => {
-      const element = document.querySelector(target);
-      const details = element?.closest?.("details");
-      if (details) details.open = true;
-      element?.scrollIntoView?.({ behavior: "smooth", block: "center" });
-      element?.focus?.({ preventScroll: true });
-      if (suggestion.activate && element && !element.disabled) element.click();
-    });
+    this.onNavigate = onNavigate || (() => {});
+    this.onApply = onApply || (() => {});
     this.context = {};
+    this.generation = null;
+    this.dismissedIds = new Set();
+  }
+
+  resetForGeneration(generation) {
+    const normalized = generation ?? null;
+    if (this.generation === normalized) return;
+    this.generation = normalized;
+    this.dismissedIds.clear();
   }
 
   update(context = {}) {
+    this.resetForGeneration(context.generation ?? this.generation);
     this.context = { ...this.context, ...context };
-    const suggestions = evaluateGuide(this.context);
+    const suggestions = evaluateGuide(this.context, DEFAULT_RULES, this.dismissedIds);
     this.render(suggestions);
     return suggestions;
+  }
+
+  dismiss(id) {
+    if (!id) return;
+    this.dismissedIds.add(id);
+    this.update({});
   }
 
   render(suggestions) {
@@ -190,24 +239,60 @@ export class IntelligentAssistant {
       const article = document.createElement("article");
       article.className = `guide-card guide-${suggestion.level}`;
       article.dataset.suggestionId = suggestion.id;
+
       const rank = document.createElement("span");
       rank.className = "guide-rank";
       rank.textContent = String(index + 1).padStart(2, "0");
+
       const body = document.createElement("div");
+      body.className = "guide-card-body";
       const heading = document.createElement("h4");
       heading.textContent = suggestion.title;
       const message = document.createElement("p");
       message.textContent = suggestion.message;
       body.append(heading, message);
-      article.append(rank, body);
+
+      if (suggestion.dismissible !== false) {
+        const dismiss = document.createElement("button");
+        dismiss.type = "button";
+        dismiss.className = "guide-dismiss-button";
+        dismiss.setAttribute("aria-label", `Descartar recomendación: ${suggestion.title}`);
+        dismiss.title = "Descartar para este apilado";
+        appendSpriteIcon(dismiss, "icon-cross");
+        dismiss.addEventListener("click", () => this.dismiss(suggestion.id));
+        article.append(dismiss);
+      }
+
+      const actions = document.createElement("div");
+      actions.className = "guide-card-actions";
       if (suggestion.target) {
         const button = document.createElement("button");
         button.type = "button";
         button.className = "guide-go-button";
         button.textContent = suggestion.actionLabel || "Ir al control";
         button.addEventListener("click", () => this.onNavigate(suggestion.target, suggestion));
-        body.append(button);
+        actions.append(button);
       }
+      if (suggestion.applyAction) {
+        const apply = document.createElement("button");
+        apply.type = "button";
+        apply.className = "guide-apply-button";
+        apply.textContent = suggestion.applyLabel || "Aplicar recomendación";
+        apply.addEventListener("click", async () => {
+          apply.disabled = true;
+          apply.setAttribute("aria-busy", "true");
+          try {
+            await this.onApply(suggestion.applyAction, suggestion, this.context);
+          } finally {
+            apply.disabled = false;
+            apply.removeAttribute("aria-busy");
+          }
+        });
+        actions.append(apply);
+      }
+      if (actions.childElementCount) body.append(actions);
+
+      article.append(rank, body);
       this.list.append(article);
     });
   }

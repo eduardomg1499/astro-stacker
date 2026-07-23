@@ -2960,6 +2960,36 @@ struct WaveletLayers {
     edge_aware_strength: f32,
 }
 
+/// Brightness-aware unsharp-mask contract. The base USM amount remains the
+/// master strength; these values modulate that strength from dark to bright
+/// regions using the unprocessed luminance as the reference. This mirrors the
+/// useful ImPPG workflow without changing the neutral recipe when disabled.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct AdaptiveUsmParams {
+    enabled: bool,
+    /// Multiplier applied below the threshold, expressed as 0..2.
+    amount_min: f32,
+    /// Multiplier applied above the transition, expressed as 0..2.
+    amount_max: f32,
+    /// Normalised input luminance at the centre of the transition.
+    threshold: f32,
+    /// Width of the smooth transition in normalised luminance.
+    transition: f32,
+}
+
+impl Default for AdaptiveUsmParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            amount_min: 0.15,
+            amount_max: 1.0,
+            threshold: 0.12,
+            transition: 0.18,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq)]
 struct FilterParams {
     u_amts: [f32; 5],
@@ -2985,6 +3015,7 @@ struct FilterParams {
     edge_aware: bool,
     edge_aware_strength: f32,
     auto_mask: f32,
+    adaptive_usm: AdaptiveUsmParams,
 }
 
 #[derive(Clone)]

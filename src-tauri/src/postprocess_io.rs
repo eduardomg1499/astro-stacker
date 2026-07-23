@@ -9,6 +9,8 @@ struct PostprocessHistogram {
     minimum: u16,
     maximum: u16,
     median: u16,
+    percentile_low: u16,
+    percentile_high: u16,
     shadow_clip: f32,
     highlight_clip: f32,
     is_mono: bool,
@@ -185,16 +187,23 @@ fn compute_postprocess_histogram(
     }
 
     let pixel_count = image.width.saturating_mul(image.height).max(1);
-    let median_target = (pixel_count as u64 + 1) / 2;
-    let mut cumulative = 0u64;
-    let mut median_bin = 0usize;
-    for (index, count) in luminance.iter().enumerate() {
-        cumulative += count;
-        if cumulative >= median_target {
-            median_bin = index;
-            break;
+    let percentile_bin = |quantile: f64| -> usize {
+        let target = ((pixel_count as f64 * quantile).ceil() as u64).max(1);
+        let mut cumulative = 0u64;
+        for (index, count) in luminance.iter().enumerate() {
+            cumulative += count;
+            if cumulative >= target {
+                return index;
+            }
         }
-    }
+        BINS - 1
+    };
+    let bin_to_u16 = |bin: usize| -> u16 {
+        ((bin as u32 * 65535 + (BINS as u32 - 1) / 2) / (BINS as u32 - 1)) as u16
+    };
+    let median_bin = percentile_bin(0.5);
+    let percentile_low_bin = percentile_bin(0.001);
+    let percentile_high_bin = percentile_bin(0.999);
 
     PostprocessHistogram {
         bins: BINS,
@@ -204,7 +213,9 @@ fn compute_postprocess_histogram(
         luminance,
         minimum,
         maximum,
-        median: ((median_bin as u32 * 65535 + (BINS as u32 - 1) / 2) / (BINS as u32 - 1)) as u16,
+        median: bin_to_u16(median_bin).clamp(minimum, maximum),
+        percentile_low: bin_to_u16(percentile_low_bin).clamp(minimum, maximum),
+        percentile_high: bin_to_u16(percentile_high_bin).clamp(minimum, maximum),
         shadow_clip: clipped_shadows as f32 / pixel_count as f32,
         highlight_clip: clipped_highlights as f32 / pixel_count as f32,
         is_mono: image.is_mono,
@@ -837,6 +848,9 @@ mod postprocess_io_tests {
         assert_eq!(histogram.red.iter().sum::<u64>(), 2);
         assert_eq!(histogram.luminance.iter().sum::<u64>(), 2);
         assert!(histogram.maximum > histogram.minimum);
+        assert!(histogram.percentile_low >= histogram.minimum);
+        assert!(histogram.percentile_high <= histogram.maximum);
+        assert!(histogram.percentile_high >= histogram.percentile_low);
     }
 
     #[test]
@@ -944,5 +958,40 @@ mod postprocess_io_tests {
         );
         assert!((r / g - rg_before).abs() < 1e-5);
         assert!((b / g - bg_before).abs() < 1e-5);
+    }
+
+    #[test]
+    fn gamma_brightness_and_saturation_follow_their_independent_meanings() {
+        let apply = |gamma: f32, saturation: f32, brightness: f32| {
+            let (mut r, mut g, mut b) = (9000.0f32, 18000.0f32, 27000.0f32);
+            apply_advanced_color_magic(
+                &mut r,
+                &mut g,
+                &mut b,
+                gamma,
+                saturation,
+                1.0,
+                brightness,
+                0.0,
+                0.0,
+                16000.0,
+                65535.0,
+                0.0,
+                1.0,
+                1.0,
+            );
+            (r, g, b)
+        };
+
+        let neutral = apply(1.0, 1.0, 0.0);
+        let gamma_lift = apply(1.8, 1.0, 0.0);
+        let brighter = apply(1.0, 1.0, 0.4);
+        let saturated = apply(1.0, 1.8, 0.0);
+        assert!(gamma_lift.1 > neutral.1, "gamma > 1 debe elevar medios tonos");
+        assert!(brighter.1 > neutral.1, "brillo debe actuar como exposición positiva");
+        assert!(
+            saturated.2 - saturated.0 > neutral.2 - neutral.0,
+            "saturación debe ampliar la separación cromática"
+        );
     }
 }

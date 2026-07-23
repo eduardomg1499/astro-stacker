@@ -2445,13 +2445,13 @@
                                     <span class="planetary-settings-label"
                                         data-i18n="settings.general.quality_policy">Rigor de validación por AP</span>
                                     <small id="planetary-quality-policy-hint" class="planetary-settings-hint"
-                                        data-i18n="settings.general.quality_policy_hint">Adaptive revisa coincidencias ambiguas. Maximum es más estricto y lento.</small>
+                                        data-i18n="settings.general.quality_policy_hint">Maximum revalida coincidencias ambiguas por AP; es el valor predeterminado y puede tardar más.</small>
                                 </div>
                                 <select id="sel-planetary-quality-policy" aria-describedby="planetary-quality-policy-hint"
                                     class="planetary-settings-select planetary-settings-select--quality">
-                                    <option value="adaptive" selected data-i18n="settings.general.quality_adaptive">Adaptive (recomendado)</option>
+                                    <option value="adaptive" data-i18n="settings.general.quality_adaptive">Adaptive</option>
                                     <option value="standard" data-i18n="settings.general.quality_standard">Standard</option>
-                                    <option value="maximum" data-i18n="settings.general.quality_maximum">Maximum (experto)</option>
+                                    <option value="maximum" selected data-i18n="settings.general.quality_maximum">Maximum (predeterminado)</option>
                                 </select>
                             </div>
                             <details class="planetary-settings-details">
@@ -3232,9 +3232,10 @@
                         </label>
                     </div>
                     <!-- NORMALIZE COLORS TOGGLE -->
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
-                        <span style="color:#aaa; font-size:0.8rem;" data-i18n="analysis.normalize_colors">Normalizar
-                            Colores (Auto-Balance)</span>
+                    <div id="planetary-normalize-option" class="planetary-color-option"
+                        style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                        <span class="planetary-option-copy"><span style="color:#aaa; font-size:0.8rem;" data-i18n="analysis.normalize_colors">Normalizar
+                            Colores (Auto-Balance)</span><small class="planetary-option-availability" aria-live="polite"></small></span>
                         <label class="switch-container">
                             <span class="switch" style="transform:scale(0.8);">
                                 <input type="checkbox" id="chk-normalize-colors"
@@ -3244,9 +3245,10 @@
                         </label>
                     </div>
                     <!-- AUTO RGB ALIGN TOGGLE (dispersion atmosferica) -->
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
-                        <span style="color:#aaa; font-size:0.8rem;" data-i18n="analysis.rgb_align">Alineación RGB
-                            (Auto)</span>
+                    <div id="planetary-rgb-align-option" class="planetary-color-option"
+                        style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                        <span class="planetary-option-copy"><span style="color:#aaa; font-size:0.8rem;" data-i18n="analysis.rgb_align">Alineación RGB
+                            (Auto)</span><small class="planetary-option-availability" aria-live="polite"></small></span>
                         <label class="switch-container">
                             <span class="switch" style="transform:scale(0.8);">
                                 <input type="checkbox" id="chk-rgb-align" checked>
@@ -3540,6 +3542,22 @@
                             class="slider-green">
                         <input type="number" id="num-auto-mask" value="0" class="input-val">
                     </div>
+                    <div class="linked-wavelet-editor" aria-label="Edición enlazada de capas wavelet">
+                        <div class="linked-wavelet-heading">
+                            <div>
+                                <strong>Capas enlazadas</strong>
+                                <small>Propaga el ajuste hacia escalas sucesivas</small>
+                            </div>
+                            <label class="switch-container"><span class="switch" style="transform:scale(0.8);">
+                                <input type="checkbox" id="chk-linked-wavelets">
+                                <span class="slider round"></span></span></label>
+                        </div>
+                        <label class="linked-wavelet-decay" for="sl-linked-wavelet-decay">
+                            <span>Continuidad entre capas</span><output id="out-linked-wavelet-decay">70%</output>
+                        </label>
+                        <input id="sl-linked-wavelet-decay" type="range" min="0" max="100" value="70" step="1" disabled>
+                        <p>Al mover Intensidad o Red. Ruido, las capas más gruesas reciben una fracción decreciente. Puedes retocar cada capa después.</p>
+                    </div>
                     <div class="wavelet-row header-row"><span>#</span> <span
                             data-i18n="wavelets.multiscale.intensity">Intensidad</span> <span>Val</span>
                         <span data-i18n="wavelets.multiscale.noise_reduction">Red. Ruido</span> <span>Val</span>
@@ -3597,14 +3615,15 @@
                             <div class="post-heading-actions">
                                 <button id="btn-toggle-post-scopes" type="button" class="post-icon-button"
                                     title="Mostrar gráficas flotantes" aria-label="Mostrar gráficas flotantes" aria-pressed="false">
-                                    <svg class="zas-icon"><use href="#icon-chart"></use></svg>
+                                    <svg class="zas-icon"><use href="#icon-chart"></use></svg><span>Gráficas</span>
                                 </button>
                                 <button id="btn-refresh-histogram" type="button" class="post-icon-button"
-                                    title="Actualizar histograma" aria-label="Actualizar histograma">
-                                    <svg class="zas-icon"><use href="#icon-refresh"></use></svg>
+                                    title="Volver a medir el histograma; no cambia la imagen" aria-label="Actualizar medición del histograma">
+                                    <svg class="zas-icon"><use href="#icon-refresh"></use></svg><span>Actualizar</span>
                                 </button>
                             </div>
                         </div>
+                        <p class="histogram-action-help">Gráficas abre el panel flotante. Actualizar sólo vuelve a medir la vista 16-bit; no reinicia ni modifica ajustes.</p>
                         <div class="histogram-stage">
                             <canvas id="post-histogram" width="360" height="150"></canvas>
                             <div id="histogram-black-marker" class="histogram-marker marker-black"></div>
@@ -3676,6 +3695,25 @@
                                 class="slider-yellow">
                             <input type="number" id="num-usm-rad" value="0.0" step="0.1" class="input-val">
                         </div>
+                        <details id="adaptive-usm-module" class="adaptive-usm-module">
+                            <summary>
+                                <span>USM adaptativo por luminancia</span>
+                                <label class="switch-container" aria-label="Activar USM adaptativo"><span class="switch" style="transform:scale(0.78);">
+                                    <input type="checkbox" id="chk-adaptive-usm">
+                                    <span class="slider round"></span></span></label>
+                            </summary>
+                            <p class="module-help">Modula Smart Sharpen con el brillo del máster sin procesar: protege señal oscura y conserva la fuerza sobre detalle brillante.</p>
+                            <div id="adaptive-usm-controls" class="adaptive-usm-controls is-disabled">
+                                <label for="sl-adaptive-usm-min"><span>Fuerza mínima</span><output id="out-adaptive-usm-min">15%</output></label>
+                                <input id="sl-adaptive-usm-min" type="range" min="0" max="200" value="15" step="1" disabled>
+                                <label for="sl-adaptive-usm-max"><span>Fuerza máxima</span><output id="out-adaptive-usm-max">100%</output></label>
+                                <input id="sl-adaptive-usm-max" type="range" min="0" max="200" value="100" step="1" disabled>
+                                <label for="sl-adaptive-usm-threshold"><span>Umbral de luminancia</span><output id="out-adaptive-usm-threshold">12%</output></label>
+                                <input id="sl-adaptive-usm-threshold" type="range" min="0" max="100" value="12" step="1" disabled>
+                                <label for="sl-adaptive-usm-transition"><span>Transición suave</span><output id="out-adaptive-usm-transition">18%</output></label>
+                                <input id="sl-adaptive-usm-transition" type="range" min="1" max="100" value="18" step="1" disabled>
+                            </div>
+                        </details>
                     </div>
                     <div class="control-row" style="margin-top:8px;">
                         <label style="color:#c084fc;">LCE / CLAHE</label>
@@ -3867,12 +3905,14 @@
                                 <input type="number" id="by" aria-label="Azul Y" step="0.05" min="-6" max="6" value="0">
                             </div>
                         </details>
-                        <div class="control-row" style="margin-top:15px;">
-                            <label data-i18n="wavelets.post.blend">Mezcla (Blend)</label>
-                            <input type="range" id="blend-slider" min="0" max="100" value="100">
+                        <div class="control-row blend-control-row" style="margin-top:15px;">
+                            <label for="blend-slider">Mezcla de restauración</label>
+                            <input type="range" id="blend-slider" min="0" max="100" value="100"
+                                aria-describedby="blend-help">
                             <span id="blend-display"
                                 style="font-size:0.8em; width:35px; text-align:right; color:#aaa;">100%</span>
                         </div>
+                        <p id="blend-help" class="module-help blend-help">0% conserva la base (máster o deconvolución); 100% incorpora wavelets, High Pass, Smart Sharpen, reducción de ruido, LCE y deringing. Tono y color se aplican después.</p>
                         <div id="artifact-repair-card" class="artifact-repair-card">
                             <label style="font-size:0.85rem; color:#94a3b8; font-weight:bold;"
                                 data-i18n="wavelets.post.deringing">Reduccion de Artefactos
@@ -3984,9 +4024,8 @@
                 </div>
             </div>
             <div id="view-result" class="view-box" style="display:none; border-left:1px solid #334155;">
-                <div class="view-label"
-                    style="color:var(--success); display:flex; align-items:center; gap:12px; pointer-events:auto !important; width:auto; max-width:none;">
-                    <span data-i18n="viewer.processed_result">Resultado Procesado</span>
+                <div class="view-label result-view-label">
+                    <span class="result-view-title" data-i18n="viewer.processed_result">Resultado Procesado</span>
                     <div class="result-history-toolbar" role="toolbar" aria-label="Historial y comparación">
                         <button id="btn-post-undo" type="button" disabled title="Deshacer" aria-label="Deshacer">
                             <svg class="zas-icon"><use href="#icon-undo"></use></svg>
@@ -3997,18 +4036,21 @@
                         <button id="btn-post-compare" type="button" disabled aria-pressed="false" title="Activar comparación A/B">
                             <svg class="zas-icon"><use href="#icon-compare"></use></svg><span>A/B</span>
                         </button>
-                        <select id="post-compare-reference" disabled aria-label="Referencia de comparación" title="Referencia A">
-                            <option value="previous">A: ajuste anterior</option>
-                            <option value="source">A: resultado original</option>
-                        </select>
+                        <label class="compare-reference-control" for="post-compare-reference">
+                            <span>Comparar A con</span>
+                            <select id="post-compare-reference" disabled aria-label="Referencia de comparación" title="Referencia A">
+                                <option value="previous">Paso anterior</option>
+                                <option value="source">Apilado original</option>
+                            </select>
+                        </label>
                         <label id="post-compare-split-wrap" class="compare-split-wrap" hidden>
-                            <span>División</span>
-                            <input id="post-compare-split" type="range" min="0" max="100" value="50">
+                            <span>Corte A/B</span>
+                            <input id="post-compare-split" type="range" min="0" max="100" value="50" aria-label="Posición de división A/B">
                         </label>
                         <span id="post-history-state" class="post-history-state">Original</span>
                     </div>
-                    <button id="btn-toggle-source"
-                        style="display:none; width:auto; flex-shrink:0; background:rgba(0,0,0,0.4); border:1px solid #334155; color:#cbd5e1; cursor:pointer; font-size:0.7rem; padding:2px 10px; border-radius:12px; backdrop-filter:blur(4px); white-space:nowrap; line-height:1.2; box-shadow:0 1px 2px rgba(0,0,0,0.2); pointer-events:auto;" data-i18n="viewer.hide_source">Ocultar
+                    <button id="btn-toggle-source" class="result-source-toggle"
+                        style="display:none;" data-i18n="viewer.hide_source">Ocultar
                         Fuente</button>
                 </div>
                 <div id="local-processing-overlay" class="local-overlay">
@@ -4063,7 +4105,7 @@
                 <span class="guide-kicker">ANÁLISIS LOCAL 16-BIT</span>
                 <h3>Asistente inteligente</h3>
             </div>
-            <button id="btn-close-guide" type="button" aria-label="Cerrar asistente">
+            <button id="btn-close-guide" class="floating-panel-close" type="button" aria-label="Cerrar asistente">
                 <svg class="zas-icon"><use href="#icon-cross"></use></svg>
             </button>
         </div>
@@ -4081,8 +4123,9 @@
             <div>
                 <span class="guide-kicker">SCOPES 16-BIT</span>
                 <h3>Diagnóstico visual</h3>
+                <small class="floating-panel-drag-hint">Arrastra este encabezado para mover el panel</small>
             </div>
-            <button id="btn-close-post-scopes" type="button" aria-label="Ocultar gráficas">
+            <button id="btn-close-post-scopes" class="floating-panel-close" type="button" aria-label="Ocultar gráficas">
                 <svg class="zas-icon"><use href="#icon-cross"></use></svg>
             </button>
         </div>
@@ -4095,7 +4138,7 @@
             <canvas id="post-tone-curve" width="420" height="170"></canvas>
         </section>
         <section class="scope-card">
-            <header><strong>Respuesta de detalle</strong><span>escala espacial</span></header>
+            <header><strong>Respuesta de detalle</strong><span id="detail-response-summary">receta neutra</span></header>
             <canvas id="post-detail-curve" width="420" height="150"></canvas>
         </section>
     </aside>
