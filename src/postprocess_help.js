@@ -200,8 +200,35 @@ function helpButton(label) {
   return button;
 }
 
+function ensureHelpLabelCopy(label) {
+  const prepared = label.querySelector?.(":scope > .post-help-label-copy");
+  if (prepared) return prepared;
+
+  const existing = Array.from(label.children || []).find((child) => (
+    child.tagName === "SPAN"
+    && !child.matches(".switch, .slider, .post-control-help")
+    && !child.querySelector("input, output, select, textarea, button")
+  ));
+  if (existing) {
+    existing.classList.add("post-help-label-copy");
+    return existing;
+  }
+
+  const textNodes = Array.from(label.childNodes || []).filter((node) => (
+    node.nodeType === 3 && node.textContent?.trim()
+  ));
+  if (!textNodes.length) return null;
+
+  const copy = document.createElement("span");
+  copy.className = "post-help-label-copy";
+  label.insertBefore(copy, textNodes[0]);
+  textNodes.forEach((node) => copy.append(node));
+  return copy;
+}
+
 function placeControlHelpButton(label, button) {
   label.classList.add("post-help-label");
+  ensureHelpLabelCopy(label);
   const output = label.querySelector?.(":scope > output");
   if (output) {
     label.insertBefore(button, output);

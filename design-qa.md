@@ -57,6 +57,42 @@ final result: passed
 
 ---
 
+# Design QA — alineación responsive y precisión de curvas
+
+Fecha: 2026-07-23
+
+## Estado reproducido
+
+- Aplicación nativa Tauri, ventana 1093×768.
+- Fuente mono 960×612, 24 fotogramas, 977 AP y apilado 12/24.
+- Barra lateral estrecha, resultado 16-bit, historial y A/B activos.
+
+## Comparación visual conjunta
+
+- Histograma, acciones, niveles y encabezado del módulo: `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/layout-icons-histogram-comparison.png`.
+- Sliders del Laboratorio Solar mono: `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/layout-icons-solar-comparison.png`.
+- Tarjetas y cierres del Asistente inteligente: `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/assistant-cards-comparison.png`.
+
+## Recorrido funcional validado
+
+1. `Histograma RGB` conserva título y origen en una fila; `Gráficas` y `Actualizar` ocupan una segunda fila sin invadir el texto.
+2. Negro, Medios, Blanco, tono avanzado y controles solares reservan columnas separadas para etiqueta, ayuda y valor; el track usa una fila completa.
+3. Las bombillas SVG tienen un contenedor exacto de 24×24 px, sin el margen heredado del icono global y con el glifo centrado.
+4. Los controles clásicos de deconvolución, detalle y tono muestran etiqueta y valor arriba y el deslizable debajo, sin colisiones al envolver texto.
+5. En la curva tonal estrecha se pulsó en `(150, 625)` y el nuevo nodo quedó bajo el cursor en esa misma coordenada; la evidencia es `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/tone-curve-pointer-aligned-after.png`.
+6. La edición creó `2/2 · Curva tonal · personalizada` y habilitó A/B, confirmando que el clic no fue sólo visual.
+7. El cierre de cada recomendación ocupa una tercera columna de 30×30 px; al pulsarlo la tarjeta se elimina y las restantes se renumeran sin salto ni superposición.
+
+## Revisión visual
+
+- No se observan iconos sobre texto, valores sobre etiquetas, botones recortados ni cierres flotando sobre el contenido.
+- Los textos largos envuelven dentro de su zona y los controles mantienen un objetivo cómodo para mouse o trackpad.
+- La geometría de la curva usa el área visible real, incluidos sus bordes, tanto para dibujar como para convertir coordenadas del puntero.
+
+final result: passed
+
+---
+
 # Design QA — iconos de ayuda, guía contextual y curva tonal
 
 Fecha: 2026-07-23

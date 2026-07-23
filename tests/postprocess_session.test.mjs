@@ -9,6 +9,8 @@ import {
   evaluateToneCurve,
   normalizeSolarCurvePoints,
   normalizeToneCurvePoints,
+  resolveToneCurveGeometry,
+  toneCurvePointFromClient,
 } from "../src/solar_postprocess.js";
 import { resolvePostprocessHelp } from "../src/postprocess_help.js";
 
@@ -155,6 +157,29 @@ test("the shared tone curve is exact when linear and the assistant can propose i
   }).find((item) => item.id === "tone-curve-opportunity");
   assert.equal(suggestion?.target, "#tone-curve-free");
   assert.equal(suggestion?.applyAction, "tone-curve-auto");
+});
+
+test("tone-curve pointer geometry matches the visible canvas at narrow widths", () => {
+  const geometry = resolveToneCurveGeometry(
+    { left: 100, top: 40, width: 230, height: 172 },
+    {
+      borderLeft: "1px",
+      borderRight: "1px",
+      borderTop: "1px",
+      borderBottom: "1px",
+    },
+  );
+  assert.equal(geometry.left, 101);
+  assert.equal(geometry.top, 41);
+  assert.equal(geometry.width, 228);
+  assert.equal(geometry.height, 170);
+  assert.ok(geometry.width < 260, "the editor must not expand a narrow visible canvas internally");
+
+  const clientX = geometry.left + geometry.pad + (geometry.width - geometry.pad * 2) * 0.25;
+  const clientY = geometry.top + geometry.pad + (geometry.height - geometry.pad * 2) * 0.75;
+  const [x, y] = toneCurvePointFromClient(clientX, clientY, geometry);
+  assert.ok(Math.abs(x - 0.25) < 1e-9);
+  assert.ok(Math.abs(y - 0.25) < 1e-9);
 });
 
 test("contextual control descriptions stay short and concrete", () => {

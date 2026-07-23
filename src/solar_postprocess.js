@@ -135,6 +135,60 @@ export function evaluateSolarCurve(points, value) {
 export const normalizeToneCurvePoints = normalizeSolarCurvePoints;
 export const evaluateToneCurve = evaluateSolarCurve;
 
+function finiteCssNumber(value, fallback = 0) {
+  const number = Number.parseFloat(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+export function resolveToneCurveGeometry(bounds = {}, {
+  borderLeft = 0,
+  borderRight = 0,
+  borderTop = 0,
+  borderBottom = 0,
+  fallbackWidth = 360,
+  fallbackHeight = 190,
+  pad = 16,
+} = {}) {
+  const leftBorder = Math.max(0, finiteCssNumber(borderLeft));
+  const rightBorder = Math.max(0, finiteCssNumber(borderRight));
+  const topBorder = Math.max(0, finiteCssNumber(borderTop));
+  const bottomBorder = Math.max(0, finiteCssNumber(borderBottom));
+  const measuredWidth = finiteCssNumber(bounds.width);
+  const measuredHeight = finiteCssNumber(bounds.height);
+  const width = Math.max(
+    1,
+    measuredWidth > 0
+      ? measuredWidth - leftBorder - rightBorder
+      : finiteCssNumber(fallbackWidth, 360),
+  );
+  const height = Math.max(
+    1,
+    measuredHeight > 0
+      ? measuredHeight - topBorder - bottomBorder
+      : finiteCssNumber(fallbackHeight, 190),
+  );
+  return {
+    left: finiteCssNumber(bounds.left) + leftBorder,
+    top: finiteCssNumber(bounds.top) + topBorder,
+    width,
+    height,
+    pad: Math.max(0, Math.min(finiteCssNumber(pad, 16), Math.min(width, height) / 2 - 1)),
+  };
+}
+
+export function toneCurvePointFromClient(clientX, clientY, geometry) {
+  const { left, top, width, height, pad } = geometry;
+  const x = Math.max(
+    0,
+    Math.min(1, (finiteCssNumber(clientX) - left - pad) / Math.max(1, width - pad * 2)),
+  );
+  const y = Math.max(
+    0,
+    Math.min(1, 1 - (finiteCssNumber(clientY) - top - pad) / Math.max(1, height - pad * 2)),
+  );
+  return [x, y];
+}
+
 export function cloneSolarPreset(name) {
   const preset = SOLAR_CURVE_PRESETS[name] || SOLAR_CURVE_PRESETS.neutral;
   return {
@@ -163,6 +217,8 @@ export class ToneCurveEditor {
     this.pointerId = null;
     this.resizeObserver = null;
     if (!this.canvas) return;
+    this.fallbackWidth = finiteCssNumber(this.canvas.getAttribute?.("width"), 360);
+    this.fallbackHeight = finiteCssNumber(this.canvas.getAttribute?.("height"), 190);
 
     this.canvas.addEventListener("contextmenu", (event) => {
       event.preventDefault();
@@ -206,29 +262,36 @@ export class ToneCurveEditor {
 
   #geometry() {
     const bounds = this.canvas.getBoundingClientRect();
-    const width = Math.max(260, Math.round(bounds.width || this.canvas.width || 360));
-    const height = Math.max(150, Math.round(bounds.height || this.canvas.height || 190));
+    const style = typeof globalThis.getComputedStyle === "function"
+      ? globalThis.getComputedStyle(this.canvas)
+      : null;
+    const geometry = resolveToneCurveGeometry(bounds, {
+      borderLeft: style?.borderLeftWidth,
+      borderRight: style?.borderRightWidth,
+      borderTop: style?.borderTopWidth,
+      borderBottom: style?.borderBottomWidth,
+      fallbackWidth: this.fallbackWidth,
+      fallbackHeight: this.fallbackHeight,
+    });
+    const { width, height } = geometry;
     const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
     if (this.canvas.width !== Math.round(width * dpr) || this.canvas.height !== Math.round(height * dpr)) {
       this.canvas.width = Math.round(width * dpr);
       this.canvas.height = Math.round(height * dpr);
     }
     const context = this.canvas.getContext("2d");
-    context.setTransform(dpr, 0, 0, dpr, 0, 0);
-    return { bounds, context, width, height, pad: 16 };
+    context.setTransform(this.canvas.width / width, 0, 0, this.canvas.height / height, 0, 0);
+    return { ...geometry, context };
   }
 
   #pointFromEvent(event) {
-    const { bounds, width, height, pad } = this.#geometry();
-    const x = Math.max(0, Math.min(1, (event.clientX - bounds.left - pad) / Math.max(1, width - pad * 2)));
-    const y = Math.max(0, Math.min(1, 1 - (event.clientY - bounds.top - pad) / Math.max(1, height - pad * 2)));
-    return [x, y];
+    return toneCurvePointFromClient(event.clientX, event.clientY, this.#geometry());
   }
 
   #nearestIndex(event) {
-    const { bounds, width, height, pad } = this.#geometry();
-    const px = event.clientX - bounds.left;
-    const py = event.clientY - bounds.top;
+    const { left, top, width, height, pad } = this.#geometry();
+    const px = event.clientX - left;
+    const py = event.clientY - top;
     let best = -1;
     let distance = 14;
     this.points.forEach((point, index) => {
