@@ -6494,18 +6494,55 @@ async fn analyze_psf(state: State<'_, AppState>) -> Result<PsfResult, String> {
     }
 
     let sigma = auto_detect_sigma(&g_f, original.width, original.height).clamp(0.6, 2.2);
-    let iterations = if sigma > 1.8 {
-        3
+    let stride = (len / 32_768).max(1);
+    let mut residuals = Vec::with_capacity((len / stride).max(1));
+    if original.width > 2 && original.height > 2 {
+        let start = original.width + 1;
+        let end = len.saturating_sub(original.width + 1);
+        for index in (start..end).step_by(stride) {
+            let local = (g_f[index - 1]
+                + g_f[index + 1]
+                + g_f[index - original.width]
+                + g_f[index + original.width])
+                * 0.25;
+            residuals.push((g_f[index] - local).abs());
+        }
+    }
+    residuals.sort_by(|left, right| left.total_cmp(right));
+    let noise_sigma = residuals
+        .get(residuals.len().saturating_sub(1) / 2)
+        .copied()
+        .unwrap_or(0.0)
+        * 1.4826;
+    let p90 = residuals
+        .get(((residuals.len().saturating_sub(1)) as f32 * 0.90).round() as usize)
+        .copied()
+        .unwrap_or(noise_sigma);
+    let confidence = ((p90 / noise_sigma.max(1.0) - 1.4) / 7.0).clamp(0.18, 0.96);
+    let base_iterations: f32 = if sigma > 1.8 {
+        14.0
     } else if sigma > 1.1 {
-        2
+        11.0
     } else {
-        1
+        8.0
     };
+    let surface_bonus: f32 = if original.is_surface { 1.0 } else { 0.0 };
+    let iterations = (base_iterations * (0.72 + confidence * 0.28) + surface_bonus)
+        .round()
+        .clamp(6.0, 16.0) as usize;
 
     Ok(PsfResult {
         sigma: (sigma * 10.0).round() / 10.0,
         iterations,
-        msg: format!("Sigma Calc: {:.2}px | Iteraciones conservadoras: {}", sigma, iterations),
+        confidence,
+        noise_sigma: noise_sigma / 65535.0,
+        msg: format!(
+            "PSF {:.2}px | confianza {:.0}% | ruido {:.4}% | RL {} iteraciones",
+            sigma,
+            confidence * 100.0,
+            noise_sigma / 655.35,
+            iterations
+        ),
     })
 }
 

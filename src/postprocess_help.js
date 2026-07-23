@@ -32,12 +32,14 @@ const HELP_BY_ID = {
   "sl-solar-filament": ["Recuperar filamentos", "Refuerza estructura solar que supera el ruido medido.", "Aumenta fibrillas claras y oscuras sin tocar el máster.", "Bájalo si el ruido forma patrones."],
   "sl-solar-radius": ["Escala de filamentos", "Elige el grosor de la estructura solar.", "Menos radio busca fibrillas finas; más radio, formas anchas.", "Ajústalo al muestreo de la captura."],
   "sl-solar-noise-guard": ["Protección de ruido", "Exige más confianza antes de realzar.", "Al subirla evita ruido, pero puede omitir filamentos débiles.", "Súbela antes de reducir la fuerza global."],
+  "sl-solar-background-protect": ["Conservar cielo", "Evita que la curva levante el fondo oscuro fuera del disco.", "Zenith detecta primero si existe un cielo real; no actúa igual en una superficie que llena el encuadre.", "Súbelo si el fondo se vuelve naranja o gris."],
+  "sl-solar-prominence": ["Recuperar protuberancias", "Eleva señal tenue coherente justo por encima del cielo medido.", "Se concentra fuera del fondo y antes del brillo del disco.", "Aumenta después de proteger el cielo para no confundir ruido con señal."],
   "sl-solar-color-strength": ["Fuerza de falso color", "Mezcla gris y la paleta solar elegida.", "0 conserva gris; 100 usa todo el color.", "Es interpretativo y no cambia el máster mono."],
-  "sl-solar-highlight-protect": ["Proteger altas luces", "Reduce color intenso en las zonas más brillantes.", "Conserva detalle del limbo y prominencias.", "Súbelo si el amarillo se satura."],
+  "sl-solar-highlight-protect": ["Proteger altas luces", "Conserva luminancia y reduce color excesivo en el disco brillante.", "Mezcla la curva hacia la señal original antes de saturar.", "Súbelo si el disco pierde textura o el amarillo se quema."],
 };
 
 const HELP_BY_ADVANCED = {
-  exposure: ["Exposición", "Aclara u oscurece en pasos EV.", "Un paso duplica o divide la luminancia.", "Ajústala antes de sombras y luces."],
+  exposure: ["Exposición", "Izquierda oscurece y derecha aclara en pasos EV.", "+1 EV duplica la luminancia; −1 EV la divide por dos.", "Ajústala antes de sombras y luces."],
   shadows: ["Sombras", "Recupera o profundiza zonas oscuras.", "Respeta mejor el negro que Brillo.", "No levantes también el ruido de fondo."],
   highlights: ["Altas luces", "Recupera o refuerza zonas brillantes.", "Afecta menos a los medios tonos.", "No sustituye un punto blanco correcto."],
   whites: ["Blancos", "Ajusta el extremo claro.", "Da presencia o recupera margen cerca del blanco.", "Vigila el recorte de luces."],
@@ -59,6 +61,7 @@ const MODULE_HELP = [
   ["#post-tone-module", "Tono profesional", "Controla el rango y la luminancia con sliders y una curva libre."],
   ["#tone-curve-free", "Curva tonal libre", "Permite mover puntos para ajustar sombras, medios y luces con precisión."],
   ["#solar-mono-module", "Laboratorio Solar mono", "Crea un derivado solar mono o coloreado con curva y protección de ruido."],
+  ["#object-finishing-module", "Laboratorio Luna y Planetas", "Aplica recetas visibles y reversibles de deconvolución, wavelets, tono y color por objetivo."],
   [".color-module", "Colorimetría", "Ajusta balance, HSL y grading únicamente en fuentes a color."],
   [".atmospheric-module", "Corrección atmosférica", "Alinea rojo y azul con verde para reducir bordes de color."],
   ["#artifact-repair-card", "Reducción de artefactos", "Mide halos y defectos antes de aplicar una corrección reversible."],

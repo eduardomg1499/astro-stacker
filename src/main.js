@@ -27,6 +27,10 @@ import {
     normalizeToneCurvePoints,
 } from "./solar_postprocess.js";
 import { installPostprocessHelp } from "./postprocess_help.js";
+import {
+    cloneObjectFinishingPreset,
+    objectPresetApplicable,
+} from "./object_postprocess_presets.js";
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import {
     BATCH_OUTPUT_POLICY_SINGLE_DIRECTORY,
@@ -1429,7 +1433,15 @@ let postCompareLoadId = 0;
 let postEyedropperActive = false;
 let lastPostHistogram = null;
 let lastArtifactSuggestion = null;
+let previewDownscaleFactor = 1;
 let zenithGuide = null;
+let assistantJourney = {
+    flow: "individual",
+    stage: "empty",
+    workflowStep: 0,
+    workflowTotal: 3,
+};
+let lastAssistantAnnouncement = "";
 let solarCurveEditor = null;
 let toneCurveEditor = null;
 let activeSolarPreset = "neutral";
@@ -2447,6 +2459,8 @@ function getSolarMonoParams() {
         highlightColor: hexToRgbUnit(document.getElementById("solar-highlight-color")?.value || "#fff05a"),
         colorStrength: fraction("sl-solar-color-strength", .9),
         highlightProtect: fraction("sl-solar-highlight-protect", .65),
+        backgroundProtect: fraction("sl-solar-background-protect", .72),
+        prominenceAmount: fraction("sl-solar-prominence", 0),
         filamentAmount: fraction("sl-solar-filament", 0),
         filamentRadius: fraction("sl-solar-radius", 1.15),
         noiseGuard: fraction("sl-solar-noise-guard", .65),
@@ -2460,6 +2474,8 @@ function updateSolarControlOutputs() {
         "out-solar-noise-guard": Math.round(parseFloat(document.getElementById("sl-solar-noise-guard")?.value || "65")).toString(),
         "out-solar-color-strength": Math.round(parseFloat(document.getElementById("sl-solar-color-strength")?.value || "90")).toString(),
         "out-solar-highlight-protect": Math.round(parseFloat(document.getElementById("sl-solar-highlight-protect")?.value || "65")).toString(),
+        "out-solar-background-protect": Math.round(parseFloat(document.getElementById("sl-solar-background-protect")?.value || "72")).toString(),
+        "out-solar-prominence": Math.round(parseFloat(document.getElementById("sl-solar-prominence")?.value || "0")).toString(),
     };
     Object.entries(values).forEach(([id, value]) => {
         const output = document.getElementById(id);
@@ -2490,7 +2506,7 @@ function updateSolarUiState() {
     const params = getSolarMonoParams();
     module?.classList.toggle("is-neutral", !params.enabled);
     module?.setAttribute("data-solar-active", String(params.enabled));
-    document.querySelectorAll("[data-solar-color], #sl-solar-color-strength, #sl-solar-highlight-protect")
+    document.querySelectorAll("[data-solar-color], #sl-solar-color-strength")
         .forEach((control) => { control.disabled = !params.colorize; });
     updateSolarControlOutputs();
     updateSolarColorRamp();
@@ -2506,6 +2522,12 @@ function updateSolarUiState() {
     ];
     if (params.filamentAmount > 0.001) {
         stages.push(`filamentos ${Math.round(params.filamentAmount * 100)}% · ${params.filamentRadius.toFixed(2)} px`);
+    }
+    if (params.prominenceAmount > 0.001) {
+        stages.push(`protuberancias ${Math.round(params.prominenceAmount * 100)}%`);
+    }
+    if (params.backgroundProtect > 0.001) {
+        stages.push(`cielo protegido ${Math.round(params.backgroundProtect * 100)}%`);
     }
     status.textContent = `${stages.join(" · ")} · derivado 16-bit reversible`;
     status.dataset.state = "active";
@@ -2534,6 +2556,8 @@ function applySolarParamsToUi(solar = {}, { presetName = "custom" } = {}) {
     setValue("sl-solar-noise-guard", Number(params.noiseGuard ?? .65) * 100);
     setValue("sl-solar-color-strength", Number(params.colorStrength ?? .9) * 100);
     setValue("sl-solar-highlight-protect", Number(params.highlightProtect ?? .65) * 100);
+    setValue("sl-solar-background-protect", Number(params.backgroundProtect ?? .72) * 100);
+    setValue("sl-solar-prominence", Number(params.prominenceAmount || 0) * 100);
     setValue("solar-shadow-color", Array.isArray(params.shadowColor) ? rgbUnitToHex(params.shadowColor) : params.shadowColor);
     setValue("solar-mid-color", Array.isArray(params.midtoneColor) ? rgbUnitToHex(params.midtoneColor) : params.midtoneColor);
     setValue("solar-highlight-color", Array.isArray(params.highlightColor) ? rgbUnitToHex(params.highlightColor) : params.highlightColor);
@@ -2587,7 +2611,7 @@ function initSolarMonoUi() {
             queuePostHistoryCommit(`Solar · ${id === "chk-solar-invert" ? "inversión" : id === "chk-solar-colorize" ? "falso color" : "activar módulo"}`);
         });
     });
-    ["sl-solar-filament", "sl-solar-radius", "sl-solar-noise-guard", "sl-solar-color-strength", "sl-solar-highlight-protect"]
+    ["sl-solar-filament", "sl-solar-radius", "sl-solar-noise-guard", "sl-solar-background-protect", "sl-solar-prominence", "sl-solar-color-strength", "sl-solar-highlight-protect"]
         .forEach((id) => {
             const control = document.getElementById(id);
             control?.addEventListener("input", () => {
@@ -5516,6 +5540,15 @@ function resetProcessingParams({ updateMemo = true } = {}) {
     toneCurveEditor?.setPoints([[0, 0], [1, 1]]);
     markTonePreset("linear");
     applySolarParamsToUi(cloneSolarPreset("neutral"), { presetName: "neutral" });
+    document.querySelectorAll("[data-object-preset]").forEach((button) => {
+        button.classList.remove("is-active");
+        button.setAttribute("aria-pressed", "false");
+    });
+    const objectStatus = document.getElementById("object-finishing-status");
+    if (objectStatus) {
+        objectStatus.textContent = "Elige una receta para ver qué módulos activa.";
+        objectStatus.dataset.state = "idle";
+    }
     updateLevelMarkers();
     updateModeGlow();
     updateDeconvolutionStatus();
@@ -5999,7 +6032,18 @@ async function beginNewPostprocessResult(preview, source = "stack") {
     updatePostHistoryUi();
     updateAdcPadFromInputs();
     await refreshPostHistogram(false);
-    updateZenithGuide();
+    const resultFlow = source === "mosaic" ? "mosaic" : source === "batch" ? "batch" : "individual";
+    const resultStep = resultFlow === "mosaic" ? 4 : resultFlow === "batch" ? 3 : 2;
+    const resultTotal = resultFlow === "mosaic" ? 5 : resultFlow === "batch" ? 4 : 3;
+    setAssistantJourney({
+        flow: resultFlow,
+        stage: "postprocess",
+        workflowStep: resultStep,
+        workflowTotal: resultTotal,
+    }, {
+        open: true,
+        announceKey: `${currentPostprocessResultId}:${resultFlow}:postprocess`,
+    });
     log("INFO", `Nueva sesión de postprocesado 16-bit (${source}); ajustes e historial reiniciados.`);
     return currentPostprocessResultId;
 }
@@ -6185,6 +6229,23 @@ function drawPostprocessScopes() {
     drawToneCurveCanvas(document.getElementById("post-tone-curve"), advanced);
     drawDetailResponseCanvas(document.getElementById("post-detail-curve"), getPipelineParams());
     if (lastPostHistogram) drawPostHistogram(lastPostHistogram);
+    const paintHealth = (id, label, value, warning) => {
+        const node = document.getElementById(id);
+        if (!node) return;
+        node.textContent = `${label} ${value}`;
+        node.dataset.state = warning ? "warning" : "good";
+    };
+    const shadow = Number(lastPostHistogram?.shadowClip || 0) * 100;
+    const highlight = Number(lastPostHistogram?.highlightClip || 0) * 100;
+    paintHealth("scope-shadow-health", "Sombras", lastPostHistogram ? `${shadow.toFixed(2)}%` : "—", shadow > .01);
+    paintHealth("scope-highlight-health", "Luces", lastPostHistogram ? `${highlight.toFixed(2)}%` : "—", highlight > .01);
+    const render = document.getElementById("scope-render-health");
+    if (render) {
+        render.textContent = previewIsDownscaled
+            ? `Vista rápida 1:${previewDownscaleFactor}`
+            : "Final 1:1 exacta";
+        render.dataset.state = previewIsDownscaled ? "warning" : "good";
+    }
 }
 
 function setPostColorControlsForMono(isMono) {
@@ -6232,6 +6293,12 @@ function setPostColorControlsForMono(isMono) {
         mode.disabled = !!isMono;
         if (isMono) mode.value = "luminance";
     }
+    document.querySelectorAll('[data-object-preset="lunar-mineral"]').forEach((button) => {
+        button.disabled = !!isMono;
+        button.title = isMono
+            ? "No disponible: una captura mono no contiene diferencias minerales de color."
+            : "Amplifica diferencias cromáticas reales con una receta interpretativa.";
+    });
 }
 
 async function refreshPostHistogram(preferProcessed = true) {
@@ -6283,6 +6350,7 @@ function updateZenithGuide(extra = {}) {
         ? Math.max(0.1, Math.min(1.5, Math.log2(0.18 / Math.max(0.002, medianLevel))))
         : 0.75;
     zenithGuide.update({
+        ...assistantJourney,
         generation: history.generation || null,
         hasSource: !!currentFilePath,
         hasAnalysis: !!currentFileMetadata,
@@ -6308,11 +6376,13 @@ function updateZenithGuide(extra = {}) {
         solarActive: !!postProcessSession.current()?.recipe?.advanced?.solar?.enabled,
         solarFilamentAmount: Number(postProcessSession.current()?.recipe?.advanced?.solar?.filamentAmount || 0),
         toneCurveActive: !toneCurveIsLinear(getAdvancedPostprocessParams().toneCurvePoints),
+        targetCategory: getSelectedTargetCategory(),
         helpTarget: null,
         helpTitle: "",
         helpMessage: "",
         ...extra,
     });
+    paintAssistantPrimaryAction();
 }
 
 function setAdvancedControlValue(name, value) {
@@ -6431,6 +6501,57 @@ function applyDeconvolutionPreset(name) {
     queuePostHistoryCommit(`Deconvolución · ${name === "gentle" ? "Suave" : name === "balanced" ? "Equilibrada" : "Detalle fino"}`);
 }
 
+function applyObjectFinishingPreset(name) {
+    const preset = cloneObjectFinishingPreset(name);
+    const status = document.getElementById("object-finishing-status");
+    const applicability = objectPresetApplicable(preset, { isMono: !!lastPostHistogram?.isMono });
+    if (!applicability.applicable) {
+        if (status) {
+            status.textContent = applicability.reason;
+            status.dataset.state = "warning";
+        }
+        document.getElementById("object-finishing-module")?.classList.add("assistant-target-pulse");
+        window.setTimeout(() => document.getElementById("object-finishing-module")?.classList.remove("assistant-target-pulse"), 1450);
+        return;
+    }
+
+    suppressPostprocessEvents = true;
+    try {
+        resetProcessingParams({ updateMemo: false });
+        const neutral = getPipelineParams();
+        const recipe = preset.pipeline || {};
+        applyWaveletPreset({
+            ...neutral,
+            ...recipe,
+            deconv: { ...neutral.deconv, ...(recipe.deconv || {}) },
+            advanced: { ...neutral.advanced, ...(recipe.advanced || {}) },
+        }, { trigger: false });
+    } finally {
+        suppressPostprocessEvents = false;
+    }
+    document.querySelectorAll("[data-object-preset]").forEach((button) => {
+        const active = button.dataset.objectPreset === name;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-pressed", String(active));
+    });
+    if (status) {
+        const intent = preset.intent === "creative" ? "Creativo e interpretativo" : "Científico y natural";
+        status.textContent = `${preset.label} · ${intent} · ${preset.description}`;
+        status.dataset.state = "active";
+    }
+    updateDeconvolutionStatus();
+    drawPostprocessScopes();
+    triggerUpdate({ forceFastPreview: true });
+    queuePostHistoryCommit(`${preset.label} · receta ${preset.intent === "creative" ? "creativa" : "natural"}`);
+    updateZenithGuide();
+}
+
+function initObjectFinishingUi() {
+    document.querySelectorAll("[data-object-preset]").forEach((button) => {
+        button.addEventListener("click", () => applyObjectFinishingPreset(button.dataset.objectPreset));
+    });
+}
+
 function setPostScopesOpen(open) {
     const panel = document.getElementById("post-scopes-panel");
     const button = document.getElementById("btn-toggle-post-scopes");
@@ -6528,6 +6649,7 @@ function initAdvancedPostprocessControls() {
     document.getElementById("btn-refresh-histogram")?.addEventListener("click", () => refreshPostHistogram(true));
     document.querySelectorAll("[data-tone-preset]").forEach((button) => button.addEventListener("click", () => applyTonePreset(button.dataset.tonePreset)));
     document.querySelectorAll("[data-deconv-preset]").forEach((button) => button.addEventListener("click", () => applyDeconvolutionPreset(button.dataset.deconvPreset)));
+    initObjectFinishingUi();
     ["sl-deconv-sigma", "num-deconv-sigma", "sl-deconv-iter", "num-deconv-iter", "sl-vc-sigma", "num-vc-sigma", "sl-vc-iter", "num-vc-iter"]
         .forEach((id) => document.getElementById(id)?.addEventListener("input", updateDeconvolutionStatus));
     document.getElementById("btn-post-undo")?.addEventListener("click", () => applyPostHistoryEntry(postProcessSession.undo()));
@@ -6759,7 +6881,6 @@ async function analyzeActivePostprocessArtifacts() {
 
 function initArtifactRepairUi() {
     document.getElementById("btn-analyze-artifacts")?.addEventListener("click", analyzeActivePostprocessArtifacts);
-    document.getElementById("btn-assistant-analyze")?.addEventListener("click", analyzeActivePostprocessArtifacts);
 
     document.getElementById("btn-apply-artifact-suggestion")?.addEventListener("click", async () => {
         if (!lastArtifactSuggestion) return;
@@ -6790,11 +6911,96 @@ function initArtifactRepairUi() {
     });
 }
 
+function paintAssistantPrimaryAction() {
+    const button = document.getElementById("btn-assistant-analyze");
+    const label = document.getElementById("assistant-primary-label");
+    if (!button || !label) return;
+    const context = zenithGuide?.context || {};
+    if (context.hasResult) {
+        label.textContent = "Diagnosticar resultado activo";
+        button.dataset.action = "diagnose";
+        return;
+    }
+    const key = `${context.flow || "individual"}:${context.stage || "empty"}`;
+    const actions = {
+        "individual:empty": ["Elegir un video", "load"],
+        "individual:analyze": ["Analizar video ahora", "analyze"],
+        "individual:stack": ["Continuar al apilado", "stack"],
+        "batch:scan": ["Definir alcance del lote", "batch-scan"],
+        "batch:load": ["Elegir referencia del lote", "batch-load"],
+        "batch:analyze": ["Analizar referencia ahora", "analyze"],
+        "batch:run": ["Revisar ejecución del lote", "batch-run"],
+        "batch:complete": ["Revisar resultados del lote", "batch-complete"],
+        "mosaic:load": ["Añadir paneles del mosaico", "mosaic-load"],
+        "mosaic:analyze": ["Analizar paneles ahora", "mosaic-analyze"],
+        "mosaic:stack": ["Revisar apilado de paneles", "mosaic-stack"],
+        "mosaic:compose": ["Continuar a composición", "mosaic-compose"],
+        "mosaic:result": ["Abrir postprocesado del mosaico", "mosaic-result"],
+        "deepsky:blocked": ["Revisar incompatibilidades", "deepsky-review"],
+    };
+    const [text, action] = actions[key] || [
+        context.flow === "deepsky" ? "Volver al paso activo" : "Ver siguiente paso",
+        context.flow === "deepsky" ? "deepsky-step" : "next",
+    ];
+    label.textContent = text;
+    button.dataset.action = action;
+}
+
+function pulseAssistantLauncher() {
+    const launcher = document.getElementById("btn-toggle-guide");
+    if (!launcher) return;
+    launcher.classList.remove("assistant-needs-attention");
+    requestAnimationFrame(() => launcher.classList.add("assistant-needs-attention"));
+    window.setTimeout(() => launcher.classList.remove("assistant-needs-attention"), 5200);
+}
+
+function setAssistantJourney(patch = {}, { open = false, announceKey = "" } = {}) {
+    assistantJourney = { ...assistantJourney, ...patch };
+    updateZenithGuide();
+    paintAssistantPrimaryAction();
+    if (announceKey && announceKey !== lastAssistantAnnouncement) {
+        lastAssistantAnnouncement = announceKey;
+        pulseAssistantLauncher();
+        if (open) setZenithGuideOpen(true);
+    }
+}
+window.updateIntelligentAssistantContext = (patch = {}, options = {}) => setAssistantJourney(patch, options);
+
 function setZenithGuideOpen(open) {
     const panel = document.getElementById("zenith-guide-panel");
     panel?.classList.toggle("open", !!open);
     panel?.setAttribute("aria-hidden", String(!open));
     document.getElementById("btn-toggle-guide")?.setAttribute("aria-pressed", String(!!open));
+}
+
+async function runAssistantPrimaryAction() {
+    const button = document.getElementById("btn-assistant-analyze");
+    const action = button?.dataset.action || "next";
+    if (action === "diagnose") {
+        await analyzeActivePostprocessArtifacts();
+        return;
+    }
+    const destinations = {
+        load: ["#btn-analyze", true],
+        analyze: ["#btn-run-analysis", true],
+        stack: ["#btn-stack", false],
+        "batch-scan": ["#btn-batch-mode", false],
+        "batch-load": ["#btn-batch-tune", true],
+        "batch-run": ["#btn-batch-run", false],
+        "batch-complete": ["#animation-modal", false],
+        "mosaic-load": ["#mosaic-dropzone", false],
+        "mosaic-analyze": ["#btn-mosaic-analyze-all", true],
+        "mosaic-stack": ["#btn-mosaic-stack-all", false],
+        "mosaic-compose": ["#mosaic-step-generate", false],
+        "mosaic-result": ["#btn-mosaic-edit", true],
+        "deepsky-review": ["#ds-preflight-review", false],
+        "deepsky-step": ["#ds-wizard-scroll", false],
+    };
+    const [target, activate] = destinations[action] || ["#zenith-guide-list", false];
+    navigateAssistantToControl(target, {
+        title: document.getElementById("assistant-primary-label")?.textContent || "Siguiente paso",
+        activate,
+    });
 }
 
 function navigateAssistantToControl(target, suggestion = {}) {
@@ -6856,6 +7062,8 @@ async function applyAssistantRecommendation(action, suggestion, context) {
         const robustRange = Math.max(.01, Number(context.robustDynamicRange || high - low));
         preset.filamentAmount = robustRange < .18 ? .24 : .34;
         preset.noiseGuard = Number(context.medianLevel || 0) < .06 ? .8 : .7;
+        preset.backgroundProtect = Number(context.shadowClip || 0) > .001 ? .94 : .82;
+        preset.prominenceAmount = Number(context.medianLevel || 0) < .18 ? .34 : .18;
         suppressPostprocessEvents = true;
         try {
             applySolarParamsToUi(preset, { presetName: "custom" });
@@ -6993,7 +7201,9 @@ function initZenithGuideUi() {
     });
     document.getElementById("btn-toggle-guide")?.addEventListener("click", () => setZenithGuideOpen(!panel?.classList.contains("open")));
     document.getElementById("btn-close-guide")?.addEventListener("click", () => setZenithGuideOpen(false));
+    document.getElementById("btn-assistant-analyze")?.addEventListener("click", runAssistantPrimaryAction);
     updateZenithGuide();
+    paintAssistantPrimaryAction();
 }
 
 let contextualHelpTargetId = 0;
@@ -7124,7 +7334,15 @@ async function processPipeline(requestId, paramsString, downscale = 1) {
         // Solo el render a resolución COMPLETA fija el memo; el preview rápido
         // (downscale) marca la vista como baja-res para forzar luego el full.
         if (downscale === 1) lastProcessedParams = paramsString;
-        previewIsDownscaled = (downscale !== 1);
+        const previewWidth = Number(ui.imgResult?.naturalWidth || currentFileMetadata?.width || 0);
+        const previewHeight = Number(ui.imgResult?.naturalHeight || currentFileMetadata?.height || 0);
+        previewDownscaleFactor = downscale > 1
+            && previewWidth >= 256 * downscale
+            && previewHeight >= 256 * downscale
+            ? downscale
+            : 1;
+        previewIsDownscaled = previewDownscaleFactor !== 1;
+        drawPostprocessScopes();
         if (downscale === 1) postProcessSession.setPreview(b64);
 
         if (ui.imgResult) {
@@ -7135,10 +7353,10 @@ async function processPipeline(requestId, paramsString, downscale = 1) {
 
             if (ui.statusText) {
                 const elapsed = Math.max(0, performance.now() - renderStartedAt);
-                ui.statusText.textContent = downscale === 1
+                ui.statusText.textContent = !previewIsDownscaled
                     ? `Vista 1:1 actualizada · ${(elapsed / 1000).toFixed(1)} s · CPU exacta`
-                    : `Vista rápida 1/${downscale} · ${(elapsed / 1000).toFixed(1)} s · GPU si es apta`;
-                ui.statusText.style.color = downscale === 1 ? "#94a3b8" : "#67e8f9";
+                    : `Vista rápida 1/${previewDownscaleFactor} · ${(elapsed / 1000).toFixed(1)} s · GPU si es apta`;
+                ui.statusText.style.color = !previewIsDownscaled ? "#94a3b8" : "#67e8f9";
             }
         }
         // El historial y el histograma científico sólo aceptan el render 1:1;
@@ -7270,6 +7488,12 @@ function resetDataAcquisitionUI() {
     isCropping = false;
     cropSelection = { x: 0, y: 0, w: 0, h: 0 };
     manualAnchorPoint = null; // Reset Anchor
+    assistantJourney = {
+        flow: "individual",
+        stage: "empty",
+        workflowStep: 0,
+        workflowTotal: 3,
+    };
     updateZenithGuide({ hasResult: false, hasAnalysis: false });
 }
 
@@ -7395,6 +7619,16 @@ if (ui.btnBatchMode) {
 
         // CLEANUP
         resetDataAcquisitionUI();
+        setAssistantJourney({
+            flow: "batch",
+            stage: "scan",
+            workflowStep: 0,
+            workflowTotal: 4,
+            itemCount: 0,
+        }, {
+            open: true,
+            announceKey: `batch:scan:${String(folder)}`,
+        });
 
         const selectedBatchTarget = normalizeZenithCategory(ui.selBatchTargetCategory?.value || getSelectedTargetCategory());
 
@@ -7437,6 +7671,16 @@ if (ui.btnBatchMode) {
 
             log("INFO", trFormat("batch.logs.activated", { count: files.length }, `Modo Batch activado. ${files.length} archivos.`));
             updateStackButtonState();
+            setAssistantJourney({
+                flow: "batch",
+                stage: "load",
+                workflowStep: 0,
+                workflowTotal: 4,
+                itemCount: files.length,
+            }, {
+                open: true,
+                announceKey: `batch:loaded:${folder}:${files.length}`,
+            });
             maybeStartTutorialFlow("batch", 1, 350);
 
             // Tutorial: Detect if images are loaded and skip to Step 4 if so
@@ -7482,6 +7726,15 @@ if ($("#btn-mosaic-mode")) {
             } else {
                 console.error("MAIN: panel-mosaic not found in DOM");
             }
+            setAssistantJourney({
+                flow: "mosaic",
+                stage: "load",
+                workflowStep: 0,
+                workflowTotal: 5,
+            }, {
+                open: true,
+                announceKey: "mosaic:opened",
+            });
 
             // Show Overlay
             if (mosaicManager) {
@@ -8359,6 +8612,16 @@ if (ui.btnBatchTune) {
                 ui.btnBatchRun.disabled = true;
 
                 log("SUCCESS", tr("batch.logs.reference_ready", "Referencia cargada. Pulsa 'Analizar Video' para continuar."));
+                setAssistantJourney({
+                    flow: "batch",
+                    stage: "analyze",
+                    workflowStep: 1,
+                    workflowTotal: 4,
+                    itemCount: batchFiles.length,
+                }, {
+                    open: true,
+                    announceKey: `batch:reference:${currentFilePath}`,
+                });
                 if (tutorialManager?.currentFlowName === 'batch' && tutorialManager.currentStepIndex === 3) {
                     tutorialManager.nextStep();
                 }
@@ -8673,6 +8936,17 @@ if (ui.btnBatchRun) {
                 ok: batchGeneratedImages.length,
                 total: batchFiles.length
             }, `Lote completado: ${batchGeneratedImages.length}/${batchFiles.length} PNGs guardados. Iniciando modo Animacion...`));
+            setAssistantJourney({
+                flow: "batch",
+                stage: "complete",
+                workflowStep: 3,
+                workflowTotal: 4,
+                completedItems: batchGeneratedImages.length,
+                itemCount: batchFiles.length,
+            }, {
+                open: true,
+                announceKey: `batch:complete:${batchGeneratedImages.length}:${batchFiles.length}`,
+            });
             startAnimationPlayer(batchGeneratedImages);
             if (shouldPauseBatchRunTutorial) {
                 tutorialManager.showOverlay();
@@ -8723,8 +8997,19 @@ if (ui.btnAutoPsf) {
             log("INFO", res.msg);
             const mode = ui.selAutoMode.value;
             const sigma = Math.max(0.6, Math.min(parseFloat(res.sigma) || 1.2, 2.2));
-            const iter = Math.max(1, Math.min(parseInt(res.iterations, 10) || 2, 3));
-            const vcIter = mode === "vc" ? Math.max(1, Math.min(iter, 2)) : Math.max(1, Math.min(iter - 1, 2));
+            const iter = Math.max(6, Math.min(parseInt(res.iterations, 10) || 8, 18));
+            const confidence = Math.max(.18, Math.min(Number(res.confidence) || .45, .96));
+            const vcIter = mode === "vc"
+                ? Math.max(2, Math.min(Math.round(iter * .34), 6))
+                : Math.max(1, Math.min(Math.round(iter * .22), 4));
+            if (mode === "vc") {
+                ui.slDeconvIter.value = 0;
+                ui.valDeconvIter.value = 0;
+            }
+            if (mode === "rl") {
+                ui.slVcIter.value = 0;
+                ui.valVcIter.value = 0;
+            }
             if (mode === "rl" || mode === "both") {
                 ui.slDeconvSigma.value = Math.round(sigma * 10); ui.valDeconvSigma.value = sigma.toFixed(1);
                 ui.slDeconvIter.value = iter; ui.valDeconvIter.value = iter;
@@ -8734,8 +9019,15 @@ if (ui.btnAutoPsf) {
                 ui.slVcSigma.value = Math.round(vcSig * 10); ui.valVcSigma.value = vcSig.toFixed(1);
                 ui.slVcIter.value = vcIter; ui.valVcIter.value = vcIter;
             }
-            log("SUCCESS", `PSF conservador: Sigma=${sigma.toFixed(1)}, RL=${iter}, VC=${mode === "rl" ? 0 : vcIter}`);
-            triggerUpdate();
+            setLinkedControlValue("edge-strength", Math.round(52 + confidence * 24), 1);
+            setLinkedControlValue("auto-mask", Math.round(38 + (1 - confidence) * 28), 1);
+            const edgeAware = document.getElementById("chk-edge-wavelets");
+            if (edgeAware) edgeAware.checked = true;
+            log("SUCCESS", `PSF estimada: Sigma=${sigma.toFixed(1)}, confianza=${Math.round(confidence * 100)}%, RL=${mode === "vc" ? 0 : iter}, VC=${mode === "rl" ? 0 : vcIter}`);
+            updateDeconvolutionStatus();
+            drawPostprocessScopes();
+            triggerUpdate({ forceFastPreview: true });
+            queuePostHistoryCommit("Deconvolución · PSF automática estimada");
         } catch (e) { log("ERROR", "Auto PSF: " + e); showCustomAlert("Error", "Error: " + e); }
         finally { ui.btnAutoPsf.disabled = false; ui.btnAutoPsf.innerHTML = i18n.t("wavelets.deconvolution.auto_analyze"); }
     });
@@ -8754,6 +9046,15 @@ if (ui.btnAnalyze) {
         // hasta que el nuevo análisis termine (evita errores de usuario).
         currentFileMetadata = null;
         updateStackButtonState();
+        setAssistantJourney({
+            flow: isBatchMode ? "batch" : "individual",
+            stage: "analyze",
+            workflowStep: isBatchMode ? 1 : 0,
+            workflowTotal: isBatchMode ? 4 : 3,
+        }, {
+            open: true,
+            announceKey: `${isBatchMode ? "batch" : "individual"}:source:${currentFilePath}`,
+        });
 
         // Comprobación de formato (Auto-Conversion a SER)
         const ext = currentFilePath.split('.').pop().toLowerCase();
@@ -9041,8 +9342,6 @@ if (ui.btnRunAnalysis) {
                 } else {
                     ui.btnAnalyze.textContent = tr("general.load_another_video", "📂 Cargar Otro Video");
                 }
-                updateStackButtonState();
-
                 // AUTOMACION DE CONFIGURACION PARA VIDEO EN COLOR
                 if (res.metadata.is_color) {
                     log("INFO", "Video en color detectado. Aplicando sRGB y Bayer Auto.");
@@ -9078,6 +9377,19 @@ if (ui.btnRunAnalysis) {
                 currentBestFrame = res.best_frame_idx || 0; // NEW: Capture Ref Frame
                 currentVideoStats = res.stats; // NEW: Store stats for report
                 currentFileMetadata = res.metadata; // NEW: Store for report
+                // El estado del botón y del asistente depende de metadata y ruta.
+                // Antes se calculaba mientras metadata aún era null, dejando
+                // "Iniciar apilado" deshabilitado después de un análisis válido.
+                updateStackButtonState();
+                setAssistantJourney({
+                    flow: isBatchMode ? "batch" : "individual",
+                    stage: isBatchMode ? "run" : "stack",
+                    workflowStep: isBatchMode ? 2 : 1,
+                    workflowTotal: isBatchMode ? 4 : 3,
+                }, {
+                    open: true,
+                    announceKey: `${isBatchMode ? "batch" : "individual"}:analysis:${currentFilePath}`,
+                });
                 updateChartViz();
 
                 if (res.preview_base64) {
@@ -12275,7 +12587,7 @@ function dsRenderGuide(plan) {
     card.innerHTML = `
         <div class="ds-guide-head">
             <svg class="zas-icon zas-icon-inline" style="color:#a78bfa;"><use href="#icon-${blockers ? "warning" : "check"}"></use></svg>
-            <b>${tr("deepsky.guide_title", "Guía")}</b>
+            <b>${tr("deepsky.guide_title", "Asistente inteligente")}</b>
             <span style="color:#94a3b8;">${blockers
                 ? trFormat("deepsky.guide_pending", { n: blockers }, `${blockers} por resolver`)
                 : tr("deepsky.guide_all_clear", "sin bloqueos")}</span>
@@ -12788,6 +13100,16 @@ function dsSetWizardStep(next, force = false) {
         box.scrollTop = 0;
         requestAnimationFrame(() => { box.scrollTop = 0; });
     }
+    const blocked = dsWizardStep === 3 && dsPreparedPlan && !dsPreparedPlan.valid;
+    setAssistantJourney({
+        flow: "deepsky",
+        stage: blocked ? "blocked" : "guide",
+        workflowStep: dsWizardStep,
+        workflowTotal: 4,
+    }, {
+        open: dsWizardStep === 0,
+        announceKey: `deepsky:step:${dsWizardStep}:${blocked ? "blocked" : "ready"}`,
+    });
 }
 
 function dsSyncWizard() {
@@ -12815,6 +13137,25 @@ function dsSyncWizard() {
         const messages = ["selecciona y agrupa los datos", "revisa compatibilidad y calibraciones", "elige perfil u opciones avanzadas", dsPreparedPlan?.valid ? "plan listo para ejecutar" : (dsActiveLights().length ? "corrige las alertas del plan" : "añade lights para preparar el plan")];
         status.textContent = `Paso ${dsWizardStep + 1} de 4 · ${messages[dsWizardStep]}`;
     }
+    const assistant = document.getElementById("ds-step-assistant");
+    const assistantText = document.getElementById("ds-step-assistant-text");
+    const assistantProgress = document.getElementById("ds-step-assistant-progress");
+    if (assistant && assistantText) {
+        const blocked = dsWizardStep === 3 && !!dsActiveLights().length && !dsPreparedPlan?.valid;
+        const messages = [
+            "Añade lights; las calibraciones son opcionales. Zenith agrupará firmas compatibles y evitará mezclas silenciosas.",
+            "Revisa agrupación, PSF y calibraciones. Los avisos explican qué corregir antes de integrar.",
+            "Auto es el punto de partida recomendado. Abre los controles avanzados sólo cuando tu objetivo lo necesite.",
+            dsPreparedPlan?.valid
+                ? "El plan es compatible. Confirma las salidas lineales y ejecuta cuando estés listo."
+                : dsActiveLights().length
+                    ? "Hay bloqueos pendientes. La guía te lleva al control exacto que debes corregir."
+                    : "Añade lights para que pueda preparar y validar el plan de integración.",
+        ];
+        assistantText.textContent = messages[dsWizardStep];
+        assistant.dataset.state = blocked ? "warning" : "active";
+    }
+    if (assistantProgress) assistantProgress.textContent = `${dsWizardStep + 1} / 4`;
 }
 
 function dsSetPresetButtons(name) {
@@ -13970,7 +14311,16 @@ function dsLoadUxFixtureIfRequested(modal) {
         dsUpdateUI();
         setTimeout(() => modal.querySelector('.ds-wizard-step[data-step="0"]')?.focus(), 0);
     });
-    const closeWizard = () => { modal.style.display = "none"; btnOpen.focus(); };
+    const closeWizard = () => {
+        modal.style.display = "none";
+        btnOpen.focus();
+        setAssistantJourney({
+            flow: "individual",
+            stage: postProcessSession.current() ? "postprocess" : currentFileMetadata ? "stack" : currentFilePath ? "analyze" : "empty",
+            workflowStep: postProcessSession.current() ? 2 : currentFileMetadata ? 1 : 0,
+            workflowTotal: 3,
+        });
+    };
     document.getElementById("btn-deepsky-close")?.addEventListener("click", closeWizard);
     modal.addEventListener("click", (e) => { if (e.target === modal) closeWizard(); });
     document.getElementById("btn-deepsky-prev")?.addEventListener("click", () => dsSetWizardStep(dsWizardStep - 1));

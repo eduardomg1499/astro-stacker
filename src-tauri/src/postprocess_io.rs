@@ -706,6 +706,44 @@ fn build_solar_filament_delta(
     )
 }
 
+/// Detecta si la imagen solar contiene un cielo/fondo oscuro real. En una
+/// superficie solar que llena todo el encuadre no devuelve máscara: así el
+/// control no confunde textura tenue del disco con cielo.
+fn estimate_solar_background(data: &[u16]) -> Option<(f32, f32)> {
+    if data.len() < 48 {
+        return None;
+    }
+    let pixels = data.len() / 3;
+    let stride = (pixels / 32_768).max(1);
+    let mut sample: Vec<f32> = (0..pixels)
+        .step_by(stride)
+        .map(|index| {
+            let offset = index * 3;
+            (0.2126 * data[offset] as f32
+                + 0.7152 * data[offset + 1] as f32
+                + 0.0722 * data[offset + 2] as f32)
+                / 65535.0
+        })
+        .collect();
+    if sample.len() < 16 {
+        return None;
+    }
+    sample.sort_by(|left, right| left.total_cmp(right));
+    let percentile = |fraction: f32| {
+        let index = ((sample.len() - 1) as f32 * fraction).round() as usize;
+        sample[index.min(sample.len() - 1)]
+    };
+    let p05 = percentile(0.05);
+    let p25 = percentile(0.25);
+    let p80 = percentile(0.80);
+    if p05 > 0.14 || p80 - p05 < 0.10 {
+        return None;
+    }
+    let ceiling = (p05 + (p25 - p05).max(0.002) * 1.65 + 0.003)
+        .clamp(p05 + 0.004, (p05 + 0.12).min(p80 - 0.015));
+    Some((p05, ceiling))
+}
+
 #[inline]
 fn interpolate_solar_color(
     value: f32,
@@ -761,12 +799,21 @@ fn apply_advanced_postprocess(
     let solar_curve_tangents = solar_curve_tangents(&solar_curve);
     let solar_filament_delta =
         build_solar_filament_delta(data, width, height, &params.solar);
+    let solar_background = if solar_enabled {
+        estimate_solar_background(data)
+    } else {
+        None
+    };
     let hsl_active = params.hsl_hue.iter().any(|value| value.abs() > 1e-6)
         || params.hsl_saturation.iter().any(|value| value.abs() > 1e-6)
         || params.hsl_luminance.iter().any(|value| value.abs() > 1e-6);
     let local_delta = build_local_contrast_delta(data, width, height, params.texture, params.clarity);
 
     data.par_chunks_exact_mut(3).enumerate().for_each(|(pixel_index, pixel)| {
+        let source_mono = (0.2126 * pixel[0] as f32
+            + 0.7152 * pixel[1] as f32
+            + 0.0722 * pixel[2] as f32)
+            / 65535.0;
         let mut r = (pixel[0] as f32 / 65535.0 - black) / (white - black);
         let mut g = (pixel[1] as f32 / 65535.0 - black) / (white - black);
         let mut b = (pixel[2] as f32 / 65535.0 - black) / (white - black);
@@ -892,6 +939,31 @@ fn apply_advanced_postprocess(
             if solar_enabled {
                 let mut solar_luma =
                     evaluate_solar_curve(&solar_curve, &solar_curve_tangents, mono);
+                if let Some((background_floor, background_ceiling)) = solar_background {
+                    let protect = params.solar.background_protect.clamp(0.0, 1.0);
+                    let background_weight =
+                        1.0 - post_smoothstep(background_floor, background_ceiling, source_mono);
+                    solar_luma += (mono - solar_luma) * background_weight * protect;
+
+                    let prominence = params.solar.prominence_amount.clamp(0.0, 1.0);
+                    if prominence > 1e-6 {
+                        let signal_start = background_ceiling;
+                        let signal_end = (background_ceiling + 0.055).min(0.28);
+                        let low_signal = post_smoothstep(signal_start, signal_end, source_mono)
+                            * (1.0 - post_smoothstep(0.22, 0.58, source_mono));
+                        let separation = ((source_mono - background_ceiling)
+                            / (signal_end - background_ceiling).max(0.008))
+                            .clamp(0.0, 1.0);
+                        solar_luma += prominence
+                            * low_signal
+                            * separation.sqrt()
+                            * (1.0 - solar_luma)
+                            * 0.28;
+                    }
+                }
+                let highlight_weight = post_smoothstep(0.48, 0.97, source_mono)
+                    * params.solar.highlight_protect.clamp(0.0, 1.0);
+                solar_luma += (mono - solar_luma) * highlight_weight * 0.78;
                 if params.solar.invert {
                     solar_luma = 1.0 - solar_luma;
                 }
@@ -903,7 +975,7 @@ fn apply_advanced_postprocess(
                         params.solar.highlight_color,
                     );
                     let strength = params.solar.color_strength.clamp(0.0, 1.0);
-                    let highlight_weight = post_smoothstep(0.72, 0.995, solar_luma)
+                    let highlight_weight = post_smoothstep(0.72, 0.995, source_mono)
                         * params.solar.highlight_protect.clamp(0.0, 1.0);
                     let effective_strength = strength * (1.0 - highlight_weight * 0.82);
                     r = solar_luma + (mapped[0] - solar_luma) * effective_strength;
@@ -1164,6 +1236,55 @@ mod postprocess_io_tests {
             assert_eq!(pixel[0], pixel[1]);
             assert_eq!(pixel[1], pixel[2]);
         }
+    }
+
+    #[test]
+    fn solar_background_protection_keeps_sky_dark_and_recovers_prominence_signal() {
+        let (width, height) = (64usize, 32usize);
+        let mut source = vec![900u16; width * height * 3];
+        for y in 5..27 {
+            for x in 25..59 {
+                source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(38_000);
+            }
+        }
+        for y in 10..22 {
+            let x = 21 + (y % 2);
+            source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(4_800);
+        }
+
+        let mut baseline = source.clone();
+        let mut protected = source.clone();
+        let mut base_params = AdvancedColorParams::default();
+        base_params.solar.enabled = true;
+        base_params.solar.colorize = false;
+        base_params.solar.curve_points =
+            vec![[0.0, 0.0], [0.04, 0.12], [0.18, 0.3], [1.0, 1.0]];
+        base_params.solar.background_protect = 0.0;
+        base_params.solar.prominence_amount = 0.0;
+        apply_advanced_postprocess(&mut baseline, width, height, true, &base_params);
+
+        let mut protected_params = base_params.clone();
+        protected_params.solar.background_protect = 1.0;
+        protected_params.solar.prominence_amount = 0.85;
+        protected_params.solar.highlight_protect = 0.9;
+        apply_advanced_postprocess(&mut protected, width, height, true, &protected_params);
+
+        let sky = (3 * width + 3) * 3;
+        assert!(
+            protected[sky] < baseline[sky],
+            "la protección debe evitar que la curva levante el cielo"
+        );
+        let prominence = (14 * width + 21) * 3;
+        assert!(
+            protected[prominence] > source[prominence],
+            "la señal coherente fuera del disco debe poder recuperarse"
+        );
+        let disk = (16 * width + 42) * 3;
+        assert!(
+            (protected[disk] as i32 - source[disk] as i32).abs()
+                < (baseline[disk] as i32 - source[disk] as i32).abs(),
+            "la protección de luces debe conservar mejor la luminancia del disco"
+        );
     }
 
     #[test]

@@ -1421,6 +1421,25 @@
         #deepsky-modal .ds-wizard-step.active .ds-step-n { background: #7c3aed; color: white; }
         #deepsky-modal .ds-wizard-step.done { color: #a7f3d0; }
         #deepsky-modal .ds-wizard-step.done .ds-step-n { background: #047857; color: white; }
+        #deepsky-modal .ds-step-assistant {
+            flex: 0 0 auto; display: grid; grid-template-columns: 26px minmax(0, 1fr) auto;
+            align-items: center; gap: 10px; margin: 0 5px 10px; padding: 9px 12px;
+            border: 1px solid rgba(34,211,238,.2); border-radius: 12px;
+            background: linear-gradient(135deg, rgba(8,145,178,.11), rgba(79,70,229,.08));
+        }
+        #deepsky-modal .ds-step-assistant > svg { width: 18px; height: 18px; color: #67e8f9; }
+        #deepsky-modal .ds-step-assistant strong { display:block; color:#cffafe; font-size:.69rem; margin-bottom:2px; }
+        #deepsky-modal .ds-step-assistant span { display:block; color:#94a3b8; font-size:.68rem; line-height:1.4; }
+        #deepsky-modal .ds-step-assistant .ds-assistant-progress {
+            min-width: 38px; padding: 4px 7px; color:#c4b5fd; border:1px solid rgba(167,139,250,.24);
+            border-radius:8px; background:rgba(124,58,237,.09); font-size:.61rem; font-weight:800; text-align:center;
+        }
+        #deepsky-modal .ds-step-assistant[data-state="warning"] {
+            border-color: rgba(251,191,36,.35);
+            background: linear-gradient(135deg, rgba(120,53,15,.16), rgba(127,29,29,.08));
+        }
+        #deepsky-modal .ds-step-assistant[data-state="warning"] > svg,
+        #deepsky-modal .ds-step-assistant[data-state="warning"] strong { color:#fde68a; }
         #deepsky-modal :is(button,input,select,summary):focus-visible {
             outline: 2px solid #38bdf8 !important; outline-offset: 2px;
         }
@@ -1582,6 +1601,14 @@
                         <button type="button" class="ds-wizard-step" data-step="3"><span class="ds-step-n">4</span><span>Revisar y apilar</span></button>
                     </nav>
                 </header>
+                <aside id="ds-step-assistant" class="ds-step-assistant" data-state="active" aria-live="polite">
+                    <svg class="zas-icon" aria-hidden="true"><use href="#icon-star"></use></svg>
+                    <div>
+                        <strong>Asistente inteligente</strong>
+                        <span id="ds-step-assistant-text">Añade lights; las calibraciones son opcionales. Zenith agrupará firmas compatibles.</span>
+                    </div>
+                    <span id="ds-step-assistant-progress" class="ds-assistant-progress">1 / 4</span>
+                </aside>
                 <div class="ds-wizard-scroll" id="ds-wizard-scroll">
                 <section class="ds-wizard-page active" data-step="0" aria-label="Datos">
                     <div class="ds-page-intro"><div><strong>Datos de la sesión</strong><span>Añade lights y calibraciones. Zenith agrupa por geometría, Bayer, filtro, exposición, ganancia, binning y temperatura.</span></div></div>
@@ -3786,22 +3813,29 @@
                             <div class="advanced-slider-list">
                                 <label for="sl-adv-exposure"><span>Exposición</span><output>0.00 EV</output></label>
                                 <input id="sl-adv-exposure" type="range" min="-400" max="400" value="0"
-                                    data-advanced-control="exposure" data-scale="100" data-default="0" data-suffix=" EV">
+                                    data-advanced-control="exposure" data-scale="100" data-default="0" data-suffix=" EV"
+                                    data-bipolar="true" dir="ltr">
+                                <div class="bipolar-scale" aria-hidden="true"><span>Oscurecer</span><span>0</span><span>Aclarar</span></div>
                                 <label for="sl-adv-shadows"><span>Sombras</span><output>0</output></label>
                                 <input id="sl-adv-shadows" type="range" min="-100" max="100" value="0"
-                                    data-advanced-control="shadows" data-scale="100" data-display-scale="100" data-default="0">
+                                    data-advanced-control="shadows" data-scale="100" data-display-scale="100" data-default="0"
+                                    data-bipolar="true" dir="ltr">
                                 <label for="sl-adv-highlights"><span>Altas luces</span><output>0</output></label>
                                 <input id="sl-adv-highlights" type="range" min="-100" max="100" value="0"
-                                    data-advanced-control="highlights" data-scale="100" data-display-scale="100" data-default="0">
+                                    data-advanced-control="highlights" data-scale="100" data-display-scale="100" data-default="0"
+                                    data-bipolar="true" dir="ltr">
                                 <label for="sl-adv-whites"><span>Blancos</span><output>0</output></label>
                                 <input id="sl-adv-whites" type="range" min="-100" max="100" value="0"
-                                    data-advanced-control="whites" data-scale="100" data-display-scale="100" data-default="0">
+                                    data-advanced-control="whites" data-scale="100" data-display-scale="100" data-default="0"
+                                    data-bipolar="true" dir="ltr">
                                 <label for="sl-adv-blacks"><span>Negros</span><output>0</output></label>
                                 <input id="sl-adv-blacks" type="range" min="-100" max="100" value="0"
-                                    data-advanced-control="blacks" data-scale="100" data-display-scale="100" data-default="0">
+                                    data-advanced-control="blacks" data-scale="100" data-display-scale="100" data-default="0"
+                                    data-bipolar="true" dir="ltr">
                                 <label for="sl-adv-vibrance"><span>Intensidad</span><output>0</output></label>
                                 <input id="sl-adv-vibrance" type="range" min="-100" max="100" value="0"
-                                    data-advanced-control="vibrance" data-scale="100" data-display-scale="100" data-default="0">
+                                    data-advanced-control="vibrance" data-scale="100" data-display-scale="100" data-default="0"
+                                    data-bipolar="true" dir="ltr">
                             </div>
                         </details>
 
@@ -3858,6 +3892,10 @@
                                 <input id="sl-solar-radius" type="range" min="55" max="400" value="115" step="5" data-default="115">
                                 <label for="sl-solar-noise-guard"><span>Protección de ruido</span><output id="out-solar-noise-guard">65</output></label>
                                 <input id="sl-solar-noise-guard" type="range" min="0" max="100" value="65" step="1" data-default="65">
+                                <label for="sl-solar-background-protect"><span>Conservar cielo</span><output id="out-solar-background-protect">72</output></label>
+                                <input id="sl-solar-background-protect" type="range" min="0" max="100" value="72" step="1" data-default="72">
+                                <label for="sl-solar-prominence"><span>Recuperar protuberancias</span><output id="out-solar-prominence">0</output></label>
+                                <input id="sl-solar-prominence" type="range" min="0" max="100" value="0" step="1" data-default="0">
                                 <label for="sl-solar-color-strength"><span>Fuerza de falso color</span><output id="out-solar-color-strength">90</output></label>
                                 <input id="sl-solar-color-strength" type="range" min="0" max="100" value="90" step="1" data-default="90">
                                 <label for="sl-solar-highlight-protect"><span>Proteger altas luces</span><output id="out-solar-highlight-protect">65</output></label>
@@ -3876,6 +3914,43 @@
                                 </div>
                             </div>
                             <div id="solar-module-status" class="module-status" data-state="idle" aria-live="polite">Neutral · sin alterar la señal mono</div>
+                        </details>
+
+                        <details id="object-finishing-module" class="post-module object-finishing-module" open>
+                            <summary>
+                                <span>Laboratorio Luna y Planetas</span>
+                                <small>recetas 16-bit por objetivo</small>
+                            </summary>
+                            <div class="object-finishing-contract">
+                                <strong>Un punto de partida, no una caja negra.</strong>
+                                <p>Cada receta mueve controles visibles y crea un paso reversible. “Científico” conserva color y tono; “Creativo” es interpretativo.</p>
+                            </div>
+                            <section class="object-preset-family" aria-labelledby="lunar-preset-title">
+                                <div class="object-preset-heading">
+                                    <strong id="lunar-preset-title">Luna</strong>
+                                    <span>fase · superficie · mineral</span>
+                                </div>
+                                <div class="object-preset-grid">
+                                    <button type="button" data-object-preset="lunar-relief"><span>Relieve lunar</span><small>Científico</small></button>
+                                    <button type="button" data-object-preset="lunar-phase"><span>Fase completa</span><small>Científico</small></button>
+                                    <button type="button" data-object-preset="lunar-mineral"><span>Luna mineral</span><small>Creativo · color</small></button>
+                                </div>
+                            </section>
+                            <section class="object-preset-family" aria-labelledby="planet-preset-title">
+                                <div class="object-preset-heading">
+                                    <strong id="planet-preset-title">Planetas</strong>
+                                    <span>detalle natural o expresivo</span>
+                                </div>
+                                <div class="object-preset-grid">
+                                    <button type="button" data-object-preset="jupiter-natural"><span>Júpiter natural</span><small>Científico</small></button>
+                                    <button type="button" data-object-preset="saturn-rings"><span>Saturno y anillos</span><small>Científico</small></button>
+                                    <button type="button" data-object-preset="mars-detail"><span>Marte detallado</span><small>Científico</small></button>
+                                    <button type="button" data-object-preset="planet-cinematic"><span>Planetario expresivo</span><small>Creativo</small></button>
+                                </div>
+                            </section>
+                            <div id="object-finishing-status" class="module-status" data-state="idle" aria-live="polite">
+                                Elige una receta para ver qué módulos activa.
+                            </div>
                         </details>
 
                         <details class="post-module color-module" open>
@@ -4189,7 +4264,7 @@
     <aside id="zenith-guide-panel" aria-label="Asistente inteligente" aria-hidden="true">
         <div class="guide-panel-header">
             <div>
-                <span class="guide-kicker">ANÁLISIS LOCAL 16-BIT</span>
+                <span class="guide-kicker">ASISTENTE PERSONAL · LOCAL 16-BIT</span>
                 <h3>Asistente inteligente</h3>
             </div>
             <button id="btn-close-guide" class="floating-panel-close" type="button" aria-label="Cerrar asistente">
@@ -4199,7 +4274,7 @@
         <div id="intelligent-assistant-summary" class="assistant-summary">Preparación · sin resultado</div>
         <button id="btn-assistant-analyze" type="button" class="assistant-analyze-button">
             <svg class="zas-icon"><use href="#icon-chart"></use></svg>
-            Diagnosticar resultado activo
+            <span id="assistant-primary-label">Ver siguiente paso</span>
         </button>
         <div id="zenith-guide-list" class="guide-list"></div>
         <p class="guide-privacy-note">Las recomendaciones se calculan localmente a partir del flujo, histograma, artefactos e historial activo.</p>
@@ -4225,9 +4300,14 @@
             <canvas id="post-tone-curve" width="420" height="170"></canvas>
         </section>
         <section class="scope-card">
-            <header><strong>Respuesta de detalle</strong><span id="detail-response-summary">receta neutra</span></header>
+            <header><strong>Respuesta estimada de detalle</strong><span id="detail-response-summary">receta neutra</span></header>
             <canvas id="post-detail-curve" width="420" height="150"></canvas>
         </section>
+        <div class="scope-health-strip" aria-live="polite">
+            <span id="scope-shadow-health">Sombras —</span>
+            <span id="scope-highlight-health">Luces —</span>
+            <span id="scope-render-health">Final 1:1</span>
+        </div>
     </aside>
 
     <div id="console-panel" aria-hidden="true">

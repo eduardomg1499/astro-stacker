@@ -3084,7 +3084,13 @@ struct SolarMonoParams {
     midtone_color: [f32; 3],
     highlight_color: [f32; 3],
     color_strength: f32,
+    /// Preserves luminance in the bright solar disk instead of protecting
+    /// only the false-colour saturation.
     highlight_protect: f32,
+    /// Keeps the estimated sky/background near its measured black floor.
+    background_protect: f32,
+    /// Recovers coherent low-signal structures immediately outside the disk.
+    prominence_amount: f32,
     /// Edge-confident local contrast dedicated to fine solar filaments.
     filament_amount: f32,
     filament_radius: f32,
@@ -3103,6 +3109,8 @@ impl Default for SolarMonoParams {
             highlight_color: [1.0, 0.94, 0.35],
             color_strength: 0.9,
             highlight_protect: 0.65,
+            background_protect: 0.72,
+            prominence_amount: 0.0,
             filament_amount: 0.0,
             filament_radius: 1.15,
             noise_guard: 0.65,
@@ -3324,6 +3332,8 @@ struct Progress {
 struct PsfResult {
     sigma: f32,
     iterations: usize,
+    confidence: f32,
+    noise_sigma: f32,
     msg: String,
 }
 #[derive(serde::Serialize)]

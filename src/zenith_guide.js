@@ -11,13 +11,149 @@ const DEFAULT_RULES = [
     dismissible: true,
   },
   {
+    id: "batch-scan",
+    priority: 109,
+    when: (ctx) => ctx.flow === "batch" && ctx.stage === "scan",
+    level: "next",
+    title: "Define el alcance del lote",
+    message: "Usa sólo esta carpeta si contiene una sesión; incluye subcarpetas cuando cada captura esté organizada dentro de ella.",
+    target: "#btn-batch-mode",
+    actionLabel: "Revisar selección",
+    dismissible: false,
+  },
+  {
+    id: "batch-load",
+    priority: 108,
+    when: (ctx) => ctx.flow === "batch" && ctx.stage === "load",
+    level: "next",
+    title: "Prepara la referencia del lote",
+    message: (ctx) => `${Number(ctx.itemCount || 0)} videos detectados. Ajusta uno representativo y Zenith reutilizará esa receta con trazabilidad.`,
+    target: "#btn-batch-tune",
+    actionLabel: "Elegir referencia",
+    dismissible: false,
+  },
+  {
+    id: "batch-analyze",
+    priority: 107,
+    when: (ctx) => ctx.flow === "batch" && ctx.stage === "analyze",
+    level: "next",
+    title: "Analiza la referencia",
+    message: "La referencia fija calidad, malla y porcentaje para todo el lote. Comprueba que represente bien la sesión.",
+    target: "#btn-run-analysis",
+    actionLabel: "Analizar referencia",
+    activate: true,
+    dismissible: false,
+  },
+  {
+    id: "batch-run",
+    priority: 106,
+    when: (ctx) => ctx.flow === "batch" && ctx.stage === "run",
+    level: "next",
+    title: "La receta del lote está lista",
+    message: "Revisa la carpeta de salida y ejecuta. Cada video conservará trazabilidad y no se sobrescribirá.",
+    target: "#btn-batch-run",
+    actionLabel: "Revisar y ejecutar",
+    dismissible: false,
+  },
+  {
+    id: "batch-complete",
+    priority: 107,
+    when: (ctx) => ctx.flow === "batch" && ctx.stage === "complete",
+    level: "success",
+    title: "El lote terminó",
+    message: (ctx) => `${Number(ctx.completedItems || 0)} de ${Number(ctx.itemCount || 0)} resultados están disponibles. Revisa la secuencia y abre un máster si necesita acabado individual.`,
+    target: "#animation-modal",
+    actionLabel: "Revisar resultados",
+    dismissible: false,
+  },
+  {
+    id: "mosaic-load",
+    priority: 108,
+    when: (ctx) => ctx.flow === "mosaic" && ctx.stage === "load",
+    level: "next",
+    title: "Añade los paneles del mosaico",
+    message: "Usa tomas con solape y orientación compatibles. El asistente continuará con análisis, apilado y unión.",
+    target: "#mosaic-dropzone",
+    actionLabel: "Ir a fuentes",
+    dismissible: false,
+  },
+  {
+    id: "mosaic-analyze",
+    priority: 107,
+    when: (ctx) => ctx.flow === "mosaic" && ctx.stage === "analyze",
+    level: "next",
+    title: "Analiza todos los paneles",
+    message: "Zenith medirá calidad y consistencia antes de apilar para evitar uniones con detalle desigual.",
+    target: "#btn-mosaic-analyze-all",
+    actionLabel: "Analizar paneles",
+    activate: true,
+    dismissible: false,
+  },
+  {
+    id: "mosaic-stack",
+    priority: 106,
+    when: (ctx) => ctx.flow === "mosaic" && ctx.stage === "stack",
+    level: "next",
+    title: "Apila los paneles",
+    message: "Confirma el porcentaje sugerido y genera un máster coherente por panel antes de componer.",
+    target: "#btn-mosaic-stack-all",
+    actionLabel: "Apilar paneles",
+    dismissible: false,
+  },
+  {
+    id: "mosaic-compose",
+    priority: 105,
+    when: (ctx) => ctx.flow === "mosaic" && ctx.stage === "compose",
+    level: "next",
+    title: "Compón y revisa las uniones",
+    message: "Ordena los paneles, valida el solape y crea el mosaico. Después podrás abrir el postprocesado compartido.",
+    target: "#mosaic-step-generate",
+    actionLabel: "Ir a composición",
+    dismissible: false,
+  },
+  {
+    id: "mosaic-result",
+    priority: 106,
+    when: (ctx) => ctx.flow === "mosaic" && ctx.stage === "result",
+    level: "success",
+    title: "El mosaico está unido",
+    message: "Revisa las costuras y abre el postprocesado. El historial comenzará desde el mosaico original.",
+    target: "#btn-mosaic-edit",
+    actionLabel: "Abrir postprocesado",
+    activate: true,
+    dismissible: false,
+  },
+  {
+    id: "deepsky-step",
+    priority: 108,
+    when: (ctx) => ctx.flow === "deepsky" && Number.isFinite(ctx.workflowStep),
+    level: ctx => ctx.stage === "blocked" ? "warning" : "next",
+    title: (ctx) => [
+      "Organiza lights y calibraciones",
+      "Valida compatibilidad",
+      "Elige una receta reproducible",
+      ctx.stage === "blocked" ? "Resuelve el plan antes de integrar" : "Integra el cielo profundo",
+    ][Math.max(0, Math.min(3, Number(ctx.workflowStep) || 0))],
+    message: (ctx) => [
+      "Añade las tomas y deja que Zenith agrupe exposición, filtro y firma de calibración.",
+      "Revisa PSF, coincidencias y avisos; los datos incompatibles no se mezclarán en silencio.",
+      "Empieza con Auto o un perfil y abre las opciones avanzadas sólo si necesitas control experto.",
+      ctx.stage === "blocked"
+        ? "El plan muestra una incompatibilidad material. Abre la revisión y corrígela antes de continuar."
+        : "El plan es válido. Comprueba las salidas lineales y ejecuta la integración.",
+    ][Math.max(0, Math.min(3, Number(ctx.workflowStep) || 0))],
+    target: (ctx) => Number(ctx.workflowStep) === 3 ? "#ds-preflight-review" : "#ds-wizard-scroll",
+    actionLabel: "Volver al paso activo",
+    dismissible: false,
+  },
+  {
     id: "no-source",
     priority: 100,
-    when: (ctx) => !ctx.hasSource && !ctx.hasResult,
+    when: (ctx) => (!ctx.flow || ctx.flow === "individual") && !ctx.hasSource && !ctx.hasResult,
     level: "info",
     title: "Carga una fuente",
     message: "Selecciona un video, una secuencia o un resultado para comenzar.",
-    target: "#btn-open-file",
+    target: "#btn-analyze",
     actionLabel: "Elegir fuente",
     activate: true,
     dismissible: false,
@@ -37,24 +173,42 @@ const DEFAULT_RULES = [
   {
     id: "needs-analysis",
     priority: 95,
-    when: (ctx) => ctx.hasSource && !ctx.hasAnalysis && !ctx.hasResult,
+    when: (ctx) => (!ctx.flow || ctx.flow === "individual") && ctx.hasSource && !ctx.hasAnalysis && !ctx.hasResult,
     level: "next",
     title: "Analiza antes de apilar",
     message: "El análisis detecta calidad, movimiento y el mejor fotograma de referencia.",
-    target: "#btn-analyze",
-    actionLabel: "Ir al análisis",
+    target: "#btn-run-analysis",
+    actionLabel: "Analizar ahora",
+    activate: true,
     dismissible: false,
   },
   {
     id: "ready-to-stack",
     priority: 90,
-    when: (ctx) => ctx.hasAnalysis && !ctx.hasResult,
+    when: (ctx) => (!ctx.flow || ctx.flow === "individual") && ctx.hasAnalysis && !ctx.hasResult,
     level: "next",
     title: "Listo para apilar",
     message: "Revisa porcentaje, objetivo y método; después inicia el apilado.",
     target: "#btn-stack",
     actionLabel: "Revisar apilado",
     dismissible: false,
+  },
+  {
+    id: "object-finishing-start",
+    priority: 67,
+    when: (ctx) => ctx.hasResult
+      && ctx.historyLength <= 1
+      && (ctx.targetCategory === "surface" || ctx.targetCategory === "planet_small"),
+    level: "next",
+    title: (ctx) => ctx.targetCategory === "surface"
+      ? "Elige un acabado lunar o solar"
+      : "Elige un acabado planetario",
+    message: (ctx) => ctx.targetCategory === "surface"
+      ? "Hay recetas de relieve lunar, fase completa y mineral; las creativas están separadas de las científicas."
+      : "Empieza con una receta natural y ajusta deconvolución, wavelets y color con A/B.",
+    target: "#object-finishing-module",
+    actionLabel: "Abrir laboratorio",
+    dismissible: true,
   },
   {
     id: "clipping",
@@ -228,6 +382,7 @@ export function evaluateGuide(context, rules = DEFAULT_RULES, dismissedIds = new
     .slice(0, 4)
     .map(({ when, ...rule }) => ({
       ...rule,
+      level: resolveValue(rule.level, context),
       title: resolveValue(rule.title, context),
       message: resolveValue(rule.message, context),
       target: resolveValue(rule.target, context),
@@ -287,12 +442,16 @@ export class IntelligentAssistant {
       this.status.dataset.level = warnings ? "warning" : "success";
     }
     if (this.summary) {
-      const flow = this.context.source === "mosaic" ? "Mosaico"
-        : this.context.source === "batch" ? "Lote"
-          : this.context.hasResult ? "Resultado individual" : "Preparación";
-      const precision = this.context.hasResult ? "16-bit" : "sin resultado";
+      const flow = this.context.flow === "deepsky" ? "Cielo profundo"
+        : this.context.flow === "mosaic" || this.context.source === "mosaic" ? "Mosaico"
+          : this.context.flow === "batch" || this.context.source === "batch" ? "Lote"
+            : this.context.hasResult ? "Resultado individual" : "Preparación";
+      const step = Number.isFinite(this.context.workflowStep)
+        ? ` · paso ${Number(this.context.workflowStep) + 1}/${Math.max(1, Number(this.context.workflowTotal) || 1)}`
+        : "";
+      const precision = this.context.hasResult ? "16-bit" : "flujo guiado";
       const recommendationCount = suggestions.length === 1 ? "1 recomendación" : `${suggestions.length} recomendaciones`;
-      this.summary.textContent = `${flow} · ${precision} · ${recommendationCount}`;
+      this.summary.textContent = `${flow}${step} · ${precision} · ${recommendationCount}`;
     }
     if (!this.list) return;
     this.list.replaceChildren();

@@ -359,6 +359,20 @@ export class MosaicManager {
             // UI UNLOCK - Always execute even if addTile fails
             lockUI(false);
             this.updateWorkflowState();
+            const hasPending = this.tiles.some(tile => tile.type === "video" && tile.status === "pending_analysis");
+            const hasAnalyzed = this.tiles.some(tile => tile.type === "video" && tile.status === "analyzed");
+            const stage = hasPending ? "analyze" : hasAnalyzed ? "stack" : this.tiles.length ? "compose" : "load";
+            const step = stage === "analyze" ? 1 : stage === "stack" ? 2 : stage === "compose" ? 3 : 0;
+            window.updateIntelligentAssistantContext?.({
+                flow: "mosaic",
+                stage,
+                workflowStep: step,
+                workflowTotal: 5,
+                itemCount: this.tiles.length,
+            }, {
+                open: true,
+                announceKey: `mosaic:${stage}:${this.tiles.length}`,
+            });
 
             // Tutorial: file selection completed. The guide branches later based
             // on whether these are videos or already-stacked images.
@@ -559,6 +573,16 @@ export class MosaicManager {
             const avg = analyzed.reduce((a, b) => a + (b.analysisData ? b.analysisData.avg_quality : 0), 0) / analyzed.length;
             document.getElementById("mosaic-quality-summary").textContent = `Promedio Calidad: ${Math.round(avg)}%`;
         }
+        window.updateIntelligentAssistantContext?.({
+            flow: "mosaic",
+            stage: "stack",
+            workflowStep: 2,
+            workflowTotal: 5,
+            itemCount: this.tiles.length,
+        }, {
+            open: true,
+            announceKey: `mosaic:analyzed:${successCount}`,
+        });
     }
 
     async stackAll() {
@@ -720,6 +744,16 @@ export class MosaicManager {
         if (window.log) window.log("SUCCESS", `Apilado completado: ${successCount} de ${videos.length} teselas procesadas.`);
         this.updateWorkflowState();
         this.renderCanvas();
+        window.updateIntelligentAssistantContext?.({
+            flow: "mosaic",
+            stage: "compose",
+            workflowStep: 3,
+            workflowTotal: 5,
+            itemCount: this.tiles.length,
+        }, {
+            open: true,
+            announceKey: `mosaic:stacked:${successCount}`,
+        });
         if (tutorialManager?.currentFlowName === 'mosaic' && tutorialManager.currentStepIndex === 5) {
             setTimeout(() => tutorialManager.nextStep(), 500);
         }
@@ -1131,6 +1165,16 @@ export class MosaicManager {
             }
 
             console.log("Mosaic Generated. Waiting for user confirmation.");
+            window.updateIntelligentAssistantContext?.({
+                flow: "mosaic",
+                stage: "result",
+                workflowStep: 4,
+                workflowTotal: 5,
+                itemCount: this.tiles.length,
+            }, {
+                open: true,
+                announceKey: `mosaic:result:${res.path}`,
+            });
 
             if (shouldPauseMosaicTutorial) {
                 tutorialManager.showOverlay();

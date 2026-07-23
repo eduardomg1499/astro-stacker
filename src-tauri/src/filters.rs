@@ -1397,14 +1397,14 @@ fn run_processing_pipeline(
     let (color_pivot, tone_white) = estimate_color_adjust_context(&original.data);
 
     let mut r_plane = vec![0.0f32; size];
-    let g_plane = vec![0.0f32; size];
+    let mut g_plane = vec![0.0f32; size];
     let mut b_plane = vec![0.0f32; size];
 
     // 1. Parallel Render into separate f32 planes
     // Use unsafe for direct memory writing from parallel iterator
-    let r_ptr = r_plane.as_ptr() as usize;
-    let g_ptr = g_plane.as_ptr() as usize;
-    let b_ptr = b_plane.as_ptr() as usize;
+    let r_ptr = r_plane.as_mut_ptr() as usize;
+    let g_ptr = g_plane.as_mut_ptr() as usize;
+    let b_ptr = b_plane.as_mut_ptr() as usize;
 
     (0..size).into_par_iter().for_each(|i| {
         let (mut r, mut g, mut b);

@@ -13,6 +13,10 @@ import {
   toneCurvePointFromClient,
 } from "../src/solar_postprocess.js";
 import { resolvePostprocessHelp } from "../src/postprocess_help.js";
+import {
+  cloneObjectFinishingPreset,
+  objectPresetApplicable,
+} from "../src/object_postprocess_presets.js";
 
 test("a new result atomically discards the previous history", () => {
   const session = new PostProcessSession();
@@ -90,6 +94,34 @@ test("the assistant exposes A/B as an executable action when history exists", ()
   assert.equal(compare?.activate, true);
 });
 
+test("the assistant follows batch, mosaic and deep-sky workflow stages", () => {
+  const batchScan = evaluateGuide({ flow: "batch", stage: "scan", hasSource: false, hasResult: false });
+  assert.equal(batchScan[0]?.id, "batch-scan");
+  assert.match(batchScan[0]?.message || "", /subcarpetas/i);
+
+  const batchLoad = evaluateGuide({ flow: "batch", stage: "load", itemCount: 3, hasResult: false });
+  assert.equal(batchLoad[0]?.id, "batch-load");
+  assert.match(batchLoad[0]?.message || "", /3 videos detectados/i);
+
+  const batch = evaluateGuide({ flow: "batch", stage: "analyze", hasSource: true, hasResult: false });
+  assert.equal(batch[0]?.id, "batch-analyze");
+  assert.equal(batch[0]?.target, "#btn-run-analysis");
+  assert.equal(batch[0]?.activate, true);
+
+  const mosaic = evaluateGuide({ flow: "mosaic", stage: "stack", hasResult: false });
+  assert.equal(mosaic[0]?.id, "mosaic-stack");
+  assert.equal(mosaic[0]?.target, "#btn-mosaic-stack-all");
+
+  const deepSky = evaluateGuide({
+    flow: "deepsky",
+    stage: "blocked",
+    workflowStep: 3,
+    hasResult: false,
+  });
+  assert.equal(deepSky[0]?.id, "deepsky-step");
+  assert.equal(deepSky[0]?.level, "warning");
+});
+
 test("assistant recommendations are actionable and dismissible per result", () => {
   const context = {
     hasSource: true,
@@ -143,6 +175,18 @@ test("solar curves remain bounded and presets are independent copies", () => {
   const second = cloneSolarPreset("ha-gold");
   first.curvePoints[1][1] = 1;
   assert.notEqual(first.curvePoints[1][1], second.curvePoints[1][1]);
+});
+
+test("object finishing presets separate natural and interpretive colour contracts", () => {
+  const lunar = cloneObjectFinishingPreset("lunar-relief");
+  const mineral = cloneObjectFinishingPreset("lunar-mineral");
+  assert.equal(lunar.intent, "scientific");
+  assert.equal(mineral.intent, "creative");
+  assert.ok(lunar.pipeline.deconv.i >= 6);
+  assert.equal(objectPresetApplicable(mineral, { isMono: true }).applicable, false);
+  assert.equal(objectPresetApplicable(mineral, { isMono: false }).applicable, true);
+  mineral.pipeline.w[0] = 99;
+  assert.notEqual(cloneObjectFinishingPreset("lunar-mineral").pipeline.w[0], 99);
 });
 
 test("the shared tone curve is exact when linear and the assistant can propose it", () => {
@@ -212,6 +256,11 @@ test("only the scientific 16-bit histogram and advanced modules remain in the pa
   assert.ok(html.includes('id="solar-mono-module"'));
   assert.ok(html.includes('id="solar-tone-curve"'));
   assert.equal((html.match(/data-solar-preset=/g) || []).length, 5);
+  assert.ok(html.includes('id="sl-solar-background-protect"'));
+  assert.ok(html.includes('id="sl-solar-prominence"'));
+  assert.ok(html.includes('id="object-finishing-module"'));
+  assert.equal((html.match(/data-object-preset=/g) || []).length, 7);
+  assert.ok(html.includes('id="ds-step-assistant"'));
   assert.equal(html.includes("Supera al sharpening"), false);
 });
 
@@ -229,6 +278,15 @@ test("standard stacking, colour grading and mosaic share the corrected contracts
   assert.match(main, /invoke\("stack_video",[\s\S]*?alignRgb:[\s\S]*?qualityPolicy:/);
   assert.ok(main.includes('if (control.type === "color") return;'));
   assert.ok(main.includes("forceFastPreview: true"));
+  const metadataAssignment = main.indexOf("currentFileMetadata = res.metadata");
+  const stackRefresh = main.indexOf("updateStackButtonState();", metadataAssignment);
+  assert.ok(metadataAssignment >= 0 && stackRefresh > metadataAssignment,
+    "stack readiness must refresh after successful analysis metadata is stored");
+  const batchReset = main.indexOf("resetDataAcquisitionUI();", main.indexOf("ui.btnBatchMode.addEventListener"));
+  const batchScanGuide = main.indexOf('stage: "scan"', batchReset);
+  const batchScanChoice = main.indexOf("showCustomChoice(", batchScanGuide);
+  assert.ok(batchReset >= 0 && batchScanGuide > batchReset && batchScanChoice > batchScanGuide,
+    "batch assistant must explain scan scope before the recursion choice opens");
   assert.ok(mosaic.includes('document.getElementById("chk-rgb-align")'));
   assert.ok(mosaic.includes("adaptiveUsm: p?.adaptiveUsm"));
 });
