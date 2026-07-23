@@ -754,6 +754,8 @@ fn apply_advanced_postprocess(
     let temperature = params.temperature.clamp(-1.0, 1.0);
     let tint = params.tint.clamp(-1.0, 1.0);
     let scnr_green = params.scnr_green.clamp(0.0, 1.0);
+    let tone_curve = normalized_solar_curve(&params.tone_curve_points);
+    let tone_curve_tangents = solar_curve_tangents(&tone_curve);
     let solar_enabled = is_mono && params.solar.enabled;
     let solar_curve = normalized_solar_curve(&params.solar.curve_points);
     let solar_curve_tangents = solar_curve_tangents(&solar_curve);
@@ -781,7 +783,7 @@ fn apply_advanced_postprocess(
             + highlights * highlight_weight * 0.22
             + blacks * black_weight * 0.12
             + whites * white_weight * 0.12;
-        let new_luma = (luma
+        let adjusted_luma = (luma
             + tone_delta
             + local_delta
                 .as_ref()
@@ -792,6 +794,11 @@ fn apply_advanced_postprocess(
                 .map(|delta| delta[pixel_index])
                 .unwrap_or(0.0))
         .max(0.0);
+        let new_luma = evaluate_solar_curve(
+            &tone_curve,
+            &tone_curve_tangents,
+            adjusted_luma.clamp(0.0, 1.0),
+        );
         if luma > 1e-6 {
             let scale = new_luma / luma;
             r *= scale;
@@ -1165,6 +1172,31 @@ mod postprocess_io_tests {
         let original = data.clone();
         apply_advanced_postprocess(&mut data, 2, 1, false, &AdvancedColorParams::default());
         assert_eq!(data, original);
+    }
+
+    #[test]
+    fn free_tone_curve_is_bounded_and_preserves_mono_or_colour_ratios() {
+        let mut params = AdvancedColorParams::default();
+        params.tone_curve_points = vec![[0.0, 0.0], [0.5, 0.72], [1.0, 1.0]];
+
+        let mut mono = vec![24_000u16, 24_000, 24_000];
+        apply_advanced_postprocess(&mut mono, 1, 1, true, &params);
+        assert!(mono[0] > 24_000, "la curva debe elevar el medio tono");
+        assert_eq!(mono[0], mono[1]);
+        assert_eq!(mono[1], mono[2]);
+
+        let mut colour = vec![10_000u16, 20_000, 30_000];
+        let rg_before = colour[0] as f32 / colour[1] as f32;
+        let bg_before = colour[2] as f32 / colour[1] as f32;
+        apply_advanced_postprocess(&mut colour, 1, 1, false, &params);
+        let rg_after = colour[0] as f32 / colour[1] as f32;
+        let bg_after = colour[2] as f32 / colour[1] as f32;
+        assert!((rg_after - rg_before).abs() < 0.001);
+        assert!((bg_after - bg_before).abs() < 0.001);
+        assert!(
+            colour.iter().all(|value| *value >= 10_000),
+            "la curva monotónica no debe plegar ni vaciar los canales"
+        );
     }
 
     #[test]

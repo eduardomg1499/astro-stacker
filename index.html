@@ -3761,14 +3761,28 @@
 
                         <details id="post-tone-module" class="post-module" open>
                             <summary><span>Tono profesional</span><small>luminancia 16-bit</small></summary>
-                            <div class="tone-curve-preview">
-                                <canvas id="post-tone-curve-inline" width="360" height="150" aria-label="Curva tonal de la receta"></canvas>
+                            <section id="tone-curve-free" class="tone-curve-preview">
+                                <div class="tone-curve-heading">
+                                    <div>
+                                        <strong>Curva tonal libre</strong>
+                                        <small>Arrastra para ajustar · clic derecho elimina un punto</small>
+                                    </div>
+                                    <button id="btn-reset-tone-curve" type="button" class="secondary compact-button">
+                                        <svg class="zas-icon" aria-hidden="true"><use href="#icon-refresh"></use></svg>
+                                        Lineal
+                                    </button>
+                                </div>
+                                <canvas id="post-tone-curve-editor" width="360" height="170"
+                                    role="application"
+                                    aria-label="Curva tonal editable: clic para añadir o mover puntos, clic derecho para eliminarlos"></canvas>
+                                <div class="tone-curve-axis" aria-hidden="true"><span>Sombras</span><span>Medios</span><span>Luces</span></div>
                                 <div class="tone-preset-row" role="group" aria-label="Ajustes rápidos de curva">
                                     <button type="button" data-tone-preset="linear">Lineal</button>
                                     <button type="button" data-tone-preset="soft-contrast">Contraste suave</button>
                                     <button type="button" data-tone-preset="shadow-recovery">Recuperar sombras</button>
+                                    <button type="button" data-tone-preset="highlight-recovery">Proteger luces</button>
                                 </div>
-                            </div>
+                            </section>
                             <div class="advanced-slider-list">
                                 <label for="sl-adv-exposure"><span>Exposición</span><output>0.00 EV</output></label>
                                 <input id="sl-adv-exposure" type="range" min="-400" max="400" value="0"

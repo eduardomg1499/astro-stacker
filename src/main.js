@@ -18,7 +18,14 @@ import { i18n } from "./i18n.js";
 import { tutorialManager } from "./tutorial_manager.js";
 import { PostProcessSession, unwrapPreviewReference } from "./postprocess_session.js";
 import { IntelligentAssistant } from "./zenith_guide.js";
-import { SolarCurveEditor, cloneSolarPreset, normalizeSolarCurvePoints } from "./solar_postprocess.js";
+import {
+    SolarCurveEditor,
+    ToneCurveEditor,
+    cloneSolarPreset,
+    evaluateToneCurve,
+    normalizeSolarCurvePoints,
+    normalizeToneCurvePoints,
+} from "./solar_postprocess.js";
 import { installPostprocessHelp } from "./postprocess_help.js";
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import {
@@ -1424,7 +1431,9 @@ let lastPostHistogram = null;
 let lastArtifactSuggestion = null;
 let zenithGuide = null;
 let solarCurveEditor = null;
+let toneCurveEditor = null;
 let activeSolarPreset = "neutral";
+let activeTonePreset = "linear";
 let postHistogramRequestId = 0;
 let postBeginNonce = 0;
 window.resetPipelineState = () => {
@@ -2605,6 +2614,43 @@ function initSolarMonoUi() {
     applySolarParamsToUi(cloneSolarPreset("neutral"), { presetName: "neutral" });
 }
 
+function toneCurveIsLinear(points) {
+    const normalized = normalizeToneCurvePoints(points);
+    return normalized.length === 2
+        && Math.abs(normalized[0][0]) < 1e-6
+        && Math.abs(normalized[0][1]) < 1e-6
+        && Math.abs(normalized[1][0] - 1) < 1e-6
+        && Math.abs(normalized[1][1] - 1) < 1e-6;
+}
+
+function markTonePreset(name = "custom") {
+    activeTonePreset = name;
+    document.querySelectorAll("[data-tone-preset]").forEach((button) => {
+        const active = button.dataset.tonePreset === name;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-pressed", String(active));
+    });
+}
+
+function initToneCurveUi() {
+    toneCurveEditor = new ToneCurveEditor(document.getElementById("post-tone-curve-editor"), {
+        onInput: () => {
+            markTonePreset("custom");
+            drawPostprocessScopes();
+            triggerUpdate({ forceFastPreview: true });
+        },
+        onCommit: () => queuePostHistoryCommit("Curva tonal · personalizada"),
+    });
+    document.getElementById("btn-reset-tone-curve")?.addEventListener("click", () => {
+        toneCurveEditor?.setPoints([[0, 0], [1, 1]], { notify: true });
+        markTonePreset("linear");
+        drawPostprocessScopes();
+        triggerUpdate({ forceFastPreview: true });
+        queuePostHistoryCommit("Curva tonal · lineal");
+    });
+    markTonePreset("linear");
+}
+
 function applyAdvancedParamsToUi(advanced = {}) {
     const mapping = {
         levelsBlack: advanced.levelsBlack ?? 0,
@@ -2654,6 +2700,9 @@ function applyAdvancedParamsToUi(advanced = {}) {
         const control = document.querySelector(`[data-grade-color="${name}"]`);
         if (control) control.value = rgbUnitToHex(rgb);
     });
+    const tonePoints = normalizeToneCurvePoints(advanced.toneCurvePoints);
+    toneCurveEditor?.setPoints(tonePoints);
+    markTonePreset(toneCurveIsLinear(tonePoints) ? "linear" : "custom");
     applySolarParamsToUi(advanced.solar || cloneSolarPreset("neutral"));
     updateLevelMarkers();
 }
@@ -5464,6 +5513,8 @@ function resetProcessingParams({ updateMemo = true } = {}) {
         updateAdvancedControlOutput(control);
     });
     document.querySelectorAll("[data-grade-color]").forEach((control) => { control.value = "#ffffff"; });
+    toneCurveEditor?.setPoints([[0, 0], [1, 1]]);
+    markTonePreset("linear");
     applySolarParamsToUi(cloneSolarPreset("neutral"), { presetName: "neutral" });
     updateLevelMarkers();
     updateModeGlow();
@@ -5552,6 +5603,7 @@ function getAdvancedPostprocessParams() {
         levelsBlack: byParam("levelsBlack", 0),
         levelsMid: byParam("levelsMid", 1),
         levelsWhite: byParam("levelsWhite", 1),
+        toneCurvePoints: toneCurveEditor?.getPoints() || [[0, 0], [1, 1]],
         exposure: byParam("exposure", 0),
         shadows: byParam("shadows", 0),
         highlights: byParam("highlights", 0),
@@ -5656,6 +5708,7 @@ function isPostConfigNeutral(p) {
         && p.dr.mode === 0
         && zero(p.levels.black) && one(p.levels.white) && one(p.levels.gamma)
         && zero(p.advanced.levelsBlack) && one(p.advanced.levelsMid) && one(p.advanced.levelsWhite)
+        && toneCurveIsLinear(p.advanced.toneCurvePoints)
         && zero(p.advanced.exposure) && zero(p.advanced.shadows) && zero(p.advanced.highlights)
         && zero(p.advanced.whites) && zero(p.advanced.blacks) && zero(p.advanced.vibrance)
         && zero(p.advanced.temperature) && zero(p.advanced.tint)
@@ -6046,7 +6099,7 @@ function toneCurveOutput(input, params) {
     const whiteWeight = smooth(.72, 1, value);
     value += params.shadows * shadow * .22 + params.highlights * highlight * .22
         + params.blacks * blackWeight * .12 + params.whites * whiteWeight * .12;
-    return Math.max(0, Math.min(1, value));
+    return evaluateToneCurve(params.toneCurvePoints, Math.max(0, Math.min(1, value)));
 }
 
 function drawToneCurveCanvas(canvas, params) {
@@ -6129,7 +6182,6 @@ function drawDetailResponseCanvas(canvas, pipeline) {
 
 function drawPostprocessScopes() {
     const advanced = getAdvancedPostprocessParams();
-    drawToneCurveCanvas(document.getElementById("post-tone-curve-inline"), advanced);
     drawToneCurveCanvas(document.getElementById("post-tone-curve"), advanced);
     drawDetailResponseCanvas(document.getElementById("post-detail-curve"), getPipelineParams());
     if (lastPostHistogram) drawPostHistogram(lastPostHistogram);
@@ -6190,6 +6242,7 @@ async function refreshPostHistogram(preferProcessed = true) {
         if (request !== postHistogramRequestId) return null;
         lastPostHistogram = histogram;
         solarCurveEditor?.setHistogram(histogram.luminance);
+        toneCurveEditor?.setHistogram(histogram.luminance);
         drawPostHistogram(histogram);
         const setText = (id, value) => { const node = document.getElementById(id); if (node) node.textContent = value; };
         setText("hist-min", histogram.minimum.toLocaleString());
@@ -6254,6 +6307,7 @@ function updateZenithGuide(extra = {}) {
         colorFringeScore: Number(lastArtifactSuggestion?.colorFringeScore || 0),
         solarActive: !!postProcessSession.current()?.recipe?.advanced?.solar?.enabled,
         solarFilamentAmount: Number(postProcessSession.current()?.recipe?.advanced?.solar?.filamentAmount || 0),
+        toneCurveActive: !toneCurveIsLinear(getAdvancedPostprocessParams().toneCurvePoints),
         helpTarget: null,
         helpTitle: "",
         helpMessage: "",
@@ -6270,23 +6324,52 @@ function setAdvancedControlValue(name, value) {
 }
 
 function applyTonePreset(name) {
+    const neutral = {
+        levelsBlack: 0,
+        levelsMid: 1,
+        levelsWhite: 1,
+        exposure: 0,
+        shadows: 0,
+        highlights: 0,
+        whites: 0,
+        blacks: 0,
+    };
     const presets = {
-        linear: { levelsBlack: 0, levelsMid: 1, levelsWhite: 1, exposure: 0, shadows: 0, highlights: 0, whites: 0, blacks: 0 },
-        "soft-contrast": { levelsBlack: .004, levelsMid: .96, levelsWhite: .996, exposure: 0, shadows: .08, highlights: -.08, whites: .05, blacks: -.05 },
-        "shadow-recovery": { levelsBlack: 0, levelsMid: 1.08, levelsWhite: 1, exposure: .1, shadows: .28, highlights: -.12, whites: 0, blacks: .03 },
+        linear: {
+            controls: neutral,
+            points: [[0, 0], [1, 1]],
+            label: "Lineal",
+        },
+        "soft-contrast": {
+            controls: neutral,
+            points: [[0, 0], [.18, .12], [.5, .51], [.82, .9], [1, 1]],
+            label: "Contraste suave",
+        },
+        "shadow-recovery": {
+            controls: neutral,
+            points: [[0, 0], [.12, .2], [.38, .48], [.72, .78], [1, 1]],
+            label: "Recuperar sombras",
+        },
+        "highlight-recovery": {
+            controls: neutral,
+            points: [[0, 0], [.28, .25], [.62, .56], [.88, .78], [1, 1]],
+            label: "Proteger luces",
+        },
     };
     const preset = presets[name];
     if (!preset) return;
     suppressPostprocessEvents = true;
     try {
-        Object.entries(preset).forEach(([control, value]) => setAdvancedControlValue(control, value));
+        Object.entries(preset.controls).forEach(([control, value]) => setAdvancedControlValue(control, value));
+        toneCurveEditor?.setPoints(preset.points);
+        markTonePreset(name);
         updateLevelMarkers();
     } finally {
         suppressPostprocessEvents = false;
     }
     drawPostprocessScopes();
-    triggerUpdate();
-    queuePostHistoryCommit(`Curva · ${name === "linear" ? "Lineal" : name === "soft-contrast" ? "Contraste suave" : "Recuperar sombras"}`);
+    triggerUpdate({ forceFastPreview: true });
+    queuePostHistoryCommit(`Curva tonal · ${preset.label}`);
 }
 
 function setLinkedControlValue(id, value, scale = 1) {
@@ -6460,6 +6543,7 @@ function initAdvancedPostprocessControls() {
     });
 }
 
+initToneCurveUi();
 initSolarMonoUi();
 initAdvancedPostprocessControls();
 initPostScopesUi();
@@ -6803,6 +6887,42 @@ async function applyAssistantRecommendation(action, suggestion, context) {
         triggerUpdate({ forceFastPreview: true });
         queuePostHistoryCommit("Asistente · filamentos conservadores");
         navigateAssistantToControl("#sl-solar-filament", { title: "Recuperación de filamentos" });
+        return;
+    }
+
+    if (action === "tone-curve-auto") {
+        const low = Math.max(0, Math.min(.8, Number(context.percentileLow || 0)));
+        const high = Math.max(low + .12, Math.min(1, Number(context.percentileHigh || 1)));
+        const span = high - low;
+        let lowX = Math.max(.04, Math.min(.32, low + span * .12));
+        let highX = Math.max(.68, Math.min(.96, high - span * .08));
+        if (highX - lowX < .25) {
+            lowX = .2;
+            highX = .8;
+        }
+        const measuredMid = Number(context.medianLevel);
+        const midX = Math.max(
+            lowX + .08,
+            Math.min(highX - .08, Number.isFinite(measuredMid) ? measuredMid : (lowX + highX) * .5),
+        );
+        const lowY = lowX * .72;
+        const highY = highX + (1 - highX) * .25;
+        const midY = Math.max(
+            lowY + .06,
+            Math.min(highY - .06, midX + (.5 - midX) * .16),
+        );
+        toneCurveEditor?.setPoints(normalizeToneCurvePoints([
+            [0, 0],
+            [lowX, lowY],
+            [midX, midY],
+            [highX, highY],
+            [1, 1],
+        ]));
+        markTonePreset("custom");
+        drawPostprocessScopes();
+        triggerUpdate({ forceFastPreview: true });
+        queuePostHistoryCommit("Asistente · curva tonal suave");
+        navigateAssistantToControl("#tone-curve-free", { title: "Curva tonal suave" });
         return;
     }
 

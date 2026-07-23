@@ -3117,6 +3117,9 @@ struct AdvancedColorParams {
     levels_black: f32,
     levels_mid: f32,
     levels_white: f32,
+    /// Optional free luminance curve shared by mono and colour output.
+    /// A two-point diagonal is an exact identity.
+    tone_curve_points: Vec<[f32; 2]>,
     /// Exposure is expressed in stops; the remaining tone controls use -1..1.
     exposure: f32,
     shadows: f32,
@@ -3150,6 +3153,7 @@ impl Default for AdvancedColorParams {
             levels_black: 0.0,
             levels_mid: 1.0,
             levels_white: 1.0,
+            tone_curve_points: vec![[0.0, 0.0], [1.0, 1.0]],
             exposure: 0.0,
             shadows: 0.0,
             highlights: 0.0,

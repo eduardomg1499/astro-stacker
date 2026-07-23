@@ -57,6 +57,46 @@ final result: passed
 
 ---
 
+# Design QA — iconos de ayuda, guía contextual y curva tonal
+
+Fecha: 2026-07-23
+
+## Comparación visual en el mismo componente
+
+- Estado: apilado mono 960×612, 12/24 fotogramas, 977 AP, ventana nativa 1288×768.
+- Iconos: la referencia mostraba la bombilla separada del título y del distintivo; la versión corregida agrupa título e icono y conserva `SUB-PIXEL` en una columna estable.
+- Comparación conjunta de iconos: `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/help-icons-comparison.png`.
+- Guía: título y cierre ocupan columnas independientes; el texto se reduce a resumen, efecto y consejo.
+- Comparación conjunta de la guía: `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/context-help-comparison.png`.
+
+## Recorrido funcional validado
+
+1. Los iconos de Deconvolución, Detalles de alta frecuencia, Wavelets y módulos plegables aparecen junto al título que explican.
+2. La guía contextual abre sin recortar el título ni desplazar el cierre; el botón de cierre conserva un objetivo de 32×32 px.
+3. `Abrir en Asistente inteligente` cierra la guía y crea primero una recomendación del control consultado con `Volver al control`.
+4. La nueva curva tonal libre muestra histograma, puntos editables, reset lineal y cuatro presets: Lineal, Contraste suave, Recuperar sombras y Proteger luces.
+5. `Contraste suave` modifica la curva y el resultado, crea `2/2 · Curva tonal · Contraste suave` y habilita A/B con `Anterior` y `Actual`.
+6. Deshacer restaura la línea neutra y el apilado original; rehacer recupera la curva y el resultado procesado.
+7. La ruta mono mantiene Colorimetría y Corrección atmosférica deshabilitadas.
+
+## Evidencia adicional
+
+- Encabezados corregidos: `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/help-icons-aligned.png`.
+- Guía final: `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/context-help-final.png`.
+- Curva y A/B: `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/tone-curve-ab-final.png`.
+- Deshacer frente a rehacer: `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/tone-curve-history-comparison.png`.
+
+## Revisión visual
+
+- No se observan bombillas aisladas, solapamientos ni distintivos fuera de su encabezado.
+- Los textos extensos rompen línea dentro de su propia columna y no invaden el botón de cierre.
+- Los iconos mantienen forma, tamaño y color del sprite SVG de Zenith.
+- La nueva curva añade control profesional sin crear otra tarjeta desconectada del historial.
+
+final result: passed
+
+---
+
 # Design QA — Laboratorio Solar mono y ayuda contextual
 
 Fecha: 2026-07-22

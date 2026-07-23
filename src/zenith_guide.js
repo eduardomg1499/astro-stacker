@@ -162,6 +162,24 @@ const DEFAULT_RULES = [
     dismissible: true,
   },
   {
+    id: "tone-curve-opportunity",
+    priority: 65,
+    when: (ctx) => ctx.hasResult
+      && ctx.histogramAvailable
+      && !ctx.toneCurveActive
+      && ctx.shadowClip <= 0.0001
+      && ctx.highlightClip <= 0.0001
+      && ctx.robustDynamicRange >= 0.12,
+    level: "info",
+    title: "La curva tonal sigue lineal",
+    message: "Puedo crear una curva suave con el histograma actual para separar mejor sombras, medios y luces.",
+    target: "#tone-curve-free",
+    actionLabel: "Abrir curva",
+    applyAction: "tone-curve-auto",
+    applyLabel: "Crear curva suave",
+    dismissible: true,
+  },
+  {
     id: "mono-color",
     priority: 64,
     when: (ctx) => ctx.hasResult && ctx.isMono,

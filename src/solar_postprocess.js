@@ -132,6 +132,9 @@ export function evaluateSolarCurve(points, value) {
   return normalized.at(-1)?.[1] ?? x;
 }
 
+export const normalizeToneCurvePoints = normalizeSolarCurvePoints;
+export const evaluateToneCurve = evaluateSolarCurve;
+
 export function cloneSolarPreset(name) {
   const preset = SOLAR_CURVE_PRESETS[name] || SOLAR_CURVE_PRESETS.neutral;
   return {
@@ -140,11 +143,20 @@ export function cloneSolarPreset(name) {
   };
 }
 
-export class SolarCurveEditor {
-  constructor(canvas, { onInput, onCommit } = {}) {
+export class ToneCurveEditor {
+  constructor(canvas, {
+    onInput,
+    onCommit,
+    lineColor = "#38bdf8",
+    nodeColor = "#67e8f9",
+    activeColor = "#ecfeff",
+  } = {}) {
     this.canvas = canvas || null;
     this.onInput = onInput || (() => {});
     this.onCommit = onCommit || (() => {});
+    this.lineColor = lineColor;
+    this.nodeColor = nodeColor;
+    this.activeColor = activeColor;
     this.points = normalizeSolarCurvePoints();
     this.histogram = [];
     this.activeIndex = -1;
@@ -318,7 +330,7 @@ export class SolarCurveEditor {
       const y = pad + (1 - output) * (height - pad * 2);
       if (index === 0) context.moveTo(x, y); else context.lineTo(x, y);
     }
-    context.strokeStyle = "#f59e0b";
+    context.strokeStyle = this.lineColor;
     context.lineWidth = 2.2;
     context.stroke();
 
@@ -327,11 +339,22 @@ export class SolarCurveEditor {
       const y = pad + (1 - point[1]) * (height - pad * 2);
       context.beginPath();
       context.arc(x, y, index === this.activeIndex ? 6 : 4.5, 0, Math.PI * 2);
-      context.fillStyle = index === this.activeIndex ? "#fef3c7" : "#0f172a";
+      context.fillStyle = index === this.activeIndex ? this.activeColor : "#0f172a";
       context.fill();
-      context.strokeStyle = "#fbbf24";
+      context.strokeStyle = this.nodeColor;
       context.lineWidth = 2;
       context.stroke();
+    });
+  }
+}
+
+export class SolarCurveEditor extends ToneCurveEditor {
+  constructor(canvas, options = {}) {
+    super(canvas, {
+      lineColor: "#f59e0b",
+      nodeColor: "#fbbf24",
+      activeColor: "#fef3c7",
+      ...options,
     });
   }
 }

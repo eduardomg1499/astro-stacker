@@ -3,7 +3,14 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { PostProcessSession, recipesEqual, unwrapPreviewReference } from "../src/postprocess_session.js";
 import { evaluateGuide } from "../src/zenith_guide.js";
-import { cloneSolarPreset, evaluateSolarCurve, normalizeSolarCurvePoints } from "../src/solar_postprocess.js";
+import {
+  cloneSolarPreset,
+  evaluateSolarCurve,
+  evaluateToneCurve,
+  normalizeSolarCurvePoints,
+  normalizeToneCurvePoints,
+} from "../src/solar_postprocess.js";
+import { resolvePostprocessHelp } from "../src/postprocess_help.js";
 
 test("a new result atomically discards the previous history", () => {
   const session = new PostProcessSession();
@@ -136,6 +143,30 @@ test("solar curves remain bounded and presets are independent copies", () => {
   assert.notEqual(first.curvePoints[1][1], second.curvePoints[1][1]);
 });
 
+test("the shared tone curve is exact when linear and the assistant can propose it", () => {
+  assert.equal(evaluateToneCurve(normalizeToneCurvePoints([[0, 0], [1, 1]]), 0.625), 0.625);
+  const suggestion = evaluateGuide({
+    hasResult: true,
+    histogramAvailable: true,
+    toneCurveActive: false,
+    shadowClip: 0,
+    highlightClip: 0,
+    robustDynamicRange: 0.6,
+  }).find((item) => item.id === "tone-curve-opportunity");
+  assert.equal(suggestion?.target, "#tone-curve-free");
+  assert.equal(suggestion?.applyAction, "tone-curve-auto");
+});
+
+test("contextual control descriptions stay short and concrete", () => {
+  for (const id of ["sl-level-black", "sl-deconv-iter", "sl-usm-amt", "sl-solar-filament"]) {
+    const info = resolvePostprocessHelp({ id, dataset: {} });
+    assert.ok(info);
+    assert.ok(info.summary.length <= 90, `${id} summary is too long`);
+    assert.ok(info.effect.length <= 100, `${id} effect is too long`);
+    assert.ok(info.caution.length <= 100, `${id} caution is too long`);
+  }
+});
+
 test("only the scientific 16-bit histogram and advanced modules remain in the panel", async () => {
   const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
   assert.equal((html.match(/id="post-histogram"/g) || []).length, 1);
@@ -150,6 +181,9 @@ test("only the scientific 16-bit histogram and advanced modules remain in the pa
   assert.ok(html.includes('id="chk-linked-wavelets"'));
   assert.ok(html.includes('id="chk-adaptive-usm"'));
   assert.ok(html.includes('id="detail-response-summary"'));
+  assert.ok(html.includes('id="tone-curve-free"'));
+  assert.ok(html.includes('id="post-tone-curve-editor"'));
+  assert.equal((html.match(/data-tone-preset=/g) || []).length, 4);
   assert.ok(html.includes('id="solar-mono-module"'));
   assert.ok(html.includes('id="solar-tone-curve"'));
   assert.equal((html.match(/data-solar-preset=/g) || []).length, 5);
