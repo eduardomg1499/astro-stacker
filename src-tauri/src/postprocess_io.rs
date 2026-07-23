@@ -552,6 +552,189 @@ fn build_local_contrast_delta(
     )
 }
 
+fn normalized_solar_curve(points: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    let mut normalized: Vec<[f32; 2]> = points
+        .iter()
+        .filter(|point| point[0].is_finite() && point[1].is_finite())
+        .map(|point| [point[0].clamp(0.0, 1.0), point[1].clamp(0.0, 1.0)])
+        .collect();
+    normalized.sort_by(|left, right| left[0].total_cmp(&right[0]));
+    normalized.dedup_by(|left, right| (left[0] - right[0]).abs() < 0.000_1);
+    if normalized.first().map(|point| point[0]).unwrap_or(1.0) > 0.000_1 {
+        normalized.insert(0, [0.0, 0.0]);
+    }
+    if normalized.last().map(|point| point[0]).unwrap_or(0.0) < 0.999_9 {
+        normalized.push([1.0, 1.0]);
+    }
+    if normalized.len() < 2 {
+        return vec![[0.0, 0.0], [1.0, 1.0]];
+    }
+    normalized
+}
+
+fn solar_curve_tangents(points: &[[f32; 2]]) -> Vec<f32> {
+    if points.len() < 2 {
+        return vec![1.0; points.len()];
+    }
+    let intervals: Vec<f32> = points
+        .windows(2)
+        .map(|pair| (pair[1][0] - pair[0][0]).max(1e-6))
+        .collect();
+    let secants: Vec<f32> = points
+        .windows(2)
+        .zip(intervals.iter())
+        .map(|(pair, &interval)| (pair[1][1] - pair[0][1]) / interval)
+        .collect();
+    let mut tangents = vec![0.0; points.len()];
+    tangents[0] = secants[0];
+    tangents[points.len() - 1] = secants[secants.len() - 1];
+    for index in 1..points.len() - 1 {
+        let previous = secants[index - 1];
+        let next = secants[index];
+        tangents[index] = if previous * next <= 0.0 {
+            0.0
+        } else {
+            // Weighted harmonic mean (PCHIP). It preserves a genuinely
+            // linear curve, keeps monotone segments monotone and still lets
+            // the user create a controlled local maximum or minimum.
+            let previous_interval = intervals[index - 1];
+            let next_interval = intervals[index];
+            let weight_previous = 2.0 * next_interval + previous_interval;
+            let weight_next = next_interval + 2.0 * previous_interval;
+            (weight_previous + weight_next)
+                / (weight_previous / previous + weight_next / next)
+        };
+    }
+    tangents
+}
+
+#[inline]
+fn evaluate_solar_curve(points: &[[f32; 2]], tangents: &[f32], value: f32) -> f32 {
+    let x = value.clamp(0.0, 1.0);
+    for (index, pair) in points.windows(2).enumerate() {
+        let left = pair[0];
+        let right = pair[1];
+        if x <= right[0] {
+            let span = (right[0] - left[0]).max(1e-6);
+            let t = ((x - left[0]) / span).clamp(0.0, 1.0);
+            let t2 = t * t;
+            let t3 = t2 * t;
+            let output = (2.0 * t3 - 3.0 * t2 + 1.0) * left[1]
+                + (t3 - 2.0 * t2 + t) * span * tangents[index]
+                + (-2.0 * t3 + 3.0 * t2) * right[1]
+                + (t3 - t2) * span * tangents[index + 1];
+            return output
+                .clamp(left[1].min(right[1]), left[1].max(right[1]))
+                .clamp(0.0, 1.0);
+        }
+    }
+    points.last().map(|point| point[1]).unwrap_or(x)
+}
+
+fn build_solar_filament_delta(
+    data: &[u16],
+    width: usize,
+    height: usize,
+    params: &SolarMonoParams,
+) -> Option<Vec<f32>> {
+    if !params.enabled
+        || params.filament_amount <= 1e-6
+        || width == 0
+        || height == 0
+        || data.len() != width * height * 3
+    {
+        return None;
+    }
+    let luma: Vec<f32> = data
+        .par_chunks_exact(3)
+        .map(|pixel| {
+            (0.2126 * pixel[0] as f32
+                + 0.7152 * pixel[1] as f32
+                + 0.0722 * pixel[2] as f32)
+                / 65535.0
+        })
+        .collect();
+    let radius = params.filament_radius.clamp(0.55, 4.0);
+    let blurred = apply_gaussian_blur(&luma, width, height, radius);
+    let details: Vec<f32> = luma
+        .par_iter()
+        .zip(blurred.par_iter())
+        .map(|(&source, &low_pass)| source - low_pass)
+        .collect();
+    if details
+        .par_iter()
+        .map(|detail| detail.abs())
+        .reduce(|| 0.0, f32::max)
+        <= 1e-7
+    {
+        return None;
+    }
+
+    // Robust global noise floor from a deterministic sample of the high-pass
+    // residual. It does not invent texture in a flat field and makes the
+    // "Protección de ruido" control meaningful for high-resolution stacks.
+    let stride = (details.len() / 32_768).max(1);
+    let mut absolute_sample: Vec<f32> = details
+        .iter()
+        .step_by(stride)
+        .map(|value| value.abs())
+        .collect();
+    absolute_sample.sort_by(|left, right| left.total_cmp(right));
+    let mad = absolute_sample
+        .get(absolute_sample.len().saturating_sub(1) / 2)
+        .copied()
+        .unwrap_or(0.0);
+    let noise_sigma = (mad * 1.4826).max(0.000_35);
+    let guard = params.noise_guard.clamp(0.0, 1.0);
+    let threshold = noise_sigma * (0.8 + guard * 3.8);
+    let upper = threshold * (2.4 + guard * 2.8);
+    let amount = params.filament_amount.clamp(0.0, 1.5);
+
+    Some(
+        luma.par_iter()
+            .zip(details.par_iter())
+            .map(|(&value, &detail)| {
+                let confidence = post_smoothstep(threshold, upper, detail.abs());
+                let signal_gate = post_smoothstep(0.004, 0.055, value)
+                    * (1.0 - post_smoothstep(0.9, 0.998, value));
+                // Dark H-alpha fibrils benefit from a slightly stronger
+                // response, while the confidence gate prevents noise worms.
+                let polarity = if detail < 0.0 { 1.16 } else { 1.0 };
+                detail * amount * 2.15 * confidence * signal_gate * polarity
+            })
+            .collect(),
+    )
+}
+
+#[inline]
+fn interpolate_solar_color(
+    value: f32,
+    shadow: [f32; 3],
+    midtone: [f32; 3],
+    highlight: [f32; 3],
+) -> [f32; 3] {
+    let value = value.clamp(0.0, 1.0);
+    let (left, right, linear_t) = if value <= 0.5 {
+        (shadow, midtone, value * 2.0)
+    } else {
+        (midtone, highlight, (value - 0.5) * 2.0)
+    };
+    let t = linear_t * linear_t * (3.0 - 2.0 * linear_t);
+    let chroma = [
+        left[0] + (right[0] - left[0]) * t,
+        left[1] + (right[1] - left[1]) * t,
+        left[2] + (right[2] - left[2]) * t,
+    ];
+    let chroma_luma = (0.2126 * chroma[0] + 0.7152 * chroma[1] + 0.0722 * chroma[2])
+        .max(0.015);
+    let scale = value / chroma_luma;
+    [
+        (chroma[0] * scale).clamp(0.0, 1.0),
+        (chroma[1] * scale).clamp(0.0, 1.0),
+        (chroma[2] * scale).clamp(0.0, 1.0),
+    ]
+}
+
 fn apply_advanced_postprocess(
     data: &mut [u16],
     width: usize,
@@ -571,6 +754,11 @@ fn apply_advanced_postprocess(
     let temperature = params.temperature.clamp(-1.0, 1.0);
     let tint = params.tint.clamp(-1.0, 1.0);
     let scnr_green = params.scnr_green.clamp(0.0, 1.0);
+    let solar_enabled = is_mono && params.solar.enabled;
+    let solar_curve = normalized_solar_curve(&params.solar.curve_points);
+    let solar_curve_tangents = solar_curve_tangents(&solar_curve);
+    let solar_filament_delta =
+        build_solar_filament_delta(data, width, height, &params.solar);
     let hsl_active = params.hsl_hue.iter().any(|value| value.abs() > 1e-6)
         || params.hsl_saturation.iter().any(|value| value.abs() > 1e-6)
         || params.hsl_luminance.iter().any(|value| value.abs() > 1e-6);
@@ -593,7 +781,17 @@ fn apply_advanced_postprocess(
             + highlights * highlight_weight * 0.22
             + blacks * black_weight * 0.12
             + whites * white_weight * 0.12;
-        let new_luma = (luma + tone_delta + local_delta.as_ref().map(|delta| delta[pixel_index]).unwrap_or(0.0)).max(0.0);
+        let new_luma = (luma
+            + tone_delta
+            + local_delta
+                .as_ref()
+                .map(|delta| delta[pixel_index])
+                .unwrap_or(0.0)
+            + solar_filament_delta
+                .as_ref()
+                .map(|delta| delta[pixel_index])
+                .unwrap_or(0.0))
+        .max(0.0);
         if luma > 1e-6 {
             let scale = new_luma / luma;
             r *= scale;
@@ -683,10 +881,37 @@ fn apply_advanced_postprocess(
                 g -= green_excess * scnr_green;
             }
         } else {
-            let mono = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-            r = mono;
-            g = mono;
-            b = mono;
+            let mono = (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0);
+            if solar_enabled {
+                let mut solar_luma =
+                    evaluate_solar_curve(&solar_curve, &solar_curve_tangents, mono);
+                if params.solar.invert {
+                    solar_luma = 1.0 - solar_luma;
+                }
+                if params.solar.colorize {
+                    let mapped = interpolate_solar_color(
+                        solar_luma,
+                        params.solar.shadow_color,
+                        params.solar.midtone_color,
+                        params.solar.highlight_color,
+                    );
+                    let strength = params.solar.color_strength.clamp(0.0, 1.0);
+                    let highlight_weight = post_smoothstep(0.72, 0.995, solar_luma)
+                        * params.solar.highlight_protect.clamp(0.0, 1.0);
+                    let effective_strength = strength * (1.0 - highlight_weight * 0.82);
+                    r = solar_luma + (mapped[0] - solar_luma) * effective_strength;
+                    g = solar_luma + (mapped[1] - solar_luma) * effective_strength;
+                    b = solar_luma + (mapped[2] - solar_luma) * effective_strength;
+                } else {
+                    r = solar_luma;
+                    g = solar_luma;
+                    b = solar_luma;
+                }
+            } else {
+                r = mono;
+                g = mono;
+                b = mono;
+            }
         }
 
         pixel[0] = (r.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
@@ -877,6 +1102,58 @@ mod postprocess_io_tests {
         params.exposure = 0.25;
         apply_advanced_postprocess(&mut data, 2, 1, true, &params);
         for pixel in data.chunks_exact(3) {
+            assert_eq!(pixel[0], pixel[1]);
+            assert_eq!(pixel[1], pixel[2]);
+        }
+    }
+
+    #[test]
+    fn solar_mono_curve_can_invert_and_false_colour_without_mutating_the_contract() {
+        let mut data = vec![8_000u16, 8_000, 8_000, 48_000, 48_000, 48_000];
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.invert = true;
+        params.solar.colorize = true;
+        params.solar.color_strength = 1.0;
+        params.solar.curve_points = vec![[0.0, 0.0], [0.45, 0.32], [1.0, 1.0]];
+        apply_advanced_postprocess(&mut data, 2, 1, true, &params);
+        assert!(
+            data[0] > data[3],
+            "la inversión debe convertir la muestra oscura en la más luminosa"
+        );
+        assert!(
+            data[0] != data[1] || data[1] != data[2],
+            "el falso color solar debe producir canales distintos"
+        );
+    }
+
+    #[test]
+    fn solar_filament_recovery_ignores_flat_fields_and_responds_to_structure() {
+        let (width, height) = (24usize, 24usize);
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.colorize = false;
+        params.solar.filament_amount = 0.8;
+        params.solar.filament_radius = 1.0;
+        params.solar.noise_guard = 0.7;
+
+        let mut flat = vec![24_000u16; width * height * 3];
+        let flat_before = flat.clone();
+        apply_advanced_postprocess(&mut flat, width, height, true, &params);
+        assert_eq!(flat, flat_before, "un campo plano no debe generar filamentos");
+
+        let mut structured = vec![24_000u16; width * height * 3];
+        for y in 5..19 {
+            let x = 7 + (y % 3);
+            structured[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(15_000);
+        }
+        let before = structured.clone();
+        apply_advanced_postprocess(&mut structured, width, height, true, &params);
+        assert_ne!(
+            structured, before,
+            "una fibrilla coherente por encima del piso robusto debe responder"
+        );
+        for pixel in structured.chunks_exact(3) {
             assert_eq!(pixel[0], pixel[1]);
             assert_eq!(pixel[1], pixel[2]);
         }

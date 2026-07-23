@@ -3791,6 +3791,79 @@
                             </div>
                         </details>
 
+                        <details id="solar-mono-module" class="post-module solar-mono-module" open hidden>
+                            <summary>
+                                <span>Laboratorio Solar mono</span>
+                                <small>curvas, inversión, falso color y filamentos</small>
+                            </summary>
+                            <div class="solar-mono-contract">
+                                <svg class="zas-icon" aria-hidden="true"><use href="#icon-lightbulb"></use></svg>
+                                <p><strong>Derivado solar reversible.</strong> El máster apilado permanece monocromo; la curva y el color se guardan como una etapa del historial.</p>
+                            </div>
+                            <div class="solar-preset-row" role="group" aria-label="Presets solares">
+                                <button type="button" data-solar-preset="ha-gold">H-alpha dorado</button>
+                                <button type="button" data-solar-preset="ha-inverted">H-alpha invertido</button>
+                                <button type="button" data-solar-preset="prominence">Prominencias</button>
+                                <button type="button" data-solar-preset="filaments">Filamentos mono</button>
+                                <button type="button" data-solar-preset="neutral">Neutral</button>
+                            </div>
+                            <div class="solar-toggle-grid">
+                                <label>
+                                    <span><strong>Procesamiento solar</strong><small>Activa esta etapa</small></span>
+                                    <span class="switch"><input type="checkbox" id="chk-solar-enabled"><span class="slider round"></span></span>
+                                </label>
+                                <label>
+                                    <span><strong>Invertir luminancia</strong><small>Negativo solar</small></span>
+                                    <span class="switch"><input type="checkbox" id="chk-solar-invert"><span class="slider round"></span></span>
+                                </label>
+                                <label>
+                                    <span><strong>Falso color</strong><small>Mapa por luminancia</small></span>
+                                    <span class="switch"><input type="checkbox" id="chk-solar-colorize" checked><span class="slider round"></span></span>
+                                </label>
+                            </div>
+                            <div class="solar-curve-editor">
+                                <div class="solar-curve-heading">
+                                    <div>
+                                        <strong>Curva de luminancia solar</strong>
+                                        <small>Clic: añadir o mover · clic derecho: eliminar</small>
+                                    </div>
+                                    <button id="btn-reset-solar-curve" type="button" class="secondary compact-button">
+                                        <svg class="zas-icon" aria-hidden="true"><use href="#icon-refresh"></use></svg>
+                                        Lineal
+                                    </button>
+                                </div>
+                                <canvas id="solar-tone-curve" width="360" height="190"
+                                    role="application"
+                                    aria-label="Curva solar editable: clic para añadir o mover puntos, clic derecho para eliminarlos"></canvas>
+                                <div class="solar-curve-axis" aria-hidden="true"><span>Sombras</span><span>Medios</span><span>Luces</span></div>
+                            </div>
+                            <div class="advanced-slider-list solar-slider-list">
+                                <label for="sl-solar-filament"><span>Recuperar filamentos</span><output id="out-solar-filament">0</output></label>
+                                <input id="sl-solar-filament" type="range" min="0" max="150" value="0" step="1" data-default="0">
+                                <label for="sl-solar-radius"><span>Escala de filamentos</span><output id="out-solar-radius">1.15 px</output></label>
+                                <input id="sl-solar-radius" type="range" min="55" max="400" value="115" step="5" data-default="115">
+                                <label for="sl-solar-noise-guard"><span>Protección de ruido</span><output id="out-solar-noise-guard">65</output></label>
+                                <input id="sl-solar-noise-guard" type="range" min="0" max="100" value="65" step="1" data-default="65">
+                                <label for="sl-solar-color-strength"><span>Fuerza de falso color</span><output id="out-solar-color-strength">90</output></label>
+                                <input id="sl-solar-color-strength" type="range" min="0" max="100" value="90" step="1" data-default="90">
+                                <label for="sl-solar-highlight-protect"><span>Proteger altas luces</span><output id="out-solar-highlight-protect">65</output></label>
+                                <input id="sl-solar-highlight-protect" type="range" min="0" max="100" value="65" step="1" data-default="65">
+                            </div>
+                            <div class="solar-color-map">
+                                <div class="solar-color-map-heading">
+                                    <strong>Mapa cromático libre</strong>
+                                    <small>Tres anclas interpoladas suavemente</small>
+                                </div>
+                                <div id="solar-color-ramp" class="solar-color-ramp" aria-label="Vista previa del mapa cromático"></div>
+                                <div class="solar-color-stops">
+                                    <label>Sombras<input id="solar-shadow-color" type="color" value="#0f0000" data-solar-color="shadow"></label>
+                                    <label>Medios<input id="solar-mid-color" type="color" value="#b83300" data-solar-color="midtone"></label>
+                                    <label>Luces<input id="solar-highlight-color" type="color" value="#fff05a" data-solar-color="highlight"></label>
+                                </div>
+                            </div>
+                            <div id="solar-module-status" class="module-status" data-state="idle" aria-live="polite">Neutral · sin alterar la señal mono</div>
+                        </details>
+
                         <details class="post-module color-module" open>
                             <summary><span>Colorimetría</span><small>balance, HSL y grading</small></summary>
                             <div class="advanced-slider-list color-temperature-grid">

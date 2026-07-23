@@ -1,5 +1,16 @@
 const DEFAULT_RULES = [
   {
+    id: "control-help",
+    priority: 110,
+    when: (ctx) => !!ctx.helpTarget,
+    level: "info",
+    title: (ctx) => ctx.helpTitle || "Ayuda del control",
+    message: (ctx) => ctx.helpMessage || "Te llevo al control y conservo la explicación contextual.",
+    target: (ctx) => ctx.helpTarget,
+    actionLabel: "Volver al control",
+    dismissible: true,
+  },
+  {
     id: "no-source",
     priority: 100,
     when: (ctx) => !ctx.hasSource && !ctx.hasResult,
@@ -122,14 +133,43 @@ const DEFAULT_RULES = [
     dismissible: true,
   },
   {
+    id: "solar-mono-workflow",
+    priority: 68,
+    when: (ctx) => ctx.hasResult && ctx.isMono && !ctx.solarActive,
+    level: "next",
+    title: "¿Es una captura solar mono?",
+    message: (ctx) => {
+      const range = Math.round(Number(ctx.robustDynamicRange || 0) * 100);
+      return `La señal útil ocupa cerca del ${range}% del rango. Si corresponde al Sol, puedo crear un derivado H-alpha conservador con curva, falso color y protección de ruido.`;
+    },
+    target: "#solar-mono-module",
+    actionLabel: "Abrir laboratorio solar",
+    applyAction: "solar-auto",
+    applyLabel: "Aplicar receta automática",
+    dismissible: true,
+  },
+  {
+    id: "solar-filaments",
+    priority: 66,
+    when: (ctx) => ctx.hasResult && ctx.isMono && ctx.solarActive && Number(ctx.solarFilamentAmount || 0) <= 0.001,
+    level: "info",
+    title: "Filamentos aún neutrales",
+    message: "La curva solar está activa, pero la recuperación protegida de filamentos sigue en cero. Puedes medirla visualmente con A/B sin alterar el master.",
+    target: "#sl-solar-filament",
+    actionLabel: "Ver recuperación",
+    applyAction: "solar-filaments-auto",
+    applyLabel: "Aplicar realce conservador",
+    dismissible: true,
+  },
+  {
     id: "mono-color",
     priority: 64,
     when: (ctx) => ctx.hasResult && ctx.isMono,
     level: "info",
-    title: "Señal monocroma protegida",
-    message: "Colorimetría y alineación RGB están bloqueadas; tono, deconvolución, wavelets y detalle siguen disponibles.",
-    target: "#post-detail-module",
-    actionLabel: "Trabajar detalle",
+    title: "Ruta monocroma protegida",
+    message: "Colorimetría RGB y alineación atmosférica están bloqueadas. Si la captura es solar, el Laboratorio Solar puede generar falso color sin convertir ni reemplazar el master mono.",
+    target: "#solar-mono-module",
+    actionLabel: "Ver opciones solares",
     dismissible: true,
   },
   {
@@ -172,6 +212,9 @@ export function evaluateGuide(context, rules = DEFAULT_RULES, dismissedIds = new
       ...rule,
       title: resolveValue(rule.title, context),
       message: resolveValue(rule.message, context),
+      target: resolveValue(rule.target, context),
+      actionLabel: resolveValue(rule.actionLabel, context),
+      applyLabel: resolveValue(rule.applyLabel, context),
     }));
 }
 

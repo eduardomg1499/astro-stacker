@@ -3071,6 +3071,47 @@ struct StackResult {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
+struct SolarMonoParams {
+    /// Activates the solar-only derivative. The stacked master remains mono.
+    enabled: bool,
+    /// Inverts the luminance after the editable tone curve.
+    invert: bool,
+    /// Maps the processed mono luminance to the three-stop false-colour gradient.
+    colorize: bool,
+    /// Normalised input/output control points. Endpoints are restored if absent.
+    curve_points: Vec<[f32; 2]>,
+    shadow_color: [f32; 3],
+    midtone_color: [f32; 3],
+    highlight_color: [f32; 3],
+    color_strength: f32,
+    highlight_protect: f32,
+    /// Edge-confident local contrast dedicated to fine solar filaments.
+    filament_amount: f32,
+    filament_radius: f32,
+    noise_guard: f32,
+}
+
+impl Default for SolarMonoParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            invert: false,
+            colorize: true,
+            curve_points: vec![[0.0, 0.0], [1.0, 1.0]],
+            shadow_color: [0.06, 0.0, 0.0],
+            midtone_color: [0.72, 0.2, 0.0],
+            highlight_color: [1.0, 0.94, 0.35],
+            color_strength: 0.9,
+            highlight_protect: 0.65,
+            filament_amount: 0.0,
+            filament_radius: 1.15,
+            noise_guard: 0.65,
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 struct AdvancedColorParams {
     /// Input/output levels in normalised linear 16-bit space.
     levels_black: f32,
@@ -3099,6 +3140,8 @@ struct AdvancedColorParams {
     grading_midtones: [f32; 3],
     grading_highlights: [f32; 3],
     grading_amounts: [f32; 3],
+    /// Exclusive derivative for monochrome solar data.
+    solar: SolarMonoParams,
 }
 
 impl Default for AdvancedColorParams {
@@ -3125,6 +3168,7 @@ impl Default for AdvancedColorParams {
             grading_midtones: [1.0, 1.0, 1.0],
             grading_highlights: [1.0, 1.0, 1.0],
             grading_amounts: [0.0; 3],
+            solar: SolarMonoParams::default(),
         }
     }
 }

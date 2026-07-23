@@ -18,6 +18,8 @@ import { i18n } from "./i18n.js";
 import { tutorialManager } from "./tutorial_manager.js";
 import { PostProcessSession, unwrapPreviewReference } from "./postprocess_session.js";
 import { IntelligentAssistant } from "./zenith_guide.js";
+import { SolarCurveEditor, cloneSolarPreset, normalizeSolarCurvePoints } from "./solar_postprocess.js";
+import { installPostprocessHelp } from "./postprocess_help.js";
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import {
     BATCH_OUTPUT_POLICY_SINGLE_DIRECTORY,
@@ -1421,6 +1423,8 @@ let postEyedropperActive = false;
 let lastPostHistogram = null;
 let lastArtifactSuggestion = null;
 let zenithGuide = null;
+let solarCurveEditor = null;
+let activeSolarPreset = "neutral";
 let postHistogramRequestId = 0;
 let postBeginNonce = 0;
 window.resetPipelineState = () => {
@@ -2419,6 +2423,188 @@ function rgbUnitToHex(rgb) {
     return `#${(rgb || [1, 1, 1]).map((value) => Math.round(Math.max(0, Math.min(1, value)) * 255).toString(16).padStart(2, "0")).join("")}`;
 }
 
+function getSolarMonoParams() {
+    const fraction = (id, fallback = 0) => {
+        const value = parseFloat(document.getElementById(id)?.value);
+        return Number.isFinite(value) ? value / 100 : fallback;
+    };
+    return {
+        enabled: document.getElementById("chk-solar-enabled")?.checked || false,
+        invert: document.getElementById("chk-solar-invert")?.checked || false,
+        colorize: document.getElementById("chk-solar-colorize")?.checked || false,
+        curvePoints: solarCurveEditor?.getPoints() || [[0, 0], [1, 1]],
+        shadowColor: hexToRgbUnit(document.getElementById("solar-shadow-color")?.value || "#0f0000"),
+        midtoneColor: hexToRgbUnit(document.getElementById("solar-mid-color")?.value || "#b83300"),
+        highlightColor: hexToRgbUnit(document.getElementById("solar-highlight-color")?.value || "#fff05a"),
+        colorStrength: fraction("sl-solar-color-strength", .9),
+        highlightProtect: fraction("sl-solar-highlight-protect", .65),
+        filamentAmount: fraction("sl-solar-filament", 0),
+        filamentRadius: fraction("sl-solar-radius", 1.15),
+        noiseGuard: fraction("sl-solar-noise-guard", .65),
+    };
+}
+
+function updateSolarControlOutputs() {
+    const values = {
+        "out-solar-filament": Math.round(parseFloat(document.getElementById("sl-solar-filament")?.value || "0")).toString(),
+        "out-solar-radius": `${(parseFloat(document.getElementById("sl-solar-radius")?.value || "115") / 100).toFixed(2)} px`,
+        "out-solar-noise-guard": Math.round(parseFloat(document.getElementById("sl-solar-noise-guard")?.value || "65")).toString(),
+        "out-solar-color-strength": Math.round(parseFloat(document.getElementById("sl-solar-color-strength")?.value || "90")).toString(),
+        "out-solar-highlight-protect": Math.round(parseFloat(document.getElementById("sl-solar-highlight-protect")?.value || "65")).toString(),
+    };
+    Object.entries(values).forEach(([id, value]) => {
+        const output = document.getElementById(id);
+        if (output) output.textContent = value;
+    });
+}
+
+function updateSolarColorRamp() {
+    const ramp = document.getElementById("solar-color-ramp");
+    if (!ramp) return;
+    const shadow = document.getElementById("solar-shadow-color")?.value || "#0f0000";
+    const midtone = document.getElementById("solar-mid-color")?.value || "#b83300";
+    const highlight = document.getElementById("solar-highlight-color")?.value || "#fff05a";
+    ramp.style.background = `linear-gradient(90deg, ${shadow}, ${midtone}, ${highlight})`;
+}
+
+function markSolarPreset(name = "custom") {
+    activeSolarPreset = name;
+    document.querySelectorAll("[data-solar-preset]").forEach((button) => {
+        button.classList.toggle("is-active", button.dataset.solarPreset === name);
+        button.setAttribute("aria-pressed", String(button.dataset.solarPreset === name));
+    });
+}
+
+function updateSolarUiState() {
+    const module = document.getElementById("solar-mono-module");
+    const status = document.getElementById("solar-module-status");
+    const params = getSolarMonoParams();
+    module?.classList.toggle("is-neutral", !params.enabled);
+    module?.setAttribute("data-solar-active", String(params.enabled));
+    document.querySelectorAll("[data-solar-color], #sl-solar-color-strength, #sl-solar-highlight-protect")
+        .forEach((control) => { control.disabled = !params.colorize; });
+    updateSolarControlOutputs();
+    updateSolarColorRamp();
+    if (!status) return;
+    if (!params.enabled) {
+        status.textContent = "Neutral · sin alterar la señal mono";
+        status.dataset.state = "idle";
+        return;
+    }
+    const stages = [
+        params.invert ? "invertido" : "curva tonal",
+        params.colorize ? "falso color" : "salida mono",
+    ];
+    if (params.filamentAmount > 0.001) {
+        stages.push(`filamentos ${Math.round(params.filamentAmount * 100)}% · ${params.filamentRadius.toFixed(2)} px`);
+    }
+    status.textContent = `${stages.join(" · ")} · derivado 16-bit reversible`;
+    status.dataset.state = "active";
+}
+
+function applySolarParamsToUi(solar = {}, { presetName = "custom" } = {}) {
+    const neutral = cloneSolarPreset("neutral");
+    const params = {
+        ...neutral,
+        ...solar,
+        curvePoints: normalizeSolarCurvePoints(solar.curvePoints || neutral.curvePoints),
+    };
+    const setChecked = (id, value) => {
+        const control = document.getElementById(id);
+        if (control) control.checked = !!value;
+    };
+    const setValue = (id, value) => {
+        const control = document.getElementById(id);
+        if (control) control.value = String(value);
+    };
+    setChecked("chk-solar-enabled", params.enabled);
+    setChecked("chk-solar-invert", params.invert);
+    setChecked("chk-solar-colorize", params.colorize);
+    setValue("sl-solar-filament", Number(params.filamentAmount || 0) * 100);
+    setValue("sl-solar-radius", Number(params.filamentRadius ?? 1.15) * 100);
+    setValue("sl-solar-noise-guard", Number(params.noiseGuard ?? .65) * 100);
+    setValue("sl-solar-color-strength", Number(params.colorStrength ?? .9) * 100);
+    setValue("sl-solar-highlight-protect", Number(params.highlightProtect ?? .65) * 100);
+    setValue("solar-shadow-color", Array.isArray(params.shadowColor) ? rgbUnitToHex(params.shadowColor) : params.shadowColor);
+    setValue("solar-mid-color", Array.isArray(params.midtoneColor) ? rgbUnitToHex(params.midtoneColor) : params.midtoneColor);
+    setValue("solar-highlight-color", Array.isArray(params.highlightColor) ? rgbUnitToHex(params.highlightColor) : params.highlightColor);
+    solarCurveEditor?.setPoints(params.curvePoints);
+    markSolarPreset(presetName);
+    updateSolarUiState();
+}
+
+function applySolarPreset(name) {
+    const preset = cloneSolarPreset(name);
+    suppressPostprocessEvents = true;
+    try {
+        applySolarParamsToUi(preset, { presetName: name });
+    } finally {
+        suppressPostprocessEvents = false;
+    }
+    drawPostprocessScopes();
+    triggerUpdate({ forceFastPreview: preset.filamentAmount > 0 });
+    queuePostHistoryCommit(`Solar · ${preset.label}`);
+}
+
+function initSolarMonoUi() {
+    const canvas = document.getElementById("solar-tone-curve");
+    solarCurveEditor = new SolarCurveEditor(canvas, {
+        onInput: () => {
+            const enabled = document.getElementById("chk-solar-enabled");
+            if (enabled) enabled.checked = true;
+            markSolarPreset("custom");
+            updateSolarUiState();
+            triggerUpdate({ forceFastPreview: true });
+        },
+        onCommit: () => queuePostHistoryCommit("Solar · curva personalizada"),
+    });
+
+    document.querySelectorAll("[data-solar-preset]").forEach((button) => {
+        button.addEventListener("click", () => applySolarPreset(button.dataset.solarPreset));
+    });
+    document.getElementById("btn-reset-solar-curve")?.addEventListener("click", () => {
+        const enabled = document.getElementById("chk-solar-enabled");
+        if (enabled) enabled.checked = true;
+        solarCurveEditor?.setPoints([[0, 0], [1, 1]], { notify: true });
+        markSolarPreset("custom");
+        triggerUpdate({ forceFastPreview: true });
+        queuePostHistoryCommit("Solar · curva lineal");
+    });
+    ["chk-solar-enabled", "chk-solar-invert", "chk-solar-colorize"].forEach((id) => {
+        document.getElementById(id)?.addEventListener("change", () => {
+            markSolarPreset("custom");
+            updateSolarUiState();
+            triggerUpdate({ forceFastPreview: true });
+            queuePostHistoryCommit(`Solar · ${id === "chk-solar-invert" ? "inversión" : id === "chk-solar-colorize" ? "falso color" : "activar módulo"}`);
+        });
+    });
+    ["sl-solar-filament", "sl-solar-radius", "sl-solar-noise-guard", "sl-solar-color-strength", "sl-solar-highlight-protect"]
+        .forEach((id) => {
+            const control = document.getElementById(id);
+            control?.addEventListener("input", () => {
+                const enabled = document.getElementById("chk-solar-enabled");
+                if (enabled) enabled.checked = true;
+                markSolarPreset("custom");
+                updateSolarUiState();
+                triggerUpdate({ forceFastPreview: true });
+            });
+            control?.addEventListener("change", () => queuePostHistoryCommit("Solar · ajuste fino"));
+        });
+    document.querySelectorAll("[data-solar-color]").forEach((control) => {
+        control.addEventListener("input", () => {
+            const enabled = document.getElementById("chk-solar-enabled");
+            const colorize = document.getElementById("chk-solar-colorize");
+            if (enabled) enabled.checked = true;
+            if (colorize) colorize.checked = true;
+            markSolarPreset("custom");
+            updateSolarUiState();
+            triggerUpdate({ forceFastPreview: true });
+        });
+        control.addEventListener("change", () => queuePostHistoryCommit("Solar · mapa cromático"));
+    });
+    applySolarParamsToUi(cloneSolarPreset("neutral"), { presetName: "neutral" });
+}
+
 function applyAdvancedParamsToUi(advanced = {}) {
     const mapping = {
         levelsBlack: advanced.levelsBlack ?? 0,
@@ -2468,6 +2654,7 @@ function applyAdvancedParamsToUi(advanced = {}) {
         const control = document.querySelector(`[data-grade-color="${name}"]`);
         if (control) control.value = rgbUnitToHex(rgb);
     });
+    applySolarParamsToUi(advanced.solar || cloneSolarPreset("neutral"));
     updateLevelMarkers();
 }
 
@@ -5277,6 +5464,7 @@ function resetProcessingParams({ updateMemo = true } = {}) {
         updateAdvancedControlOutput(control);
     });
     document.querySelectorAll("[data-grade-color]").forEach((control) => { control.value = "#ffffff"; });
+    applySolarParamsToUi(cloneSolarPreset("neutral"), { presetName: "neutral" });
     updateLevelMarkers();
     updateModeGlow();
     updateDeconvolutionStatus();
@@ -5382,6 +5570,7 @@ function getAdvancedPostprocessParams() {
         gradingMidtones: hexToRgbUnit(document.querySelector('[data-grade-color="midtones"]')?.value),
         gradingHighlights: hexToRgbUnit(document.querySelector('[data-grade-color="highlights"]')?.value),
         gradingAmounts,
+        solar: getSolarMonoParams(),
     };
 }
 
@@ -5474,7 +5663,8 @@ function isPostConfigNeutral(p) {
         && p.advanced.hslHue.every(zero)
         && p.advanced.hslSaturation.every(zero)
         && p.advanced.hslLuminance.every(zero)
-        && p.advanced.gradingAmounts.every(zero);
+        && p.advanced.gradingAmounts.every(zero)
+        && !p.advanced.solar?.enabled;
 }
 
 // Preview en vivo: la vista actual está en baja resolución (render rápido de
@@ -5946,6 +6136,11 @@ function drawPostprocessScopes() {
 }
 
 function setPostColorControlsForMono(isMono) {
+    const solarModule = document.getElementById("solar-mono-module");
+    if (solarModule) {
+        solarModule.hidden = !isMono;
+        solarModule.setAttribute("aria-hidden", String(!isMono));
+    }
     const colorControls = document.querySelectorAll(
         '.color-module [data-advanced-control], .color-module [data-hsl-index], .color-module [data-grade-amount], .color-module [data-grade-color]'
     );
@@ -5994,6 +6189,7 @@ async function refreshPostHistogram(preferProcessed = true) {
         const histogram = await invoke("postprocess_histogram", { preferProcessed });
         if (request !== postHistogramRequestId) return null;
         lastPostHistogram = histogram;
+        solarCurveEditor?.setHistogram(histogram.luminance);
         drawPostHistogram(histogram);
         const setText = (id, value) => { const node = document.getElementById(id); if (node) node.textContent = value; };
         setText("hist-min", histogram.minimum.toLocaleString());
@@ -6056,6 +6252,11 @@ function updateZenithGuide(extra = {}) {
         hasArtifactAnalysis: !!lastArtifactSuggestion,
         ringingScore: Number(lastArtifactSuggestion?.ringingScore || 0),
         colorFringeScore: Number(lastArtifactSuggestion?.colorFringeScore || 0),
+        solarActive: !!postProcessSession.current()?.recipe?.advanced?.solar?.enabled,
+        solarFilamentAmount: Number(postProcessSession.current()?.recipe?.advanced?.solar?.filamentAmount || 0),
+        helpTarget: null,
+        helpTitle: "",
+        helpMessage: "",
         ...extra,
     });
 }
@@ -6259,6 +6460,7 @@ function initAdvancedPostprocessControls() {
     });
 }
 
+initSolarMonoUi();
 initAdvancedPostprocessControls();
 initPostScopesUi();
 
@@ -6535,6 +6737,7 @@ function navigateAssistantToControl(target, suggestion = {}) {
         ui.statusText.textContent = `Asistente · ${suggestion.title || "control localizado"}`;
         ui.statusText.style.color = "#67e8f9";
     }
+    if (suggestion.id === "control-help") updateZenithGuide({ helpTarget: null, helpTitle: "", helpMessage: "" });
     return true;
 }
 
@@ -6554,6 +6757,55 @@ function applyAssistantToneAdjustments(values, label, target = "#post-tone-modul
 
 async function applyAssistantRecommendation(action, suggestion, context) {
     const advanced = getAdvancedPostprocessParams();
+    if (action === "solar-auto") {
+        const preset = cloneSolarPreset("ha-gold");
+        const low = Math.max(0, Math.min(.8, Number(context.percentileLow || 0)));
+        const high = Math.max(low + .02, Math.min(1, Number(context.percentileHigh || 1)));
+        const middle = low + (high - low) * .48;
+        preset.curvePoints = normalizeSolarCurvePoints([
+            [0, 0],
+            [Math.max(.015, low), .025],
+            [middle, .46],
+            [Math.min(.985, high), .97],
+            [1, 1],
+        ]);
+        const robustRange = Math.max(.01, Number(context.robustDynamicRange || high - low));
+        preset.filamentAmount = robustRange < .18 ? .24 : .34;
+        preset.noiseGuard = Number(context.medianLevel || 0) < .06 ? .8 : .7;
+        suppressPostprocessEvents = true;
+        try {
+            applySolarParamsToUi(preset, { presetName: "custom" });
+        } finally {
+            suppressPostprocessEvents = false;
+        }
+        triggerUpdate({ forceFastPreview: true });
+        queuePostHistoryCommit("Asistente · receta solar automática");
+        navigateAssistantToControl("#solar-mono-module", { title: "Receta solar automática" });
+        return;
+    }
+
+    if (action === "solar-filaments-auto") {
+        const amount = document.getElementById("sl-solar-filament");
+        const radius = document.getElementById("sl-solar-radius");
+        const guard = document.getElementById("sl-solar-noise-guard");
+        const enabled = document.getElementById("chk-solar-enabled");
+        suppressPostprocessEvents = true;
+        try {
+            if (enabled) enabled.checked = true;
+            if (amount) amount.value = "28";
+            if (radius) radius.value = "110";
+            if (guard) guard.value = "76";
+            markSolarPreset("custom");
+            updateSolarUiState();
+        } finally {
+            suppressPostprocessEvents = false;
+        }
+        triggerUpdate({ forceFastPreview: true });
+        queuePostHistoryCommit("Asistente · filamentos conservadores");
+        navigateAssistantToControl("#sl-solar-filament", { title: "Recuperación de filamentos" });
+        return;
+    }
+
     if (action === "protect-range") {
         const values = {};
         if (Number(context.shadowClip || 0) > 0.0001) {
@@ -6624,10 +6876,30 @@ function initZenithGuideUi() {
     updateZenithGuide();
 }
 
+let contextualHelpTargetId = 0;
+function initPostprocessHelpUi() {
+    installPostprocessHelp({
+        root: document.getElementById("panel-wavelets"),
+        onAskAssistant: ({ control, info }) => {
+            if (!control.id) {
+                contextualHelpTargetId += 1;
+                control.id = `post-context-help-${contextualHelpTargetId}`;
+            }
+            updateZenithGuide({
+                helpTarget: `#${control.id}`,
+                helpTitle: info.title,
+                helpMessage: `${info.summary} ${info.caution}`,
+            });
+            setZenithGuideOpen(true);
+        },
+    });
+}
+
 initAtmosphericCorrectionUi();
 initPostEyedropper();
 initArtifactRepairUi();
 initZenithGuideUi();
+initPostprocessHelpUi();
 
 function triggerUpdate(options = {}) {
     if (suppressPostprocessEvents) return;
@@ -6644,7 +6916,8 @@ function triggerUpdate(options = {}) {
     if (currentFilePath) {
         const pf = getPipelineParams();
         const heavy = pf.deconv.i > 0 || pf.deconv.vi > 0 || pf.lce > 0
-            || pf.edgeAwareWavelets || pf.autoMask > 0 || pf.psfFromLimb;
+            || pf.edgeAwareWavelets || pf.autoMask > 0 || pf.psfFromLimb
+            || (pf.advanced?.solar?.enabled && pf.advanced.solar.filamentAmount > 0);
         const nowT = performance.now();
         if ((heavy || forceFastPreview) && nowT - lastFastPreview >= FAST_PREVIEW_MS) {
             lastFastPreview = nowT;

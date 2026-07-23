@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { PostProcessSession, recipesEqual, unwrapPreviewReference } from "../src/postprocess_session.js";
 import { evaluateGuide } from "../src/zenith_guide.js";
+import { cloneSolarPreset, evaluateSolarCurve, normalizeSolarCurvePoints } from "../src/solar_postprocess.js";
 
 test("a new result atomically discards the previous history", () => {
   const session = new PostProcessSession();
@@ -99,6 +100,42 @@ test("assistant recommendations are actionable and dismissible per result", () =
   assert.equal(dismissed.some((item) => item.id === "clipping"), false);
 });
 
+test("mono solar assistant offers an executable recipe and retires it after activation", () => {
+  const context = {
+    hasSource: true,
+    hasResult: true,
+    isMono: true,
+    solarActive: false,
+    histogramAvailable: true,
+    historyLength: 1,
+    canCompare: false,
+    shadowClip: 0,
+    highlightClip: 0,
+    robustDynamicRange: 0.42,
+    medianLevel: 0.2,
+  };
+  const suggestion = evaluateGuide(context).find((item) => item.id === "solar-mono-workflow");
+  assert.equal(suggestion?.target, "#solar-mono-module");
+  assert.equal(suggestion?.applyAction, "solar-auto");
+  assert.equal(
+    evaluateGuide({ ...context, solarActive: true }).some((item) => item.id === "solar-mono-workflow"),
+    false,
+  );
+});
+
+test("solar curves remain bounded and presets are independent copies", () => {
+  const normalized = normalizeSolarCurvePoints([[0.8, 0.95], [0.2, 0.05]]);
+  assert.deepEqual(normalized[0], [0, 0]);
+  assert.deepEqual(normalized.at(-1), [1, 1]);
+  assert.ok(evaluateSolarCurve(normalized, 0.5) > 0.05);
+  assert.ok(evaluateSolarCurve(normalized, 0.5) < 0.95);
+  assert.equal(evaluateSolarCurve([[0, 0], [1, 1]], 0.375), 0.375);
+  const first = cloneSolarPreset("ha-gold");
+  const second = cloneSolarPreset("ha-gold");
+  first.curvePoints[1][1] = 1;
+  assert.notEqual(first.curvePoints[1][1], second.curvePoints[1][1]);
+});
+
 test("only the scientific 16-bit histogram and advanced modules remain in the panel", async () => {
   const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
   assert.equal((html.match(/id="post-histogram"/g) || []).length, 1);
@@ -113,6 +150,9 @@ test("only the scientific 16-bit histogram and advanced modules remain in the pa
   assert.ok(html.includes('id="chk-linked-wavelets"'));
   assert.ok(html.includes('id="chk-adaptive-usm"'));
   assert.ok(html.includes('id="detail-response-summary"'));
+  assert.ok(html.includes('id="solar-mono-module"'));
+  assert.ok(html.includes('id="solar-tone-curve"'));
+  assert.equal((html.match(/data-solar-preset=/g) || []).length, 5);
   assert.equal(html.includes("Supera al sharpening"), false);
 });
 

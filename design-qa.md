@@ -54,3 +54,45 @@ Fecha: 2026-07-22
 - Corrección atmosférica: `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/atmospheric-drag.jpg`.
 
 final result: passed
+
+---
+
+# Design QA — Laboratorio Solar mono y ayuda contextual
+
+Fecha: 2026-07-22
+
+## Comparación funcional con la referencia
+
+- Referencia: curva tonal editable de ImPPG suministrada por el usuario.
+- Implementación: Laboratorio Solar mono dentro del sistema visual de Zenith, ventana nativa 1093×768.
+- Comparación conjunta: `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/solar-reference-comparison.png`.
+- La implementación conserva la interacción esencial de la referencia: histograma de fondo, puntos añadibles y movibles, eliminación con clic derecho, curva continua y reset lineal.
+- Zenith añade presets, inversión, falso color, protección de luces, recuperación de filamentos y A/B sin copiar el estilo visual de otra aplicación.
+
+## Recorrido funcional validado
+
+1. Importar y analizar `lunar-mono.avi`; la ruta se detecta como `MONO`.
+2. Generar 977 AP y apilar 12/24 fotogramas a 960×612.
+3. Abrir la ayuda del módulo y la de `Recuperación de filamentos`; ambas muestran propósito, efecto, cautela y acceso al Asistente inteligente.
+4. Consultar al Asistente: aparece primero el control consultado y después la receta solar calculada con el histograma activo.
+5. Aplicar la receta automática: se activan curva, falso color y recuperación conservadora; la vista procesada cambia en vivo.
+6. Arrastrar un punto de curva: la gráfica, la imagen, A/B y el historial avanzan a `Solar · curva personalizada`.
+7. Aplicar `H-alpha invertido`, `Filamentos mono` y `Neutral`: los tres estados son visibles y Neutral devuelve curva lineal, fuerza cero y módulo inactivo.
+8. A/B compara correctamente el paso anterior con el actual y conserva la división móvil.
+
+## Evidencia
+
+- Laboratorio y A/B: `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/solar-lab-ab.png`.
+- Ayuda por deslizable: `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/solar-slider-help.png`.
+- Preset invertido: `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/solar-inverted-preset.png`.
+- Recuperación mono: `/Users/edumg/.codex/visualizations/2026/07/22/019f898e-9b5e-7232-a050-44e36004925a/solar-filaments-mono.png`.
+
+## Revisión visual
+
+- No se observan solapamientos, cortes ni desbordamientos en el panel de 330 px.
+- Los objetivos táctiles, sliders y puntos de curva funcionan con mouse y trackpad.
+- Los estados activo, inactivo y deshabilitado se distinguen sin depender sólo del color.
+- La ayuda flotante no tapa el control consultado y mantiene un CTA claro.
+- La curva lineal es visual y matemáticamente neutra.
+
+final result: passed
