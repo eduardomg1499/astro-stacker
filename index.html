@@ -1522,8 +1522,81 @@
         #deepsky-modal .ds-session-note svg { width:16px; height:16px; flex:0 0 auto; margin-top:2px; }
         #deepsky-modal .ds-session-note strong { display:block; color:#ccfbf1; margin-bottom:2px; }
         #deepsky-modal .ds-session-note span { color:#a7f3d0; }
+        #deepsky-modal .ds-session-actions {
+            display:grid; grid-template-columns:minmax(0,.9fr) minmax(0,1.1fr); gap:10px;
+            margin:0 0 12px; padding:10px; border:1px solid rgba(56,189,248,.16);
+            border-radius:15px; background:linear-gradient(145deg,rgba(2,6,23,.62),rgba(15,23,42,.42));
+        }
+        #deepsky-modal .ds-session-action {
+            appearance:none; width:100%; min-width:0; min-height:78px; margin:0; padding:11px 12px;
+            display:grid; grid-template-columns:42px minmax(0,1fr) auto; align-items:center; gap:11px;
+            border-radius:12px; text-align:left; cursor:pointer; user-select:none;
+            transition:transform .16s ease,border-color .16s ease,background .16s ease,box-shadow .16s ease;
+        }
+        #deepsky-modal .ds-session-action:hover { transform:translateY(-1px); }
+        #deepsky-modal .ds-session-action:active { transform:translateY(0); }
+        #deepsky-modal .ds-session-action-import {
+            color:#ede9fe; border:1px solid rgba(167,139,250,.5);
+            background:linear-gradient(135deg,rgba(109,40,217,.34),rgba(76,29,149,.16));
+            box-shadow:inset 0 1px 0 rgba(255,255,255,.05),0 10px 26px rgba(76,29,149,.12);
+        }
+        #deepsky-modal .ds-session-action-import:hover {
+            border-color:rgba(196,181,253,.8); background:linear-gradient(135deg,rgba(124,58,237,.45),rgba(76,29,149,.2));
+            box-shadow:0 12px 30px rgba(76,29,149,.2);
+        }
+        #deepsky-modal .ds-session-action-output {
+            color:#cffafe; border:1px solid rgba(34,211,238,.3);
+            background:linear-gradient(135deg,rgba(8,145,178,.14),rgba(15,23,42,.5));
+            box-shadow:inset 3px 0 0 rgba(34,211,238,.5);
+        }
+        #deepsky-modal .ds-session-action-output:hover {
+            border-color:rgba(103,232,249,.58); background:linear-gradient(135deg,rgba(8,145,178,.22),rgba(15,23,42,.58));
+        }
+        #deepsky-modal .ds-session-action-icon {
+            width:42px; height:42px; display:grid; place-items:center; border-radius:12px;
+            border:1px solid currentColor; background:rgba(2,6,23,.24);
+        }
+        #deepsky-modal .ds-session-action-icon svg { width:20px; height:20px; }
+        #deepsky-modal .ds-session-action-copy { min-width:0; display:flex; flex-direction:column; gap:2px; }
+        #deepsky-modal .ds-session-action-kicker {
+            color:#94a3b8; font-size:.55rem; font-weight:800; letter-spacing:.14em; text-transform:uppercase;
+        }
+        #deepsky-modal .ds-session-action-import .ds-session-action-kicker { color:#c4b5fd; }
+        #deepsky-modal .ds-session-action-output .ds-session-action-kicker { color:#67e8f9; }
+        #deepsky-modal .ds-session-action-copy strong {
+            color:#f8fafc; font-size:.73rem; line-height:1.25; letter-spacing:.035em;
+        }
+        #deepsky-modal .ds-session-action-copy small {
+            min-width:0; display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+            color:#94a3b8; font-size:.61rem; line-height:1.4;
+        }
+        #deepsky-modal .ds-session-action-trail {
+            display:flex; flex-direction:column; align-items:flex-end; gap:5px; white-space:nowrap;
+        }
+        #deepsky-modal .ds-session-action-space {
+            max-width:130px; overflow:hidden; text-overflow:ellipsis; color:#67e8f9;
+            font-size:.56rem; font-weight:700;
+        }
+        #deepsky-modal .ds-session-action-cta {
+            display:inline-flex; align-items:center; justify-content:center; min-height:28px; padding:4px 9px;
+            border-radius:8px; border:1px solid currentColor; color:#e2e8f0;
+            background:rgba(2,6,23,.3); font-size:.57rem; font-weight:900; letter-spacing:.06em; text-transform:uppercase;
+        }
+        #deepsky-modal .ds-session-action-import .ds-session-action-cta { color:#ddd6fe; }
+        #deepsky-modal .ds-session-action-output .ds-session-action-cta { color:#a5f3fc; }
+        #deepsky-modal .ds-frame-groups-head {
+            display:flex; align-items:flex-end; justify-content:space-between; gap:16px;
+            margin:0 2px 8px; padding-top:3px;
+        }
+        #deepsky-modal .ds-frame-groups-copy { min-width:0; display:flex; flex-direction:column; gap:2px; }
+        #deepsky-modal .ds-frame-groups-copy strong { color:#e2e8f0; font-size:.72rem; }
+        #deepsky-modal .ds-frame-groups-copy span { color:#64748b; font-size:.61rem; line-height:1.35; }
+        #deepsky-modal .ds-frame-drag-hint {
+            display:flex; align-items:center; justify-content:flex-end; gap:6px; color:#94a3b8;
+            font-size:.58rem; line-height:1.35; text-align:right;
+        }
+        #deepsky-modal .ds-frame-drag-hint svg { color:#7c3aed; flex:0 0 auto; }
         #deepsky-modal .ds-source-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:9px; margin-bottom:12px; }
-        #deepsky-modal .ds-source-grid > .ds-source-wide { grid-column:1 / -1; }
         #deepsky-modal .ds-source-kind { min-width:0; border:1px solid rgba(148,163,184,.12); border-radius:13px; padding:7px; background:rgba(15,23,42,.32); }
         #deepsky-modal .ds-source-kind:has(details[open]) { grid-column:1 / -1; }
         #deepsky-modal .ds-source-kind details { margin:6px 3px 1px; border-top:1px solid rgba(148,163,184,.12); padding-top:6px; }
@@ -1594,7 +1667,14 @@
         @media (max-width: 760px) {
             #deepsky-modal .ds-opts { grid-template-columns: 1fr; }
             #deepsky-modal .ds-multiband-grid, #deepsky-modal .ds-session-groups { grid-template-columns:1fr; }
-            #deepsky-modal .ds-source-grid, #deepsky-modal .ds-night-list { grid-template-columns:1fr; }
+            #deepsky-modal .ds-session-actions, #deepsky-modal .ds-source-grid, #deepsky-modal .ds-night-list { grid-template-columns:1fr; }
+            #deepsky-modal .ds-frame-groups-head { align-items:flex-start; flex-direction:column; gap:6px; }
+            #deepsky-modal .ds-frame-drag-hint { justify-content:flex-start; text-align:left; }
+        }
+        @media (max-width: 520px) {
+            #deepsky-modal .ds-session-action { grid-template-columns:38px minmax(0,1fr); min-height:72px; }
+            #deepsky-modal .ds-session-action-icon { width:38px; height:38px; }
+            #deepsky-modal .ds-session-action-trail { grid-column:2; align-items:flex-start; flex-direction:row; flex-wrap:wrap; }
         }
         @media (max-width: 1050px), (max-height: 740px) {
             #deepsky-modal .ds-wizard-box { height: 94vh; }
@@ -1657,12 +1737,23 @@
                     <div id="ds-group-chips" style="display:none; gap:6px; margin-top:8px; flex-wrap:wrap;"></div>
                 </div>
 
-                <!-- SECCIONES (filas estilo donation-option, render dinámico) -->
-                <div style="font-size:0.62rem; color:#94a3b8; margin:0 0 6px; display:flex; align-items:center; gap:6px;">
-                    <svg class="zas-icon zas-icon-inline" style="color:#7c3aed;"><use href="#icon-grip"></use></svg>
-                    <span data-i18n="deepsky.drag_hint">Arrastra un archivo a otra categoría para reclasificarlo · ✕ para quitarlo</span>
+                <!-- CONFIGURACIÓN DE SESIÓN: acciones, no categorías de tomas. -->
+                <div id="ds-session-actions" class="ds-session-actions"
+                    role="group" aria-label="Carpetas de la sesión"
+                    data-i18n-aria-label="deepsky.session_folders_aria"></div>
+
+                <!-- GRUPOS DE TOMAS: categorías científicas y reclasificación. -->
+                <div class="ds-frame-groups-head">
+                    <div class="ds-frame-groups-copy">
+                        <strong data-i18n="deepsky.frame_groups_title">Grupos de tomas</strong>
+                        <span data-i18n="deepsky.frame_groups_hint">Lights son obligatorios; la calibración es opcional y se valida por firma.</span>
+                    </div>
+                    <div class="ds-frame-drag-hint">
+                        <svg class="zas-icon zas-icon-inline" aria-hidden="true"><use href="#icon-grip"></use></svg>
+                        <span data-i18n="deepsky.drag_hint">Arrastra un archivo a otra categoría para reclasificarlo · ✕ para quitarlo</span>
+                    </div>
                 </div>
-                <div class="donation-options ds-source-grid" id="ds-sections"></div>
+                <div class="ds-source-grid" id="ds-sections"></div>
                 <section id="ds-session-organizer" class="ds-session-organizer" hidden aria-live="polite"></section>
                 </section>
 

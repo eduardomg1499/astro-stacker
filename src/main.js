@@ -11935,38 +11935,46 @@ function dsMoveFile(fromKind, path, toKind) {
 
 function dsRenderSections(force = false) {
     const host = document.getElementById("ds-sections");
-    if (!host) return;
+    const actionHost = document.getElementById("ds-session-actions");
+    if (!host || !actionHost) return;
     if (force) {
         host.innerHTML = "";
+        actionHost.innerHTML = "";
         delete host.dataset.built;
+        delete actionHost.dataset.built;
     }
     if (host.dataset.built) return;
     host.dataset.built = "1";
+    actionHost.dataset.built = "1";
 
     // Botón de auto-clasificación de carpeta (una sola carpeta raíz →
     // lights/darks/flats/dark-flats/bias por palabras clave, recursivo).
     const auto = document.createElement("button");
+    auto.id = "btn-ds-scan-folder";
     auto.type = "button";
-    auto.className = "donation-option ds-source-wide";
-    auto.style.cssText = "width:100%; min-height:52px; margin:0 0 4px;";
+    auto.className = "ds-session-action ds-session-action-import";
     auto.innerHTML = `
-        <span class="donation-option-icon" style="background:rgba(124,58,237,0.18); color:#c4b5fd; width:36px; height:36px; display:inline-flex; align-items:center; justify-content:center; flex:none;">
-            <svg class="zas-icon" style="width:18px; height:18px; display:block;"><use href="#icon-folder"></use></svg>
+        <span class="ds-session-action-icon" aria-hidden="true">
+            <svg class="zas-icon"><use href="#icon-search"></use></svg>
         </span>
-        <span class="donation-option-copy" style="min-width:0;">
-            <strong style="letter-spacing:0.05em;">${escapeHtml(tr("deepsky.scan_folder", "Escanear carpeta (auto-clasificar)"))}</strong>
+        <span class="ds-session-action-copy">
+            <span class="ds-session-action-kicker">${escapeHtml(tr("deepsky.source_action", "1 · Origen"))}</span>
+            <strong>${escapeHtml(tr("deepsky.scan_folder", "Escanear carpeta (auto-clasificar)"))}</strong>
             <small>${escapeHtml(tr("deepsky.scan_folder_hint", "Detecta lights/darks/flats/dark-flats/bias en subcarpetas por nombre"))}</small>
+        </span>
+        <span class="ds-session-action-trail">
+            <span class="ds-session-action-cta">${escapeHtml(tr("deepsky.scan_action", "Elegir y escanear"))}</span>
         </span>`;
     auto.addEventListener("click", dsScanFolder);
-    host.appendChild(auto);
+    actionHost.appendChild(auto);
 
     // CARPETA DE TRABAJO Y SALIDA (estilo PixInsight): cachés de calibración
     // (varios GB), masters y exportaciones van aquí — imprescindible cuando el
     // disco del sistema anda justo. Persistente en localStorage.
     const workBtn = document.createElement("button");
+    workBtn.id = "btn-ds-work-folder";
     workBtn.type = "button";
-    workBtn.className = "donation-option ds-source-wide";
-    workBtn.style.cssText = "width:100%; min-height:52px; margin:0 0 4px;";
+    workBtn.className = "ds-session-action ds-session-action-output";
     const renderWorkDir = async () => {
         const dir = localStorage.getItem("zas_ds_workdir") || "";
         let space = "";
@@ -11980,13 +11988,22 @@ function dsRenderSections(force = false) {
                 )}`;
             } catch (_) { }
         }
+        workBtn.dataset.configured = dir ? "true" : "false";
+        workBtn.title = dir
+            ? tr("deepsky.work_dir_change_hint", "Clic para cambiar la carpeta de trabajo y salida")
+            : tr("deepsky.work_dir_choose_hint", "Clic para elegir dónde guardar cachés, masters y exportaciones");
         workBtn.innerHTML = `
-        <span class="donation-option-icon" style="background:rgba(14,165,233,0.16); color:#7dd3fc; width:36px; height:36px; display:inline-flex; align-items:center; justify-content:center; flex:none;">
-            <svg class="zas-icon" style="width:18px; height:18px; display:block;"><use href="#icon-download"></use></svg>
+        <span class="ds-session-action-icon" aria-hidden="true">
+            <svg class="zas-icon"><use href="#icon-save"></use></svg>
         </span>
-        <span class="donation-option-copy" style="min-width:0;">
-            <strong style="letter-spacing:0.05em;">${tr("deepsky.work_dir", "Carpeta de trabajo y salida")}</strong>
-            <small style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block;">${dir ? escapeHtml(dir) + escapeHtml(space) : tr("deepsky.work_dir_hint", "Junto a los lights (clic para elegir otro disco: cachés de varios GB + masters + exportaciones)")}</small>
+        <span class="ds-session-action-copy">
+            <span class="ds-session-action-kicker">${escapeHtml(tr("deepsky.destination_action", "2 · Destino"))}</span>
+            <strong>${escapeHtml(tr("deepsky.work_dir", "Carpeta de trabajo y salida"))}</strong>
+            <small>${dir ? escapeHtml(dir) : escapeHtml(tr("deepsky.work_dir_hint", "Junto a los lights; elige otro disco para cachés, masters y exportaciones"))}</small>
+        </span>
+        <span class="ds-session-action-trail">
+            ${space ? `<span class="ds-session-action-space">${escapeHtml(space.replace(/^\s*·\s*/, ""))}</span>` : ""}
+            <span class="ds-session-action-cta">${escapeHtml(tr(dir ? "deepsky.change_action" : "deepsky.choose_action", dir ? "Cambiar" : "Elegir carpeta"))}</span>
         </span>`;
     };
     workBtn.addEventListener("click", async () => {
@@ -12004,7 +12021,7 @@ function dsRenderSections(force = false) {
         log("INFO", "Carpeta de trabajo restablecida (junto a los lights).");
     });
     renderWorkDir();
-    host.appendChild(workBtn);
+    actionHost.appendChild(workBtn);
 
     for (const s of DS_SECTIONS) {
         const sectionLabel = tr(s.labelKey, s.fallback);
@@ -13089,7 +13106,7 @@ function dsGuideItems(plan) {
             kind: "error",
             text: tr("deepsky.guide_add_lights", "Añade lights para empezar"),
             actionLabel: tr("deepsky.guide_go_data", "Ir a Datos"),
-            run: () => { dsSetWizardStep(0, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("ds-sections"))); },
+            run: () => { dsSetWizardStep(0, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("btn-ds-scan-folder") || document.getElementById("btn-ds-lights"))); },
         });
         return items;
     }
@@ -13106,7 +13123,7 @@ function dsGuideItems(plan) {
             item.run = dsOpenLinkerAndSpotlight;
         } else if (/light|lineal|PNG|JPEG/i.test(group.key)) {
             item.actionLabel = tr("deepsky.guide_go_data", "Ir a Datos");
-            item.run = () => { dsSetWizardStep(0, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("ds-sections"))); };
+            item.run = () => { dsSetWizardStep(0, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("btn-ds-scan-folder") || document.getElementById("btn-ds-lights"))); };
         } else {
             item.actionLabel = tr("deepsky.guide_view", "Ver detalle");
             item.run = () => { dsSetWizardStep(1, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("ds-preflight-inspection"))); };
@@ -13123,7 +13140,7 @@ function dsGuideItems(plan) {
                 ? (/añade/i.test(firstReason) ? tr("deepsky.guide_go_data", "Ir a Datos") : tr("deepsky.guide_fix_linker", "Ligar calibración"))
                 : tr("deepsky.guide_go_data", "Ir a Datos"),
             run: /añade|PNG|JPEG/i.test(firstReason)
-                ? () => { dsSetWizardStep(0, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("ds-sections"))); }
+                ? () => { dsSetWizardStep(0, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("btn-ds-scan-folder") || document.getElementById("btn-ds-lights"))); }
                 : dsOpenLinkerAndSpotlight,
         });
     }

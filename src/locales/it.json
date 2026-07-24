@@ -13,6 +13,18 @@
         "hide_source": "Nascondi sorgente",
         "show_source": "Mostra sorgente"
     },
+    "deepsky": {
+        "session_folders_aria": "Cartelle sorgente e destinazione della sessione",
+        "source_action": "1 · Origine",
+        "destination_action": "2 · Destinazione",
+        "scan_action": "Scegli e analizza",
+        "choose_action": "Scegli cartella",
+        "change_action": "Modifica",
+        "work_dir_choose_hint": "Fai clic per scegliere dove salvare cache, master ed esportazioni",
+        "work_dir_change_hint": "Fai clic per cambiare la cartella di lavoro e di output",
+        "frame_groups_title": "Gruppi di frame",
+        "frame_groups_hint": "I light sono obbligatori; la calibrazione è facoltativa e validata per firma."
+    },
     "wavelets": {
         "title": "Elaborazione del segnale",
         "deconvolution": {

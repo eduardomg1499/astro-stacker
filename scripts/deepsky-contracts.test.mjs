@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const [main, html, en, es, abSchema] = await Promise.all([
+const [main, html, en, es, fr, it, abSchema] = await Promise.all([
     readFile(new URL("../src/main.js", import.meta.url), "utf8"),
     readFile(new URL("../index.html", import.meta.url), "utf8"),
     readFile(new URL("../src/locales/en.json", import.meta.url), "utf8").then(JSON.parse),
     readFile(new URL("../src/locales/es.json", import.meta.url), "utf8").then(JSON.parse),
+    readFile(new URL("../src/locales/fr.json", import.meta.url), "utf8").then(JSON.parse),
+    readFile(new URL("../src/locales/it.json", import.meta.url), "utf8").then(JSON.parse),
     readFile(new URL("../benchmarks/deepsky-ab-run.schema.json", import.meta.url), "utf8").then(JSON.parse),
 ]);
 
@@ -33,6 +35,22 @@ test("science picker exposes only linear FITS and TIFF inputs", () => {
     assert.ok(picker, "dsPick must remain identifiable");
     assert.match(picker, /"fits",\s*"fit",\s*"fts",\s*"tif",\s*"tiff"/);
     assert.doesNotMatch(picker, /"png"|"jpg"|"jpeg"/);
+});
+
+test("session folders are actions with a hierarchy separate from frame groups", () => {
+    assert.match(html, /id="ds-session-actions" class="ds-session-actions"/);
+    assert.match(html, /class="ds-frame-groups-head"/);
+    assert.match(main, /id = "btn-ds-scan-folder"/);
+    assert.match(main, /className = "ds-session-action ds-session-action-import"/);
+    assert.match(main, /id = "btn-ds-work-folder"/);
+    assert.match(main, /className = "ds-session-action ds-session-action-output"/);
+    for (const locale of [en, es, fr, it]) {
+        assert.ok(locale.deepsky.session_folders_aria);
+        assert.ok(locale.deepsky.source_action);
+        assert.ok(locale.deepsky.destination_action);
+        assert.ok(locale.deepsky.frame_groups_title);
+        assert.ok(locale.deepsky.frame_groups_hint);
+    }
 });
 
 test("deep-sky UI makes safe defaults and experimental engines explicit", () => {

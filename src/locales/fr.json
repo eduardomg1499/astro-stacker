@@ -13,6 +13,18 @@
         "hide_source": "Masquer la source",
         "show_source": "Afficher la source"
     },
+    "deepsky": {
+        "session_folders_aria": "Dossiers source et destination de la session",
+        "source_action": "1 · Source",
+        "destination_action": "2 · Destination",
+        "scan_action": "Choisir et analyser",
+        "choose_action": "Choisir le dossier",
+        "change_action": "Modifier",
+        "work_dir_choose_hint": "Cliquer pour choisir où stocker les caches, masters et exportations",
+        "work_dir_change_hint": "Cliquer pour modifier le dossier de travail et de sortie",
+        "frame_groups_title": "Groupes d'images",
+        "frame_groups_hint": "Les lights sont requises ; la calibration est facultative et validée par signature."
+    },
     "wavelets": {
         "title": "Traitement du signal",
         "deconvolution": {
