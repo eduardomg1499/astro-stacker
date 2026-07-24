@@ -21,6 +21,7 @@ import { IntelligentAssistant } from "./zenith_guide.js";
 import {
     SolarCurveEditor,
     ToneCurveEditor,
+    adaptSolarPreset,
     cloneSolarPreset,
     evaluateToneCurve,
     normalizeSolarCurvePoints,
@@ -28,6 +29,7 @@ import {
 } from "./solar_postprocess.js";
 import { installPostprocessHelp } from "./postprocess_help.js";
 import {
+    adaptObjectFinishingPreset,
     cloneObjectFinishingPreset,
     objectPresetApplicable,
 } from "./object_postprocess_presets.js";
@@ -113,7 +115,7 @@ function pathBaseName(value) {
 
 function translateBackendProgressText(value) {
     const text = normalizeBackendText(value);
-    if (i18n?.currentLang !== "en") return text;
+    if (i18n?.currentLang === "es") return text;
 
     let out = text
         .replace(/Procesando Frame/g, "Processing frame")
@@ -376,7 +378,8 @@ function initCustomSelect() {
 }
 
 function normalizeLanguageCode(lang) {
-    return lang === "en" ? "en" : "es";
+    const normalized = String(lang || "").toLowerCase().split("-")[0];
+    return ["es", "en", "it", "fr"].includes(normalized) ? normalized : "es";
 }
 
 function syncActivationLanguageButtons(lang) {
@@ -1427,6 +1430,7 @@ const postProcessSession = new PostProcessSession({ limit: 50 });
 let currentPostprocessResultId = 0;
 let suppressPostprocessEvents = false;
 let historyPlaybackRequestId = 0;
+let historyPlaybackNonce = 0;
 let pendingHistoryCommit = null;
 let postCompareActive = false;
 let postCompareLoadId = 0;
@@ -1445,12 +1449,22 @@ let lastAssistantAnnouncement = "";
 let solarCurveEditor = null;
 let toneCurveEditor = null;
 let activeSolarPreset = "neutral";
+let lastSolarAdaptiveState = null;
 let activeTonePreset = "linear";
+let activeObjectFinishingState = null;
+let solarAdaptiveRequestId = 0;
+let objectAdaptiveRequestId = 0;
 let postHistogramRequestId = 0;
 let postBeginNonce = 0;
 window.resetPipelineState = () => {
     clearTimeout(updateTimer);
     pipelineRequestId += 1;
+    historyPlaybackNonce += 1;
+    historyPlaybackRequestId = 0;
+    solarAdaptiveRequestId += 1;
+    objectAdaptiveRequestId += 1;
+    lastSolarAdaptiveState = null;
+    activeObjectFinishingState = null;
     lastProcessedParams = "";
     pendingHistoryCommit = null;
 };
@@ -2514,27 +2528,50 @@ function updateSolarUiState() {
     updateSolarColorRamp();
     if (!status) return;
     if (!params.enabled) {
-        status.textContent = "Neutral · sin alterar la señal mono";
+        status.textContent = tr("wavelets.solar.status_neutral", "Neutral · sin alterar la señal mono");
         status.dataset.state = "idle";
         return;
     }
     const stages = [
-        params.invert ? "invertido" : "curva tonal",
-        params.colorize ? "falso color" : "salida mono",
+        params.invert
+            ? tr("wavelets.solar.stage_inverted", "invertido")
+            : tr("wavelets.solar.stage_curve", "curva tonal"),
+        params.colorize
+            ? tr("wavelets.solar.stage_false_color", "falso color")
+            : tr("wavelets.solar.stage_mono", "salida mono"),
     ];
     if (params.filamentAmount > 0.001) {
-        stages.push(`filamentos ${Math.round(params.filamentAmount * 100)}% · ${params.filamentRadius.toFixed(2)} px`);
+        stages.push(trFormat(
+            "wavelets.solar.stage_filaments",
+            { amount: Math.round(params.filamentAmount * 100), radius: params.filamentRadius.toFixed(2) },
+            `filamentos ${Math.round(params.filamentAmount * 100)}% · ${params.filamentRadius.toFixed(2)} px`,
+        ));
     }
     if (params.prominenceAmount > 0.001) {
-        stages.push(`protuberancias ${Math.round(params.prominenceAmount * 100)}%`);
+        stages.push(trFormat(
+            "wavelets.solar.stage_prominences",
+            { amount: Math.round(params.prominenceAmount * 100) },
+            `protuberancias ${Math.round(params.prominenceAmount * 100)}%`,
+        ));
     }
     if (params.backgroundProtect > 0.001) {
-        stages.push(`cielo protegido ${Math.round(params.backgroundProtect * 100)}%`);
+        stages.push(trFormat(
+            "wavelets.solar.stage_sky",
+            { amount: Math.round(params.backgroundProtect * 100) },
+            `cielo protegido ${Math.round(params.backgroundProtect * 100)}%`,
+        ));
     }
     if (params.highlightCompression > 0.001) {
-        stages.push(`luces comprimidas ${Math.round(params.highlightCompression * 100)}%`);
+        stages.push(trFormat(
+            "wavelets.solar.stage_highlights",
+            { amount: Math.round(params.highlightCompression * 100) },
+            `luces comprimidas ${Math.round(params.highlightCompression * 100)}%`,
+        ));
     }
-    status.textContent = `${stages.join(" · ")} · derivado 16-bit reversible`;
+    const adaptive = lastSolarAdaptiveState?.adaptation?.measured
+        ? tr("wavelets.adaptive.measured_short", "adaptado a señal medida")
+        : tr("wavelets.adaptive.conservative_short", "protección conservadora");
+    status.textContent = `${stages.join(" · ")} · ${adaptive} · ${tr("wavelets.solar.reversible", "derivado 16-bit reversible")}`;
     status.dataset.state = "active";
 }
 
@@ -2572,17 +2609,135 @@ function applySolarParamsToUi(solar = {}, { presetName = "custom" } = {}) {
     updateSolarUiState();
 }
 
-function applySolarPreset(name) {
-    const preset = cloneSolarPreset(name);
-    suppressPostprocessEvents = true;
+async function measureAdaptiveRecipeInput() {
+    const [histogram, artifacts] = await Promise.all([
+        invoke("postprocess_histogram", { preferProcessed: false }).catch(() => lastPostHistogram),
+        invoke("analyze_postprocess_artifacts", { preferProcessed: false }).catch(() => null),
+    ]);
+    return {
+        histogram: histogram || lastPostHistogram || {},
+        artifacts: artifacts || {},
+        capture: {
+            qualityStability: Number(
+                currentVideoStats?.quality_stability
+                ?? currentVideoStats?.qualityStability
+                ?? 100,
+            ),
+        },
+    };
+}
+
+function adaptiveProtectionSummary(adaptation) {
+    if (!adaptation?.measured) {
+        return tr("wavelets.adaptive.fallback", "análisis no disponible; límites conservadores");
+    }
+    const labels = {
+        highlights: tr("wavelets.adaptive.highlights", "altas luces"),
+        noise: tr("wavelets.adaptive.noise", "ruido"),
+        ringing: tr("wavelets.adaptive.ringing", "halos"),
+        shadows: tr("wavelets.adaptive.shadows", "sombras"),
+        balanced: tr("wavelets.adaptive.balanced", "señal equilibrada"),
+    };
+    return (adaptation.safeguards || ["balanced"]).map((key) => labels[key] || key).join(" + ");
+}
+
+function localizedSolarPresetLabel(name, fallback = "") {
+    const keys = {
+        "ha-natural": "ha_natural",
+        "ha-gold": "ha_gold",
+        "ha-inverted": "ha_inverted",
+        chromosphere: "chromosphere",
+        prominence: "prominence",
+        "dual-range": "dual_range",
+        filaments: "filaments",
+        neutral: "neutral",
+    };
+    return tr(`wavelets.solar.presets.${keys[name] || name}`, fallback || name);
+}
+
+async function applySolarPreset(name) {
+    const status = document.getElementById("solar-module-status");
+    const token = ++solarAdaptiveRequestId;
+    const buttons = Array.from(document.querySelectorAll("[data-solar-preset]"));
+    const adaptive = name !== "neutral";
+    const previousSolar = getSolarMonoParams();
+    const previousPresetName = activeSolarPreset;
+    const previousAdaptiveState = lastSolarAdaptiveState;
+    let mutationStarted = false;
+    if (adaptive) {
+        if (status) {
+            status.textContent = tr("wavelets.adaptive.measuring", "Midiendo máster 16-bit, ruido y halos…");
+            status.dataset.state = "processing";
+        }
+        buttons.forEach((button) => {
+            button.disabled = true;
+            button.classList.toggle("is-analyzing", button.dataset.solarPreset === name);
+        });
+    }
     try {
-        applySolarParamsToUi(preset, { presetName: name });
+        const measurement = adaptive ? await measureAdaptiveRecipeInput() : {};
+        if (token !== solarAdaptiveRequestId) return;
+        const preset = adaptive
+            ? adaptSolarPreset(name, measurement)
+            : cloneSolarPreset(name);
+        preset.label = localizedSolarPresetLabel(name, preset.label);
+        lastSolarAdaptiveState = preset;
+        suppressPostprocessEvents = true;
+        try {
+            mutationStarted = true;
+            applySolarParamsToUi(preset, { presetName: name });
+        } finally {
+            suppressPostprocessEvents = false;
+        }
+        drawPostprocessScopes();
+        triggerUpdate({ forceFastPreview: preset.filamentAmount > 0 });
+        queuePostHistoryCommit(trFormat(
+            "wavelets.solar.history_preset",
+            { label: preset.label },
+            `Solar · ${preset.label}`,
+        ));
+        if (status && adaptive) {
+            status.textContent = trFormat(
+                "wavelets.adaptive.solar_applied",
+                {
+                    label: preset.label,
+                    protections: adaptiveProtectionSummary(preset.adaptation),
+                },
+                `${preset.label} · adaptado al máster · protege ${adaptiveProtectionSummary(preset.adaptation)}`,
+            );
+            status.dataset.state = "active";
+        }
+    } catch (error) {
+        console.error("No se pudo aplicar la receta solar adaptativa:", error);
+        if (mutationStarted) {
+            suppressPostprocessEvents = true;
+            try {
+                applySolarParamsToUi(previousSolar, { presetName: previousPresetName });
+                lastSolarAdaptiveState = previousAdaptiveState;
+                drawPostprocessScopes();
+                triggerUpdate({ forceFastPreview: true });
+            } catch (rollbackError) {
+                console.error("No se pudo restaurar el estado solar anterior:", rollbackError);
+            } finally {
+                suppressPostprocessEvents = false;
+            }
+        }
+        if (token === solarAdaptiveRequestId && status) {
+            status.textContent = tr(
+                "wavelets.adaptive.error",
+                "No se pudo medir la señal; no se aplicaron cambios.",
+            );
+            status.dataset.state = "warning";
+        }
     } finally {
         suppressPostprocessEvents = false;
+        if (token === solarAdaptiveRequestId) {
+            buttons.forEach((button) => {
+                button.disabled = false;
+                button.classList.remove("is-analyzing");
+            });
+        }
     }
-    drawPostprocessScopes();
-    triggerUpdate({ forceFastPreview: preset.filamentAmount > 0 });
-    queuePostHistoryCommit(`Solar · ${preset.label}`);
 }
 
 function initSolarMonoUi() {
@@ -2592,10 +2747,11 @@ function initSolarMonoUi() {
             const enabled = document.getElementById("chk-solar-enabled");
             if (enabled) enabled.checked = true;
             markSolarPreset("custom");
+            lastSolarAdaptiveState = null;
             updateSolarUiState();
             triggerUpdate({ forceFastPreview: true });
         },
-        onCommit: () => queuePostHistoryCommit("Solar · curva personalizada"),
+        onCommit: () => queuePostHistoryCommit(tr("wavelets.solar.history_custom_curve", "Solar · curva personalizada")),
     });
 
     document.querySelectorAll("[data-solar-preset]").forEach((button) => {
@@ -2606,15 +2762,22 @@ function initSolarMonoUi() {
         if (enabled) enabled.checked = true;
         solarCurveEditor?.setPoints([[0, 0], [1, 1]], { notify: true });
         markSolarPreset("custom");
+        lastSolarAdaptiveState = null;
         triggerUpdate({ forceFastPreview: true });
-        queuePostHistoryCommit("Solar · curva lineal");
+        queuePostHistoryCommit(tr("wavelets.solar.history_linear_curve", "Solar · curva lineal"));
     });
     ["chk-solar-enabled", "chk-solar-invert", "chk-solar-colorize"].forEach((id) => {
         document.getElementById(id)?.addEventListener("change", () => {
             markSolarPreset("custom");
+            lastSolarAdaptiveState = null;
             updateSolarUiState();
             triggerUpdate({ forceFastPreview: true });
-            queuePostHistoryCommit(`Solar · ${id === "chk-solar-invert" ? "inversión" : id === "chk-solar-colorize" ? "falso color" : "activar módulo"}`);
+            const historyKey = id === "chk-solar-invert"
+                ? "history_inversion"
+                : id === "chk-solar-colorize"
+                    ? "history_false_color"
+                    : "history_enable";
+            queuePostHistoryCommit(tr(`wavelets.solar.${historyKey}`, "Solar · ajuste de módulo"));
         });
     });
     ["sl-solar-filament", "sl-solar-radius", "sl-solar-noise-guard", "sl-solar-background-protect", "sl-solar-prominence", "sl-solar-color-strength", "sl-solar-highlight-protect", "sl-solar-highlight-compression"]
@@ -2624,10 +2787,11 @@ function initSolarMonoUi() {
                 const enabled = document.getElementById("chk-solar-enabled");
                 if (enabled) enabled.checked = true;
                 markSolarPreset("custom");
+                lastSolarAdaptiveState = null;
                 updateSolarUiState();
                 triggerUpdate({ forceFastPreview: true });
             });
-            control?.addEventListener("change", () => queuePostHistoryCommit("Solar · ajuste fino"));
+            control?.addEventListener("change", () => queuePostHistoryCommit(tr("wavelets.solar.history_fine", "Solar · ajuste fino")));
         });
     document.querySelectorAll("[data-solar-color]").forEach((control) => {
         control.addEventListener("input", () => {
@@ -2636,12 +2800,14 @@ function initSolarMonoUi() {
             if (enabled) enabled.checked = true;
             if (colorize) colorize.checked = true;
             markSolarPreset("custom");
+            lastSolarAdaptiveState = null;
             updateSolarUiState();
             triggerUpdate({ forceFastPreview: true });
         });
-        control.addEventListener("change", () => queuePostHistoryCommit("Solar · mapa cromático"));
+        control.addEventListener("change", () => queuePostHistoryCommit(tr("wavelets.solar.history_color_map", "Solar · mapa cromático")));
     });
     applySolarParamsToUi(cloneSolarPreset("neutral"), { presetName: "neutral" });
+    lastSolarAdaptiveState = null;
 }
 
 function toneCurveIsLinear(points) {
@@ -5546,13 +5712,19 @@ function resetProcessingParams({ updateMemo = true } = {}) {
     toneCurveEditor?.setPoints([[0, 0], [1, 1]]);
     markTonePreset("linear");
     applySolarParamsToUi(cloneSolarPreset("neutral"), { presetName: "neutral" });
+    lastSolarAdaptiveState = null;
+    solarAdaptiveRequestId += 1;
+    activeObjectFinishingState = null;
     document.querySelectorAll("[data-object-preset]").forEach((button) => {
         button.classList.remove("is-active");
         button.setAttribute("aria-pressed", "false");
     });
     const objectStatus = document.getElementById("object-finishing-status");
     if (objectStatus) {
-        objectStatus.textContent = "Elige una receta para ver qué módulos activa.";
+        objectStatus.textContent = tr(
+            "wavelets.object_lab.status_idle",
+            "Elige una receta para ver qué módulos activa.",
+        );
         objectStatus.dataset.state = "idle";
     }
     updateLevelMarkers();
@@ -5854,14 +6026,16 @@ function updatePostHistoryUi() {
     if (!state.canCompare && postCompareActive) setPostCompareActive(false);
     if (label) {
         const current = postProcessSession.current();
-        label.textContent = current ? `${state.index + 1}/${state.length} · ${current.label}` : "Sin resultado";
+        label.textContent = current
+            ? `${state.index + 1}/${state.length} · ${current.label}`
+            : tr("wavelets.history.no_result", "Sin resultado");
     }
     if (compare) {
         compare.title = !state.canCompare
-            ? "Aplica un ajuste para habilitar A/B"
+            ? tr("wavelets.history.compare_disabled", "Aplica un ajuste para habilitar A/B")
             : postCompareActive
-                ? "Cerrar comparación A/B"
-                : "Comparar el paso actual con el anterior o con el apilado original";
+                ? tr("wavelets.history.compare_close", "Cerrar comparación A/B")
+                : tr("wavelets.history.compare_open", "Comparar el paso actual con el anterior o con el apilado original");
     }
     void refreshPostCompareReference();
     updateZenithGuide();
@@ -5896,7 +6070,11 @@ async function refreshPostCompareReference() {
     layer.hidden = true;
     layer.setAttribute("aria-hidden", "true");
     if (labelB) labelB.hidden = !canShow;
-    if (labelA) labelA.textContent = selector?.value === "source" ? "A · Original" : "A · Anterior";
+    if (labelA) {
+        labelA.textContent = selector?.value === "source"
+            ? tr("wavelets.history.label_source", "A · Original")
+            : tr("wavelets.history.label_previous", "A · Anterior");
+    }
     if (!canShow) return;
 
     const loadId = ++postCompareLoadId;
@@ -5929,8 +6107,8 @@ function setPostCompareActive(active) {
     if (button) {
         button.setAttribute("aria-pressed", String(postCompareActive));
         button.title = postCompareActive
-            ? "Cerrar comparación A/B"
-            : "Comparar el paso actual con el anterior o con el apilado original";
+            ? tr("wavelets.history.compare_close", "Cerrar comparación A/B")
+            : tr("wavelets.history.compare_open", "Comparar el paso actual con el anterior o con el apilado original");
     }
     if (splitWrap) splitWrap.hidden = !postCompareActive;
     void refreshPostCompareReference();
@@ -5960,7 +6138,14 @@ function queuePostHistoryCommit(label = "Ajuste") {
 
 async function applyPostHistoryEntry(entry) {
     if (!entry) return;
+    // Invalidate the currently running render before waiting for the stored
+    // preview. Previously a slow deconvolution could finish in this window and
+    // repaint (or even update) the state that the user had just undone.
+    const playbackNonce = ++historyPlaybackNonce;
+    const requestId = ++pipelineRequestId;
+    historyPlaybackRequestId = 0;
     pendingHistoryCommit = null;
+    clearTimeout(updateTimer);
     suppressPostprocessEvents = true;
     try {
         applyWaveletPreset(entry.recipe, { trigger: false });
@@ -5973,12 +6158,12 @@ async function applyPostHistoryEntry(entry) {
         await setImageAndWait(ui.imgResult, entry.preview, false);
         restoreViewportState(viewport);
     }
+    if (playbackNonce !== historyPlaybackNonce || requestId !== pipelineRequestId) return;
     updatePostHistoryUi();
     const paramsString = JSON.stringify(entry.recipe);
     lastProcessedParams = "";
-    const requestId = ++pipelineRequestId;
     historyPlaybackRequestId = requestId;
-    showLocalProcessing("Restaurando historial...");
+    showLocalProcessing(tr("wavelets.history.restoring", "Restaurando historial…"));
     showImgLoader();
     processPipeline(requestId, paramsString);
 }
@@ -6465,12 +6650,12 @@ function updateDeconvolutionStatus() {
     const rlSigma = parseFloat(document.getElementById("num-deconv-sigma")?.value || "0");
     const vcSigma = parseFloat(document.getElementById("num-vc-sigma")?.value || "0");
     if (rlIterations <= 0 && vcIterations <= 0) {
-        status.textContent = "Desactivada · el máster permanece intacto";
+        status.textContent = tr("wavelets.deconvolution.status_off", "Desactivada · el máster permanece intacto");
         status.dataset.state = "idle";
         return;
     }
     if ((rlIterations > 0 && rlSigma <= 0) || (vcIterations > 0 && vcSigma <= 0)) {
-        status.textContent = "Revisa el radio PSF: debe ser mayor que cero cuando hay iteraciones.";
+        status.textContent = tr("wavelets.deconvolution.status_invalid_psf", "Revisa el radio PSF: debe ser mayor que cero cuando hay iteraciones.");
         status.dataset.state = "warning";
         return;
     }
@@ -6478,19 +6663,23 @@ function updateDeconvolutionStatus() {
     if (rlIterations > 0) modes.push(`RL ${rlIterations}× · σ ${rlSigma.toFixed(1)}`);
     if (vcIterations > 0) modes.push(`VC ${vcIterations}× · σ ${vcSigma.toFixed(1)}`);
     const engine = getGpuMode() === "cpu"
-        ? "CPU"
-        : "GPU con prueba de paridad y respaldo CPU";
-    status.textContent = `${modes.join(" + ")} · ${engine} · final 1:1 · valida con A/B`;
+        ? tr("wavelets.deconvolution.engine_cpu", "CPU")
+        : tr("wavelets.deconvolution.engine_gpu", "GPU con prueba de paridad y respaldo CPU");
+    status.textContent = trFormat(
+        "wavelets.deconvolution.status_active",
+        { modes: modes.join(" + "), engine },
+        `${modes.join(" + ")} · ${engine} · final 1:1 · valida con A/B`,
+    );
     status.dataset.state = "active";
 }
 
 function applyDeconvolutionPreset(name) {
     const presets = {
-        gentle: { label: "Suave", rlSigma: 1.35, rlIterations: 8, vcSigma: 0, vcIterations: 0, edge: 32, mask: 38, psf: false },
-        balanced: { label: "Equilibrada", rlSigma: 1.2, rlIterations: 11, vcSigma: 0, vcIterations: 0, edge: 52, mask: 52, psf: false },
-        detail: { label: "Detalle fino", rlSigma: 1.0, rlIterations: 14, vcSigma: .75, vcIterations: 2, edge: 68, mask: 66, psf: false },
-        solar: { label: "Solar H-alpha", rlSigma: 1.0, rlIterations: 14, vcSigma: .75, vcIterations: 2, edge: 74, mask: 70, psf: true },
-        "solar-limb": { label: "Limbo solar", rlSigma: 1.2, rlIterations: 10, vcSigma: 0, vcIterations: 0, edge: 86, mask: 78, psf: true },
+        gentle: { label: tr("wavelets.deconvolution.presets.gentle", "Suave"), rlSigma: 1.35, rlIterations: 8, vcSigma: 0, vcIterations: 0, edge: 32, mask: 38, psf: false },
+        balanced: { label: tr("wavelets.deconvolution.presets.balanced", "Equilibrada"), rlSigma: 1.2, rlIterations: 11, vcSigma: 0, vcIterations: 0, edge: 52, mask: 52, psf: false },
+        detail: { label: tr("wavelets.deconvolution.presets.detail", "Detalle fino"), rlSigma: 1.0, rlIterations: 14, vcSigma: .75, vcIterations: 2, edge: 68, mask: 66, psf: false },
+        solar: { label: tr("wavelets.deconvolution.presets.solar", "Solar H-alpha"), rlSigma: 1.0, rlIterations: 14, vcSigma: .75, vcIterations: 2, edge: 74, mask: 70, psf: true },
+        "solar-limb": { label: tr("wavelets.deconvolution.presets.solar_limb", "Limbo solar"), rlSigma: 1.2, rlIterations: 10, vcSigma: 0, vcIterations: 0, edge: 86, mask: 78, psf: true },
     };
     const preset = presets[name];
     if (!preset) return;
@@ -6512,7 +6701,11 @@ function applyDeconvolutionPreset(name) {
     updateDeconvolutionStatus();
     const status = document.getElementById("deconv-module-status");
     if (status) {
-        status.textContent = `${preset.label} · calculando vista rápida y resultado 1:1…`;
+        status.textContent = trFormat(
+            "wavelets.deconvolution.status_processing",
+            { label: preset.label },
+            `${preset.label} · calculando vista rápida y resultado 1:1…`,
+        );
         status.dataset.state = "processing";
     }
     drawPostprocessScopes();
@@ -6520,13 +6713,81 @@ function applyDeconvolutionPreset(name) {
     queuePostHistoryCommit(`Deconvolución · ${preset.label}`);
 }
 
-function applyObjectFinishingPreset(name) {
-    const preset = cloneObjectFinishingPreset(name);
+function markObjectFinishingSelection(name = "") {
+    document.querySelectorAll("[data-object-preset]").forEach((button) => {
+        const active = button.dataset.objectPreset === name;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-pressed", String(active));
+    });
+    const original = document.getElementById("btn-object-original");
+    const originalActive = name === "original";
+    original?.classList.toggle("is-active", originalActive);
+    original?.setAttribute("aria-pressed", String(originalActive));
+}
+
+function restoreObjectPresetButtons(isMono = !!lastPostHistogram?.isMono) {
+    document.querySelectorAll("[data-object-preset], #btn-object-original").forEach((button) => {
+        button.disabled = button.dataset.objectPreset === "lunar-mineral" && !!isMono;
+        button.classList.remove("is-analyzing");
+    });
+}
+
+function localizedObjectPresetLabel(name, fallback = "") {
+    const keys = {
+        "lunar-relief": "lunar_relief",
+        "lunar-phase": "lunar_phase",
+        "lunar-mineral": "lunar_mineral",
+        "jupiter-natural": "jupiter_natural",
+        "saturn-rings": "saturn_rings",
+        "mars-detail": "mars_detail",
+        "planet-cinematic": "planet_cinematic",
+    };
+    return tr(`wavelets.object_lab.presets.${keys[name] || name}`, fallback || name);
+}
+
+function renderObjectFinishingStatus() {
     const status = document.getElementById("object-finishing-status");
-    const applicability = objectPresetApplicable(preset, { isMono: !!lastPostHistogram?.isMono });
+    if (!status) return;
+    if (!activeObjectFinishingState) {
+        status.textContent = tr("wavelets.object_lab.status_idle", "Elige una receta para ver qué módulos activa.");
+        status.dataset.state = "idle";
+        return;
+    }
+    if (activeObjectFinishingState.name === "original") {
+        status.textContent = tr(
+            "wavelets.object_lab.status_original",
+            "Original apilado · receta neutra · puedes deshacer para recuperar el ajuste anterior.",
+        );
+        status.dataset.state = "idle";
+        return;
+    }
+    const { preset } = activeObjectFinishingState;
+    const localizedLabel = localizedObjectPresetLabel(activeObjectFinishingState.name, preset.label);
+    const intent = preset.intent === "creative"
+        ? tr("wavelets.object_lab.intent_creative_long", "Creativo e interpretativo")
+        : tr("wavelets.object_lab.intent_scientific_long", "Científico y natural");
+    status.textContent = trFormat(
+        "wavelets.adaptive.object_applied",
+        {
+            label: localizedLabel,
+            intent,
+            protections: adaptiveProtectionSummary(preset.adaptation),
+        },
+        `${localizedLabel} · ${intent} · adaptado al máster · protege ${adaptiveProtectionSummary(preset.adaptation)}`,
+    );
+    status.dataset.state = "active";
+}
+
+async function applyObjectFinishingPreset(name) {
+    const basePreset = cloneObjectFinishingPreset(name);
+    const status = document.getElementById("object-finishing-status");
+    const applicability = objectPresetApplicable(basePreset, { isMono: !!lastPostHistogram?.isMono });
     if (!applicability.applicable) {
         if (status) {
-            status.textContent = applicability.reason;
+            status.textContent = tr(
+                "wavelets.object_lab.mono_color_unavailable",
+                applicability.reason,
+            );
             status.dataset.state = "warning";
         }
         document.getElementById("object-finishing-module")?.classList.add("assistant-target-pulse");
@@ -6534,34 +6795,114 @@ function applyObjectFinishingPreset(name) {
         return;
     }
 
+    const token = ++objectAdaptiveRequestId;
+    let measuredMono = !!lastPostHistogram?.isMono;
+    const previousPipeline = getPipelineParams();
+    const previousObjectState = activeObjectFinishingState;
+    let mutationStarted = false;
+    if (status) {
+        status.textContent = tr("wavelets.adaptive.measuring", "Midiendo máster 16-bit, ruido y halos…");
+        status.dataset.state = "processing";
+    }
+    document.querySelectorAll("[data-object-preset], #btn-object-original").forEach((button) => {
+        button.disabled = true;
+        button.classList.toggle("is-analyzing", button.dataset.objectPreset === name);
+    });
+    try {
+        const measurement = await measureAdaptiveRecipeInput();
+        if (token !== objectAdaptiveRequestId) return;
+        const preset = adaptObjectFinishingPreset(name, measurement);
+        measuredMono = !!preset?.adaptation?.isMono;
+        preset.label = localizedObjectPresetLabel(name, preset.label);
+        const measuredApplicability = objectPresetApplicable(preset, { isMono: measuredMono });
+        if (!measuredApplicability.applicable) {
+            if (status) {
+                status.textContent = tr(
+                    "wavelets.object_lab.mono_color_unavailable",
+                    measuredApplicability.reason,
+                );
+                status.dataset.state = "warning";
+            }
+            return;
+        }
+        suppressPostprocessEvents = true;
+        try {
+            mutationStarted = true;
+            resetProcessingParams({ updateMemo: false });
+            const neutral = getPipelineParams();
+            const recipe = preset.pipeline || {};
+            applyWaveletPreset({
+                ...neutral,
+                ...recipe,
+                deconv: { ...neutral.deconv, ...(recipe.deconv || {}) },
+                advanced: { ...neutral.advanced, ...(recipe.advanced || {}) },
+            }, { trigger: false });
+        } finally {
+            suppressPostprocessEvents = false;
+        }
+        activeObjectFinishingState = { name, preset };
+        markObjectFinishingSelection(name);
+        renderObjectFinishingStatus();
+        updateDeconvolutionStatus();
+        drawPostprocessScopes();
+        triggerUpdate({ forceFastPreview: true });
+        queuePostHistoryCommit(trFormat(
+            "wavelets.object_lab.history_preset",
+            {
+                label: preset.label,
+                intent: preset.intent === "creative"
+                    ? tr("wavelets.object_lab.intent_recipe_creative", "creativa")
+                    : tr("wavelets.object_lab.intent_recipe_natural", "natural"),
+            },
+            `${preset.label} · receta ${preset.intent === "creative" ? "creativa" : "natural"}`,
+        ));
+        updateZenithGuide();
+    } catch (error) {
+        console.error("No se pudo aplicar la receta adaptativa de Luna/Planetas:", error);
+        if (mutationStarted) {
+            suppressPostprocessEvents = true;
+            try {
+                applyWaveletPreset(previousPipeline, { trigger: false });
+                activeObjectFinishingState = previousObjectState;
+                markObjectFinishingSelection(previousObjectState?.name || "");
+                renderObjectFinishingStatus();
+                updateDeconvolutionStatus();
+                drawPostprocessScopes();
+                triggerUpdate({ forceFastPreview: true });
+            } catch (rollbackError) {
+                console.error("No se pudo restaurar la receta anterior:", rollbackError);
+            } finally {
+                suppressPostprocessEvents = false;
+            }
+        }
+        if (token === objectAdaptiveRequestId && status) {
+            status.textContent = tr(
+                "wavelets.adaptive.error",
+                "No se pudo medir la señal; no se aplicaron cambios.",
+            );
+            status.dataset.state = "warning";
+        }
+    } finally {
+        suppressPostprocessEvents = false;
+        if (token === objectAdaptiveRequestId) restoreObjectPresetButtons(measuredMono);
+    }
+}
+
+function applyObjectFinishingOriginal() {
+    ++objectAdaptiveRequestId;
     suppressPostprocessEvents = true;
     try {
         resetProcessingParams({ updateMemo: false });
-        const neutral = getPipelineParams();
-        const recipe = preset.pipeline || {};
-        applyWaveletPreset({
-            ...neutral,
-            ...recipe,
-            deconv: { ...neutral.deconv, ...(recipe.deconv || {}) },
-            advanced: { ...neutral.advanced, ...(recipe.advanced || {}) },
-        }, { trigger: false });
     } finally {
         suppressPostprocessEvents = false;
     }
-    document.querySelectorAll("[data-object-preset]").forEach((button) => {
-        const active = button.dataset.objectPreset === name;
-        button.classList.toggle("is-active", active);
-        button.setAttribute("aria-pressed", String(active));
-    });
-    if (status) {
-        const intent = preset.intent === "creative" ? "Creativo e interpretativo" : "Científico y natural";
-        status.textContent = `${preset.label} · ${intent} · ${preset.description}`;
-        status.dataset.state = "active";
-    }
-    updateDeconvolutionStatus();
+    activeObjectFinishingState = { name: "original", preset: null };
+    markObjectFinishingSelection("original");
+    renderObjectFinishingStatus();
+    restoreObjectPresetButtons();
     drawPostprocessScopes();
     triggerUpdate({ forceFastPreview: true });
-    queuePostHistoryCommit(`${preset.label} · receta ${preset.intent === "creative" ? "creativa" : "natural"}`);
+    queuePostHistoryCommit(tr("wavelets.object_lab.history_original", "Original apilado · receta neutra"));
     updateZenithGuide();
 }
 
@@ -6569,6 +6910,7 @@ function initObjectFinishingUi() {
     document.querySelectorAll("[data-object-preset]").forEach((button) => {
         button.addEventListener("click", () => applyObjectFinishingPreset(button.dataset.objectPreset));
     });
+    document.getElementById("btn-object-original")?.addEventListener("click", applyObjectFinishingOriginal);
 }
 
 function setPostScopesOpen(open) {
@@ -6668,34 +7010,6 @@ function initAdvancedPostprocessControls() {
     document.getElementById("btn-refresh-histogram")?.addEventListener("click", () => refreshPostHistogram(true));
     document.querySelectorAll("[data-tone-preset]").forEach((button) => button.addEventListener("click", () => applyTonePreset(button.dataset.tonePreset)));
     document.querySelectorAll("[data-deconv-preset]").forEach((button) => button.addEventListener("click", () => applyDeconvolutionPreset(button.dataset.deconvPreset)));
-    document.getElementById("btn-deconv-compare")?.addEventListener("click", () => {
-        const status = document.getElementById("deconv-module-status");
-        if (!postProcessSession.getState().canCompare) {
-            if (status) {
-                status.textContent = "Espera a que termine el resultado 1:1 para comparar con el paso anterior.";
-                status.dataset.state = "warning";
-            }
-            return;
-        }
-        const selector = document.getElementById("post-compare-reference");
-        if (selector) selector.value = "previous";
-        setPostCompareActive(true);
-        if (ui.imgResult?.naturalWidth && ui.imgResult?.naturalHeight) {
-            prepareZoomSurfaceForImage(ui.imgResult);
-            const viewport = ui.imgResult.closest(".zoom-target-container")?.getBoundingClientRect();
-            if (viewport?.width && viewport?.height) {
-                zoomLevel = 1;
-                panX = (viewport.width - ui.imgResult.naturalWidth) / 2;
-                panY = (viewport.height - ui.imgResult.naturalHeight) / 2;
-                updateTransform();
-            }
-        }
-        if (status) {
-            status.textContent = "A/B activo · paso anterior · zoom 100% · arrastra para inspeccionar otra zona";
-            status.dataset.state = "active";
-        }
-        document.getElementById("view-result")?.scrollIntoView({ behavior: "smooth", block: "start" });
-    });
     initObjectFinishingUi();
     ["sl-deconv-sigma", "num-deconv-sigma", "sl-deconv-iter", "num-deconv-iter", "sl-vc-sigma", "num-vc-sigma", "sl-vc-iter", "num-vc-iter"]
         .forEach((id) => document.getElementById(id)?.addEventListener("input", updateDeconvolutionStatus));
@@ -10930,6 +11244,10 @@ window.addEventListener("languageChanged", (e) => {
     if (divAnimFrameManager?.style.display !== "none") {
         renderFrameManager();
     }
+    updateDeconvolutionStatus();
+    updateSolarUiState();
+    renderObjectFinishingStatus();
+    updatePostHistoryUi();
 });
 
 // =========================================================================

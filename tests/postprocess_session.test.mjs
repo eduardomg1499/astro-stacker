@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { PostProcessSession, recipesEqual, unwrapPreviewReference } from "../src/postprocess_session.js";
 import { evaluateGuide } from "../src/zenith_guide.js";
 import {
+  adaptSolarPreset,
   cloneSolarPreset,
   evaluateSolarCurve,
   evaluateToneCurve,
@@ -14,9 +15,11 @@ import {
 } from "../src/solar_postprocess.js";
 import { resolvePostprocessHelp } from "../src/postprocess_help.js";
 import {
+  adaptObjectFinishingPreset,
   cloneObjectFinishingPreset,
   objectPresetApplicable,
 } from "../src/object_postprocess_presets.js";
+import { normalizeAdaptivePostprocessAnalysis } from "../src/adaptive_postprocess.js";
 
 test("a new result atomically discards the previous history", () => {
   const session = new PostProcessSession();
@@ -47,6 +50,19 @@ test("undo, redo and divergent edits behave predictably", () => {
   assert.equal(session.canRedo(), false);
   assert.equal(session.getCompareEntry("source").preview, "a");
   assert.equal(session.getCompareEntry("previous").preview, "b");
+});
+
+test("undo and redo restore the exact recipe and preview in both directions", () => {
+  const session = new PostProcessSession();
+  const original = { deconv: { s: 0, i: 0 }, advanced: { exposure: 0 } };
+  const restored = { deconv: { s: 1.2, i: 11 }, advanced: { exposure: -0.12 } };
+  session.beginResult({ generation: 1, recipe: original, preview: "original-16bit" });
+  session.commit(restored, { preview: "deconvolved-16bit", label: "Deconvolución" });
+
+  assert.deepEqual(session.undo().recipe, original);
+  assert.equal(session.current().preview, "original-16bit");
+  assert.deepEqual(session.redo().recipe, restored);
+  assert.equal(session.current().preview, "deconvolved-16bit");
 });
 
 test("continuous edits coalesce without losing their A/B baseline", () => {
@@ -211,6 +227,79 @@ test("solar curves remain bounded and presets are independent copies", () => {
   }
 });
 
+test("adaptive analysis responds to clipping, noise, ringing, and stable signal", () => {
+  assert.equal(
+    normalizeAdaptivePostprocessAnalysis({ histogram: {} }).measured,
+    false,
+    "an empty backend response must not be presented as a measured adaptation",
+  );
+
+  const stressed = normalizeAdaptivePostprocessAnalysis({
+    histogram: {
+      median: 48_000,
+      percentileLow: 0,
+      percentileHigh: 65_500,
+      shadowClip: 0.02,
+      highlightClip: 0.01,
+      isMono: true,
+    },
+    artifacts: {
+      sampledPixels: 100_000,
+      hotPixels: 120,
+      deadPixels: 80,
+      ringingScore: 12,
+      suggestedDenoise: 28,
+    },
+    capture: { qualityStability: 62 },
+  });
+  const clean = normalizeAdaptivePostprocessAnalysis({
+    histogram: {
+      median: 25_000,
+      percentileLow: 1_200,
+      percentileHigh: 55_000,
+      shadowClip: 0,
+      highlightClip: 0,
+    },
+    artifacts: {
+      sampledPixels: 100_000,
+      ringingScore: 0.2,
+      suggestedDenoise: 1,
+    },
+    capture: { qualityStability: 96 },
+  });
+  assert.ok(stressed.highlightStress > clean.highlightStress);
+  assert.ok(stressed.noiseStress > clean.noiseStress);
+  assert.ok(stressed.detailConfidence < clean.detailConfidence);
+  assert.ok(stressed.safeguards.includes("highlights"));
+  assert.ok(stressed.safeguards.includes("noise"));
+});
+
+test("solar recipes adapt to the measured master without losing bounded headroom", () => {
+  const baseline = cloneSolarPreset("ha-gold");
+  const adapted = adaptSolarPreset("ha-gold", {
+    histogram: {
+      median: 46_000,
+      percentileLow: 0,
+      percentileHigh: 65_535,
+      shadowClip: 0.04,
+      highlightClip: 0.008,
+      isMono: true,
+    },
+    artifacts: {
+      sampledPixels: 100_000,
+      ringingScore: 10,
+      suggestedDenoise: 24,
+    },
+  });
+  assert.equal(adapted.adaptation.measured, true);
+  assert.ok(adapted.highlightProtect >= baseline.highlightProtect);
+  assert.ok(adapted.highlightCompression >= baseline.highlightCompression);
+  assert.ok(adapted.filamentAmount < baseline.filamentAmount);
+  assert.ok(adapted.noiseGuard >= baseline.noiseGuard);
+  assert.ok(adapted.curvePoints.at(-1)[1] < baseline.curvePoints.at(-1)[1]);
+  assert.ok(adapted.curvePoints.every(([, y]) => y >= 0 && y <= 1));
+});
+
 test("object finishing presets separate natural and interpretive colour contracts", () => {
   const lunar = cloneObjectFinishingPreset("lunar-relief");
   const mineral = cloneObjectFinishingPreset("lunar-mineral");
@@ -221,6 +310,35 @@ test("object finishing presets separate natural and interpretive colour contract
   assert.equal(objectPresetApplicable(mineral, { isMono: false }).applicable, true);
   mineral.pipeline.w[0] = 99;
   assert.notEqual(cloneObjectFinishingPreset("lunar-mineral").pipeline.w[0], 99);
+});
+
+test("moon and planet recipes reduce risky detail and add measured protection", () => {
+  const baseline = cloneObjectFinishingPreset("jupiter-natural");
+  const adapted = adaptObjectFinishingPreset("jupiter-natural", {
+    histogram: {
+      median: 42_000,
+      percentileLow: 20,
+      percentileHigh: 65_500,
+      shadowClip: 0.01,
+      highlightClip: 0.006,
+      isMono: false,
+    },
+    artifacts: {
+      sampledPixels: 80_000,
+      hotPixels: 120,
+      deadPixels: 90,
+      ringingScore: 11,
+      suggestedDenoise: 25,
+    },
+    capture: { qualityStability: 68 },
+  });
+  assert.equal(adapted.adaptation.measured, true);
+  assert.ok(adapted.pipeline.deconv.i < baseline.pipeline.deconv.i);
+  assert.ok(adapted.pipeline.w[0] < baseline.pipeline.w[0]);
+  assert.ok(adapted.pipeline.autoMask >= baseline.pipeline.autoMask);
+  assert.ok(adapted.pipeline.masterDenoise >= baseline.pipeline.masterDenoise);
+  assert.ok(adapted.pipeline.advanced.highlights <= baseline.pipeline.advanced.highlights);
+  assert.ok(adapted.pipeline.blend >= 68 && adapted.pipeline.blend <= 100);
 });
 
 test("the shared tone curve is exact when linear and the assistant can propose it", () => {
@@ -295,11 +413,45 @@ test("only the scientific 16-bit histogram and advanced modules remain in the pa
   assert.ok(html.includes('id="sl-solar-highlight-compression"'));
   assert.ok(html.includes('data-deconv-preset="solar"'));
   assert.ok(html.includes('data-deconv-preset="solar-limb"'));
-  assert.ok(html.includes('id="btn-deconv-compare"'));
+  assert.equal(html.includes('id="btn-deconv-compare"'), false);
   assert.ok(html.includes('id="object-finishing-module"'));
   assert.equal((html.match(/data-object-preset=/g) || []).length, 7);
+  assert.ok(html.includes('id="btn-object-original"'));
   assert.ok(html.includes('id="ds-step-assistant"'));
   assert.equal(html.includes("Supera al sharpening"), false);
+});
+
+test("history playback invalidates stale renders before waiting for its preview", async () => {
+  const main = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+  const start = main.indexOf("async function applyPostHistoryEntry");
+  const end = main.indexOf("async function beginNewPostprocessResult", start);
+  const block = main.slice(start, end);
+  const invalidate = block.indexOf("const requestId = ++pipelineRequestId");
+  const waitForPreview = block.indexOf("await setImageAndWait");
+  assert.ok(invalidate >= 0 && waitForPreview > invalidate,
+    "undo/redo must cancel the in-flight render before awaiting the stored preview");
+  assert.ok(block.includes("playbackNonce !== historyPlaybackNonce"));
+});
+
+test("new post-processing text is available in Spanish, English, Italian, and French", async () => {
+  const files = ["es", "en", "it", "fr"];
+  const locales = {};
+  for (const language of files) {
+    locales[language] = JSON.parse(await readFile(
+      new URL(`../src/locales/${language}.json`, import.meta.url),
+      "utf8",
+    ));
+  }
+  for (const language of files) {
+    assert.ok(locales[language].wavelets?.adaptive?.measuring);
+    assert.ok(locales[language].wavelets?.solar?.recover_prominences);
+    assert.ok(locales[language].wavelets?.object_lab?.original);
+    assert.ok(locales[language].wavelets?.history?.redo);
+  }
+  const i18nSource = await readFile(new URL("../src/i18n.js", import.meta.url), "utf8");
+  for (const language of files) {
+    assert.ok(i18nSource.includes(`'${language}'`));
+  }
 });
 
 test("planetary defaults and mono-only availability are explicit", async () => {

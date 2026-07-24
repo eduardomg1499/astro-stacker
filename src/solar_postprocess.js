@@ -1,3 +1,9 @@
+import {
+  clampAdaptive,
+  normalizeAdaptivePostprocessAnalysis,
+  roundAdaptive,
+} from "./adaptive_postprocess.js";
+
 const LINEAR_POINTS = Object.freeze([[0, 0], [1, 1]]);
 
 export const SOLAR_CURVE_PRESETS = Object.freeze({
@@ -264,6 +270,88 @@ export function cloneSolarPreset(name) {
     ...preset,
     curvePoints: normalizeSolarCurvePoints(preset.curvePoints),
   };
+}
+
+/**
+ * Protects each solar recipe according to the measured 16-bit master. It
+ * never invents gain/exposure metadata; it responds to their observable
+ * consequences in the stack and keeps all values visible in the module.
+ */
+export function adaptSolarPreset(name, input = {}) {
+  const preset = cloneSolarPreset(name);
+  const analysis = normalizeAdaptivePostprocessAnalysis(input);
+  if (name === "neutral" || !preset.enabled) {
+    return { ...preset, adaptation: analysis };
+  }
+
+  const detailScale = clampAdaptive(
+    analysis.detailConfidence
+      - analysis.ringing * 0.08
+      - analysis.noiseStress * 0.06,
+    0.48,
+    1,
+  );
+  const highlightStress = analysis.highlightStress;
+  preset.highlightProtect = roundAdaptive(clampAdaptive(
+    Math.max(preset.highlightProtect, 0.9 + highlightStress * 0.09),
+    0,
+    1,
+  ), 3);
+  preset.highlightCompression = roundAdaptive(clampAdaptive(
+    preset.highlightCompression
+      + highlightStress * 0.2
+      + analysis.ringing * 0.06,
+    0.35,
+    0.92,
+  ), 3);
+  preset.backgroundProtect = roundAdaptive(clampAdaptive(
+    Math.max(preset.backgroundProtect, 0.985 + analysis.shadowStress * 0.015),
+    0,
+    1,
+  ), 3);
+  preset.filamentAmount = roundAdaptive(clampAdaptive(
+    preset.filamentAmount * detailScale,
+    0,
+    1,
+  ), 3);
+  preset.prominenceAmount = roundAdaptive(clampAdaptive(
+    preset.prominenceAmount
+      * clampAdaptive(0.82 + analysis.rangeConfidence * 0.18, 0.72, 1),
+    0,
+    1,
+  ), 3);
+  preset.noiseGuard = roundAdaptive(clampAdaptive(
+    Math.max(
+      preset.noiseGuard,
+      0.72 + analysis.noiseStress * 0.24 + analysis.ringing * 0.08,
+    ),
+    0,
+    0.98,
+  ), 3);
+  preset.colorStrength = roundAdaptive(clampAdaptive(
+    preset.colorStrength
+      * (1 - analysis.highlightStress * 0.18 - analysis.noiseStress * 0.12),
+    0,
+    1,
+  ), 3);
+
+  // Preserve the preset's shape while reserving additional 16-bit headroom
+  // when the source already reaches the right edge of the histogram.
+  const endpointCap = clampAdaptive(
+    0.985 - highlightStress * 0.055,
+    0.91,
+    0.985,
+  );
+  preset.curvePoints = normalizeSolarCurvePoints(preset.curvePoints)
+    .map(([x, y]) => [
+      x,
+      roundAdaptive(Math.min(y, endpointCap), 4),
+    ]);
+  preset.adaptation = {
+    ...analysis,
+    detailScale: roundAdaptive(detailScale, 2),
+  };
+  return preset;
 }
 
 export class ToneCurveEditor {

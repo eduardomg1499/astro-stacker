@@ -2304,6 +2304,16 @@
                         <span class="license-lang-code">🇺🇸</span>
                         <span class="license-lang-name">English</span>
                     </button>
+                    <button type="button" class="license-lang-btn" data-lang="it" aria-pressed="false"
+                        onclick="document.dispatchEvent(new CustomEvent('changeLang', {detail: 'it'}))">
+                        <span class="license-lang-code">🇮🇹</span>
+                        <span class="license-lang-name">Italiano</span>
+                    </button>
+                    <button type="button" class="license-lang-btn" data-lang="fr" aria-pressed="false"
+                        onclick="document.dispatchEvent(new CustomEvent('changeLang', {detail: 'fr'}))">
+                        <span class="license-lang-code">🇫🇷</span>
+                        <span class="license-lang-name">Français</span>
+                    </button>
                 </div>
             </div>
 
@@ -2423,6 +2433,8 @@
                                 <select id="settings-lang-select" style="display: none;">
                                     <option value="es">Español (ES)</option>
                                     <option value="en">English (EN)</option>
+                                    <option value="it">Italiano (IT)</option>
+                                    <option value="fr">Français (FR)</option>
                                 </select>
 
                                 <div class="custom-select-trigger" id="custom-language-trigger">
@@ -2443,6 +2455,14 @@
                                     <div class="custom-option" data-value="en">
                                         <svg viewBox="0 0 24 24" class="cs-icon cs-en" style="font-family: Arial, sans-serif; font-weight: 800; font-size: 14px;"><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="currentColor">EN</text></svg>
                                         <span>English (EN)</span>
+                                    </div>
+                                    <div class="custom-option" data-value="it">
+                                        <svg viewBox="0 0 24 24" class="cs-icon cs-it" style="font-family: Arial, sans-serif; font-weight: 800; font-size: 14px;"><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="currentColor">IT</text></svg>
+                                        <span>Italiano (IT)</span>
+                                    </div>
+                                    <div class="custom-option" data-value="fr">
+                                        <svg viewBox="0 0 24 24" class="cs-icon cs-fr" style="font-family: Arial, sans-serif; font-weight: 800; font-size: 14px;"><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="currentColor">FR</text></svg>
+                                        <span>Français (FR)</span>
                                     </div>
                                 </div>
                             </div>
@@ -3461,12 +3481,11 @@
                         </select>
                     </div>
                     <div class="deconv-preset-row" role="group" aria-label="Puntos de partida de deconvolución">
-                        <button type="button" data-deconv-preset="gentle">Suave</button>
-                        <button type="button" data-deconv-preset="balanced">Equilibrada</button>
-                        <button type="button" data-deconv-preset="detail">Detalle fino</button>
-                        <button type="button" data-deconv-preset="solar">Solar H-alpha</button>
-                        <button type="button" data-deconv-preset="solar-limb">Limbo solar</button>
-                        <button type="button" id="btn-deconv-compare">A/B al 100%</button>
+                        <button type="button" data-deconv-preset="gentle" data-i18n="wavelets.deconvolution.presets.gentle">Suave</button>
+                        <button type="button" data-deconv-preset="balanced" data-i18n="wavelets.deconvolution.presets.balanced">Equilibrada</button>
+                        <button type="button" data-deconv-preset="detail" data-i18n="wavelets.deconvolution.presets.detail">Detalle fino</button>
+                        <button type="button" data-deconv-preset="solar" data-i18n="wavelets.deconvolution.presets.solar">Solar H-alpha</button>
+                        <button type="button" data-deconv-preset="solar-limb" data-i18n="wavelets.deconvolution.presets.solar_limb">Limbo solar</button>
                     </div>
                     <div style="margin-bottom:8px;">
                         <span style="font-size:0.7em; color:#aaa; font-weight:bold;"
@@ -3510,7 +3529,7 @@
                             <input type="checkbox" id="chk-psf-limb">
                             <span class="slider round"></span></span></label>
                     </div>
-                    <div id="deconv-module-status" class="module-status">Desactivada · el máster permanece intacto</div>
+                    <div id="deconv-module-status" class="module-status" data-i18n="wavelets.deconvolution.status_off">Desactivada · el máster permanece intacto</div>
                 </div>
 
                 <div class="control-group" style="border-left: 3px solid #f472b6;">
@@ -3844,120 +3863,127 @@
 
                         <details id="solar-mono-module" class="post-module solar-mono-module" open hidden>
                             <summary>
-                                <span>Laboratorio Solar mono</span>
-                                <small>curvas, inversión, falso color y filamentos</small>
+                                <span data-i18n="wavelets.solar.title">Laboratorio Solar mono</span>
+                                <small data-i18n="wavelets.solar.subtitle">curvas, inversión, falso color y filamentos</small>
                             </summary>
                             <div class="solar-mono-contract">
                                 <svg class="zas-icon" aria-hidden="true"><use href="#icon-lightbulb"></use></svg>
-                                <p><strong>Derivado solar reversible.</strong> El máster apilado permanece monocromo; la curva y el color se guardan como una etapa del historial.</p>
+                                <div>
+                                    <p data-i18n="wavelets.solar.contract"><strong>Derivado solar reversible.</strong> El máster apilado permanece monocromo; la curva y el color se guardan como una etapa del historial.</p>
+                                    <small class="adaptive-recipe-note" data-i18n="wavelets.adaptive.contract">Cada receta mide el máster 16-bit antes de ajustar detalle, ruido, halos y margen de luces.</small>
+                                </div>
                             </div>
                             <div class="solar-preset-row" role="group" aria-label="Presets solares">
-                                <button type="button" data-solar-preset="ha-natural">H-alpha natural</button>
-                                <button type="button" data-solar-preset="ha-gold">H-alpha dorado</button>
-                                <button type="button" data-solar-preset="ha-inverted">H-alpha invertido</button>
-                                <button type="button" data-solar-preset="chromosphere">Cromosfera</button>
-                                <button type="button" data-solar-preset="prominence">Prominencias</button>
-                                <button type="button" data-solar-preset="dual-range">Disco + corona</button>
-                                <button type="button" data-solar-preset="filaments">Filamentos mono</button>
-                                <button type="button" data-solar-preset="neutral">Neutral</button>
+                                <button type="button" data-solar-preset="ha-natural" data-i18n="wavelets.solar.presets.ha_natural">H-alpha natural</button>
+                                <button type="button" data-solar-preset="ha-gold" data-i18n="wavelets.solar.presets.ha_gold">H-alpha dorado</button>
+                                <button type="button" data-solar-preset="ha-inverted" data-i18n="wavelets.solar.presets.ha_inverted">H-alpha invertido</button>
+                                <button type="button" data-solar-preset="chromosphere" data-i18n="wavelets.solar.presets.chromosphere">Cromosfera</button>
+                                <button type="button" data-solar-preset="prominence" data-i18n="wavelets.solar.presets.prominence">Prominencias</button>
+                                <button type="button" data-solar-preset="dual-range" data-i18n="wavelets.solar.presets.dual_range">Disco + corona</button>
+                                <button type="button" data-solar-preset="filaments" data-i18n="wavelets.solar.presets.filaments">Filamentos mono</button>
+                                <button type="button" data-solar-preset="neutral" data-i18n="wavelets.solar.presets.neutral">Neutral</button>
                             </div>
                             <div class="solar-toggle-grid">
                                 <label>
-                                    <span><strong>Procesamiento solar</strong><small>Activa esta etapa</small></span>
+                                    <span><strong data-i18n="wavelets.solar.enable">Procesamiento solar</strong><small data-i18n="wavelets.solar.enable_hint">Activa esta etapa</small></span>
                                     <span class="switch"><input type="checkbox" id="chk-solar-enabled"><span class="slider round"></span></span>
                                 </label>
                                 <label>
-                                    <span><strong>Invertir luminancia</strong><small>Negativo solar</small></span>
+                                    <span><strong data-i18n="wavelets.solar.invert">Invertir luminancia</strong><small data-i18n="wavelets.solar.invert_hint">Negativo solar</small></span>
                                     <span class="switch"><input type="checkbox" id="chk-solar-invert"><span class="slider round"></span></span>
                                 </label>
                                 <label>
-                                    <span><strong>Falso color</strong><small>Mapa por luminancia</small></span>
+                                    <span><strong data-i18n="wavelets.solar.false_color">Falso color</strong><small data-i18n="wavelets.solar.false_color_hint">Mapa por luminancia</small></span>
                                     <span class="switch"><input type="checkbox" id="chk-solar-colorize" checked><span class="slider round"></span></span>
                                 </label>
                             </div>
                             <div class="solar-curve-editor">
                                 <div class="solar-curve-heading">
                                     <div>
-                                        <strong>Curva de luminancia solar</strong>
-                                        <small>Clic: añadir o mover · clic derecho: eliminar</small>
+                                        <strong data-i18n="wavelets.solar.curve_title">Curva de luminancia solar</strong>
+                                        <small data-i18n="wavelets.solar.curve_hint">Clic: añadir o mover · clic derecho: eliminar</small>
                                     </div>
                                     <button id="btn-reset-solar-curve" type="button" class="secondary compact-button">
                                         <svg class="zas-icon" aria-hidden="true"><use href="#icon-refresh"></use></svg>
-                                        Lineal
+                                        <span data-i18n="wavelets.solar.linear">Lineal</span>
                                     </button>
                                 </div>
                                 <canvas id="solar-tone-curve" width="360" height="190"
                                     role="application"
                                     aria-label="Curva solar editable: clic para añadir o mover puntos, clic derecho para eliminarlos"></canvas>
-                                <div class="solar-curve-axis" aria-hidden="true"><span>Sombras</span><span>Medios</span><span>Luces</span></div>
+                                <div class="solar-curve-axis" aria-hidden="true"><span data-i18n="wavelets.solar.shadows">Sombras</span><span data-i18n="wavelets.solar.midtones">Medios</span><span data-i18n="wavelets.solar.highlights">Luces</span></div>
                             </div>
                             <div class="advanced-slider-list solar-slider-list">
-                                <label for="sl-solar-filament"><span>Recuperar filamentos</span><output id="out-solar-filament">0</output></label>
+                                <label for="sl-solar-filament"><span data-i18n="wavelets.solar.recover_filaments">Recuperar filamentos</span><output id="out-solar-filament">0</output></label>
                                 <input id="sl-solar-filament" type="range" min="0" max="150" value="0" step="1" data-default="0">
-                                <label for="sl-solar-radius"><span>Escala de filamentos</span><output id="out-solar-radius">1.15 px</output></label>
+                                <label for="sl-solar-radius"><span data-i18n="wavelets.solar.filament_scale">Escala de filamentos</span><output id="out-solar-radius">1.15 px</output></label>
                                 <input id="sl-solar-radius" type="range" min="55" max="400" value="115" step="5" data-default="115">
-                                <label for="sl-solar-noise-guard"><span>Protección de ruido</span><output id="out-solar-noise-guard">65</output></label>
+                                <label for="sl-solar-noise-guard"><span data-i18n="wavelets.solar.noise_guard">Protección de ruido</span><output id="out-solar-noise-guard">65</output></label>
                                 <input id="sl-solar-noise-guard" type="range" min="0" max="100" value="65" step="1" data-default="65">
-                                <label for="sl-solar-background-protect"><span>Conservar cielo</span><output id="out-solar-background-protect">72</output></label>
+                                <label for="sl-solar-background-protect"><span data-i18n="wavelets.solar.keep_sky">Conservar cielo</span><output id="out-solar-background-protect">72</output></label>
                                 <input id="sl-solar-background-protect" type="range" min="0" max="100" value="72" step="1" data-default="72">
-                                <label for="sl-solar-prominence"><span>Recuperar protuberancias</span><output id="out-solar-prominence">0</output></label>
+                                <label for="sl-solar-prominence"><span data-i18n="wavelets.solar.recover_prominences">Recuperar protuberancias</span><output id="out-solar-prominence">0</output></label>
                                 <input id="sl-solar-prominence" type="range" min="0" max="100" value="0" step="1" data-default="0">
-                                <label for="sl-solar-color-strength"><span>Fuerza de falso color</span><output id="out-solar-color-strength">90</output></label>
+                                <label for="sl-solar-color-strength"><span data-i18n="wavelets.solar.color_strength">Fuerza de falso color</span><output id="out-solar-color-strength">90</output></label>
                                 <input id="sl-solar-color-strength" type="range" min="0" max="100" value="90" step="1" data-default="90">
-                                <label for="sl-solar-highlight-protect"><span>Proteger altas luces</span><output id="out-solar-highlight-protect">65</output></label>
+                                <label for="sl-solar-highlight-protect"><span data-i18n="wavelets.solar.protect_highlights">Proteger altas luces</span><output id="out-solar-highlight-protect">65</output></label>
                                 <input id="sl-solar-highlight-protect" type="range" min="0" max="100" value="65" step="1" data-default="65">
-                                <label for="sl-solar-highlight-compression"><span>Compresión de luces</span><output id="out-solar-highlight-compression">62</output></label>
+                                <label for="sl-solar-highlight-compression"><span data-i18n="wavelets.solar.highlight_compression">Compresión de luces</span><output id="out-solar-highlight-compression">62</output></label>
                                 <input id="sl-solar-highlight-compression" type="range" min="0" max="100" value="62" step="1" data-default="62">
                             </div>
                             <div class="solar-color-map">
                                 <div class="solar-color-map-heading">
-                                    <strong>Mapa cromático libre</strong>
-                                    <small>Tres anclas interpoladas suavemente</small>
+                                    <strong data-i18n="wavelets.solar.color_map">Mapa cromático libre</strong>
+                                    <small data-i18n="wavelets.solar.color_map_hint">Tres anclas interpoladas suavemente</small>
                                 </div>
                                 <div id="solar-color-ramp" class="solar-color-ramp" aria-label="Vista previa del mapa cromático"></div>
                                 <div class="solar-color-stops">
-                                    <label>Sombras<input id="solar-shadow-color" type="color" value="#0f0000" data-solar-color="shadow"></label>
-                                    <label>Medios<input id="solar-mid-color" type="color" value="#b83300" data-solar-color="midtone"></label>
-                                    <label>Luces<input id="solar-highlight-color" type="color" value="#fff05a" data-solar-color="highlight"></label>
+                                    <label><span data-i18n="wavelets.solar.shadows">Sombras</span><input id="solar-shadow-color" type="color" value="#0f0000" data-solar-color="shadow"></label>
+                                    <label><span data-i18n="wavelets.solar.midtones">Medios</span><input id="solar-mid-color" type="color" value="#b83300" data-solar-color="midtone"></label>
+                                    <label><span data-i18n="wavelets.solar.highlights">Luces</span><input id="solar-highlight-color" type="color" value="#fff05a" data-solar-color="highlight"></label>
                                 </div>
                             </div>
-                            <div id="solar-module-status" class="module-status" data-state="idle" aria-live="polite">Neutral · sin alterar la señal mono</div>
+                            <div id="solar-module-status" class="module-status" data-state="idle" aria-live="polite" data-i18n="wavelets.solar.status_neutral">Neutral · sin alterar la señal mono</div>
                         </details>
 
                         <details id="object-finishing-module" class="post-module object-finishing-module" open>
                             <summary>
-                                <span>Laboratorio Luna y Planetas</span>
-                                <small>recetas 16-bit por objetivo</small>
+                                <span data-i18n="wavelets.object_lab.title">Laboratorio Luna y Planetas</span>
+                                <small data-i18n="wavelets.object_lab.subtitle">recetas 16-bit por objetivo</small>
                             </summary>
                             <div class="object-finishing-contract">
-                                <strong>Un punto de partida, no una caja negra.</strong>
-                                <p>Cada receta mueve controles visibles y crea un paso reversible. “Científico” conserva color y tono; “Creativo” es interpretativo.</p>
+                                <strong data-i18n="wavelets.object_lab.contract_title">Un punto de partida adaptativo, no una caja negra.</strong>
+                                <p data-i18n="wavelets.object_lab.contract_body">Antes de aplicar, Zenith mide rango, recorte, ruido y halos del máster. Después mueve controles visibles y crea un paso reversible.</p>
                             </div>
+                            <button id="btn-object-original" type="button" class="object-original-button" aria-pressed="false">
+                                <span data-i18n="wavelets.object_lab.original">Original apilado</span>
+                                <small data-i18n="wavelets.object_lab.original_hint">Receta neutra · también queda en el historial</small>
+                            </button>
                             <section class="object-preset-family" aria-labelledby="lunar-preset-title">
                                 <div class="object-preset-heading">
-                                    <strong id="lunar-preset-title">Luna</strong>
-                                    <span>fase · superficie · mineral</span>
+                                    <strong id="lunar-preset-title" data-i18n="wavelets.object_lab.lunar">Luna</strong>
+                                    <span data-i18n="wavelets.object_lab.lunar_hint">fase · superficie · mineral</span>
                                 </div>
                                 <div class="object-preset-grid">
-                                    <button type="button" data-object-preset="lunar-relief"><span>Relieve lunar</span><small>Científico</small></button>
-                                    <button type="button" data-object-preset="lunar-phase"><span>Fase completa</span><small>Científico</small></button>
-                                    <button type="button" data-object-preset="lunar-mineral"><span>Luna mineral</span><small>Creativo · color</small></button>
+                                    <button type="button" data-object-preset="lunar-relief"><span data-i18n="wavelets.object_lab.presets.lunar_relief">Relieve lunar</span><small data-i18n="wavelets.object_lab.intent_scientific">Científico</small></button>
+                                    <button type="button" data-object-preset="lunar-phase"><span data-i18n="wavelets.object_lab.presets.lunar_phase">Fase completa</span><small data-i18n="wavelets.object_lab.intent_scientific">Científico</small></button>
+                                    <button type="button" data-object-preset="lunar-mineral"><span data-i18n="wavelets.object_lab.presets.lunar_mineral">Luna mineral</span><small data-i18n="wavelets.object_lab.intent_creative_color">Creativo · color</small></button>
                                 </div>
                             </section>
                             <section class="object-preset-family" aria-labelledby="planet-preset-title">
                                 <div class="object-preset-heading">
-                                    <strong id="planet-preset-title">Planetas</strong>
-                                    <span>detalle natural o expresivo</span>
+                                    <strong id="planet-preset-title" data-i18n="wavelets.object_lab.planets">Planetas</strong>
+                                    <span data-i18n="wavelets.object_lab.planets_hint">detalle natural o expresivo</span>
                                 </div>
                                 <div class="object-preset-grid">
-                                    <button type="button" data-object-preset="jupiter-natural"><span>Júpiter natural</span><small>Científico</small></button>
-                                    <button type="button" data-object-preset="saturn-rings"><span>Saturno y anillos</span><small>Científico</small></button>
-                                    <button type="button" data-object-preset="mars-detail"><span>Marte detallado</span><small>Científico</small></button>
-                                    <button type="button" data-object-preset="planet-cinematic"><span>Planetario expresivo</span><small>Creativo</small></button>
+                                    <button type="button" data-object-preset="jupiter-natural"><span data-i18n="wavelets.object_lab.presets.jupiter_natural">Júpiter natural</span><small data-i18n="wavelets.object_lab.intent_scientific">Científico</small></button>
+                                    <button type="button" data-object-preset="saturn-rings"><span data-i18n="wavelets.object_lab.presets.saturn_rings">Saturno y anillos</span><small data-i18n="wavelets.object_lab.intent_scientific">Científico</small></button>
+                                    <button type="button" data-object-preset="mars-detail"><span data-i18n="wavelets.object_lab.presets.mars_detail">Marte detallado</span><small data-i18n="wavelets.object_lab.intent_scientific">Científico</small></button>
+                                    <button type="button" data-object-preset="planet-cinematic"><span data-i18n="wavelets.object_lab.presets.planet_cinematic">Planetario expresivo</span><small data-i18n="wavelets.object_lab.intent_creative">Creativo</small></button>
                                 </div>
                             </section>
                             <div id="object-finishing-status" class="module-status" data-state="idle" aria-live="polite">
-                                Elige una receta para ver qué módulos activa.
+                                <span data-i18n="wavelets.object_lab.status_idle">Elige una receta para ver qué módulos activa.</span>
                             </div>
                         </details>
 
@@ -4197,27 +4223,29 @@
                 <div class="view-label result-view-label">
                     <span class="result-view-title" data-i18n="viewer.processed_result">Resultado Procesado</span>
                     <div class="result-history-toolbar" role="toolbar" aria-label="Historial y comparación">
-                        <button id="btn-post-undo" type="button" disabled title="Deshacer" aria-label="Deshacer">
+                        <button id="btn-post-undo" type="button" disabled title="Deshacer" aria-label="Deshacer"
+                            data-i18n-title="wavelets.history.undo">
                             <svg class="zas-icon"><use href="#icon-undo"></use></svg>
                         </button>
-                        <button id="btn-post-redo" type="button" disabled title="Rehacer" aria-label="Rehacer">
+                        <button id="btn-post-redo" type="button" disabled title="Rehacer" aria-label="Rehacer"
+                            data-i18n-title="wavelets.history.redo">
                             <svg class="zas-icon"><use href="#icon-redo"></use></svg>
                         </button>
                         <button id="btn-post-compare" type="button" disabled aria-pressed="false" title="Activar comparación A/B">
                             <svg class="zas-icon"><use href="#icon-compare"></use></svg><span>A/B</span>
                         </button>
                         <label class="compare-reference-control" for="post-compare-reference">
-                            <span>Comparar A con</span>
+                            <span data-i18n="wavelets.history.compare_a_with">Comparar A con</span>
                             <select id="post-compare-reference" disabled aria-label="Referencia de comparación" title="Referencia A">
-                                <option value="previous">Paso anterior</option>
-                                <option value="source">Apilado original</option>
+                                <option value="previous" data-i18n="wavelets.history.previous">Paso anterior</option>
+                                <option value="source" data-i18n="wavelets.history.source">Apilado original</option>
                             </select>
                         </label>
                         <label id="post-compare-split-wrap" class="compare-split-wrap" hidden>
-                            <span>Corte A/B</span>
+                            <span data-i18n="wavelets.history.split">Corte A/B</span>
                             <input id="post-compare-split" type="range" min="0" max="100" value="50" aria-label="Posición de división A/B">
                         </label>
-                        <span id="post-history-state" class="post-history-state">Original</span>
+                        <span id="post-history-state" class="post-history-state" data-i18n="wavelets.history.original">Original</span>
                     </div>
                     <button id="btn-toggle-source" class="result-source-toggle"
                         style="display:none;" data-i18n="viewer.hide_source">Ocultar
@@ -4245,10 +4273,10 @@
                         <img id="img-result" alt="">
                         <div id="post-compare-layer" class="post-compare-layer" hidden aria-hidden="true">
                             <img id="img-result-before" alt="Referencia A">
-                            <span id="post-compare-label-a" class="compare-label compare-label-a">A · Anterior</span>
+                            <span id="post-compare-label-a" class="compare-label compare-label-a" data-i18n="wavelets.history.label_previous">A · Anterior</span>
                             <span class="compare-divider"></span>
                         </div>
-                        <span id="post-compare-label-b" class="compare-label compare-label-b" hidden>B · Actual</span>
+                        <span id="post-compare-label-b" class="compare-label compare-label-b" hidden data-i18n="wavelets.history.label_current">B · Actual</span>
                         <div id="crop-box">
                             <div class="crop-grid-v v1"></div>
                             <div class="crop-grid-v v2"></div>

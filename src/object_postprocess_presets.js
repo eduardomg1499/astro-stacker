@@ -1,3 +1,9 @@
+import {
+  clampAdaptive,
+  normalizeAdaptivePostprocessAnalysis,
+  roundAdaptive,
+} from "./adaptive_postprocess.js";
+
 const LINEAR_CURVE = Object.freeze([[0, 0], [1, 1]]);
 
 /**
@@ -180,6 +186,138 @@ export function cloneObjectFinishingPreset(name) {
   return typeof structuredClone === "function"
     ? structuredClone(preset)
     : JSON.parse(JSON.stringify(preset));
+}
+
+function scaledBands(values = [], amount = 1) {
+  return values.map((value) => roundAdaptive(
+    clampAdaptive(Number(value || 0) * amount, 0, 18),
+    2,
+  ));
+}
+
+/**
+ * Adapts a visible starting recipe to the actual 16-bit master. The base
+ * preset still describes intent; the measured profile only reduces risky
+ * detail/color and raises protection when the source has clipping, noise or
+ * ringing. This keeps the result predictable and fully editable.
+ */
+export function adaptObjectFinishingPreset(name, input = {}) {
+  const preset = cloneObjectFinishingPreset(name);
+  if (!preset) return null;
+  const analysis = normalizeAdaptivePostprocessAnalysis(input);
+  const pipeline = preset.pipeline;
+  const creativePenalty = preset.intent === "creative" ? 0.05 : 0;
+  const detailScale = clampAdaptive(
+    analysis.detailConfidence - creativePenalty,
+    0.44,
+    1,
+  );
+  const deconvScale = clampAdaptive(
+    detailScale - analysis.ringing * 0.12,
+    0.48,
+    1,
+  );
+  const noiseBoost = analysis.noiseStress * 9 + analysis.ringing * 3;
+  const highlightGuard = analysis.highlightStress;
+
+  pipeline.w = scaledBands(pipeline.w, detailScale);
+  pipeline.d = (pipeline.d || []).map((value, index) => roundAdaptive(
+    clampAdaptive(
+      Number(value || 0) + noiseBoost * (1 - index / Math.max(1, pipeline.d.length)),
+      0,
+      18,
+    ),
+    2,
+  ));
+  pipeline.deconv = {
+    ...pipeline.deconv,
+    s: roundAdaptive(
+      clampAdaptive(
+        Number(pipeline.deconv?.s || 0) * (1 + analysis.noiseStress * 0.06),
+        0,
+        3,
+      ),
+      2,
+    ),
+    i: Math.max(
+      pipeline.deconv?.i > 0 ? 4 : 0,
+      Math.round(Number(pipeline.deconv?.i || 0) * deconvScale),
+    ),
+    vi: Math.round(
+      Number(pipeline.deconv?.vi || 0)
+        * clampAdaptive(deconvScale - analysis.ringing * 0.22, 0, 1),
+    ),
+  };
+  pipeline.edgeAwareStrength = Math.round(clampAdaptive(
+    Number(pipeline.edgeAwareStrength || 50)
+      + analysis.ringing * 14
+      + highlightGuard * 6,
+    0,
+    100,
+  ));
+  pipeline.autoMask = Math.round(clampAdaptive(
+    Math.max(
+      Number(pipeline.autoMask || 0),
+      46 + analysis.noiseStress * 34 + analysis.ringing * 18,
+    ),
+    0,
+    100,
+  ));
+  pipeline.masterDenoise = roundAdaptive(clampAdaptive(
+    Math.max(
+      Number(pipeline.masterDenoise || 0),
+      analysis.noiseStress * 16,
+    ),
+    0,
+    24,
+  ), 1);
+  pipeline.blend = Math.round(clampAdaptive(
+    Number(pipeline.blend ?? 100)
+      - analysis.ringing * 12
+      - analysis.noiseStress * 5,
+    68,
+    100,
+  ));
+
+  const advanced = pipeline.advanced || {};
+  advanced.texture = roundAdaptive(
+    Number(advanced.texture || 0) * detailScale,
+    3,
+  );
+  advanced.clarity = roundAdaptive(
+    Number(advanced.clarity || 0)
+      * clampAdaptive(detailScale - analysis.ringing * 0.12, 0.35, 1),
+    3,
+  );
+  if (highlightGuard > 0.02) {
+    advanced.highlights = roundAdaptive(Math.min(
+      Number(advanced.highlights || 0),
+      -0.1 - highlightGuard * 0.22,
+    ), 3);
+    advanced.whites = roundAdaptive(Math.min(
+      Number(advanced.whites || 0),
+      -0.04 - highlightGuard * 0.12,
+    ), 3);
+  }
+  if (preset.intent === "creative" && analysis.noiseStress + highlightGuard > 0.2) {
+    const colorScale = clampAdaptive(
+      1 - analysis.noiseStress * 0.28 - highlightGuard * 0.24,
+      0.58,
+      1,
+    );
+    advanced.vibrance = roundAdaptive(Number(advanced.vibrance || 0) * colorScale, 3);
+    if (Array.isArray(advanced.hslSaturation)) {
+      advanced.hslSaturation = advanced.hslSaturation
+        .map((value) => roundAdaptive(Number(value || 0) * colorScale, 3));
+    }
+  }
+  pipeline.advanced = advanced;
+  preset.adaptation = {
+    ...analysis,
+    detailScale: roundAdaptive(detailScale, 2),
+    deconvScale: roundAdaptive(deconvScale, 2),
+  };
+  return preset;
 }
 
 export function objectPresetApplicable(preset, { isMono = false } = {}) {
