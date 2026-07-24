@@ -401,14 +401,50 @@ function appendSpriteIcon(button, iconId) {
   button.append(svg);
 }
 
+function guideTranslationValues(context = {}) {
+  const low = Math.round(Number(context.percentileLow || 0) * 65535);
+  const high = Math.round(Number(context.percentileHigh || 1) * 65535);
+  return {
+    itemCount: Number(context.itemCount || 0),
+    completedItems: Number(context.completedItems || 0),
+    shadow: (Number(context.shadowClip || 0) * 100).toFixed(2),
+    highlight: (Number(context.highlightClip || 0) * 100).toFixed(2),
+    ringing: Number(context.ringingScore || 0).toFixed(1),
+    fringe: Number(context.colorFringeScore || 0).toFixed(1),
+    low: low.toLocaleString(),
+    high: high.toLocaleString(),
+    ev: Number(context.recommendedExposureEv || 0).toFixed(2),
+    median: (Number(context.medianLevel || 0) * 100).toFixed(1),
+    range: Math.round(Number(context.robustDynamicRange || 0) * 100),
+  };
+}
+
+function guideRuleTranslationKey(suggestion, field, context) {
+  if (suggestion.id === "deepsky-step") {
+    const step = Math.max(0, Math.min(3, Number(context.workflowStep) || 0));
+    const blocked = step === 3 && context.stage === "blocked" ? "_blocked" : "";
+    return `assistant.rules.${suggestion.id}.${field}_${step}${blocked}`;
+  }
+  if (suggestion.id === "object-finishing-start") {
+    const variant = context.targetCategory === "surface" ? "surface" : "planet";
+    return `assistant.rules.${suggestion.id}.${field}_${variant}`;
+  }
+  if (suggestion.id === "result-ready") {
+    const variant = Number(context.historyLength || 0) > 1 ? "continue" : "start";
+    return `assistant.rules.${suggestion.id}.${field}_${variant}`;
+  }
+  return `assistant.rules.${suggestion.id}.${field}`;
+}
+
 export class IntelligentAssistant {
-  constructor({ panel, list, status, summary, onNavigate, onApply } = {}) {
+  constructor({ panel, list, status, summary, onNavigate, onApply, translate } = {}) {
     this.panel = panel || null;
     this.list = list || null;
     this.status = status || null;
     this.summary = summary || null;
     this.onNavigate = onNavigate || (() => {});
     this.onApply = onApply || (() => {});
+    this.translate = translate || ((key, fallback) => fallback || key);
     this.context = {};
     this.generation = null;
     this.dismissedIds = new Set();
@@ -424,7 +460,20 @@ export class IntelligentAssistant {
   update(context = {}) {
     this.resetForGeneration(context.generation ?? this.generation);
     this.context = { ...this.context, ...context };
-    const suggestions = evaluateGuide(this.context, DEFAULT_RULES, this.dismissedIds);
+    const suggestions = evaluateGuide(this.context, DEFAULT_RULES, this.dismissedIds)
+      .map((suggestion) => {
+        const values = guideTranslationValues(this.context);
+        const localized = { ...suggestion };
+        for (const field of ["title", "message", "actionLabel", "applyLabel"]) {
+          if (!suggestion[field]) continue;
+          localized[field] = this.translate(
+            guideRuleTranslationKey(suggestion, field, this.context),
+            suggestion[field],
+            values,
+          );
+        }
+        return localized;
+      });
     this.render(suggestions);
     return suggestions;
   }
@@ -438,19 +487,47 @@ export class IntelligentAssistant {
   render(suggestions) {
     if (this.status) {
       const warnings = suggestions.filter((item) => item.level === "warning").length;
-      this.status.textContent = warnings ? `Asistente · ${warnings} alerta${warnings === 1 ? "" : "s"}` : "Asistente inteligente";
+      this.status.textContent = warnings
+        ? this.translate(
+            warnings === 1 ? "assistant.status.alert_one" : "assistant.status.alert_many",
+            warnings === 1 ? "Asistente · 1 alerta" : `Asistente · ${warnings} alertas`,
+            { count: warnings },
+          )
+        : this.translate("assistant.name", "Asistente inteligente");
       this.status.dataset.level = warnings ? "warning" : "success";
     }
     if (this.summary) {
-      const flow = this.context.flow === "deepsky" ? "Cielo profundo"
-        : this.context.flow === "mosaic" || this.context.source === "mosaic" ? "Mosaico"
-          : this.context.flow === "batch" || this.context.source === "batch" ? "Lote"
-            : this.context.hasResult ? "Resultado individual" : "Preparación";
+      const flowKey = this.context.flow === "deepsky" ? "deepsky"
+        : this.context.flow === "mosaic" || this.context.source === "mosaic" ? "mosaic"
+          : this.context.flow === "batch" || this.context.source === "batch" ? "batch"
+            : this.context.hasResult ? "result" : "preparation";
+      const flow = this.translate(`assistant.flow.${flowKey}`, {
+        deepsky: "Cielo profundo",
+        mosaic: "Mosaico",
+        batch: "Lote",
+        result: "Resultado individual",
+        preparation: "Preparación",
+      }[flowKey]);
       const step = Number.isFinite(this.context.workflowStep)
-        ? ` · paso ${Number(this.context.workflowStep) + 1}/${Math.max(1, Number(this.context.workflowTotal) || 1)}`
+        ? this.translate(
+            "assistant.summary_step",
+            ` · paso ${Number(this.context.workflowStep) + 1}/${Math.max(1, Number(this.context.workflowTotal) || 1)}`,
+            {
+              current: Number(this.context.workflowStep) + 1,
+              total: Math.max(1, Number(this.context.workflowTotal) || 1),
+            },
+          )
         : "";
-      const precision = this.context.hasResult ? "16-bit" : "flujo guiado";
-      const recommendationCount = suggestions.length === 1 ? "1 recomendación" : `${suggestions.length} recomendaciones`;
+      const precision = this.context.hasResult
+        ? this.translate("assistant.precision.result", "16-bit")
+        : this.translate("assistant.precision.guided", "flujo guiado");
+      const recommendationCount = this.translate(
+        suggestions.length === 1
+          ? "assistant.recommendations.one"
+          : "assistant.recommendations.many",
+        suggestions.length === 1 ? "1 recomendación" : `${suggestions.length} recomendaciones`,
+        { count: suggestions.length },
+      );
       this.summary.textContent = `${flow}${step} · ${precision} · ${recommendationCount}`;
     }
     if (!this.list) return;
@@ -476,8 +553,12 @@ export class IntelligentAssistant {
         const dismiss = document.createElement("button");
         dismiss.type = "button";
         dismiss.className = "guide-dismiss-button";
-        dismiss.setAttribute("aria-label", `Descartar recomendación: ${suggestion.title}`);
-        dismiss.title = "Descartar para este apilado";
+        dismiss.setAttribute("aria-label", this.translate(
+          "assistant.dismiss_aria",
+          `Descartar recomendación: ${suggestion.title}`,
+          { title: suggestion.title },
+        ));
+        dismiss.title = this.translate("assistant.dismiss_title", "Descartar para este apilado");
         appendSpriteIcon(dismiss, "icon-cross");
         dismiss.addEventListener("click", () => this.dismiss(suggestion.id));
         article.append(dismiss);
@@ -489,7 +570,8 @@ export class IntelligentAssistant {
         const button = document.createElement("button");
         button.type = "button";
         button.className = "guide-go-button";
-        button.textContent = suggestion.actionLabel || "Ir al control";
+        button.textContent = suggestion.actionLabel
+          || this.translate("assistant.go_to_control", "Ir al control");
         button.addEventListener("click", () => this.onNavigate(suggestion.target, suggestion));
         actions.append(button);
       }
@@ -497,7 +579,8 @@ export class IntelligentAssistant {
         const apply = document.createElement("button");
         apply.type = "button";
         apply.className = "guide-apply-button";
-        apply.textContent = suggestion.applyLabel || "Aplicar recomendación";
+        apply.textContent = suggestion.applyLabel
+          || this.translate("assistant.apply_recommendation", "Aplicar recomendación");
         apply.addEventListener("click", async () => {
           apply.disabled = true;
           apply.setAttribute("aria-busy", "true");

@@ -1522,6 +1522,35 @@
         #deepsky-modal .ds-session-note svg { width:16px; height:16px; flex:0 0 auto; margin-top:2px; }
         #deepsky-modal .ds-session-note strong { display:block; color:#ccfbf1; margin-bottom:2px; }
         #deepsky-modal .ds-session-note span { color:#a7f3d0; }
+        #deepsky-modal .ds-source-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:9px; margin-bottom:12px; }
+        #deepsky-modal .ds-source-grid > .ds-source-wide { grid-column:1 / -1; }
+        #deepsky-modal .ds-source-kind { min-width:0; border:1px solid rgba(148,163,184,.12); border-radius:13px; padding:7px; background:rgba(15,23,42,.32); }
+        #deepsky-modal .ds-source-kind:has(details[open]) { grid-column:1 / -1; }
+        #deepsky-modal .ds-source-kind details { margin:6px 3px 1px; border-top:1px solid rgba(148,163,184,.12); padding-top:6px; }
+        #deepsky-modal .ds-source-kind details[hidden] { display:none; }
+        #deepsky-modal .ds-source-kind summary { cursor:pointer; color:#7dd3fc; font-size:.63rem; font-weight:700; letter-spacing:.04em; list-style:none; }
+        #deepsky-modal .ds-source-kind summary::-webkit-details-marker { display:none; }
+        #deepsky-modal .ds-source-kind summary::before { content:"▸"; display:inline-block; margin-right:6px; color:#a78bfa; transition:transform .15s ease; }
+        #deepsky-modal .ds-source-kind details[open] summary::before { transform:rotate(90deg); }
+        #deepsky-modal .ds-session-organizer { margin:12px 0 14px; padding:12px; border:1px solid rgba(56,189,248,.2); border-radius:14px; background:linear-gradient(145deg,rgba(14,165,233,.06),rgba(124,58,237,.045)); text-align:left; }
+        #deepsky-modal .ds-session-organizer[hidden] { display:none; }
+        #deepsky-modal .ds-session-organizer-head { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; margin-bottom:10px; }
+        #deepsky-modal .ds-session-organizer-head > div { display:flex; flex-direction:column; gap:2px; }
+        #deepsky-modal .ds-session-organizer-head strong { color:#e2e8f0; font-size:.82rem; }
+        #deepsky-modal .ds-session-organizer-head span { color:#94a3b8; font-size:.67rem; line-height:1.4; }
+        #deepsky-modal .ds-session-summary { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
+        #deepsky-modal .ds-session-summary b { padding:4px 8px; border:1px solid rgba(125,211,252,.22); border-radius:999px; color:#7dd3fc; font-size:.62rem; white-space:nowrap; }
+        #deepsky-modal .ds-night-list { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+        #deepsky-modal .ds-night-card { min-width:0; padding:10px; border:1px solid rgba(148,163,184,.15); border-radius:11px; background:rgba(2,6,23,.42); }
+        #deepsky-modal .ds-night-head { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
+        #deepsky-modal .ds-night-head strong { color:#c4b5fd; font-size:.75rem; }
+        #deepsky-modal .ds-night-head span { color:#94a3b8; font-size:.62rem; white-space:nowrap; }
+        #deepsky-modal .ds-night-groups { display:flex; gap:5px; flex-wrap:wrap; margin:7px 0; }
+        #deepsky-modal .ds-night-groups span { padding:3px 6px; border-radius:999px; background:rgba(99,102,241,.1); color:#a5b4fc; font-size:.58rem; }
+        #deepsky-modal .ds-calibration-rail { display:grid; grid-template-columns:1fr 1fr; gap:5px; }
+        #deepsky-modal .ds-calibration-chip { min-width:0; padding:5px 7px; border-radius:8px; border:1px solid rgba(148,163,184,.14); color:#94a3b8; font-size:.59rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        #deepsky-modal .ds-calibration-chip.confirmed { color:#6ee7b7; border-color:rgba(52,211,153,.28); background:rgba(6,95,70,.09); }
+        #deepsky-modal .ds-calibration-chip.pending { color:#fcd34d; border-color:rgba(251,191,36,.22); background:rgba(120,53,15,.08); }
         #deepsky-modal .ds-multiband-card { margin:0 0 12px; padding:13px 15px; border:1px solid rgba(45,212,191,.26); border-radius:13px; background:rgba(13,148,136,.06); }
         #deepsky-modal .ds-multiband-card > label { display:flex; gap:10px; align-items:flex-start; color:#e2e8f0; font-size:.76rem; font-weight:700; }
         #deepsky-modal .ds-multiband-card small { display:block; margin:4px 0 11px 32px; color:#94a3b8; font-size:.7rem; line-height:1.45; }
@@ -1565,6 +1594,7 @@
         @media (max-width: 760px) {
             #deepsky-modal .ds-opts { grid-template-columns: 1fr; }
             #deepsky-modal .ds-multiband-grid, #deepsky-modal .ds-session-groups { grid-template-columns:1fr; }
+            #deepsky-modal .ds-source-grid, #deepsky-modal .ds-night-list { grid-template-columns:1fr; }
         }
         @media (max-width: 1050px), (max-height: 740px) {
             #deepsky-modal .ds-wizard-box { height: 94vh; }
@@ -1579,7 +1609,8 @@
         role="dialog" aria-modal="true" aria-labelledby="deepsky-dialog-title">
         <div class="donation-modal-box ds-wizard-box">
             <div class="donation-glow donation-glow-pink" style="background:rgba(124,58,237,0.35);"></div>
-            <button id="btn-deepsky-close" class="donation-close-btn" type="button" aria-label="Cerrar">
+            <button id="btn-deepsky-close" class="donation-close-btn" type="button" aria-label="Cerrar"
+                data-i18n-aria-label="deepsky.close">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"
                     stroke-linecap="round" stroke-linejoin="round">
                     <path d="M18 6 6 18"></path>
@@ -1594,24 +1625,25 @@
                     <h2 id="deepsky-dialog-title" data-i18n="deepsky.title">Apilado de Cielo Profundo</h2>
                     <p data-i18n="deepsky.hint">Selecciona tus lights y (opcional) calibración. Referencia, alineación por
                         estrellas, rechazo de satélites y estiramiento: automáticos.</p>
-                    <nav class="ds-wizard-steps" aria-label="Etapas del apilado">
-                        <button type="button" class="ds-wizard-step active" data-step="0" aria-current="step"><span class="ds-step-n">1</span><span>Datos</span></button>
-                        <button type="button" class="ds-wizard-step" data-step="1"><span class="ds-step-n">2</span><span>Inspección de tomas</span></button>
-                        <button type="button" class="ds-wizard-step" data-step="2"><span class="ds-step-n">3</span><span>Receta</span></button>
-                        <button type="button" class="ds-wizard-step" data-step="3"><span class="ds-step-n">4</span><span>Revisar y apilar</span></button>
+                    <nav class="ds-wizard-steps" aria-label="Etapas del apilado"
+                        data-i18n-aria-label="deepsky.steps_aria">
+                        <button type="button" class="ds-wizard-step active" data-step="0" aria-current="step"><span class="ds-step-n">1</span><span data-i18n="deepsky.step_data">Datos</span></button>
+                        <button type="button" class="ds-wizard-step" data-step="1"><span class="ds-step-n">2</span><span data-i18n="deepsky.step_inspect">Inspección de tomas</span></button>
+                        <button type="button" class="ds-wizard-step" data-step="2"><span class="ds-step-n">3</span><span data-i18n="deepsky.step_recipe">Receta</span></button>
+                        <button type="button" class="ds-wizard-step" data-step="3"><span class="ds-step-n">4</span><span data-i18n="deepsky.step_review">Revisar y apilar</span></button>
                     </nav>
                 </header>
                 <aside id="ds-step-assistant" class="ds-step-assistant" data-state="active" aria-live="polite">
                     <svg class="zas-icon" aria-hidden="true"><use href="#icon-star"></use></svg>
                     <div>
-                        <strong>Asistente inteligente</strong>
-                        <span id="ds-step-assistant-text">Añade lights; las calibraciones son opcionales. Zenith agrupará firmas compatibles.</span>
+                        <strong data-i18n="deepsky.step_assistant_title">Asistente inteligente</strong>
+                        <span id="ds-step-assistant-text" data-i18n="deepsky.step_assistant_0">Añade lights; las calibraciones son opcionales. Zenith agrupará firmas compatibles.</span>
                     </div>
                     <span id="ds-step-assistant-progress" class="ds-assistant-progress">1 / 4</span>
                 </aside>
                 <div class="ds-wizard-scroll" id="ds-wizard-scroll">
-                <section class="ds-wizard-page active" data-step="0" aria-label="Datos">
-                    <div class="ds-page-intro"><div><strong>Datos de la sesión</strong><span>Añade lights y calibraciones. Zenith agrupa por geometría, Bayer, filtro, exposición, ganancia, binning y temperatura.</span></div></div>
+                <section class="ds-wizard-page active" data-step="0" aria-label="Datos" data-i18n-aria-label="deepsky.step_data">
+                    <div class="ds-page-intro"><div><strong data-i18n="deepsky.data_title">Datos de la sesión</strong><span data-i18n="deepsky.data_intro">Añade lights y calibraciones. Zenith agrupa por geometría, Bayer, filtro, exposición, ganancia, binning y temperatura.</span></div></div>
 
                 <!-- PALABRAS CLAVE (agrupación estilo WBPP) -->
                 <div style="margin:0 0 12px; padding:8px 10px; background:rgba(56,189,248,0.05); border:1px solid rgba(56,189,248,0.14); border-radius:12px; text-align:left;">
@@ -1620,6 +1652,7 @@
                         <span style="font-size:0.68rem; color:#7dd3fc; font-weight:600; letter-spacing:0.03em;" data-i18n="deepsky.keywords_label">Palabras clave (opcional, separadas por coma)</span>
                     </label>
                     <input type="text" id="ds-keywords" placeholder="300s, 180s, Ha, ISO800..."
+                        data-i18n-placeholder="deepsky.keywords_placeholder"
                         style="width:100%; background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:8px; font-size:0.72rem; padding:6px 9px; outline:none;">
                     <div id="ds-group-chips" style="display:none; gap:6px; margin-top:8px; flex-wrap:wrap;"></div>
                 </div>
@@ -1629,22 +1662,23 @@
                     <svg class="zas-icon zas-icon-inline" style="color:#7c3aed;"><use href="#icon-grip"></use></svg>
                     <span data-i18n="deepsky.drag_hint">Arrastra un archivo a otra categoría para reclasificarlo · ✕ para quitarlo</span>
                 </div>
-                <div class="donation-options" id="ds-sections" style="margin-bottom:12px; gap:10px;"></div>
+                <div class="donation-options ds-source-grid" id="ds-sections"></div>
+                <section id="ds-session-organizer" class="ds-session-organizer" hidden aria-live="polite"></section>
                 </section>
 
                 <!-- RESUMEN DE EMPAREJAMIENTO -->
-                <section class="ds-wizard-page" data-step="1" aria-label="Inspección de tomas">
-                <div class="ds-page-intro"><div><strong>Inspección y compatibilidad</strong><span>Revisa agrupación, calibraciones aplicables, incompatibilidades y advertencias antes de elegir la receta.</span></div></div>
+                <section class="ds-wizard-page" data-step="1" aria-label="Inspección de tomas" data-i18n-aria-label="deepsky.step_inspect">
+                <div class="ds-page-intro"><div><strong data-i18n="deepsky.inspect_title">Inspección y compatibilidad</strong><span data-i18n="deepsky.inspect_intro">Revisa agrupación, calibraciones aplicables, incompatibilidades y advertencias antes de elegir la receta.</span></div></div>
                 <div id="ds-match-summary"
                     style="display:none; font-size:0.68rem; color:#cbd5e1; background:rgba(16,185,129,0.05); border:1px solid rgba(16,185,129,0.15); border-radius:12px; padding:8px 12px; margin-bottom:12px; line-height:1.55; text-align:left;">
                 </div>
-                <div id="ds-preflight-inspection" class="ds-preflight" data-state="idle">Añade lights para preparar el plan.</div>
-                <div id="ds-frame-inspection" class="ds-preflight" data-state="idle" aria-live="polite">La inspección PSF se ejecutará al entrar en este paso.</div>
+                <div id="ds-preflight-inspection" class="ds-preflight" data-state="idle" data-i18n="deepsky.preflight_empty">Añade lights para preparar el plan.</div>
+                <div id="ds-frame-inspection" class="ds-preflight" data-state="idle" aria-live="polite" data-i18n="deepsky.psf_pending">La inspección PSF se ejecutará al entrar en este paso.</div>
                 </section>
 
                 <!-- PRESETS (estilo WBPP) -->
-                <section class="ds-wizard-page" data-step="2" aria-label="Receta">
-                <div class="ds-page-intro"><div><strong>Receta de integración</strong><span>Elige un perfil recomendado. Abre las opciones avanzadas sólo cuando necesites controlar cada etapa.</span></div></div>
+                <section class="ds-wizard-page" data-step="2" aria-label="Receta" data-i18n-aria-label="deepsky.step_recipe">
+                <div class="ds-page-intro"><div><strong data-i18n="deepsky.recipe_title">Receta de integración</strong><span data-i18n="deepsky.recipe_intro">Elige un perfil recomendado. Abre las opciones avanzadas sólo cuando necesites controlar cada etapa.</span></div></div>
                 <div class="ds-presets">
                     <span class="ds-presets-label" data-i18n="deepsky.preset_label">Preset</span>
                     <div class="ds-preset-btns">
@@ -1657,35 +1691,35 @@
                 </div>
                 <div class="ds-profile-help">
                     <div class="ds-profile-note"><b>Auto</b><span data-i18n="deepsky.profile_auto_note">Mide tus datos (nº de lights, filtro, dithering, gradiente, fondo) y fija la receta óptima; cada decisión y su motivo quedan visibles en el plan.</span></div>
-                    <div class="ds-profile-note"><b>Rápido</b>Bilineal, normalización aditiva y una pasada sigma.</div>
-                    <div class="ds-profile-note"><b>Equilibrado</b>Lanczos-3, escala robusta y rechazo Winsorized.</div>
-                    <div class="ds-profile-note"><b>Máxima calidad</b>Winsorized y normalización local; exige más RAM/CPU.</div>
+                    <div class="ds-profile-note"><b data-i18n="deepsky.preset_fast">Rápido</b><span data-i18n="deepsky.profile_fast_note">Bilineal, normalización aditiva y una pasada sigma.</span></div>
+                    <div class="ds-profile-note"><b data-i18n="deepsky.preset_balanced">Equilibrado</b><span data-i18n="deepsky.profile_balanced_note">Lanczos-3, escala robusta y rechazo Winsorized.</span></div>
+                    <div class="ds-profile-note"><b data-i18n="deepsky.preset_max">Máxima calidad</b><span data-i18n="deepsky.profile_max_note">Winsorized y normalización local; exige más RAM/CPU.</span></div>
                 </div>
 
                 <div id="ds-multiband-options" class="ds-multiband-card" hidden>
                     <label>
                         <span class="switch" style="transform:scale(.76);transform-origin:top left;"><input type="checkbox" id="chk-ds-multiband-session" checked><span class="slider round"></span></span>
-                        <span>Procesar todos los filtros en una sesión multibanda</span>
+                        <span data-i18n="deepsky.multiband_enable">Procesar todos los filtros en una sesión multibanda</span>
                     </label>
-                    <small id="ds-multiband-summary">Zenith separará cada integración y conservará una receta común.</small>
+                    <small id="ds-multiband-summary" data-i18n="deepsky.multiband_summary">Zenith separará cada integración y conservará una receta común.</small>
                     <div class="ds-multiband-grid">
-                        <label>Extracción de OIII
+                        <label><span data-i18n="deepsky.oiii_extraction">Extracción de OIII</span>
                             <select id="sel-ds-oiii-mix" class="ds-sel">
                                 <option value="0.5">G 50% · B 50%</option>
-                                <option value="0.65" selected>G 65% · B 35% (recomendado)</option>
+                                <option value="0.65" selected data-i18n="deepsky.oiii_recommended">G 65% · B 35% (recomendado)</option>
                                 <option value="0.75">G 75% · B 25%</option>
                             </select>
                         </label>
-                        <label>Contaminación entre bandas
+                        <label><span data-i18n="deepsky.crosstalk">Contaminación entre bandas</span>
                             <select id="sel-ds-crosstalk" class="ds-sel">
-                                <option value="0" selected>Off · conservar señal lineal</option>
-                                <option value="0.1">Suave · 10%</option>
-                                <option value="0.2">Media · 20%</option>
+                                <option value="0" selected data-i18n="deepsky.crosstalk_off">Off · conservar señal lineal</option>
+                                <option value="0.1" data-i18n="deepsky.crosstalk_soft">Suave · 10%</option>
+                                <option value="0.2" data-i18n="deepsky.crosstalk_medium">Media · 20%</option>
                             </select>
                         </label>
-                        <label>Paleta sugerida
+                        <label><span data-i18n="deepsky.palette_suggested">Paleta sugerida</span>
                             <select id="sel-ds-session-palette" class="ds-sel">
-                                <option value="none">Sólo masters científicos</option>
+                                <option value="none" data-i18n="deepsky.palette_scientific">Sólo masters científicos</option>
                                 <option value="sho" selected>SHO · SII / Ha / OIII</option>
                                 <option value="hoo">HOO · Ha / OIII</option>
                             </select>
@@ -1695,7 +1729,7 @@
 
                 <!-- OPCIONES (grupos etiquetados estilo WBPP) -->
                 <details class="ds-advanced" id="ds-advanced-options">
-                    <summary>Opciones avanzadas · registro, rechazo, normalización, memoria y motor</summary>
+                    <summary data-i18n="deepsky.advanced_summary">Opciones avanzadas · registro, rechazo, normalización, memoria y motor</summary>
                 <div class="ds-opts">
                     <!-- CALIBRACIÓN -->
                     <div class="ds-og">
@@ -1896,12 +1930,12 @@
                             <span class="switch"><input type="checkbox" id="chk-ds-gradient"><span class="slider round"></span></span>
                         </label>
                         <label class="ds-row" title="Auto/Hybrid permiten fallback CPU seguro. GPU only cancela si una etapa no tiene paridad o recursos suficientes.">
-                            <span>Motor de cómputo</span>
+                            <span data-i18n="deepsky.compute_engine">Motor de cómputo</span>
                             <select id="sel-ds-compute" class="ds-sel">
                                 <option value="hybrid" selected>Hybrid v2 (experimental)</option>
-                                <option value="auto">Auto (tras validación)</option>
-                                <option value="cpu_only">Sólo CPU</option>
-                                <option value="gpu_only">Sólo GPU</option>
+                                <option value="auto" data-i18n="deepsky.compute_auto">Auto (tras validación)</option>
+                                <option value="cpu_only" data-i18n="deepsky.compute_cpu">Sólo CPU</option>
+                                <option value="gpu_only" data-i18n="deepsky.compute_gpu">Sólo GPU</option>
                             </select>
                         </label>
                     </div>
@@ -1910,17 +1944,17 @@
                 </section>
 
                 <!-- DIAGRAMA DE PROCESO + DATOS TÉCNICOS + TIEMPO ESTIMADO -->
-                <section class="ds-wizard-page" data-step="3" aria-label="Revisar y apilar">
-                <div class="ds-page-intro"><div><strong>Plan final</strong><span>Confirma grupos, método efectivo, CPU/GPU por etapa y presupuesto estimado. Los fallbacks se muestran antes de iniciar.</span></div></div>
-                <div id="ds-preflight-review" class="ds-preflight" data-state="idle">Preparando plan reproducible…</div>
+                <section class="ds-wizard-page" data-step="3" aria-label="Revisar y apilar" data-i18n-aria-label="deepsky.step_review">
+                <div class="ds-page-intro"><div><strong data-i18n="deepsky.review_title">Plan final</strong><span data-i18n="deepsky.review_intro">Confirma grupos, método efectivo, CPU/GPU por etapa y presupuesto estimado. Los fallbacks se muestran antes de iniciar.</span></div></div>
+                <div id="ds-preflight-review" class="ds-preflight" data-state="idle" data-i18n="deepsky.preparing_plan">Preparando plan reproducible…</div>
                 <div id="ds-diagram" class="ds-diagram" style="display:none;"></div>
                 <div id="ds-session-quality" class="ds-quality-panel" hidden aria-live="polite"></div>
                 </section>
                 </div>
 
                 <footer class="ds-wizard-footer">
-                <button id="btn-deepsky-prev" type="button">← Anterior</button>
-                <span id="ds-wizard-status" class="ds-footer-status" aria-live="polite">Paso 1 de 4 · selecciona los datos</span>
+                <button id="btn-deepsky-prev" type="button" data-i18n="deepsky.previous">← Anterior</button>
+                <span id="ds-wizard-status" class="ds-footer-status" aria-live="polite" data-i18n="deepsky.footer_step_0">Paso 1 de 4 · selecciona los datos</span>
                 <button id="btn-deepsky-run" class="primary"
                     style="background:linear-gradient(135deg,#7c3aed,#db2777); font-size:0.85rem; padding:10px 16px; display:none; align-items:center; justify-content:center; gap:8px; border-radius:12px;">
                     <svg class="zas-icon" style="width:15px; height:15px;"><use href="#icon-lightning"></use></svg>
@@ -1931,7 +1965,7 @@
                     <svg class="zas-icon" style="width:14px; height:14px;"><use href="#icon-galaxy"></use></svg>
                     <span data-i18n="deepsky.combine_open">Combinar canales (LRGB / SHO)</span>
                 </button>
-                <button id="btn-deepsky-next" type="button">Siguiente →</button>
+                <button id="btn-deepsky-next" type="button" data-i18n="deepsky.next">Siguiente →</button>
                 </footer>
             </div>
         </div>
@@ -2699,7 +2733,7 @@
                         </svg> <span data-i18n="general.deepsky_mode">Apilado Cielo Profundo</span></button>
                     <button id="btn-analyze-fits" class="primary"
                         style="background: linear-gradient(135deg, #0ea5e9, #2563eb); margin-top: 5px; opacity: 0.5; cursor: not-allowed;"
-                        disabled><svg class="zas-icon">
+                        disabled data-i18n="general.add_fits_sequence"><svg class="zas-icon">
                             <use href="#icon-sequence"></use>
                         </svg> Añadir Secuencia FITS/TIF</button>
                     <button id="btn-batch-mode" class="primary"
@@ -4297,65 +4331,69 @@
         </div>
     </div>
 
-    <aside id="zenith-guide-panel" aria-label="Asistente inteligente" aria-hidden="true">
+    <aside id="zenith-guide-panel" aria-label="Asistente inteligente" aria-hidden="true"
+        data-i18n-aria-label="assistant.name">
         <div class="guide-panel-header">
             <div>
-                <span class="guide-kicker">ASISTENTE PERSONAL · LOCAL 16-BIT</span>
-                <h3>Asistente inteligente</h3>
+                <span class="guide-kicker" data-i18n="assistant.kicker">ASISTENTE PERSONAL · LOCAL 16-BIT</span>
+                <h3 data-i18n="assistant.name">Asistente inteligente</h3>
             </div>
-            <button id="btn-close-guide" class="floating-panel-close" type="button" aria-label="Cerrar asistente">
+            <button id="btn-close-guide" class="floating-panel-close" type="button" aria-label="Cerrar asistente"
+                data-i18n-aria-label="assistant.close">
                 <svg class="zas-icon"><use href="#icon-cross"></use></svg>
             </button>
         </div>
-        <div id="intelligent-assistant-summary" class="assistant-summary">Preparación · sin resultado</div>
+        <div id="intelligent-assistant-summary" class="assistant-summary" data-i18n="assistant.initial_summary">Preparación · sin resultado</div>
         <button id="btn-assistant-analyze" type="button" class="assistant-analyze-button">
             <svg class="zas-icon"><use href="#icon-chart"></use></svg>
-            <span id="assistant-primary-label">Ver siguiente paso</span>
+            <span id="assistant-primary-label" data-i18n="assistant.primary.next">Ver siguiente paso</span>
         </button>
         <div id="zenith-guide-list" class="guide-list"></div>
-        <p class="guide-privacy-note">Las recomendaciones se calculan localmente a partir del flujo, histograma, artefactos e historial activo.</p>
+        <p class="guide-privacy-note" data-i18n="assistant.privacy">Las recomendaciones se calculan localmente a partir del flujo, histograma, artefactos e historial activo.</p>
     </aside>
 
-    <aside id="post-scopes-panel" aria-label="Gráficas de postprocesado" aria-hidden="true">
+    <aside id="post-scopes-panel" aria-label="Gráficas de postprocesado" aria-hidden="true"
+        data-i18n-aria-label="assistant.scopes_aria">
         <div id="post-scopes-drag-handle" class="scopes-panel-header">
             <div>
-                <span class="guide-kicker">SCOPES 16-BIT</span>
-                <h3>Diagnóstico visual</h3>
-                <small class="floating-panel-drag-hint">Arrastra este encabezado para mover el panel</small>
+                <span class="guide-kicker" data-i18n="assistant.scopes_kicker">SCOPES 16-BIT</span>
+                <h3 data-i18n="assistant.scopes_title">Diagnóstico visual</h3>
+                <small class="floating-panel-drag-hint" data-i18n="assistant.scopes_drag">Arrastra este encabezado para mover el panel</small>
             </div>
-            <button id="btn-close-post-scopes" class="floating-panel-close" type="button" aria-label="Ocultar gráficas">
+            <button id="btn-close-post-scopes" class="floating-panel-close" type="button" aria-label="Ocultar gráficas"
+                data-i18n-aria-label="assistant.scopes_close">
                 <svg class="zas-icon"><use href="#icon-cross"></use></svg>
             </button>
         </div>
         <section class="scope-card">
-            <header><strong>Histograma RGB</strong><span id="floating-histogram-source">Master</span></header>
+            <header><strong data-i18n="assistant.histogram_rgb">Histograma RGB</strong><span id="floating-histogram-source">Master</span></header>
             <canvas id="post-histogram-floating" width="420" height="170"></canvas>
         </section>
         <section class="scope-card">
-            <header><strong>Curva tonal</strong><span>entrada → salida</span></header>
+            <header><strong data-i18n="assistant.tone_curve">Curva tonal</strong><span data-i18n="assistant.input_output">entrada → salida</span></header>
             <canvas id="post-tone-curve" width="420" height="170"></canvas>
         </section>
         <section class="scope-card">
-            <header><strong>Respuesta estimada de detalle</strong><span id="detail-response-summary">receta neutra</span></header>
+            <header><strong data-i18n="assistant.detail_response">Respuesta estimada de detalle</strong><span id="detail-response-summary" data-i18n="assistant.neutral_recipe">receta neutra</span></header>
             <canvas id="post-detail-curve" width="420" height="150"></canvas>
         </section>
         <div class="scope-health-strip" aria-live="polite">
-            <span id="scope-shadow-health">Sombras —</span>
-            <span id="scope-highlight-health">Luces —</span>
-            <span id="scope-render-health">Final 1:1</span>
+            <span id="scope-shadow-health" data-i18n="assistant.shadows_empty">Sombras —</span>
+            <span id="scope-highlight-health" data-i18n="assistant.highlights_empty">Luces —</span>
+            <span id="scope-render-health" data-i18n="assistant.final_1to1">Final 1:1</span>
         </div>
     </aside>
 
     <div id="console-panel" aria-hidden="true">
         <div class="console-header">
-            <div><span>REGISTRO DEL SISTEMA</span><small id="log-entry-count">0 eventos</small></div>
+            <div><span data-i18n="assistant.logs_title">REGISTRO DEL SISTEMA</span><small id="log-entry-count" data-i18n="assistant.logs_empty">0 eventos</small></div>
             <div class="console-actions">
-                <button id="btn-copy-logs" type="button">Copiar</button>
-                <button id="btn-clear-logs" type="button">Limpiar</button>
-                <button id="btn-close-logs" type="button" aria-label="Ocultar registro">×</button>
+                <button id="btn-copy-logs" type="button" data-i18n="assistant.logs_copy">Copiar</button>
+                <button id="btn-clear-logs" type="button" data-i18n="assistant.logs_clear">Limpiar</button>
+                <button id="btn-close-logs" type="button" aria-label="Ocultar registro" data-i18n-aria-label="assistant.logs_close">×</button>
             </div>
         </div>
-        <div class="log-table-header"><span>Hora</span><span>Nivel</span><span>Evento</span></div>
+        <div class="log-table-header"><span data-i18n="assistant.logs_time">Hora</span><span data-i18n="assistant.logs_level">Nivel</span><span data-i18n="assistant.logs_event">Evento</span></div>
         <div id="log-container" role="log" aria-live="polite"></div>
     </div>
 
@@ -4366,7 +4404,7 @@
                 <svg class="zas-icon"><use href="#icon-star"></use></svg>
                 <span id="zenith-guide-status">Asistente inteligente</span>
             </button>
-            <span id="status-text" style="color:var(--text-muted);">Listo.</span>
+            <span id="status-text" style="color:var(--text-muted);" data-i18n="general.status_ready">Listo.</span>
         </div>
         <div id="progress-container">
             <div id="progress-fill"></div>

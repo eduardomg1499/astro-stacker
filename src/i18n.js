@@ -151,6 +151,24 @@ export class I18nManager {
             }
         });
 
+        const ariaElements = document.querySelectorAll('[data-i18n-aria-label]');
+        ariaElements.forEach(el => {
+            const key = el.getAttribute('data-i18n-aria-label');
+            const translation = this.t(key);
+            if (translation && translation !== key) {
+                el.setAttribute('aria-label', translation);
+            }
+        });
+
+        const placeholderElements = document.querySelectorAll('[data-i18n-placeholder]');
+        placeholderElements.forEach(el => {
+            const key = el.getAttribute('data-i18n-placeholder');
+            const translation = this.t(key);
+            if (translation && translation !== key) {
+                el.setAttribute('placeholder', translation);
+            }
+        });
+
         this.updateDynamicElements();
     }
 

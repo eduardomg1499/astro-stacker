@@ -41,6 +41,23 @@ export function normalizeAdaptivePostprocessAnalysis(input = {}) {
   const denoiseNeed = clampAdaptive((Number(artifacts.suggestedDenoise) || 0) / 35);
   const ringing = clampAdaptive((Number(artifacts.ringingScore) || 0) / 18);
   const colorFringe = clampAdaptive((Number(artifacts.colorFringeScore) || 0) / 18);
+  const chromaSampledPixels = Math.max(0, Number(artifacts.chromaSampledPixels) || 0);
+  const meanSaturation = clampAdaptive(Number(artifacts.meanSaturation) || 0);
+  const p95Saturation = clampAdaptive(Number(artifacts.p95Saturation) || 0);
+  const chromaticFraction = clampAdaptive(Number(artifacts.chromaticFraction) || 0);
+  const chromaMeasured = !Boolean(histogram.isMono)
+    && chromaSampledPixels >= 64
+    && (
+      Number.isFinite(Number(artifacts.meanSaturation))
+      || Number.isFinite(Number(artifacts.p95Saturation))
+    );
+  const chromaEvidence = chromaMeasured
+    ? clampAdaptive(
+        clampAdaptive((meanSaturation - 0.004) / 0.08) * 0.35
+          + clampAdaptive((p95Saturation - 0.012) / 0.22) * 0.45
+          + clampAdaptive((chromaticFraction - 0.04) / 0.55) * 0.2,
+      )
+    : 0.45;
   const highlightStress = clampAdaptive(
     Math.max(
       highlightClip * 320,
@@ -54,6 +71,11 @@ export function normalizeAdaptivePostprocessAnalysis(input = {}) {
     ),
   );
   const noiseStress = clampAdaptive(Math.max(denoiseNeed, defectRate * 900));
+  const chromaStress = clampAdaptive(
+    colorFringe * 0.45
+      + noiseStress * 0.4
+      + clampAdaptive((p95Saturation - 0.5) / 0.3) * 0.3,
+  );
   const rangeConfidence = clampAdaptive((robustRange - 0.12) / 0.68);
   const stability = clampAdaptive(
     Number(input.capture?.qualityStability ?? input.qualityStability ?? 100) / 100,
@@ -82,6 +104,9 @@ export function normalizeAdaptivePostprocessAnalysis(input = {}) {
   if (noiseStress > 0.18) safeguards.push("noise");
   if (ringing > 0.12) safeguards.push("ringing");
   if (shadowStress > 0.2) safeguards.push("shadows");
+  if (!histogram.isMono && (chromaStress > 0.32 || (chromaMeasured && chromaEvidence < 0.18))) {
+    safeguards.push("chroma");
+  }
   if (!safeguards.length) safeguards.push("balanced");
 
   return Object.freeze({
@@ -98,6 +123,13 @@ export function normalizeAdaptivePostprocessAnalysis(input = {}) {
     noiseStress,
     ringing,
     colorFringe,
+    chromaSampledPixels,
+    meanSaturation,
+    p95Saturation,
+    chromaticFraction,
+    chromaMeasured,
+    chromaEvidence,
+    chromaStress,
     rangeConfidence,
     stability,
     detailConfidence,

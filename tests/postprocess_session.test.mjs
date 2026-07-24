@@ -341,6 +341,52 @@ test("moon and planet recipes reduce risky detail and add measured protection", 
   assert.ok(adapted.pipeline.blend >= 68 && adapted.pipeline.blend <= 100);
 });
 
+test("mineral moon scales colour from measured chroma instead of neutral noise", () => {
+  const noisyNeutral = adaptObjectFinishingPreset("lunar-mineral", {
+    histogram: {
+      median: 30_000,
+      percentileLow: 900,
+      percentileHigh: 61_000,
+      isMono: false,
+    },
+    artifacts: {
+      sampledPixels: 100_000,
+      chromaSampledPixels: 82_000,
+      meanSaturation: 0.006,
+      p95Saturation: 0.016,
+      chromaticFraction: 0.03,
+      colorFringeScore: 9,
+      suggestedDenoise: 18,
+    },
+  });
+  const chromaticMaster = adaptObjectFinishingPreset("lunar-mineral", {
+    histogram: {
+      median: 30_000,
+      percentileLow: 900,
+      percentileHigh: 61_000,
+      isMono: false,
+    },
+    artifacts: {
+      sampledPixels: 100_000,
+      chromaSampledPixels: 82_000,
+      meanSaturation: 0.055,
+      p95Saturation: 0.16,
+      chromaticFraction: 0.62,
+      colorFringeScore: 2,
+      suggestedDenoise: 3,
+    },
+  });
+  assert.equal(noisyNeutral.adaptation.chromaMeasured, true);
+  assert.ok(noisyNeutral.adaptation.safeguards.includes("chroma"));
+  assert.ok(noisyNeutral.adaptation.colorScale < chromaticMaster.adaptation.colorScale);
+  assert.ok(
+    noisyNeutral.pipeline.advanced.vibrance
+      < chromaticMaster.pipeline.advanced.vibrance,
+  );
+  assert.ok(Math.max(...noisyNeutral.pipeline.advanced.hslSaturation) <= 0.025);
+  assert.ok(Math.max(...chromaticMaster.pipeline.advanced.hslSaturation) <= 0.065);
+});
+
 test("the shared tone curve is exact when linear and the assistant can propose it", () => {
   assert.equal(evaluateToneCurve(normalizeToneCurvePoints([[0, 0], [1, 1]]), 0.625), 0.625);
   const suggestion = evaluateGuide({
@@ -452,6 +498,36 @@ test("new post-processing text is available in Spanish, English, Italian, and Fr
   for (const language of files) {
     assert.ok(i18nSource.includes(`'${language}'`));
   }
+});
+
+test("the intelligent assistant and deep-sky session organizer have English contracts", async () => {
+  const english = JSON.parse(await readFile(
+    new URL("../src/locales/en.json", import.meta.url),
+    "utf8",
+  ));
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  const main = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+  assert.equal(english.assistant?.name, "Intelligent Assistant");
+  assert.equal(
+    english.assistant?.rules?.["clipping"]?.applyLabel,
+    "Apply safe correction",
+  );
+  assert.equal(english.deepsky?.step_data, "Data");
+  assert.ok(english.deepsky?.sessions_hint?.includes("Strict preflight"));
+  assert.equal(english.deepsky?.pick_lights, "Lights (object frames)");
+  assert.equal(english.deepsky?.scan_folder, "Scan folder (auto-classify)");
+  assert.equal(english.deepsky?.session_quality_title, "Session quality control");
+  assert.equal(english.deepsky?.psf_inspection_title, "Pre-stack PSF inspection");
+  assert.equal(english.settings?.general?.gpu_budget?.includes("presupuestada"), false);
+  assert.ok(html.includes('id="ds-session-organizer"'));
+  assert.ok(html.includes('data-i18n-aria-label="deepsky.steps_aria"'));
+  assert.ok(html.includes('data-i18n="general.add_fits_sequence"'));
+  assert.ok(html.includes('data-i18n="general.status_ready"'));
+  assert.ok(main.includes("function dsRenderSessionOrganizer()"));
+  assert.ok(main.includes("strictEntries"));
+  assert.ok(main.includes('class="ds-calibration-chip ${state}"'));
+  assert.ok(main.includes('tr("deepsky.psf_inspection_title"'));
+  assert.ok(main.includes('tr("deepsky.session_quality_title"'));
 });
 
 test("planetary defaults and mono-only availability are explicit", async () => {

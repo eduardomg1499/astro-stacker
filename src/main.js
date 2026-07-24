@@ -2263,7 +2263,17 @@ window.setPlanetaryColorOptionsAvailability = setPlanetaryColorOptionsAvailabili
         window._gpuInfo = info;
         const line = document.getElementById("gpu-info-line");
         if (info && info.available) {
-            if (line) line.textContent = `✔ ${info.name} — ${info.backend} · VRAM presupuestada: ${info.vram_budget_mb} MB`;
+            if (line) {
+                line.textContent = trFormat(
+                    "settings.general.gpu_budget",
+                    {
+                        name: info.name,
+                        backend: info.backend,
+                        budget: info.vram_budget_mb,
+                    },
+                    "✔ {{name}} — {{backend}} · VRAM presupuestada: {{budget}} MB",
+                );
+            }
             log("INFO", `GPU detectada: ${info.name} (${info.backend}) — ${info.vram_budget_mb} MB presupuestados para cómputo planetario.`);
         } else {
             if (line) line.textContent = tr("settings.general.gpu_none", "Sin GPU compatible — análisis y apilado usan CPU (SIMD).");
@@ -6474,10 +6484,16 @@ function setPostColorControlsForMono(isMono) {
     const adcStatus = document.getElementById("adc-status");
     if (adcStatus) {
         if (isMono) {
-            adcStatus.textContent = "No disponible: el resultado activo es monocromo";
+            adcStatus.textContent = tr(
+                "assistant.mono.atmospheric_unavailable",
+                "No disponible: el resultado activo es monocromo",
+            );
             adcStatus.dataset.state = "idle";
-        } else if (adcStatus.textContent.startsWith("No disponible")) {
-            adcStatus.textContent = "G es la referencia · rango ±6 px";
+        } else if (adcStatus.dataset.state === "idle") {
+            adcStatus.textContent = tr(
+                "assistant.mono.atmospheric_reference",
+                "G es la referencia · rango ±6 px",
+            );
             adcStatus.dataset.state = "idle";
         }
     }
@@ -6489,8 +6505,14 @@ function setPostColorControlsForMono(isMono) {
     document.querySelectorAll('[data-object-preset="lunar-mineral"]').forEach((button) => {
         button.disabled = !!isMono;
         button.title = isMono
-            ? "No disponible: una captura mono no contiene diferencias minerales de color."
-            : "Amplifica diferencias cromáticas reales con una receta interpretativa.";
+            ? tr(
+                "assistant.mono.mineral_unavailable",
+                "No disponible: una captura mono no contiene diferencias minerales de color.",
+            )
+            : tr(
+                "assistant.mono.mineral_available",
+                "Amplifica diferencias cromáticas reales con una receta interpretativa.",
+            );
     });
 }
 
@@ -7214,7 +7236,10 @@ async function analyzeActivePostprocessArtifacts() {
     const assistantButton = document.getElementById("btn-assistant-analyze");
     const summary = document.getElementById("artifact-analysis-summary");
     [repairButton, assistantButton].forEach((button) => { if (button) button.disabled = true; });
-    if (summary) summary.textContent = "Analizando señal, vecindades y canales...";
+    if (summary) summary.textContent = tr(
+        "assistant.artifacts.analyzing",
+        "Analizando señal, vecindades y canales...",
+    );
     try {
         await refreshPostHistogram(true);
         const analysis = await invoke("analyze_postprocess_artifacts", { preferProcessed: true });
@@ -7222,9 +7247,27 @@ async function analyzeActivePostprocessArtifacts() {
         if (summary) {
             summary.replaceChildren();
             const heading = document.createElement("strong");
-            heading.textContent = analysis.summary;
+            const summaryKey = analysis.ringingScore > 8
+                ? "ringing"
+                : analysis.hotPixels + analysis.deadPixels > analysis.sampledPixels / 500
+                    ? "defects"
+                    : "clear";
+            heading.textContent = tr(
+                `assistant.artifacts.summary_${summaryKey}`,
+                analysis.summary,
+            );
             const metrics = document.createElement("span");
-            metrics.textContent = `Halos ${analysis.ringingScore.toFixed(2)} · fringing ${analysis.colorFringeScore.toFixed(2)} · calientes ${analysis.hotPixels} · muertos ${analysis.deadPixels} · muestra ${analysis.sampledPixels.toLocaleString()}`;
+            metrics.textContent = trFormat(
+                "assistant.artifacts.metrics",
+                {
+                    ringing: analysis.ringingScore.toFixed(2),
+                    fringe: analysis.colorFringeScore.toFixed(2),
+                    hot: analysis.hotPixels,
+                    dead: analysis.deadPixels,
+                    sample: analysis.sampledPixels.toLocaleString(),
+                },
+                `Halos ${analysis.ringingScore.toFixed(2)} · fringing ${analysis.colorFringeScore.toFixed(2)} · calientes ${analysis.hotPixels} · muertos ${analysis.deadPixels} · muestra ${analysis.sampledPixels.toLocaleString()}`,
+            );
             summary.append(heading, document.createElement("br"), metrics);
         }
         const apply = document.getElementById("btn-apply-artifact-suggestion");
@@ -7232,7 +7275,13 @@ async function analyzeActivePostprocessArtifacts() {
         updateZenithGuide();
         return analysis;
     } catch (error) {
-        if (summary) summary.textContent = `Análisis no disponible: ${normalizeBackendText(error)}`;
+        if (summary) {
+            summary.textContent = trFormat(
+                "assistant.artifacts.unavailable",
+                { error: normalizeBackendText(error) },
+                `Análisis no disponible: ${normalizeBackendText(error)}`,
+            );
+        }
         log("ERROR", `Artefactos: ${error}`);
         return null;
     } finally {
@@ -7246,10 +7295,13 @@ function initArtifactRepairUi() {
     document.getElementById("btn-apply-artifact-suggestion")?.addEventListener("click", async () => {
         if (!lastArtifactSuggestion) return;
         const confirmed = await showCustomChoice(
-            "Aplicar corrección sugerida",
-            `${lastArtifactSuggestion.summary}\n\nSe aplicará de forma reversible y podrás compararla con A/B.`,
-            "Aplicar",
-            "Cancelar"
+            tr("assistant.artifacts.apply_title", "Aplicar corrección sugerida"),
+            tr(
+                "assistant.artifacts.apply_body",
+                "La corrección medida se aplicará de forma reversible y podrás compararla con A/B.",
+            ),
+            tr("assistant.artifacts.apply", "Aplicar"),
+            tr("general.cancel", "Cancelar"),
         );
         if (!confirmed) return;
         suppressPostprocessEvents = true;
@@ -7268,7 +7320,10 @@ function initArtifactRepairUi() {
             suppressPostprocessEvents = false;
         }
         triggerUpdate();
-        queuePostHistoryCommit("Corrección inteligente de artefactos");
+        queuePostHistoryCommit(tr(
+            "assistant.artifacts.history",
+            "Corrección inteligente de artefactos",
+        ));
     });
 }
 
@@ -7278,32 +7333,33 @@ function paintAssistantPrimaryAction() {
     if (!button || !label) return;
     const context = zenithGuide?.context || {};
     if (context.hasResult) {
-        label.textContent = "Diagnosticar resultado activo";
+        label.textContent = tr("assistant.primary.diagnose", "Diagnosticar resultado activo");
         button.dataset.action = "diagnose";
         return;
     }
     const key = `${context.flow || "individual"}:${context.stage || "empty"}`;
     const actions = {
-        "individual:empty": ["Elegir un video", "load"],
-        "individual:analyze": ["Analizar video ahora", "analyze"],
-        "individual:stack": ["Continuar al apilado", "stack"],
-        "batch:scan": ["Definir alcance del lote", "batch-scan"],
-        "batch:load": ["Elegir referencia del lote", "batch-load"],
-        "batch:analyze": ["Analizar referencia ahora", "analyze"],
-        "batch:run": ["Revisar ejecución del lote", "batch-run"],
-        "batch:complete": ["Revisar resultados del lote", "batch-complete"],
-        "mosaic:load": ["Añadir paneles del mosaico", "mosaic-load"],
-        "mosaic:analyze": ["Analizar paneles ahora", "mosaic-analyze"],
-        "mosaic:stack": ["Revisar apilado de paneles", "mosaic-stack"],
-        "mosaic:compose": ["Continuar a composición", "mosaic-compose"],
-        "mosaic:result": ["Abrir postprocesado del mosaico", "mosaic-result"],
-        "deepsky:blocked": ["Revisar incompatibilidades", "deepsky-review"],
+        "individual:empty": ["load", "Elegir un video", "load"],
+        "individual:analyze": ["analyze", "Analizar video ahora", "analyze"],
+        "individual:stack": ["stack", "Continuar al apilado", "stack"],
+        "batch:scan": ["batch_scan", "Definir alcance del lote", "batch-scan"],
+        "batch:load": ["batch_load", "Elegir referencia del lote", "batch-load"],
+        "batch:analyze": ["batch_analyze", "Analizar referencia ahora", "analyze"],
+        "batch:run": ["batch_run", "Revisar ejecución del lote", "batch-run"],
+        "batch:complete": ["batch_complete", "Revisar resultados del lote", "batch-complete"],
+        "mosaic:load": ["mosaic_load", "Añadir paneles del mosaico", "mosaic-load"],
+        "mosaic:analyze": ["mosaic_analyze", "Analizar paneles ahora", "mosaic-analyze"],
+        "mosaic:stack": ["mosaic_stack", "Revisar apilado de paneles", "mosaic-stack"],
+        "mosaic:compose": ["mosaic_compose", "Continuar a composición", "mosaic-compose"],
+        "mosaic:result": ["mosaic_result", "Abrir postprocesado del mosaico", "mosaic-result"],
+        "deepsky:blocked": ["deepsky_review", "Revisar incompatibilidades", "deepsky-review"],
     };
-    const [text, action] = actions[key] || [
+    const [translationKey, fallback, action] = actions[key] || [
+        context.flow === "deepsky" ? "deepsky_step" : "next",
         context.flow === "deepsky" ? "Volver al paso activo" : "Ver siguiente paso",
         context.flow === "deepsky" ? "deepsky-step" : "next",
     ];
-    label.textContent = text;
+    label.textContent = tr(`assistant.primary.${translationKey}`, fallback);
     button.dataset.action = action;
 }
 
@@ -7559,6 +7615,7 @@ function initZenithGuideUi() {
         summary: document.getElementById("intelligent-assistant-summary"),
         onNavigate: navigateAssistantToControl,
         onApply: applyAssistantRecommendation,
+        translate: (key, fallback, values = {}) => trFormat(key, values, fallback),
     });
     document.getElementById("btn-toggle-guide")?.addEventListener("click", () => setZenithGuideOpen(!panel?.classList.contains("open")));
     document.getElementById("btn-close-guide")?.addEventListener("click", () => setZenithGuideOpen(false));
@@ -9493,7 +9550,9 @@ if (ui.btnAnalyze) {
                 }
 
                 log("SUCCESS", "Video cargado.");
-                if (ui.statusText) ui.statusText.textContent = "Listo. Esperando accion.";
+                if (ui.statusText) {
+                    ui.statusText.textContent = tr("general.status_waiting", "Listo. Esperando acción.");
+                }
                 maybeStartTutorialFlow('individual', 1, 250);
 
                 // INITIATE GUIDED UI GLOW SEQUENCE
@@ -9768,7 +9827,7 @@ if (ui.btnRunAnalysis) {
                 }
 
                 log("SUCCESS", "Analisis completado.");
-                if (ui.statusText) ui.statusText.textContent = "Listo.";
+                if (ui.statusText) ui.statusText.textContent = tr("general.status_ready", "Listo.");
                 const btnToggle = $("#btn-toggle-source");
                 if (btnToggle) btnToggle.style.display = "block";
             } catch (e) {
@@ -11188,7 +11247,7 @@ if (ui.btnAnimCancel) {
 // I18N INITIALIZATION
 // =========================================================================
 
-(async () => {
+const i18nReady = (async () => {
     try {
         await i18n.init();
 
@@ -11248,6 +11307,12 @@ window.addEventListener("languageChanged", (e) => {
     updateSolarUiState();
     renderObjectFinishingStatus();
     updatePostHistoryUi();
+    updateZenithGuide();
+    paintAssistantPrimaryAction();
+    if (document.getElementById("deepsky-modal")?.style.display !== "none") {
+        dsRenderSections(true);
+        dsUpdateUI();
+    }
 });
 
 // =========================================================================
@@ -11868,24 +11933,29 @@ function dsMoveFile(fromKind, path, toKind) {
     dsUpdateUI();
 }
 
-function dsRenderSections() {
+function dsRenderSections(force = false) {
     const host = document.getElementById("ds-sections");
-    if (!host || host.dataset.built) return;
+    if (!host) return;
+    if (force) {
+        host.innerHTML = "";
+        delete host.dataset.built;
+    }
+    if (host.dataset.built) return;
     host.dataset.built = "1";
 
     // Botón de auto-clasificación de carpeta (una sola carpeta raíz →
     // lights/darks/flats/dark-flats/bias por palabras clave, recursivo).
     const auto = document.createElement("button");
     auto.type = "button";
-    auto.className = "donation-option";
+    auto.className = "donation-option ds-source-wide";
     auto.style.cssText = "width:100%; min-height:52px; margin:0 0 4px;";
     auto.innerHTML = `
         <span class="donation-option-icon" style="background:rgba(124,58,237,0.18); color:#c4b5fd; width:36px; height:36px; display:inline-flex; align-items:center; justify-content:center; flex:none;">
             <svg class="zas-icon" style="width:18px; height:18px; display:block;"><use href="#icon-folder"></use></svg>
         </span>
         <span class="donation-option-copy" style="min-width:0;">
-            <strong data-i18n="deepsky.scan_folder" style="letter-spacing:0.05em;">Escanear carpeta (auto-clasificar)</strong>
-            <small data-i18n="deepsky.scan_folder_hint">Detecta lights/darks/flats/dark-flats/bias en subcarpetas por nombre</small>
+            <strong style="letter-spacing:0.05em;">${escapeHtml(tr("deepsky.scan_folder", "Escanear carpeta (auto-clasificar)"))}</strong>
+            <small>${escapeHtml(tr("deepsky.scan_folder_hint", "Detecta lights/darks/flats/dark-flats/bias en subcarpetas por nombre"))}</small>
         </span>`;
     auto.addEventListener("click", dsScanFolder);
     host.appendChild(auto);
@@ -11895,7 +11965,7 @@ function dsRenderSections() {
     // disco del sistema anda justo. Persistente en localStorage.
     const workBtn = document.createElement("button");
     workBtn.type = "button";
-    workBtn.className = "donation-option";
+    workBtn.className = "donation-option ds-source-wide";
     workBtn.style.cssText = "width:100%; min-height:52px; margin:0 0 4px;";
     const renderWorkDir = async () => {
         const dir = localStorage.getItem("zas_ds_workdir") || "";
@@ -11903,7 +11973,11 @@ function dsRenderSections() {
         if (dir) {
             try {
                 const info = await invoke("disk_space_info", { path: dir });
-                space = ` · ${(info.availableMb / 1024).toFixed(1)} GB libres`;
+                space = ` · ${trFormat(
+                    "deepsky.free_space_gb",
+                    { amount: (info.availableMb / 1024).toFixed(1) },
+                    "{{amount}} GB libres",
+                )}`;
             } catch (_) { }
         }
         workBtn.innerHTML = `
@@ -11933,9 +12007,11 @@ function dsRenderSections() {
     host.appendChild(workBtn);
 
     for (const s of DS_SECTIONS) {
+        const sectionLabel = tr(s.labelKey, s.fallback);
         const wrap = document.createElement("div");
+        wrap.className = "ds-source-kind";
         wrap.dataset.kind = s.kind;
-        wrap.style.cssText = "display:flex; flex-direction:column; gap:4px; border-radius:12px; transition:background 0.15s, box-shadow 0.15s;";
+        wrap.style.cssText = "display:flex; flex-direction:column; gap:4px; transition:background 0.15s, box-shadow 0.15s;";
         // Zona de soltado: arrastrar un archivo aquí lo reclasifica.
         wrap.addEventListener("dragover", (e) => { e.preventDefault(); wrap.style.boxShadow = "inset 0 0 0 2px #7c3aed"; wrap.style.background = "rgba(124,58,237,0.06)"; });
         wrap.addEventListener("dragleave", () => { wrap.style.boxShadow = "none"; wrap.style.background = "transparent"; });
@@ -11960,7 +12036,7 @@ function dsRenderSections() {
                 <svg class="zas-icon" style="width:18px; height:18px; display:block;"><use href="#${s.icon}"></use></svg>
             </span>
             <span class="donation-option-copy" style="min-width:0;">
-                <strong data-i18n="${s.labelKey}" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${s.fallback}</strong>
+                <strong style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(sectionLabel)}</strong>
                 <small id="ds-${s.kind}-sub">${tr("deepsky.no_files", "Sin archivos")}</small>
             </span>
             <span id="ds-${s.kind}-count"
@@ -11971,7 +12047,7 @@ function dsRenderSections() {
         const folder = document.createElement("button");
         folder.type = "button";
         folder.title = tr("deepsky.pick_folder", "Cargar carpeta (recursivo)");
-        folder.setAttribute("aria-label", `${folder.title}: ${s.fallback}`);
+        folder.setAttribute("aria-label", `${folder.title}: ${sectionLabel}`);
         folder.innerHTML = `<svg class="zas-icon" style="width:14px;height:14px;"><use href="#icon-folder"></use></svg>`;
         folder.style.cssText = "flex:0 0 auto; width:auto; background:none; border:1px solid #334155; color:#94a3b8; border-radius:8px; padding:6px 9px; cursor:pointer; display:flex; align-items:center;";
         folder.addEventListener("click", () => dsPickFolder(s.kind));
@@ -11979,16 +12055,23 @@ function dsRenderSections() {
         const clear = document.createElement("button");
         clear.type = "button";
         clear.title = tr("deepsky.clear", "Limpiar");
-        clear.setAttribute("aria-label", `${clear.title}: ${s.fallback}`);
+        clear.setAttribute("aria-label", `${clear.title}: ${sectionLabel}`);
         clear.innerHTML = '<svg class="zas-icon zas-icon-inline"><use href="#icon-cross"></use></svg>';
         clear.style.cssText = "flex:0 0 auto; width:auto; background:none; border:1px solid #334155; color:#64748b; border-radius:8px; padding:6px 10px; cursor:pointer; font-size:0.7rem;";
         clear.addEventListener("click", () => { dsFiles[s.kind] = []; dsUpdateUI(); });
 
         rowTop.append(btn, folder, clear);
+        const details = document.createElement("details");
+        details.id = `ds-details-${s.kind}`;
+        details.hidden = true;
+        const summary = document.createElement("summary");
+        summary.id = `ds-details-summary-${s.kind}`;
+        summary.textContent = trFormat("deepsky.view_files", { count: 0 }, "Ver 0 archivos");
         const list = document.createElement("div");
         list.id = `ds-list-${s.kind}`;
-        list.style.cssText = "display:none; max-height:240px; overflow-y:auto; margin:2px 4px 0; border-left:2px solid rgba(124,58,237,0.25); padding:2px 4px 2px 8px;";
-        wrap.append(rowTop, list);
+        list.style.cssText = "max-height:240px; overflow-y:auto; margin:5px 0 0; border-left:2px solid rgba(124,58,237,0.25); padding:2px 4px 2px 8px;";
+        details.append(summary, list);
+        wrap.append(rowTop, details);
         host.appendChild(wrap);
         btn.addEventListener("click", () => dsPick(s.kind));
     }
@@ -12032,7 +12115,9 @@ function dsFilterToken(str) {
     return null;
 }
 function dsFilterLabel(filter) {
-    return ({ HA_OIII: "Ha + OIII", SII_OIII: "SII + OIII", HA: "Ha" })[filter] || filter || "Banda ancha / OSC";
+    return ({ HA_OIII: "Ha + OIII", SII_OIII: "SII + OIII", HA: "Ha" })[filter]
+        || filter
+        || tr("deepsky.broadband_osc", "Banda ancha / OSC");
 }
 function dsFilterComponents(filter) {
     if (filter === "HA_OIII") return ["HA", "OIII"];
@@ -12099,6 +12184,105 @@ function dsMetaBits(files) {
     const filt = dsFilterOf(files);
     if (filt) bits.push(dsFilterLabel(filt));
     return bits;
+}
+
+function dsSessionIdentity(file) {
+    const signatureSession = file?.signature?.session;
+    if (signatureSession) return String(signatureSession);
+    const observed = String(file?.date_obs || file?.dateObs || "");
+    if (/^\d{4}-\d{2}-\d{2}/.test(observed)) return observed.slice(0, 10);
+    const match = String(file?.path || file?.name || "").match(/20\d{2}[-_]\d{2}[-_]\d{2}/);
+    if (match) return match[0].replaceAll("_", "-");
+    return tr("deepsky.unknown_session", "Sesión sin fecha");
+}
+
+function dsPreparedSessionEntries() {
+    const plans = dsPreparedPlan?.sessionId
+        ? (dsPreparedPlan.groups || []).map(group => group.plan).filter(Boolean)
+        : [dsPreparedPlan].filter(Boolean);
+    return plans.flatMap(plan => plan.sessionMap || []);
+}
+
+function dsFormatIntegrationSeconds(seconds) {
+    const value = Math.max(0, Number(seconds) || 0);
+    if (value >= 3600) return `${(value / 3600).toFixed(1)} h`;
+    if (value >= 60) return `${Math.round(value / 60)} min`;
+    return `${Math.round(value)} s`;
+}
+
+function dsRenderSessionOrganizer() {
+    const panel = document.getElementById("ds-session-organizer");
+    if (!panel) return;
+    const lights = dsActiveLights().filter(file => file.ok);
+    if (!lights.length) {
+        panel.hidden = true;
+        panel.replaceChildren();
+        return;
+    }
+    const groups = new Map();
+    for (const light of lights) {
+        const session = dsSessionIdentity(light);
+        if (!groups.has(session)) groups.set(session, []);
+        groups.get(session).push(light);
+    }
+    const strictEntries = new Map(dsPreparedSessionEntries().map(entry => [String(entry.night), entry]));
+    const totalExposure = lights.reduce((sum, light) => sum + (Number(light.exptime) || 0), 0);
+    const candidateDarks = dsMatchedCalib("darks").length;
+    const candidateFlats = dsMatchedCalib("flats").length;
+    const candidateDarkFlats = dsMatchedCalib("darkFlats").length;
+    const candidateBias = dsMatchedCalib("bias").length;
+    const cards = [...groups.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([session, sessionLights]) => {
+            const strict = strictEntries.get(session);
+            const exposure = sessionLights.reduce((sum, light) => sum + (Number(light.exptime) || 0), 0);
+            const signatures = new Map();
+            for (const light of sessionLights) {
+                const filter = dsFilterOfFile(light) || tr("deepsky.broadband", "Banda ancha");
+                const key = `${filter}|${dsExpKey(light)}`;
+                signatures.set(key, (signatures.get(key) || 0) + 1);
+            }
+            const signatureChips = [...signatures.entries()].map(([key, count]) => {
+                const [filter, exposureKey] = key.split("|");
+                const exposureLabel = exposureKey === "?" ? "—" : dsFmtExp(Number(exposureKey));
+                return `<span>${escapeHtml(dsFilterLabel(filter))} · ${escapeHtml(exposureLabel)} · ${count}</span>`;
+            }).join("");
+            const calibrationChip = (label, confirmed, count, detail = "") => {
+                const state = confirmed ? "confirmed" : "pending";
+                const marker = confirmed ? "✓" : "?";
+                const suffix = detail || `${count} ${tr("deepsky.candidates", "candidatos")}`;
+                return `<span class="ds-calibration-chip ${state}" title="${escapeHtml(suffix)}">${marker} ${escapeHtml(label)} · ${escapeHtml(suffix)}</span>`;
+            };
+            const flatsConfirmed = Boolean(strict && Number(strict.flatCount) > 0);
+            const darksConfirmed = Boolean(strict && strict.darks && strict.darks !== "—");
+            return `<article class="ds-night-card">
+                <div class="ds-night-head">
+                    <strong>${escapeHtml(session)}</strong>
+                    <span>${sessionLights.length} lights · ${dsFormatIntegrationSeconds(exposure)}</span>
+                </div>
+                <div class="ds-night-groups">${signatureChips}</div>
+                <div class="ds-calibration-rail">
+                    ${calibrationChip(tr("deepsky.step_flat_s", "Flats"), flatsConfirmed, candidateFlats, flatsConfirmed ? `${strict.flatNight || session} · ${strict.flatCount}` : "")}
+                    ${calibrationChip(tr("deepsky.step_dark_s", "Darks"), darksConfirmed, candidateDarks, darksConfirmed ? String(strict.darks).replace(/^darks:\s*/i, "") : "")}
+                    ${calibrationChip(tr("deepsky.step_dark_flat_s", "Dark-flats"), false, candidateDarkFlats)}
+                    ${calibrationChip(tr("deepsky.step_bias_s", "Bias"), false, candidateBias)}
+                </div>
+            </article>`;
+        }).join("");
+    panel.hidden = false;
+    panel.innerHTML = `
+        <header class="ds-session-organizer-head">
+            <div>
+                <strong>${tr("deepsky.sessions_title", "Noches y calibración")}</strong>
+                <span>${tr("deepsky.sessions_hint", "Cada noche conserva sus lights, firmas y calibraciones. ✓ confirma el preflight Strict; ? sólo indica archivos candidatos.")}</span>
+            </div>
+            <div class="ds-session-summary">
+                <b>${groups.size} ${groups.size === 1 ? tr("deepsky.night", "noche") : tr("deepsky.nights", "noches")}</b>
+                <b>${lights.length} lights</b>
+                <b>${dsFormatIntegrationSeconds(totalExposure)}</b>
+            </div>
+        </header>
+        <div class="ds-night-list">${cards}</div>`;
 }
 
 // Renderiza el plan de calibración agrupado (una tarjeta por exposición).
@@ -12217,8 +12401,15 @@ function dsRenderCalibrationPlan(container, lights) {
     const mixNote = distinctFilters.length >= 2
         ? `<div class="ds-session-note">
             <svg class="zas-icon"><use href="#icon-sequence"></use></svg>
-            <div><strong>Sesión multibanda detectada</strong>
-            <span>${distinctFilters.map(dsFilterLabel).map(escapeHtml).join(" · ")}. Zenith ejecutará ${distinctFilters.length} integraciones separadas dentro de la misma sesión, extraerá sus líneas y conservará una receta común.</span></div>
+            <div><strong>${tr("deepsky.multiband_note_title", "Sesión multibanda detectada")}</strong>
+            <span>${trFormat(
+                "deepsky.multiband_note_body",
+                {
+                    filters: distinctFilters.map(dsFilterLabel).join(" · "),
+                    count: distinctFilters.length,
+                },
+                `${distinctFilters.map(dsFilterLabel).join(" · ")}. Zenith ejecutará ${distinctFilters.length} integraciones separadas dentro de la misma sesión, extraerá sus líneas y conservará una receta común.`,
+            )}</span></div>
         </div>`
         : "";
     container.innerHTML = `
@@ -12240,11 +12431,21 @@ function dsUpdateMultibandControls() {
     if (summary) {
         const outputs = groups.flatMap(group => dsFilterComponents(group.filter));
         summary.textContent = multiband
-            ? `${groups.length} integraciones: ${groups.map(group => dsFilterLabel(group.filter)).join(" · ")} · salidas ${outputs.join(" / ")}`
-            : "Se mostrará cuando Zenith detecte dos o más perfiles espectrales.";
+            ? trFormat(
+                "deepsky.multiband_detected",
+                {
+                    count: groups.length,
+                    filters: groups.map(group => dsFilterLabel(group.filter)).join(" · "),
+                    outputs: outputs.join(" / "),
+                },
+                `${groups.length} integraciones: ${groups.map(group => dsFilterLabel(group.filter)).join(" · ")} · salidas ${outputs.join(" / ")}`,
+            )
+            : tr("deepsky.multiband_waiting", "Se mostrará cuando Zenith detecte dos o más perfiles espectrales.");
     }
     const runLabel = document.querySelector("#btn-deepsky-run span");
-    if (runLabel) runLabel.textContent = multiband ? "Apilar sesión multibanda" : tr("deepsky.run", "Apilar Cielo Profundo");
+    if (runLabel) runLabel.textContent = multiband
+        ? tr("deepsky.run_multiband", "Apilar sesión multibanda")
+        : tr("deepsky.run", "Apilar Cielo Profundo");
 }
 
 function dsRenderSessionResult(result) {
@@ -12285,21 +12486,25 @@ function dsRenderSessionResult(result) {
                 <summary style="cursor:pointer;color:#7dd3fc;font-size:.62rem;font-weight:700;letter-spacing:.04em;">${tr("deepsky.bundle_title", "PRODUCTOS CIENTÍFICOS")} · ${(bundle.products || []).length}</summary>
                 <div style="overflow:auto;border:1px solid rgba(148,163,184,.12);border-radius:8px;margin-top:4px;">
                 <table style="width:100%;border-collapse:collapse;font-size:.58rem;min-width:520px;">
-                    <thead style="background:#111827;color:#94a3b8;"><tr><th style="padding:3px 8px;text-align:left;">Producto</th><th style="padding:3px 8px;text-align:left;">Archivo</th><th style="padding:3px 8px;text-align:right;">Geometría</th><th style="padding:3px 8px;text-align:left;">Unidad</th><th></th></tr></thead>
+                    <thead style="background:#111827;color:#94a3b8;"><tr><th style="padding:3px 8px;text-align:left;">${tr("deepsky.product", "Producto")}</th><th style="padding:3px 8px;text-align:left;">${tr("deepsky.file", "Archivo")}</th><th style="padding:3px 8px;text-align:right;">${tr("deepsky.geometry", "Geometría")}</th><th style="padding:3px 8px;text-align:left;">${tr("deepsky.unit", "Unidad")}</th><th></th></tr></thead>
                     <tbody>${bundleProducts}</tbody>
                 </table></div>
                 ${bundleChips ? `<div style="margin-top:4px;font-size:.58rem;">${bundleChips}</div>` : ""}
             </details>`
             : "";
+        const grade = String(q.grade || "review").toLowerCase();
+        const gradeLabel = /^(ok|good|excellent|buena|excelente)$/.test(grade)
+            ? tr("deepsky.quality_good", "Correcta")
+            : tr("deepsky.quality_review", "Revisar");
         return `<article class="ds-quality-card">
-            <div class="ds-quality-head"><div><strong>${escapeHtml(dsFilterLabel(group.filterProfile))}</strong><span>${group.framesUsed} usadas · ${group.framesRejected} rechazadas</span></div><b data-grade="${escapeHtml(q.grade || "Revisar")}">${escapeHtml(q.grade || "Revisar")}</b></div>
-            <div class="ds-quality-metrics"><span>Cobertura <b>${Number(q.coveragePercent || 0).toFixed(1)}%</b></span><span>Rechazo <b>${Number(q.rejectionPercent || 0).toFixed(1)}%</b></span><span>Ruido fondo <b>${Number(q.backgroundNoise || 0).toFixed(2)}</b></span></div>
+            <div class="ds-quality-head"><div><strong>${escapeHtml(dsFilterLabel(group.filterProfile))}</strong><span>${trFormat("deepsky.quality_frame_counts", { used: group.framesUsed, rejected: group.framesRejected }, `${group.framesUsed} usadas · ${group.framesRejected} rechazadas`)}</span></div><b data-grade="${escapeHtml(grade)}">${gradeLabel}</b></div>
+            <div class="ds-quality-metrics"><span>${tr("deepsky.quality_coverage", "Cobertura")} <b>${Number(q.coveragePercent || 0).toFixed(1)}%</b></span><span>${tr("deepsky.quality_rejection", "Rechazo")} <b>${Number(q.rejectionPercent || 0).toFixed(1)}%</b></span><span>${tr("deepsky.quality_background_noise", "Ruido de fondo")} <b>${Number(q.backgroundNoise || 0).toFixed(2)}</b></span></div>
             ${outputs ? `<ul class="ds-output-list">${outputs}</ul>` : ""}
             ${bundleBlock}
             <ul class="ds-quality-recommendations">${recommendations}</ul>
         </article>`;
     }).join("");
-    panel.innerHTML = `<div class="ds-quality-title"><div><strong>Control de calidad de la sesión</strong><span>Másters lineales y métricas medidos, no la vista STF.</span></div><span>${escapeHtml(result.outputDir || "")}</span></div>${cards}`;
+    panel.innerHTML = `<div class="ds-quality-title"><div><strong>${tr("deepsky.session_quality_title", "Control de calidad de la sesión")}</strong><span>${tr("deepsky.session_quality_hint", "Másters lineales y métricas medidos, no la vista STF.")}</span></div><span>${escapeHtml(result.outputDir || "")}</span></div>${cards}`;
 
     const components = result.componentPaths || {};
     if (components.SII?.[0] && components.HA?.[0] && components.OIII?.[0]) {
@@ -12541,7 +12746,13 @@ function dsFormatSessionPreflight(plan) {
         }).join("");
     const alerts = [
         sessionGroupedAlerts(plan.errors || [], "error", false),
-        sessionGroupedAlerts((plan.warnings || []).filter(warning => !warning.startsWith("Sesión multibanda")), "warn", true),
+        sessionGroupedAlerts(
+            (plan.warnings || []).filter(
+                warning => !/^(Sesión multibanda|Multiband session)/i.test(String(warning)),
+            ),
+            "warn",
+            true,
+        ),
     ].join("");
     const groups = (plan.groups || []).map(group => {
         const p = group.plan || {};
@@ -12549,7 +12760,7 @@ function dsFormatSessionPreflight(plan) {
         return `<article class="ds-session-group">
             <div class="ds-session-group-head">
                 <div><strong>${escapeHtml(dsFilterLabel(group.filterProfile))}</strong><span>${escapeHtml(group.label)}</span></div>
-                <span class="ds-plan-state ${p.valid ? "ok" : "error"}">${p.valid ? "Listo" : "Revisar"}</span>
+                <span class="ds-plan-state ${p.valid ? "ok" : "error"}">${p.valid ? tr("deepsky.state_ready", "Listo") : tr("deepsky.state_review", "Revisar")}</span>
             </div>
             <div class="ds-session-group-meta">
                 <span>${p.groups?.reduce((sum, item) => sum + (item.frameCount || 0), 0) || 0} lights</span>
@@ -12557,7 +12768,7 @@ function dsFormatSessionPreflight(plan) {
                 <span>${escapeHtml(p.effectiveRejection || "")}</span>
                 <span>~${Math.max(1, Math.round(p.estimatedSeconds || 0))} s</span>
             </div>
-            <div class="ds-component-flow"><span>Salidas:</span>${components || `<span class="ds-component-chip">Máster</span>`}</div>
+            <div class="ds-component-flow"><span>${tr("deepsky.outputs", "Salidas")}:</span>${components || `<span class="ds-component-chip">${tr("deepsky.master", "Máster")}</span>`}</div>
             ${dsFormatSamplingAdvisor(p.samplingAdvisor)}
             ${dsFormatSessionMap(p.sessionMap)}
             ${dsFormatCalibrationLinker(p)}
@@ -12565,10 +12776,10 @@ function dsFormatSessionPreflight(plan) {
         </article>`;
     }).join("");
     return `<div class="ds-session-overview">
-        <div><b>${plan.valid ? "Sesión lista" : "Sesión requiere atención"}</b><span>${plan.groups?.length || 0} integraciones coordinadas · ${plan.totalFrames || 0} lights</span></div>
+        <div><b>${plan.valid ? tr("deepsky.session_ready", "Sesión lista") : tr("deepsky.session_attention", "Sesión requiere atención")}</b><span>${trFormat("deepsky.session_integrations", { count: plan.groups?.length || 0, frames: plan.totalFrames || 0 }, `${plan.groups?.length || 0} integraciones coordinadas · ${plan.totalFrames || 0} lights`)}</span></div>
         <span class="ds-session-time">~${Math.max(1, Math.round(plan.estimatedSeconds || 0))} s</span>
     </div>
-    <div class="ds-resource-grid"><span>RAM pico <b>~${plan.estimatedRamMb || 0} MB</b></span><span>VRAM pico <b>~${plan.estimatedVramMb || 0} MB</b></span><span>Disco <b>~${plan.estimatedDiskMb || 0} MB</b></span></div>
+    <div class="ds-resource-grid"><span>${tr("deepsky.peak_ram", "RAM pico")} <b>~${plan.estimatedRamMb || 0} MB</b></span><span>${tr("deepsky.peak_vram", "VRAM pico")} <b>~${plan.estimatedVramMb || 0} MB</b></span><span>${tr("deepsky.disk", "Disco")} <b>~${plan.estimatedDiskMb || 0} MB</b></span></div>
     <div class="ds-session-groups">${groups}</div>${alerts}`;
 }
 
@@ -12581,7 +12792,7 @@ function dsFormatSessionMap(map) {
         <td style="padding:4px 8px;color:#e2e8f0;">${escapeHtml(e.night)}</td>
         <td style="padding:4px 8px;text-align:right;">${e.lights}</td>
         <td style="padding:4px 8px;text-align:right;">${fmtExp(e.exposureSeconds || 0)}</td>
-        <td style="padding:4px 8px;color:${e.flatDistanceDays > 30 ? "#fcd34d" : "#cbd5e1"};">${e.flatNight ? `${escapeHtml(e.flatNight)} · ${e.flatCount} tomas${e.flatDistanceDays > 0 && e.flatDistanceDays < 3650 ? ` · Δ${e.flatDistanceDays} d` : ""}` : "—"}</td>
+        <td style="padding:4px 8px;color:${e.flatDistanceDays > 30 ? "#fcd34d" : "#cbd5e1"};">${e.flatNight ? `${escapeHtml(e.flatNight)} · ${e.flatCount} ${tr("deepsky.frames_lower", "tomas")}${e.flatDistanceDays > 0 && e.flatDistanceDays < 3650 ? ` · Δ${e.flatDistanceDays} d` : ""}` : "—"}</td>
         <td style="padding:4px 8px;color:#94a3b8;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(e.darks || "")}">${escapeHtml((e.darks || "—").replace(/^darks: /, ""))}</td>
     </tr>`).join("");
     return `<div style="margin-top:10px;">
@@ -12589,7 +12800,7 @@ function dsFormatSessionMap(map) {
         <div style="overflow:auto;border:1px solid rgba(148,163,184,.12);border-radius:8px;">
         <table style="width:100%;border-collapse:collapse;font-size:.6rem;min-width:540px;">
             <thead style="background:#111827;color:#94a3b8;"><tr>
-                <th style="padding:4px 8px;text-align:left;">Noche (lights)</th><th style="padding:4px 8px;text-align:right;">Lights</th><th style="padding:4px 8px;text-align:right;">Exposición</th><th style="padding:4px 8px;text-align:left;">Flats que aplicará</th><th style="padding:4px 8px;text-align:left;">Darks</th>
+                <th style="padding:4px 8px;text-align:left;">${tr("deepsky.session_night", "Noche (lights)")}</th><th style="padding:4px 8px;text-align:right;">Lights</th><th style="padding:4px 8px;text-align:right;">${tr("deepsky.exposure", "Exposición")}</th><th style="padding:4px 8px;text-align:left;">${tr("deepsky.session_flats", "Flats que aplicará")}</th><th style="padding:4px 8px;text-align:left;">Darks</th>
             </tr></thead><tbody>${rows}</tbody>
         </table></div></div>`;
 }
@@ -12605,7 +12816,11 @@ function dsFormatCalibrationDecisions(decisions) {
         const reasons = (decision.reasons || []).join(" · ");
         const status = decision.manual
             ? tr("deepsky.decision_manual", "Manual")
-            : ok ? "Exacta" : decision.degraded ? "Degradada" : "Bloqueada";
+            : ok
+                ? tr("deepsky.decision_exact", "Exacta")
+                : decision.degraded
+                    ? tr("deepsky.decision_degraded", "Degradada")
+                    : tr("deepsky.decision_blocked", "Bloqueada");
         const color = decision.manual ? "#7dd3fc" : ok ? "#6ee7b7" : decision.degraded ? "#fcd34d" : "#fca5a5";
         return `<tr style="border-top:1px solid rgba(148,163,184,.1);">
             <td style="padding:4px 8px;color:#e2e8f0;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(decision.framePath || "")}">${escapeHtml(pathBaseName(decision.framePath || ""))}</td>
@@ -12619,12 +12834,12 @@ function dsFormatCalibrationDecisions(decisions) {
     }).join("");
     const omitted = decisions.length - visible.length;
     return `<details style="margin-top:10px;" ${decisions.some(decision => !decision.compatible) ? "open" : ""}>
-        <summary style="cursor:pointer;color:#a5b4fc;font-size:.62rem;font-weight:700;letter-spacing:.05em;">MATRIZ DE CALIBRACIÓN · ${decisions.length} LIGHTS</summary>
+        <summary style="cursor:pointer;color:#a5b4fc;font-size:.62rem;font-weight:700;letter-spacing:.05em;">${trFormat("deepsky.calibration_matrix", { count: decisions.length }, `MATRIZ DE CALIBRACIÓN · ${decisions.length} LIGHTS`)}</summary>
         <div style="overflow:auto;max-height:260px;border:1px solid rgba(148,163,184,.12);border-radius:8px;margin-top:4px;">
         <table style="width:100%;border-collapse:collapse;font-size:.58rem;min-width:980px;">
-            <thead style="background:#111827;color:#94a3b8;"><tr><th style="padding:4px 8px;text-align:left;">Light</th><th style="padding:4px 8px;text-align:left;">Estado</th><th style="padding:4px 8px;text-align:left;">Bias</th><th style="padding:4px 8px;text-align:left;">Dark</th><th style="padding:4px 8px;text-align:left;">Dark-flat</th><th style="padding:4px 8px;text-align:left;">Flat</th><th style="padding:4px 8px;text-align:left;">Razón / fallback</th></tr></thead>
+            <thead style="background:#111827;color:#94a3b8;"><tr><th style="padding:4px 8px;text-align:left;">Light</th><th style="padding:4px 8px;text-align:left;">${tr("deepsky.status", "Estado")}</th><th style="padding:4px 8px;text-align:left;">Bias</th><th style="padding:4px 8px;text-align:left;">Dark</th><th style="padding:4px 8px;text-align:left;">Dark-flat</th><th style="padding:4px 8px;text-align:left;">Flat</th><th style="padding:4px 8px;text-align:left;">${tr("deepsky.reason_fallback", "Razón / fallback")}</th></tr></thead>
             <tbody>${rows}</tbody>
-        </table></div>${omitted > 0 ? `<div style="color:#94a3b8;margin-top:4px;">Se muestran 50 de ${decisions.length}; la receta conserva todas.</div>` : ""}
+        </table></div>${omitted > 0 ? `<div style="color:#94a3b8;margin-top:4px;">${trFormat("deepsky.calibration_matrix_truncated", { count: decisions.length }, `Se muestran 50 de ${decisions.length}; la receta conserva todas.`)}</div>` : ""}
     </details>`;
 }
 
@@ -12728,7 +12943,7 @@ function dsGroupAlertMessages(messages) {
 const dsSilencedAlerts = new Set();
 
 function dsFormatPreflight(plan) {
-    if (!plan) return `<span style="color:#94a3b8;">Preparando plan…</span>`;
+    if (!plan) return `<span style="color:#94a3b8;">${tr("deepsky.preparing_plan", "Preparando plan reproducible…")}</span>`;
     if (plan.sessionId) return dsFormatSessionPreflight(plan);
     const errors = plan.errors || [];
     const warnings = plan.warnings || [];
@@ -12741,7 +12956,7 @@ function dsFormatPreflight(plan) {
         .join("");
     const groupRows = groups.map(g => `<div style="padding:5px 0;border-top:1px solid rgba(148,163,184,.1);">
         <b style="color:#e2e8f0;">${g.frameCount} lights · ${g.width}×${g.height}×${g.channels}</b>
-        <span style="color:#64748b;"> · ${escapeHtml(g.bayerPattern || g.filter || "mono/RGB")} · ${escapeHtml(g.filter || "sin filtro")} · ${g.exposureSeconds ?? "?"} s · gain ${g.gain ?? "?"} · bin ${g.binning ?? "?"} · ${g.temperatureC ?? "?"} °C</span>
+        <span style="color:#64748b;"> · ${escapeHtml(g.bayerPattern || g.filter || "mono/RGB")} · ${escapeHtml(g.filter || tr("deepsky.no_filter", "sin filtro"))} · ${g.exposureSeconds ?? "?"} s · gain ${g.gain ?? "?"} · bin ${g.binning ?? "?"} · ${g.temperatureC ?? "?"} °C</span>
     </div>`).join("");
     const alertIcon = (icon) => `<svg class="zas-icon zas-icon-inline" style="margin-top:2px;"><use href="#icon-${icon}"></use></svg>`;
     // Mensajes idénticos salvo el nombre entre comillas se agrupan en UNA
@@ -12787,11 +13002,11 @@ function dsFormatPreflight(plan) {
     ].join("");
     const recommendedKey = plan.recommendedProfile || "balanced";
     const recommendedLabel = {
-        auto: "Auto (receta medida)",
-        fast: "Rápido",
-        balanced: "Equilibrado",
-        maximum_quality: "Máxima calidad",
-        custom: "Personalizado",
+        auto: tr("deepsky.preset_auto_measured", "Auto (receta medida)"),
+        fast: tr("deepsky.preset_fast", "Rápido"),
+        balanced: tr("deepsky.preset_balanced", "Equilibrado"),
+        maximum_quality: tr("deepsky.preset_max", "Máxima calidad"),
+        custom: tr("deepsky.preset_custom", "Personalizado"),
     }[recommendedKey] || recommendedKey;
     const recommendation = (plan.recommendationReasons || [])
         .map(reason => `<div>• ${escapeHtml(reason)}</div>`)
@@ -12821,23 +13036,23 @@ function dsFormatPreflight(plan) {
         ? `${requestedRejection} → ${effectiveRejection}`
         : effectiveRejection;
     return `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:7px;">
-        <b style="color:${plan.valid ? "#6ee7b7" : "#fca5a5"};">${plan.valid ? "Plan válido" : "Requiere atención"}</b>
+        <b style="color:${plan.valid ? "#6ee7b7" : "#fca5a5"};">${plan.valid ? tr("deepsky.plan_valid", "Plan válido") : tr("deepsky.plan_attention", "Requiere atención")}</b>
         <span>${escapeHtml(plan.effectiveEngine || "")}</span>
-        <span style="color:#c4b5fd;">Método real <b>${escapeHtml(methodLabel)}</b></span>
+        <span style="color:#c4b5fd;">${tr("deepsky.effective_method", "Método real")} <b>${escapeHtml(methodLabel)}</b></span>
         <span style="margin-left:auto;color:#7dd3fc;">~${Math.max(1, Math.round(plan.estimatedSeconds || 0))} s</span>
     </div>
     <div style="display:flex;gap:14px;flex-wrap:wrap;color:#94a3b8;margin-bottom:7px;">
         <span>RAM <b style="color:#e2e8f0;">~${plan.estimatedRamMb || 0} MB</b></span>
         <span>VRAM <b style="color:#e2e8f0;">~${plan.estimatedVramMb || 0} MB</b></span>
-        <span>Disco <b style="color:#e2e8f0;">~${plan.estimatedDiskMb || 0} MB</b></span>
-        <span><b style="color:#e2e8f0;">${groups.length}</b> grupo(s)</span>
+        <span>${tr("deepsky.disk", "Disco")} <b style="color:#e2e8f0;">~${plan.estimatedDiskMb || 0} MB</b></span>
+        <span>${trFormat("deepsky.groups_count", { count: `<b style="color:#e2e8f0;">${groups.length}</b>` }, `<b style="color:#e2e8f0;">${groups.length}</b> grupo(s)`)}</span>
         ${plan.gpuName ? `<span>GPU <b style="color:#e2e8f0;">${escapeHtml(plan.gpuName)}</b></span>` : ""}
     </div>
     <div style="margin:0 0 8px;padding:7px 9px;border:1px solid rgba(34,211,238,.2);border-radius:8px;background:rgba(8,145,178,.06);color:#a5f3fc;">
-        <b>Perfil recomendado: ${escapeHtml(recommendedLabel)}</b>
+        <b>${tr("deepsky.recommended_profile", "Perfil recomendado")}: ${escapeHtml(recommendedLabel)}</b>
         ${recommendation ? `<div style="margin-top:3px;color:#94a3b8;line-height:1.45;">${recommendation}</div>` : ""}
     </div>${resolvedBlock}${dsFormatSamplingAdvisor(plan.samplingAdvisor)}${alerts}${groupRows}${dsFormatSessionMap(plan.sessionMap)}${dsFormatCalibrationLinker(plan)}${dsFormatCalibrationDecisions(plan.calibrationDecisions)}<div style="margin-top:8px;">${stages}</div>
-    ${normModel ? `<details style="margin-top:7px;"><summary style="cursor:pointer;color:#a5f3fc;">Modelo de normalización a inspeccionar</summary><div style="padding-top:5px;">${normModel}</div></details>` : ""}`;
+    ${normModel ? `<details style="margin-top:7px;"><summary style="cursor:pointer;color:#a5f3fc;">${tr("deepsky.normalization_model", "Modelo de normalización a inspeccionar")}</summary><div style="padding-top:5px;">${normModel}</div></details>` : ""}`;
 }
 
 // ============ GUÍA INTERACTIVA: qué falta para poder apilar ============
@@ -13020,7 +13235,10 @@ function dsApplyPreparedPlan(plan) {
     document.querySelectorAll("#deepsky-modal .ds-preset").forEach(button => {
         const recommended = button.dataset.preset === recommendedPreset;
         button.classList.toggle("recommended", recommended);
-        if (recommended) button.setAttribute("aria-description", "Recomendado para los datos actuales");
+        if (recommended) button.setAttribute(
+            "aria-description",
+            tr("deepsky.recommended_current", "Recomendado para los datos actuales"),
+        );
         else button.removeAttribute("aria-description");
     });
     // Gating de motores experimentales: si los datos no son elegibles
@@ -13104,6 +13322,7 @@ function dsApplyPreparedPlan(plan) {
     if (wizardScroller) {
         requestAnimationFrame(() => { wizardScroller.scrollTop = wizardScrollTop; });
     }
+    dsRenderSessionOrganizer();
     dsRenderGuide(plan);
     dsSyncWizard();
 }
@@ -13155,7 +13374,7 @@ function dsRenderFrameInspection(rows) {
     if (!panel) return;
     if (!rows?.length) {
         panel.dataset.state = "idle";
-        panel.textContent = "No hay tomas inspeccionables.";
+        panel.textContent = tr("deepsky.inspect_no_frames", "No hay tomas inspeccionables.");
         return;
     }
     const rejected = rows.filter(row => row.rejectable).length;
@@ -13164,18 +13383,18 @@ function dsRenderFrameInspection(rows) {
     const tableRows = rows.map((row, index) => {
         const isDiscarded = dsDiscardedPaths.has(row.path);
         const status = isDiscarded
-            ? `<span style="color:#94a3b8;font-weight:700;text-decoration:line-through;">descartada</span>`
+            ? `<span style="color:#94a3b8;font-weight:700;text-decoration:line-through;">${tr("deepsky.frame_discarded", "descartada")}</span>`
             : row.recommendedReference
-                ? `<span style="color:#fde68a;font-weight:700;">★ referencia</span>`
+                ? `<span style="color:#fde68a;font-weight:700;">★ ${tr("deepsky.frame_reference", "referencia")}</span>`
                 : row.rejectable
-                    ? `<span style="color:#fca5a5;font-weight:700;">revisar</span>`
-                    : `<span style="color:#6ee7b7;">utilizable</span>`;
+                    ? `<span style="color:#fca5a5;font-weight:700;">${tr("deepsky.frame_review", "revisar")}</span>`
+                    : `<span style="color:#6ee7b7;">${tr("deepsky.frame_usable", "utilizable")}</span>`;
         const rowBg = isDiscarded
             ? "opacity:.45;"
             : row.rejectable
                 ? "background:rgba(127,29,29,.08);"
                 : "";
-        return `<tr data-ds-row="${index}" style="border-top:1px solid rgba(148,163,184,.12);cursor:pointer;${rowBg}" title="Clic para ver la toma y el motivo">
+        return `<tr data-ds-row="${index}" style="border-top:1px solid rgba(148,163,184,.12);cursor:pointer;${rowBg}" title="${tr("deepsky.frame_open_hint", "Clic para ver la toma y el motivo")}">
             <td style="padding:6px 7px;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(row.path)}">${escapeHtml(row.name)}</td>
             <td style="padding:6px 7px;text-align:right;">${row.stars}</td>
             <td style="padding:6px 7px;text-align:right;">${Number(row.fwhm || 0).toFixed(2)}</td>
@@ -13183,24 +13402,24 @@ function dsRenderFrameInspection(rows) {
             <td style="padding:6px 7px;text-align:right;color:${row.eccentricity > .55 ? "#fca5a5" : "#cbd5e1"};">${Number(row.eccentricity || 0).toFixed(2)}</td>
             <td style="padding:6px 7px;">${status}${row.rejectionReason ? `<div style="color:#94a3b8;font-size:.58rem;">${escapeHtml(row.rejectionReason)}</div>` : ""}</td>
             <td style="padding:6px 7px;text-align:center;">
-                <button data-ds-discard="${index}" class="secondary" style="font-size:.58rem;padding:2px 8px;border-radius:6px;">${isDiscarded ? "Restaurar" : "Descartar"}</button>
+                <button data-ds-discard="${index}" class="secondary" style="font-size:.58rem;padding:2px 8px;border-radius:6px;">${isDiscarded ? tr("deepsky.frame_restore", "Restaurar") : tr("deepsky.frame_discard", "Descartar")}</button>
             </td>
         </tr>`;
     }).join("");
     panel.dataset.state = rejected ? "error" : "ok";
     panel.innerHTML = `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:7px;">
-        <b style="color:#e2e8f0;">Inspección PSF previa</b>
-        <span style="color:#94a3b8;">${rows.length} tomas · ${rejected} para revisar${discarded ? ` · ${discarded} descartadas a mano` : ""}</span>
-        ${reference ? `<span style="margin-left:auto;color:#fde68a;">Referencia sugerida: ${escapeHtml(reference.name)}</span>` : ""}
+        <b style="color:#e2e8f0;">${tr("deepsky.psf_inspection_title", "Inspección PSF previa")}</b>
+        <span style="color:#94a3b8;">${trFormat("deepsky.psf_inspection_counts", { total: rows.length, review: rejected }, `${rows.length} tomas · ${rejected} para revisar`)}${discarded ? ` · ${trFormat("deepsky.psf_manual_discards", { count: discarded }, `${discarded} descartadas a mano`)}` : ""}</span>
+        ${reference ? `<span style="margin-left:auto;color:#fde68a;">${tr("deepsky.suggested_reference", "Referencia sugerida")}: ${escapeHtml(reference.name)}</span>` : ""}
     </div>
     <div style="overflow:auto;max-height:260px;border:1px solid rgba(148,163,184,.12);border-radius:8px;">
         <table style="width:100%;border-collapse:collapse;font-size:.62rem;min-width:650px;">
             <thead style="position:sticky;top:0;background:#111827;color:#94a3b8;"><tr>
-                <th style="padding:6px 7px;text-align:left;">Toma</th><th>Estrellas</th><th>FWHM</th><th>Ruido</th><th>Ecc</th><th style="text-align:left;padding-left:7px;">Decisión provisional</th><th>Acción</th>
+                <th style="padding:6px 7px;text-align:left;">${tr("deepsky.frame", "Toma")}</th><th>${tr("deepsky.report_stars", "Estrellas")}</th><th>FWHM</th><th>${tr("deepsky.noise", "Ruido")}</th><th>Ecc</th><th style="text-align:left;padding-left:7px;">${tr("deepsky.provisional_decision", "Decisión provisional")}</th><th>${tr("deepsky.action", "Acción")}</th>
             </tr></thead><tbody>${tableRows}</tbody>
         </table>
     </div>
-    <div style="margin-top:6px;color:#64748b;font-size:.58rem;">Clic en una fila para ver la toma estirada y su motivo. "Descartar" la excluye del plan y del apilado (reversible); la decisión final sobre las demás se recalcula con los datos calibrados completos.</div>
+    <div style="margin-top:6px;color:#64748b;font-size:.58rem;">${tr("deepsky.psf_inspection_hint", "Clic en una fila para ver la toma estirada y su motivo. Descartar la excluye del plan y del apilado de forma reversible; la decisión final se recalcula con los datos calibrados completos.")}</div>
     ${dsFormatInspectionDiagnostics()}`;
 
     // Delegación: el tbody se regenera con cada render, los listeners van con él.
@@ -13300,24 +13519,26 @@ async function dsOpenFramePreview(row, allRows) {
     const rowIndex = rows.indexOf(row);
     const reason = row.rejectionReason
         ? escapeHtml(row.rejectionReason)
-        : (row.rejectable ? "Métricas fuera de la mediana del lote" : "Sin observaciones: métricas dentro del lote");
+        : (row.rejectable
+            ? tr("deepsky.frame_reason_outlier", "Métricas fuera de la mediana del lote")
+            : tr("deepsky.frame_reason_ok", "Sin observaciones: métricas dentro del lote"));
     overlay.innerHTML = `<div class="ds-viewer-shell">
         <div class="ds-viewer-bar top">
-            <button id="ds-viewer-prev" class="secondary" style="font-size:.62rem;padding:4px 10px;border-radius:8px;" ${rowIndex > 0 ? "" : "disabled"} title="Toma anterior (flecha izquierda)">‹</button>
-            <button id="ds-viewer-next" class="secondary" style="font-size:.62rem;padding:4px 10px;border-radius:8px;" ${rowIndex >= 0 && rowIndex < rows.length - 1 ? "" : "disabled"} title="Toma siguiente (flecha derecha)">›</button>
+            <button id="ds-viewer-prev" class="secondary" style="font-size:.62rem;padding:4px 10px;border-radius:8px;" ${rowIndex > 0 ? "" : "disabled"} title="${tr("deepsky.previous_frame", "Toma anterior (flecha izquierda)")}">‹</button>
+            <button id="ds-viewer-next" class="secondary" style="font-size:.62rem;padding:4px 10px;border-radius:8px;" ${rowIndex >= 0 && rowIndex < rows.length - 1 ? "" : "disabled"} title="${tr("deepsky.next_frame", "Toma siguiente (flecha derecha)")}">›</button>
             <b style="color:#e2e8f0;font-size:.72rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(row.path)}">${escapeHtml(row.name)}</b>
             <span style="color:#64748b;font-size:.6rem;">${rowIndex + 1}/${rows.length}</span>
             <span style="margin-left:auto;"></span>
-            <button id="ds-viewer-discard" class="secondary" style="font-size:.62rem;padding:4px 12px;border-radius:8px;">${isDiscarded() ? "Restaurar" : "Descartar del apilado"}</button>
-            <button id="ds-viewer-close" class="secondary" style="font-size:.62rem;padding:4px 12px;border-radius:8px;">Cerrar</button>
+            <button id="ds-viewer-discard" class="secondary" style="font-size:.62rem;padding:4px 12px;border-radius:8px;">${isDiscarded() ? tr("deepsky.frame_restore", "Restaurar") : tr("deepsky.discard_from_stack", "Descartar del apilado")}</button>
+            <button id="ds-viewer-close" class="secondary" style="font-size:.62rem;padding:4px 12px;border-radius:8px;">${tr("deepsky.close", "Cerrar")}</button>
         </div>
-        <div id="ds-viewer-body" class="ds-viewer-body">Cargando y estirando la toma…</div>
+        <div id="ds-viewer-body" class="ds-viewer-body">${tr("deepsky.loading_frame", "Cargando y estirando la toma…")}</div>
         <div class="ds-viewer-bar bottom">
-            <span>Estrellas <b>${row.stars}</b></span>
+            <span>${tr("deepsky.report_stars", "Estrellas")} <b>${row.stars}</b></span>
             <span>FWHM <b>${Number(row.fwhm || 0).toFixed(2)}</b></span>
-            <span>Ruido <b>${Math.round(row.noise || 0)}</b></span>
+            <span>${tr("deepsky.noise", "Ruido")} <b>${Math.round(row.noise || 0)}</b></span>
             <span>Ecc <b>${Number(row.eccentricity || 0).toFixed(2)}</b></span>
-            <span style="color:${row.rejectable ? "#fca5a5" : "#6ee7b7"};">Motivo: ${reason}</span>
+            <span style="color:${row.rejectable ? "#fca5a5" : "#6ee7b7"};">${tr("deepsky.reason", "Motivo")}: ${reason}</span>
         </div>
     </div>`;
     overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
@@ -13341,7 +13562,9 @@ async function dsOpenFramePreview(row, allRows) {
     overlay.querySelector("#ds-viewer-discard").addEventListener("click", (e) => {
         if (isDiscarded()) dsDiscardedPaths.delete(row.path);
         else dsDiscardedPaths.add(row.path);
-        e.target.textContent = isDiscarded() ? "Restaurar" : "Descartar del apilado";
+        e.target.textContent = isDiscarded()
+            ? tr("deepsky.frame_restore", "Restaurar")
+            : tr("deepsky.discard_from_stack", "Descartar del apilado");
         const panel = document.getElementById("ds-frame-inspection");
         if (panel) dsPreserveInspectionScroll(panel, () => dsRenderFrameInspection(allRows || dsFrameInspection));
         dsSchedulePreflight(true);
@@ -13353,7 +13576,13 @@ async function dsOpenFramePreview(row, allRows) {
         if (body) body.innerHTML = `<img src="${dataUrl}" style="max-width:100%;max-height:100%;object-fit:contain;" alt="">`;
     } catch (error) {
         const body = overlay.querySelector("#ds-viewer-body");
-        if (body) body.textContent = `No se pudo generar el preview: ${error}`;
+        if (body) {
+            body.textContent = trFormat(
+                "deepsky.preview_failed",
+                { error },
+                `No se pudo generar el preview: ${error}`,
+            );
+        }
     }
 }
 
@@ -13375,7 +13604,7 @@ async function dsInspectFrames(force = false) {
     const panel = document.getElementById("ds-frame-inspection");
     if (panel) {
         panel.dataset.state = "idle";
-        panel.textContent = "Midiendo estrellas, PSF/FWHM, ruido y eccentricidad…";
+        panel.textContent = tr("deepsky.inspecting_frames", "Midiendo estrellas, PSF/FWHM, ruido y eccentricidad…");
     }
     try {
         const report = await invoke("inspect_deepsky_frames", { paths: lights.map(light => light.path) });
@@ -13399,7 +13628,11 @@ async function dsInspectFrames(force = false) {
         if (serial !== dsInspectionSerial) return dsFrameInspection;
         if (panel) {
             panel.dataset.state = "error";
-            panel.textContent = `No se pudo completar la inspección: ${error}`;
+            panel.textContent = trFormat(
+                "deepsky.inspection_failed",
+                { error },
+                `No se pudo completar la inspección: ${error}`,
+            );
         }
         return [];
     }
@@ -13412,7 +13645,10 @@ async function dsPreparePlan() {
         dsPreparedPlan = null;
         for (const id of ["ds-preflight-inspection", "ds-preflight-review"]) {
             const panel = document.getElementById(id);
-            if (panel) { panel.dataset.state = "idle"; panel.textContent = "Añade lights para preparar el plan."; }
+            if (panel) {
+                panel.dataset.state = "idle";
+                panel.textContent = tr("deepsky.preflight_empty", "Añade lights para preparar el plan.");
+            }
         }
         // Sin lights efectivos no hay plan: Ejecutar no puede quedar armado
         // con el estado del último plan válido (auditoría 2026-07-20).
@@ -13431,7 +13667,7 @@ async function dsPreparePlan() {
             panel.classList.add("ds-refreshing");
         } else {
             panel.dataset.state = "idle";
-            panel.textContent = "Leyendo cabeceras y preparando el plan…";
+            panel.textContent = tr("deepsky.reading_headers", "Leyendo cabeceras y preparando el plan…");
         }
     }
     try {
@@ -13505,25 +13741,50 @@ function dsSyncWizard() {
     if (combine) combine.style.display = dsWizardStep === 0 ? "flex" : "none";
     const status = document.getElementById("ds-wizard-status");
     if (status) {
-        const messages = ["selecciona y agrupa los datos", "revisa compatibilidad y calibraciones", "elige perfil u opciones avanzadas", dsPreparedPlan?.valid ? "plan listo para ejecutar" : (dsActiveLights().length ? "corrige las alertas del plan" : "añade lights para preparar el plan")];
-        status.textContent = `Paso ${dsWizardStep + 1} de 4 · ${messages[dsWizardStep]}`;
+        const messageKey = dsWizardStep === 3
+            ? (dsPreparedPlan?.valid
+                ? "footer_ready"
+                : (dsActiveLights().length ? "footer_fix" : "footer_add_lights"))
+            : `footer_${dsWizardStep}`;
+        const fallbacks = {
+            footer_0: "selecciona y agrupa los datos",
+            footer_1: "revisa compatibilidad y calibraciones",
+            footer_2: "elige perfil u opciones avanzadas",
+            footer_ready: "plan listo para ejecutar",
+            footer_fix: "corrige las alertas del plan",
+            footer_add_lights: "añade lights para preparar el plan",
+        };
+        status.textContent = trFormat(
+            "deepsky.footer_status",
+            {
+                current: dsWizardStep + 1,
+                total: 4,
+                message: tr(`deepsky.${messageKey}`, fallbacks[messageKey]),
+            },
+            `Paso ${dsWizardStep + 1} de 4 · ${fallbacks[messageKey]}`,
+        );
     }
     const assistant = document.getElementById("ds-step-assistant");
     const assistantText = document.getElementById("ds-step-assistant-text");
     const assistantProgress = document.getElementById("ds-step-assistant-progress");
     if (assistant && assistantText) {
         const blocked = dsWizardStep === 3 && !!dsActiveLights().length && !dsPreparedPlan?.valid;
-        const messages = [
-            "Añade lights; las calibraciones son opcionales. Zenith agrupará firmas compatibles y evitará mezclas silenciosas.",
-            "Revisa agrupación, PSF y calibraciones. Los avisos explican qué corregir antes de integrar.",
-            "Auto es el punto de partida recomendado. Abre los controles avanzados sólo cuando tu objetivo lo necesite.",
-            dsPreparedPlan?.valid
-                ? "El plan es compatible. Confirma las salidas lineales y ejecuta cuando estés listo."
+        const stepKey = dsWizardStep === 3
+            ? (dsPreparedPlan?.valid
+                ? "step_assistant_ready"
                 : dsActiveLights().length
-                    ? "Hay bloqueos pendientes. La guía te lleva al control exacto que debes corregir."
-                    : "Añade lights para que pueda preparar y validar el plan de integración.",
-        ];
-        assistantText.textContent = messages[dsWizardStep];
+                    ? "step_assistant_blocked"
+                    : "step_assistant_empty")
+            : `step_assistant_${dsWizardStep}`;
+        const fallbacks = {
+            step_assistant_0: "Añade lights; las calibraciones son opcionales. Zenith agrupará firmas compatibles y evitará mezclas silenciosas.",
+            step_assistant_1: "Revisa agrupación, PSF y calibraciones. Los avisos explican qué corregir antes de integrar.",
+            step_assistant_2: "Auto es el punto de partida recomendado. Abre los controles avanzados sólo cuando tu objetivo lo necesite.",
+            step_assistant_ready: "El plan es compatible. Confirma las salidas lineales y ejecuta cuando estés listo.",
+            step_assistant_blocked: "Hay bloqueos pendientes. La guía te lleva al control exacto que debes corregir.",
+            step_assistant_empty: "Añade lights para que pueda preparar y validar el plan de integración.",
+        };
+        assistantText.textContent = tr(`deepsky.${stepKey}`, fallbacks[stepKey]);
         assistant.dataset.state = blocked ? "warning" : "active";
     }
     if (assistantProgress) assistantProgress.textContent = `${dsWizardStep + 1} / 4`;
@@ -13684,6 +13945,8 @@ function dsUpdateUI() {
     for (const s of DS_SECTIONS) {
         const badge = document.getElementById(`ds-${s.kind}-count`);
         const list = document.getElementById(`ds-list-${s.kind}`);
+        const details = document.getElementById(`ds-details-${s.kind}`);
+        const detailsSummary = document.getElementById(`ds-details-summary-${s.kind}`);
         const sub = document.getElementById(`ds-${s.kind}-sub`);
         const files = dsFiles[s.kind];
         const usable = s.kind === "lights" ? lights.length : dsMatchedCalib(s.kind).length;
@@ -13705,6 +13968,14 @@ function dsUpdateUI() {
             }
         }
         if (list) dsRenderFileList(list, s.kind, files, s.kind === "lights" ? null : lightsRef);
+        if (details) details.hidden = files.length === 0;
+        if (detailsSummary) {
+            detailsSummary.textContent = trFormat(
+                "deepsky.view_files",
+                { count: files.length },
+                `Ver ${files.length} ${tr("deepsky.files", "archivos")}`,
+            );
+        }
     }
 
     // Cosmética inteligente: con darks el master ya elimina los píxeles
@@ -13745,6 +14016,7 @@ function dsUpdateUI() {
     // calibra cada light.
     const sum = document.getElementById("ds-match-summary");
     if (sum) dsRenderCalibrationPlan(sum, lights);
+    dsRenderSessionOrganizer();
     dsUpdateMultibandControls();
     dsRenderProcessPreview(); // diagrama + datos técnicos + tiempo estimado
 
@@ -14584,7 +14856,11 @@ function dsSyncStretchBar() {
 // Carpeta raíz → auto-clasificación WBPP (por subcarpetas/nombres).
 async function dsScanFolder() {
     try {
-        const dir = await openDialog({ directory: true, multiple: false, title: "Carpeta raíz de la sesión (auto-clasificar)" });
+        const dir = await openDialog({
+            directory: true,
+            multiple: false,
+            title: tr("deepsky.scan_folder_pick", "Carpeta raíz de la sesión (auto-clasificar)"),
+        });
         if (!dir) return;
         showProcessing(tr("deepsky.scanning", "ESCANEANDO Y CLASIFICANDO..."));
         const cl = await invoke("deepsky_scan_classify", { root: dir });
@@ -14604,22 +14880,40 @@ async function dsScanFolder() {
 }
 
 // Fixture visual reproducible para auditoría responsive. Sólo existe en Vite
-// dev y nunca sustituye lecturas FITS ni respuestas del backend en release.
-if (import.meta.env.DEV) {
+// dev o en un build QA explícito; el build normal lo elimina y nunca sustituye
+// lecturas FITS ni respuestas del backend.
+const DS_UX_FIXTURE_BUILD = import.meta.env.VITE_UX_FIXTURE === "multiband";
+if (import.meta.env.DEV || DS_UX_FIXTURE_BUILD) {
     // Hook de QA visual: permite abrir la ventana de progreso sin apilar.
     window.__dsProgressDemo = () => { dsProgressStart(); dsProgressUpdate("Registro PSF + RANSAC", 42); };
 }
 
 function dsLoadUxFixtureIfRequested(modal) {
-    if (!import.meta.env.DEV || new URLSearchParams(window.location.search).get("ux-fixture") !== "multiband") return;
-    const probe = (name, filter, exptime, temp = -8) => ({
+    const requestedInDev = import.meta.env.DEV
+        && new URLSearchParams(window.location.search).get("ux-fixture") === "multiband";
+    if (!DS_UX_FIXTURE_BUILD && !requestedInDev) return;
+    const probe = (name, filter, exptime, temp = -8, session = null) => ({
         path: `/ux-fixture/${name}.fits`, name: `${name}.fits`, ok: true,
         w: 4144, h: 2822, ch: 1, bayer: "GRBG", filter, exptime,
         gain: 160, binning: 1, temp, error: null,
+        date_obs: session ? `${session}T22:00:00Z` : null,
+        signature: { session },
     });
     dsFiles.lights = [
-        ...Array.from({ length: 53 }, (_, index) => probe(`M42_SV220_Ha_OIII_${String(index + 1).padStart(3, "0")}`, "SV220 Ha OIII", 600, -8.1)),
-        ...Array.from({ length: 72 }, (_, index) => probe(`M42_SV220_SII_OIII_${String(index + 1).padStart(3, "0")}`, "SV220 SII OIII", 600, -8.0)),
+        ...Array.from({ length: 53 }, (_, index) => probe(
+            `M42_SV220_Ha_OIII_${String(index + 1).padStart(3, "0")}`,
+            "SV220 Ha OIII",
+            600,
+            -8.1,
+            index < 27 ? "2026-03-01" : "2026-05-11",
+        )),
+        ...Array.from({ length: 72 }, (_, index) => probe(
+            `M42_SV220_SII_OIII_${String(index + 1).padStart(3, "0")}`,
+            "SV220 SII OIII",
+            600,
+            -8.0,
+            index < 36 ? "2026-03-02" : "2026-05-12",
+        )),
     ];
     dsFiles.darks = Array.from({ length: 20 }, (_, index) => probe(`Dark_600s_${index + 1}`, null, 600));
     dsFiles.flats = [
@@ -14655,7 +14949,9 @@ function dsLoadUxFixtureIfRequested(modal) {
     dsApplyPreparedPlan({
         sessionId: "ux-session", valid: true, totalFrames: 125,
         estimatedRamMb: 620, estimatedVramMb: 410, estimatedDiskMb: 11800, estimatedSeconds: 86,
-        componentFilters: ["HA", "OIII", "SII"], warnings: ["Sesión multibanda: 2 integraciones separadas y coordinadas"], errors: [],
+        componentFilters: ["HA", "OIII", "SII"],
+        warnings: [tr("deepsky.multiband_fixture_warning", "Multiband session: 2 coordinated integrations")],
+        errors: [],
         groups: [
             { id: "ha_oiii", label: "Ha + OIII · 53 lights", filterProfile: "HA_OIII", componentFilters: ["HA", "OIII"], plan: groupPlan(53, 38, 1) },
             { id: "sii_oiii", label: "SII + OIII · 72 lights", filterProfile: "SII_OIII", componentFilters: ["SII", "OIII"], plan: groupPlan(72, 48, 2) },
@@ -14664,7 +14960,21 @@ function dsLoadUxFixtureIfRequested(modal) {
     dsRenderFrameInspection([
         { path: "/ux-fixture/M42_001.fits", name: "M42_SV220_Ha_OIII_001.fits", stars: 386, fwhm: 2.31, noise: 84, eccentricity: .41, score: .94, rejectable: false, recommendedReference: true },
         { path: "/ux-fixture/M42_002.fits", name: "M42_SV220_SII_OIII_002.fits", stars: 352, fwhm: 2.57, noise: 91, eccentricity: .45, score: .89, rejectable: false, recommendedReference: false },
-        { path: "/ux-fixture/M42_003.fits", name: "M42_SV220_SII_OIII_003.fits", stars: 128, fwhm: 4.92, noise: 166, eccentricity: .72, score: .34, rejectable: true, recommendedReference: false, rejectionReason: "FWHM y eccentricidad fuera del rango robusto" },
+        {
+            path: "/ux-fixture/M42_003.fits",
+            name: "M42_SV220_SII_OIII_003.fits",
+            stars: 128,
+            fwhm: 4.92,
+            noise: 166,
+            eccentricity: .72,
+            score: .34,
+            rejectable: true,
+            recommendedReference: false,
+            rejectionReason: tr(
+                "deepsky.fixture_rejection_reason",
+                "FWHM and eccentricity are outside the robust range",
+            ),
+        },
     ]);
 }
 
@@ -14829,7 +15139,10 @@ Motor: ${result.engine} · ${result.framesUsed} usadas · ${result.framesRejecte
             }
         }
     });
-    setTimeout(() => dsLoadUxFixtureIfRequested(modal), 0);
+    // The fixture contains dynamically generated text, so wait for the locale
+    // before rendering it. This prevents mixed-language QA states without
+    // changing the normal production path.
+    void i18nReady.finally(() => dsLoadUxFixtureIfRequested(modal));
 })();
 
 // ============ COMBINAR CANALES (LRGB / SHO / HOO) ============

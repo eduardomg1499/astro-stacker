@@ -48,10 +48,14 @@ struct RgbAlignmentEstimate {
 #[serde(rename_all = "camelCase")]
 struct ArtifactAnalysis {
     sampled_pixels: usize,
+    chroma_sampled_pixels: usize,
     hot_pixels: usize,
     dead_pixels: usize,
     clipped_shadows: usize,
     clipped_highlights: usize,
+    mean_saturation: f32,
+    p95_saturation: f32,
+    chromatic_fraction: f32,
     color_fringe_score: f32,
     ringing_score: f32,
     suggested_deringing_mode: i32,
@@ -341,6 +345,10 @@ fn compute_artifact_analysis(image: &StackResult) -> ArtifactAnalysis {
     let mut fringe_sum = 0.0f64;
     let mut ringing_sum = 0.0f64;
     let mut sampled = 0usize;
+    let mut chroma_sampled = 0usize;
+    let mut saturation_sum = 0.0f64;
+    let mut chromatic_samples = 0usize;
+    let mut saturation_histogram = [0usize; 64];
 
     if w > 2 && h > 2 {
         for linear in (w + 1..total.saturating_sub(w + 1)).step_by(stride) {
@@ -384,6 +392,22 @@ fn compute_artifact_analysis(image: &StackResult) -> ArtifactAnalysis {
             }
             if !image.is_mono {
                 fringe_sum += ((r - g).abs() + (b - g).abs()) as f64 / 131070.0;
+                let maximum = r.max(g).max(b);
+                let minimum = r.min(g).min(b);
+                // Exclude black canvas/sky padding: its read noise is not
+                // evidence that a lunar master contains useful mineral colour.
+                if maximum >= 1024.0 && center >= 512.0 {
+                    let saturation = ((maximum - minimum) / maximum.max(1.0))
+                        .clamp(0.0, 1.0);
+                    saturation_sum += saturation as f64;
+                    chroma_sampled += 1;
+                    if saturation >= 0.02 {
+                        chromatic_samples += 1;
+                    }
+                    let bin = (saturation * (saturation_histogram.len() - 1) as f32)
+                        .round() as usize;
+                    saturation_histogram[bin.min(saturation_histogram.len() - 1)] += 1;
+                }
             }
             let overshoot = (center - local_median).abs() / local_range;
             if overshoot > 1.0 {
@@ -396,6 +420,19 @@ fn compute_artifact_analysis(image: &StackResult) -> ArtifactAnalysis {
     let divisor = sampled.max(1) as f64;
     let ringing_score = (ringing_sum / divisor * 100.0).min(100.0) as f32;
     let color_fringe_score = (fringe_sum / divisor * 100.0).min(100.0) as f32;
+    let mean_saturation = (saturation_sum / chroma_sampled.max(1) as f64) as f32;
+    let saturation_target = ((chroma_sampled as f64 * 0.95).ceil() as usize).max(1);
+    let mut saturation_cumulative = 0usize;
+    let mut p95_bin = 0usize;
+    for (bin, count) in saturation_histogram.iter().enumerate() {
+        saturation_cumulative += count;
+        if saturation_cumulative >= saturation_target {
+            p95_bin = bin;
+            break;
+        }
+    }
+    let p95_saturation = p95_bin as f32 / (saturation_histogram.len() - 1) as f32;
+    let chromatic_fraction = chromatic_samples as f32 / chroma_sampled.max(1) as f32;
     let defect_rate = (hot_pixels + dead_pixels) as f32 / sampled.max(1) as f32;
     let suggested_denoise = (defect_rate * 5000.0).clamp(0.0, 35.0);
     let severity = (ringing_score / 100.0).clamp(0.0, 1.0);
@@ -410,10 +447,14 @@ fn compute_artifact_analysis(image: &StackResult) -> ArtifactAnalysis {
 
     ArtifactAnalysis {
         sampled_pixels: sampled,
+        chroma_sampled_pixels: chroma_sampled,
         hot_pixels,
         dead_pixels,
         clipped_shadows,
         clipped_highlights,
+        mean_saturation,
+        p95_saturation,
+        chromatic_fraction,
         color_fringe_score,
         ringing_score,
         suggested_deringing_mode: suggested_mode,
@@ -949,13 +990,26 @@ fn apply_advanced_postprocess(
     let local_delta = build_local_contrast_delta(data, width, height, params.texture, params.clarity);
 
     data.par_chunks_exact_mut(3).enumerate().for_each(|(pixel_index, pixel)| {
-        let source_mono = (0.2126 * pixel[0] as f32
-            + 0.7152 * pixel[1] as f32
-            + 0.0722 * pixel[2] as f32)
-            / 65535.0;
-        let mut r = (pixel[0] as f32 / 65535.0 - black) / (white - black);
-        let mut g = (pixel[1] as f32 / 65535.0 - black) / (white - black);
-        let mut b = (pixel[2] as f32 / 65535.0 - black) / (white - black);
+        let source_r = pixel[0] as f32 / 65535.0;
+        let source_g = pixel[1] as f32 / 65535.0;
+        let source_b = pixel[2] as f32 / 65535.0;
+        let source_mono = 0.2126 * source_r + 0.7152 * source_g + 0.0722 * source_b;
+        let source_maximum = source_r.max(source_g).max(source_b);
+        let source_minimum = source_r.min(source_g).min(source_b);
+        let source_saturation = if source_maximum > 1e-6 {
+            (source_maximum - source_minimum) / source_maximum
+        } else {
+            0.0
+        };
+        let source_chroma_evidence =
+            post_smoothstep(0.003, 0.08, source_saturation);
+        let source_tonal_gate = post_smoothstep(0.025, 0.16, source_mono)
+            * (1.0 - post_smoothstep(0.9, 1.0, source_mono) * 0.75);
+        let chroma_confidence =
+            (source_chroma_evidence * source_tonal_gate).clamp(0.0, 1.0);
+        let mut r = (source_r - black) / (white - black);
+        let mut g = (source_g - black) / (white - black);
+        let mut b = (source_b - black) / (white - black);
         r = r.clamp(0.0, 1.0).powf(1.0 / mid) * exposure;
         g = g.clamp(0.0, 1.0).powf(1.0 / mid) * exposure;
         b = b.clamp(0.0, 1.0).powf(1.0 / mid) * exposure;
@@ -1013,7 +1067,11 @@ fn apply_advanced_postprocess(
                 0.0
             };
             let vibrance_factor = if vibrance >= 0.0 {
-                1.0 + vibrance * (1.0 - current_saturation) * 1.25
+                1.0
+                    + vibrance
+                        * (1.0 - current_saturation)
+                        * 0.9
+                        * chroma_confidence.sqrt()
             } else {
                 1.0 + vibrance
             };
@@ -1023,18 +1081,28 @@ fn apply_advanced_postprocess(
 
             if hsl_active && chroma > 1e-6 {
                 let (hue, saturation, lightness) = rgb_to_hsl(r, g, b);
-                let hue_adjustment = interpolate_hue_control(&params.hsl_hue, hue) / 12.0;
+                let hue_adjustment = interpolate_hue_control(&params.hsl_hue, hue)
+                    / 12.0
+                    * chroma_confidence.sqrt();
                 let saturation_adjustment = interpolate_hue_control(&params.hsl_saturation, hue);
                 let luminance_adjustment = interpolate_hue_control(&params.hsl_luminance, hue);
                 let adjusted_saturation = if saturation_adjustment >= 0.0 {
-                    saturation + saturation_adjustment * (1.0 - saturation)
+                    let evidence = chroma_confidence.sqrt()
+                        * (0.45 + 0.55 * post_smoothstep(0.03, 0.25, saturation));
+                    saturation + saturation_adjustment * evidence * (1.0 - saturation)
                 } else {
                     saturation * (1.0 + saturation_adjustment)
                 };
+                let luminance_evidence = 0.25 + 0.75 * chroma_confidence.sqrt();
                 let adjusted_lightness = if luminance_adjustment >= 0.0 {
-                    lightness + luminance_adjustment * (1.0 - lightness) * 0.42
+                    lightness
+                        + luminance_adjustment
+                            * luminance_evidence
+                            * (1.0 - lightness)
+                            * 0.42
                 } else {
-                    lightness * (1.0 + luminance_adjustment * 0.42)
+                    lightness
+                        * (1.0 + luminance_adjustment * luminance_evidence * 0.42)
                 };
                 (r, g, b) = hsl_to_rgb(
                     hue + hue_adjustment,
@@ -1348,6 +1416,29 @@ mod postprocess_io_tests {
     }
 
     #[test]
+    fn artifact_analysis_measures_signal_chroma_without_black_canvas() {
+        let (width, height) = (32usize, 32usize);
+        let mut data = vec![0u16; width * height * 3];
+        for y in 4..28 {
+            for x in 4..28 {
+                let index = (y * width + x) * 3;
+                data[index..index + 3].copy_from_slice(&[32_000, 30_000, 27_000]);
+            }
+        }
+        let analysis = compute_artifact_analysis(&StackResult {
+            data,
+            width,
+            height,
+            is_mono: false,
+            is_surface: true,
+        });
+        assert!(analysis.chroma_sampled_pixels > 400);
+        assert!(analysis.mean_saturation > 0.1);
+        assert!(analysis.p95_saturation > 0.1);
+        assert!(analysis.chromatic_fraction > 0.9);
+    }
+
+    #[test]
     fn monochrome_detection_samples_beyond_neutral_canvas_padding() {
         let mut data = vec![0u16; 600 * 3];
         data[15..18].copy_from_slice(&[8000, 16000, 32000]);
@@ -1643,6 +1734,35 @@ mod postprocess_io_tests {
         assert!(green[1] <= 12000, "SCNR debe limitar el exceso verde a la referencia R/B");
         assert_eq!(green[0], 10000);
         assert_eq!(green[2], 12000);
+    }
+
+    #[test]
+    fn positive_colour_controls_do_not_colourize_neutral_lunar_noise() {
+        let mut neutral_noise = vec![30_000u16, 30_030, 29_970];
+        let before = neutral_noise.clone();
+        let mut params = AdvancedColorParams::default();
+        params.vibrance = 0.9;
+        params.hsl_saturation = [0.7; 8];
+        apply_advanced_postprocess(&mut neutral_noise, 1, 1, false, &params);
+        let range_before = before.iter().max().unwrap() - before.iter().min().unwrap();
+        let range_after =
+            neutral_noise.iter().max().unwrap() - neutral_noise.iter().min().unwrap();
+        assert!(
+            range_after <= range_before + 3,
+            "el ruido casi neutro no debe convertirse en bandas cromáticas"
+        );
+
+        let mut measured_colour = vec![36_000u16, 28_000, 20_000];
+        let colour_before = measured_colour.clone();
+        apply_advanced_postprocess(&mut measured_colour, 1, 1, false, &params);
+        let colour_range_before =
+            colour_before.iter().max().unwrap() - colour_before.iter().min().unwrap();
+        let colour_range_after =
+            measured_colour.iter().max().unwrap() - measured_colour.iter().min().unwrap();
+        assert!(
+            colour_range_after > colour_range_before,
+            "el color medido sí debe responder al preset mineral"
+        );
     }
 
     #[test]

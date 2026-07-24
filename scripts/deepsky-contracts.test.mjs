@@ -131,7 +131,12 @@ test("balanced preset mirrors the backend resolved profile (winsorized)", () => 
         /balanced:\s*\{[^}]*rejection:\s*"winsorized"/,
         "DS_PRESETS.balanced must match PipelineProfile::Balanced (winsorized)",
     );
-    assert.match(html, /<b>Equilibrado<\/b>[^<]*Winsorized/);
+    assert.match(
+        html,
+        /<b data-i18n="deepsky\.preset_balanced">Equilibrado<\/b>\s*<span data-i18n="deepsky\.profile_balanced_note">[^<]*Winsorized/,
+    );
+    assert.match(en.deepsky.profile_balanced_note, /Winsorized/);
+    assert.match(es.deepsky.profile_balanced_note, /Winsorized/);
 });
 
 test("session results render the typed scientific bundle manifest", () => {

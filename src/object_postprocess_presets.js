@@ -77,12 +77,18 @@ export const OBJECT_FINISHING_PRESETS = Object.freeze({
       blend: 86,
       advanced: {
         toneCurvePoints: [[0, 0], [.2, .17], [.5, .53], [.82, .86], [1, 1]],
-        highlights: -.15,
+        shadows: -.03,
+        highlights: -.2,
+        whites: -.08,
         texture: .12,
         clarity: .08,
-        vibrance: .62,
-        hslSaturation: [.18, .3, .26, .08, .22, .34, .28, .2],
-        hslLuminance: [0, .04, .05, 0, .02, -.04, -.02, 0],
+        // Mineral colour must reveal measured chroma, not manufacture colour
+        // from near-neutral read noise. The adaptive pass scales these modest
+        // maxima from the actual master and the Rust pipeline adds a per-pixel
+        // chroma/tonal confidence gate.
+        vibrance: .34,
+        hslSaturation: [.035, .07, .06, .015, .04, .09, .075, .04],
+        hslLuminance: [0, .018, .02, 0, .01, -.018, -.01, 0],
       },
     },
   },
@@ -219,6 +225,7 @@ export function adaptObjectFinishingPreset(name, input = {}) {
   );
   const noiseBoost = analysis.noiseStress * 9 + analysis.ringing * 3;
   const highlightGuard = analysis.highlightStress;
+  let adaptiveColorScale = 1;
 
   pipeline.w = scaledBands(pipeline.w, detailScale);
   pipeline.d = (pipeline.d || []).map((value, index) => roundAdaptive(
@@ -299,16 +306,28 @@ export function adaptObjectFinishingPreset(name, input = {}) {
       -0.04 - highlightGuard * 0.12,
     ), 3);
   }
-  if (preset.intent === "creative" && analysis.noiseStress + highlightGuard > 0.2) {
-    const colorScale = clampAdaptive(
-      1 - analysis.noiseStress * 0.28 - highlightGuard * 0.24,
-      0.58,
-      1,
+  if (preset.intent === "creative") {
+    const baseColorScale = name === "lunar-mineral"
+      ? (analysis.chromaMeasured
+          ? 0.12 + analysis.chromaEvidence * 0.72
+          : 0.38)
+      : 1;
+    adaptiveColorScale = clampAdaptive(
+      baseColorScale
+        * (1
+          - analysis.noiseStress * 0.42
+          - highlightGuard * 0.24
+          - analysis.chromaStress * (name === "lunar-mineral" ? 0.5 : 0.2)),
+      name === "lunar-mineral" ? 0.08 : 0.55,
+      name === "lunar-mineral" ? 0.72 : 1,
     );
-    advanced.vibrance = roundAdaptive(Number(advanced.vibrance || 0) * colorScale, 3);
+    advanced.vibrance = roundAdaptive(
+      Number(advanced.vibrance || 0) * adaptiveColorScale,
+      3,
+    );
     if (Array.isArray(advanced.hslSaturation)) {
       advanced.hslSaturation = advanced.hslSaturation
-        .map((value) => roundAdaptive(Number(value || 0) * colorScale, 3));
+        .map((value) => roundAdaptive(Number(value || 0) * adaptiveColorScale, 3));
     }
   }
   pipeline.advanced = advanced;
@@ -316,6 +335,7 @@ export function adaptObjectFinishingPreset(name, input = {}) {
     ...analysis,
     detailScale: roundAdaptive(detailScale, 2),
     deconvScale: roundAdaptive(deconvScale, 2),
+    colorScale: roundAdaptive(adaptiveColorScale, 2),
   };
   return preset;
 }
