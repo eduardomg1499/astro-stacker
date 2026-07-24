@@ -1400,15 +1400,24 @@
             border-radius: 13px; background: rgba(15,23,42,.72);
         }
         #deepsky-modal .ds-wizard-step {
-            width: auto; min-height: 42px; padding: 7px 8px; display: flex; align-items: center;
-            justify-content: center; gap: 7px; border: 1px solid transparent; border-radius: 9px;
+            width: auto; min-height: 46px; padding: 6px 8px; display: grid;
+            grid-template-columns:21px minmax(0,1fr); grid-template-rows:auto auto;
+            align-items:center; column-gap:7px; row-gap:1px; border: 1px solid transparent; border-radius: 9px;
             background: transparent; color: #94a3b8; font: 600 .72rem/1.25 inherit; cursor: pointer;
             text-transform: none; letter-spacing: 0;
         }
-        #deepsky-modal .ds-wizard-step > span:last-child { min-width:0; overflow-wrap:normal; }
+        #deepsky-modal .ds-wizard-step .ds-step-label { min-width:0; overflow-wrap:normal; }
+        #deepsky-modal .ds-wizard-step .ds-step-state {
+            grid-column:2; color:#64748b; font-size:.48rem; font-weight:800;
+            letter-spacing:.08em; line-height:1.1; text-transform:uppercase;
+        }
+        #deepsky-modal .ds-wizard-step[data-state="ready"] .ds-step-state { color:#6ee7b7; }
+        #deepsky-modal .ds-wizard-step[data-state="review"] .ds-step-state { color:#fcd34d; }
+        #deepsky-modal .ds-wizard-step[data-state="pending"] .ds-step-state { color:#64748b; }
         #deepsky-modal .ds-wizard-step .ds-step-n {
             /* flex:0 0 auto: sin él, el círculo se ENCOGÍA con etiquetas
                largas y quedaba ovalado. */
+            grid-column:1; grid-row:1 / 3;
             flex: 0 0 21px; width: 21px; height: 21px; display: inline-grid; place-items: center;
             border-radius: 50%; background: #1e293b; color: #94a3b8; font-size: .62rem;
             transition: background .2s ease, color .2s ease;
@@ -1421,6 +1430,8 @@
         #deepsky-modal .ds-wizard-step.active .ds-step-n { background: #7c3aed; color: white; }
         #deepsky-modal .ds-wizard-step.done { color: #a7f3d0; }
         #deepsky-modal .ds-wizard-step.done .ds-step-n { background: #047857; color: white; }
+        #deepsky-modal .ds-wizard-step.active.done { color:#f5f3ff; }
+        #deepsky-modal .ds-wizard-step.active.done .ds-step-n { background:#7c3aed; color:white; }
         #deepsky-modal .ds-step-assistant {
             flex: 0 0 auto; display: grid; grid-template-columns: 26px minmax(0, 1fr) auto;
             align-items: center; gap: 10px; margin: 0 5px 10px; padding: 9px 12px;
@@ -1472,13 +1483,16 @@
             background:rgba(148,163,184,.08); border:1px solid rgba(148,163,184,.3); color:#94a3b8; cursor:pointer;
         }
         #deepsky-modal .ds-mini-btn:hover, #ds-guide .ds-mini-btn:hover { background:rgba(148,163,184,.18); color:#cbd5e1; }
-        /* Guía interactiva flotante: bloqueos actuales con salto al control. */
-        #ds-guide { position:absolute; right:16px; bottom:74px; z-index:60; width:min(380px,86%); background:rgba(10,14,26,.97); border:1px solid rgba(124,58,237,.4); border-radius:12px; padding:9px 11px; box-shadow:0 14px 44px rgba(0,0,0,.55); font-size:.62rem; }
+        /* La guía vive en un carril reservado entre el contenido y el footer:
+           nunca vuelve a cubrir noches, alertas ni el CTA principal. */
+        #deepsky-modal .ds-guide-dock { flex:0 0 auto; min-height:0; margin:0 4px 9px; }
+        #deepsky-modal .ds-guide-dock:empty { display:none; }
+        #ds-guide { position:relative; z-index:2; width:100%; background:rgba(10,14,26,.94); border:1px solid rgba(124,58,237,.4); border-radius:12px; padding:9px 11px; box-shadow:0 8px 22px rgba(0,0,0,.28); font-size:.62rem; }
         #ds-guide .ds-guide-head { display:flex; align-items:center; gap:7px; color:#e2e8f0; }
         #ds-guide .ds-guide-head b { letter-spacing:.04em; }
         #ds-guide #ds-guide-toggle { margin-left:auto; background:none; border:1px solid rgba(148,163,184,.3); color:#94a3b8; border-radius:6px; font-size:.56rem; padding:1px 8px; cursor:pointer; width:auto; }
         #ds-guide.collapsed .ds-guide-body { display:none; }
-        #ds-guide .ds-guide-body { max-height:44vh; overflow-y:auto; overscroll-behavior:contain; padding-right:2px; }
+        #ds-guide .ds-guide-body { max-height:16vh; overflow-y:auto; overscroll-behavior:contain; padding-right:2px; }
         /* Rejilla punto|texto y el botón SIEMPRE en su propia línea alineado a
            la derecha: antes botón y texto competían y se cortaban. */
         #ds-guide .ds-guide-item { display:grid; grid-template-columns:8px 1fr; gap:3px 8px; align-items:start; margin-top:8px; padding-bottom:8px; border-bottom:1px solid rgba(148,163,184,.08); color:#cbd5e1; line-height:1.45; }
@@ -1554,9 +1568,12 @@
         }
         #deepsky-modal .ds-session-action-icon {
             width:42px; height:42px; display:grid; place-items:center; border-radius:12px;
-            border:1px solid currentColor; background:rgba(2,6,23,.24);
+            border:1px solid currentColor; background:rgba(2,6,23,.24); padding:0; line-height:0;
         }
-        #deepsky-modal .ds-session-action-icon svg { width:20px; height:20px; }
+        #deepsky-modal .ds-session-action-icon .zas-icon {
+            width:20px; height:20px; display:block; position:static; margin:0 !important;
+            transform:none !important; flex:none;
+        }
         #deepsky-modal .ds-session-action-copy { min-width:0; display:flex; flex-direction:column; gap:2px; }
         #deepsky-modal .ds-session-action-kicker {
             color:#94a3b8; font-size:.55rem; font-weight:800; letter-spacing:.14em; text-transform:uppercase;
@@ -1605,6 +1622,22 @@
         #deepsky-modal .ds-source-kind summary::-webkit-details-marker { display:none; }
         #deepsky-modal .ds-source-kind summary::before { content:"▸"; display:inline-block; margin-right:6px; color:#a78bfa; transition:transform .15s ease; }
         #deepsky-modal .ds-source-kind details[open] summary::before { transform:rotate(90deg); }
+        #deepsky-modal .ds-kind-action {
+            flex:0 0 42px; width:42px; height:42px; min-width:42px; min-height:42px;
+            margin:0; padding:0; display:grid; place-items:center; align-self:center;
+            border:1px solid #334155; border-radius:10px; background:rgba(15,23,42,.65);
+            color:#94a3b8; cursor:pointer; line-height:0;
+        }
+        #deepsky-modal .ds-kind-action:hover { color:#e2e8f0; border-color:#64748b; background:rgba(51,65,85,.45); }
+        #deepsky-modal .ds-kind-action[data-action="clear"]:hover { color:#fca5a5; border-color:rgba(248,113,113,.45); }
+        #deepsky-modal .ds-kind-action .zas-icon { width:17px; height:17px; display:block; margin:0 !important; transform:none !important; filter:none; }
+        #deepsky-modal .ds-auto-classify-report {
+            display:flex; align-items:flex-start; gap:9px; margin:-3px 3px 12px; padding:9px 11px;
+            border:1px solid rgba(52,211,153,.25); border-radius:10px; background:rgba(6,95,70,.08);
+            color:#a7f3d0; font-size:.64rem; line-height:1.45;
+        }
+        #deepsky-modal .ds-auto-classify-report[hidden] { display:none; }
+        #deepsky-modal .ds-auto-classify-report .zas-icon { margin:1px 0 0 !important; color:#34d399; flex:none; }
         #deepsky-modal .ds-session-organizer { margin:12px 0 14px; padding:12px; border:1px solid rgba(56,189,248,.2); border-radius:14px; background:linear-gradient(145deg,rgba(14,165,233,.06),rgba(124,58,237,.045)); text-align:left; }
         #deepsky-modal .ds-session-organizer[hidden] { display:none; }
         #deepsky-modal .ds-session-organizer-head { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; margin-bottom:10px; }
@@ -1624,6 +1657,12 @@
         #deepsky-modal .ds-calibration-chip { min-width:0; padding:5px 7px; border-radius:8px; border:1px solid rgba(148,163,184,.14); color:#94a3b8; font-size:.59rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
         #deepsky-modal .ds-calibration-chip.confirmed { color:#6ee7b7; border-color:rgba(52,211,153,.28); background:rgba(6,95,70,.09); }
         #deepsky-modal .ds-calibration-chip.pending { color:#fcd34d; border-color:rgba(251,191,36,.22); background:rgba(120,53,15,.08); }
+        #deepsky-modal .ds-session-flow-label { display:flex; align-items:center; gap:5px; margin:3px 0 6px; color:#64748b; font-size:.53rem; text-transform:uppercase; letter-spacing:.06em; }
+        #deepsky-modal .ds-session-toggle {
+            width:auto; min-height:38px; margin:10px auto 0; padding:7px 13px; display:flex; align-items:center; justify-content:center;
+            border:1px solid rgba(167,139,250,.3); border-radius:9px; background:rgba(124,58,237,.09);
+            color:#c4b5fd; font-size:.61rem; font-weight:800; cursor:pointer;
+        }
         #deepsky-modal .ds-multiband-card { margin:0 0 12px; padding:13px 15px; border:1px solid rgba(45,212,191,.26); border-radius:13px; background:rgba(13,148,136,.06); }
         #deepsky-modal .ds-multiband-card > label { display:flex; gap:10px; align-items:flex-start; color:#e2e8f0; font-size:.76rem; font-weight:700; }
         #deepsky-modal .ds-multiband-card small { display:block; margin:4px 0 11px 32px; color:#94a3b8; font-size:.7rem; line-height:1.45; }
@@ -1654,6 +1693,27 @@
         #deepsky-modal .ds-alert { margin-top:7px; padding:7px 9px; border-radius:8px; }
         #deepsky-modal .ds-alert.warn { color:#fde68a; background:rgba(245,158,11,.08); }
         #deepsky-modal .ds-alert.error { color:#fecaca; background:rgba(239,68,68,.09); }
+        #deepsky-modal .ds-recipe-impact {
+            margin:0 0 12px; padding:12px 14px; border:1px solid rgba(34,211,238,.22);
+            border-radius:12px; background:linear-gradient(135deg,rgba(8,145,178,.08),rgba(79,70,229,.055));
+        }
+        #deepsky-modal .ds-recipe-impact[hidden] { display:none; }
+        #deepsky-modal .ds-impact-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:8px; }
+        #deepsky-modal .ds-impact-head strong { color:#cffafe; font-size:.76rem; }
+        #deepsky-modal .ds-impact-head span { color:#94a3b8; font-size:.62rem; }
+        #deepsky-modal .ds-impact-metrics { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; }
+        #deepsky-modal .ds-impact-metrics span { padding:7px 8px; border:1px solid rgba(148,163,184,.14); border-radius:8px; color:#94a3b8; font-size:.58rem; }
+        #deepsky-modal .ds-impact-metrics b { display:block; margin-top:2px; color:#e2e8f0; font-size:.67rem; }
+        #deepsky-modal .ds-impact-reasons { margin:8px 0 0; color:#94a3b8; font-size:.62rem; line-height:1.45; }
+        #deepsky-modal .ds-review-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-bottom:10px; }
+        #deepsky-modal .ds-review-card { min-width:0; padding:10px 11px; border:1px solid rgba(148,163,184,.16); border-radius:10px; background:rgba(2,6,23,.34); }
+        #deepsky-modal .ds-review-card strong { display:block; color:#e2e8f0; font-size:.68rem; margin-bottom:5px; }
+        #deepsky-modal .ds-review-card span, #deepsky-modal .ds-review-card div { color:#94a3b8; font-size:.61rem; line-height:1.45; }
+        #deepsky-modal .ds-review-card[data-state="ready"] { border-color:rgba(52,211,153,.25); }
+        #deepsky-modal .ds-review-card[data-state="review"] { border-color:rgba(251,191,36,.3); }
+        #deepsky-modal .ds-review-technical { margin-top:8px; border-top:1px solid rgba(148,163,184,.13); padding-top:8px; }
+        #deepsky-modal .ds-review-technical > summary { cursor:pointer; color:#a5b4fc; font-size:.63rem; font-weight:800; }
+        #deepsky-modal .ds-review-technical-body { padding-top:9px; }
         #deepsky-modal .ds-quality-panel { margin-top:12px; padding:14px; border:1px solid rgba(56,189,248,.22); border-radius:13px; background:rgba(14,116,144,.06); }
         #deepsky-modal .ds-quality-title > span { max-width:55%; text-align:right; overflow-wrap:anywhere; }
         #deepsky-modal .ds-quality-card { padding:11px 12px; border-top:1px solid rgba(148,163,184,.13); }
@@ -1670,6 +1730,7 @@
             #deepsky-modal .ds-session-actions, #deepsky-modal .ds-source-grid, #deepsky-modal .ds-night-list { grid-template-columns:1fr; }
             #deepsky-modal .ds-frame-groups-head { align-items:flex-start; flex-direction:column; gap:6px; }
             #deepsky-modal .ds-frame-drag-hint { justify-content:flex-start; text-align:left; }
+            #deepsky-modal .ds-impact-metrics, #deepsky-modal .ds-review-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
         }
         @media (max-width: 520px) {
             #deepsky-modal .ds-session-action { grid-template-columns:38px minmax(0,1fr); min-height:72px; }
@@ -1707,10 +1768,10 @@
                         estrellas, rechazo de satélites y estiramiento: automáticos.</p>
                     <nav class="ds-wizard-steps" aria-label="Etapas del apilado"
                         data-i18n-aria-label="deepsky.steps_aria">
-                        <button type="button" class="ds-wizard-step active" data-step="0" aria-current="step"><span class="ds-step-n">1</span><span data-i18n="deepsky.step_data">Datos</span></button>
-                        <button type="button" class="ds-wizard-step" data-step="1"><span class="ds-step-n">2</span><span data-i18n="deepsky.step_inspect">Inspección de tomas</span></button>
-                        <button type="button" class="ds-wizard-step" data-step="2"><span class="ds-step-n">3</span><span data-i18n="deepsky.step_recipe">Receta</span></button>
-                        <button type="button" class="ds-wizard-step" data-step="3"><span class="ds-step-n">4</span><span data-i18n="deepsky.step_review">Revisar y apilar</span></button>
+                        <button type="button" class="ds-wizard-step active" data-step="0" data-state="pending" aria-current="step"><span class="ds-step-n">1</span><span class="ds-step-label" data-i18n="deepsky.step_data">Datos</span><span class="ds-step-state" data-i18n="deepsky.state_pending">Pendiente</span></button>
+                        <button type="button" class="ds-wizard-step" data-step="1" data-state="pending"><span class="ds-step-n">2</span><span class="ds-step-label" data-i18n="deepsky.step_inspect">Inspección de tomas</span><span class="ds-step-state" data-i18n="deepsky.state_pending">Pendiente</span></button>
+                        <button type="button" class="ds-wizard-step" data-step="2" data-state="pending"><span class="ds-step-n">3</span><span class="ds-step-label" data-i18n="deepsky.step_recipe">Receta</span><span class="ds-step-state" data-i18n="deepsky.state_pending">Pendiente</span></button>
+                        <button type="button" class="ds-wizard-step" data-step="3" data-state="pending"><span class="ds-step-n">4</span><span class="ds-step-label" data-i18n="deepsky.step_review">Revisar y apilar</span><span class="ds-step-state" data-i18n="deepsky.state_pending">Pendiente</span></button>
                     </nav>
                 </header>
                 <aside id="ds-step-assistant" class="ds-step-assistant" data-state="active" aria-live="polite">
@@ -1741,6 +1802,7 @@
                 <div id="ds-session-actions" class="ds-session-actions"
                     role="group" aria-label="Carpetas de la sesión"
                     data-i18n-aria-label="deepsky.session_folders_aria"></div>
+                <div id="ds-auto-classify-report" class="ds-auto-classify-report" hidden role="status" aria-live="polite"></div>
 
                 <!-- GRUPOS DE TOMAS: categorías científicas y reclasificación. -->
                 <div class="ds-frame-groups-head">
@@ -1786,6 +1848,7 @@
                     <div class="ds-profile-note"><b data-i18n="deepsky.preset_balanced">Equilibrado</b><span data-i18n="deepsky.profile_balanced_note">Lanczos-3, escala robusta y rechazo Winsorized.</span></div>
                     <div class="ds-profile-note"><b data-i18n="deepsky.preset_max">Máxima calidad</b><span data-i18n="deepsky.profile_max_note">Winsorized y normalización local; exige más RAM/CPU.</span></div>
                 </div>
+                <section id="ds-recipe-impact" class="ds-recipe-impact" hidden aria-live="polite"></section>
 
                 <div id="ds-multiband-options" class="ds-multiband-card" hidden>
                     <label>
@@ -2043,6 +2106,7 @@
                 </section>
                 </div>
 
+                <div id="ds-guide-dock" class="ds-guide-dock" aria-live="polite"></div>
                 <footer class="ds-wizard-footer">
                 <button id="btn-deepsky-prev" type="button" data-i18n="deepsky.previous">← Anterior</button>
                 <span id="ds-wizard-status" class="ds-footer-status" aria-live="polite" data-i18n="deepsky.footer_step_0">Paso 1 de 4 · selecciona los datos</span>

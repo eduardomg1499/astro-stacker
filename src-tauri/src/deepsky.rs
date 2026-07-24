@@ -7495,6 +7495,9 @@ struct DsProbe {
     binning: Option<i32>,     // XBINNING
     filter: Option<String>,   // FILTER
     date_obs: Option<String>, // DATE-OBS (inicio de exposición) — sesiones/noches
+    #[serde(rename = "frameType")]
+    frame_type: Option<String>, // IMAGETYP / OBSTYPE / FRAME
+    object: Option<String>,    // OBJECT (p. ej. FlatWizard de N.I.N.A.)
     signature: pipeline::CalibrationSignature,
     #[serde(rename = "storeLayout")]
     store_layout: Option<pipeline::StoreLayout>,
@@ -7715,17 +7718,77 @@ fn ds_source_fingerprint(groups: &[&[String]]) -> String {
     format!("{:016x}", h.finish())
 }
 
-/// Classify a path into a frame bucket by WBPP-style keyword matching. The
-/// FILENAME is checked FIRST and wins over the folder — a file named
-/// "…DARK_600s.tif" sitting in a "Bias" folder is a dark (this exact case put
-/// darks in bias before). Only if the filename has no frame-type keyword do we
-/// fall back to the folder path.
+fn ds_has_explicit_dark_flat_marker(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    let spaced = lowered
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    let words = spaced.split_whitespace().collect::<Vec<_>>();
+    words
+        .windows(2)
+        .any(|pair| matches!(pair, ["dark", "flat"] | ["flat", "dark"]))
+        || lowered.contains("darkflat")
+        || lowered.contains("flatdark")
+}
+
+fn ds_classify_header(
+    path: &str,
+    frame_type: Option<&str>,
+    object: Option<&str>,
+) -> Option<&'static str> {
+    let role = frame_type?.trim().to_ascii_lowercase();
+    if role.is_empty() {
+        return None;
+    }
+    if ds_has_explicit_dark_flat_marker(&role) {
+        return Some("dark_flats");
+    }
+    if role.contains("bias") || role.contains("offset") {
+        return Some("bias");
+    }
+    if role.contains("flat") {
+        return Some("flats");
+    }
+    if role.contains("dark") {
+        // N.I.N.A. writes dark-flat captures as IMAGETYP='DARK' and
+        // OBJECT='FlatWizard'. Their filenames are otherwise indistinguishable
+        // from the illuminated flats. Combining both independent header facts
+        // is deterministic and avoids unsafe brightness thresholds.
+        let flat_wizard = object
+            .map(|value| value.to_ascii_lowercase().contains("flatwizard"))
+            .unwrap_or(false);
+        if flat_wizard || ds_has_explicit_dark_flat_marker(path) {
+            return Some("dark_flats");
+        }
+        return Some("darks");
+    }
+    if role.contains("light") || role.contains("object") {
+        return Some("lights");
+    }
+    None
+}
+
+/// Classify a path into a frame bucket by WBPP-style keyword matching.
+/// Explicit compound roles in a folder (Dark Flat / Flat-Dark) win over a
+/// generic capture-tool token such as `FlatWizard` in the filename. Otherwise
+/// a specific filename still wins over its parent folder.
 fn ds_classify(path: &str) -> &'static str {
     let fname = std::path::Path::new(path)
         .file_name()
         .map(|s| s.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     let full = path.to_lowercase();
+
+    if ds_has_explicit_dark_flat_marker(&full) {
+        return "dark_flats";
+    }
 
     let check = |s: &str| -> Option<&'static str> {
         let has_flat = s.contains("flat");
@@ -7754,6 +7817,15 @@ fn ds_classify(path: &str) -> &'static str {
     check(&fname).or_else(|| check(&full)).unwrap_or("lights")
 }
 
+fn ds_classify_probe(probe: &DsProbe) -> &'static str {
+    ds_classify_header(
+        &probe.path,
+        probe.frame_type.as_deref(),
+        probe.object.as_deref(),
+    )
+    .unwrap_or_else(|| ds_classify(&probe.path))
+}
+
 #[derive(serde::Serialize)]
 struct DsClassified {
     lights: Vec<DsProbe>,
@@ -7779,7 +7851,7 @@ fn deepsky_scan_classify(root: String) -> DsClassified {
         bias: vec![],
     };
     for pr in probes {
-        match ds_classify(&pr.path) {
+        match ds_classify_probe(&pr) {
             "bias" => out.bias.push(pr),
             "flats" => out.flats.push(pr),
             "dark_flats" => out.dark_flats.push(pr),
@@ -7958,6 +8030,8 @@ fn deepsky_probe(paths: Vec<String>) -> Vec<DsProbe> {
                 binning: None,
                 filter: None,
                 date_obs: None,
+                frame_type: None,
+                object: None,
                 signature: pipeline::CalibrationSignature::default(),
                 store_layout: None,
                 signature_warnings: Vec::new(),
@@ -7996,6 +8070,10 @@ fn deepsky_probe(paths: Vec<String>) -> Vec<DsProbe> {
                             let date_obs = ds_hdr_str(&hdu, "DATE-OBS")
                                 .or_else(|| ds_hdr_str(&hdu, "DATE-LOC"))
                                 .or_else(|| ds_hdr_str(&hdu, "DATE"));
+                            let frame_type = ds_hdr_str(&hdu, "IMAGETYP")
+                                .or_else(|| ds_hdr_str(&hdu, "OBSTYPE"))
+                                .or_else(|| ds_hdr_str(&hdu, "FRAME"));
+                            let object = ds_hdr_str(&hdu, "OBJECT");
                             let extraction =
                                 ds_signature_extraction_for_hdu(&hdu, w, h, ch.min(3));
                             let signature_missing =
@@ -8018,6 +8096,8 @@ fn deepsky_probe(paths: Vec<String>) -> Vec<DsProbe> {
                                 binning,
                                 filter,
                                 date_obs,
+                                frame_type,
+                                object,
                                 signature,
                                 store_layout: extraction.layout,
                                 signature_warnings: extraction.warnings,
@@ -19364,6 +19444,8 @@ mod ds_tests {
             binning: signature.binning_x.map(|value| value as i32),
             filter: signature.filter.clone(),
             date_obs: signature.session.clone(),
+            frame_type: None,
+            object: None,
             signature,
             store_layout,
             signature_warnings: Vec::new(),
@@ -19402,6 +19484,32 @@ mod ds_tests {
         );
         assert_eq!(ds_classify("/capture/flat-dark_2s.fit"), "dark_flats");
         assert_eq!(ds_classify("/capture/FLATDARK_2s.tiff"), "dark_flats");
+        // N.I.N.A. uses FlatWizard in both illuminated flats and dark-flats:
+        // an explicit folder role must not be hidden by that generic filename.
+        assert_eq!(
+            ds_classify(
+                "/Calibracion/DARK FLAT 16-Abril-26/2026-04-17_13-02-39_0000160FlatWizard.fits"
+            ),
+            "dark_flats"
+        );
+    }
+
+    #[test]
+    fn test_ds_classifies_nina_flatwizard_from_fits_role() {
+        let path =
+            "/Calibracion/mixed/2026-04-17_13-02-39_0000160FlatWizard_0.00_10.fits";
+        assert_eq!(
+            ds_classify_header(path, Some("DARK"), Some("FlatWizard")),
+            Some("dark_flats")
+        );
+        assert_eq!(
+            ds_classify_header(path, Some("FLAT"), Some("FlatWizard")),
+            Some("flats")
+        );
+        assert_eq!(
+            ds_classify_header("/Calibracion/DARK/Dark_600s.fits", Some("DARK"), Some("M42")),
+            Some("darks")
+        );
     }
 
     #[test]

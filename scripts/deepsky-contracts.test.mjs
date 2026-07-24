@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const [main, html, en, es, fr, it, abSchema] = await Promise.all([
+const [main, html, en, es, fr, it, abSchema, deepskyRust] = await Promise.all([
     readFile(new URL("../src/main.js", import.meta.url), "utf8"),
     readFile(new URL("../index.html", import.meta.url), "utf8"),
     readFile(new URL("../src/locales/en.json", import.meta.url), "utf8").then(JSON.parse),
@@ -10,6 +10,7 @@ const [main, html, en, es, fr, it, abSchema] = await Promise.all([
     readFile(new URL("../src/locales/fr.json", import.meta.url), "utf8").then(JSON.parse),
     readFile(new URL("../src/locales/it.json", import.meta.url), "utf8").then(JSON.parse),
     readFile(new URL("../benchmarks/deepsky-ab-run.schema.json", import.meta.url), "utf8").then(JSON.parse),
+    readFile(new URL("../src-tauri/src/deepsky.rs", import.meta.url), "utf8"),
 ]);
 
 const requestBuilder = main.match(
@@ -51,6 +52,40 @@ test("session folders are actions with a hierarchy separate from frame groups", 
         assert.ok(locale.deepsky.frame_groups_title);
         assert.ok(locale.deepsky.frame_groups_hint);
     }
+});
+
+test("N.I.N.A. FlatWizard dark-flats use FITS evidence before generic filenames", () => {
+    assert.match(deepskyRust, /IMAGETYP/);
+    assert.match(deepskyRust, /OBJECT/);
+    assert.match(deepskyRust, /flat_wizard/);
+    assert.match(deepskyRust, /ds_classify_probe\(&pr\)/);
+    assert.match(main, /frameType \|\| probe\.frame_type/);
+    assert.match(main, /dsFiles\.darkFlats = classifiedDarkFlats/);
+    assert.match(main, /dsFiles\.flats = classifiedFlats/);
+    assert.match(html, /id="ds-auto-classify-report"/);
+});
+
+test("wizard states, guide dock, recipe impact and compact review stay visible", () => {
+    assert.match(html, /class="ds-step-state"/);
+    assert.match(main, /function dsWizardStepState\(step\)/);
+    assert.match(html, /id="ds-guide-dock" class="ds-guide-dock"/);
+    assert.match(main, /getElementById\("ds-guide-dock"\)/);
+    assert.doesNotMatch(html, /#ds-guide \{ position:absolute/);
+    assert.match(html, /id="ds-recipe-impact"/);
+    assert.match(main, /function dsRenderRecipeImpact\(plan\)/);
+    assert.match(main, /function dsFormatReviewPlan\(plan\)/);
+    assert.match(main, /class="ds-review-technical"/);
+    for (const locale of [en, es, fr, it]) {
+        assert.ok(locale.deepsky.state_pending);
+        assert.ok(locale.deepsky.recipe_impact_title);
+        assert.ok(locale.deepsky.review_technical);
+    }
+});
+
+test("folder and clear actions meet the centered touch-target contract", () => {
+    assert.match(main, /className = "ds-kind-action"/);
+    assert.match(html, /\.ds-kind-action \{[\s\S]*?width:42px; height:42px/);
+    assert.match(html, /\.ds-session-action-icon \.zas-icon \{[\s\S]*?margin:0 !important/);
 });
 
 test("deep-sky UI makes safe defaults and experimental engines explicit", () => {

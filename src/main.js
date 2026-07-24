@@ -11960,7 +11960,7 @@ function dsRenderSections(force = false) {
         <span class="ds-session-action-copy">
             <span class="ds-session-action-kicker">${escapeHtml(tr("deepsky.source_action", "1 · Origen"))}</span>
             <strong>${escapeHtml(tr("deepsky.scan_folder", "Escanear carpeta (auto-clasificar)"))}</strong>
-            <small>${escapeHtml(tr("deepsky.scan_folder_hint", "Detecta lights/darks/flats/dark-flats/bias en subcarpetas por nombre"))}</small>
+            <small>${escapeHtml(tr("deepsky.scan_folder_hint", "Lee IMAGETYP; usa carpetas y nombres como respaldo seguro"))}</small>
         </span>
         <span class="ds-session-action-trail">
             <span class="ds-session-action-cta">${escapeHtml(tr("deepsky.scan_action", "Elegir y escanear"))}</span>
@@ -12063,18 +12063,20 @@ function dsRenderSections(force = false) {
         // carpeta se asignan a esta categoría).
         const folder = document.createElement("button");
         folder.type = "button";
+        folder.className = "ds-kind-action";
+        folder.dataset.action = "folder";
         folder.title = tr("deepsky.pick_folder", "Cargar carpeta (recursivo)");
         folder.setAttribute("aria-label", `${folder.title}: ${sectionLabel}`);
-        folder.innerHTML = `<svg class="zas-icon" style="width:14px;height:14px;"><use href="#icon-folder"></use></svg>`;
-        folder.style.cssText = "flex:0 0 auto; width:auto; background:none; border:1px solid #334155; color:#94a3b8; border-radius:8px; padding:6px 9px; cursor:pointer; display:flex; align-items:center;";
+        folder.innerHTML = `<svg class="zas-icon zas-icon-inline"><use href="#icon-folder"></use></svg>`;
         folder.addEventListener("click", () => dsPickFolder(s.kind));
 
         const clear = document.createElement("button");
         clear.type = "button";
+        clear.className = "ds-kind-action";
+        clear.dataset.action = "clear";
         clear.title = tr("deepsky.clear", "Limpiar");
         clear.setAttribute("aria-label", `${clear.title}: ${sectionLabel}`);
         clear.innerHTML = '<svg class="zas-icon zas-icon-inline"><use href="#icon-cross"></use></svg>';
-        clear.style.cssText = "flex:0 0 auto; width:auto; background:none; border:1px solid #334155; color:#64748b; border-radius:8px; padding:6px 10px; cursor:pointer; font-size:0.7rem;";
         clear.addEventListener("click", () => { dsFiles[s.kind] = []; dsUpdateUI(); });
 
         rowTop.append(btn, folder, clear);
@@ -12220,12 +12222,21 @@ function dsPreparedSessionEntries() {
     return plans.flatMap(plan => plan.sessionMap || []);
 }
 
+function dsPreparedCalibrationDecisions() {
+    const plans = dsPreparedPlan?.sessionId
+        ? (dsPreparedPlan.groups || []).map(group => group.plan).filter(Boolean)
+        : [dsPreparedPlan].filter(Boolean);
+    return plans.flatMap(plan => plan.calibrationDecisions || []);
+}
+
 function dsFormatIntegrationSeconds(seconds) {
     const value = Math.max(0, Number(seconds) || 0);
     if (value >= 3600) return `${(value / 3600).toFixed(1)} h`;
     if (value >= 60) return `${Math.round(value / 60)} min`;
     return `${Math.round(value)} s`;
 }
+
+let dsSessionOrganizerExpanded = false;
 
 function dsRenderSessionOrganizer() {
     const panel = document.getElementById("ds-session-organizer");
@@ -12243,14 +12254,16 @@ function dsRenderSessionOrganizer() {
         groups.get(session).push(light);
     }
     const strictEntries = new Map(dsPreparedSessionEntries().map(entry => [String(entry.night), entry]));
+    const decisionsByPath = new Map(dsPreparedCalibrationDecisions()
+        .map(decision => [String(decision.framePath || decision.frame_path || ""), decision]));
     const totalExposure = lights.reduce((sum, light) => sum + (Number(light.exptime) || 0), 0);
     const candidateDarks = dsMatchedCalib("darks").length;
     const candidateFlats = dsMatchedCalib("flats").length;
     const candidateDarkFlats = dsMatchedCalib("darkFlats").length;
     const candidateBias = dsMatchedCalib("bias").length;
-    const cards = [...groups.entries()]
+    const cardEntries = [...groups.entries()]
         .sort(([left], [right]) => left.localeCompare(right))
-        .map(([session, sessionLights]) => {
+        .map(([session, sessionLights], cardIndex) => {
             const strict = strictEntries.get(session);
             const exposure = sessionLights.reduce((sum, light) => sum + (Number(light.exptime) || 0), 0);
             const signatures = new Map();
@@ -12272,20 +12285,35 @@ function dsRenderSessionOrganizer() {
             };
             const flatsConfirmed = Boolean(strict && Number(strict.flatCount) > 0);
             const darksConfirmed = Boolean(strict && strict.darks && strict.darks !== "—");
-            return `<article class="ds-night-card">
+            const decisions = sessionLights
+                .map(light => decisionsByPath.get(light.path))
+                .filter(Boolean);
+            const darkFlatsConfirmed = decisions.length === sessionLights.length
+                && decisions.every(decision => decision.darkFlatMasterPath || decision.dark_flat_master_path);
+            const biasConfirmed = decisions.length === sessionLights.length
+                && decisions.every(decision => decision.biasMasterPath || decision.bias_master_path);
+            const hidden = !dsSessionOrganizerExpanded && cardIndex >= 6;
+            return `<article class="ds-night-card"${hidden ? " hidden" : ""}>
                 <div class="ds-night-head">
                     <strong>${escapeHtml(session)}</strong>
                     <span>${sessionLights.length} lights · ${dsFormatIntegrationSeconds(exposure)}</span>
                 </div>
                 <div class="ds-night-groups">${signatureChips}</div>
+                <div class="ds-session-flow-label"><span>${tr("deepsky.session_flow_lights", "Lights por filtro y exposición")}</span><span>→</span><span>${tr("deepsky.session_flow_calibration", "calibración por firma")}</span></div>
                 <div class="ds-calibration-rail">
                     ${calibrationChip(tr("deepsky.step_flat_s", "Flats"), flatsConfirmed, candidateFlats, flatsConfirmed ? `${strict.flatNight || session} · ${strict.flatCount}` : "")}
                     ${calibrationChip(tr("deepsky.step_dark_s", "Darks"), darksConfirmed, candidateDarks, darksConfirmed ? String(strict.darks).replace(/^darks:\s*/i, "") : "")}
-                    ${calibrationChip(tr("deepsky.step_dark_flat_s", "Dark-flats"), false, candidateDarkFlats)}
-                    ${calibrationChip(tr("deepsky.step_bias_s", "Bias"), false, candidateBias)}
+                    ${calibrationChip(tr("deepsky.step_dark_flat_s", "Dark-flats"), darkFlatsConfirmed, candidateDarkFlats, darkFlatsConfirmed ? tr("deepsky.signature_confirmed", "firma y exposición confirmadas") : "")}
+                    ${calibrationChip(tr("deepsky.step_bias_s", "Bias"), biasConfirmed, candidateBias, biasConfirmed ? tr("deepsky.signature_confirmed", "firma y exposición confirmadas") : "")}
                 </div>
             </article>`;
-        }).join("");
+        });
+    const cards = cardEntries.join("");
+    const toggle = cardEntries.length > 6
+        ? `<button type="button" id="ds-session-toggle" class="ds-session-toggle">${dsSessionOrganizerExpanded
+            ? tr("deepsky.sessions_show_less", "Mostrar menos")
+            : trFormat("deepsky.sessions_show_all", { count: cardEntries.length }, `Mostrar las ${cardEntries.length} noches`)}</button>`
+        : "";
     panel.hidden = false;
     panel.innerHTML = `
         <header class="ds-session-organizer-head">
@@ -12299,7 +12327,11 @@ function dsRenderSessionOrganizer() {
                 <b>${dsFormatIntegrationSeconds(totalExposure)}</b>
             </div>
         </header>
-        <div class="ds-night-list">${cards}</div>`;
+        <div class="ds-night-list">${cards}</div>${toggle}`;
+    panel.querySelector("#ds-session-toggle")?.addEventListener("click", () => {
+        dsSessionOrganizerExpanded = !dsSessionOrganizerExpanded;
+        dsRenderSessionOrganizer();
+    });
 }
 
 // Renderiza el plan de calibración agrupado (una tarjeta por exposición).
@@ -12955,6 +12987,79 @@ function dsGroupAlertMessages(messages) {
     return [...groups.values()];
 }
 
+function dsPlanMembers(plan) {
+    if (!plan) return [];
+    if (plan.sessionId) return (plan.groups || []).map(group => group.plan).filter(Boolean);
+    return [plan];
+}
+
+function dsPlanFrameCount(plan) {
+    if (!plan) return 0;
+    if (Number.isFinite(Number(plan.totalFrames))) return Number(plan.totalFrames);
+    return dsPlanMembers(plan).reduce(
+        (total, member) => total + (member.groups || []).reduce(
+            (groupTotal, group) => groupTotal + (Number(group.frameCount) || 0),
+            0,
+        ),
+        0,
+    );
+}
+
+function dsRenderRecipeImpact(plan) {
+    const panel = document.getElementById("ds-recipe-impact");
+    if (!panel) return;
+    if (!plan || !dsActiveLights().length) {
+        panel.hidden = true;
+        panel.replaceChildren();
+        return;
+    }
+    const members = dsPlanMembers(plan);
+    const profile = dsActivePreset || "auto";
+    const profileLabel = {
+        auto: tr("deepsky.preset_auto_measured", "Auto (receta medida)"),
+        fast: tr("deepsky.preset_fast", "Rápido"),
+        balanced: tr("deepsky.preset_balanced", "Equilibrado"),
+        max: tr("deepsky.preset_max", "Máxima calidad"),
+        custom: tr("deepsky.preset_custom", "Personalizado"),
+    }[profile] || profile;
+    const impactLabel = {
+        auto: tr("deepsky.impact_auto", "Adaptado a las mediciones actuales"),
+        fast: tr("deepsky.impact_fast", "Prioriza tiempo y memoria"),
+        balanced: tr("deepsky.impact_balanced", "Equilibra detalle, rechazo y coste"),
+        max: tr("deepsky.impact_max", "Prioriza rechazo y normalización local"),
+        custom: tr("deepsky.impact_custom", "Usa tus controles visibles"),
+    }[profile] || "";
+    const reasons = [...new Set([
+        ...(plan.recommendationReasons || []),
+        ...members.flatMap(member => member.recommendationReasons || []),
+    ])].slice(0, 3);
+    const seconds = Number(plan.estimatedSeconds)
+        || members.reduce((total, member) => total + (Number(member.estimatedSeconds) || 0), 0);
+    const ram = Number(plan.estimatedRamMb)
+        || Math.max(0, ...members.map(member => Number(member.estimatedRamMb) || 0));
+    const disk = Number(plan.estimatedDiskMb)
+        || members.reduce((total, member) => total + (Number(member.estimatedDiskMb) || 0), 0);
+    const engines = [...new Set(members.map(member => member.effectiveEngine).filter(Boolean))];
+    panel.hidden = false;
+    panel.innerHTML = `
+        <div class="ds-impact-head">
+            <div><strong>${tr("deepsky.recipe_impact_title", "Impacto de la receta")}</strong><span>${escapeHtml(profileLabel)} · ${escapeHtml(impactLabel)}</span></div>
+            <span>${plan.valid ? tr("deepsky.state_ready", "Listo") : tr("deepsky.state_review", "Revisar")}</span>
+        </div>
+        <div class="ds-impact-metrics">
+            <span>${tr("deepsky.impact_frames", "Tomas efectivas")}<b>${dsPlanFrameCount(plan)}</b></span>
+            <span>${tr("deepsky.impact_time", "Tiempo estimado")}<b>~${Math.max(1, Math.round(seconds))} s</b></span>
+            <span>${tr("deepsky.impact_ram", "RAM pico")}<b>~${Math.round(ram)} MB</b></span>
+            <span>${tr("deepsky.impact_disk", "Disco temporal")}<b>~${Math.round(disk)} MB</b></span>
+        </div>
+        <div class="ds-impact-reasons">
+            <b>${tr("deepsky.impact_why", "Por qué Zenith eligió esto")}:</b>
+            ${reasons.length
+                ? reasons.map(reason => `<div>• ${escapeHtml(reason)}</div>`).join("")
+                : `<div>• ${escapeHtml(engines.join(" · ") || tr("deepsky.impact_waiting", "El análisis se actualiza con cada cambio."))}</div>`}
+        </div>`;
+}
+
 // Avisos silenciados por el usuario en ESTA sesión (clave = patrón agrupado).
 // Los errores bloqueantes nunca se silencian.
 const dsSilencedAlerts = new Set();
@@ -13072,6 +13177,56 @@ function dsFormatPreflight(plan) {
     ${normModel ? `<details style="margin-top:7px;"><summary style="cursor:pointer;color:#a5f3fc;">${tr("deepsky.normalization_model", "Modelo de normalización a inspeccionar")}</summary><div style="padding-top:5px;">${normModel}</div></details>` : ""}`;
 }
 
+function dsFormatReviewPlan(plan) {
+    if (!plan) return `<span style="color:#94a3b8;">${tr("deepsky.preparing_plan", "Preparando plan reproducible…")}</span>`;
+    const members = dsPlanMembers(plan);
+    const errors = [...new Set([
+        ...(plan.errors || []),
+        ...members.flatMap(member => member.errors || []),
+    ])];
+    const warnings = [...new Set([
+        ...(plan.warnings || []),
+        ...members.flatMap(member => member.warnings || []),
+    ])];
+    const blockerGroups = dsGroupAlertMessages(errors);
+    const warningGroups = dsGroupAlertMessages(warnings);
+    const engines = [...new Set(members.map(member => member.effectiveEngine).filter(Boolean))];
+    const methods = [...new Set(members.map(member => member.effectiveRejection || member.requestedRejection).filter(Boolean))];
+    const seconds = Number(plan.estimatedSeconds)
+        || members.reduce((total, member) => total + (Number(member.estimatedSeconds) || 0), 0);
+    const ram = Number(plan.estimatedRamMb)
+        || Math.max(0, ...members.map(member => Number(member.estimatedRamMb) || 0));
+    const disk = Number(plan.estimatedDiskMb)
+        || members.reduce((total, member) => total + (Number(member.estimatedDiskMb) || 0), 0);
+    const compactAlerts = blockerGroups.slice(0, 2)
+        .map(group => `<div>• ${group.items.length > 1 ? `×${group.items.length} ` : ""}${escapeHtml(group.items[0])}</div>`)
+        .join("");
+    return `
+        <div class="ds-review-grid">
+            <section class="ds-review-card" data-state="${plan.valid ? "ready" : "review"}">
+                <strong>${tr("deepsky.review_blockers", "Bloqueos")}</strong>
+                <div>${plan.valid
+                    ? tr("deepsky.review_no_blockers", "Sin bloqueos; el contrato está listo.")
+                    : compactAlerts || tr("deepsky.review_has_blockers", "Revisa los avisos antes de ejecutar.")}</div>
+                ${warningGroups.length ? `<span>${warningGroups.length} ${tr("deepsky.review_warnings", "aviso(s) no bloqueante(s)")}</span>` : ""}
+            </section>
+            <section class="ds-review-card" data-state="ready">
+                <strong>${tr("deepsky.review_outputs", "Salidas")}</strong>
+                <div>${tr("deepsky.review_outputs_body", "Máster lineal y receta reproducible; SCI/VAR/NEFF/DQ cuando el plan es científicamente elegible.")}</div>
+                <span>${dsPlanFrameCount(plan)} lights</span>
+            </section>
+            <section class="ds-review-card" data-state="${plan.valid ? "ready" : "review"}">
+                <strong>${tr("deepsky.review_method_resources", "Método y recursos")}</strong>
+                <div>${escapeHtml(methods.join(" · ") || "—")} · ${escapeHtml(engines.join(" · ") || "—")}</div>
+                <span>~${Math.max(1, Math.round(seconds))} s · RAM ~${Math.round(ram)} MB · ${tr("deepsky.disk", "Disco")} ~${Math.round(disk)} MB</span>
+            </section>
+        </div>
+        <details class="ds-review-technical">
+            <summary>${tr("deepsky.review_technical", "Ver plan técnico, firmas y fallbacks")}</summary>
+            <div class="ds-review-technical-body">${dsFormatPreflight(plan)}</div>
+        </details>`;
+}
+
 // ============ GUÍA INTERACTIVA: qué falta para poder apilar ============
 // Tarjeta flotante dentro del asistente: lista los bloqueos ACTUALES y cada
 // uno lleva al control exacto (paso + scroll + resalte pulsante). Con el plan
@@ -13171,7 +13326,7 @@ function dsGuideItems(plan) {
 }
 
 function dsRenderGuide(plan) {
-    const host = document.querySelector("#deepsky-modal .ds-wizard-box");
+    const host = document.getElementById("ds-guide-dock");
     if (!host) return;
     let card = document.getElementById("ds-guide");
     const items = dsGuideItems(plan);
@@ -13291,7 +13446,9 @@ function dsApplyPreparedPlan(plan) {
         if (!panel) continue;
         panel.classList.remove("ds-refreshing");
         panel.dataset.state = plan?.valid ? "ok" : "error";
-        panel.innerHTML = dsFormatPreflight(plan)
+        panel.innerHTML = (id === "ds-preflight-review"
+            ? dsFormatReviewPlan(plan)
+            : dsFormatPreflight(plan))
             + (id === "ds-preflight-review" ? dsFormatInspectionDiagnostics() : "");
         // "Continuar en modo degradado": cambia la política y re-prepara. La
         // decisión es del usuario y queda divulgada en el plan y la receta.
@@ -13331,6 +13488,7 @@ function dsApplyPreparedPlan(plan) {
             });
         });
     }
+    dsRenderRecipeImpact(plan);
     const run = document.getElementById("btn-deepsky-run");
     if (run) {
         run.disabled = !plan?.valid;
@@ -13640,6 +13798,7 @@ async function dsInspectFrames(force = false) {
             if (!currentPaths.has(discarded)) dsDiscardedPaths.delete(discarded);
         }
         dsRenderFrameInspection(dsFrameInspection);
+        dsSyncWizard();
         return dsFrameInspection;
     } catch (error) {
         if (serial !== dsInspectionSerial) return dsFrameInspection;
@@ -13660,6 +13819,7 @@ async function dsPreparePlan() {
     const stackRequest = dsBuildStackRequest();
     if (!stackRequest.lights.length) {
         dsPreparedPlan = null;
+        dsRenderRecipeImpact(null);
         for (const id of ["ds-preflight-inspection", "ds-preflight-review"]) {
             const panel = document.getElementById(id);
             if (panel) {
@@ -13736,6 +13896,16 @@ function dsSetWizardStep(next, force = false) {
     });
 }
 
+function dsWizardStepState(step) {
+    const hasLights = dsActiveLights().length > 0;
+    if (!hasLights) return "pending";
+    if (step === 0) return "ready";
+    if (!dsPreparedPlan) return step === 1 ? "review" : "pending";
+    if (!dsPreparedPlan.valid) return "review";
+    if (step === 1 && !dsFrameInspection?.length) return "review";
+    return "ready";
+}
+
 function dsSyncWizard() {
     document.querySelectorAll("#deepsky-modal .ds-wizard-page").forEach(p => {
         const active = Number(p.dataset.step) === dsWizardStep;
@@ -13744,8 +13914,19 @@ function dsSyncWizard() {
     });
     document.querySelectorAll("#deepsky-modal .ds-wizard-step").forEach(b => {
         const step = Number(b.dataset.step);
+        const state = dsWizardStepState(step);
         b.classList.toggle("active", step === dsWizardStep);
-        b.classList.toggle("done", step < dsWizardStep);
+        b.classList.toggle("done", state === "ready");
+        b.dataset.state = state;
+        const stateLabel = {
+            pending: tr("deepsky.state_pending", "Pendiente"),
+            review: tr("deepsky.state_review", "Revisar"),
+            ready: tr("deepsky.state_ready", "Listo"),
+        }[state];
+        const stateNode = b.querySelector(".ds-step-state");
+        if (stateNode) stateNode.textContent = stateLabel;
+        const stepLabel = b.querySelector(".ds-step-label")?.textContent?.trim() || "";
+        b.setAttribute("aria-label", `${stepLabel}: ${stateLabel}`);
         if (step === dsWizardStep) b.setAttribute("aria-current", "step"); else b.removeAttribute("aria-current");
     });
     const prev = document.getElementById("btn-deepsky-prev");
@@ -13820,6 +14001,7 @@ function dsApplyPreset(name) {
         // "custom" y "auto" no tocan controles; AUTO además refresca el plan
         // para que la receta resuelta y sus motivos aparezcan de inmediato.
         dsRenderProcessPreview();
+        dsRenderRecipeImpact(dsPreparedPlan);
         if (name === "auto") dsSchedulePreflight();
         return;
     }
@@ -13842,6 +14024,7 @@ function dsApplyPreset(name) {
     const pixfrac = document.getElementById("lbl-ds-pixfrac");
     if (pixfrac) pixfrac.style.display = (parseFloat(dz?.value) > 1) ? "flex" : "none";
     dsRenderProcessPreview();
+    dsRenderRecipeImpact(dsPreparedPlan);
     dsSchedulePreflight();
 }
 
@@ -13849,6 +14032,7 @@ function dsApplyPreset(name) {
 function dsMarkCustomPreset() {
     if (dsActivePreset !== "custom") { dsActivePreset = "custom"; dsSetPresetButtons("custom"); }
     dsRenderProcessPreview();
+    dsRenderRecipeImpact(dsPreparedPlan);
     dsSchedulePreflight();
 }
 
@@ -14882,13 +15066,53 @@ async function dsScanFolder() {
         showProcessing(tr("deepsky.scanning", "ESCANEANDO Y CLASIFICANDO..."));
         const cl = await invoke("deepsky_scan_classify", { root: dir });
         hideProcessing();
-        const classifiedDarkFlats = cl.darkFlats || cl.dark_flats || [];
-        if (cl.lights.length) dsFiles.lights = cl.lights;
-        if (cl.darks.length) dsFiles.darks = cl.darks;
-        if (cl.flats.length) dsFiles.flats = cl.flats;
-        if (classifiedDarkFlats.length) dsFiles.darkFlats = classifiedDarkFlats;
-        if (cl.bias.length) dsFiles.bias = cl.bias;
-        log("SUCCESS", `Auto-clasificación: ${cl.lights.length} lights · ${cl.darks.length} darks · ${cl.flats.length} flats · ${classifiedDarkFlats.length} dark-flats · ${cl.bias.length} bias.`);
+        let classifiedFlats = [...(cl.flats || [])];
+        let classifiedDarkFlats = [...(cl.darkFlats || cl.dark_flats || [])];
+        // Defensa ante una app/backend mezclados durante una actualización:
+        // IMAGETYP='DARK' + OBJECT/archivo FlatWizard es un dark-flat de N.I.N.A.
+        const recoveredDarkFlats = classifiedFlats.filter(probe => {
+            const frameType = String(probe.frameType || probe.frame_type || "").toLowerCase();
+            const context = `${probe.object || ""} ${probe.name || ""} ${probe.path || ""}`.toLowerCase();
+            return frameType.includes("dark")
+                && (/flatwizard/.test(context) || /dark[\s_-]*flat|flat[\s_-]*dark/.test(context));
+        });
+        if (recoveredDarkFlats.length) {
+            const recoveredPaths = new Set(recoveredDarkFlats.map(probe => probe.path));
+            classifiedFlats = classifiedFlats.filter(probe => !recoveredPaths.has(probe.path));
+            classifiedDarkFlats.push(...recoveredDarkFlats);
+        }
+        // Un escaneo es una sesión nueva: nunca conserva categorías, ligado,
+        // descartes ni silencios del apilado anterior.
+        dsFiles.lights = [...(cl.lights || [])];
+        dsFiles.darks = [...(cl.darks || [])];
+        dsFiles.flats = classifiedFlats;
+        dsFiles.darkFlats = classifiedDarkFlats;
+        dsFiles.bias = [...(cl.bias || [])];
+        dsCalibAssignments.clear();
+        dsDisabledCalibBatches.clear();
+        dsDiscardedPaths.clear();
+        dsSilencedAlerts.clear();
+        dsSessionOrganizerExpanded = false;
+        dsFrameInspection = [];
+        dsInspectionFingerprint = "";
+        dsInspectionDiagnostics = null;
+        dsPreparedPlan = null;
+        const headerDetectedDarkFlats = classifiedDarkFlats.filter(probe =>
+            String(probe.frameType || probe.frame_type || "").toLowerCase().includes("dark")
+        ).length;
+        log("SUCCESS", `Auto-clasificación: ${dsFiles.lights.length} lights · ${dsFiles.darks.length} darks · ${dsFiles.flats.length} flats · ${classifiedDarkFlats.length} dark-flats · ${dsFiles.bias.length} bias.`);
+        const report = document.getElementById("ds-auto-classify-report");
+        if (report) {
+            report.hidden = false;
+            report.innerHTML = `<svg class="zas-icon zas-icon-inline" aria-hidden="true"><use href="#icon-check"></use></svg>
+                <span><b>${tr("deepsky.scan_complete", "Clasificación automática completada")}</b> ·
+                ${dsFiles.lights.length} lights · ${dsFiles.darks.length} darks · ${dsFiles.flats.length} flats ·
+                <b>${classifiedDarkFlats.length} dark-flats</b> · ${dsFiles.bias.length} bias.
+                ${headerDetectedDarkFlats
+                    ? trFormat("deepsky.dark_flats_header_detected", { count: headerDetectedDarkFlats }, `${headerDetectedDarkFlats} identificados por IMAGETYP + contexto FlatWizard.`)
+                    : ""}
+                ${tr("deepsky.scan_signature_note", "Zenith validará después cada firma antes de usarla.")}</span>`;
+        }
         dsUpdateUI();
     } catch (e) {
         hideProcessing();
