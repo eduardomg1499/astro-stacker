@@ -55,7 +55,20 @@
         "review_outputs": "Sorties",
         "review_outputs_body": "Master linéaire et recette reproductible ; SCI/VAR/NEFF/DQ lorsque le plan est scientifiquement admissible.",
         "review_method_resources": "Méthode et ressources",
-        "review_technical": "Afficher le plan technique, les signatures et les replis"
+        "review_technical": "Afficher le plan technique, les signatures et les replis",
+        "wbpp_hint": "Une ligne par nuit, filtre et exposition. Choisissez le bloc de flats ou de darks à lier à chaque groupe, ou laissez Auto pour que la signature décide.",
+        "groups": "groupes",
+        "state": "État",
+        "session_all": "Tous",
+        "blocks_compatible": "Blocs compatibles",
+        "blocks_other": "Autres signatures",
+        "groups_show_all": "Afficher les {{count}} groupes",
+        "groups_show_less": "Afficher moins de groupes",
+        "scan_added": "{{count}} prises ajoutées",
+        "scan_duplicates": "{{count}} déjà chargées",
+        "scan_reclassified": "{{count}} reclassées d'après les en-têtes FITS",
+        "scan_total": "Total cumulé",
+        "scan_accumulates": "Vous pouvez scanner d'autres dossiers : ils s'ajoutent aux précédents. Utilisez ✕ sur un groupe pour le vider."
     },
     "wavelets": {
         "title": "Traitement du signal",
@@ -184,11 +197,11 @@
             "lunar_hint": "phase · surface · minéral",
             "planets": "Planètes",
             "planets_hint": "détail naturel ou expressif",
-            "intent_scientific": "Scientifique",
+            "intent_scientific": "Conservateur",
             "intent_creative": "Créatif",
             "intent_creative_color": "Créatif · couleur",
             "intent_creative_long": "Créatif et interprétatif",
-            "intent_scientific_long": "Scientifique et naturel",
+            "intent_scientific_long": "Conservateur et naturel",
             "intent_recipe_creative": "créative",
             "intent_recipe_natural": "naturelle",
             "presets": {
@@ -198,7 +211,8 @@
                 "jupiter_natural": "Jupiter naturel",
                 "saturn_rings": "Saturne et anneaux",
                 "mars_detail": "Mars détaillée",
-                "planet_cinematic": "Planète expressive"
+                "planet_cinematic": "Planète expressive",
+                "lunar_mineral_intense": "Lune minérale intense"
             },
             "status_idle": "Choisissez une recette pour voir les modules qu'elle active.",
             "status_original": "Empilement original · recette neutre · Annuler restaure le réglage précédent.",

@@ -7738,6 +7738,57 @@ fn ds_has_explicit_dark_flat_marker(value: &str) -> bool {
         || lowered.contains("flatdark")
 }
 
+/// Some capture applications write a generic or incorrect IMAGETYP while
+/// keeping the real calibration role in OBJECT (for example
+/// IMAGETYP='LIGHT', OBJECT='DARK 600SEG'). Only accept OBJECT as calibration
+/// evidence when it is a canonical capture label, never a science target such
+/// as "Dark Nebula".
+fn ds_calibration_role_from_object(value: &str) -> Option<&'static str> {
+    let lowered = value.trim().to_ascii_lowercase();
+    if lowered.is_empty() {
+        return None;
+    }
+    if ds_has_explicit_dark_flat_marker(&lowered) {
+        return Some("dark_flats");
+    }
+    let normalized = lowered
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    let first = words.first().copied()?;
+    let suffix_is_capture_metadata = words[1..].iter().all(|word| {
+        word.chars().any(|character| character.is_ascii_digit())
+            || matches!(
+                *word,
+                "frame"
+                    | "frames"
+                    | "master"
+                    | "calibration"
+                    | "calibracion"
+                    | "seg"
+                    | "secs"
+                    | "seconds"
+                    | "s"
+            )
+    });
+    if !suffix_is_capture_metadata {
+        return None;
+    }
+    match first {
+        "dark" | "darks" => Some("darks"),
+        "bias" | "offset" => Some("bias"),
+        "flat" | "flats" => Some("flats"),
+        _ => None,
+    }
+}
+
 fn ds_classify_header(
     path: &str,
     frame_type: Option<&str>,
@@ -7746,6 +7797,15 @@ fn ds_classify_header(
     let role = frame_type?.trim().to_ascii_lowercase();
     if role.is_empty() {
         return None;
+    }
+    // Require two independent facts before overriding a contradictory generic
+    // LIGHT header: a canonical OBJECT calibration label and the same explicit
+    // role in the path. This repairs known N.I.N.A./capture-tool headers without
+    // turning a legitimate target named "Dark Nebula" into a master dark.
+    let path_role = ds_classify(path);
+    let object_role = object.and_then(ds_calibration_role_from_object);
+    if object_role == Some(path_role) && path_role != "lights" {
+        return object_role;
     }
     if ds_has_explicit_dark_flat_marker(&role) {
         return Some("dark_flats");
@@ -19509,6 +19569,36 @@ mod ds_tests {
         assert_eq!(
             ds_classify_header("/Calibracion/DARK/Dark_600s.fits", Some("DARK"), Some("M42")),
             Some("darks")
+        );
+        // Regression from a real capture set: the camera software wrote LIGHT
+        // in IMAGETYP, but both OBJECT and the session folder identify a dark.
+        assert_eq!(
+            ds_classify_header(
+                "/APILADOS/(20) DARKS 600 seg/Dark_600s.fits",
+                Some("LIGHT"),
+                Some("DARK 600SEG"),
+            ),
+            Some("darks")
+        );
+        // A science target containing the word "dark" is not a calibration
+        // role and the explicit LIGHT header remains authoritative.
+        assert_eq!(
+            ds_classify_header(
+                "/APILADOS/LIGHTS/Dark Nebula/frame_001.fits",
+                Some("LIGHT"),
+                Some("Dark Nebula"),
+            ),
+            Some("lights")
+        );
+        // OBJECT alone is insufficient when the path supplies no independent
+        // calibration evidence.
+        assert_eq!(
+            ds_classify_header(
+                "/APILADOS/session/frame_001.fits",
+                Some("LIGHT"),
+                Some("DARK 600SEG"),
+            ),
+            Some("lights")
         );
     }
 

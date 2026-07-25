@@ -55,7 +55,20 @@
         "review_outputs": "Output",
         "review_outputs_body": "Master lineare e ricetta riproducibile; SCI/VAR/NEFF/DQ quando il piano è scientificamente idoneo.",
         "review_method_resources": "Metodo e risorse",
-        "review_technical": "Mostra piano tecnico, firme e fallback"
+        "review_technical": "Mostra piano tecnico, firme e fallback",
+        "wbpp_hint": "Una riga per notte, filtro ed esposizione. Scegli il blocco di flat o dark da collegare a ogni gruppo, oppure lascia Auto e decide la firma.",
+        "groups": "gruppi",
+        "state": "Stato",
+        "session_all": "Tutti",
+        "blocks_compatible": "Blocchi compatibili",
+        "blocks_other": "Altre firme",
+        "groups_show_all": "Mostra tutti i {{count}} gruppi",
+        "groups_show_less": "Mostra meno gruppi",
+        "scan_added": "{{count}} riprese aggiunte",
+        "scan_duplicates": "{{count}} già caricate",
+        "scan_reclassified": "{{count}} riclassificate dalle intestazioni FITS",
+        "scan_total": "Totale accumulato",
+        "scan_accumulates": "Puoi scansionare altre cartelle: si sommano alle precedenti. Usa ✕ su un gruppo per svuotarlo."
     },
     "wavelets": {
         "title": "Elaborazione del segnale",
@@ -184,11 +197,11 @@
             "lunar_hint": "fase · superficie · minerale",
             "planets": "Pianeti",
             "planets_hint": "dettaglio naturale o espressivo",
-            "intent_scientific": "Scientifico",
+            "intent_scientific": "Conservativo",
             "intent_creative": "Creativo",
             "intent_creative_color": "Creativo · colore",
             "intent_creative_long": "Creativo e interpretativo",
-            "intent_scientific_long": "Scientifico e naturale",
+            "intent_scientific_long": "Conservativo e naturale",
             "intent_recipe_creative": "creativa",
             "intent_recipe_natural": "naturale",
             "presets": {
@@ -198,7 +211,8 @@
                 "jupiter_natural": "Giove naturale",
                 "saturn_rings": "Saturno e anelli",
                 "mars_detail": "Marte dettagliato",
-                "planet_cinematic": "Pianeta espressivo"
+                "planet_cinematic": "Pianeta espressivo",
+                "lunar_mineral_intense": "Luna minerale intensa"
             },
             "status_idle": "Scegli una ricetta per vedere quali moduli attiva.",
             "status_original": "Stack originale · ricetta neutra · Annulla ripristina la regolazione precedente.",

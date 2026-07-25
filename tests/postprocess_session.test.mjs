@@ -300,6 +300,48 @@ test("solar recipes adapt to the measured master without losing bounded headroom
   assert.ok(adapted.curvePoints.every(([, y]) => y >= 0 && y <= 1));
 });
 
+test("a well-exposed master without measured clipping keeps its detail budget", () => {
+  // Un p99.9 alto es lo NORMAL en un máster solar: el disco ocupa la parte alta
+  // del rango. Medir el estrés de luces desde 0.88 saturaba a 1.0 sin un solo
+  // píxel recortado y disparaba la protección máxima —compresión de altas,
+  // recorte del extremo de la curva y menos color— sobre datos sanos. Ser
+  // adaptativo tiene que significar conservar la calidad, no aplanarla.
+  const input = (histogram) => ({
+    histogram: { median: 30_000, percentileLow: 900, shadowClip: 0, isMono: true, ...histogram },
+    artifacts: { sampledPixels: 100_000, ringingScore: 0.3, suggestedDenoise: 1 },
+    capture: { qualityStability: 95 },
+  });
+  const healthy = normalizeAdaptivePostprocessAnalysis(
+    input({ percentileHigh: 65_000, highlightClip: 0 }),
+  );
+  const clipped = normalizeAdaptivePostprocessAnalysis(
+    input({ percentileHigh: 65_535, highlightClip: 0.01 }),
+  );
+  assert.ok(
+    healthy.highlightStress < 0.35,
+    `un máster sin recorte no puede recibir la protección máxima (${healthy.highlightStress})`,
+  );
+  assert.equal(clipped.highlightStress, 1, "el recorte medido sí es evidencia directa");
+  assert.ok(!healthy.safeguards.includes("highlights"));
+
+  const baseline = cloneSolarPreset("ha-gold");
+  const adapted = adaptSolarPreset("ha-gold", input({ percentileHigh: 65_000, highlightClip: 0 }));
+  assert.equal(adapted.adaptation.measured, true);
+  assert.deepEqual(
+    adapted.curvePoints.at(-1),
+    baseline.curvePoints.at(-1),
+    "sin recorte medido, el extremo de la curva no se recorta",
+  );
+  assert.ok(
+    adapted.highlightCompression < baseline.highlightCompression + 0.06,
+    "la compresión de altas no puede dispararse sobre un máster sano",
+  );
+  assert.ok(
+    adapted.colorStrength > baseline.colorStrength * 0.94,
+    "el color esperado del preset debe sobrevivir a la adaptación",
+  );
+});
+
 test("object finishing presets separate natural and interpretive colour contracts", () => {
   const lunar = cloneObjectFinishingPreset("lunar-relief");
   const mineral = cloneObjectFinishingPreset("lunar-mineral");
@@ -383,8 +425,74 @@ test("mineral moon scales colour from measured chroma instead of neutral noise",
     noisyNeutral.pipeline.advanced.vibrance
       < chromaticMaster.pipeline.advanced.vibrance,
   );
-  assert.ok(Math.max(...noisyNeutral.pipeline.advanced.hslSaturation) <= 0.025);
-  assert.ok(Math.max(...chromaticMaster.pipeline.advanced.hslSaturation) <= 0.065);
+  // Relativo a la receta, no en absoluto: el contrato es "se repliega sobre
+  // croma neutra y nunca supera lo que pide el preset", y así sobrevive a los
+  // retoques de intensidad sin dejar de detectar un color desbocado.
+  const recipeMax = Math.max(
+    ...cloneObjectFinishingPreset("lunar-mineral").pipeline.advanced.hslSaturation,
+  );
+  const noisyMax = Math.max(...noisyNeutral.pipeline.advanced.hslSaturation);
+  const chromaticMax = Math.max(...chromaticMaster.pipeline.advanced.hslSaturation);
+  assert.ok(
+    noisyMax <= recipeMax * 0.3,
+    `sobre croma casi neutra el mineral debe replegarse (${noisyMax} de ${recipeMax})`,
+  );
+  assert.ok(
+    chromaticMax <= recipeMax,
+    "la adaptación nunca puede superar el color que declara la receta",
+  );
+  assert.ok(chromaticMax > noisyMax * 2);
+});
+
+test("the intense mineral moon reaches its colour without inventing it", () => {
+  const chromaticMaster = {
+    histogram: {
+      median: 28_000, percentileLow: 800, percentileHigh: 62_000,
+      shadowClip: 0, highlightClip: 0, isMono: false,
+    },
+    artifacts: {
+      sampledPixels: 90_000, chromaSampledPixels: 90_000,
+      meanSaturation: 0.07, p95Saturation: 0.2, chromaticFraction: 0.5,
+      ringingScore: 0.4, suggestedDenoise: 2,
+    },
+    capture: { qualityStability: 94 },
+  };
+  const contained = adaptObjectFinishingPreset("lunar-mineral", chromaticMaster);
+  const intense = adaptObjectFinishingPreset("lunar-mineral-intense", chromaticMaster);
+
+  // La separación mineral que se pide (maria azules, tierras altas rojas) tiene
+  // que sobrevivir a la adaptación, no quedarse en el techo de la receta suave.
+  assert.ok(
+    intense.adaptation.colorScale > contained.adaptation.colorScale,
+    `la intensa debe sostener más color (${intense.adaptation.colorScale} vs ${contained.adaptation.colorScale})`,
+  );
+  assert.ok(intense.pipeline.advanced.vibrance > contained.pipeline.advanced.vibrance);
+  const [red, , , green, , blue] = intense.pipeline.advanced.hslSaturation;
+  const [containedRed] = contained.pipeline.advanced.hslSaturation;
+  assert.ok(red > 0.5 && blue > 0.5, `rojo y azul deben quedar altos (${red}, ${blue})`);
+  assert.ok(red > containedRed * 3, "la separación mineral debe ser claramente mayor que la contenida");
+  // El mineral vive del color, no de apurar el detalle: saturar así hace visible
+  // cualquier exceso de nitidez.
+  assert.ok(intense.pipeline.w[0] < 4, `la nitidez base debe ser contenida (${intense.pipeline.w[0]})`);
+  assert.ok(intense.pipeline.deconv.i <= 6);
+  assert.equal(green, 0, "la Luna no tiene mineral verde: subirlo sólo amplifica ruido");
+
+  // Pero sigue siendo una lectura de la croma MEDIDA: sobre un máster casi
+  // neutro y ruidoso el color se retira solo.
+  const neutralNoisy = adaptObjectFinishingPreset("lunar-mineral-intense", {
+    histogram: { median: 30_000, percentileLow: 900, percentileHigh: 61_000, isMono: false },
+    artifacts: {
+      sampledPixels: 90_000, chromaSampledPixels: 90_000,
+      meanSaturation: 0.002, p95Saturation: 0.006, chromaticFraction: 0.01,
+      ringingScore: 9, suggestedDenoise: 26,
+    },
+    capture: { qualityStability: 60 },
+  });
+  assert.ok(
+    neutralNoisy.adaptation.colorScale < intense.adaptation.colorScale,
+    "sin croma medida el mineral intenso debe replegarse",
+  );
+  assert.equal(objectPresetApplicable(intense, { isMono: true }).applicable, false);
 });
 
 test("the shared tone curve is exact when linear and the assistant can propose it", () => {
@@ -461,7 +569,8 @@ test("only the scientific 16-bit histogram and advanced modules remain in the pa
   assert.ok(html.includes('data-deconv-preset="solar-limb"'));
   assert.equal(html.includes('id="btn-deconv-compare"'), false);
   assert.ok(html.includes('id="object-finishing-module"'));
-  assert.equal((html.match(/data-object-preset=/g) || []).length, 7);
+  assert.equal((html.match(/data-object-preset=/g) || []).length, 8);
+  assert.ok(html.includes('data-object-preset="lunar-mineral-intense"'));
   assert.ok(html.includes('id="btn-object-original"'));
   assert.ok(html.includes('id="ds-step-assistant"'));
   assert.equal(html.includes("Supera al sharpening"), false);
@@ -528,6 +637,77 @@ test("the intelligent assistant and deep-sky session organizer have English cont
   assert.ok(main.includes('class="ds-calibration-chip ${state}"'));
   assert.ok(main.includes('tr("deepsky.psf_inspection_title"'));
   assert.ok(main.includes('tr("deepsky.session_quality_title"'));
+});
+
+test("assistant corrections surface in the panel that owns them", async () => {
+  const main = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+
+  // `levelsBlack: 0` y `levelsWhite: 1` son EXACTAMENTE los `data-default` de los
+  // sliders (0 y 65535 a escala 65535): escribirlos no movía nada, así que el
+  // panel de niveles se quedaba quieto mientras la imagen sí cambiaba.
+  assert.ok(html.includes('data-advanced-control="levelsBlack"') && html.includes('data-default="0"'));
+  assert.ok(html.includes('data-advanced-control="levelsWhite"'));
+  const protectRange = main.slice(
+    main.indexOf('if (action === "protect-range")'),
+    main.indexOf('if (action === "auto-levels")'),
+  );
+  assert.ok(protectRange.length > 0, "la acción protect-range debe existir");
+  assert.ok(
+    !/values\.levelsBlack = 0;/.test(protectRange) && !/values\.levelsWhite = 1;/.test(protectRange),
+    "protect-range no puede escribir el valor neutro de los niveles como si fuera una corrección",
+  );
+  assert.ok(
+    protectRange.includes("advanced.levelsBlack > 0.0005")
+      && protectRange.includes("advanced.levelsWhite < 0.9995"),
+    "los niveles sólo se tocan cuando son la causa del recorte",
+  );
+
+  // Toda corrección revela y resalta los controles que movió, y retira las
+  // marcas de preset que dejan de describir la imagen.
+  assert.ok(main.includes("function revealAssistantEdits(names, label)"));
+  assert.ok(main.includes("function assistantInvalidateFinishingClaim()"));
+  const helper = main.slice(
+    main.indexOf("function applyAssistantToneAdjustments("),
+    main.indexOf("async function applyAssistantRecommendation("),
+  );
+  assert.ok(helper.includes("constrainLevelControls"), "los niveles deben respetar su invariante");
+  assert.ok(helper.includes("assistantInvalidateFinishingClaim()"));
+  assert.ok(helper.includes("revealAssistantEdits(names, label)"));
+});
+
+test("deep-sky calibration is linked from one WBPP-style table per light group", async () => {
+  const main = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+
+  // Una fila por (noche × filtro × exposición) y bloques derivados de los
+  // ficheros cargados: ligar no puede depender de que exista un plan preparado.
+  assert.ok(main.includes("function dsCalibrationRows(lights)"));
+  assert.ok(main.includes("function dsCalibrationBlocks(kind)"));
+  assert.ok(main.includes("function dsBlockFitsRow(kind, block, row)"));
+  assert.ok(main.includes('`${night}|${filter}|${expKey}`'));
+  assert.ok(main.includes('data-ds-link="${escapeHtml(row.key)}"'));
+  assert.ok(html.includes(".ds-wbpp-table"));
+
+  // El ligado antiguo por noche desaparece por completo: convivir con la tabla
+  // significaba dos escrituras con claves distintas sobre el mismo mapa.
+  assert.ok(!main.includes("dsFormatCalibrationLinker"), "el ligador por noche debe estar retirado");
+  assert.ok(!main.includes("dsNightPaths"), "los índices del plan ya no gobiernan el ligado");
+  assert.ok(!main.includes("dsBatchIndex"));
+
+  // Sólo se ofrece desplegable para los roles que el backend sabe forzar.
+  assert.ok(main.includes('{ kind: "flats", labelKey: "deepsky.step_flat_s", fallback: "Flats", icon: "icon-lightbulb", linkable: true }'));
+  assert.ok(main.includes('{ kind: "bias", labelKey: "deepsky.step_bias_s", fallback: "Bias", icon: "icon-film", linkable: false }'));
+
+  for (const lang of ["es", "en", "fr", "it"]) {
+    const locale = JSON.parse(await readFile(
+      new URL(`../src/locales/${lang}.json`, import.meta.url),
+      "utf8",
+    ));
+    for (const key of ["wbpp_hint", "groups", "state", "blocks_compatible", "blocks_other", "groups_show_all"]) {
+      assert.ok(locale.deepsky?.[key], `falta deepsky.${key} en ${lang}.json`);
+    }
+  }
 });
 
 test("planetary defaults and mono-only availability are explicit", async () => {

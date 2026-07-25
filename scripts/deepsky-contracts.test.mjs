@@ -59,9 +59,17 @@ test("N.I.N.A. FlatWizard dark-flats use FITS evidence before generic filenames"
     assert.match(deepskyRust, /OBJECT/);
     assert.match(deepskyRust, /flat_wizard/);
     assert.match(deepskyRust, /ds_classify_probe\(&pr\)/);
+    assert.match(deepskyRust, /fn ds_calibration_role_from_object/);
+    assert.match(
+        deepskyRust,
+        /Some\("LIGHT"\),\s*Some\("DARK 600SEG"\)/,
+        "a contradictory LIGHT header needs matching OBJECT and path evidence",
+    );
     assert.match(main, /frameType \|\| probe\.frame_type/);
-    assert.match(main, /dsFiles\.darkFlats = classifiedDarkFlats/);
-    assert.match(main, /dsFiles\.flats = classifiedFlats/);
+    // Los dark-flats recuperados por evidencia FITS entran en SU categoría al
+    // fusionar el escaneo (antes se asignaba directamente a `dsFiles`).
+    assert.match(main, /darkFlats: classifiedDarkFlats,/);
+    assert.match(main, /flats: classifiedFlats,/);
     assert.match(html, /id="ds-auto-classify-report"/);
 });
 
@@ -248,19 +256,27 @@ test("manual calibration assignment is wired end to end", () => {
     }
 });
 
-test("manual calibration linking works per night with skippable batches", () => {
-    assert.match(main, /function dsFormatCalibrationLinker\(plan\)/);
-    assert.match(main, /plan\?\.calibrationBatches/);
-    assert.match(main, /entry\.lightPaths/);
-    assert.match(main, /data-ds-assign/);
+// El ligado manual pasó de una fila por NOCHE (en un desplegable del paso de
+// inspección) a una fila por GRUPO —noche × filtro × exposición— en la tabla de
+// calibración del paso de datos: una noche con Ha y OIII ya no comparte una
+// única elección de flats.
+test("manual calibration linking works per light group with skippable batches", () => {
+    assert.match(main, /function dsCalibrationRows\(lights\)/);
+    assert.match(main, /function dsCalibrationBlocks\(kind\)/);
+    assert.match(main, /`\$\{night\}\|\$\{filter\}\|\$\{expKey\}`/);
+    assert.match(main, /data-ds-link/);
     assert.match(main, /data-ds-batch/);
     assert.match(main, /skipFlats/);
     assert.match(main, /skipDarks/);
     assert.match(main, /function dsBuildCalibrationOverrides\(/);
+    // Las rutas del override se resuelven contra los bloques vigentes, no contra
+    // un índice del último plan preparado.
+    assert.match(main, /dsCalibrationBlocks\(kind\)\.map\(block => \[block\.id, block\]\)/);
     for (const locale of [en, es]) {
-        assert.ok(locale.deepsky.linker_title);
-        assert.ok(locale.deepsky.linker_hint);
+        assert.ok(locale.deepsky.linker_auto);
         assert.ok(locale.deepsky.linker_skip_flats);
+        assert.ok(locale.deepsky.wbpp_hint);
+        assert.ok(locale.deepsky.blocks_compatible);
     }
 });
 
@@ -284,9 +300,38 @@ test("interactive guide points the user at every blocker", () => {
     }
 });
 
+test("scanning another folder adds to the session instead of replacing it", () => {
+    // Una sesión real vive en varias carpetas (una por noche, o lights y
+    // calibración aparte): escanear la segunda no puede borrar la primera.
+    assert.match(main, /function dsMergeScannedFiles\(scanned\)/);
+    assert.match(main, /mergeClassifiedDeepSkyFrames\(dsFiles, scanned\)/,
+        "debe deduplicar y reclasificar por ruta con el probe más reciente");
+    assert.match(main, /const added = dsMergeScannedFiles\(\{/);
+    assert.match(main, /added\.reclassified/,
+        "debe informar cuando una cabecera corregida mueve la toma a otro grupo");
+    // El escaneo ya no reinicia el ligado ni los descartes del usuario.
+    assert.doesNotMatch(main, /dsFiles\.lights = \[\.\.\.\(cl\.lights \|\| \[\]\)\]/);
+    const scan = main.match(/async function dsScanFolder\(\)[\s\S]*?\n}\n/)?.[0] || "";
+    assert.ok(scan, "dsScanFolder debe seguir siendo identificable");
+    assert.doesNotMatch(scan, /dsCalibAssignments\.clear\(\)/);
+    assert.doesNotMatch(scan, /dsDiscardedPaths\.clear\(\)/);
+    for (const locale of [en, es, fr, it]) {
+        assert.ok(locale.deepsky.scan_added);
+        assert.ok(locale.deepsky.scan_reclassified);
+        assert.ok(locale.deepsky.scan_total);
+        assert.ok(locale.deepsky.scan_accumulates);
+    }
+});
+
 test("all four calibration batch kinds are detectable and excludable", () => {
-    assert.match(main, /batches\.darkFlats/);
-    assert.match(main, /batches\.bias/);
+    // Los cuatro roles se agrupan en bloques y se pueden excluir; sólo flats y
+    // darks admiten asignación manual, porque son los únicos que el backend sabe
+    // forzar (`DeepSkyCalibrationOverride`). Ofrecer desplegable para los otros
+    // dos sería un control que no cambia nada.
+    assert.match(main, /kind: "darkFlats"[\s\S]{0,140}linkable: false/);
+    assert.match(main, /kind: "bias"[\s\S]{0,140}linkable: false/);
+    assert.match(main, /kind: "flats"[\s\S]{0,140}linkable: true/);
+    assert.match(main, /kind: "darks"[\s\S]{0,140}linkable: true/);
     assert.match(main, /\["flats", "darks", "darkFlats", "bias"\]\.includes\(kind\)/);
 });
 

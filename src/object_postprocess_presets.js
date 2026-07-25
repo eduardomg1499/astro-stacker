@@ -6,6 +6,17 @@ import {
 
 const LINEAR_CURVE = Object.freeze([[0, 0], [1, 1]]);
 
+// Techo de color por defecto de una receta creativa: no arranca de la croma
+// medida (`evidenceGain: 0` ⇒ base 1) y conserva al menos algo de intención.
+const DEFAULT_CREATIVE_COLOR = Object.freeze({
+  evidenceBias: 1,
+  evidenceGain: 0,
+  unmeasured: 1,
+  chromaWeight: 0.2,
+  min: 0.55,
+  max: 1,
+});
+
 /**
  * Recipes deliberately separate measured/natural rendering from interpretive
  * colour. They only drive existing 16-bit pipeline controls, so every preset
@@ -66,29 +77,77 @@ export const OBJECT_FINISHING_PRESETS = Object.freeze({
     intent: "creative",
     colorRequired: true,
     description: "Amplifica diferencias cromáticas reales; resultado interpretativo.",
+    // Mineral contenida: el color sigue arrancando de la croma MEDIDA, pero con
+    // un techo utilizable — al 72 % el mineral quedaba casi invisible sobre
+    // tomas reales.
+    colorAdaptive: { evidenceBias: .28, evidenceGain: .72, unmeasured: .5, chromaWeight: .42, min: .18, max: .9 },
     pipeline: {
-      w: [4.5, 3.5, 2, .8, 0, 0],
+      // Nitidez contenida: el realce lunar se notaba crudo (cráteres con borde
+      // duro). El mineral vive del COLOR, no de apurar el detalle.
+      w: [3, 2.4, 1.4, .6, 0, 0],
       d: [5, 4, 3, 1.5, 0, 0],
-      deconv: { s: 1.2, i: 8, vs: 0, vi: 0 },
+      deconv: { s: 1.2, i: 6, vs: 0, vi: 0 },
       edgeAwareWavelets: true,
-      edgeAwareStrength: 64,
+      edgeAwareStrength: 74,
       autoMask: 60,
-      masterDenoise: 7,
+      masterDenoise: 8,
       blend: 86,
       advanced: {
         toneCurvePoints: [[0, 0], [.2, .17], [.5, .53], [.82, .86], [1, 1]],
         shadows: -.03,
         highlights: -.2,
         whites: -.08,
-        texture: .12,
-        clarity: .08,
+        texture: .08,
+        clarity: .06,
         // Mineral colour must reveal measured chroma, not manufacture colour
-        // from near-neutral read noise. The adaptive pass scales these modest
-        // maxima from the actual master and the Rust pipeline adds a per-pixel
-        // chroma/tonal confidence gate.
-        vibrance: .34,
-        hslSaturation: [.035, .07, .06, .015, .04, .09, .075, .04],
-        hslLuminance: [0, .018, .02, 0, .01, -.018, -.01, 0],
+        // from near-neutral read noise. The adaptive pass scales these from the
+        // actual master and the Rust pipeline adds a per-pixel chroma/tonal
+        // confidence gate — así que el punto de partida puede ser generoso sin
+        // inventar color: sobre una toma neutra se repliega solo.
+        vibrance: .5,
+        hslSaturation: [.16, .24, .16, 0, .15, .28, .2, .13],
+        hslLuminance: [.012, .018, .01, 0, -.01, -.02, -.012, 0],
+      },
+    },
+  },
+  "lunar-mineral-intense": {
+    label: "Luna mineral intensa",
+    family: "lunar",
+    intent: "creative",
+    colorRequired: true,
+    description: "Separación mineral máxima: maria de titanio en azul y tierras altas férricas en rojo.",
+    // La versión declarada del "mineral moon" clásico. Sigue exigiendo croma
+    // MEDIDA (evidenceGain > 0), pero con un suelo y un techo mucho más altos:
+    // es una lectura abiertamente interpretativa, no una medida.
+    colorAdaptive: { evidenceBias: .52, evidenceGain: .48, unmeasured: .7, chromaWeight: .28, min: .45, max: 1 },
+    pipeline: {
+      // Igual que la contenida: aquí manda el color, no la nitidez. Apurar el
+      // detalle además hace visible el ruido que la saturación amplifica.
+      w: [3.2, 2.6, 1.5, .65, 0, 0],
+      d: [6, 5, 3.5, 2, 0, 0],
+      deconv: { s: 1.2, i: 6, vs: 0, vi: 0 },
+      edgeAwareWavelets: true,
+      edgeAwareStrength: 76,
+      autoMask: 62,
+      // Saturar así amplifica también el ruido de croma: se compensa de salida.
+      masterDenoise: 9,
+      blend: 88,
+      advanced: {
+        toneCurvePoints: [[0, 0], [.18, .15], [.5, .55], [.82, .88], [1, 1]],
+        shadows: -.05,
+        highlights: -.22,
+        whites: -.1,
+        texture: .09,
+        clarity: .07,
+        // Índices de tono: 0 rojo · 1 naranja · 2 amarillo · 3 verde · 4 aqua
+        // · 5 azul · 6 púrpura · 7 magenta. El VERDE se deja en 0 a propósito:
+        // la Luna no tiene mineral verde, así que subirlo sólo amplificaría
+        // ruido y desequilibrio de balance de blancos.
+        vibrance: .88,
+        hslSaturation: [.82, .7, .32, 0, .74, .95, .52, .44],
+        // Separa las maria (azules, algo más oscuras) de las tierras altas
+        // (rojizas, algo más claras) sin tocar la luminancia global.
+        hslLuminance: [.022, .026, 0, 0, -.02, -.032, -.016, 0],
       },
     },
   },
@@ -307,19 +366,23 @@ export function adaptObjectFinishingPreset(name, input = {}) {
     ), 3);
   }
   if (preset.intent === "creative") {
-    const baseColorScale = name === "lunar-mineral"
+    // Cada receta creativa declara cuánto color puede sostener: las minerales
+    // parten de la CROMA MEDIDA (no inventan color sobre ruido casi neutro) y
+    // fijan su propio techo, en vez de cablear el nombre del preset aquí.
+    const colorAdaptive = { ...DEFAULT_CREATIVE_COLOR, ...(preset.colorAdaptive || {}) };
+    const baseColorScale = colorAdaptive.evidenceGain > 0
       ? (analysis.chromaMeasured
-          ? 0.12 + analysis.chromaEvidence * 0.72
-          : 0.38)
+          ? colorAdaptive.evidenceBias + analysis.chromaEvidence * colorAdaptive.evidenceGain
+          : colorAdaptive.unmeasured)
       : 1;
     adaptiveColorScale = clampAdaptive(
       baseColorScale
         * (1
           - analysis.noiseStress * 0.42
           - highlightGuard * 0.24
-          - analysis.chromaStress * (name === "lunar-mineral" ? 0.5 : 0.2)),
-      name === "lunar-mineral" ? 0.08 : 0.55,
-      name === "lunar-mineral" ? 0.72 : 1,
+          - analysis.chromaStress * colorAdaptive.chromaWeight),
+      colorAdaptive.min,
+      colorAdaptive.max,
     );
     advanced.vibrance = roundAdaptive(
       Number(advanced.vibrance || 0) * adaptiveColorScale,

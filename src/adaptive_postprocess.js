@@ -58,10 +58,19 @@ export function normalizeAdaptivePostprocessAnalysis(input = {}) {
           + clampAdaptive((chromaticFraction - 0.04) / 0.55) * 0.2,
       )
     : 0.45;
+  // Un p99.9 alto NO es prueba de recorte: en un máster solar o lunar bien
+  // expuesto el disco ocupa legítimamente la parte alta del rango. Medir el
+  // estrés desde 0.88 saturaba a 1.0 en casi cualquier máster sano y disparaba
+  // la protección máxima (compresión de altas, recorte del extremo de la curva
+  // y menos color) sobre datos que no la necesitaban: adaptativo acababa
+  // significando "aplanado". La única evidencia directa es la fracción de
+  // píxeles realmente recortada; la falta de headroom entra como señal
+  // secundaria, más tardía y acotada, incapaz de saturar por sí sola.
+  const highlightHeadroom = clampAdaptive((percentileHigh - 0.985) / 0.015);
   const highlightStress = clampAdaptive(
     Math.max(
       highlightClip * 320,
-      (percentileHigh - 0.88) / 0.12,
+      highlightHeadroom * 0.45,
     ),
   );
   const shadowStress = clampAdaptive(
@@ -100,7 +109,10 @@ export function normalizeAdaptivePostprocessAnalysis(input = {}) {
   );
 
   const safeguards = [];
-  if (highlightStress > 0.18) safeguards.push("highlights");
+  // Umbral por encima de lo que puede producir la mera falta de headroom sin
+  // recorte medido: anunciar "highlights" en un máster sano describía una
+  // protección que no hacía falta (y que antes sí se aplicaba).
+  if (highlightStress > 0.3) safeguards.push("highlights");
   if (noiseStress > 0.18) safeguards.push("noise");
   if (ringing > 0.12) safeguards.push("ringing");
   if (shadowStress > 0.2) safeguards.push("shadows");

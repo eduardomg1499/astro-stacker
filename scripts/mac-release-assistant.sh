@@ -440,7 +440,7 @@ echo "Version actual: $CURRENT_VERSION"
 read -r -p "Nueva version (Enter para conservar $CURRENT_VERSION): " REQUESTED_VERSION
 REQUESTED_VERSION="${REQUESTED_VERSION#v}"
 VERSION="${REQUESTED_VERSION:-$CURRENT_VERSION}"
-[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Usa una version como 0.2.8, sin la letra v."
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Usa una version como 0.3.0, sin la letra v."
 
 if [[ "$VERSION" != "$CURRENT_VERSION" ]]; then
   step "Actualizando $CURRENT_VERSION -> $VERSION"

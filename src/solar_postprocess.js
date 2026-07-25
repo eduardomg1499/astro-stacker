@@ -283,15 +283,30 @@ export function adaptSolarPreset(name, input = {}) {
   if (name === "neutral" || !preset.enabled) {
     return { ...preset, adaptation: analysis };
   }
+  // A recipe without a measured master is only a declared starting point. Do
+  // not pretend to adapt it from fallback histogram values.
+  if (!analysis.measured) {
+    return { ...preset, adaptation: analysis };
+  }
 
   const detailScale = clampAdaptive(
     analysis.detailConfidence
-      - analysis.ringing * 0.08
-      - analysis.noiseStress * 0.06,
-    0.48,
-    1,
+      - analysis.ringing * 0.12
+      - analysis.noiseStress * 0.1,
+    0.7,
+    1.06,
   );
   const highlightStress = analysis.highlightStress;
+  const narrowRange = clampAdaptive((0.5 - analysis.robustRange) / 0.38);
+  const exposureOffset = clampAdaptive(Math.abs(analysis.median - 0.52) / 0.48);
+  const tonePreservation = clampAdaptive(
+    narrowRange * 0.18
+      + exposureOffset * 0.1
+      + analysis.shadowStress * 0.06
+      + highlightStress * 0.07,
+    0,
+    0.3,
+  );
   preset.highlightProtect = roundAdaptive(clampAdaptive(
     Math.max(preset.highlightProtect, 0.9 + highlightStress * 0.09),
     0,
@@ -299,9 +314,9 @@ export function adaptSolarPreset(name, input = {}) {
   ), 3);
   preset.highlightCompression = roundAdaptive(clampAdaptive(
     preset.highlightCompression
-      + highlightStress * 0.2
-      + analysis.ringing * 0.06,
-    0.35,
+      * (0.68 + highlightStress * 0.48)
+      + analysis.ringing * 0.04,
+    0.18,
     0.92,
   ), 3);
   preset.backgroundProtect = roundAdaptive(clampAdaptive(
@@ -310,46 +325,61 @@ export function adaptSolarPreset(name, input = {}) {
     1,
   ), 3);
   preset.filamentAmount = roundAdaptive(clampAdaptive(
-    preset.filamentAmount * detailScale,
-    0,
-    1,
+    preset.filamentAmount * detailScale
+      + narrowRange * preset.filamentAmount * 0.16,
+    preset.filamentAmount * 0.7,
+    Math.min(1, preset.filamentAmount * 1.18 + 0.04),
   ), 3);
   preset.prominenceAmount = roundAdaptive(clampAdaptive(
     preset.prominenceAmount
-      * clampAdaptive(0.82 + analysis.rangeConfidence * 0.18, 0.72, 1),
-    0,
+      * (1
+        + narrowRange * 0.5
+        + analysis.shadowStress * 0.18)
+      * (1 - analysis.noiseStress * 0.14),
+    preset.prominenceAmount * 0.88,
     1,
   ), 3);
   preset.noiseGuard = roundAdaptive(clampAdaptive(
     Math.max(
       preset.noiseGuard,
-      0.72 + analysis.noiseStress * 0.24 + analysis.ringing * 0.08,
+      0.7 + analysis.noiseStress * 0.18 + analysis.ringing * 0.06,
     ),
     0,
-    0.98,
+    0.94,
   ), 3);
   preset.colorStrength = roundAdaptive(clampAdaptive(
     preset.colorStrength
-      * (1 - analysis.highlightStress * 0.18 - analysis.noiseStress * 0.12),
+      * (1 - analysis.highlightStress * 0.12 - analysis.ringing * 0.04),
     0,
     1,
   ), 3);
 
-  // Preserve the preset's shape while reserving additional 16-bit headroom
-  // when the source already reaches the right edge of the histogram.
+  // Extreme gain/exposure and narrow histograms get a measured blend toward
+  // identity. This preserves black, median and white ordering instead of
+  // forcing every capture through the exact same S-curve. Only the final
+  // endpoint reserves headroom; clipping every high control point can create a
+  // plateau and erase the very filament/prominence contrast being protected.
   const endpointCap = clampAdaptive(
-    0.985 - highlightStress * 0.055,
-    0.91,
+    0.985 - highlightStress * 0.045,
+    0.925,
     0.985,
   );
   preset.curvePoints = normalizeSolarCurvePoints(preset.curvePoints)
-    .map(([x, y]) => [
-      x,
-      roundAdaptive(Math.min(y, endpointCap), 4),
-    ]);
+    .map(([x, y]) => {
+      if (x >= 0.9999) {
+        return [x, roundAdaptive(Math.min(y, endpointCap), 4)];
+      }
+      const protectedY = y + (x - y) * tonePreservation;
+      return [
+        x,
+        roundAdaptive(protectedY, 4),
+      ];
+    });
   preset.adaptation = {
     ...analysis,
     detailScale: roundAdaptive(detailScale, 2),
+    narrowRange: roundAdaptive(narrowRange, 2),
+    tonePreservation: roundAdaptive(tonePreservation, 2),
   };
   return preset;
 }

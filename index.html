@@ -1273,7 +1273,7 @@
                 <div id="splash-progress-fill" style="width: 30%; height: 100%; background: #38bdf8; box-shadow: 0 0 10px #38bdf8;"></div>
             </div>
 
-            <div class="splash-version">v0.2.8 Beta | Astro Stacker Edition</div>
+            <div class="splash-version">v0.3.0 Beta | Astro Stacker Edition</div>
         </div>
     </div>
 
@@ -1658,6 +1658,34 @@
         #deepsky-modal .ds-calibration-chip.confirmed { color:#6ee7b7; border-color:rgba(52,211,153,.28); background:rgba(6,95,70,.09); }
         #deepsky-modal .ds-calibration-chip.pending { color:#fcd34d; border-color:rgba(251,191,36,.22); background:rgba(120,53,15,.08); }
         #deepsky-modal .ds-session-flow-label { display:flex; align-items:center; gap:5px; margin:3px 0 6px; color:#64748b; font-size:.53rem; text-transform:uppercase; letter-spacing:.06em; }
+        /* Tabla de calibración estilo WBPP: una fila por noche/filtro/exposición. */
+        #deepsky-modal .ds-wbpp-scroll { overflow-x:auto; border:1px solid rgba(148,163,184,.14); border-radius:11px; background:rgba(2,6,23,.42); }
+        #deepsky-modal .ds-wbpp-table { width:100%; min-width:860px; border-collapse:collapse; font-size:.62rem; }
+        #deepsky-modal .ds-wbpp-table thead th {
+            position:sticky; top:0; z-index:1; padding:7px 9px; text-align:left; white-space:nowrap;
+            background:#111827; color:#94a3b8; font-size:.53rem; font-weight:800;
+            text-transform:uppercase; letter-spacing:.06em; border-bottom:1px solid rgba(148,163,184,.16);
+        }
+        #deepsky-modal .ds-wbpp-table tbody tr { border-top:1px solid rgba(148,163,184,.09); }
+        #deepsky-modal .ds-wbpp-table tbody tr:hover { background:rgba(124,58,237,.07); }
+        #deepsky-modal .ds-wbpp-table td { padding:6px 9px; vertical-align:middle; }
+        #deepsky-modal .ds-wbpp-group { min-width:150px; }
+        #deepsky-modal .ds-wbpp-group strong { display:block; color:#c4b5fd; font-size:.7rem; }
+        #deepsky-modal .ds-wbpp-group span { display:block; color:#94a3b8; font-size:.57rem; white-space:nowrap; }
+        #deepsky-modal .ds-wbpp-exp { color:#e2e8f0; white-space:nowrap; font-variant-numeric:tabular-nums; }
+        #deepsky-modal .ds-link-sel { width:100%; min-width:168px; margin:0; }
+        /* Un grupo ligado a mano se distingue del automático de un vistazo. */
+        #deepsky-modal .ds-link-sel.is-linked { border-color:rgba(103,232,249,.5); color:#67e8f9; background:rgba(8,145,178,.1); }
+        #deepsky-modal .ds-wbpp-table .ds-calibration-chip { display:inline-flex; align-items:center; gap:4px; }
+        /* La celda de filtro no puede partir la etiqueta: el fondo de la píldora
+           se rompía en dos líneas ("Banda / ancha"). */
+        #deepsky-modal .ds-wbpp-table .ds-filter-badge { display:inline-block; white-space:nowrap; font-size:.6rem; padding:2px 7px; }
+        #deepsky-modal .ds-wbpp-table td:nth-child(2) { white-space:nowrap; }
+        #deepsky-modal .ds-block-list { margin-top:9px; }
+        #deepsky-modal .ds-block-list > summary { cursor:pointer; color:#a5b4fc; font-size:.58rem; font-weight:800; letter-spacing:.05em; text-transform:uppercase; }
+        #deepsky-modal .ds-block-chips { display:flex; flex-wrap:wrap; gap:4px 14px; margin-top:6px; }
+        #deepsky-modal .ds-block-chip { display:inline-flex; align-items:center; gap:5px; color:#cbd5e1; font-size:.59rem; cursor:pointer; }
+        #deepsky-modal .ds-block-chip input { width:auto; margin:0; }
         #deepsky-modal .ds-session-toggle {
             width:auto; min-height:38px; margin:10px auto 0; padding:7px 13px; display:flex; align-items:center; justify-content:center;
             border:1px solid rgba(167,139,250,.3); border-radius:9px; background:rgba(124,58,237,.09);
@@ -3978,8 +4006,8 @@
                         </div>
                         <div class="control-row">
                             <label data-i18n="wavelets.post.saturation">Saturacion</label>
-                            <input type="range" id="sl-sat" min="0" max="5000" value="1000" class="slider-yellow">
-                            <input type="number" id="num-sat" value="1" step="0.01" min="0.00" max="5.00"
+                            <input type="range" id="sl-sat" min="0" max="10000" value="1000" class="slider-yellow">
+                            <input type="number" id="num-sat" value="1" step="0.01" min="0.00" max="10.00"
                                 class="input-val">
                         </div>
                         <div class="control-row">
@@ -4154,9 +4182,10 @@
                                     <span data-i18n="wavelets.object_lab.lunar_hint">fase · superficie · mineral</span>
                                 </div>
                                 <div class="object-preset-grid">
-                                    <button type="button" data-object-preset="lunar-relief"><span data-i18n="wavelets.object_lab.presets.lunar_relief">Relieve lunar</span><small data-i18n="wavelets.object_lab.intent_scientific">Científico</small></button>
-                                    <button type="button" data-object-preset="lunar-phase"><span data-i18n="wavelets.object_lab.presets.lunar_phase">Fase completa</span><small data-i18n="wavelets.object_lab.intent_scientific">Científico</small></button>
+                                    <button type="button" data-object-preset="lunar-relief"><span data-i18n="wavelets.object_lab.presets.lunar_relief">Relieve lunar</span><small data-i18n="wavelets.object_lab.intent_scientific">Conservador</small></button>
+                                    <button type="button" data-object-preset="lunar-phase"><span data-i18n="wavelets.object_lab.presets.lunar_phase">Fase completa</span><small data-i18n="wavelets.object_lab.intent_scientific">Conservador</small></button>
                                     <button type="button" data-object-preset="lunar-mineral"><span data-i18n="wavelets.object_lab.presets.lunar_mineral">Luna mineral</span><small data-i18n="wavelets.object_lab.intent_creative_color">Creativo · color</small></button>
+                                    <button type="button" data-object-preset="lunar-mineral-intense"><span data-i18n="wavelets.object_lab.presets.lunar_mineral_intense">Luna mineral intensa</span><small data-i18n="wavelets.object_lab.intent_creative_color">Creativo · color</small></button>
                                 </div>
                             </section>
                             <section class="object-preset-family" aria-labelledby="planet-preset-title">
@@ -4165,9 +4194,9 @@
                                     <span data-i18n="wavelets.object_lab.planets_hint">detalle natural o expresivo</span>
                                 </div>
                                 <div class="object-preset-grid">
-                                    <button type="button" data-object-preset="jupiter-natural"><span data-i18n="wavelets.object_lab.presets.jupiter_natural">Júpiter natural</span><small data-i18n="wavelets.object_lab.intent_scientific">Científico</small></button>
-                                    <button type="button" data-object-preset="saturn-rings"><span data-i18n="wavelets.object_lab.presets.saturn_rings">Saturno y anillos</span><small data-i18n="wavelets.object_lab.intent_scientific">Científico</small></button>
-                                    <button type="button" data-object-preset="mars-detail"><span data-i18n="wavelets.object_lab.presets.mars_detail">Marte detallado</span><small data-i18n="wavelets.object_lab.intent_scientific">Científico</small></button>
+                                    <button type="button" data-object-preset="jupiter-natural"><span data-i18n="wavelets.object_lab.presets.jupiter_natural">Júpiter natural</span><small data-i18n="wavelets.object_lab.intent_scientific">Conservador</small></button>
+                                    <button type="button" data-object-preset="saturn-rings"><span data-i18n="wavelets.object_lab.presets.saturn_rings">Saturno y anillos</span><small data-i18n="wavelets.object_lab.intent_scientific">Conservador</small></button>
+                                    <button type="button" data-object-preset="mars-detail"><span data-i18n="wavelets.object_lab.presets.mars_detail">Marte detallado</span><small data-i18n="wavelets.object_lab.intent_scientific">Conservador</small></button>
                                     <button type="button" data-object-preset="planet-cinematic"><span data-i18n="wavelets.object_lab.presets.planet_cinematic">Planetario expresivo</span><small data-i18n="wavelets.object_lab.intent_creative">Creativo</small></button>
                                 </div>
                             </section>

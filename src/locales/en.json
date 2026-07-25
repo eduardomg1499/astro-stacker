@@ -718,11 +718,11 @@
             "lunar_hint": "phase · surface · mineral",
             "planets": "Planets",
             "planets_hint": "natural or expressive detail",
-            "intent_scientific": "Scientific",
+            "intent_scientific": "Conservative",
             "intent_creative": "Creative",
             "intent_creative_color": "Creative · color",
             "intent_creative_long": "Creative and interpretive",
-            "intent_scientific_long": "Scientific and natural",
+            "intent_scientific_long": "Conservative and natural",
             "intent_recipe_creative": "creative",
             "intent_recipe_natural": "natural",
             "presets": {
@@ -732,7 +732,8 @@
                 "jupiter_natural": "Natural Jupiter",
                 "saturn_rings": "Saturn and rings",
                 "mars_detail": "Detailed Mars",
-                "planet_cinematic": "Expressive planet"
+                "planet_cinematic": "Expressive planet",
+                "lunar_mineral_intense": "Intense mineral moon"
             },
             "status_idle": "Choose a recipe to see which modules it enables.",
             "status_original": "Original stack · neutral recipe · undo restores the previous adjustment.",
@@ -1858,6 +1859,19 @@
         "eidr_mode_label": "EIDR mode",
         "eidr_mode_quadratic": "Scientific quadratic",
         "eidr_mode_experimental": "Experimental detail (Huber)",
-        "eidr_refine_label": "Micro-registration ±0.2 px"
+        "eidr_refine_label": "Micro-registration ±0.2 px",
+        "wbpp_hint": "One row per night, filter and exposure. Pick the block of flats or darks you want to link to each group, or leave it on Auto and let the signature decide.",
+        "groups": "groups",
+        "state": "State",
+        "session_all": "All",
+        "blocks_compatible": "Compatible blocks",
+        "blocks_other": "Other signatures",
+        "groups_show_all": "Show all {{count}} groups",
+        "groups_show_less": "Show fewer groups",
+        "scan_added": "{{count}} frames added",
+        "scan_duplicates": "{{count}} already loaded",
+        "scan_reclassified": "{{count}} reclassified from FITS headers",
+        "scan_total": "Running total",
+        "scan_accumulates": "You can scan more folders: they add to the previous ones. Use ✕ on a group to empty it."
     }
 }

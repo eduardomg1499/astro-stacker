@@ -1,7 +1,7 @@
 {
   "suiteVersion": "4.0-example-incomplete",
   "environment": {
-    "appVersion": "0.2.8",
+    "appVersion": "0.3.0",
     "os": "macos",
     "arch": "aarch64",
     "cpuThreads": 8,
@@ -376,7 +376,7 @@
         "runKey": "zenith:hybrid-v2:cold",
         "product": "Zenith Astro Stacker",
         "vendor": "EMG",
-        "version": "0.2.8",
+        "version": "0.3.0",
         "distribution": "replace-with-release-or-commit-identifier",
         "executableArtifactId": "zenith-release-executable",
         "outputArtifactId": "planet-surface-output-cold",
@@ -395,7 +395,7 @@
         "runKey": "zenith:hybrid-v2:warm",
         "product": "Zenith Astro Stacker",
         "vendor": "EMG",
-        "version": "0.2.8",
+        "version": "0.3.0",
         "distribution": "replace-with-release-or-commit-identifier",
         "executableArtifactId": "zenith-release-executable",
         "outputArtifactId": "planet-surface-output-warm",

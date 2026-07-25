@@ -718,11 +718,11 @@
             "lunar_hint": "fase · superficie · mineral",
             "planets": "Planetas",
             "planets_hint": "detalle natural o expresivo",
-            "intent_scientific": "Científico",
+            "intent_scientific": "Conservador",
             "intent_creative": "Creativo",
             "intent_creative_color": "Creativo · color",
             "intent_creative_long": "Creativo e interpretativo",
-            "intent_scientific_long": "Científico y natural",
+            "intent_scientific_long": "Conservador y natural",
             "intent_recipe_creative": "creativa",
             "intent_recipe_natural": "natural",
             "presets": {
@@ -732,7 +732,8 @@
                 "jupiter_natural": "Júpiter natural",
                 "saturn_rings": "Saturno y anillos",
                 "mars_detail": "Marte detallado",
-                "planet_cinematic": "Planetario expresivo"
+                "planet_cinematic": "Planetario expresivo",
+                "lunar_mineral_intense": "Luna mineral intensa"
             },
             "status_idle": "Elige una receta para ver qué módulos activa.",
             "status_original": "Original apilado · receta neutra · puedes deshacer para recuperar el ajuste anterior.",
@@ -1690,6 +1691,19 @@
         "eidr_mode_label": "Modo EIDR",
         "eidr_mode_quadratic": "Cuadrático científico",
         "eidr_mode_experimental": "Detalle experimental (Huber)",
-        "eidr_refine_label": "Microregistro ±0.2 px"
+        "eidr_refine_label": "Microregistro ±0.2 px",
+        "wbpp_hint": "Una fila por noche, filtro y exposición. Elige el bloque de flats o darks que quieres ligar a cada grupo, o déjalo en Auto para que la firma decida.",
+        "groups": "grupos",
+        "state": "Estado",
+        "session_all": "Todos",
+        "blocks_compatible": "Bloques compatibles",
+        "blocks_other": "Otras firmas",
+        "groups_show_all": "Mostrar los {{count}} grupos",
+        "groups_show_less": "Mostrar menos grupos",
+        "scan_added": "{{count}} tomas añadidas",
+        "scan_duplicates": "{{count}} ya estaban",
+        "scan_reclassified": "{{count}} reclasificadas por su cabecera FITS",
+        "scan_total": "Total acumulado",
+        "scan_accumulates": "Puedes escanear más carpetas: se suman a las anteriores. Usa ✕ en cada grupo para vaciarlo."
     }
 }

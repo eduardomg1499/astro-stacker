@@ -721,13 +721,30 @@ fn build_solar_filament_delta(
         .map(|value| value.abs())
         .collect();
     absolute_sample.sort_by(|left, right| left.total_cmp(right));
-    let mad = absolute_sample
-        .get(absolute_sample.len().saturating_sub(1) / 2)
-        .copied()
-        .unwrap_or(0.0);
-    let noise_sigma = (mad * 1.4826).max(0.000_35);
+    // Cuantil BAJO, no la mediana. En un fotograma solar el disco llena el
+    // encuadre, así que la mediana de |paso-alto| ES la granulación: estimar el
+    // ruido con ella daba un umbral ~5× la estructura real y la puerta de
+    // confianza anulaba TODOS los filamentos. El percentil 25 se apoya en las
+    // zonas planas. Para ruido gaussiano puro ambos estimadores coinciden
+    // (|N(0,σ)|: P50 = 0.6745σ ⇒ ×1.4826; P25 = 0.3186σ ⇒ ×3.1382), así que un
+    // campo plano se comporta igual que antes y sólo cambia el caso con señal.
+    let last = absolute_sample.len().saturating_sub(1);
+    let quantile_at = |q: f32| -> f32 {
+        let index = ((last as f32) * q).round() as usize;
+        absolute_sample.get(index.min(last)).copied().unwrap_or(0.0)
+    };
+    let noise_sigma = (quantile_at(0.25) * 3.1382).max(0.000_35);
     let guard = params.noise_guard.clamp(0.0, 1.0);
-    let threshold = noise_sigma * (0.8 + guard * 3.8);
+    let noise_threshold = noise_sigma * (0.7 + guard * 2.6);
+    // Segundo anclaje, en un cuantil ALTO. Si la estructura llena el encuadre
+    // —un disco solar granulado— cualquier cuantil bajo sigue escalando con ella
+    // y el umbral acaba por encima de la señal: eso dejaba el resultado liso.
+    // Atarlo también a la parte fuerte del detalle garantiza que la estructura
+    // más marcada SIEMPRE pase, sea cual sea la escala absoluta, mientras que en
+    // un campo de puro ruido este anclaje queda por encima del piso y no abre la
+    // puerta (|N(0,σ)|: P25 = 0.3186σ, P90 = 1.6449σ).
+    let structure = quantile_at(0.90);
+    let threshold = noise_threshold.min(structure * (0.55 + guard * 0.35));
     let upper = threshold * (2.4 + guard * 2.8);
     let amount = params.filament_amount.clamp(0.0, 1.5);
 
@@ -867,10 +884,28 @@ fn interpolate_solar_color(
     let chroma_luma = (0.2126 * chroma[0] + 0.7152 * chroma[1] + 0.0722 * chroma[2])
         .max(0.015);
     let scale = value / chroma_luma;
+    let scaled = [chroma[0] * scale, chroma[1] * scale, chroma[2] * scale];
+    // Las paletas solares son rojo-dominantes: `scaled[0]` supera 1.0 desde
+    // luminancia ~0.5 hacia arriba, y recortar POR CANAL dejaba la derivada del
+    // rojo en CERO sobre el disco entero — la granulación sobrevivía en
+    // luminancia pero desaparecía del canal que domina la imagen, que es
+    // exactamente el "disco naranja plano" que se ve al aplicar un preset.
+    // En vez de recortar se desatura hacia el gris de la MISMA luminancia sólo
+    // lo justo para caber en gama: como la luma es lineal, la mezcla conserva
+    // `value` exacto y ningún canal pierde su gradiente.
+    let mut fit = 1.0f32;
+    for channel in scaled {
+        if channel > 1.0 {
+            fit = fit.min((1.0 - value) / (channel - value));
+        } else if channel < 0.0 {
+            fit = fit.min(value / (value - channel));
+        }
+    }
+    let fit = fit.clamp(0.0, 1.0);
     [
-        (chroma[0] * scale).clamp(0.0, 1.0),
-        (chroma[1] * scale).clamp(0.0, 1.0),
-        (chroma[2] * scale).clamp(0.0, 1.0),
+        (value + (scaled[0] - value) * fit).clamp(0.0, 1.0),
+        (value + (scaled[1] - value) * fit).clamp(0.0, 1.0),
+        (value + (scaled[2] - value) * fit).clamp(0.0, 1.0),
     ]
 }
 
@@ -1163,7 +1198,12 @@ fn apply_advanced_postprocess(
                             * 0.28;
                     }
                 }
-                let highlight_weight = post_smoothstep(0.48, 0.97, source_mono)
+                // La protección de luces reinyecta luminancia SIN curva. Arrancar
+                // en 0.48 metía en el reparto al disco entero (un máster solar
+                // estirado vive entre 0.5 y 0.85), así que devolvía ~50 % de la
+                // señal sin curva y el preset se veía plano y suavizado. Ahora
+                // empieza donde de verdad hay riesgo de quemar: el limbo.
+                let highlight_weight = post_smoothstep(0.80, 0.995, source_mono)
                     * params.solar.highlight_protect.clamp(0.0, 1.0);
                 solar_luma += (mono - solar_luma) * highlight_weight * 0.78;
                 if params.solar.invert {
@@ -1225,16 +1265,27 @@ fn apply_advanced_postprocess(
                                 })
                                 .unwrap_or(0.0),
                         );
-                    let prominence_rescue = prominence_confidence
-                        * (0.35
-                            + 0.65
-                                * params
-                                    .solar
-                                    .prominence_amount
-                                    .clamp(0.0, 1.0));
-                    let background_weight = intensity_background
-                        .max(spatial_background)
-                        * (1.0 - prominence_rescue).clamp(0.0, 1.0);
+                    // La confianza decide si el píxel ES estructura coherente;
+                    // `prominence_amount` decide cuánto se REALZA (en el lift de
+                    // arriba), no cuánto se le permite sobrevivir. Atar aquí el
+                    // techo del rescate a ese valor hacía que un preset
+                    // conservador (ha-natural, 0.12 → rescate máximo 0.43)
+                    // borrase ~80 % del estirado de una protuberancia aunque
+                    // estuviera detectada con confianza total.
+                    let prominence_rescue = prominence_confidence.clamp(0.0, 1.0);
+                    // El mask espacial (cielo conectado al borde) es
+                    // AUTORITATIVO cuando existe: combinarlo con `max` hacía que
+                    // una umbra o un filamento oscuro DENTRO del disco puntuara
+                    // como fondo por intensidad y se reseteara al valor sin
+                    // estirar, justo lo contrario de lo que el mask documenta.
+                    // Sin mask, la intensidad sigue siendo la única evidencia.
+                    let background_presence = if solar_signal_mask.is_some() {
+                        spatial_background
+                    } else {
+                        intensity_background
+                    };
+                    let background_weight =
+                        background_presence * (1.0 - prominence_rescue).clamp(0.0, 1.0);
                     let protect = params.solar.background_protect.clamp(0.0, 1.0);
                     let weighted_protect = (background_weight * protect).clamp(0.0, 1.0);
                     let effective_protect =
@@ -1528,6 +1579,13 @@ mod postprocess_io_tests {
                 source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(38_000);
             }
         }
+        // Limbo casi saturado: ESTO es una luz, y es lo que la protección existe
+        // para conservar. El disco de 38 000 (luma 0.58) es tono medio.
+        for y in 8..24 {
+            for x in 54..59 {
+                source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(63_500);
+            }
+        }
         for y in 10..22 {
             let x = 21 + (y % 2);
             source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(4_800);
@@ -1560,11 +1618,27 @@ mod postprocess_io_tests {
             protected[prominence] > source[prominence],
             "la señal coherente fuera del disco debe poder recuperarse"
         );
+        // La protección de luces actúa sobre el LIMBO casi saturado, donde de
+        // verdad hay riesgo de quemar: subir `highlight_protect` tiene que
+        // moverlo respecto a la misma receta sin esa protección.
+        let limb = (16 * width + 56) * 3;
+        assert_ne!(
+            protected[limb], baseline[limb],
+            "la protección de luces debe seguir actuando sobre el limbo casi saturado"
+        );
+        // ...y NO sobre el disco de tono medio: reinyectar ahí luminancia sin
+        // curva era lo que dejaba el preset plano y suavizado. El disco debe
+        // conservar el estirado que pide la receta.
         let disk = (16 * width + 42) * 3;
+        assert_eq!(
+            protected[disk], baseline[disk],
+            "el disco de tono medio no puede perder la curva por la protección de luces"
+        );
         assert!(
-            (protected[disk] as i32 - source[disk] as i32).abs()
-                < (baseline[disk] as i32 - source[disk] as i32).abs(),
-            "la protección de luces debe conservar mejor la luminancia del disco"
+            protected[disk] > source[disk],
+            "el disco debe conservar el estirado de la curva ({} desde {})",
+            protected[disk],
+            source[disk]
         );
     }
 
@@ -1655,6 +1729,197 @@ mod postprocess_io_tests {
         assert!(high < 0.98, "debe reservar margen antes del recorte");
         assert_eq!(compress_solar_highlights(0.58, 0.8), 0.58);
         assert_eq!(compress_solar_highlights(0.98, 0.0), 0.98);
+    }
+
+    #[test]
+    fn solar_filaments_survive_a_disk_that_fills_the_frame() {
+        // Regresión: el piso de ruido se estimaba con la MEDIANA de |paso-alto|
+        // sobre toda la imagen. En un disco solar que llena el encuadre esa
+        // mediana ES la granulación, así que el umbral quedaba muy por encima de
+        // la estructura real y la puerta de confianza anulaba TODOS los
+        // filamentos: el resultado salía liso. Con un cuantil bajo el piso vuelve
+        // a describir el ruido de las zonas planas.
+        let (width, height) = (64usize, 64usize);
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.colorize = false;
+        params.solar.filament_amount = 0.8;
+        params.solar.filament_radius = 1.0;
+        // Guard alto, como lo deja la adaptación sobre un máster real.
+        params.solar.noise_guard = 0.85;
+
+        // Granulación SUAVE por todo el encuadre (como la real: pasa por su
+        // media, así que su paso-alto tiene muchos valores pequeños) sobre un
+        // piso de ruido determinista mucho menor.
+        let mut disk = vec![0u16; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let granulation = 1_400.0
+                    * (x as f32 / 2.6).sin()
+                    * (y as f32 / 2.9).sin();
+                let noise = (((x * 7 + y * 13) % 11) as f32 - 5.0) * 12.0;
+                let value = (34_000.0 + granulation + noise).clamp(0.0, 65_535.0) as u16;
+                let index = (y * width + x) * 3;
+                disk[index..index + 3].fill(value);
+            }
+        }
+        for y in 12..52 {
+            let x = 26 + (y % 3);
+            let index = (y * width + x) * 3;
+            disk[index..index + 3].fill(21_000);
+        }
+
+        // Aísla EXACTAMENTE la recuperación de filamentos: misma receta con el
+        // control a cero y al valor pedido.
+        let mut without_filaments = params.clone();
+        without_filaments.solar.filament_amount = 0.0;
+        let mut off = disk.clone();
+        apply_advanced_postprocess(&mut off, width, height, true, &without_filaments);
+        let mut on = disk.clone();
+        apply_advanced_postprocess(&mut on, width, height, true, &params);
+
+        let fibril = (30 * width + 26 + (30 % 3)) * 3;
+        assert_ne!(
+            on[fibril], off[fibril],
+            "la fibrilla debe responder aunque el disco llene el encuadre"
+        );
+        let touched = off
+            .chunks_exact(3)
+            .zip(on.chunks_exact(3))
+            .filter(|(before, after)| before[0] != after[0])
+            .count();
+        assert!(
+            touched > width * height / 8,
+            "la textura del disco debe sobrevivir a la puerta de ruido ({touched} píxeles de {})",
+            width * height
+        );
+    }
+
+    #[test]
+    fn solar_filaments_do_not_invent_worms_on_a_noisy_flat_field() {
+        // Contrapeso del test anterior: bajar el piso de ruido no puede convertir
+        // el ruido en "filamentos". Un campo plano CON ruido (no el plano
+        // perfecto, que sale por el atajo de detalle nulo) debe quedar
+        // prácticamente intacto.
+        let (width, height) = (64usize, 64usize);
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.colorize = false;
+        params.solar.filament_amount = 0.8;
+        params.solar.filament_radius = 1.0;
+        params.solar.noise_guard = 0.85;
+
+        let mut noisy = vec![0u16; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let noise = (((x * 7 + y * 13) % 11) as f32 - 5.0) * 12.0;
+                let value = (34_000.0 + noise).clamp(0.0, 65_535.0) as u16;
+                let index = (y * width + x) * 3;
+                noisy[index..index + 3].fill(value);
+            }
+        }
+
+        let mut without_filaments = params.clone();
+        without_filaments.solar.filament_amount = 0.0;
+        let mut off = noisy.clone();
+        apply_advanced_postprocess(&mut off, width, height, true, &without_filaments);
+        let mut on = noisy.clone();
+        apply_advanced_postprocess(&mut on, width, height, true, &params);
+
+        let worst = off
+            .chunks_exact(3)
+            .zip(on.chunks_exact(3))
+            .map(|(before, after)| (after[0] as i32 - before[0] as i32).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            worst < 260,
+            "el ruido no puede convertirse en filamentos (desvío máximo {worst} ADU)"
+        );
+    }
+
+    #[test]
+    fn solar_false_colour_preserves_the_luminance_it_was_asked_for() {
+        // Regresión de detalle: el mapa de falso color escalaba la paleta a la
+        // luminancia pedida y recortaba POR CANAL. Con paletas rojo-dominantes
+        // el rojo se salía de gama desde luminancia ~0.5, el recorte se comía
+        // la parte del canal que faltaba y la luminancia resultante caía por
+        // debajo de la pedida: la granulación del disco se atenuaba justo en el
+        // tramo donde vive. Ahora se desatura hacia el gris de la misma
+        // luminancia, así que `luma(salida) == value` exacto en todo el rango.
+        let shadow = [0.070_6, 0.0, 0.0];
+        let midtone = [0.776_5, 0.352_9, 0.070_6]; // #c65a12 — H-alpha dorado
+        let highlight = [1.0, 0.913_7, 0.658_8]; // #ffe9a8
+        let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+
+        let mut previous = luma(interpolate_solar_color(0.0, shadow, midtone, highlight));
+        for step in 0..=200 {
+            let value = step as f32 / 200.0;
+            let mapped = interpolate_solar_color(value, shadow, midtone, highlight);
+            for (index, channel) in mapped.iter().enumerate() {
+                assert!(
+                    (0.0..=1.0).contains(channel),
+                    "el canal {index} debe quedar en gama (v={value}, {channel})"
+                );
+            }
+            let mapped_luma = luma(mapped);
+            assert!(
+                (mapped_luma - value).abs() < 1e-3,
+                "la luma mapeada debe ser la pedida (v={value}, luma={mapped_luma})"
+            );
+            assert!(
+                mapped_luma >= previous - 1e-4,
+                "la luma mapeada debe crecer con la señal (v={value})"
+            );
+            previous = mapped_luma;
+        }
+    }
+
+    #[test]
+    fn solar_background_protection_keeps_dark_disk_features_stretched() {
+        // Una umbra o un filamento oscuro DENTRO del disco puntúa como fondo por
+        // intensidad. Cuando existe el mask espacial de cielo, ese píxel es
+        // disco y su estirado debe sobrevivir; combinarlo con `max` lo reseteaba
+        // al valor sin estirar, que es lo contrario de lo que el mask documenta.
+        let (width, height) = (64usize, 32usize);
+        let mut source = vec![600u16; width * height * 3];
+        for y in 4..28 {
+            for x in 8..56 {
+                source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(36_000);
+            }
+        }
+        // Mancha oscura bien dentro del disco.
+        for y in 14..18 {
+            for x in 28..34 {
+                source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(3_200);
+            }
+        }
+
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.colorize = false;
+        params.solar.curve_points = vec![[0.0, 0.0], [0.05, 0.18], [0.2, 0.34], [1.0, 1.0]];
+        params.solar.background_protect = 1.0;
+        params.solar.prominence_amount = 0.12;
+        params.solar.highlight_protect = 0.9;
+
+        let mut stretched = source.clone();
+        apply_advanced_postprocess(&mut stretched, width, height, true, &params);
+
+        let umbra = (16 * width + 31) * 3;
+        assert!(
+            stretched[umbra] > source[umbra] + 1_500,
+            "la mancha del disco debe conservar el estirado de la curva (fue {} desde {})",
+            stretched[umbra],
+            source[umbra]
+        );
+        let sky = (1 * width + 2) * 3;
+        assert!(
+            stretched[sky] <= source[sky] + 400,
+            "el cielo debe seguir protegido (fue {} desde {})",
+            stretched[sky],
+            source[sky]
+        );
     }
 
     #[test]

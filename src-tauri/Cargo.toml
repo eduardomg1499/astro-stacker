@@ -1,6 +1,6 @@
 [package]
 name = "astro-stacker"
-version = "0.2.8"
+version = "0.3.0"
 description = "ZenithAstroCode"
 authors = ["ZenithAstroCode-by-EduardoMG"]
 edition = "2021"
