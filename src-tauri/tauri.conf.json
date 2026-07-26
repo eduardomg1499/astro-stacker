@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "productName": "Zenith Astro Stacker",
-  "version": "0.2.8",
+  "version": "0.3.0",
   "identifier": "com.emg.zenith.astro.stacker",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -10,6 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "Zenith Astro Stacker",
@@ -29,6 +30,12 @@
     ],
     "security": {
       "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "**"
+        ]
+      },
       "capabilities": [
         "default"
       ]

@@ -792,7 +792,19 @@ impl LicenseManager {
     }
 
     // ACTUALIZADO: Devuelve TRUE solo si la licencia esta VERIFICADA y ACTIVA
+    /// Bypass exclusivo de builds locales (benchmark/desarrollo): requiere la
+    /// feature de compilación `dev-license` (los binarios distribuidos no
+    /// contienen este código) Y la variable ZAS_DEV_LICENSE=1 en runtime.
+    #[cfg(feature = "dev-license")]
+    fn dev_license_bypass() -> bool {
+        std::env::var("ZAS_DEV_LICENSE").ok().as_deref() == Some("1")
+    }
+
     pub fn is_pro(&self) -> bool {
+        #[cfg(feature = "dev-license")]
+        if Self::dev_license_bypass() {
+            return true;
+        }
         let state_snapshot = {
             let guard = match self.state.lock() {
                 Ok(g) => g,
@@ -813,6 +825,21 @@ impl LicenseManager {
     }
 
     pub fn get_status(&self) -> AppStatus {
+        #[cfg(feature = "dev-license")]
+        if Self::dev_license_bypass() {
+            return AppStatus {
+                status: "PRO".to_string(),
+                days_remaining: 3650,
+                is_pro: true,
+                message: "Licencia de desarrollo local (dev-license).".to_string(),
+                license_key: Some("DEV-LOCAL".to_string()),
+                license_type: "PRO".to_string(),
+                registered_at: None,
+                expires_at: None,
+                last_checked_at: None,
+                renewal_status: None,
+            };
+        }
         self.refresh_remote_validation(false);
 
         let guard = match self.state.lock() {

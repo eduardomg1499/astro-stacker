@@ -208,6 +208,7 @@ export class MosaicManager {
 
         const hasTiles = this.tiles.length > 0;
         const hasVideo = this.tiles.some(t => t.type === 'video');
+        const allReady = hasTiles && this.tiles.every(t => t.type === 'image' && t.status === 'ready');
         window.__mosaicTutorialHasVideo = hasVideo;
 
         const labelEl = document.querySelector('#mosaic-workflow-controls > label');
@@ -225,7 +226,7 @@ export class MosaicManager {
             // DIRECT IMAGE WORKFLOW
             // All tiles are static images (or stacked results).
             this.setStepVisibility('generate');
-            this.ui.btnGenerate.disabled = false;
+            this.ui.btnGenerate.disabled = !allReady;
             if (labelEl) {
                 labelEl.innerHTML = '2. Proceso de Apilado <span style="color:#10b981; margin-left:8px; font-weight:bold;">✔ Completado</span>';
                 labelEl.style.color = '#10b981';
@@ -244,8 +245,11 @@ export class MosaicManager {
                 this.setStepVisibility('analyze');
             } else if (needsStacking) {
                 this.setStepVisibility('stack');
-            } else {
+            } else if (allReady) {
                 this.setStepVisibility('generate');
+                this.ui.btnGenerate.disabled = false;
+            } else {
+                this.setStepVisibility('none');
             }
         }
     }
@@ -265,7 +269,7 @@ export class MosaicManager {
     async openFileDialog() {
         const files = await openDialog({
             multiple: true,
-            filters: [{ name: 'Media', extensions: ['ser', 'avi', 'png', 'tif', 'tiff', 'jpg'] }]
+            filters: [{ name: 'Capturas o masters 16-bit', extensions: ['ser', 'avi', 'mp4', 'mov', 'mkv', 'm4v', 'png', 'tif', 'tiff'] }]
         });
         if (files) {
             this.handleFiles(Array.isArray(files) ? files : [files]);
@@ -355,6 +359,20 @@ export class MosaicManager {
             // UI UNLOCK - Always execute even if addTile fails
             lockUI(false);
             this.updateWorkflowState();
+            const hasPending = this.tiles.some(tile => tile.type === "video" && tile.status === "pending_analysis");
+            const hasAnalyzed = this.tiles.some(tile => tile.type === "video" && tile.status === "analyzed");
+            const stage = hasPending ? "analyze" : hasAnalyzed ? "stack" : this.tiles.length ? "compose" : "load";
+            const step = stage === "analyze" ? 1 : stage === "stack" ? 2 : stage === "compose" ? 3 : 0;
+            window.updateIntelligentAssistantContext?.({
+                flow: "mosaic",
+                stage,
+                workflowStep: step,
+                workflowTotal: 5,
+                itemCount: this.tiles.length,
+            }, {
+                open: true,
+                announceKey: `mosaic:${stage}:${this.tiles.length}`,
+            });
 
             // Tutorial: file selection completed. The guide branches later based
             // on whether these are videos or already-stacked images.
@@ -371,7 +389,18 @@ export class MosaicManager {
         }
 
         const ext = path.split('.').pop().toLowerCase();
-        const isVideo = ['ser', 'avi'].includes(ext);
+        const isVideo = ['ser', 'avi', 'mp4', 'mov', 'mkv', 'm4v'].includes(ext);
+        const isLinearMaster = ['png', 'tif', 'tiff'].includes(ext);
+        if (!isVideo && !isLinearMaster) {
+            console.error(`Unsupported mosaic source: ${path}`);
+            if (window.showCustomAlert) {
+                window.showCustomAlert(
+                    t("general.error", "Error"),
+                    t("mosaic.errors.master_format", "El mosaico sólo acepta capturas para apilar o masters PNG/TIFF de 16 bits.")
+                );
+            }
+            return;
+        }
         const id = 'tile_' + Date.now() + Math.random().toString(36).substr(2, 5);
 
         const tile = {
@@ -544,6 +573,16 @@ export class MosaicManager {
             const avg = analyzed.reduce((a, b) => a + (b.analysisData ? b.analysisData.avg_quality : 0), 0) / analyzed.length;
             document.getElementById("mosaic-quality-summary").textContent = `Promedio Calidad: ${Math.round(avg)}%`;
         }
+        window.updateIntelligentAssistantContext?.({
+            flow: "mosaic",
+            stage: "stack",
+            workflowStep: 2,
+            workflowTotal: 5,
+            itemCount: this.tiles.length,
+        }, {
+            open: true,
+            announceKey: `mosaic:analyzed:${successCount}`,
+        });
     }
 
     async stackAll() {
@@ -580,7 +619,7 @@ export class MosaicManager {
 
         if (window.showProcessing) window.showProcessing(`APILANDO ${videos.length} TESELAS...`);
 
-        // Use global pipeline params but force deringing OFF
+        // Reuse the same non-destructive 16-bit recipe as the individual flow.
         const p = typeof window.getPipelineParams === "function" ? window.getPipelineParams() : null;
 
         // Output folder logic: Use the directory of the first video
@@ -635,24 +674,34 @@ export class MosaicManager {
                     u1: p?.u[0] || 0, u2: p?.u[1] || 0, u3: p?.u[2] || 0, u4: p?.u[3] || 0, u5: p?.u[4] || 0,
                     w1: p?.w[0] || 0, w2: p?.w[1] || 0, w3: p?.w[2] || 0, w4: p?.w[3] || 0, w5: p?.w[4] || 0, w6: p?.w[5] || 0,
                     d1: p?.d[0] || 0, d2: p?.d[1] || 0, d3: p?.d[2] || 0, d4: p?.d[3] || 0, d5: p?.d[4] || 0, d6: p?.d[5] || 0,
-                    gamma: p?.color.g || 1.0, saturation: p?.color.s || 1.0,
-                    contrast: p?.color.c || 1.0, brightness: p?.color.b || 1.0,
-                    rBal: p?.color.rb || 1.0, bBal: p?.color.bb || 1.0,
+                    gamma: p?.color.g ?? 1.0, saturation: p?.color.s ?? 1.0,
+                    contrast: p?.color.c ?? 1.0, brightness: p?.color.b ?? 0.0,
+                    rBal: p?.color.rb ?? 0.0, bBal: p?.color.bb ?? 0.0,
                     rX: p?.shift.rx || 0, rY: p?.shift.ry || 0, bX: p?.shift.bx || 0, bY: p?.shift.by || 0,
 
-                    deringingMode: 0,
-                    deringingRadius: p?.dr.rad || 2.0,
-                    deringingDark: p?.dr.dark || 0.1,
-                    deringingLight: p?.dr.light || 0.1,
-                    deringingMask: false,
+                    deringingMode: p?.dr.mode ?? 0,
+                    deringingRadius: p?.dr.rad ?? 10.0,
+                    deringingDark: p?.dr.dark ?? 0.5,
+                    deringingLight: p?.dr.light ?? 0.0,
+                    deringingMask: p?.dr.mask ?? false,
 
                     crisp: p?.crisp || 0,
                     deconvIter: p?.deconv.i || 0, deconvSigma: p?.deconv.s || 1.0,
                     vcIter: p?.deconv.vi || 0, vcSigma: p?.deconv.vs || 1.0,
                     usmAmount: p?.usm.a || 0, usmRadius: p?.usm.r || 1.0, lceAmount: p?.lce || 0,
                     masterDenoise: p?.masterDenoise || 0,
+                    masterDenoiseDetail: p?.denoiseDetail ?? 70,
+                    masterDenoiseChroma: p?.denoiseChroma ?? 55,
                     blend: (p?.blend || 100) / 100.0,
                     useRgbSharpening: p?.useRgbSharpening || false,
+                    edgeAwareWavelets: p?.edgeAwareWavelets ?? false,
+                    psfFromLimb: p?.psfFromLimb ?? false,
+                    edgeAwareStrength: p?.edgeAwareStrength ?? 50,
+                    autoMask: p?.autoMask ?? 0,
+                    adaptiveUsm: p?.adaptiveUsm || null,
+                    levelsBlack: p?.levels?.black ?? 0,
+                    levelsWhite: p?.levels?.white ?? 1,
+                    levelsGamma: p?.levels?.gamma ?? 1,
                     batchMode: mode,
                     targetType: flow.category,
                     bayerOverride: bOverride,
@@ -662,16 +711,21 @@ export class MosaicManager {
                     doublePass: doublePass,
                     warpingAnalysis: flow.warpingAnalysis,
                     normalizeColors: document.getElementById("chk-normalize-colors")?.checked || false,
+                    alignRgb: document.getElementById("chk-rgb-align")?.checked || false,
+                    qualityPolicy: document.getElementById("sel-planetary-quality-policy")?.value || "maximum",
                     isV3: flow.isV3,
                     apGridSize: flow.apSize,
                     apThreshold: flow.apThreshold,
+                    advanced: p?.advanced || null,
                     progressPrefix: `[Mosaico ${displayIdx}/${videos.length}]`
                 });
 
                 tile.path = result.path;
                 tile.type = 'image';
                 tile.status = 'ready';
-                tile.src = result.preview_base64;
+                // process_batch_entry ya no manda preview base64: cargar el PNG
+                // guardado via asset protocol (fallback al base64 por compat).
+                tile.src = result.preview_base64 || convertFileSrc(result.path);
                 successCount++;
 
                 if (el) el.innerHTML = "";
@@ -690,6 +744,16 @@ export class MosaicManager {
         if (window.log) window.log("SUCCESS", `Apilado completado: ${successCount} de ${videos.length} teselas procesadas.`);
         this.updateWorkflowState();
         this.renderCanvas();
+        window.updateIntelligentAssistantContext?.({
+            flow: "mosaic",
+            stage: "compose",
+            workflowStep: 3,
+            workflowTotal: 5,
+            itemCount: this.tiles.length,
+        }, {
+            open: true,
+            announceKey: `mosaic:stacked:${successCount}`,
+        });
         if (tutorialManager?.currentFlowName === 'mosaic' && tutorialManager.currentStepIndex === 5) {
             setTimeout(() => tutorialManager.nextStep(), 500);
         }
@@ -931,6 +995,16 @@ export class MosaicManager {
         if (this.tiles.length < 1) {
             return;
         }
+        const invalid = this.tiles.filter(t => t.type !== 'image' || t.status !== 'ready');
+        if (invalid.length > 0) {
+            if (window.showCustomAlert) {
+                window.showCustomAlert(
+                    t("general.error", "Error"),
+                    t("mosaic.errors.stack_first", "Todas las capturas deben analizarse y apilarse correctamente antes de generar el mosaico.")
+                );
+            }
+            return;
+        }
 
         // Check Integration Mode (User requested "types of integration")
         // ENFORCED: Blind Stitching (Microsoft ICE style)
@@ -1091,6 +1165,16 @@ export class MosaicManager {
             }
 
             console.log("Mosaic Generated. Waiting for user confirmation.");
+            window.updateIntelligentAssistantContext?.({
+                flow: "mosaic",
+                stage: "result",
+                workflowStep: 4,
+                workflowTotal: 5,
+                itemCount: this.tiles.length,
+            }, {
+                open: true,
+                announceKey: `mosaic:result:${res.path}`,
+            });
 
             if (shouldPauseMosaicTutorial) {
                 tutorialManager.showOverlay();
@@ -1308,7 +1392,7 @@ export class MosaicManager {
         if (btnArr) btnArr.style.display = "block";
     }
 
-    sendToWavelets(path) {
+    async sendToWavelets(path) {
         console.log("MosaicManager: Switching to Wavelets View...");
         const targetPath = path || window.getCurrentFilePath?.() || window.currentFilePath || "";
         if (targetPath) {
@@ -1333,12 +1417,10 @@ export class MosaicManager {
         const panelWavelets = document.getElementById("panel-wavelets");
         if (panelWavelets) panelWavelets.style.display = "block";
 
-        // HIDE Deringing UI in Mosaic Flow transition
+        // Artifact repair is shared by individual, batch and mosaic results.
         const selDr = document.getElementById("sel-deringing-mode");
         if (selDr) {
-            selDr.parentElement.style.display = "none";
-            const panelDr = document.getElementById("panel-deringing-manual");
-            if (panelDr) panelDr.style.display = "none";
+            selDr.parentElement.style.display = "block";
         }
 
         // MANAGE VIEWPORT: Show Result, Hide Source
@@ -1383,7 +1465,11 @@ export class MosaicManager {
 
         // UPDATE GLOBALS for Wavelets/Saving to work
         if (targetPath && window.setCurrentFilePath) window.setCurrentFilePath(targetPath);
-        if (window.resetPipelineState) window.resetPipelineState();
+        if (window.beginNewPostprocessResult && imgResult?.src) {
+            await window.beginNewPostprocessResult(imgResult.src, "mosaic");
+        } else if (window.resetPipelineState) {
+            window.resetPipelineState();
+        }
 
         // Also hide overlay
         this.toggleOverlay(false);

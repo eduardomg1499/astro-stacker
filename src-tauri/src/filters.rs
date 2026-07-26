@@ -2,6 +2,179 @@
 // 5. FILTROS Y WAVELETS
 // ==========================================
 
+/// Blur BILATERAL (edge-preserving) para la descomposicion wavelet edge-aware
+/// (opcion B). A diferencia del Gaussiano, NO cruza los bordes de alto
+/// contraste: el termino de rango (diferencia de intensidad) anula los vecinos
+/// del otro lado del borde. Resultado: el detalle `base - bilateral(base)` cerca
+/// del limbo es ~0 (el borde queda en la base, no en el detalle), asi que
+/// amplificar las bandas finas NO genera el ringing/gusanos del limbo.
+/// `sigma_range` se calibra al contraste real de la imagen (ver caller).
+/// Solo se usa en las escalas FINAS (radio pequeño) → coste acotado.
+fn apply_bilateral_blur(
+    input: &[f32],
+    width: usize,
+    height: usize,
+    sigma_spatial: f32,
+    sigma_range: f32,
+) -> Vec<f32> {
+    let radius = (sigma_spatial * 2.5).ceil().clamp(1.0, 9.0) as isize;
+    let inv2_s = 1.0 / (2.0 * sigma_spatial * sigma_spatial);
+    let inv2_r = 1.0 / (2.0 * sigma_range.max(1.0) * sigma_range.max(1.0));
+    // LUT espacial (por offset) para no recalcular exp de distancia.
+    let mut spatial = vec![0.0f32; (2 * radius + 1) as usize * (2 * radius + 1) as usize];
+    let sw = (2 * radius + 1) as usize;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            let d2 = (dx * dx + dy * dy) as f32;
+            spatial[((dy + radius) as usize) * sw + (dx + radius) as usize] =
+                (-d2 * inv2_s).exp();
+        }
+    }
+    // VELOCIDAD: LUT del término de RANGO exp(-dr²·inv2_r). El exp era el coste
+    // dominante del bilateral (uno por vecino = W·H·(2r+1)² exp). Ahora se
+    // precomputa una tabla de RANGE_LUT_N muestras hasta el corte donde el peso
+    // es despreciable (~4.5·σ_range → exp(-10)≈4.5e-5) y en el bucle interno se
+    // hace un lookup por |dr| cuantizado. Error < 1e-3 con N=2048.
+    const RANGE_LUT_N: usize = 2048;
+    let range_cut = (4.5 * sigma_range.max(1.0)).max(1.0);
+    let inv_cut = (RANGE_LUT_N - 1) as f32 / range_cut; // idx = |dr|·inv_cut
+    let mut range_lut = vec![0.0f32; RANGE_LUT_N];
+    for (k, slot) in range_lut.iter_mut().enumerate() {
+        let dr = k as f32 / inv_cut;
+        *slot = (-dr * dr * inv2_r).exp();
+    }
+    let mut out = vec![0.0f32; width * height];
+    out.par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let y = y as isize;
+            for x in 0..width as isize {
+                let center = input[(y as usize) * width + x as usize];
+                let mut sum = 0.0f32;
+                let mut wsum = 0.0f32;
+                for dy in -radius..=radius {
+                    let yy = y + dy;
+                    if yy < 0 || yy >= height as isize {
+                        continue;
+                    }
+                    let srow = (yy as usize) * width;
+                    let sprow = ((dy + radius) as usize) * sw;
+                    for dx in -radius..=radius {
+                        let xx = x + dx;
+                        if xx < 0 || xx >= width as isize {
+                            continue;
+                        }
+                        let v = input[srow + xx as usize];
+                        let idx = ((v - center).abs() * inv_cut) as usize;
+                        let rw = if idx < RANGE_LUT_N { range_lut[idx] } else { 0.0 };
+                        let w = spatial[sprow + (dx + radius) as usize] * rw;
+                        sum += v * w;
+                        wsum += w;
+                    }
+                }
+                row[x as usize] = if wsum > 1e-9 { sum / wsum } else { center };
+            }
+        });
+    out
+}
+
+/// Estimador robusto del `sigma_range` bilateral: mediana de |gradiente| ×
+/// `mult`. Escala automaticamente con el nivel de señal/ruido de CUALQUIER
+/// objeto (planeta tenue, Luna brillante) — el detalle real (por debajo de
+/// unos pocos σ_range) se preserva, el borde del limbo (muy por encima) NO se
+/// mezcla. `mult` lo controla el slider "Intensidad Edge-Aware": mas intensidad
+/// → `mult` menor → kernel de rango mas estrecho → borde MAS protegido.
+fn estimate_bilateral_range(input: &[f32], width: usize, height: usize, mult: f32) -> f32 {
+    let size = width * height;
+    if size < 16 {
+        return 1000.0;
+    }
+    let stride = (size / 20000).max(1);
+    let mut grads: Vec<f32> = Vec::new();
+    let mut i = width + 1;
+    while i < size - width - 1 {
+        let gx = (input[i + 1] - input[i - 1]).abs();
+        let gy = (input[i + width] - input[i - width]).abs();
+        grads.push(gx.max(gy));
+        i += stride;
+    }
+    if grads.is_empty() {
+        return 1000.0;
+    }
+    grads.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med = grads[grads.len() / 2];
+    // `mult`× la mediana del gradiente (por defecto 4×): el detalle fino/ruido
+    // queda dentro del kernel de rango; el salto del limbo (ordenes de magnitud
+    // mayor) queda fuera → se preserva el borde sin mezclarlo.
+    (med * mult).clamp(200.0, 20000.0)
+}
+
+/// Estimador de ruido de Donoho sobre una banda de detalle wavelet: σ ≈
+/// 1.4826 · mediana(|detalle|). La banda fina es de media ~cero, asi que la MAD
+/// respecto a 0 aproxima la desviacion tipica del ruido. Se usa para la
+/// auto-mascara adaptativa (distinguir ruido plano de estructura real).
+fn estimate_noise_mad(band: &[f32]) -> f32 {
+    if band.is_empty() {
+        return 0.0;
+    }
+    let stride = (band.len() / 20000).max(1);
+    let mut mags: Vec<f32> = band.iter().step_by(stride).map(|v| v.abs()).collect();
+    if mags.is_empty() {
+        return 0.0;
+    }
+    mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    mags[mags.len() / 2] * 1.4826
+}
+
+/// Mapa de confianza de detalle en [0,1) para el sharpening ADAPTATIVO
+/// (auto-mascara). Estructura coherente (magnitud del detalle suavizada, alta
+/// respecto al ruido) → ~1 (se amplifica); ruido aislado (magnitud baja) → ~0
+/// (se atenua). Formulacion Wiener-like: conf = s / (s + β·σ_ruido), con `s` la
+/// magnitud del detalle SUAVIZADA (box radio 2) para exigir coherencia espacial
+/// — el ruido impulsivo se promedia a la baja, el borde/textura persiste. Esto
+/// mata el ruido "wormy" que el sharpening por-capa de RegiStax/WaveSharp
+/// amplifica de forma uniforme.
+fn detail_confidence_map(band: &[f32], width: usize, height: usize, sigma_n: f32) -> Vec<f32> {
+    let size = width * height;
+    let mag: Vec<f32> = band.iter().map(|v| v.abs()).collect();
+    let sm = box_blur_parallel(&mag, width, height, 2);
+    let denom = (3.0 * sigma_n).max(1e-3);
+    let mut conf = vec![0.0f32; size];
+    conf.par_iter_mut().enumerate().for_each(|(i, c)| {
+        let s = sm[i];
+        *c = s / (s + denom);
+    });
+    conf
+}
+
+/// Convolucion 2-D directa con un kernel pequeño (PSF medida, opcion A).
+/// Bordes por replicacion (clamp). El kernel debe estar normalizado (Σ=1).
+fn convolve_kernel(input: &[f32], width: usize, height: usize, kernel: &[f32], k_radius: usize) -> Vec<f32> {
+    let ksize = 2 * k_radius + 1;
+    let mut out = vec![0.0f32; width * height];
+    out.par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let y = y as isize;
+            for x in 0..width as isize {
+                let mut acc = 0.0f32;
+                for ky in 0..ksize {
+                    let sy = (y + ky as isize - k_radius as isize)
+                        .clamp(0, height as isize - 1) as usize;
+                    let srow = sy * width;
+                    let krow = ky * ksize;
+                    for kx in 0..ksize {
+                        let sx = (x + kx as isize - k_radius as isize)
+                            .clamp(0, width as isize - 1) as usize;
+                        acc += input[srow + sx] * kernel[krow + kx];
+                    }
+                }
+                row[x as usize] = acc;
+            }
+        });
+    out
+}
+
 fn apply_gaussian_blur(input: &[f32], width: usize, height: usize, sigma: f32) -> Vec<f32> {
     // OPTIMIZATION: 3-pass box blur approximating a Gaussian — CANONICAL box
     // sizing (Kuckir): w_ideal = sqrt(12σ²/n + 1) with n = 3 passes. The old
@@ -47,6 +220,19 @@ fn apply_gaussian_blur(input: &[f32], width: usize, height: usize, sigma: f32) -
 
 fn box_blur_parallel(input: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
     let size = w * h;
+    // GUARD: un buffer más corto que la geometría declarada (canal vacío de un
+    // caché envenenado, aborto a medio camino) paniqueaba con "range start
+    // index … out of range". Devolver negro es un estado visible y recuperable;
+    // el panic tumbaba el pipeline entero de post-procesado.
+    if input.len() < size {
+        eprintln!(
+            "[filters] box_blur_parallel: entrada {} < {}x{} — devolviendo búfer vacío",
+            input.len(),
+            w,
+            h
+        );
+        return vec![0.0; size];
+    }
     let mut temp = vec![0.0; size];
     let mut output = vec![0.0; size];
 
@@ -76,13 +262,18 @@ fn box_blur_parallel(input: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
             }
         });
 
-    // Transpose
+    // Transpose (F3: paralela por columnas — las dos transposiciones en serie
+    // eran la fracción monohilo del blur, que corre 6 sigmas × canales ×
+    // (deconv+wavelets) en cada render interactivo del editor).
     let mut transp = vec![0.0; size];
-    for y in 0..h {
-        for x in 0..w {
-            transp[x * h + y] = temp[y * w + x];
-        }
-    }
+    transp
+        .par_chunks_exact_mut(h)
+        .enumerate()
+        .for_each(|(x, col_out)| {
+            for y in 0..h {
+                col_out[y] = temp[y * w + x];
+            }
+        });
 
     // Vertical Pass (Horizontal on Transposed)
     let mut temp_transp = vec![0.0; size];
@@ -110,18 +301,42 @@ fn box_blur_parallel(input: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
             }
         });
 
-    // Transpose Back
-    for x in 0..w {
-        for y in 0..h {
-            output[y * w + x] = temp_transp[x * h + y];
-        }
-    }
+    // Transpose Back (F3: paralela por filas de salida)
+    output
+        .par_chunks_exact_mut(w)
+        .enumerate()
+        .for_each(|(y, row_out)| {
+            for x in 0..w {
+                row_out[x] = temp_transp[x * h + y];
+            }
+        });
 
     output
 }
 
 fn check_cancel(state: &AppState, req_id: usize) -> bool {
-    state.active_req_id.load(Ordering::Relaxed) != req_id
+    state.cancel_requested.load(Ordering::Acquire)
+        || state.active_req_id.load(Ordering::Acquire) != req_id
+}
+
+/// Publica una entrada derivada sólo mientras la generación que la calculó
+/// sigue siendo propietaria. El orden global es siempre generation_gate →
+/// cache mutex, igual que clear/stack/derotación, de modo que un worker viejo
+/// no puede reinsertar canales después de que el nuevo máster los borró.
+fn commit_processing_cache_if_current(
+    state: &AppState,
+    req_id: usize,
+    commit: impl FnOnce(),
+) -> bool {
+    let _generation_guard = state
+        .planetary_generation_gate
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if check_cancel(state, req_id) {
+        return false;
+    }
+    commit();
+    true
 }
 
 fn apply_richardson_lucy(
@@ -135,43 +350,25 @@ fn apply_richardson_lucy(
     iterations: usize,
     sigma: f32,
     range: (f32, f32),
+    // PSF MEDIDA (opcion A): Some((kernel, radius)) → RL usa la PSF real del
+    // limbo en vez de la Gaussiana. El kernel medido es radialmente simetrico
+    // (PsfEstimator lo construye por distancia) → adjunta = el mismo kernel,
+    // asi que se usa para el forward-blur Y la back-projection. None = Gaussiana.
+    measured_psf: Option<(&[f32], usize)>,
 ) -> Vec<f32> {
-    if iterations == 0 || sigma <= 0.0 {
+    if iterations == 0 || (sigma <= 0.0 && measured_psf.is_none()) {
         return input.to_vec();
     }
-
-    let size = width * height;
-    let mut est = input.to_vec();
-
-    // We compute a "confidence mask" based on edge strength and signal intensity.
-    // Deconvolution should only work hard where there are actual structures (planetary disk, rings).
-    // It should NOT work hard in the pure dark background.
-    let mut mask = vec![0.0f32; size];
-    let bg_blur = apply_gaussian_blur(original, width, height, sigma * 3.0);
-
-    // Finding p95 roughly to understand signal level
-    let mut sorted = original.to_vec();
-    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let p95 = sorted[size * 95 / 100].max(100.0);
-    let noise_floor = sorted[size * 5 / 100].max(1.0);
-
-    for j in 0..size {
-        // High confidence where signal stands out strongly above the background
-        let local_diff = (original[j] - bg_blur[j]).abs();
-        let signal_ratio = (original[j] - noise_floor) / p95;
-        let diff_ratio = local_diff / (p95 * 0.1).max(1.0);
-
-        let confidence = (signal_ratio * 0.5 + diff_ratio * 0.5).clamp(0.0, 1.0);
-        mask[j] = confidence; // Smoothed application weight
-    }
-
-    let mut ratio_buf = vec![0.0f32; size];
-
-    for i in 0..iterations {
-        if check_cancel(state, req_id) {
-            return Vec::new();
+    // Forward model: convolucion con la PSF activa (medida o Gaussiana).
+    let blur = |img: &[f32]| -> Vec<f32> {
+        match measured_psf {
+            Some((k, r)) => convolve_kernel(img, width, height, k, r),
+            None => apply_gaussian_blur(img, width, height, sigma),
         }
-        if range.1 - range.0 > 1.0 && i % 1 == 0 {
+    };
+    let should_cancel = || check_cancel(state, req_id);
+    let on_progress = |i: usize| {
+        if range.1 - range.0 > 1.0 {
             let local_p = i as f32 / iterations as f32;
             let global_p = range.0 + local_p * (range.1 - range.0);
             emit_progress(
@@ -181,11 +378,74 @@ fn apply_richardson_lucy(
                 Some(format!("Iteracion {}/{}", i + 1, iterations)),
             );
         }
+    };
+    richardson_lucy_core(
+        input, original, width, height, iterations, sigma, &blur, &should_cancel, &on_progress,
+    )
+    .unwrap_or_default()
+}
 
-        // 1. Blur the Current Estimate
-        let blurred_est = apply_gaussian_blur(&est, width, height, sigma);
+/// Máscara de confianza del RL (señal fuerte sobre el fondo → 1; fondo → 0).
+/// Extraída para compartirla EXACTAMENTE con la ruta GPU (misma entrada = misma
+/// máscara).
+fn richardson_lucy_mask(original: &[f32], width: usize, height: usize, sigma: f32) -> Vec<f32> {
+    let size = width * height;
+    let bg_blur = apply_gaussian_blur(original, width, height, sigma * 3.0);
+    let mut sorted = original.to_vec();
+    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p95 = sorted[size * 95 / 100].max(100.0);
+    let noise_floor = sorted[size * 5 / 100].max(1.0);
+    let mut mask = vec![0.0f32; size];
+    for j in 0..size {
+        let local_diff = (original[j] - bg_blur[j]).abs();
+        let signal_ratio = (original[j] - noise_floor) / p95;
+        let diff_ratio = local_diff / (p95 * 0.1).max(1.0);
+        mask[j] = (signal_ratio * 0.5 + diff_ratio * 0.5).clamp(0.0, 1.0);
+    }
+    mask
+}
 
-        // 2. Compute Ratio (Original / Blurred_Estimate)
+/// Núcleo Richardson-Lucy (TV + máscara de confianza, actualización JACOBI) SIN
+/// dependencias de Tauri: `blur` es la convolución con la PSF activa (Gaussiana
+/// o medida), `should_cancel` aborta devolviendo None, `on_progress` reporta la
+/// iteración. Compartido por la ruta de producción (apply_richardson_lucy) y por
+/// el self-test de paridad GPU → la referencia y la producción son EL MISMO
+/// cálculo (imposible que deriven).
+fn richardson_lucy_core(
+    input: &[f32],
+    original: &[f32],
+    width: usize,
+    height: usize,
+    iterations: usize,
+    sigma: f32,
+    blur: &dyn Fn(&[f32]) -> Vec<f32>,
+    should_cancel: &dyn Fn() -> bool,
+    on_progress: &dyn Fn(usize),
+) -> Option<Vec<f32>> {
+    let size = width * height;
+    let mut est = input.to_vec();
+
+    // Máscara de confianza (helper compartido con la ruta GPU → idéntica).
+    let mask = richardson_lucy_mask(original, width, height, sigma);
+
+    let mut ratio_buf = vec![0.0f32; size];
+    // The previous Laplacian term was applied at 5% on every iteration. On
+    // extended solar/lunar texture it could dominate the RL correction and
+    // make "deconvolution" measurably softer. Keep regularisation only as a
+    // very small background stabiliser; signal regions are already protected
+    // by the confidence mask and ratio clamp.
+    let background_regularisation = 0.0025;
+
+    for i in 0..iterations {
+        if should_cancel() {
+            return None;
+        }
+        on_progress(i);
+
+        // 1. Forward blur del estimado actual.
+        let blurred_est = blur(&est);
+
+        // 2. Ratio (original / blurred), acotado para evitar explosión.
         for j in 0..size {
             let denom = blurred_est[j].max(1.0);
             let raw_ratio = if original[j] > 1.0 {
@@ -193,57 +453,51 @@ fn apply_richardson_lucy(
             } else {
                 1.0
             };
-            // Strict per-iteration bounds to prevent explosion
             ratio_buf[j] = raw_ratio.clamp(0.5, 2.0);
         }
 
-        // 3. Back-Project Ratio (Blur the Ratio)
-        let blurred_ratio = apply_gaussian_blur(&ratio_buf, width, height, sigma);
+        // 3. Back-projection (PSF simétrica → mismo kernel que el forward).
+        let blurred_ratio = blur(&ratio_buf);
 
-        // 4. Update the Estimate (With Total Variation Regularization & Masking)
-        let tv_weight = 0.05; // TV dampening to kill individual hot pixels
-
-        for y in 1..(height - 1) {
+        // 4. Update JACOBI (snapshot) + confidence mask. The multiplicative RL
+        // correction remains the primary operation; background-only
+        // regularisation prevents isolated noise from growing without erasing
+        // real high-frequency texture.
+        let est_prev = est.clone();
+        est.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+            if y == 0 || y == height - 1 {
+                return;
+            }
             for x in 1..(width - 1) {
                 let j = y * width + x;
-
-                // Total Variation (TV) - Push pixel toward its neighborhood average if it's spiking
-                let n1 = est[y * width + (x - 1)];
-                let n2 = est[y * width + (x + 1)];
-                let n3 = est[(y - 1) * width + x];
-                let n4 = est[(y + 1) * width + x];
+                let n1 = est_prev[y * width + (x - 1)];
+                let n2 = est_prev[y * width + (x + 1)];
+                let n3 = est_prev[(y - 1) * width + x];
+                let n4 = est_prev[(y + 1) * width + x];
                 let local_mean = (n1 + n2 + n3 + n4) * 0.25;
-                let tv_gradient = local_mean - est[j];
-
-                // Apply update natively
-                let mut update = est[j] * blurred_ratio[j];
-
-                // Apply TV Regularization to smooth out ringing/spikes
-                update += tv_gradient * tv_weight;
-
-                // Blend the correction conservatively. Even high-confidence pixels should not
-                // receive the full RL update in one pass because that creates halos quickly.
-                let correction_weight = mask[j] * 0.58;
-                let mut final_val = est[j] * (1.0 - correction_weight) + update * correction_weight;
-
+                let tv_gradient = local_mean - est_prev[j];
+                let confidence = mask[j].clamp(0.0, 1.0);
+                let correction_weight = confidence.sqrt() * 0.78;
+                let raw_delta = est_prev[j] * (blurred_ratio[j] - 1.0);
+                // Bound each iteration instead of globally clipping the final
+                // restoration. This keeps strong limbs stable while allowing
+                // coherent texture to accumulate over several iterations.
+                let max_step = (original[j].abs() * 0.22 + 96.0).clamp(96.0, 8_000.0);
+                let rl_delta = raw_delta.clamp(-max_step, max_step) * correction_weight;
+                let noise_regularisation = tv_gradient
+                    * background_regularisation
+                    * (1.0 - confidence).powi(2);
+                let mut final_val = est_prev[j] + rl_delta + noise_regularisation;
                 if final_val.is_nan() || final_val.is_infinite() {
                     final_val = original[j];
                 }
-
-                // Hard mathematical limits for 16-bit space
-                if final_val > 65535.0 {
-                    final_val = 65535.0;
-                }
-                if final_val < 0.0 {
-                    final_val = 0.0;
-                }
-
-                est[j] = final_val;
+                final_val = final_val.clamp(0.0, 65535.0);
+                row[x] = final_val;
             }
-        }
+        });
     }
 
-    est
+    Some(est)
 }
 
 fn apply_van_cittert(
@@ -308,47 +562,57 @@ fn apply_van_cittert(
         // 1. Blur the Current Estimate
         let blurred_est = apply_gaussian_blur(&est, width, height, sigma);
 
-        // 2. Iterate block
-        for y in 1..(height - 1) {
-            for x in 1..(width - 1) {
-                let j = y * width + x;
+        // 2. Iterate block — F3: SNAPSHOT JACOBI + rayon (como richardson_lucy_core).
+        // El barrido Gauss-Seidel anterior leía vecinos YA modificados en la
+        // misma iteración (serie y=1.., x=1..): sesgo direccional
+        // arriba-izquierda→abajo-derecha en el detalle deconvolucionado, y
+        // además impedía paralelizar. El TV lee ahora est_prev (inmutable).
+        let est_prev = est.clone();
+        est.par_chunks_mut(width)
+            .enumerate()
+            .skip(1)
+            .take(height.saturating_sub(2))
+            .for_each(|(y, row)| {
+                for x in 1..(width - 1) {
+                    let j = y * width + x;
 
-                // Van Cittert Residual (Difference between Original and Blurred Estimate)
-                let residual = (original[j] - blurred_est[j]).clamp(-15000.0, 15000.0);
+                    // Van Cittert Residual (Difference between Original and Blurred Estimate)
+                    let residual = (original[j] - blurred_est[j]).clamp(-15000.0, 15000.0);
 
-                // Total Variation (TV) - Push pixel toward its neighborhood average if it's spiking
-                let n1 = est[y * width + (x - 1)];
-                let n2 = est[y * width + (x + 1)];
-                let n3 = est[(y - 1) * width + x];
-                let n4 = est[(y + 1) * width + x];
-                let local_mean = (n1 + n2 + n3 + n4) * 0.25;
-                let tv_gradient = local_mean - est[j];
+                    // Total Variation (TV) - Push pixel toward its neighborhood average if it's spiking
+                    let n1 = est_prev[y * width + (x - 1)];
+                    let n2 = est_prev[y * width + (x + 1)];
+                    let n3 = est_prev[(y - 1) * width + x];
+                    let n4 = est_prev[(y + 1) * width + x];
+                    let local_mean = (n1 + n2 + n3 + n4) * 0.25;
+                    let tv_gradient = local_mean - est_prev[j];
 
-                // Apply update natively
-                let mut update = est[j] + (residual * vc_dampening);
+                    // Apply update natively
+                    let mut update = est_prev[j] + (residual * vc_dampening);
 
-                // Apply TV Regularization to smooth out ringing/spikes
-                update += tv_gradient * tv_weight;
+                    // Apply TV Regularization to smooth out ringing/spikes
+                    update += tv_gradient * tv_weight;
 
-                let correction_weight = mask[j] * 0.50;
-                let mut final_val = est[j] * (1.0 - correction_weight) + update * correction_weight;
+                    let correction_weight = mask[j] * 0.50;
+                    let mut final_val =
+                        est_prev[j] * (1.0 - correction_weight) + update * correction_weight;
 
-                if final_val.is_nan() || final_val.is_infinite() {
-                    final_val = original[j];
+                    if final_val.is_nan() || final_val.is_infinite() {
+                        final_val = original[j];
+                    }
+
+                    // Hard mathematical limits for 16-bit space
+                    // Allow a tiny bit of negative headroom during intermediate VC steps, but not full -30,000 runaway
+                    if final_val > 65535.0 {
+                        final_val = 65535.0;
+                    }
+                    if final_val < -2000.0 {
+                        final_val = -2000.0;
+                    } // Very clamped bounce floor
+
+                    row[x] = final_val;
                 }
-
-                // Hard mathematical limits for 16-bit space
-                // Allow a tiny bit of negative headroom during intermediate VC steps, but not full -30,000 runaway
-                if final_val > 65535.0 {
-                    final_val = 65535.0;
-                }
-                if final_val < -2000.0 {
-                    final_val = -2000.0;
-                } // Very clamped bounce floor
-
-                est[j] = final_val;
-            }
-        }
+            });
     }
 
     // Final hard-clamp negative residual energy to solid black
@@ -429,6 +693,11 @@ fn estimate_color_adjust_context(data: &[u16]) -> (f32, f32) {
     (pivot, tone_white)
 }
 
+#[inline]
+fn blend_restoration(base: f32, restored: f32, amount: f32, protection: f32) -> f32 {
+    base + (restored - base) * amount.clamp(0.0, 1.0) * protection.clamp(0.0, 1.0)
+}
+
 fn run_processing_pipeline(
     app: &tauri::AppHandle,
     state: &State<'_, AppState>,
@@ -457,6 +726,7 @@ fn run_processing_pipeline(
     vc_sigma: f32,
     usm_amount: f32,
     usm_radius: f32,
+    adaptive_usm: AdaptiveUsmParams,
     lce_amount: f32,
     blend: f32,
     contrast: f32,
@@ -467,8 +737,46 @@ fn run_processing_pipeline(
     master_denoise_detail: f32,
     master_denoise_chroma: f32,
     use_rgb_sharpening: bool, // PHASE 15: New Toggle
+    edge_aware_wavelets: bool, // B: descomposicion wavelet edge-aware (anti-ringing limbo)
+    psf_from_limb: bool,       // A: deconvolucion con PSF medida del limbo
+    edge_aware_strength: f32,  // B+: intensidad edge-aware (0..100, 50 = historico ×4)
+    auto_mask: f32,            // Calidad: sharpening adaptativo por SNR local (0..100, 0 = off)
+    gpu_allowed: bool,         // Velocidad: intentar descomposicion wavelet en GPU (paridad+fallback)
+    levels_black: f32,         // Niveles: punto negro de entrada (0..1, 0 = neutro)
+    levels_white: f32,         // Niveles: punto blanco de entrada (0..1, 1 = neutro)
+    levels_gamma: f32,         // Niveles: gamma de medios tonos (0.1..5, 1 = neutro)
 ) -> Vec<u16> {
     let size = width * height;
+
+    // A neutral recipe is an exact identity contract. Besides avoiding an
+    // expensive wavelet decomposition, this prevents the final soft-clipping
+    // stage and RGB↔YUV round-trip from altering a master when the user resets,
+    // undoes back to Original, or starts a new stack.
+    let near_zero = |value: f32| value.abs() <= 1e-6;
+    let neutral_recipe = u_amts.iter().all(|value| near_zero(*value))
+        && w_amts.iter().all(|value| near_zero(*value))
+        && d_amts.iter().all(|value| near_zero(*value))
+        && (gamma - 1.0).abs() <= 1e-6
+        && (saturation - 1.0).abs() <= 1e-6
+        && [r_x, r_y, b_x, b_y].iter().all(|value| near_zero(*value))
+        && deringing_mode == 0
+        && near_zero(crisp)
+        && deconv_iter == 0
+        && vc_iter == 0
+        && near_zero(usm_amount)
+        && near_zero(lce_amount)
+        && (contrast - 1.0).abs() <= 1e-6
+        && near_zero(brightness)
+        && near_zero(r_bal)
+        && near_zero(b_bal)
+        && near_zero(master_denoise);
+    if neutral_recipe {
+        if check_cancel(state, req_id) {
+            return Vec::new();
+        }
+        emit_progress(app, "Receta neutra · master 16-bit", 100.0, None);
+        return original.data.clone();
+    }
 
     // === NORMALIZATION: Detect actual image signal range ===
     // This is the core fix for bit-depth artifacts. Instead of using hardcoded
@@ -493,6 +801,7 @@ fn run_processing_pipeline(
         iter: deconv_iter,
         vc_sigma,
         vc_iter,
+        psf_from_limb,
     };
 
     if check_cancel(state, req_id) {
@@ -507,7 +816,7 @@ fn run_processing_pipeline(
     let mut d_changed = false;
 
     {
-        let mut guard = state.deconv_cache.lock().unwrap();
+        let mut guard = state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner());
         let mut match_idx = None;
         for (i, c) in guard.iter().enumerate() {
             if c.params == d_params && c.width == width && c.height == height {
@@ -561,6 +870,44 @@ fn run_processing_pipeline(
 
         if d_params.iter > 0 || d_params.vc_iter > 0 {
             emit_progress(app, "Iniciando Deconvolucion...", 0.0, None);
+
+            // PSF MEDIDA DEL LIMBO (opcion A): mide la PSF real (edge-spread)
+            // del borde disco/cielo y la usa en la RL en vez de la Gaussiana
+            // parametrica. Achromatica → se mide una vez de la luminancia y se
+            // aplica a los 3 canales. Fallback a Gaussiana si no hay un limbo
+            // fiable (disco lleno sin cielo, PSF no valida): psf_measured=None.
+            let psf_radius = (deconv_sigma * 2.0).ceil().clamp(3.0, 9.0) as usize;
+            let psf_measured: Option<Vec<f32>> = if psf_from_limb && deconv_iter > 0 {
+                let luma: Vec<f32> = (0..size)
+                    .map(|i| {
+                        0.299 * original.data[i * 3] as f32
+                            + 0.587 * original.data[i * 3 + 1] as f32
+                            + 0.114 * original.data[i * 3 + 2] as f32
+                    })
+                    .collect();
+                let planet_mask = compute_planet_mask(&luma, width, height, 4);
+                let limb_mask = compute_limb_mask(&planet_mask, width, height, psf_radius.max(4));
+                let has_limb = limb_mask.iter().filter(|&&m| m > 0.5).count() > psf_radius * psf_radius * 8;
+                if has_limb {
+                    let est = PsfEstimator { psf_radius }
+                        .estimate_from_limb(&luma, width, height, &limb_mask, 0.85);
+                    if psf_is_valid(&est, psf_radius) {
+                        log_to_front(app, "INFO", "Deconvolucion: PSF medida del limbo (edge-spread) — activa.");
+                        Some(est)
+                    } else {
+                        log_to_front(app, "INFO", "Deconvolucion: PSF del limbo no fiable → Gaussiana parametrica.");
+                        None
+                    }
+                } else {
+                    log_to_front(app, "INFO", "Deconvolucion: sin limbo claro (disco lleno) → Gaussiana parametrica.");
+                    None
+                }
+            } else {
+                None
+            };
+            let psf_ref: Option<(&[f32], usize)> =
+                psf_measured.as_ref().map(|p| (p.as_slice(), psf_radius));
+
             let mut processed = Vec::new();
 
             for (ch_idx, ch) in work_channels.iter().enumerate() {
@@ -568,18 +915,37 @@ fn run_processing_pipeline(
                     return Vec::new();
                 }
 
-                let dr = apply_richardson_lucy(
-                    app,
-                    state,
-                    req_id,
-                    ch,
-                    ch,
-                    width,
-                    height,
-                    deconv_iter,
-                    deconv_sigma,
-                    (0.0, 100.0),
-                );
+                // GPU RL: solo PSF Gaussiana (psf_ref None), imagen grande y
+                // gpu_allowed. Con paridad + fallback: si algo falla → CPU. Con
+                // PSF medida (opción A) o imagen pequeña → CPU siempre.
+                let dr = if gpu_allowed
+                    && psf_ref.is_none()
+                    && deconv_iter > 0
+                    && width * height >= 500_000
+                {
+                    crate::gpu_wavelet::gpu_richardson_lucy(
+                        ch, ch, width, height, deconv_iter, deconv_sigma,
+                    )
+                    .unwrap_or_else(|| {
+                        apply_richardson_lucy(
+                            app, state, req_id, ch, ch, width, height, deconv_iter, deconv_sigma,
+                            (0.0, 100.0), psf_ref,
+                        )
+                    })
+                } else {
+                    apply_richardson_lucy(
+                        app, state, req_id, ch, ch, width, height, deconv_iter, deconv_sigma,
+                        (0.0, 100.0), psf_ref,
+                    )
+                };
+                // CANCELACIÓN INTERNA: RL/VC devuelven un Vec VACÍO al cancelar
+                // (unwrap_or_default sobre None). Antes ese canal vacío seguía
+                // adelante y se guardaba en el caché LRU: el siguiente render
+                // con los mismos parámetros lo servía del caché y reventaba en
+                // box_blur_parallel ("range start index … slice of length 0").
+                if dr.len() != size {
+                    return Vec::new();
+                }
                 let vcr = apply_van_cittert(
                     app,
                     state,
@@ -592,6 +958,9 @@ fn run_processing_pipeline(
                     vc_sigma,
                     (0.0, 100.0),
                 );
+                if vcr.len() != size {
+                    return Vec::new();
+                }
                 processed.push(vcr);
 
                 let pct = (ch_idx + 1) as f32 / work_channels.len() as f32 * 35.0;
@@ -600,20 +969,30 @@ fn run_processing_pipeline(
             work_channels = processed;
         }
 
+        // Nunca cachear canales incompletos (cancelación u otro aborto): un
+        // caché envenenado reproduce el fallo en cada render posterior.
+        if work_channels.iter().any(|c| c.len() != size) {
+            return Vec::new();
+        }
         let nc = DeconvCache {
-            channels: work_channels.clone(),
+            channels: Arc::new(work_channels),
             params: d_params.clone(),
             width,
             height,
         };
-        {
-            let mut guard = state.deconv_cache.lock().unwrap();
+        let result_channels = nc.channels.clone();
+        if !commit_processing_cache_if_current(state, req_id, || {
+            let mut guard = state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner());
             guard.insert(0, nc);
-            if guard.len() > 3 {
+            // F3: tope 8 (antes 3): comparar >3 estados A/B/C/D expulsaba
+            // la entrada y forzaba recomputar el tramo más caro (deconv/wavelets).
+            if guard.len() > 8 {
                 guard.pop();
             }
+        }) {
+            return Vec::new();
         }
-        work_channels
+        result_channels
     };
 
     // We also need original chrominance for reconstructing if in Luminance mode
@@ -667,10 +1046,15 @@ fn run_processing_pipeline(
     // CACHe DE WAVELETS
     let mut w_cache: Option<WaveletLayers> = None;
     if !d_changed {
-        let mut guard = state.wavelet_cache.lock().unwrap();
+        let mut guard = state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner());
         let mut match_idx = None;
         for (i, w) in guard.iter().enumerate() {
-            if w.width == width && w.height == height && w.parent_deconv_params == d_params {
+            if w.width == width
+                && w.height == height
+                && w.parent_deconv_params == d_params
+                && w.edge_aware == edge_aware_wavelets
+                && (!edge_aware_wavelets || w.edge_aware_strength == edge_aware_strength)
+            {
                 let req_chans = if effective_rgb_mode { 3 } else { 1 };
                 if w.channels.len() == req_chans {
                     match_idx = Some(i);
@@ -689,12 +1073,49 @@ fn run_processing_pipeline(
         emit_progress(app, "Wavelets (Cache)", 60.0, None);
         l
     } else {
+        // EDGE-AWARE POR CAPA (opcion B, extendida): la "Intensidad Edge-Aware"
+        // controla CUANTAS bandas finas usan blur BILATERAL (2 por defecto, 3
+        // con intensidad alta → incluye σ4) y cuan estrecho es el kernel de
+        // rango (`range_mult`, menor = borde MAS protegido). El salto del limbo
+        // queda en la base, NO en las bandas de detalle, asi que amplificarlas
+        // no genera ringing/gusanos. Las escalas gruesas siguen Gaussianas (ahi
+        // el borde ya esta muy difuminado). Coste acotado: radio bilateral ≤ 9.
+        // Intensidad 50 = comportamiento historico exacto (2 bandas, mult ×4).
+        let ea_strength = edge_aware_strength.clamp(0.0, 100.0);
+        let n_bilateral = if edge_aware_wavelets {
+            if ea_strength >= 66.0 {
+                3
+            } else {
+                2
+            }
+        } else {
+            0
+        };
+        let range_mult = (6.0 - 4.0 * (ea_strength / 100.0)).clamp(1.5, 6.0);
+        // GPU: la descomposición Gaussiana PURA (sin edge-aware bilateral) puede
+        // correr en GPU en imágenes grandes. Con paridad obligatoria + fallback:
+        // si no hay GPU / la paridad no cuadra / cualquier error → CPU idéntica.
+        let use_gpu_decompose = gpu_allowed && n_bilateral == 0 && width * height >= 500_000;
         let decompose = |base: &[f32]| -> Vec<Vec<f32>> {
+            if use_gpu_decompose {
+                if let Some(ls) = crate::gpu_wavelet::gpu_decompose(base, width, height) {
+                    return ls;
+                }
+            }
             let mut ls = Vec::new();
             let sigmas = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+            let range_sigma = if n_bilateral > 0 {
+                estimate_bilateral_range(base, width, height, range_mult)
+            } else {
+                0.0
+            };
             let mut blurs = Vec::new();
-            for &s in &sigmas {
-                blurs.push(apply_gaussian_blur(base, width, height, s));
+            for (idx, &s) in sigmas.iter().enumerate() {
+                if idx < n_bilateral {
+                    blurs.push(apply_bilateral_blur(base, width, height, s, range_sigma));
+                } else {
+                    blurs.push(apply_gaussian_blur(base, width, height, s));
+                }
             }
             ls.push(base.iter().zip(&blurs[0]).map(|(a, b)| a - b).collect());
             for i in 0..5 {
@@ -721,17 +1142,23 @@ fn run_processing_pipeline(
         }
 
         let wc = WaveletLayers {
-            channels: multi_layers,
+            channels: Arc::new(multi_layers),
             width,
             height,
             parent_deconv_params: d_params.clone(),
+            edge_aware: edge_aware_wavelets,
+            edge_aware_strength,
         };
-        {
-            let mut guard = state.wavelet_cache.lock().unwrap();
+        if !commit_processing_cache_if_current(state, req_id, || {
+            let mut guard = state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner());
             guard.insert(0, wc.clone());
-            if guard.len() > 3 {
+            // F3: tope 8 (antes 3): comparar >3 estados A/B/C/D expulsaba
+            // la entrada y forzaba recomputar el tramo más caro (deconv/wavelets).
+            if guard.len() > 8 {
                 guard.pop();
             }
+        }) {
+            return Vec::new();
         }
         wc
     };
@@ -750,6 +1177,7 @@ fn run_processing_pipeline(
         master_denoise_chroma,
         usm_amount,
         usm_radius,
+        adaptive_usm: adaptive_usm.clone(),
         lce_amount,
         deringing_mode,
         deringing_radius: if deringing_mode > 0 { deringing_radius } else { 0.0 },
@@ -757,11 +1185,14 @@ fn run_processing_pipeline(
         deringing_light: if deringing_mode > 0 { deringing_light } else { 0.0 },
         deringing_mask: if deringing_mode > 0 { deringing_mask } else { false },
         deconv_params: d_params.clone(),
+        edge_aware: edge_aware_wavelets,
+        edge_aware_strength,
+        auto_mask,
     };
 
     let mut cached_filter: Option<FilterCache> = None;
     {
-        let mut guard = state.filter_cache.lock().unwrap();
+        let mut guard = state.filter_cache.lock().unwrap_or_else(|e| e.into_inner());
         let mut match_idx = None;
         for (i, c) in guard.iter().enumerate() {
             if c.params == f_params && c.width == width && c.height == height {
@@ -786,22 +1217,51 @@ fn run_processing_pipeline(
         emit_progress(app, "Mezclando y Filtrando...", 70.0, None);
         let mut work_filter = Vec::new();
 
+        // AUTO-MASCARA ADAPTATIVA: fuerza 0..1. Modula SOLO la amplificacion
+        // (no la reconstruccion base) de las 3 bandas finas por un mapa de
+        // confianza SNR local → el sharpening se aplica donde hay estructura y
+        // se atenua sobre ruido plano. `den` es LINEAL en la ganancia `a`, asi
+        // que 1.0 + sharpen·conf preserva exactamente la señal base (a=1) y solo
+        // escala el termino de realce (sharpen). Anti ruido "wormy".
+        let auto_amt = (auto_mask / 100.0).clamp(0.0, 1.0);
         let recombine = |lys: &Vec<Vec<f32>>| -> Vec<f32> {
             let mut out = vec![0.0; size];
             let _ub = u_amts.iter().sum::<f32>() * 0.2;
+            // F3: el umbral de coring escala con img_scale (normalización p99),
+            // igual que high-pass/USM/deringing. Con el corte FIJO en ADU, el
+            // mismo slider cortaba ~16× más detalle relativo en un planeta
+            // tenue (img_scale≈0.06) que en la Luna brillante.
             let den = |v: f32, a: f32, t: f32| {
-                if v.abs() < t * 100.0 {
-                    v * (v.abs() / (t * 100.0 + 0.01)) * a
+                let cut = t * 100.0 * img_scale;
+                if v.abs() < cut {
+                    v * (v.abs() / (cut + 0.01)) * a
                 } else {
                     v * a
                 }
             };
+            // Confianza por-pixel (solo si la auto-mascara esta activa). Se mide
+            // el ruido de la banda mas fina (MAD Donoho) y la coherencia espacial
+            // del detalle; se reutiliza para las 3 bandas finas (la estructura
+            // real se alinea entre escalas).
+            let conf: Option<Vec<f32>> = if auto_amt > 0.001 {
+                let sigma_n = estimate_noise_mad(&lys[0]);
+                Some(detail_confidence_map(&lys[0], width, height, sigma_n))
+            } else {
+                None
+            };
             for i in 0..size {
+                // m = 1 sobre estructura, →0 sobre ruido (escalado por la fuerza)
+                let m = match &conf {
+                    Some(c) => 1.0 - auto_amt * (1.0 - c[i]),
+                    None => 1.0,
+                };
                 let mut v = lys[6][i];
-                // Distribute high-frequency U levels properly across the first fine wavelet layers
-                v += den(lys[0][i], 1.0 + w_amts[0] + u_amts[0] * 0.5, d_amts[0]);
-                v += den(lys[1][i], 1.0 + w_amts[1] + u_amts[1] * 0.5, d_amts[1]);
-                v += den(lys[2][i], 1.0 + w_amts[2] + u_amts[2] * 0.5, d_amts[2]);
+                // Distribute high-frequency U levels properly across the first fine wavelet layers.
+                // Las 3 bandas finas (donde vive el ruido) llevan el realce
+                // modulado por `m`; las gruesas van intactas.
+                v += den(lys[0][i], 1.0 + (w_amts[0] + u_amts[0] * 0.5) * m, d_amts[0]);
+                v += den(lys[1][i], 1.0 + (w_amts[1] + u_amts[1] * 0.5) * m, d_amts[1]);
+                v += den(lys[2][i], 1.0 + (w_amts[2] + u_amts[2] * 0.5) * m, d_amts[2]);
                 v += den(lys[3][i], 1.0 + w_amts[3] + u_amts[3] * 0.5, d_amts[3]);
                 v += den(lys[4][i], 1.0 + w_amts[4] + u_amts[4] * 0.5, d_amts[4]);
                 v += den(lys[5][i], 1.0 + w_amts[5], d_amts[5]);
@@ -826,6 +1286,22 @@ fn run_processing_pipeline(
             );
         }
 
+        // ImPPG-style adaptive USM is keyed to the UNPROCESSED input
+        // luminance, not to each RGB channel independently. One shared map
+        // therefore preserves colour balance when RGB sharpening is enabled
+        // and behaves identically for mono data.
+        let adaptive_usm_reference = adaptive_usm.enabled.then(|| {
+            (0..size)
+                .map(|index| {
+                    let pixel = index * 3;
+                    let luminance = 0.2126 * original.data[pixel] as f32
+                        + 0.7152 * original.data[pixel + 1] as f32
+                        + 0.0722 * original.data[pixel + 2] as f32;
+                    (luminance / img_p99.max(1.0)).clamp(0.0, 1.0)
+                })
+                .collect::<Vec<f32>>()
+        });
+
         let total_filter_channels = work_filter.len().max(1);
         for (ch_idx, ty) in work_filter.iter_mut().enumerate() {
             if crisp > 0.0 {
@@ -833,7 +1309,15 @@ fn run_processing_pipeline(
             }
             if usm_amount > 0.0 {
                 *ty = apply_smart_sharpen_bilateral(
-                    ty, width, height, usm_radius, usm_amount, img_scale,
+                    ty,
+                    width,
+                    height,
+                    usm_radius,
+                    usm_amount,
+                    img_scale,
+                    auto_amt,
+                    &adaptive_usm,
+                    adaptive_usm_reference.as_deref(),
                 );
             }
             if lce_amount > 0.0 {
@@ -870,19 +1354,24 @@ fn run_processing_pipeline(
         }
 
         let nc = FilterCache {
-            channels: work_filter.clone(),
+            channels: Arc::new(work_filter),
             params: f_params,
             width,
             height,
         };
-        {
-            let mut guard = state.filter_cache.lock().unwrap();
+        let result_channels = nc.channels.clone();
+        if !commit_processing_cache_if_current(state, req_id, || {
+            let mut guard = state.filter_cache.lock().unwrap_or_else(|e| e.into_inner());
             guard.insert(0, nc);
-            if guard.len() > 3 {
+            // F3: tope 8 (antes 3): comparar >3 estados A/B/C/D expulsaba
+            // la entrada y forzaba recomputar el tramo más caro (deconv/wavelets).
+            if guard.len() > 8 {
                 guard.pop();
             }
+        }) {
+            return Vec::new();
         }
-        work_filter
+        result_channels
     };
 
     let (render_base_u, render_base_v) =
@@ -923,21 +1412,24 @@ fn run_processing_pipeline(
     let (color_pivot, tone_white) = estimate_color_adjust_context(&original.data);
 
     let mut r_plane = vec![0.0f32; size];
-    let g_plane = vec![0.0f32; size];
+    let mut g_plane = vec![0.0f32; size];
     let mut b_plane = vec![0.0f32; size];
 
     // 1. Parallel Render into separate f32 planes
     // Use unsafe for direct memory writing from parallel iterator
-    let r_ptr = r_plane.as_ptr() as usize;
-    let g_ptr = g_plane.as_ptr() as usize;
-    let b_ptr = b_plane.as_ptr() as usize;
+    let r_ptr = r_plane.as_mut_ptr() as usize;
+    let g_ptr = g_plane.as_mut_ptr() as usize;
+    let b_ptr = b_plane.as_mut_ptr() as usize;
 
     (0..size).into_par_iter().for_each(|i| {
         let (mut r, mut g, mut b);
         if effective_rgb_mode {
-            let or = base_channels[0][i];
-            let og = base_channels[1][i];
-            let ob = base_channels[2][i];
+            // "Mezcla" covers the complete restoration chain, including
+            // deconvolution. Using `base_channels` here made 0% keep the RL
+            // result because that buffer is already deconvolved.
+            let or = clean_channels[0][i];
+            let og = clean_channels[1][i];
+            let ob = clean_channels[2][i];
 
             let max_orig = or.max(og).max(ob);
             let p_start = 32000.0;
@@ -959,11 +1451,11 @@ fn run_processing_pipeline(
             };
 
             let effective_factor = p_factor * c_guard;
-            r = or + (filtered_channels[0][i] - or) * blend * effective_factor;
-            g = og + (filtered_channels[1][i] - og) * blend * effective_factor;
-            b = ob + (filtered_channels[2][i] - ob) * blend * effective_factor;
+            r = blend_restoration(or, filtered_channels[0][i], blend, effective_factor);
+            g = blend_restoration(og, filtered_channels[1][i], blend, effective_factor);
+            b = blend_restoration(ob, filtered_channels[2][i], blend, effective_factor);
         } else {
-            let oy = base_channels[0][i];
+            let oy = clean_channels[0][i];
             let p_start = 32000.0;
             let p_factor = if oy > p_start {
                 let ov = (oy - p_start) / (65535.0 - p_start);
@@ -972,7 +1464,7 @@ fn run_processing_pipeline(
                 1.0
             };
 
-            let y_enhanced = oy + (filtered_channels[0][i] - oy) * blend * p_factor;
+            let y_enhanced = blend_restoration(oy, filtered_channels[0][i], blend, p_factor);
             let (tr, tg, tb) = yuv_to_rgb(y_enhanced, render_base_u[i], render_base_v[i]);
             r = tr;
             g = tg;
@@ -981,7 +1473,7 @@ fn run_processing_pipeline(
 
         apply_advanced_color_magic(
             &mut r, &mut g, &mut b, gamma, saturation, contrast, brightness, r_bal, b_bal,
-            color_pivot, tone_white,
+            color_pivot, tone_white, levels_black, levels_white, levels_gamma,
         );
 
         unsafe {
@@ -1013,4 +1505,424 @@ fn run_processing_pipeline(
 
     final_u16
 }
+#[cfg(test)]
+mod edge_aware_tests {
+    use super::*;
 
+    /// El bilateral (opcion B) debe PRESERVAR un borde de alto contraste
+    /// (limbo): a un lado del salto el valor apenas cambia, mientras que un
+    /// Gaussiano del mismo sigma lo emborrona. Asi el detalle `base-bilateral`
+    /// NO contiene el salto → amplificar bandas finas no genera ringing.
+    #[test]
+    fn test_bilateral_preserves_edge_vs_gaussian() {
+        let (w, h) = (64usize, 64usize);
+        // Escalon: mitad izquierda 5000, mitad derecha 55000 (limbo simulado)
+        // + textura fina para que el sigma_range no colapse a cero.
+        let mut img = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let base = if x < w / 2 { 5000.0 } else { 55000.0 };
+                let tex = if (x + y) % 2 == 0 { 120.0 } else { -120.0 };
+                img[y * w + x] = base + tex;
+            }
+        }
+        let range = estimate_bilateral_range(&img, w, h, 4.0);
+        let bil = apply_bilateral_blur(&img, w, h, 2.0, range);
+        let gauss = apply_gaussian_blur(&img, w, h, 2.0);
+
+        // Columna justo a la IZQUIERDA del borde (x = w/2 - 1): el Gaussiano
+        // arrastra el 55000 de la derecha (se dispara); el bilateral no.
+        let xe = w / 2 - 1;
+        let mut bil_dev = 0.0f32;
+        let mut gauss_dev = 0.0f32;
+        for y in 8..h - 8 {
+            bil_dev += (bil[y * w + xe] - 5000.0).abs();
+            gauss_dev += (gauss[y * w + xe] - 5000.0).abs();
+        }
+        eprintln!("borde: desvio bilateral {bil_dev:.0} vs gaussiano {gauss_dev:.0}");
+        // El bilateral debe desviarse MUCHO menos del nivel izquierdo real.
+        assert!(
+            bil_dev < gauss_dev * 0.5,
+            "bilateral no preservo el borde: {bil_dev} vs gauss {gauss_dev}"
+        );
+    }
+
+    /// La convolucion con kernel (opcion A) con un kernel identidad (delta en
+    /// el centro) devuelve la imagen intacta — garantiza que el forward-model
+    /// de la RL con PSF medida es correcto en el caso base.
+    #[test]
+    fn test_convolve_identity_kernel() {
+        let (w, h) = (16usize, 16usize);
+        let img: Vec<f32> = (0..w * h).map(|i| (i * 7 % 1000) as f32).collect();
+        let r = 2usize;
+        let ksize = 2 * r + 1;
+        let mut kernel = vec![0.0f32; ksize * ksize];
+        kernel[r * ksize + r] = 1.0; // delta central
+        let out = convolve_kernel(&img, w, h, &kernel, r);
+        for i in 0..w * h {
+            assert!((out[i] - img[i]).abs() < 1e-3, "identidad rota en {i}");
+        }
+    }
+
+    /// El estimador de ruido MAD (Donoho) sobre una banda con |v| constante = A
+    /// debe recuperar σ ≈ 1.4826·A (mediana |v| = A).
+    #[test]
+    fn test_estimate_noise_mad_recovers_sigma() {
+        let a = 100.0f32;
+        let band: Vec<f32> = (0..4096).map(|i| if i % 2 == 0 { a } else { -a }).collect();
+        let s = estimate_noise_mad(&band);
+        assert!(
+            (s - 1.4826 * a).abs() < 1.0,
+            "sigma_mad {s} != esperado {}",
+            1.4826 * a
+        );
+    }
+
+    /// La AUTO-MASCARA debe distinguir estructura de ruido: una linea coherente
+    /// de alta magnitud recibe confianza ALTA (se amplifica) mientras el ruido
+    /// plano de baja magnitud recibe confianza BAJA (se atenua). Esto es lo que
+    /// evita el ruido "wormy" del sharpening uniforme de RegiStax/WaveSharp.
+    #[test]
+    fn test_auto_mask_confidence_structure_vs_noise() {
+        let (w, h) = (64usize, 64usize);
+        // Banda de detalle sintetica: mitad izquierda = ruido plano ±30 (baja
+        // magnitud, sin coherencia); mitad derecha = linea coherente de 800 en
+        // x=3w/4, cero alrededor.
+        let mut band = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let idx = y * w + x;
+                band[idx] = if x < w / 2 {
+                    if (x + y) % 2 == 0 { 30.0 } else { -30.0 }
+                } else if x == 3 * w / 4 {
+                    800.0
+                } else {
+                    0.0
+                };
+            }
+        }
+        let sigma_n = estimate_noise_mad(&band);
+        let conf = detail_confidence_map(&band, w, h, sigma_n);
+
+        let mut noise_conf = 0.0f32;
+        let mut nn = 0.0f32;
+        for y in 8..h - 8 {
+            for x in 4..(w / 2 - 4) {
+                noise_conf += conf[y * w + x];
+                nn += 1.0;
+            }
+        }
+        noise_conf /= nn;
+
+        let mut line_conf = 0.0f32;
+        let mut ln = 0.0f32;
+        for y in 8..h - 8 {
+            line_conf += conf[y * w + 3 * w / 4];
+            ln += 1.0;
+        }
+        line_conf /= ln;
+
+        eprintln!("auto-mask conf ruido {noise_conf:.3} vs linea {line_conf:.3}");
+        assert!(
+            line_conf > noise_conf * 2.0,
+            "auto-mask no distingue estructura ({line_conf}) de ruido ({noise_conf})"
+        );
+    }
+
+    /// La LUT de rango del bilateral (optimización de velocidad) debe reproducir
+    /// el bilateral con exp DIRECTO dentro de una tolerancia estrecha — así el
+    /// speedup no cambia el resultado visible.
+    #[test]
+    fn test_bilateral_range_lut_accuracy() {
+        let (w, h) = (32usize, 32usize);
+        let mut img = vec![0.0f32; w * h];
+        for i in 0..w * h {
+            img[i] = 500.0 + ((i * 37) % 900) as f32; // textura pseudo-aleatoria
+        }
+        let sigma_spatial = 2.0f32;
+        let sigma_range = 300.0f32;
+        let out = apply_bilateral_blur(&img, w, h, sigma_spatial, sigma_range);
+
+        // Referencia directa (mismo kernel espacial, exp de rango sin LUT), solo
+        // en píxeles interiores donde el kernel completo cabe (sin bordes).
+        let radius = (sigma_spatial * 2.5).ceil().clamp(1.0, 9.0) as isize;
+        let inv2_s = 1.0 / (2.0 * sigma_spatial * sigma_spatial);
+        let inv2_r = 1.0 / (2.0 * sigma_range * sigma_range);
+        let mut maxrel = 0.0f32;
+        for y in (radius as usize)..(h - radius as usize) {
+            for x in (radius as usize)..(w - radius as usize) {
+                let center = img[y * w + x];
+                let (mut sum, mut wsum) = (0.0f32, 0.0f32);
+                for dy in -radius..=radius {
+                    for dx in -radius..=radius {
+                        let v = img[((y as isize + dy) as usize) * w + (x as isize + dx) as usize];
+                        let ws = (-((dx * dx + dy * dy) as f32) * inv2_s).exp();
+                        let dr = v - center;
+                        let ww = ws * (-dr * dr * inv2_r).exp();
+                        sum += v * ww;
+                        wsum += ww;
+                    }
+                }
+                let refv = sum / wsum;
+                let rel = (out[y * w + x] - refv).abs() / refv.abs().max(1.0);
+                maxrel = maxrel.max(rel);
+            }
+        }
+        eprintln!("bilateral LUT vs exp directo: maxrel {maxrel:.6}");
+        assert!(maxrel < 2e-3, "LUT de rango imprecisa: {maxrel}");
+    }
+
+    #[test]
+    fn test_richardson_lucy_increases_blurred_peak_without_instability() {
+        let (width, height) = (48usize, 48usize);
+        let mut truth = vec![1800.0f32; width * height];
+        let centre = height / 2 * width + width / 2;
+        truth[centre] = 52000.0;
+        let observed = apply_gaussian_blur(&truth, width, height, 1.35);
+        let blur = |image: &[f32]| apply_gaussian_blur(image, width, height, 1.35);
+        let restored = richardson_lucy_core(
+            &observed,
+            &observed,
+            width,
+            height,
+            8,
+            1.35,
+            &blur,
+            &|| false,
+            &|_| {},
+        )
+        .expect("RL no debe cancelarse");
+        assert!(restored.iter().all(|value| value.is_finite() && *value >= 0.0 && *value <= 65535.0));
+        assert!(restored[centre] > observed[centre] * 1.03, "RL debe recuperar contraste del pico");
+    }
+
+    #[test]
+    fn test_richardson_lucy_restores_extended_texture_instead_of_softening_it() {
+        let (width, height) = (96usize, 80usize);
+        let mut truth = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let xf = x as f32;
+                let yf = y as f32;
+                let fibrils = (xf * 0.53 + (yf * 0.17).sin() * 2.4).sin() * 2_300.0;
+                let cells = (xf * 0.19).cos() * (yf * 0.23).sin() * 1_450.0;
+                let filament = if (x + (y / 5)) % 29 <= 1 { -4_800.0 } else { 0.0 };
+                truth[y * width + x] = (31_000.0 + fibrils + cells + filament)
+                    .clamp(2_000.0, 62_000.0);
+            }
+        }
+        let sigma = 1.25;
+        let observed = apply_gaussian_blur(&truth, width, height, sigma);
+        let blur = |image: &[f32]| apply_gaussian_blur(image, width, height, sigma);
+        let restored = richardson_lucy_core(
+            &observed,
+            &observed,
+            width,
+            height,
+            12,
+            sigma,
+            &blur,
+            &|| false,
+            &|_| {},
+        )
+        .expect("RL no debe cancelarse");
+
+        let mse = |image: &[f32]| {
+            image
+                .iter()
+                .zip(truth.iter())
+                .map(|(value, target)| (value - target).powi(2))
+                .sum::<f32>()
+                / image.len() as f32
+        };
+        let acutance = |image: &[f32]| {
+            let mut total = 0.0f32;
+            let mut count = 0usize;
+            for y in 2..height - 2 {
+                for x in 2..width - 2 {
+                    let index = y * width + x;
+                    total += (image[index + 1] - image[index - 1]).abs()
+                        + (image[index + width] - image[index - width]).abs();
+                    count += 2;
+                }
+            }
+            total / count as f32
+        };
+
+        let observed_mse = mse(&observed);
+        let restored_mse = mse(&restored);
+        let observed_acutance = acutance(&observed);
+        let restored_acutance = acutance(&restored);
+        assert!(
+            restored_mse < observed_mse * 0.94,
+            "RL debe acercar la textura a la señal: MSE {restored_mse} vs {observed_mse}"
+        );
+        assert!(
+            restored_acutance > observed_acutance * 1.05,
+            "RL no puede suavizar la textura: acutancia {restored_acutance} vs {observed_acutance}"
+        );
+    }
+
+    #[test]
+    fn test_smart_sharpen_auto_mask_suppresses_flat_noise_more_than_structure() {
+        let (width, height) = (64usize, 64usize);
+        let mut image = vec![12000.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let index = y * width + x;
+                if x < width / 2 {
+                    image[index] += if (x * 17 + y * 13) % 2 == 0 { 90.0 } else { -90.0 };
+                } else {
+                    image[index] = 36000.0;
+                }
+            }
+        }
+        let uniform = apply_smart_sharpen_bilateral(
+            &image,
+            width,
+            height,
+            1.2,
+            1.0,
+            1.0,
+            0.0,
+            &AdaptiveUsmParams::default(),
+            None,
+        );
+        let protected = apply_smart_sharpen_bilateral(
+            &image,
+            width,
+            height,
+            1.2,
+            1.0,
+            1.0,
+            1.0,
+            &AdaptiveUsmParams::default(),
+            None,
+        );
+        let flat_change = |result: &[f32]| -> f32 {
+            let mut total = 0.0;
+            let mut samples = 0usize;
+            for y in 8..height - 8 {
+                for x in 8..width / 2 - 8 {
+                    let index = y * width + x;
+                    total += (result[index] - image[index]).abs();
+                    samples += 1;
+                }
+            }
+            total / samples.max(1) as f32
+        };
+        let uniform_noise = flat_change(&uniform);
+        let protected_noise = flat_change(&protected);
+        assert!(protected_noise < uniform_noise * 0.7, "la auto-máscara debe atenuar ruido plano: {protected_noise} vs {uniform_noise}");
+
+        let edge_index = height / 2 * width + width / 2 - 1;
+        let uniform_edge = (uniform[edge_index] - image[edge_index]).abs();
+        let protected_edge = (protected[edge_index] - image[edge_index]).abs();
+        assert!(protected_edge > uniform_edge * 0.35, "la estructura coherente no debe desaparecer");
+    }
+
+    #[test]
+    fn test_high_pass_changes_structure_but_preserves_a_flat_field() {
+        let (width, height) = (48usize, 48usize);
+        let flat = vec![18000.0f32; width * height];
+        let flat_result = apply_high_pass(&flat, width, height, 3.0, 1.5, 1.0);
+        assert!(
+            flat_result
+                .iter()
+                .zip(flat.iter())
+                .all(|(result, source)| (result - source).abs() < 1e-3),
+            "High Pass no debe inventar detalle sobre un campo plano"
+        );
+
+        let mut structured = flat;
+        for y in 18..30 {
+            for x in 18..30 {
+                structured[y * width + x] = 42000.0;
+            }
+        }
+        let result = apply_high_pass(&structured, width, height, 3.0, 1.5, 1.0);
+        let mean_delta = result
+            .iter()
+            .zip(structured.iter())
+            .map(|(after, before)| (after - before).abs())
+            .sum::<f32>()
+            / result.len() as f32;
+        assert!(mean_delta > 25.0, "High Pass debe cambiar estructura real: {mean_delta}");
+    }
+
+    #[test]
+    fn test_adaptive_usm_protects_dark_regions_and_keeps_bright_detail() {
+        let (width, height) = (64usize, 48usize);
+        let mut image = vec![0.0f32; width * height];
+        let mut luminance = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let index = y * width + x;
+                let bright = x >= width / 2;
+                let base = if bright { 42000.0 } else { 5000.0 };
+                let texture = if (x + y) % 2 == 0 { 500.0 } else { -500.0 };
+                image[index] = base + texture;
+                luminance[index] = if bright { 0.82 } else { 0.08 };
+            }
+        }
+        let adaptive = AdaptiveUsmParams {
+            enabled: true,
+            amount_min: 0.05,
+            amount_max: 1.0,
+            threshold: 0.45,
+            transition: 0.2,
+        };
+        let result = apply_smart_sharpen_bilateral(
+            &image,
+            width,
+            height,
+            1.2,
+            1.4,
+            1.0,
+            0.0,
+            &adaptive,
+            Some(&luminance),
+        );
+        let region_delta = |left: usize, right: usize| -> f32 {
+            let mut total = 0.0;
+            let mut count = 0usize;
+            for y in 6..height - 6 {
+                for x in left..right {
+                    let index = y * width + x;
+                    total += (result[index] - image[index]).abs();
+                    count += 1;
+                }
+            }
+            total / count.max(1) as f32
+        };
+        let dark_delta = region_delta(6, width / 2 - 6);
+        let bright_delta = region_delta(width / 2 + 6, width - 6);
+        assert!(
+            bright_delta > dark_delta * 8.0,
+            "USM adaptativo debe proteger señal oscura: oscuro {dark_delta}, brillante {bright_delta}"
+        );
+    }
+
+    #[test]
+    fn test_restoration_blend_has_clear_endpoints_and_clamps() {
+        assert_eq!(blend_restoration(1200.0, 4200.0, 0.0, 1.0), 1200.0);
+        assert_eq!(blend_restoration(1200.0, 4200.0, 1.0, 1.0), 4200.0);
+        assert_eq!(blend_restoration(1200.0, 4200.0, 2.0, 1.0), 4200.0);
+        assert_eq!(blend_restoration(1200.0, 4200.0, 1.0, 0.5), 2700.0);
+    }
+
+    #[test]
+    fn test_rgb_shift_moves_a_signal_in_the_requested_direction() {
+        let (width, height) = (9usize, 7usize);
+        let mut channel = vec![0.0f32; width * height];
+        channel[3 * width + 4] = 50000.0;
+        let shifted = shift_channel(&channel, width, height, 1.0, -1.0);
+        let peak = shifted
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.partial_cmp(right.1).unwrap())
+            .map(|(index, _)| index)
+            .unwrap();
+        assert_eq!((peak % width, peak / width), (5, 2));
+    }
+}

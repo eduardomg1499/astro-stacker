@@ -1,20 +1,70 @@
 import "./styles.css";
+// Chart.js sigue EMPAQUETADO localmente (la app debe funcionar sin red en el
+// campo), pero se carga BAJO DEMANDA, fuera del camino critico de arranque.
+// Importarlo arriba lo metia en la inicializacion del modulo: cualquier fallo
+// suyo —o el orden de evaluacion que elija el bundler entre chart.js y su
+// plugin— tumbaba main.js ENTERO antes de que registrara nada, y la app se
+// quedaba congelada en el splash. Una libreria de graficas no puede impedir
+// que el programa abra. Se usa en un unico sitio (drawChart).
 import { MosaicManager } from "./mosaic_manager.js";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-shell"; // CORRECT IMPORT
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog"; // Renamed to avoid conflict
-import { mkdir } from "@tauri-apps/plugin-fs";
 import { listen } from "@tauri-apps/api/event";
 import { check } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { getVersion } from '@tauri-apps/api/app';
 import { i18n } from "./i18n.js";
 import { tutorialManager } from "./tutorial_manager.js";
+import { PostProcessSession, unwrapPreviewReference } from "./postprocess_session.js";
+import { IntelligentAssistant } from "./zenith_guide.js";
+import { mergeClassifiedDeepSkyFrames } from "./deepsky_scan_merge.js";
+import {
+    SolarCurveEditor,
+    ToneCurveEditor,
+    adaptSolarPreset,
+    cloneSolarPreset,
+    evaluateToneCurve,
+    normalizeSolarCurvePoints,
+    normalizeToneCurvePoints,
+} from "./solar_postprocess.js";
+import { installPostprocessHelp } from "./postprocess_help.js";
+import {
+    adaptObjectFinishingPreset,
+    cloneObjectFinishingPreset,
+    objectPresetApplicable,
+} from "./object_postprocess_presets.js";
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
-
-window.mkdir = mkdir;
+import {
+    BATCH_OUTPUT_POLICY_SINGLE_DIRECTORY,
+    BATCH_OUTPUT_POLICY_SOURCE_ADJACENT,
+    buildBatchOutputLookup,
+    formatBatchOutputError,
+    freezeBatchProcessingContract,
+    normalizeBatchEntryResult,
+    normalizeBatchOutputSettings
+} from "./batch_output.js";
+import { computeSafeExposureEv } from "./adaptive_postprocess.js";
 
 let appWindow = null;
+// Persistencia de la categoría de objetivo: true mientras un cambio es
+// PROGRAMÁTICO (restore/auto-detección) para no confundirlo con una elección
+// manual del usuario.
+let zasCategoryProgrammatic = false;
+// Ubicación del caché de análisis/apilado elegida por el usuario. "origin" =
+// junto al vídeo; "choose" = carpeta fija. DEBEN declararse ANTES de
+// initCustomSelect() (se ejecuta síncrono al cargar el módulo): init
+// CacheLocationSelector las lee en paint() y un `let` posterior las dejaría
+// en TDZ → ReferenceError que abortaba el módulo y colgaba el splash.
+let cacheLocationMode = localStorage.getItem("zas_cache_mode") || "origin";
+let cacheChosenDir = localStorage.getItem("zas_cache_dir") || "";
+
+function persistZenithTargetCategory(value, manual) {
+    try {
+        localStorage.setItem("zas_target_category", value);
+        if (manual) localStorage.setItem("zas_target_category_manual", "1");
+    } catch (_) {}
+}
 try {
     appWindow = getCurrentWindow();
 } catch (err) {
@@ -22,6 +72,13 @@ try {
 }
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => document.querySelectorAll(selector);
+
+document.addEventListener("dragstart", (event) => {
+    if (event.target instanceof HTMLImageElement) event.preventDefault();
+});
+document.addEventListener("selectstart", (event) => {
+    if (!event.target.closest?.("input, textarea, [contenteditable='true']")) event.preventDefault();
+});
 
 function normalizeBackendText(value) {
     if (value === null || value === undefined) return "";
@@ -60,11 +117,14 @@ function pathBaseName(value) {
 
 function translateBackendProgressText(value) {
     const text = normalizeBackendText(value);
-    if (i18n?.currentLang !== "en") return text;
+    if (i18n?.currentLang === "es") return text;
 
     let out = text
         .replace(/Procesando Frame/g, "Processing frame")
         .replace(/Procesando frame/g, "Processing frame")
+        .replace(/Analizando:/g, "Analyzing:")
+        .replace(/Midiendo decodificación GPU vs CPU/g, "Measuring GPU vs CPU decode")
+        .replace(/\(prueba corta\)/g, "(short probe)")
         .replace(/Cargando Lote/g, "Loading batch")
         .replace(/Generando Referencia Maestra/g, "Generating master reference")
         .replace(/Creando Referencia Low-Noise \(Doble Pasada\)/g, "Creating low-noise reference (double pass)")
@@ -252,10 +312,76 @@ function initCustomSelect() {
     initCustomSelectBox('sel-quality-method', 'custom-quality-trigger', 'custom-quality-options', 'custom-quality-text');
     initCustomSelectBox('settings-lang-select', 'custom-language-trigger', 'custom-language-options', 'custom-language-text');
     initCustomSelectBox('sel-target-category', 'trigger-target-category', 'options-target-category', 'text-target-category');
+    // FIX UX: la categoría elegida se pierde al reiniciar y la auto-detección
+    // del análisis la pisaba. Restaurar la guardada al arrancar y marcar como
+    // MANUAL todo cambio hecho por el usuario (los programáticos no marcan).
+    (function initTargetCategoryPersistence() {
+        const sel = document.getElementById('sel-target-category');
+        if (!sel) return;
+        const saved = localStorage.getItem('zas_target_category');
+        if (saved && sel.value !== saved && sel.querySelector(`option[value="${saved}"]`)) {
+            zasCategoryProgrammatic = true;
+            sel.value = saved;
+            sel.dispatchEvent(new Event('change'));
+            zasCategoryProgrammatic = false;
+            // NO llamar a applyZenithUltimateFlow() aqui, por el mismo motivo
+            // que applyCacheLocation() (ver el selector de cache mas abajo):
+            // initCustomSelect() corre SINCRONO al cargar el modulo —el
+            // <script type="module"> es diferido, asi que readyState ya no es
+            // 'loading'— y esta funcion lee ZENITH_ULTIMATE_NAME y
+            // currentAnalysisMode, declaradas MUCHO mas abajo. En ese instante
+            // estan en zona muerta temporal: ReferenceError que aborta el
+            // modulo ENTERO, con lo que no se registra el arranque, la ventana
+            // no crece, ningun boton queda enlazado y la licencia no se
+            // verifica. Solo saltaba con una categoria guardada distinta de la
+            // por defecto, que es justo lo que tiene cualquier usuario real.
+            // Se aplica en cuanto el modulo termina de evaluarse.
+            queueMicrotask(applyZenithUltimateFlow);
+        }
+        sel.addEventListener('change', () => {
+            if (zasCategoryProgrammatic) return;
+            persistZenithTargetCategory(sel.value, true);
+        });
+    })();
+
+    // Selector de ubicación del caché (Origen / Elegir ubicación).
+    (function initCacheLocationSelector() {
+        const btnOrigin = document.getElementById('btn-cache-origin');
+        const btnChoose = document.getElementById('btn-cache-choose');
+        if (!btnOrigin || !btnChoose) return;
+        const paint = () => {
+            const on = '#38bdf8', off = '#334155';
+            btnOrigin.style.borderColor = cacheLocationMode === 'origin' ? on : off;
+            btnChoose.style.borderColor = cacheLocationMode === 'choose' ? on : off;
+        };
+        btnOrigin.addEventListener('click', () => {
+            cacheLocationMode = 'origin';
+            localStorage.setItem('zas_cache_mode', 'origin');
+            paint();
+            applyCacheLocation();
+        });
+        btnChoose.addEventListener('click', async () => {
+            const folder = await openDialog({ directory: true, multiple: false });
+            const dir = (typeof folder === 'object' && folder && folder.path) ? folder.path : folder;
+            if (!dir) return;
+            cacheLocationMode = 'choose';
+            cacheChosenDir = dir;
+            localStorage.setItem('zas_cache_mode', 'choose');
+            localStorage.setItem('zas_cache_dir', dir);
+            paint();
+            applyCacheLocation();
+        });
+        paint();
+        // NO llamar a applyCacheLocation() aquí: initCustomSelect corre al
+        // cargar el módulo, antes de que `currentFilePath` esté inicializado
+        // (TDZ). La ubicación se aplica al importar el vídeo (setCurrentFilePath)
+        // y cuando el usuario pulsa un botón de modo.
+    })();
 }
 
 function normalizeLanguageCode(lang) {
-    return lang === "en" ? "en" : "es";
+    const normalized = String(lang || "").toLowerCase().split("-")[0];
+    return ["es", "en", "it", "fr"].includes(normalized) ? normalized : "es";
 }
 
 function syncActivationLanguageButtons(lang) {
@@ -1221,9 +1347,45 @@ if (btnTrialStart) {
 
 let currentFilePath = "";
 window.currentFilePath = "";
+// (cacheLocationMode / cacheChosenDir se declaran arriba, junto a appWindow,
+// para no quedar en TDZ cuando initCustomSelect corre al cargar el módulo.)
+
+function parentDirOf(filePath) {
+    if (!filePath) return "";
+    const norm = filePath.replace(/\\/g, "/");
+    const i = norm.lastIndexOf("/");
+    return i > 0 ? filePath.slice(0, i) : "";
+}
+
+// Envía la ubicación efectiva del caché al backend según el modo y el vídeo
+// actual. Se llama al importar un vídeo y al cambiar el modo.
+async function applyCacheLocation() {
+    let target = null;
+    if (cacheLocationMode === "origin") {
+        const dir = parentDirOf(currentFilePath);
+        target = dir ? `${dir}/zenith-cache` : null; // null => default del backend
+    } else if (cacheLocationMode === "choose" && cacheChosenDir) {
+        target = cacheChosenDir;
+    }
+    const pathSpan = document.getElementById("cache-location-path");
+    try {
+        const resolved = await invoke("set_decode_cache_location", { path: target });
+        if (pathSpan) pathSpan.textContent = target ? `Caché: ${resolved}` : "Caché: temporal del sistema";
+    } catch (e) {
+        if (pathSpan) pathSpan.textContent = `Caché no utilizable: ${normalizeBackendText(e)}`;
+        log("WARN", `Ubicación de caché rechazada (${normalizeBackendText(e)}); se usa el temporal del sistema.`);
+        try { await invoke("set_decode_cache_location", { path: null }); } catch (_) {}
+    }
+}
+window.applyCacheLocation = applyCacheLocation;
+
 window.setCurrentFilePath = (path = "") => {
     currentFilePath = path || "";
     window.currentFilePath = currentFilePath;
+    updateBayerOverrideAvailability(currentFilePath);
+    // Reaplicar la ubicación del caché al nuevo vídeo (modo "origin" depende
+    // de dónde esté el vídeo importado).
+    applyCacheLocation();
 };
 window.getCurrentFilePath = () => currentFilePath;
 window.setMosaicViewportMode = (active = false) => {
@@ -1266,9 +1428,47 @@ let isLocalOperation = false;
 let isCancellationRequested = false;
 let pipelineRequestId = 0;
 let lastProcessedParams = "";
+const postProcessSession = new PostProcessSession({ limit: 50 });
+let currentPostprocessResultId = 0;
+let suppressPostprocessEvents = false;
+let historyPlaybackRequestId = 0;
+let historyPlaybackNonce = 0;
+let pendingHistoryCommit = null;
+let postCompareActive = false;
+let postCompareLoadId = 0;
+let postEyedropperActive = false;
+let lastPostHistogram = null;
+let lastArtifactSuggestion = null;
+let previewDownscaleFactor = 1;
+let zenithGuide = null;
+let assistantJourney = {
+    flow: "individual",
+    stage: "empty",
+    workflowStep: 0,
+    workflowTotal: 3,
+};
+let lastAssistantAnnouncement = "";
+let solarCurveEditor = null;
+let toneCurveEditor = null;
+let activeSolarPreset = "neutral";
+let lastSolarAdaptiveState = null;
+let activeTonePreset = "linear";
+let activeObjectFinishingState = null;
+let solarAdaptiveRequestId = 0;
+let objectAdaptiveRequestId = 0;
+let postHistogramRequestId = 0;
+let postBeginNonce = 0;
 window.resetPipelineState = () => {
-    pipelineRequestId = 0;
+    clearTimeout(updateTimer);
+    pipelineRequestId += 1;
+    historyPlaybackNonce += 1;
+    historyPlaybackRequestId = 0;
+    solarAdaptiveRequestId += 1;
+    objectAdaptiveRequestId += 1;
+    lastSolarAdaptiveState = null;
+    activeObjectFinishingState = null;
     lastProcessedParams = "";
+    pendingHistoryCommit = null;
 };
 let currentAnalysisMode = "global";
 let currentBestFrame = 0; // NEW: Store Ref Frame
@@ -1332,6 +1532,15 @@ let isBatchMode = false;
 let batchFiles = [];
 let batchSourcePath = "";
 let batchOutputFolder = "";
+let batchOutputFoldersBySource = new Map();
+let batchSequencePlan = null;
+let batchNormalizedApPoints = [];
+const storedBatchOutput = normalizeBatchOutputSettings(
+    localStorage.getItem("zas_batch_output_policy_v1"),
+    localStorage.getItem("zas_batch_output_directory_v1")
+);
+let batchOutputPolicy = storedBatchOutput.policy;
+let batchSingleOutputDirectory = storedBatchOutput.directory;
 let batchGeneratedImages = [];
 let batchResultPaths = [];
 let mosaicManager = null; // Instance
@@ -1340,16 +1549,13 @@ const ZENITH_ULTIMATE_VALUE = "zenith_ultimate";
 const ZENITH_ULTIMATE_NAME = "Zenith Presicion Ultimate";
 
 function normalizeZenithCategory(category) {
-    // PARKED (2026-06-28): la categoría "Planeta / Fase Lunar" queda oculta y
-    // TODO se enruta al motor de Superficie. Prueba empírica del usuario:
-    // Superficie apila perfecto planetas, Luna y superficies (mono y RGB),
-    // mientras el camino planetario seguía produciendo apilados oscuros y
-    // borrosos en discos grandes pese a múltiples correcciones. El código
-    // planetario del backend sigue intacto (dormido) para una futura fase de
-    // depuración; para reactivarlo, restaurar esta función a:
-    //   return category === "planet_large" ? "planet_small" : (category || "surface");
-    // y quitar el atributo hidden de las opciones planet_small en index.html.
-    const _ = category; // firma intacta para todos los call sites
+    // Contrato canónico de categorías. `planet_large` existió en versiones
+    // anteriores como alias de Planeta/Fase Lunar; normalizarlo evita que una
+    // preferencia guardada seleccione un perfil distinto entre single y batch.
+    const key = String(category || "surface").trim().toLowerCase();
+    if (["planet_small", "planet_large", "planet", "planetary", "lunar_phase", "moon_phase"].includes(key)) {
+        return "planet_small";
+    }
     return "surface";
 }
 
@@ -1357,9 +1563,55 @@ function getSelectedTargetCategory() {
     return normalizeZenithCategory(document.getElementById("sel-target-category")?.value || "surface");
 }
 
-function getBayerOverrideValue() {
-    const value = document.getElementById("sel-bayer-override")?.value || "auto";
-    return value === "auto" ? null : parseInt(value);
+const BAYER_OVERRIDE_VALUES = new Set([0, 8, 9, 10, 11]);
+const DEMOSAICED_VIDEO_EXTENSIONS = new Set(["mp4", "mov", "mkv", "m4v", "wmv", "flv", "mts", "m2ts"]);
+
+function pathExtension(path) {
+    const clean = String(path || "").split(/[?#]/, 1)[0];
+    const dot = clean.lastIndexOf(".");
+    return dot >= 0 ? clean.slice(dot + 1).toLowerCase() : "";
+}
+
+function canOverrideBayerForPath(path = currentFilePath) {
+    // Los contenedores comprimidos comunes entregan RGB/YUV ya demosaiced.
+    // AVI queda permitido porque muchas cámaras planetarias guardan CFA/mono
+    // RAW dentro de AVI; SER/FITS son las rutas RAW preferidas.
+    return !DEMOSAICED_VIDEO_EXTENSIONS.has(pathExtension(path));
+}
+
+function updateBayerOverrideAvailability(path = currentFilePath) {
+    const selector = document.getElementById("sel-bayer-override");
+    const hint = document.getElementById("bayer-override-hint");
+    if (!selector) return true;
+
+    const allowed = canOverrideBayerForPath(path);
+    selector.disabled = !allowed;
+    selector.title = allowed
+        ? "Usar solo si conoces el patrón CFA RAW de la cámara."
+        : "No disponible: este contenedor entrega color RGB/YUV ya demosaiced.";
+    if (!allowed && selector.value !== "auto") selector.value = "auto";
+    if (hint) {
+        hint.textContent = allowed
+            ? "Solo para CFA/mono RAW (SER, AVI RAW o FITS). Automático es la opción segura."
+            : "MP4/MOV/H.26x ya contiene RGB/YUV demosaiced: se usará detección automática.";
+        hint.style.color = allowed ? "#94a3b8" : "#fbbf24";
+    }
+    return allowed;
+}
+
+function getBayerOverrideValue(path = currentFilePath) {
+    const selector = document.getElementById("sel-bayer-override");
+    const value = selector?.value || "auto";
+    if (value === "auto") return null;
+
+    const parsed = Number.parseInt(value, 10);
+    if (!BAYER_OVERRIDE_VALUES.has(parsed) || !canOverrideBayerForPath(path)) {
+        if (selector) selector.value = "auto";
+        updateBayerOverrideAvailability(path);
+        log("WARN", "Override Bayer ignorado: el archivo no es CFA RAW compatible. Se usará detección automática.");
+        return null;
+    }
+    return parsed;
 }
 
 function getAnalysisModeValue(flow) {
@@ -1464,13 +1716,27 @@ function applySuggestedTargetCategory(suggestedTarget) {
     const selTargetCategory = document.getElementById("sel-target-category");
     if (!selTargetCategory || selTargetCategory.value === category) return;
 
+    // FIX UX: la elección MANUAL del usuario manda — la auto-detección ya no
+    // la pisa (antes cada análisis reseteaba la categoría elegida). Solo se
+    // registra la sugerencia en el log.
+    if (localStorage.getItem("zas_target_category_manual") === "1") {
+        log(
+            "INFO",
+            `Detección sugiere: ${category === "planet_small" ? "Disco planetario / fase lunar" : "Superficie solar / lunar"} — se conserva tu categoría elegida.`
+        );
+        return;
+    }
+
+    zasCategoryProgrammatic = true;
     selTargetCategory.value = category;
     selTargetCategory.dispatchEvent(new Event("change"));
+    zasCategoryProgrammatic = false;
+    persistZenithTargetCategory(category, false);
     applyZenithUltimateFlow();
 
     const flow = getZenithUltimateFlow(category);
     currentAnalysisMode = flow.analysisMode;
-    log("INFO", `Objetivo detectado: ${category === "planet_small" ? "Planeta / Fase Lunar" : "General (Planetas / Superficies)"}.`);
+    log("INFO", `Objetivo detectado: ${category === "planet_small" ? "Disco planetario / fase lunar" : "Superficie solar / lunar"}.`);
 }
 
 // Estado del Reproductor de Animacion
@@ -1830,6 +2096,205 @@ async function checkAvx2Status() {
 // UTILIDADES GRAFICAS
 // =========================================================================
 
+// ASSET PROTOCOL: los resultados de apilado llegan ahora como RUTA de archivo
+// (PNG temporal servido por convertFileSrc) en vez de data-URL base64, que
+// duplicaba el pico de RAM del WebView en canvases grandes. Acepta ambos
+// formatos para no romper los comandos que siguen devolviendo base64.
+function toDisplaySrc(src) {
+    const normalized = unwrapPreviewReference(src);
+    // `setImageAndWait` is the single normalization point, but a few older
+    // callers already hand us an asset/blob URL. Converting one of those a
+    // second time produces an invalid `asset://.../asset://...` URL and left
+    // the processed-result pane completely black after a successful stack.
+    if (
+        normalized &&
+        !/^(?:data:|asset:|blob:|https?:)/i.test(normalized)
+    ) {
+        return convertFileSrc(normalized);
+    }
+    return normalized;
+}
+window.toDisplaySrc = toDisplaySrc;
+
+// CACHE-BUSTING para frames de animación recargados desde disco: normalize/
+// realign SOBRESCRIBEN los mismos archivos — sin esto el WebView serviría la
+// imagen vieja cacheada por URL. Se bumpea al completar esas operaciones; el
+// asset protocol resuelve por el path de la URL e ignora la query string.
+// ===== PLANIFICACION PLANETARIA: compute + decode independientes =====
+// v2 convierte Auto en el valor seguro por defecto. Antes de esta clave de
+// versión, `hybrid` era también el default que la aplicación persistía; por eso
+// null e Hybrid se migran una sola vez. Tras marcar v2, Hybrid vuelve a ser una
+// elección experta válida y se conserva en aperturas posteriores.
+const PLANETARY_POLICY_PREF_VERSION = "2";
+const PLANETARY_POLICY_PREF_VERSION_KEY = "zas_planetary_policy_version";
+// v2 changes the user-requested default to Maximum. The versioned migration is
+// intentionally one-shot so this checkout does not remain on the old Adaptive
+// value solely because v1 wrote it to localStorage.
+const PLANETARY_QUALITY_PREF_VERSION = "2";
+const PLANETARY_QUALITY_PREF_VERSION_KEY = "zas_planetary_quality_policy_version";
+
+function migratePlanetaryPolicyPreference() {
+    const storedVersion = localStorage.getItem(PLANETARY_POLICY_PREF_VERSION_KEY);
+    if (storedVersion === PLANETARY_POLICY_PREF_VERSION) {
+        return;
+    }
+    const legacyCompute = localStorage.getItem("zas_gpu_mode");
+    if (legacyCompute === null || (storedVersion === null && legacyCompute === "hybrid")) {
+        localStorage.setItem("zas_gpu_mode", "auto");
+    }
+    localStorage.setItem(PLANETARY_POLICY_PREF_VERSION_KEY, PLANETARY_POLICY_PREF_VERSION);
+}
+
+function getGpuMode() {
+    migratePlanetaryPolicyPreference();
+    const v = localStorage.getItem("zas_gpu_mode");
+    return (v === "gpu" || v === "cpu" || v === "auto" || v === "hybrid") ? v : "auto";
+}
+window.getGpuMode = getGpuMode;
+
+function getComputePolicy() {
+    return ({
+        gpu: "gpu_only",
+        cpu: "cpu_only",
+        auto: "auto",
+        hybrid: "hybrid"
+    })[getGpuMode()] || "auto";
+}
+window.getComputePolicy = getComputePolicy;
+
+function getDecodePolicy() {
+    const value = localStorage.getItem("zas_decode_policy");
+    return (value === "software" || value === "hardware" || value === "auto") ? value : "auto";
+}
+window.getDecodePolicy = getDecodePolicy;
+
+function getQualityPolicy() {
+    if (localStorage.getItem(PLANETARY_QUALITY_PREF_VERSION_KEY) !== PLANETARY_QUALITY_PREF_VERSION) {
+        localStorage.setItem("zas_planetary_quality_policy", "maximum");
+        localStorage.setItem(PLANETARY_QUALITY_PREF_VERSION_KEY, PLANETARY_QUALITY_PREF_VERSION);
+    }
+    const value = localStorage.getItem("zas_planetary_quality_policy");
+    return (value === "standard" || value === "maximum" || value === "adaptive")
+        ? value
+        : "maximum";
+}
+window.getQualityPolicy = getQualityPolicy;
+
+const planetaryColorOptionPreference = {
+    normalizeColors: false,
+    alignRgb: true,
+};
+
+function setPlanetaryColorOptionsAvailability(isColor) {
+    const options = [
+        {
+            control: document.getElementById("chk-normalize-colors"),
+            wrapper: document.getElementById("planetary-normalize-option"),
+            preference: "normalizeColors",
+        },
+        {
+            control: document.getElementById("chk-rgb-align"),
+            wrapper: document.getElementById("planetary-rgb-align-option"),
+            preference: "alignRgb",
+        },
+    ];
+    options.forEach(({ control, wrapper, preference }) => {
+        if (!control) return;
+        if (isColor === false) {
+            if (!control.disabled) planetaryColorOptionPreference[preference] = !!control.checked;
+            control.checked = false;
+            control.disabled = true;
+        } else {
+            control.disabled = false;
+            control.checked = !!planetaryColorOptionPreference[preference];
+        }
+        const unavailable = isColor === false;
+        wrapper?.classList.toggle("is-unavailable", unavailable);
+        wrapper?.setAttribute("aria-disabled", String(unavailable));
+        const availability = wrapper?.querySelector(".planetary-option-availability");
+        if (availability) availability.textContent = unavailable ? "No aplica a una fuente monocroma" : "";
+        control.title = unavailable
+            ? "Desactivado: la fuente analizada es monocroma."
+            : preference === "normalizeColors"
+                ? "Opt-in: actívalo sólo si deseas neutralizar el color de captura."
+                : "Alinea automáticamente los canales R y B cuando la fuente contiene color.";
+    });
+}
+window.setPlanetaryColorOptionsAvailability = setPlanetaryColorOptionsAvailability;
+
+[
+    ["chk-normalize-colors", "normalizeColors"],
+    ["chk-rgb-align", "alignRgb"],
+].forEach(([id, preference]) => {
+    document.getElementById(id)?.addEventListener("change", (event) => {
+        if (!event.target.disabled) planetaryColorOptionPreference[preference] = !!event.target.checked;
+    });
+});
+
+(async function initGpuUi() {
+    try {
+        const selGpu = document.getElementById("sel-gpu-mode");
+        if (selGpu) {
+            selGpu.value = getGpuMode();
+            selGpu.addEventListener("change", () => {
+                localStorage.setItem("zas_gpu_mode", selGpu.value);
+                log("INFO", `Cómputo planetario: ${selGpu.value === "hybrid" ? "Hybrid experimental" : selGpu.value === "auto" ? "Auto" : selGpu.value === "gpu" ? "Solo GPU (estricto)" : "Solo CPU"}`);
+            });
+        }
+        const selDecode = document.getElementById("sel-decode-policy");
+        if (selDecode) {
+            selDecode.value = getDecodePolicy();
+            selDecode.addEventListener("change", () => {
+                localStorage.setItem("zas_decode_policy", selDecode.value);
+                log("INFO", `Decodificacion FFmpeg: ${selDecode.value === "hardware" ? "Hardware estricto" : selDecode.value === "software" ? "Software (CPU)" : "Auto"}`);
+            });
+        }
+        const selQuality = document.getElementById("sel-planetary-quality-policy");
+        if (selQuality) {
+            selQuality.value = getQualityPolicy();
+            selQuality.addEventListener("change", () => {
+                const value = (selQuality.value === "standard" || selQuality.value === "maximum")
+                    ? selQuality.value
+                    : (selQuality.value === "adaptive" ? "adaptive" : "maximum");
+                localStorage.setItem("zas_planetary_quality_policy", value);
+                localStorage.setItem(PLANETARY_QUALITY_PREF_VERSION_KEY, PLANETARY_QUALITY_PREF_VERSION);
+                log("INFO", `Rigor planetario por AP: ${value}`);
+            });
+        }
+        const info = await invoke("get_gpu_info");
+        window._gpuInfo = info;
+        const line = document.getElementById("gpu-info-line");
+        if (info && info.available) {
+            if (line) {
+                line.textContent = trFormat(
+                    "settings.general.gpu_budget",
+                    {
+                        name: info.name,
+                        backend: info.backend,
+                        budget: info.vram_budget_mb,
+                    },
+                    "✔ {{name}} — {{backend}} · VRAM presupuestada: {{budget}} MB",
+                );
+            }
+            log("INFO", `GPU detectada: ${info.name} (${info.backend}) — ${info.vram_budget_mb} MB presupuestados para cómputo planetario.`);
+        } else {
+            if (line) line.textContent = tr("settings.general.gpu_none", "Sin GPU compatible — análisis y apilado usan CPU (SIMD).");
+        }
+    } catch (e) {
+        console.warn("get_gpu_info:", e);
+    }
+})();
+
+let animAssetVersion = 0;
+function toAnimationSrc(item) {
+    if (typeof item !== "string" || !item) return item;
+    if (item.startsWith("data:") || item.startsWith("http") || item.startsWith("asset:")) {
+        return item; // ya es una URL lista para <img src>
+    }
+    const url = convertFileSrc(item);
+    return animAssetVersion > 0 ? `${url}?v=${animAssetVersion}` : url;
+}
+
 function setImageAndWait(imgElement, srcBase64, fitView = true) {
     return new Promise((resolve) => {
         if (!imgElement) { resolve(false); return; }
@@ -1869,8 +2334,11 @@ function setImageAndWait(imgElement, srcBase64, fitView = true) {
         };
 
         imgElement.onload = onReady;
-        imgElement.onerror = () => resolve(false);
-        imgElement.src = srcBase64;
+        imgElement.onerror = () => {
+            console.error("No se pudo cargar la vista previa", imgElement.src);
+            resolve(false);
+        };
+        imgElement.src = toDisplaySrc(srcBase64);
 
         setTimeout(() => {
             if (
@@ -1998,7 +2466,466 @@ function refreshWaveletPresetList(selectName) {
     if (selectName) sel.value = selectName;
 }
 
-function applyWaveletPreset(p) {
+function rgbUnitToHex(rgb) {
+    return `#${(rgb || [1, 1, 1]).map((value) => Math.round(Math.max(0, Math.min(1, value)) * 255).toString(16).padStart(2, "0")).join("")}`;
+}
+
+function getSolarMonoParams() {
+    const fraction = (id, fallback = 0) => {
+        const value = parseFloat(document.getElementById(id)?.value);
+        return Number.isFinite(value) ? value / 100 : fallback;
+    };
+    return {
+        enabled: document.getElementById("chk-solar-enabled")?.checked || false,
+        invert: document.getElementById("chk-solar-invert")?.checked || false,
+        colorize: document.getElementById("chk-solar-colorize")?.checked || false,
+        curvePoints: solarCurveEditor?.getPoints() || [[0, 0], [1, 1]],
+        shadowColor: hexToRgbUnit(document.getElementById("solar-shadow-color")?.value || "#0f0000"),
+        midtoneColor: hexToRgbUnit(document.getElementById("solar-mid-color")?.value || "#b83300"),
+        highlightColor: hexToRgbUnit(document.getElementById("solar-highlight-color")?.value || "#fff05a"),
+        colorStrength: fraction("sl-solar-color-strength", .9),
+        highlightProtect: fraction("sl-solar-highlight-protect", .65),
+        highlightCompression: fraction("sl-solar-highlight-compression", .62),
+        backgroundProtect: fraction("sl-solar-background-protect", .72),
+        prominenceAmount: fraction("sl-solar-prominence", 0),
+        filamentAmount: fraction("sl-solar-filament", 0),
+        filamentRadius: fraction("sl-solar-radius", 1.15),
+        noiseGuard: fraction("sl-solar-noise-guard", .65),
+    };
+}
+
+function updateSolarControlOutputs() {
+    const values = {
+        "out-solar-filament": Math.round(parseFloat(document.getElementById("sl-solar-filament")?.value || "0")).toString(),
+        "out-solar-radius": `${(parseFloat(document.getElementById("sl-solar-radius")?.value || "115") / 100).toFixed(2)} px`,
+        "out-solar-noise-guard": Math.round(parseFloat(document.getElementById("sl-solar-noise-guard")?.value || "65")).toString(),
+        "out-solar-color-strength": Math.round(parseFloat(document.getElementById("sl-solar-color-strength")?.value || "90")).toString(),
+        "out-solar-highlight-protect": Math.round(parseFloat(document.getElementById("sl-solar-highlight-protect")?.value || "65")).toString(),
+        "out-solar-highlight-compression": Math.round(parseFloat(document.getElementById("sl-solar-highlight-compression")?.value || "62")).toString(),
+        "out-solar-background-protect": Math.round(parseFloat(document.getElementById("sl-solar-background-protect")?.value || "72")).toString(),
+        "out-solar-prominence": Math.round(parseFloat(document.getElementById("sl-solar-prominence")?.value || "0")).toString(),
+    };
+    Object.entries(values).forEach(([id, value]) => {
+        const output = document.getElementById(id);
+        if (output) output.textContent = value;
+    });
+}
+
+function updateSolarColorRamp() {
+    const ramp = document.getElementById("solar-color-ramp");
+    if (!ramp) return;
+    const shadow = document.getElementById("solar-shadow-color")?.value || "#0f0000";
+    const midtone = document.getElementById("solar-mid-color")?.value || "#b83300";
+    const highlight = document.getElementById("solar-highlight-color")?.value || "#fff05a";
+    ramp.style.background = `linear-gradient(90deg, ${shadow}, ${midtone}, ${highlight})`;
+}
+
+function markSolarPreset(name = "custom") {
+    activeSolarPreset = name;
+    document.querySelectorAll("[data-solar-preset]").forEach((button) => {
+        button.classList.toggle("is-active", button.dataset.solarPreset === name);
+        button.setAttribute("aria-pressed", String(button.dataset.solarPreset === name));
+    });
+}
+
+function updateSolarUiState() {
+    const module = document.getElementById("solar-mono-module");
+    const status = document.getElementById("solar-module-status");
+    const params = getSolarMonoParams();
+    module?.classList.toggle("is-neutral", !params.enabled);
+    module?.setAttribute("data-solar-active", String(params.enabled));
+    document.querySelectorAll("[data-solar-color], #sl-solar-color-strength")
+        .forEach((control) => { control.disabled = !params.colorize; });
+    updateSolarControlOutputs();
+    updateSolarColorRamp();
+    if (!status) return;
+    if (!params.enabled) {
+        status.textContent = tr("wavelets.solar.status_neutral", "Neutral · sin alterar la señal mono");
+        status.dataset.state = "idle";
+        return;
+    }
+    const stages = [
+        params.invert
+            ? tr("wavelets.solar.stage_inverted", "invertido")
+            : tr("wavelets.solar.stage_curve", "curva tonal"),
+        params.colorize
+            ? tr("wavelets.solar.stage_false_color", "falso color")
+            : tr("wavelets.solar.stage_mono", "salida mono"),
+    ];
+    if (params.filamentAmount > 0.001) {
+        stages.push(trFormat(
+            "wavelets.solar.stage_filaments",
+            { amount: Math.round(params.filamentAmount * 100), radius: params.filamentRadius.toFixed(2) },
+            `filamentos ${Math.round(params.filamentAmount * 100)}% · ${params.filamentRadius.toFixed(2)} px`,
+        ));
+    }
+    if (params.prominenceAmount > 0.001) {
+        stages.push(trFormat(
+            "wavelets.solar.stage_prominences",
+            { amount: Math.round(params.prominenceAmount * 100) },
+            `protuberancias ${Math.round(params.prominenceAmount * 100)}%`,
+        ));
+    }
+    if (params.backgroundProtect > 0.001) {
+        stages.push(trFormat(
+            "wavelets.solar.stage_sky",
+            { amount: Math.round(params.backgroundProtect * 100) },
+            `cielo protegido ${Math.round(params.backgroundProtect * 100)}%`,
+        ));
+    }
+    if (params.highlightCompression > 0.001) {
+        stages.push(trFormat(
+            "wavelets.solar.stage_highlights",
+            { amount: Math.round(params.highlightCompression * 100) },
+            `luces comprimidas ${Math.round(params.highlightCompression * 100)}%`,
+        ));
+    }
+    const adaptive = lastSolarAdaptiveState?.adaptation?.measured
+        ? tr("wavelets.adaptive.measured_short", "adaptado a señal medida")
+        : tr("wavelets.adaptive.conservative_short", "protección conservadora");
+    status.textContent = `${stages.join(" · ")} · ${adaptive} · ${tr("wavelets.solar.reversible", "derivado 16-bit reversible")}`;
+    status.dataset.state = "active";
+}
+
+function applySolarParamsToUi(solar = {}, { presetName = "custom" } = {}) {
+    const neutral = cloneSolarPreset("neutral");
+    const params = {
+        ...neutral,
+        ...solar,
+        curvePoints: normalizeSolarCurvePoints(solar.curvePoints || neutral.curvePoints),
+    };
+    const setChecked = (id, value) => {
+        const control = document.getElementById(id);
+        if (control) control.checked = !!value;
+    };
+    const setValue = (id, value) => {
+        const control = document.getElementById(id);
+        if (control) control.value = String(value);
+    };
+    setChecked("chk-solar-enabled", params.enabled);
+    setChecked("chk-solar-invert", params.invert);
+    setChecked("chk-solar-colorize", params.colorize);
+    setValue("sl-solar-filament", Number(params.filamentAmount || 0) * 100);
+    setValue("sl-solar-radius", Number(params.filamentRadius ?? 1.15) * 100);
+    setValue("sl-solar-noise-guard", Number(params.noiseGuard ?? .65) * 100);
+    setValue("sl-solar-color-strength", Number(params.colorStrength ?? .9) * 100);
+    setValue("sl-solar-highlight-protect", Number(params.highlightProtect ?? .65) * 100);
+    setValue("sl-solar-highlight-compression", Number(params.highlightCompression ?? .62) * 100);
+    setValue("sl-solar-background-protect", Number(params.backgroundProtect ?? .72) * 100);
+    setValue("sl-solar-prominence", Number(params.prominenceAmount || 0) * 100);
+    setValue("solar-shadow-color", Array.isArray(params.shadowColor) ? rgbUnitToHex(params.shadowColor) : params.shadowColor);
+    setValue("solar-mid-color", Array.isArray(params.midtoneColor) ? rgbUnitToHex(params.midtoneColor) : params.midtoneColor);
+    setValue("solar-highlight-color", Array.isArray(params.highlightColor) ? rgbUnitToHex(params.highlightColor) : params.highlightColor);
+    solarCurveEditor?.setPoints(params.curvePoints);
+    markSolarPreset(presetName);
+    updateSolarUiState();
+}
+
+// `preferProcessed: false` mide el máster original — correcto para las recetas
+// de acabado de objeto (wavelets/deconv actúan al INICIO del pipeline). La
+// etapa solar actúa al FINAL: su entrada real es el resultado con los pasos
+// previos aplicados (exposición del asistente incluida), así que ella pide
+// `preferProcessed: true`. Medir el máster la dejaba ciega a ese brillo
+// acumulado y su curva quemaba el disco.
+async function measureAdaptiveRecipeInput({ preferProcessed = false } = {}) {
+    const [histogram, artifacts] = await Promise.all([
+        invoke("postprocess_histogram", { preferProcessed }).catch(() => lastPostHistogram),
+        invoke("analyze_postprocess_artifacts", { preferProcessed }).catch(() => null),
+    ]);
+    return {
+        histogram: histogram || lastPostHistogram || {},
+        artifacts: artifacts || {},
+        capture: {
+            qualityStability: Number(
+                currentVideoStats?.quality_stability
+                ?? currentVideoStats?.qualityStability
+                ?? 100,
+            ),
+        },
+    };
+}
+
+function adaptiveProtectionSummary(adaptation) {
+    if (!adaptation?.measured) {
+        return tr("wavelets.adaptive.fallback", "análisis no disponible; límites conservadores");
+    }
+    const labels = {
+        highlights: tr("wavelets.adaptive.highlights", "altas luces"),
+        noise: tr("wavelets.adaptive.noise", "ruido"),
+        ringing: tr("wavelets.adaptive.ringing", "halos"),
+        shadows: tr("wavelets.adaptive.shadows", "sombras"),
+        balanced: tr("wavelets.adaptive.balanced", "señal equilibrada"),
+        exposure_guard: tr("wavelets.adaptive.exposure_guard", "brillo previo (curva frenada)"),
+        burn_guard: tr("wavelets.adaptive.burn_guard", "techo de blancos"),
+    };
+    return (adaptation.safeguards || ["balanced"]).map((key) => labels[key] || key).join(" + ");
+}
+
+function localizedSolarPresetLabel(name, fallback = "") {
+    const keys = {
+        "ha-natural": "ha_natural",
+        "ha-gold": "ha_gold",
+        "ha-inverted": "ha_inverted",
+        chromosphere: "chromosphere",
+        prominence: "prominence",
+        "dual-range": "dual_range",
+        filaments: "filaments",
+        neutral: "neutral",
+    };
+    return tr(`wavelets.solar.presets.${keys[name] || name}`, fallback || name);
+}
+
+async function applySolarPreset(name) {
+    const status = document.getElementById("solar-module-status");
+    const token = ++solarAdaptiveRequestId;
+    const buttons = Array.from(document.querySelectorAll("[data-solar-preset]"));
+    const adaptive = name !== "neutral";
+    const previousSolar = getSolarMonoParams();
+    const previousPresetName = activeSolarPreset;
+    const previousAdaptiveState = lastSolarAdaptiveState;
+    let mutationStarted = false;
+    if (adaptive) {
+        if (status) {
+            status.textContent = tr("wavelets.adaptive.measuring_active", "Midiendo el resultado activo 16-bit, ruido y halos…");
+            status.dataset.state = "processing";
+        }
+        buttons.forEach((button) => {
+            button.disabled = true;
+            button.classList.toggle("is-analyzing", button.dataset.solarPreset === name);
+        });
+    }
+    try {
+        const measurement = adaptive
+            ? await measureAdaptiveRecipeInput({ preferProcessed: true })
+            : {};
+        if (token !== solarAdaptiveRequestId) return;
+        const preset = adaptive
+            ? adaptSolarPreset(name, measurement)
+            : cloneSolarPreset(name);
+        preset.label = localizedSolarPresetLabel(name, preset.label);
+        lastSolarAdaptiveState = preset;
+        suppressPostprocessEvents = true;
+        try {
+            mutationStarted = true;
+            applySolarParamsToUi(preset, { presetName: name });
+        } finally {
+            suppressPostprocessEvents = false;
+        }
+        drawPostprocessScopes();
+        triggerUpdate({ forceFastPreview: preset.filamentAmount > 0 });
+        queuePostHistoryCommit(trFormat(
+            "wavelets.solar.history_preset",
+            { label: preset.label },
+            `Solar · ${preset.label}`,
+        ));
+        if (status && adaptive) {
+            status.textContent = trFormat(
+                "wavelets.adaptive.solar_applied",
+                {
+                    label: preset.label,
+                    protections: adaptiveProtectionSummary(preset.adaptation),
+                },
+                `${preset.label} · adaptado al máster · protege ${adaptiveProtectionSummary(preset.adaptation)}`,
+            );
+            status.dataset.state = "active";
+        }
+    } catch (error) {
+        console.error("No se pudo aplicar la receta solar adaptativa:", error);
+        if (mutationStarted) {
+            suppressPostprocessEvents = true;
+            try {
+                applySolarParamsToUi(previousSolar, { presetName: previousPresetName });
+                lastSolarAdaptiveState = previousAdaptiveState;
+                drawPostprocessScopes();
+                triggerUpdate({ forceFastPreview: true });
+            } catch (rollbackError) {
+                console.error("No se pudo restaurar el estado solar anterior:", rollbackError);
+            } finally {
+                suppressPostprocessEvents = false;
+            }
+        }
+        if (token === solarAdaptiveRequestId && status) {
+            status.textContent = tr(
+                "wavelets.adaptive.error",
+                "No se pudo medir la señal; no se aplicaron cambios.",
+            );
+            status.dataset.state = "warning";
+        }
+    } finally {
+        suppressPostprocessEvents = false;
+        if (token === solarAdaptiveRequestId) {
+            buttons.forEach((button) => {
+                button.disabled = false;
+                button.classList.remove("is-analyzing");
+            });
+        }
+    }
+}
+
+function initSolarMonoUi() {
+    const canvas = document.getElementById("solar-tone-curve");
+    solarCurveEditor = new SolarCurveEditor(canvas, {
+        onInput: () => {
+            const enabled = document.getElementById("chk-solar-enabled");
+            if (enabled) enabled.checked = true;
+            markSolarPreset("custom");
+            lastSolarAdaptiveState = null;
+            updateSolarUiState();
+            triggerUpdate({ forceFastPreview: true });
+        },
+        onCommit: () => queuePostHistoryCommit(tr("wavelets.solar.history_custom_curve", "Solar · curva personalizada")),
+    });
+
+    document.querySelectorAll("[data-solar-preset]").forEach((button) => {
+        button.addEventListener("click", () => applySolarPreset(button.dataset.solarPreset));
+    });
+    document.getElementById("btn-reset-solar-curve")?.addEventListener("click", () => {
+        const enabled = document.getElementById("chk-solar-enabled");
+        if (enabled) enabled.checked = true;
+        solarCurveEditor?.setPoints([[0, 0], [1, 1]], { notify: true });
+        markSolarPreset("custom");
+        lastSolarAdaptiveState = null;
+        triggerUpdate({ forceFastPreview: true });
+        queuePostHistoryCommit(tr("wavelets.solar.history_linear_curve", "Solar · curva lineal"));
+    });
+    ["chk-solar-enabled", "chk-solar-invert", "chk-solar-colorize"].forEach((id) => {
+        document.getElementById(id)?.addEventListener("change", () => {
+            markSolarPreset("custom");
+            lastSolarAdaptiveState = null;
+            updateSolarUiState();
+            triggerUpdate({ forceFastPreview: true });
+            const historyKey = id === "chk-solar-invert"
+                ? "history_inversion"
+                : id === "chk-solar-colorize"
+                    ? "history_false_color"
+                    : "history_enable";
+            queuePostHistoryCommit(tr(`wavelets.solar.${historyKey}`, "Solar · ajuste de módulo"));
+        });
+    });
+    ["sl-solar-filament", "sl-solar-radius", "sl-solar-noise-guard", "sl-solar-background-protect", "sl-solar-prominence", "sl-solar-color-strength", "sl-solar-highlight-protect", "sl-solar-highlight-compression"]
+        .forEach((id) => {
+            const control = document.getElementById(id);
+            control?.addEventListener("input", () => {
+                const enabled = document.getElementById("chk-solar-enabled");
+                if (enabled) enabled.checked = true;
+                markSolarPreset("custom");
+                lastSolarAdaptiveState = null;
+                updateSolarUiState();
+                triggerUpdate({ forceFastPreview: true });
+            });
+            control?.addEventListener("change", () => queuePostHistoryCommit(tr("wavelets.solar.history_fine", "Solar · ajuste fino")));
+        });
+    document.querySelectorAll("[data-solar-color]").forEach((control) => {
+        control.addEventListener("input", () => {
+            const enabled = document.getElementById("chk-solar-enabled");
+            const colorize = document.getElementById("chk-solar-colorize");
+            if (enabled) enabled.checked = true;
+            if (colorize) colorize.checked = true;
+            markSolarPreset("custom");
+            lastSolarAdaptiveState = null;
+            updateSolarUiState();
+            triggerUpdate({ forceFastPreview: true });
+        });
+        control.addEventListener("change", () => queuePostHistoryCommit(tr("wavelets.solar.history_color_map", "Solar · mapa cromático")));
+    });
+    applySolarParamsToUi(cloneSolarPreset("neutral"), { presetName: "neutral" });
+    lastSolarAdaptiveState = null;
+}
+
+function toneCurveIsLinear(points) {
+    const normalized = normalizeToneCurvePoints(points);
+    return normalized.length === 2
+        && Math.abs(normalized[0][0]) < 1e-6
+        && Math.abs(normalized[0][1]) < 1e-6
+        && Math.abs(normalized[1][0] - 1) < 1e-6
+        && Math.abs(normalized[1][1] - 1) < 1e-6;
+}
+
+function markTonePreset(name = "custom") {
+    activeTonePreset = name;
+    document.querySelectorAll("[data-tone-preset]").forEach((button) => {
+        const active = button.dataset.tonePreset === name;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-pressed", String(active));
+    });
+}
+
+function initToneCurveUi() {
+    toneCurveEditor = new ToneCurveEditor(document.getElementById("post-tone-curve-editor"), {
+        onInput: () => {
+            markTonePreset("custom");
+            drawPostprocessScopes();
+            triggerUpdate({ forceFastPreview: true });
+        },
+        onCommit: () => queuePostHistoryCommit("Curva tonal · personalizada"),
+    });
+    document.getElementById("btn-reset-tone-curve")?.addEventListener("click", () => {
+        toneCurveEditor?.setPoints([[0, 0], [1, 1]], { notify: true });
+        markTonePreset("linear");
+        drawPostprocessScopes();
+        triggerUpdate({ forceFastPreview: true });
+        queuePostHistoryCommit("Curva tonal · lineal");
+    });
+    markTonePreset("linear");
+}
+
+function applyAdvancedParamsToUi(advanced = {}) {
+    const mapping = {
+        levelsBlack: advanced.levelsBlack ?? 0,
+        levelsMid: advanced.levelsMid ?? 1,
+        levelsWhite: advanced.levelsWhite ?? 1,
+        exposure: advanced.exposure ?? 0,
+        shadows: advanced.shadows ?? 0,
+        highlights: advanced.highlights ?? 0,
+        whites: advanced.whites ?? 0,
+        blacks: advanced.blacks ?? 0,
+        vibrance: advanced.vibrance ?? 0,
+        temperature: advanced.temperature ?? 0,
+        tint: advanced.tint ?? 0,
+        texture: advanced.texture ?? 0,
+        clarity: advanced.clarity ?? 0,
+        scnrGreen: advanced.scnrGreen ?? 0,
+    };
+    Object.entries(mapping).forEach(([name, value]) => {
+        const control = document.querySelector(`[data-advanced-control="${name}"]`);
+        if (!control) return;
+        const scale = parseFloat(control.dataset.scale || "1") || 1;
+        control.value = String(value * scale);
+        updateAdvancedControlOutput(control);
+    });
+    document.querySelectorAll("[data-hsl-index]").forEach((control) => {
+        const index = parseInt(control.dataset.hslIndex, 10);
+        const component = control.dataset.hslComponent || "saturation";
+        const values = component === "hue"
+            ? advanced.hslHue
+            : component === "luminance"
+                ? advanced.hslLuminance
+                : advanced.hslSaturation;
+        control.value = String((values?.[index] || 0) * 100);
+        updateAdvancedControlOutput(control);
+    });
+    document.querySelectorAll("[data-grade-amount]").forEach((control) => {
+        const index = parseInt(control.dataset.gradeAmount, 10);
+        control.value = String((advanced.gradingAmounts?.[index] || 0) * 100);
+        updateAdvancedControlOutput(control);
+    });
+    const colors = {
+        shadows: advanced.gradingShadows,
+        midtones: advanced.gradingMidtones,
+        highlights: advanced.gradingHighlights,
+    };
+    Object.entries(colors).forEach(([name, rgb]) => {
+        const control = document.querySelector(`[data-grade-color="${name}"]`);
+        if (control) control.value = rgbUnitToHex(rgb);
+    });
+    const tonePoints = normalizeToneCurvePoints(advanced.toneCurvePoints);
+    toneCurveEditor?.setPoints(tonePoints);
+    markTonePreset(toneCurveIsLinear(tonePoints) ? "linear" : "custom");
+    applySolarParamsToUi(advanced.solar || cloneSolarPreset("neutral"));
+    updateLevelMarkers();
+}
+
+function applyWaveletPreset(p, { trigger = true } = {}) {
     const setNum = (id, val) => {
         const el = document.getElementById("num-" + id);
         if (!el || val === undefined || val === null || isNaN(val)) return;
@@ -2015,6 +2942,22 @@ function applyWaveletPreset(p) {
         setNum("vc-sigma", p.deconv.vs); setNum("vc-iter", p.deconv.vi);
     }
     if (p.usm) { setNum("usm-amt", p.usm.a); setNum("usm-rad", p.usm.r); }
+    {
+        const adaptive = p.adaptiveUsm || { enabled: false, amountMin: .15, amountMax: 1, threshold: .12, transition: .18 };
+        const adaptiveToggle = document.getElementById("chk-adaptive-usm");
+        if (adaptiveToggle) adaptiveToggle.checked = !!adaptive.enabled;
+        const adaptiveValues = [
+            ["sl-adaptive-usm-min", adaptive.amountMin, 15],
+            ["sl-adaptive-usm-max", adaptive.amountMax, 100],
+            ["sl-adaptive-usm-threshold", adaptive.threshold, 12],
+            ["sl-adaptive-usm-transition", adaptive.transition, 18],
+        ];
+        adaptiveValues.forEach(([id, value, fallback]) => {
+            const control = document.getElementById(id);
+            if (control) control.value = String(Number.isFinite(Number(value)) ? Number(value) * 100 : fallback);
+        });
+        setAdaptiveUsmUiState(!!adaptive.enabled);
+    }
     setNum("lce-amt", p.lce);
     setNum("master-denoise", p.masterDenoise);
     setNum("denoise-detail", p.denoiseDetail);
@@ -2029,6 +2972,12 @@ function applyWaveletPreset(p) {
         if (ui.selDrMode) { ui.selDrMode.value = String(p.dr.mode ?? 0); ui.selDrMode.dispatchEvent(new Event("change", { bubbles: true })); }
         if (ui.chkDrMask) ui.chkDrMask.checked = !!p.dr.mask;
     }
+    const edgeAware = document.getElementById("chk-edge-wavelets");
+    const psfFromLimb = document.getElementById("chk-psf-limb");
+    if (edgeAware && p.edgeAwareWavelets !== undefined) edgeAware.checked = !!p.edgeAwareWavelets;
+    if (psfFromLimb && p.psfFromLimb !== undefined) psfFromLimb.checked = !!p.psfFromLimb;
+    setNum("edge-strength", p.edgeAwareStrength ?? 50);
+    setNum("auto-mask", p.autoMask ?? 0);
     if (p.shift) {
         [["rx", p.shift.rx], ["ry", p.shift.ry], ["bx", p.shift.bx], ["by", p.shift.by]].forEach(([k, v]) => {
             if (ui[k] && v !== undefined) { ui[k].value = v; ui[k].dispatchEvent(new Event("input", { bubbles: true })); }
@@ -2043,7 +2992,10 @@ function applyWaveletPreset(p) {
         selSharp.value = p.useRgbSharpening ? "rgb" : "luminance";
         selSharp.dispatchEvent(new Event("change", { bubbles: true }));
     }
-    triggerUpdate();
+    if (p.advanced) applyAdvancedParamsToUi(p.advanced);
+    updateDeconvolutionStatus();
+    drawPostprocessScopes();
+    if (trigger) triggerUpdate();
 }
 
 function initWaveletPresets() {
@@ -2084,13 +3036,26 @@ function initWaveletPresets() {
         if (!name) return;
         const all = waveletPresetsLoad();
         if (all[name]) {
-            applyWaveletPreset(all[name]);
+            suppressPostprocessEvents = true;
+            try {
+                applyWaveletPreset(all[name], { trigger: false });
+            } finally {
+                suppressPostprocessEvents = false;
+            }
+            triggerUpdate();
+            queuePostHistoryCommit(`Esquema: ${name}`);
             log("INFO", tr("wavelets.presets.applied", "Esquema aplicado: ") + name);
         }
     });
 }
 
-window.addEventListener("load", () => {
+// Arranque RESILIENTE: la secuencia se dispara con `load`, pero si un recurso
+// se queda colgado (red, disco lento) un fallback tras DOMContentLoaded+4s la
+// ejecuta igualmente — la app nunca puede quedarse en el splash para siempre.
+let zasStartupRan = false;
+function zasStartupSequence() {
+    if (zasStartupRan) return;
+    zasStartupRan = true;
     console.log("Zenith: Startup content loaded.");
 
     // Populate the hardware-acceleration label (progress overlay + header badge).
@@ -2098,9 +3063,6 @@ window.addEventListener("load", () => {
 
     // Ajuste fino + doble-clic-reset en todos los sliders de la app.
     enhanceRangeInputs();
-
-    // Esquemas de wavelets guardables (paridad de flujo con RegiStax).
-    initWaveletPresets();
 
     // Double-check show if it somehow missed the module init
     if (appWindow && typeof appWindow.show === 'function') {
@@ -2127,66 +3089,107 @@ window.addEventListener("load", () => {
         finishSplash();
     }
 
-    async function finishSplash() {
-        if (splash) {
-            // PASO 1: El Banner se desvanece
-            splash.style.opacity = "0"; 
-            console.log("Zenith: Loading complete. Transitions initiated...");
-
-            // PASO 2: Expansión Animada de la Ventana
-            try {
-                if (appWindow && typeof appWindow.setSize === 'function') {
-                    // 2a. Eliminar restricciones de tamaño mínimo temporalmente
-                    if (typeof appWindow.setMinSize === 'function') {
-                        await appWindow.setMinSize(new LogicalSize(0, 0));
-                    }
-
-                    // 2b. Animación de expansión suave
-                    // Usamos una transición controlada para evitar saltos bruscos
-                    const targetWidth = 1280;
-                    const targetHeight = 900;
-                    
-                    await animateWindowExpansion(targetWidth, targetHeight, 450);
-                    
-                    console.log("Zenith: Window expansion complete.");
-                }
-            } catch(e) { 
-                console.error("Zenith: Startup Expansion failed:", e); 
-                // Fallback: Salto instantáneo en caso de error
-                try {
-                   await appWindow.setSize(new LogicalSize(1280, 900));
-                   await appWindow.center();
-                } catch(e2) {}
-            }
-
-            // PASO 3: Revelar Interfaz Principal (Sincronizado)
-            setTimeout(() => {
-                document.body.classList.add("ready");
-                // Restaurar restricciones de tamaño final para la UI principal
-                if (appWindow && typeof appWindow.setMinSize === 'function') {
-                    appWindow.setMinSize(new LogicalSize(1000, 700)).catch(() => {});
-                }
-            }, 100);
-
-            // PASO 4: Limpieza total del splash
-            setTimeout(() => { 
-                splash.style.display = "none";
-            }, 1500);
-        } else {
-            document.body.classList.add("ready"); 
+    // El revelado de la interfaz NO puede depender de la animacion de ventana.
+    // `animateWindowExpansion` se apoya en requestAnimationFrame —que el WebView
+    // PAUSA si la ventana esta ocluida, minimizada o en otro Space— y en IPC de
+    // Tauri. Si cualquiera de los dos se queda sin resolver, la promesa nunca se
+    // cumple; y `try/catch` no lo detecta, porque una promesa que no se cumple
+    // tampoco se rechaza. Resultado: `body.ready` no se ponia nunca y la app se
+    // quedaba en el splash para siempre (toda la UI vive en opacity:0 hasta esa
+    // clase). Ahora el revelado esta garantizado y la expansion tiene plazo.
+    function revealUi() {
+        if (document.body.classList.contains("ready")) return;
+        document.body.classList.add("ready");
+        // Restaurar restricciones de tamano finales para la UI principal
+        if (appWindow && typeof appWindow.setMinSize === 'function') {
+            appWindow.setMinSize(new LogicalSize(1000, 700)).catch(() => {});
         }
     }
 
+    async function finishSplash() {
+        if (!splash) {
+            revealUi();
+            return;
+        }
+
+        // PASO 1: El Banner se desvanece
+        splash.style.opacity = "0";
+        console.log("Zenith: Loading complete. Transitions initiated...");
+
+        // PASO 2: Expansion de la ventana, acotada por plazo.
+        await Promise.race([
+            expandWindow(),
+            new Promise((resolve) => setTimeout(resolve, 3000)),
+        ]);
+
+        // PASO 3: Revelar Interfaz Principal — se ejecuta pase lo que pase.
+        revealUi();
+
+        // PASO 4: Limpieza total del splash
+        setTimeout(() => {
+            splash.style.display = "none";
+        }, 1500);
+    }
+
+    // Expuesta para la red de seguridad de index.html: si esta revela la UI por
+    // watchdog, la ventana debe crecer igualmente en vez de quedarse en 650x400.
+    window.__zasExpandWindow = expandWindow;
+
+    async function expandWindow() {
+        if (!appWindow || typeof appWindow.setSize !== 'function') return;
+        try {
+            // Eliminar restricciones de tamano minimo temporalmente
+            if (typeof appWindow.setMinSize === 'function') {
+                await appWindow.setMinSize(new LogicalSize(0, 0));
+            }
+            await animateWindowExpansion(1280, 900, 450);
+            console.log("Zenith: Window expansion complete.");
+        } catch (e) {
+            console.error("Zenith: Startup Expansion failed:", e);
+        }
+        // Salto directo de garantia: si la animacion quedo a medias (rAF pausado)
+        // o fallo, la ventana termina igualmente en su tamano final.
+        try {
+            await appWindow.setSize(new LogicalSize(1280, 900));
+            await appWindow.center();
+        } catch (_) {}
+    }
+
     /**
-     * Función auxiliar para animar el tamaño de la ventana de Tauri
+     * Funcion auxiliar para animar el tamano de la ventana de Tauri.
+     * Siempre resuelve: ni rAF pausado ni una IPC lenta pueden dejarla colgada.
      */
     async function animateWindowExpansion(targetW, targetH, duration) {
-        const startSize = await appWindow.innerSize();
-        // Convertir PhysicalSize a Logical (asumiendo DPI estándar si no se puede obtener el factor)
-        // En Tauri v2, es mejor trabajar con LogicalSize consistentemente.
-        const factor = await appWindow.scaleFactor();
-        const startW = startSize.width / factor;
-        const startH = startSize.height / factor;
+        // rAF se pausa con la ventana ocluida; el setTimeout gemelo garantiza
+        // que la animacion sigue avanzando y termina en cualquier caso.
+        const nextFrame = (fn) => {
+            let fired = false;
+            const once = () => {
+                if (fired) return;
+                fired = true;
+                fn(performance.now());
+            };
+            requestAnimationFrame(once);
+            setTimeout(once, 32);
+        };
+
+        // Tamano de partida: si la IPC tarda, usamos el de tauri.conf.json.
+        let startW = 650;
+        let startH = 400;
+        try {
+            const measured = await Promise.race([
+                (async () => {
+                    const size = await appWindow.innerSize();
+                    const factor = await appWindow.scaleFactor();
+                    return { w: size.width / factor, h: size.height / factor };
+                })(),
+                new Promise((resolve) => setTimeout(() => resolve(null), 500)),
+            ]);
+            if (measured) {
+                startW = measured.w;
+                startH = measured.h;
+            }
+        } catch (_) {}
 
         const startTime = performance.now();
 
@@ -2194,29 +3197,40 @@ window.addEventListener("load", () => {
             function step(currentTime) {
                 const elapsed = currentTime - startTime;
                 const progress = Math.min(elapsed / duration, 1);
-                
+
                 // Easing: easeOutCubic
                 const ease = 1 - Math.pow(1 - progress, 3);
-                
+
                 const currentW = Math.round(startW + (targetW - startW) * ease);
                 const currentH = Math.round(startH + (targetH - startH) * ease);
 
                 appWindow.setSize(new LogicalSize(currentW, currentH)).catch(() => {});
-                
+
                 if (progress < 1) {
-                    requestAnimationFrame(step);
+                    nextFrame(step);
                 } else {
-                    appWindow.center().then(resolve).catch(resolve);
+                    // Resolvemos ya: `center()` no puede retener el arranque.
+                    appWindow.center().catch(() => {});
+                    resolve();
                 }
             }
-            requestAnimationFrame(step);
+            nextFrame(step);
         });
     }
 
     loadSystemFonts();
     checkLicenseAtStartup();
     checkForAppUpdates(true);
-});
+}
+window.addEventListener("load", zasStartupSequence);
+// Fallback anti-cuelgue: si `load` no dispara en 4 s tras tener el DOM
+// (recurso de red/disco estancado), el arranque procede igualmente.
+document.addEventListener("DOMContentLoaded", () => setTimeout(zasStartupSequence, 4000));
+if (document.readyState === "complete") {
+    zasStartupSequence();
+} else if (document.readyState === "interactive") {
+    setTimeout(zasStartupSequence, 4000);
+}
 
 async function loadSystemFonts() {
     try {
@@ -2402,6 +3416,11 @@ function showProcessing(msg = "PROCESANDO...") {
         txt.style.color = "";
         if (det) det.textContent = "Iniciando...";
         if (bar) bar.style.width = "0%";
+        // Telemetria: limpiar la rejilla de la operacion anterior (se vuelve
+        // a mostrar sola cuando llega el primer evento stack_telemetry).
+        const teleBox = $("#stack-telemetry");
+        if (teleBox) teleBox.style.display = "none";
+        _lastStackTelemetry = null;
         if (btnCancel) {
             btnCancel.disabled = false;
             btnCancel.style.opacity = "";
@@ -2415,6 +3434,8 @@ window.showProcessing = showProcessing;
 function hideProcessing() {
     const overlay = $("#processing-overlay");
     if (overlay) overlay.style.display = "none";
+    const teleBox = $("#stack-telemetry");
+    if (teleBox) teleBox.style.display = "none";
     isCancellationRequested = false;
     const btnCancel = $("#btn-cancel-process");
     if (btnCancel) {
@@ -2426,8 +3447,13 @@ function hideProcessing() {
 window.hideProcessing = hideProcessing;
 
 function isCancellationError(error) {
+    // F3: SOLO por el mensaje. El OR con el flag global clasificaba como
+    // "cancelación" cualquier error REAL (fallo GPU, OOM, decode roto) que
+    // llegara en la ventana entre pulsar Cancelar y el cierre del overlay,
+    // y se lo tragaba con un WARN en vez de mostrarlo al usuario. Los
+    // aborts genuinos del backend siempre dicen "Cancelado/Cancelled".
     const msg = String(error || "").toLowerCase();
-    return isCancellationRequested || msg.includes("cancelad") || msg.includes("cancelled") || msg.includes("cancelling");
+    return msg.includes("cancelad") || msg.includes("cancelled") || msg.includes("cancelling");
 }
 
 function showLocalProcessing(msg = "Calculando...") {
@@ -2474,6 +3500,7 @@ const ui = {
     btnSmartGrid: $("#btn-smart-grid"),
     btnSavePng: $("#btn-save-png"),
     btnSaveTiff: $("#btn-save-tiff"),
+    btnSaveFits: $("#btn-save-fits"),
     btnToggleLog: $("#btn-toggle-log"),
 
     analysisActions: $("#analysis-actions"),
@@ -2484,6 +3511,9 @@ const ui = {
     panelBatch: $("#panel-batch"),
     batchSourcePath: $("#batch-source-path"),
     batchCount: $("#batch-count"),
+    btnBatchOutputSourceAdjacent: $("#btn-batch-output-source-adjacent"),
+    btnBatchOutputSingleDirectory: $("#btn-batch-output-single-directory"),
+    batchOutputPath: $("#batch-output-path"),
     btnBatchTune: $("#btn-batch-tune"),
     btnBatchRun: $("#btn-batch-run"),
     selBatchType: $("#sel-batch-type"),
@@ -2609,8 +3639,8 @@ const ui = {
     d1: $("#d1"), d2: $("#d2"), d3: $("#d3"), d4: $("#d4"), d5: $("#d5"), d6: $("#d6"),
 
     slCrisp: $("#sl-crisp"), valCrisp: $("#num-crisp"),
-    slGamma: $("#sl-gamma"), valGamma: $("#num-gamma"),
-    slSat: $("#sl-sat"), valSat: $("#num-sat"),
+    slGamma: $("#sl-gamma"), valGamma: $("#num-gamma"), numGamma: $("#num-gamma"),
+    slSat: $("#sl-sat"), valSat: $("#num-sat"), numSat: $("#num-sat"),
     slContrast: $("#sl-contrast"), numContrast: $("#num-contrast"),
     slBrightness: $("#sl-brightness"), numBrightness: $("#num-brightness"),
     slRBal: $("#sl-r-bal"), numRBal: $("#num-r-bal"),
@@ -2906,13 +3936,9 @@ function startAnimationPlayer(imageDataList, keepFilters = false) {
         }
     }
 
-    animState.images = imageDataList.filter(Boolean).map(item => {
-        if (typeof item === 'string' && item.startsWith("data:")) {
-            return item;
-        } else {
-            return convertFileSrc(item);
-        }
-    });
+    // Rutas → URLs del asset protocol (con cache-busting si los archivos
+    // fueron reescritos por normalize/realign); data-URLs pasan tal cual.
+    animState.images = imageDataList.filter(Boolean).map(toAnimationSrc);
 
     if (animState.images.length === 0) {
         showCustomAlert(tr("general.error", "Error"), tr("animation.errors.no_valid_images", "No se generaron imagenes validas para reproducir."));
@@ -3434,9 +4460,13 @@ linkTintControl("#sl-anim-tint-b", "#num-anim-tint-b", "b");
         showProcessing(tr("animation.normalize_processing", "NORMALIZANDO BRILLO..."));
 
         try {
-            const normalizedBase64List = await invoke("normalize_batch_brightness", { paths: batchResultPaths });
-            if (normalizedBase64List && normalizedBase64List.length > 0) {
-                batchGeneratedImages = normalizedBase64List;
+            // El backend publica copias PNG no destructivas y devuelve rutas
+            // (no base64, para no retener toda la secuencia en el WebView).
+            const normalizedPaths = await invoke("normalize_batch_brightness", { paths: batchResultPaths });
+            if (normalizedPaths && normalizedPaths.length > 0) {
+                batchResultPaths = normalizedPaths;
+                animAssetVersion = Date.now();
+                batchGeneratedImages = normalizedPaths;
                 refreshAnimationFromFullFrames(batchGeneratedImages, true);
                 log("SUCCESS", i18n.t("animation.normalize_success_log"));
                 showCustomAlert(i18n.t("general.ready"), i18n.t("animation.normalize_success_message"));
@@ -4383,9 +5413,6 @@ if (ui.btnConfirmCrop) {
         const iw = Math.round(cropSelection.w);
         const ih = Math.round(cropSelection.h);
 
-        // Guardar parámetros actuales antes del recorte
-        const hadProcessing = lastProcessedParams !== null && lastProcessedParams !== "{}";
-
         ui.btnConfirmCrop.disabled = true;
         showProcessing("RECORTANDO...");
 
@@ -4393,17 +5420,7 @@ if (ui.btnConfirmCrop) {
             const b64 = await invoke("crop_stacked_image", { x: ix, y: iy, w: iw, h: ih });
             await setImageAndWait(ui.imgResult, b64, true);
 
-            // Solo resetear si no había procesamiento previo
-            if (!hadProcessing) {
-                resetProcessingParams();
-            } else {
-                // Reaplicar los parámetros guardados automáticamente
-                log("INFO", "Reaplicando parámetros de post-procesamiento...");
-                // Los parámetros ya están en los controles UI, solo trigger update
-                // Forzar actualización limpiando lastProcessedParams para que detecte cambio
-                lastProcessedParams = null;
-                triggerUpdate();
-            }
+            await beginNewPostprocessResult(b64, "crop");
 
             log("SUCCESS", `Recorte aplicado: ${iw}x${ih}`);
             ui.btnCancelCrop.click();
@@ -4462,6 +5479,102 @@ linkControl("#sl-crisp", "#num-crisp", 10.0);
 linkControl("#sl-master-denoise", "#num-master-denoise", 1.0);
 linkControl("#sl-denoise-detail", "#num-denoise-detail", 1.0);
 linkControl("#sl-denoise-chroma", "#num-denoise-chroma", 1.0);
+// B+: intensidad edge-aware · auto-máscara adaptativa (ambos 0..100 enteros)
+linkControl("#sl-edge-strength", "#num-edge-strength", 1.0);
+linkControl("#sl-auto-mask", "#num-auto-mask", 1.0);
+
+function updateAdaptiveUsmOutputs() {
+    ["min", "max", "threshold", "transition"].forEach((name) => {
+        const control = document.getElementById(`sl-adaptive-usm-${name}`);
+        const output = document.getElementById(`out-adaptive-usm-${name}`);
+        if (control && output) output.textContent = `${Math.round(parseFloat(control.value) || 0)}%`;
+    });
+}
+
+function setAdaptiveUsmUiState(enabled) {
+    const details = document.getElementById("adaptive-usm-module");
+    const controls = document.getElementById("adaptive-usm-controls");
+    controls?.classList.toggle("is-disabled", !enabled);
+    controls?.querySelectorAll("input").forEach((control) => { control.disabled = !enabled; });
+    if (enabled && details) details.open = true;
+    updateAdaptiveUsmOutputs();
+}
+
+function initAdaptiveUsmUi() {
+    const toggle = document.getElementById("chk-adaptive-usm");
+    toggle?.closest(".switch-container")?.addEventListener("click", (event) => event.stopPropagation());
+    toggle?.addEventListener("change", () => {
+        setAdaptiveUsmUiState(toggle.checked);
+        triggerUpdate();
+    });
+    ["min", "max", "threshold", "transition"].forEach((name) => {
+        const control = document.getElementById(`sl-adaptive-usm-${name}`);
+        control?.addEventListener("input", () => {
+            updateAdaptiveUsmOutputs();
+            triggerUpdate();
+        });
+    });
+    setAdaptiveUsmUiState(!!toggle?.checked);
+}
+
+let linkedWaveletAnchor = null;
+
+function updateLinkedWaveletUi() {
+    const enabled = !!document.getElementById("chk-linked-wavelets")?.checked;
+    const decay = document.getElementById("sl-linked-wavelet-decay");
+    if (decay) decay.disabled = !enabled;
+    const output = document.getElementById("out-linked-wavelet-decay");
+    if (decay && output) output.textContent = `${Math.round(parseFloat(decay.value) || 0)}%`;
+    document.querySelector(".linked-wavelet-editor")?.classList.toggle("is-active", enabled);
+}
+
+function propagateLinkedWavelets(family, sourceIndex) {
+    if (!document.getElementById("chk-linked-wavelets")?.checked) return;
+    const source = document.getElementById(`${family}${sourceIndex}`);
+    if (!source) return;
+    const sourceRaw = parseFloat(source.value) || 0;
+    const decay = (parseFloat(document.getElementById("sl-linked-wavelet-decay")?.value) || 0) / 100;
+    const maximumLayer = family === "w" || family === "d" ? 6 : 5;
+    const displayScale = family === "w" ? 5 : 10;
+    for (let index = sourceIndex + 1; index <= maximumLayer; index += 1) {
+        const slider = document.getElementById(`${family}${index}`);
+        const number = document.getElementById(`num-${family}${index}`);
+        if (!slider || !number) continue;
+        const raw = Math.max(parseFloat(slider.min) || 0, Math.min(parseFloat(slider.max) || 50,
+            sourceRaw * Math.pow(decay, index - sourceIndex)));
+        slider.value = String(raw);
+        number.value = Number((raw / displayScale).toFixed(2)).toString();
+    }
+    linkedWaveletAnchor = { family, sourceIndex };
+    drawPostprocessScopes();
+}
+
+function initLinkedWaveletUi() {
+    const toggle = document.getElementById("chk-linked-wavelets");
+    const decay = document.getElementById("sl-linked-wavelet-decay");
+    toggle?.addEventListener("change", updateLinkedWaveletUi);
+    decay?.addEventListener("input", () => {
+        updateLinkedWaveletUi();
+        if (linkedWaveletAnchor) {
+            propagateLinkedWavelets(linkedWaveletAnchor.family, linkedWaveletAnchor.sourceIndex);
+            triggerUpdate();
+        }
+    });
+    ["w", "d"].forEach((family) => {
+        for (let index = 1; index <= 6; index += 1) {
+            document.getElementById(`${family}${index}`)?.addEventListener("input", () => {
+                propagateLinkedWavelets(family, index);
+            });
+            document.getElementById(`num-${family}${index}`)?.addEventListener("change", () => {
+                propagateLinkedWavelets(family, index);
+            });
+        }
+    });
+    updateLinkedWaveletUi();
+}
+
+initAdaptiveUsmUi();
+initLinkedWaveletUi();
 // linkControl("#sl-gamma", "#num-gamma", 100.0);
 // Custom Inverted Gamma Logic for Post-Processing
 const slGamma = $("#sl-gamma");
@@ -4506,10 +5619,18 @@ if (ui.blendSlider) {
     ui.blendSlider.addEventListener("change", triggerUpdate);
 }
 
-[ui.rx, ui.ry, ui.bx, ui.by].forEach(el => { if (el) el.addEventListener("input", triggerUpdate); });
+[ui.rx, ui.ry, ui.bx, ui.by].forEach(el => {
+    if (el) el.addEventListener("input", () => triggerUpdate({ forceFastPreview: true }));
+});
 if (ui.chkDeringing) ui.chkDeringing.addEventListener("change", triggerUpdate);
 
-function resetProcessingParams() {
+// B (wavelets edge-aware) y A (PSF del limbo): re-procesar al togglear.
+["chk-edge-wavelets", "chk-psf-limb"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", triggerUpdate);
+});
+
+function resetProcessingParams({ updateMemo = true } = {}) {
     const zeroIds = [
         "u1", "u2", "u3", "u4", "u5",
         "w1", "w2", "w3", "w4", "w5", "w6",
@@ -4535,6 +5656,19 @@ function resetProcessingParams() {
     if (ui.valUsmAmt) ui.valUsmAmt.value = 0;
     if (ui.slUsmRad) ui.slUsmRad.value = 0;
     if (ui.valUsmRad) ui.valUsmRad.value = 0;
+
+    const adaptiveUsmToggle = document.getElementById("chk-adaptive-usm");
+    if (adaptiveUsmToggle) adaptiveUsmToggle.checked = false;
+    [
+        ["sl-adaptive-usm-min", "15"],
+        ["sl-adaptive-usm-max", "100"],
+        ["sl-adaptive-usm-threshold", "12"],
+        ["sl-adaptive-usm-transition", "18"],
+    ].forEach(([id, value]) => {
+        const control = document.getElementById(id);
+        if (control) control.value = value;
+    });
+    setAdaptiveUsmUiState(false);
 
     if (ui.slLceAmt) ui.slLceAmt.value = 0;
     if (ui.valLceAmt) ui.valLceAmt.value = 0;
@@ -4572,15 +5706,55 @@ function resetProcessingParams() {
         ui.selDrMode.value = "0"; // Disabled by default
         if (ui.panelDrManual) ui.panelDrManual.style.display = "none";
     }
-    if (ui.slDrRad) ui.slDrRad.value = 10;
+    if (ui.slDrRad) ui.slDrRad.value = 100;
     if (ui.numDrRad) ui.numDrRad.value = 10;
-    if (ui.slDrDark) ui.slDrDark.value = 50;
-    if (ui.numDrDark) ui.numDrDark.value = 50;
+    if (ui.slDrDark) ui.slDrDark.value = 500;
+    if (ui.numDrDark) ui.numDrDark.value = 0.5;
     if (ui.slDrLight) ui.slDrLight.value = 0;
     if (ui.numDrLight) ui.numDrLight.value = 0;
     if (ui.chkDrMask) ui.chkDrMask.checked = false;
 
-    lastProcessedParams = JSON.stringify(getPipelineParams());
+    const edgeAware = document.getElementById("chk-edge-wavelets");
+    const psfFromLimb = document.getElementById("chk-psf-limb");
+    const sharpenMode = document.getElementById("sel-sharpen-mode");
+    if (edgeAware) edgeAware.checked = false;
+    if (psfFromLimb) psfFromLimb.checked = false;
+    if (sharpenMode) sharpenMode.value = "luminance";
+    [["sl-edge-strength", "50"], ["num-edge-strength", "50"], ["sl-auto-mask", "0"], ["num-auto-mask", "0"]]
+        .forEach(([id, value]) => {
+            const control = document.getElementById(id);
+            if (control) control.value = value;
+        });
+
+    document.querySelectorAll("[data-advanced-control], [data-hsl-index], [data-grade-amount]").forEach((control) => {
+        control.value = control.dataset.default ?? "0";
+        updateAdvancedControlOutput(control);
+    });
+    document.querySelectorAll("[data-grade-color]").forEach((control) => { control.value = "#ffffff"; });
+    toneCurveEditor?.setPoints([[0, 0], [1, 1]]);
+    markTonePreset("linear");
+    applySolarParamsToUi(cloneSolarPreset("neutral"), { presetName: "neutral" });
+    lastSolarAdaptiveState = null;
+    solarAdaptiveRequestId += 1;
+    activeObjectFinishingState = null;
+    document.querySelectorAll("[data-object-preset]").forEach((button) => {
+        button.classList.remove("is-active");
+        button.setAttribute("aria-pressed", "false");
+    });
+    const objectStatus = document.getElementById("object-finishing-status");
+    if (objectStatus) {
+        objectStatus.textContent = tr(
+            "wavelets.object_lab.status_idle",
+            "Elige una receta para ver qué módulos activa.",
+        );
+        objectStatus.dataset.state = "idle";
+    }
+    updateLevelMarkers();
+    updateModeGlow();
+    updateDeconvolutionStatus();
+    drawPostprocessScopes();
+
+    if (updateMemo) lastProcessedParams = JSON.stringify(getPipelineParams());
 }
 
 if (ui.selDrMode) {
@@ -4628,8 +5802,69 @@ function updateModeGlow() {
     }
 }
 
+function hexToRgbUnit(hex) {
+    const value = String(hex || "#ffffff").replace("#", "").padEnd(6, "f").slice(0, 6);
+    return [0, 2, 4].map((offset) => parseInt(value.slice(offset, offset + 2), 16) / 255);
+}
+
+function getAdvancedPostprocessParams() {
+    const byParam = (name, fallback = 0) => {
+        const control = document.querySelector(`[data-advanced-control="${name}"]`);
+        if (!control) return fallback;
+        const scale = parseFloat(control.dataset.scale || "1") || 1;
+        const value = parseFloat(control.value);
+        return Number.isFinite(value) ? value / scale : fallback;
+    };
+    const hsl = {
+        hue: Array(8).fill(0),
+        saturation: Array(8).fill(0),
+        luminance: Array(8).fill(0),
+    };
+    document.querySelectorAll("[data-hsl-index]").forEach((control) => {
+        const index = parseInt(control.dataset.hslIndex, 10);
+        const component = control.dataset.hslComponent || "saturation";
+        if (index >= 0 && index < 8 && hsl[component]) {
+            hsl[component][index] = (parseFloat(control.value) || 0) / 100;
+        }
+    });
+    const gradingAmounts = Array(3).fill(0);
+    document.querySelectorAll("[data-grade-amount]").forEach((control) => {
+        const index = parseInt(control.dataset.gradeAmount, 10);
+        if (index >= 0 && index < 3) gradingAmounts[index] = (parseFloat(control.value) || 0) / 100;
+    });
+    return {
+        levelsBlack: byParam("levelsBlack", 0),
+        levelsMid: byParam("levelsMid", 1),
+        levelsWhite: byParam("levelsWhite", 1),
+        toneCurvePoints: toneCurveEditor?.getPoints() || [[0, 0], [1, 1]],
+        exposure: byParam("exposure", 0),
+        shadows: byParam("shadows", 0),
+        highlights: byParam("highlights", 0),
+        whites: byParam("whites", 0),
+        blacks: byParam("blacks", 0),
+        vibrance: byParam("vibrance", 0),
+        temperature: byParam("temperature", 0),
+        tint: byParam("tint", 0),
+        texture: byParam("texture", 0),
+        clarity: byParam("clarity", 0),
+        scnrGreen: byParam("scnrGreen", 0),
+        hslHue: hsl.hue,
+        hslSaturation: hsl.saturation,
+        hslLuminance: hsl.luminance,
+        gradingShadows: hexToRgbUnit(document.querySelector('[data-grade-color="shadows"]')?.value),
+        gradingMidtones: hexToRgbUnit(document.querySelector('[data-grade-color="midtones"]')?.value),
+        gradingHighlights: hexToRgbUnit(document.querySelector('[data-grade-color="highlights"]')?.value),
+        gradingAmounts,
+        solar: getSolarMonoParams(),
+    };
+}
+
 function getPipelineParams() {
     const getVal = (id) => parseFloat($(`#num-${id}`)?.value) || 0;
+    const getRangeFraction = (id, fallback) => {
+        const value = parseFloat(document.getElementById(id)?.value);
+        return Number.isFinite(value) ? value / 100 : fallback;
+    };
     return {
         u: [getVal("u1"), getVal("u2"), getVal("u3"), getVal("u4"), getVal("u5")],
         w: [getVal("w1"), getVal("w2"), getVal("w3"), getVal("w4"), getVal("w5"), getVal("w6")],
@@ -4640,6 +5875,13 @@ function getPipelineParams() {
             vs: getVal("vc-sigma"), vi: parseInt($(`#num-vc-iter`).value) || 0
         },
         usm: { a: getVal("usm-amt"), r: getVal("usm-rad") },
+        adaptiveUsm: {
+            enabled: document.getElementById("chk-adaptive-usm")?.checked || false,
+            amountMin: getRangeFraction("sl-adaptive-usm-min", .15),
+            amountMax: getRangeFraction("sl-adaptive-usm-max", 1),
+            threshold: getRangeFraction("sl-adaptive-usm-threshold", .12),
+            transition: getRangeFraction("sl-adaptive-usm-transition", .18),
+        },
         lce: getVal("lce-amt"),
         masterDenoise: getVal("master-denoise"),
         denoiseDetail: getVal("denoise-detail"),
@@ -4656,7 +5898,9 @@ function getPipelineParams() {
             rx: parseFloat(ui.rx.value) || 0, ry: parseFloat(ui.ry.value) || 0,
             bx: parseFloat(ui.bx.value) || 0, by: parseFloat(ui.by.value) || 0
         },
-        blend: parseFloat(ui.blendSlider.value) || 100,
+        blend: Number.isFinite(parseFloat(ui.blendSlider?.value))
+            ? parseFloat(ui.blendSlider.value)
+            : 100,
         // Deringing Params
         dr: {
             mode: parseInt(ui.selDrMode?.value) || 0, // 0=Off, 1=Auto, 2=Manual
@@ -4665,7 +5909,17 @@ function getPipelineParams() {
             light: getVal("dr-light"),
             mask: ui.chkDrMask?.checked || false
         },
-        useRgbSharpening: (document.getElementById("sel-sharpen-mode")?.value === "rgb")
+        useRgbSharpening: (document.getElementById("sel-sharpen-mode")?.value === "rgb"),
+        // B: wavelets edge-aware (anti-ringing en limbo) · A: deconv con PSF medida
+        edgeAwareWavelets: document.getElementById("chk-edge-wavelets")?.checked || false,
+        psfFromLimb: document.getElementById("chk-psf-limb")?.checked || false,
+        // B+: intensidad edge-aware (0..100, 50 = histórico) · auto-máscara adaptativa por SNR (0..100)
+        edgeAwareStrength: parseFloat($(`#num-edge-strength`)?.value ?? "50"),
+        autoMask: getVal("auto-mask"),
+        // El backend histórico conserva estos argumentos por compatibilidad,
+        // pero la única UI de niveles es el módulo científico 16-bit avanzado.
+        levels: { black: 0, white: 1, gamma: 1 },
+        advanced: getAdvancedPostprocessParams()
     };
 }
 window.getPipelineParams = getPipelineParams;
@@ -4686,17 +5940,1929 @@ function isPostConfigNeutral(p) {
         && zero(p.color.b) && zero(p.color.rb) && zero(p.color.bb)
         && zero(p.shift.rx) && zero(p.shift.ry) && zero(p.shift.bx) && zero(p.shift.by)
         && Math.abs(p.blend - 100) < 0.001
-        && p.dr.mode === 0;
+        && p.dr.mode === 0
+        && zero(p.levels.black) && one(p.levels.white) && one(p.levels.gamma)
+        && zero(p.advanced.levelsBlack) && one(p.advanced.levelsMid) && one(p.advanced.levelsWhite)
+        && toneCurveIsLinear(p.advanced.toneCurvePoints)
+        && zero(p.advanced.exposure) && zero(p.advanced.shadows) && zero(p.advanced.highlights)
+        && zero(p.advanced.whites) && zero(p.advanced.blacks) && zero(p.advanced.vibrance)
+        && zero(p.advanced.temperature) && zero(p.advanced.tint)
+        && zero(p.advanced.texture) && zero(p.advanced.clarity) && zero(p.advanced.scnrGreen)
+        && p.advanced.hslHue.every(zero)
+        && p.advanced.hslSaturation.every(zero)
+        && p.advanced.hslLuminance.every(zero)
+        && p.advanced.gradingAmounts.every(zero)
+        && !p.advanced.solar?.enabled;
 }
 
-function triggerUpdate() {
-    const currentParams = JSON.stringify(getPipelineParams());
-    if (currentParams === lastProcessedParams) return;
+// Preview en vivo: la vista actual está en baja resolución (render rápido de
+// arrastre) → hay que forzar el render completo aunque los params no cambien.
+let previewIsDownscaled = false;
+let lastFastPreview = 0;
+const FAST_PREVIEW_MS = 110;
+
+function updateAdvancedControlOutput(control) {
+    if (!control) return;
+    // A colour picker shares its label with the numeric grading-strength
+    // slider. Parsing "#rrggbb" produced NaN -> 0 and overwrote that slider's
+    // output even though its thumb/value never moved.
+    if (control.type === "color") return;
+    const raw = parseFloat(control.value) || 0;
+    const scale = parseFloat(control.dataset.scale || "1") || 1;
+    const value = raw / scale;
+    const name = control.dataset.advancedControl || "";
+    let output = control.closest("label")?.querySelector("output")
+        || control.previousElementSibling?.querySelector?.("output")
+        || null;
+    if (name === "levelsBlack") output = document.getElementById("out-level-black") || output;
+    if (name === "levelsMid") output = document.getElementById("out-level-mid") || output;
+    if (name === "levelsWhite") output = document.getElementById("out-level-white") || output;
+    if (!output) return;
+
+    if (name === "levelsBlack" || name === "levelsWhite") {
+        output.textContent = Math.round(raw).toString();
+    } else if (name === "levelsMid") {
+        output.textContent = value.toFixed(2);
+    } else if (name === "exposure") {
+        output.textContent = `${value.toFixed(2)} EV`;
+    } else if (control.dataset.hslIndex !== undefined || control.dataset.gradeAmount !== undefined) {
+        output.textContent = Math.round(raw).toString();
+    } else {
+        const displayScale = parseFloat(control.dataset.displayScale || "1") || 1;
+        const displayed = value * displayScale;
+        output.textContent = Math.abs(displayed - Math.round(displayed)) < 0.005
+            ? Math.round(displayed).toString()
+            : displayed.toFixed(2);
+    }
+}
+
+function constrainLevelControls(changedControl) {
+    const black = document.getElementById("sl-level-black");
+    const white = document.getElementById("sl-level-white");
+    if (!black || !white) return;
+    const minimumGap = 256;
+    if (parseFloat(black.value) > parseFloat(white.value) - minimumGap) {
+        if (changedControl === black) black.value = String(Math.max(0, parseFloat(white.value) - minimumGap));
+        else white.value = String(Math.min(65535, parseFloat(black.value) + minimumGap));
+        updateAdvancedControlOutput(changedControl);
+    }
+}
+
+function updateLevelMarkers() {
+    const black = parseFloat(document.getElementById("sl-level-black")?.value || "0") / 65535;
+    const white = parseFloat(document.getElementById("sl-level-white")?.value || "65535") / 65535;
+    const mid = parseFloat(document.getElementById("sl-level-mid")?.value || "100") / 100;
+    const blackMarker = document.getElementById("histogram-black-marker");
+    const whiteMarker = document.getElementById("histogram-white-marker");
+    const midMarker = document.getElementById("histogram-mid-marker");
+    if (blackMarker) blackMarker.style.left = `${Math.max(0, Math.min(100, black * 100))}%`;
+    if (whiteMarker) {
+        whiteMarker.style.left = `${Math.max(0, Math.min(100, white * 100))}%`;
+        whiteMarker.style.right = "auto";
+    }
+    if (midMarker) {
+        const position = black + (white - black) * Math.pow(0.5, mid);
+        midMarker.style.left = `${Math.max(0, Math.min(100, position * 100))}%`;
+    }
+}
+
+function postAdjustmentLabel(target) {
+    const moduleTitle = target.closest("details")?.querySelector("summary span")?.textContent?.trim();
+    if (moduleTitle) return moduleTitle;
+    const directLabel = target.closest("label")?.textContent?.replace(/[-+]?\d+(\.\d+)?(\s?EV)?/g, "")?.trim();
+    if (directLabel) return directLabel.slice(0, 42);
+    return "Ajuste de postprocesado";
+}
+
+function updatePostHistoryUi() {
+    const state = postProcessSession.getState();
+    const undo = document.getElementById("btn-post-undo");
+    const redo = document.getElementById("btn-post-redo");
+    const compare = document.getElementById("btn-post-compare");
+    const compareReference = document.getElementById("post-compare-reference");
+    const label = document.getElementById("post-history-state");
+    if (undo) undo.disabled = !state.canUndo;
+    if (redo) redo.disabled = !state.canRedo;
+    if (compare) compare.disabled = !state.canCompare;
+    if (compareReference) compareReference.disabled = !state.canCompare;
+    if (!state.canCompare && postCompareActive) setPostCompareActive(false);
+    if (label) {
+        const current = postProcessSession.current();
+        label.textContent = current
+            ? `${state.index + 1}/${state.length} · ${current.label}`
+            : tr("wavelets.history.no_result", "Sin resultado");
+    }
+    if (compare) {
+        compare.title = !state.canCompare
+            ? tr("wavelets.history.compare_disabled", "Aplica un ajuste para habilitar A/B")
+            : postCompareActive
+                ? tr("wavelets.history.compare_close", "Cerrar comparación A/B")
+                : tr("wavelets.history.compare_open", "Comparar el paso actual con el anterior o con el apilado original");
+    }
+    void refreshPostCompareReference();
+    updateZenithGuide();
+}
+
+function loadComparisonPreview(image, preview, loadId) {
+    return new Promise((resolve) => {
+        image.classList.remove("loaded");
+        image.onload = null;
+        image.onerror = null;
+        const finish = (ok) => {
+            if (loadId !== postCompareLoadId) return resolve(false);
+            if (ok) image.classList.add("loaded");
+            resolve(ok);
+        };
+        image.onload = () => finish(image.naturalWidth > 0 && image.naturalHeight > 0);
+        image.onerror = () => finish(false);
+        image.src = toDisplaySrc(preview);
+        if (image.complete) queueMicrotask(() => finish(image.naturalWidth > 0 && image.naturalHeight > 0));
+    });
+}
+
+async function refreshPostCompareReference() {
+    const layer = document.getElementById("post-compare-layer");
+    const image = document.getElementById("img-result-before");
+    const selector = document.getElementById("post-compare-reference");
+    const labelA = document.getElementById("post-compare-label-a");
+    const labelB = document.getElementById("post-compare-label-b");
+    if (!layer || !image) return;
+    const reference = postProcessSession.getCompareEntry(selector?.value || "previous");
+    const canShow = postCompareActive && !!reference?.preview;
+    layer.hidden = true;
+    layer.setAttribute("aria-hidden", "true");
+    if (labelB) labelB.hidden = !canShow;
+    if (labelA) {
+        labelA.textContent = selector?.value === "source"
+            ? tr("wavelets.history.label_source", "A · Original")
+            : tr("wavelets.history.label_previous", "A · Anterior");
+    }
+    if (!canShow) return;
+
+    const loadId = ++postCompareLoadId;
+    const loaded = await loadComparisonPreview(image, reference.preview, loadId);
+    if (loadId !== postCompareLoadId || !postCompareActive) return;
+    if (!loaded) {
+        postCompareActive = false;
+        document.getElementById("btn-post-compare")?.setAttribute("aria-pressed", "false");
+        document.getElementById("post-compare-split-wrap")?.setAttribute("hidden", "");
+        if (labelB) labelB.hidden = true;
+        log("WARN", "A/B: la vista de referencia ya no estaba disponible; se conservaron el historial y la receta.");
+        return;
+    }
+    // Both images must occupy exactly the same intrinsic canvas. This avoids
+    // the tiny centred reference seen when a flex container measured the A
+    // image before its natural dimensions were available.
+    if (ui.imgResult?.naturalWidth && ui.imgResult?.naturalHeight) {
+        image.style.width = `${ui.imgResult.naturalWidth}px`;
+        image.style.height = `${ui.imgResult.naturalHeight}px`;
+    }
+    layer.hidden = false;
+    layer.setAttribute("aria-hidden", "false");
+}
+
+function setPostCompareActive(active) {
+    const canCompare = postProcessSession.getState().canCompare;
+    postCompareActive = !!active && canCompare;
+    const button = document.getElementById("btn-post-compare");
+    const splitWrap = document.getElementById("post-compare-split-wrap");
+    if (button) {
+        button.setAttribute("aria-pressed", String(postCompareActive));
+        button.title = postCompareActive
+            ? tr("wavelets.history.compare_close", "Cerrar comparación A/B")
+            : tr("wavelets.history.compare_open", "Comparar el paso actual con el anterior o con el apilado original");
+    }
+    if (splitWrap) splitWrap.hidden = !postCompareActive;
+    void refreshPostCompareReference();
+    updateZenithGuide();
+}
+
+function finishPendingHistoryCommit(paramsString, preview) {
+    if (!pendingHistoryCommit || pendingHistoryCommit.paramsString !== paramsString) return false;
+    postProcessSession.commit(JSON.parse(paramsString), {
+        label: pendingHistoryCommit.label,
+        preview: preview || ui.imgResult?.src || "",
+    });
+    pendingHistoryCommit = null;
+    updatePostHistoryUi();
+    return true;
+}
+
+function queuePostHistoryCommit(label = "Ajuste") {
+    if (suppressPostprocessEvents || !postProcessSession.current()) return;
+    const recipe = getPipelineParams();
+    const paramsString = JSON.stringify(recipe);
+    pendingHistoryCommit = { paramsString, label };
+    if (paramsString === lastProcessedParams && ui.imgResult?.src) {
+        finishPendingHistoryCommit(paramsString, ui.imgResult.src);
+    }
+}
+
+async function applyPostHistoryEntry(entry) {
+    if (!entry) return;
+    // Invalidate the currently running render before waiting for the stored
+    // preview. Previously a slow deconvolution could finish in this window and
+    // repaint (or even update) the state that the user had just undone.
+    const playbackNonce = ++historyPlaybackNonce;
+    const requestId = ++pipelineRequestId;
+    historyPlaybackRequestId = 0;
+    pendingHistoryCommit = null;
+    clearTimeout(updateTimer);
+    suppressPostprocessEvents = true;
+    try {
+        applyWaveletPreset(entry.recipe, { trigger: false });
+        updateAdcPadFromInputs();
+    } finally {
+        suppressPostprocessEvents = false;
+    }
+    if (entry.preview && ui.imgResult) {
+        const viewport = captureViewportState();
+        await setImageAndWait(ui.imgResult, entry.preview, false);
+        restoreViewportState(viewport);
+    }
+    if (playbackNonce !== historyPlaybackNonce || requestId !== pipelineRequestId) return;
+    updatePostHistoryUi();
+    const paramsString = JSON.stringify(entry.recipe);
+    lastProcessedParams = "";
+    historyPlaybackRequestId = requestId;
+    showLocalProcessing(tr("wavelets.history.restoring", "Restaurando historial…"));
+    showImgLoader();
+    processPipeline(requestId, paramsString);
+}
+
+async function beginNewPostprocessResult(preview, source = "stack") {
+    const nonce = ++postBeginNonce;
+    window.resetPipelineState();
+    postCompareLoadId += 1;
+    postEyedropperActive = false;
+    document.getElementById("btn-post-eyedropper")?.classList.remove("active");
+    document.getElementById("view-result")?.classList.remove("eyedropper-active");
+    const compareSelector = document.getElementById("post-compare-reference");
+    const compareSplit = document.getElementById("post-compare-split");
+    const compareLayer = document.getElementById("post-compare-layer");
+    if (compareSelector) compareSelector.value = "previous";
+    if (compareSplit) compareSplit.value = "50";
+    if (compareLayer) compareLayer.style.clipPath = "inset(0 50% 0 0)";
+    compareLayer?.querySelector(".compare-divider")?.style.setProperty("left", "50%");
+    let generation;
+    try {
+        generation = await invoke("reset_postprocess_state");
+    } catch (error) {
+        generation = Date.now();
+        console.warn("Postprocess backend session unavailable; using local generation.", error);
+    }
+    if (nonce !== postBeginNonce) return currentPostprocessResultId;
+    currentPostprocessResultId = Number(generation) || Date.now();
+    suppressPostprocessEvents = true;
+    try {
+        resetProcessingParams({ updateMemo: false });
+    } finally {
+        suppressPostprocessEvents = false;
+    }
+    const recipe = getPipelineParams();
+    lastProcessedParams = JSON.stringify(recipe);
+    lastArtifactSuggestion = null;
+    lastPostHistogram = null;
+    const artifactSummary = document.getElementById("artifact-analysis-summary");
+    const artifactApply = document.getElementById("btn-apply-artifact-suggestion");
+    if (artifactSummary) artifactSummary.textContent = "Sin análisis todavía.";
+    if (artifactApply) artifactApply.hidden = true;
+    postProcessSession.beginResult({
+        generation: currentPostprocessResultId,
+        source,
+        recipe,
+        preview: preview || ui.imgResult?.src || "",
+        label: source === "mosaic" ? "Mosaico original" : source === "batch" ? "Lote original" : "Apilado original",
+    });
+    setPostCompareActive(false);
+    const compareImage = document.getElementById("img-result-before");
+    if (compareImage) {
+        compareImage.onload = null;
+        compareImage.onerror = null;
+        compareImage.classList.remove("loaded");
+        compareImage.style.removeProperty("width");
+        compareImage.style.removeProperty("height");
+        compareImage.removeAttribute("src");
+    }
+    updatePostHistoryUi();
+    updateAdcPadFromInputs();
+    await refreshPostHistogram(false);
+    const resultFlow = source === "mosaic" ? "mosaic" : source === "batch" ? "batch" : "individual";
+    const resultStep = resultFlow === "mosaic" ? 4 : resultFlow === "batch" ? 3 : 2;
+    const resultTotal = resultFlow === "mosaic" ? 5 : resultFlow === "batch" ? 4 : 3;
+    setAssistantJourney({
+        flow: resultFlow,
+        stage: "postprocess",
+        workflowStep: resultStep,
+        workflowTotal: resultTotal,
+    }, {
+        open: true,
+        announceKey: `${currentPostprocessResultId}:${resultFlow}:postprocess`,
+    });
+    log("INFO", `Nueva sesión de postprocesado 16-bit (${source}); ajustes e historial reiniciados.`);
+    return currentPostprocessResultId;
+}
+window.beginNewPostprocessResult = beginNewPostprocessResult;
+
+function prepareScopeCanvas(canvas, minimumWidth = 280, minimumHeight = 120) {
+    const bounds = canvas.getBoundingClientRect();
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const width = Math.max(minimumWidth, Math.round(bounds.width || canvas.width || 360));
+    const height = Math.max(minimumHeight, Math.round(bounds.height || canvas.height || 150));
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    const context = canvas.getContext("2d");
+    context.setTransform(dpr, 0, 0, dpr, 0, 0);
+    context.clearRect(0, 0, width, height);
+    return { context, width, height };
+}
+
+function drawScopeGrid(context, width, height) {
+    context.fillStyle = "#020617";
+    context.fillRect(0, 0, width, height);
+    context.strokeStyle = "rgba(148,163,184,.1)";
+    context.lineWidth = 1;
+    for (let index = 1; index < 4; index += 1) {
+        const x = index * width / 4;
+        const y = index * height / 4;
+        context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height); context.stroke();
+        context.beginPath(); context.moveTo(0, y); context.lineTo(width, y); context.stroke();
+    }
+}
+
+function drawHistogramCanvas(canvas, histogram) {
+    if (!canvas || !histogram) return;
+    const { context, width, height } = prepareScopeCanvas(canvas);
+    drawScopeGrid(context, width, height);
+
+    const all = histogram.isMono
+        ? [histogram.luminance]
+        : [histogram.red, histogram.green, histogram.blue, histogram.luminance];
+    const maximum = Math.max(1, ...all.flat().map((value) => Math.log1p(Number(value) || 0)));
+    const drawSeries = (values, color, fill = false) => {
+        context.beginPath();
+        values.forEach((count, index) => {
+            const x = index / Math.max(1, values.length - 1) * width;
+            const y = height - (Math.log1p(Number(count) || 0) / maximum) * (height - 5);
+            if (index === 0) context.moveTo(x, y);
+            else context.lineTo(x, y);
+        });
+        if (fill) {
+            context.lineTo(width, height);
+            context.lineTo(0, height);
+            context.closePath();
+            const gradient = context.createLinearGradient(0, 0, 0, height);
+            gradient.addColorStop(0, color.replace("1)", "0.26)"));
+            gradient.addColorStop(1, color.replace("1)", "0.01)"));
+            context.fillStyle = gradient;
+            context.fill();
+        }
+        context.strokeStyle = color;
+        context.lineWidth = fill ? 1.2 : 1;
+        context.stroke();
+    };
+    drawSeries(histogram.luminance, "rgba(226,232,240,1)", true);
+    if (!histogram.isMono) {
+        drawSeries(histogram.red, "rgba(251,113,133,1)");
+        drawSeries(histogram.green, "rgba(74,222,128,1)");
+        drawSeries(histogram.blue, "rgba(96,165,250,1)");
+    }
+
+    const params = getAdvancedPostprocessParams();
+    [params.levelsBlack, params.levelsWhite].forEach((value, index) => {
+        const x = Math.max(0, Math.min(1, value)) * width;
+        context.strokeStyle = index === 0 ? "rgba(34,211,238,.9)" : "rgba(251,191,36,.9)";
+        context.setLineDash([4, 3]);
+        context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height); context.stroke();
+        context.setLineDash([]);
+    });
+}
+
+function drawPostHistogram(histogram) {
+    drawHistogramCanvas(document.getElementById("post-histogram"), histogram);
+    drawHistogramCanvas(document.getElementById("post-histogram-floating"), histogram);
+}
+
+function toneCurveOutput(input, params) {
+    const black = Math.max(0, Math.min(.98, params.levelsBlack));
+    const white = Math.max(black + .005, Math.min(1, params.levelsWhite));
+    let value = Math.max(0, Math.min(1, (input - black) / (white - black)));
+    value = Math.pow(value, 1 / Math.max(.1, params.levelsMid)) * Math.pow(2, params.exposure);
+    const smooth = (a, b, x) => {
+        const t = Math.max(0, Math.min(1, (x - a) / Math.max(1e-6, b - a)));
+        return t * t * (3 - 2 * t);
+    };
+    const shadow = Math.pow(1 - smooth(.05, .62, value), 2);
+    const highlight = Math.pow(smooth(.38, .95, value), 2);
+    const blackWeight = 1 - smooth(0, .28, value);
+    const whiteWeight = smooth(.72, 1, value);
+    value += params.shadows * shadow * .22 + params.highlights * highlight * .22
+        + params.blacks * blackWeight * .12 + params.whites * whiteWeight * .12;
+    return evaluateToneCurve(params.toneCurvePoints, Math.max(0, Math.min(1, value)));
+}
+
+function drawToneCurveCanvas(canvas, params) {
+    if (!canvas) return;
+    const { context, width, height } = prepareScopeCanvas(canvas);
+    drawScopeGrid(context, width, height);
+    context.strokeStyle = "rgba(100,116,139,.55)";
+    context.setLineDash([5, 4]);
+    context.beginPath(); context.moveTo(0, height); context.lineTo(width, 0); context.stroke();
+    context.setLineDash([]);
+    const gradient = context.createLinearGradient(0, 0, width, 0);
+    gradient.addColorStop(0, "#22d3ee"); gradient.addColorStop(.55, "#a78bfa"); gradient.addColorStop(1, "#fbbf24");
+    context.strokeStyle = gradient;
+    context.lineWidth = 2;
+    context.beginPath();
+    for (let index = 0; index <= 160; index += 1) {
+        const input = index / 160;
+        const x = input * width;
+        const y = height - toneCurveOutput(input, params) * height;
+        if (index === 0) context.moveTo(x, y); else context.lineTo(x, y);
+    }
+    context.stroke();
+}
+
+function drawDetailResponseCanvas(canvas, pipeline) {
+    if (!canvas) return;
+    const { context, width, height } = prepareScopeCanvas(canvas, 280, 110);
+    drawScopeGrid(context, width, height);
+    const bands = [...pipeline.w.map((value) => value / 5), ...pipeline.u.map((value) => value / 10)];
+    const texture = Number(pipeline.advanced.texture || 0);
+    const clarity = Number(pipeline.advanced.clarity || 0);
+    const usm = Number(pipeline.usm?.a || 0);
+    const usmRadius = Math.max(.25, Number(pipeline.usm?.r || 1));
+    const highPass = Number(pipeline.crisp || 0);
+    const deconv = Math.log2(1 + Number(pipeline.deconv?.i || 0) + Number(pipeline.deconv?.vi || 0));
+    const localContrast = Number(pipeline.lce || 0) / 100;
+    const active = [];
+    if (deconv > 0) active.push("deconvolución");
+    if (pipeline.w.some((value) => Number(value) !== 0) || pipeline.u.some((value) => Number(value) !== 0)) active.push("wavelets");
+    if (highPass > 0) active.push("high pass");
+    if (usm > 0) active.push(pipeline.adaptiveUsm?.enabled ? "USM adaptativo" : "USM");
+    if (localContrast > 0) active.push("LCE");
+    if (Number(pipeline.masterDenoise || 0) > 0) active.push("denoise");
+    const summary = document.getElementById("detail-response-summary");
+    if (summary) summary.textContent = active.length ? active.slice(0, 3).join(" · ") : "receta neutra";
+
+    context.save();
+    context.setLineDash([4, 4]);
+    context.strokeStyle = "rgba(148,163,184,.35)";
+    context.beginPath();
+    context.moveTo(0, height / 2);
+    context.lineTo(width, height / 2);
+    context.stroke();
+    context.restore();
+    context.strokeStyle = "#34d399";
+    context.fillStyle = "rgba(52,211,153,.16)";
+    context.lineWidth = 2;
+    context.beginPath();
+    for (let index = 0; index <= 160; index += 1) {
+        const frequency = index / 160;
+        let response = 1;
+        bands.forEach((amount, band) => {
+            const center = (band + 1) / (bands.length + 1);
+            const spread = .045 + band * .006;
+            response += amount * Math.exp(-Math.pow(frequency - center, 2) / (2 * spread * spread)) * .18;
+        });
+        response += texture * Math.exp(-Math.pow(frequency - .72, 2) / .035) * .22;
+        response += clarity * Math.exp(-Math.pow(frequency - .32, 2) / .05) * .18;
+        response += deconv * Math.exp(-Math.pow(frequency - .74, 2) / .08) * .06;
+        response += highPass * Math.exp(-Math.pow(frequency - .62, 2) / .035) * .08;
+        response += usm * Math.exp(-Math.pow(frequency - Math.min(.86, .5 + .18 / usmRadius), 2) / .055) * .12;
+        response += localContrast * Math.exp(-Math.pow(frequency - .22, 2) / .08) * .2;
+        response -= Number(pipeline.masterDenoise || 0) / 100 * frequency * .45;
+        const x = frequency * width;
+        const y = height - Math.max(0, Math.min(2, response)) / 2 * height;
+        if (index === 0) context.moveTo(x, y); else context.lineTo(x, y);
+    }
+    context.stroke();
+}
+
+function drawPostprocessScopes() {
+    const advanced = getAdvancedPostprocessParams();
+    drawToneCurveCanvas(document.getElementById("post-tone-curve"), advanced);
+    drawDetailResponseCanvas(document.getElementById("post-detail-curve"), getPipelineParams());
+    if (lastPostHistogram) drawPostHistogram(lastPostHistogram);
+    const paintHealth = (id, label, value, warning) => {
+        const node = document.getElementById(id);
+        if (!node) return;
+        node.textContent = `${label} ${value}`;
+        node.dataset.state = warning ? "warning" : "good";
+    };
+    const shadow = Number(lastPostHistogram?.shadowClip || 0) * 100;
+    const highlight = Number(lastPostHistogram?.highlightClip || 0) * 100;
+    paintHealth("scope-shadow-health", "Sombras", lastPostHistogram ? `${shadow.toFixed(2)}%` : "—", shadow > .01);
+    paintHealth("scope-highlight-health", "Luces", lastPostHistogram ? `${highlight.toFixed(2)}%` : "—", highlight > .01);
+    const render = document.getElementById("scope-render-health");
+    if (render) {
+        render.textContent = previewIsDownscaled
+            ? `Vista rápida 1:${previewDownscaleFactor}`
+            : "Final 1:1 exacta";
+        render.dataset.state = previewIsDownscaled ? "warning" : "good";
+    }
+}
+
+function setPostColorControlsForMono(isMono) {
+    const solarModule = document.getElementById("solar-mono-module");
+    if (solarModule) {
+        solarModule.hidden = !isMono;
+        solarModule.setAttribute("aria-hidden", String(!isMono));
+    }
+    const colorControls = document.querySelectorAll(
+        '.color-module [data-advanced-control], .color-module [data-hsl-index], .color-module [data-grade-amount], .color-module [data-grade-color]'
+    );
+    colorControls.forEach((control) => { control.disabled = !!isMono; });
+    [ui.slSat, ui.numSat, ui.slRBal, ui.numRBal, ui.slBBal, ui.numBBal].forEach((control) => {
+        if (control) control.disabled = !!isMono;
+    });
+    const colorModule = document.querySelector(".color-module");
+    colorModule?.classList.toggle("mono-disabled", !!isMono);
+    colorModule?.setAttribute("aria-disabled", String(!!isMono));
+    const eyedropper = document.getElementById("btn-post-eyedropper");
+    if (eyedropper) eyedropper.disabled = !!isMono;
+    if (isMono && postEyedropperActive) {
+        postEyedropperActive = false;
+        eyedropper?.classList.remove("active");
+        document.getElementById("view-result")?.classList.remove("eyedropper-active");
+    }
+
+    const atmospheric = document.querySelector(".atmospheric-module");
+    atmospheric?.classList.toggle("mono-disabled", !!isMono);
+    atmospheric?.setAttribute("aria-disabled", String(!!isMono));
+    atmospheric?.querySelectorAll("button, input").forEach((control) => {
+        control.disabled = !!isMono;
+    });
+    const adcStatus = document.getElementById("adc-status");
+    if (adcStatus) {
+        if (isMono) {
+            adcStatus.textContent = tr(
+                "assistant.mono.atmospheric_unavailable",
+                "No disponible: el resultado activo es monocromo",
+            );
+            adcStatus.dataset.state = "idle";
+        } else if (adcStatus.dataset.state === "idle") {
+            adcStatus.textContent = tr(
+                "assistant.mono.atmospheric_reference",
+                "G es la referencia · rango ±6 px",
+            );
+            adcStatus.dataset.state = "idle";
+        }
+    }
+    const mode = document.getElementById("sel-sharpen-mode");
+    if (mode) {
+        mode.disabled = !!isMono;
+        if (isMono) mode.value = "luminance";
+    }
+    // Cualquier receta que declare `colorRequired` (las minerales) queda fuera
+    // en mono: atarlo al nombre dejaba fuera del bloqueo a las variantes nuevas.
+    document.querySelectorAll("[data-object-preset]").forEach((button) => {
+        const preset = cloneObjectFinishingPreset(button.dataset.objectPreset);
+        if (!preset?.colorRequired) return;
+        button.disabled = !!isMono;
+        button.title = isMono
+            ? tr(
+                "assistant.mono.mineral_unavailable",
+                "No disponible: una captura mono no contiene diferencias minerales de color.",
+            )
+            : tr(
+                "assistant.mono.mineral_available",
+                "Amplifica diferencias cromáticas reales con una receta interpretativa.",
+            );
+    });
+}
+
+async function refreshPostHistogram(preferProcessed = true) {
+    if (!postProcessSession.current()) return null;
+    const request = ++postHistogramRequestId;
+    try {
+        const histogram = await invoke("postprocess_histogram", { preferProcessed });
+        if (request !== postHistogramRequestId) return null;
+        lastPostHistogram = histogram;
+        solarCurveEditor?.setHistogram(histogram.luminance);
+        toneCurveEditor?.setHistogram(histogram.luminance);
+        drawPostHistogram(histogram);
+        const setText = (id, value) => { const node = document.getElementById(id); if (node) node.textContent = value; };
+        setText("hist-min", histogram.minimum.toLocaleString());
+        setText("hist-median", histogram.median.toLocaleString());
+        setText("hist-max", histogram.maximum.toLocaleString());
+        setText("post-histogram-source", histogram.source === "processed" ? "VISTA PROCESADA · 16-BIT" : "MASTER · 16-BIT");
+        setText("floating-histogram-source", histogram.source === "processed" ? "Procesada 16-bit" : "Máster 16-bit");
+        const clip = document.getElementById("hist-clip-status");
+        const shadowPct = histogram.shadowClip * 100;
+        const highlightPct = histogram.highlightClip * 100;
+        if (clip) {
+            const clipped = shadowPct > 0.01 || highlightPct > 0.01;
+            clip.classList.toggle("has-clipping", clipped);
+            clip.classList.toggle("is-clean", !clipped);
+            clip.textContent = clipped
+                ? `Recorte S ${shadowPct.toFixed(2)}% · L ${highlightPct.toFixed(2)}%`
+                : "Sin recorte relevante";
+        }
+        setPostColorControlsForMono(histogram.isMono);
+        drawPostprocessScopes();
+        updateZenithGuide();
+        return histogram;
+    } catch (error) {
+        const clip = document.getElementById("hist-clip-status");
+        if (clip) clip.textContent = "Histograma no disponible";
+        console.warn("Histogram refresh failed:", error);
+        return null;
+    }
+}
+
+// Métricas del histograma ACTIVO para el asistente. La exposición recomendada
+// combina la necesidad (mediana → lectura útil) con el tope anti-recorte de
+// `computeSafeExposureEv`: nunca recomienda más EV del que la señal brillante
+// real puede absorber sin quemarse. Se usa tanto al pintar tarjetas como al
+// APLICARLAS, siempre releyendo `lastPostHistogram` (nada de instantáneas).
+function assistantHistogramContext() {
+    const histogram = lastPostHistogram;
+    if (!histogram) return {};
+    const medianLevel = Number(histogram.median || 0) / 65535;
+    const percentileLow = Number(histogram.percentileLow ?? histogram.minimum ?? 0) / 65535;
+    const percentileHigh = Number(histogram.percentileHigh ?? histogram.maximum ?? 65535) / 65535;
+    const safeEv = computeSafeExposureEv(histogram.luminance);
+    const neededEv = medianLevel > 0
+        ? Math.log2(0.18 / Math.max(0.002, medianLevel))
+        : 0;
+    return {
+        histogramAvailable: true,
+        isMono: !!histogram.isMono,
+        shadowClip: Number(histogram.shadowClip || 0),
+        highlightClip: Number(histogram.highlightClip || 0),
+        medianLevel,
+        percentileLow,
+        percentileHigh,
+        recommendedExposureEv: Math.max(0, Math.min(1.5, neededEv, safeEv)),
+        dynamicRange: Math.max(0, Number(histogram.maximum || 0) - Number(histogram.minimum || 0)) / 65535,
+        robustDynamicRange: Math.max(0, percentileHigh - percentileLow),
+    };
+}
+
+// Lleva la vista del panel izquierdo hasta un laboratorio con desplazamiento
+// suave y el mismo pulso visual que usa el asistente para revelar controles.
+function revealModulePanel(selector, title) {
+    const element = document.querySelector(selector);
+    if (!element) return;
+    let ancestor = element;
+    while (ancestor) {
+        if (ancestor.tagName === "DETAILS") ancestor.open = true;
+        ancestor = ancestor.parentElement;
+    }
+    requestAnimationFrame(() => {
+        element.scrollIntoView({ behavior: "smooth", block: "start", inline: "nearest" });
+        element.classList.add("assistant-target-pulse");
+        window.setTimeout(() => element.classList.remove("assistant-target-pulse"), 1450);
+    });
+    if (ui.statusText && title) {
+        ui.statusText.textContent = title;
+        ui.statusText.style.color = "#67e8f9";
+    }
+}
+
+function updateModuleShortcutBar() {
+    const bar = document.getElementById("module-shortcut-bar");
+    if (!bar) return;
+    const hasResult = !!postProcessSession.current();
+    bar.style.display = hasResult ? "flex" : "none";
+    const solarButton = document.getElementById("btn-goto-solar-module");
+    // El laboratorio solar sólo opera sobre másters mono; el botón sigue a esa
+    // misma regla para no enviar a un módulo bloqueado.
+    if (solarButton) solarButton.style.display = lastPostHistogram?.isMono === false ? "none" : "";
+}
+
+function updateZenithGuide(extra = {}) {
+    if (!zenithGuide) return;
+    updateModuleShortcutBar();
+    const history = postProcessSession.getState();
+    zenithGuide.update({
+        ...assistantJourney,
+        generation: history.generation || null,
+        hasSource: !!currentFilePath,
+        hasAnalysis: !!currentFileMetadata,
+        hasResult: !!postProcessSession.current(),
+        source: history.source,
+        histogramAvailable: !!lastPostHistogram,
+        isMono: !!lastPostHistogram?.isMono,
+        shadowClip: Number(lastPostHistogram?.shadowClip || 0),
+        highlightClip: Number(lastPostHistogram?.highlightClip || 0),
+        medianLevel: 0,
+        percentileLow: 0,
+        percentileHigh: 1,
+        recommendedExposureEv: 0,
+        dynamicRange: 0,
+        robustDynamicRange: 0,
+        ...assistantHistogramContext(),
+        historyLength: history.length,
+        canCompare: history.canCompare,
+        compareActive: postCompareActive,
+        recipe: postProcessSession.current()?.recipe || null,
+        hasArtifactAnalysis: !!lastArtifactSuggestion,
+        ringingScore: Number(lastArtifactSuggestion?.ringingScore || 0),
+        colorFringeScore: Number(lastArtifactSuggestion?.colorFringeScore || 0),
+        solarActive: !!postProcessSession.current()?.recipe?.advanced?.solar?.enabled,
+        solarFilamentAmount: Number(postProcessSession.current()?.recipe?.advanced?.solar?.filamentAmount || 0),
+        toneCurveActive: !toneCurveIsLinear(getAdvancedPostprocessParams().toneCurvePoints),
+        targetCategory: getSelectedTargetCategory(),
+        helpTarget: null,
+        helpTitle: "",
+        helpMessage: "",
+        ...extra,
+    });
+    paintAssistantPrimaryAction();
+}
+
+function setAdvancedControlValue(name, value) {
+    const control = document.querySelector(`[data-advanced-control="${name}"]`);
+    if (!control) return;
+    const scale = parseFloat(control.dataset.scale || "1") || 1;
+    control.value = String(value * scale);
+    updateAdvancedControlOutput(control);
+}
+
+function applyTonePreset(name) {
+    const neutral = {
+        levelsBlack: 0,
+        levelsMid: 1,
+        levelsWhite: 1,
+        exposure: 0,
+        shadows: 0,
+        highlights: 0,
+        whites: 0,
+        blacks: 0,
+    };
+    const presets = {
+        linear: {
+            controls: neutral,
+            points: [[0, 0], [1, 1]],
+            label: "Lineal",
+        },
+        "soft-contrast": {
+            controls: neutral,
+            points: [[0, 0], [.18, .12], [.5, .51], [.82, .9], [1, 1]],
+            label: "Contraste suave",
+        },
+        "shadow-recovery": {
+            controls: neutral,
+            points: [[0, 0], [.12, .2], [.38, .48], [.72, .78], [1, 1]],
+            label: "Recuperar sombras",
+        },
+        "highlight-recovery": {
+            controls: neutral,
+            points: [[0, 0], [.28, .25], [.62, .56], [.88, .78], [1, 1]],
+            label: "Proteger luces",
+        },
+    };
+    const preset = presets[name];
+    if (!preset) return;
+    suppressPostprocessEvents = true;
+    try {
+        Object.entries(preset.controls).forEach(([control, value]) => setAdvancedControlValue(control, value));
+        toneCurveEditor?.setPoints(preset.points);
+        markTonePreset(name);
+        updateLevelMarkers();
+    } finally {
+        suppressPostprocessEvents = false;
+    }
+    drawPostprocessScopes();
+    triggerUpdate({ forceFastPreview: true });
+    queuePostHistoryCommit(`Curva tonal · ${preset.label}`);
+}
+
+function setLinkedControlValue(id, value, scale = 1) {
+    const slider = document.getElementById(`sl-${id}`);
+    const number = document.getElementById(`num-${id}`);
+    if (slider) slider.value = String(value * scale);
+    if (number) number.value = String(value);
+}
+
+function updateDeconvolutionStatus() {
+    const status = document.getElementById("deconv-module-status");
+    if (!status) return;
+    const rlIterations = parseInt(document.getElementById("num-deconv-iter")?.value || "0", 10);
+    const vcIterations = parseInt(document.getElementById("num-vc-iter")?.value || "0", 10);
+    const rlSigma = parseFloat(document.getElementById("num-deconv-sigma")?.value || "0");
+    const vcSigma = parseFloat(document.getElementById("num-vc-sigma")?.value || "0");
+    if (rlIterations <= 0 && vcIterations <= 0) {
+        status.textContent = tr("wavelets.deconvolution.status_off", "Desactivada · el máster permanece intacto");
+        status.dataset.state = "idle";
+        return;
+    }
+    if ((rlIterations > 0 && rlSigma <= 0) || (vcIterations > 0 && vcSigma <= 0)) {
+        status.textContent = tr("wavelets.deconvolution.status_invalid_psf", "Revisa el radio PSF: debe ser mayor que cero cuando hay iteraciones.");
+        status.dataset.state = "warning";
+        return;
+    }
+    const modes = [];
+    if (rlIterations > 0) modes.push(`RL ${rlIterations}× · σ ${rlSigma.toFixed(1)}`);
+    if (vcIterations > 0) modes.push(`VC ${vcIterations}× · σ ${vcSigma.toFixed(1)}`);
+    const engine = getGpuMode() === "cpu"
+        ? tr("wavelets.deconvolution.engine_cpu", "CPU")
+        : tr("wavelets.deconvolution.engine_gpu", "GPU con prueba de paridad y respaldo CPU");
+    status.textContent = trFormat(
+        "wavelets.deconvolution.status_active",
+        { modes: modes.join(" + "), engine },
+        `${modes.join(" + ")} · ${engine} · final 1:1 · valida con A/B`,
+    );
+    status.dataset.state = "active";
+}
+
+function applyDeconvolutionPreset(name) {
+    const presets = {
+        gentle: { label: tr("wavelets.deconvolution.presets.gentle", "Suave"), rlSigma: 1.35, rlIterations: 8, vcSigma: 0, vcIterations: 0, edge: 32, mask: 38, psf: false },
+        balanced: { label: tr("wavelets.deconvolution.presets.balanced", "Equilibrada"), rlSigma: 1.2, rlIterations: 11, vcSigma: 0, vcIterations: 0, edge: 52, mask: 52, psf: false },
+        detail: { label: tr("wavelets.deconvolution.presets.detail", "Detalle fino"), rlSigma: 1.0, rlIterations: 14, vcSigma: .75, vcIterations: 2, edge: 68, mask: 66, psf: false },
+        solar: { label: tr("wavelets.deconvolution.presets.solar", "Solar H-alpha"), rlSigma: 1.0, rlIterations: 14, vcSigma: .75, vcIterations: 2, edge: 74, mask: 70, psf: true },
+        "solar-limb": { label: tr("wavelets.deconvolution.presets.solar_limb", "Limbo solar"), rlSigma: 1.2, rlIterations: 10, vcSigma: 0, vcIterations: 0, edge: 86, mask: 78, psf: true },
+    };
+    const preset = presets[name];
+    if (!preset) return;
+    suppressPostprocessEvents = true;
+    try {
+        setLinkedControlValue("deconv-sigma", preset.rlSigma, 10);
+        setLinkedControlValue("deconv-iter", preset.rlIterations, 1);
+        setLinkedControlValue("vc-sigma", preset.vcSigma, 10);
+        setLinkedControlValue("vc-iter", preset.vcIterations, 1);
+        setLinkedControlValue("edge-strength", preset.edge, 1);
+        setLinkedControlValue("auto-mask", preset.mask, 1);
+        const edgeAware = document.getElementById("chk-edge-wavelets");
+        if (edgeAware) edgeAware.checked = true;
+        const measuredPsf = document.getElementById("chk-psf-limb");
+        if (measuredPsf) measuredPsf.checked = preset.psf;
+    } finally {
+        suppressPostprocessEvents = false;
+    }
+    updateDeconvolutionStatus();
+    const status = document.getElementById("deconv-module-status");
+    if (status) {
+        status.textContent = trFormat(
+            "wavelets.deconvolution.status_processing",
+            { label: preset.label },
+            `${preset.label} · calculando vista rápida y resultado 1:1…`,
+        );
+        status.dataset.state = "processing";
+    }
+    drawPostprocessScopes();
+    triggerUpdate({ forceFastPreview: true });
+    queuePostHistoryCommit(`Deconvolución · ${preset.label}`);
+}
+
+function markObjectFinishingSelection(name = "") {
+    document.querySelectorAll("[data-object-preset]").forEach((button) => {
+        const active = button.dataset.objectPreset === name;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-pressed", String(active));
+    });
+    const original = document.getElementById("btn-object-original");
+    const originalActive = name === "original";
+    original?.classList.toggle("is-active", originalActive);
+    original?.setAttribute("aria-pressed", String(originalActive));
+}
+
+function restoreObjectPresetButtons(isMono = !!lastPostHistogram?.isMono) {
+    document.querySelectorAll("[data-object-preset], #btn-object-original").forEach((button) => {
+        button.disabled = !!isMono
+            && !!cloneObjectFinishingPreset(button.dataset.objectPreset)?.colorRequired;
+        button.classList.remove("is-analyzing");
+    });
+}
+
+function localizedObjectPresetLabel(name, fallback = "") {
+    const keys = {
+        "lunar-relief": "lunar_relief",
+        "lunar-phase": "lunar_phase",
+        "lunar-mineral": "lunar_mineral",
+        "lunar-mineral-intense": "lunar_mineral_intense",
+        "jupiter-natural": "jupiter_natural",
+        "saturn-rings": "saturn_rings",
+        "mars-detail": "mars_detail",
+        "planet-cinematic": "planet_cinematic",
+    };
+    return tr(`wavelets.object_lab.presets.${keys[name] || name}`, fallback || name);
+}
+
+function renderObjectFinishingStatus() {
+    const status = document.getElementById("object-finishing-status");
+    if (!status) return;
+    if (!activeObjectFinishingState) {
+        status.textContent = tr("wavelets.object_lab.status_idle", "Elige una receta para ver qué módulos activa.");
+        status.dataset.state = "idle";
+        return;
+    }
+    if (activeObjectFinishingState.name === "original") {
+        status.textContent = tr(
+            "wavelets.object_lab.status_original",
+            "Original apilado · receta neutra · puedes deshacer para recuperar el ajuste anterior.",
+        );
+        status.dataset.state = "idle";
+        return;
+    }
+    const { preset } = activeObjectFinishingState;
+    const localizedLabel = localizedObjectPresetLabel(activeObjectFinishingState.name, preset.label);
+    const intent = preset.intent === "creative"
+        ? tr("wavelets.object_lab.intent_creative_long", "Creativo e interpretativo")
+        : tr("wavelets.object_lab.intent_scientific_long", "Conservador y natural");
+    status.textContent = trFormat(
+        "wavelets.adaptive.object_applied",
+        {
+            label: localizedLabel,
+            intent,
+            protections: adaptiveProtectionSummary(preset.adaptation),
+        },
+        `${localizedLabel} · ${intent} · adaptado al máster · protege ${adaptiveProtectionSummary(preset.adaptation)}`,
+    );
+    status.dataset.state = "active";
+}
+
+async function applyObjectFinishingPreset(name) {
+    const basePreset = cloneObjectFinishingPreset(name);
+    const status = document.getElementById("object-finishing-status");
+    const applicability = objectPresetApplicable(basePreset, { isMono: !!lastPostHistogram?.isMono });
+    if (!applicability.applicable) {
+        if (status) {
+            status.textContent = tr(
+                "wavelets.object_lab.mono_color_unavailable",
+                applicability.reason,
+            );
+            status.dataset.state = "warning";
+        }
+        document.getElementById("object-finishing-module")?.classList.add("assistant-target-pulse");
+        window.setTimeout(() => document.getElementById("object-finishing-module")?.classList.remove("assistant-target-pulse"), 1450);
+        return;
+    }
+
+    const token = ++objectAdaptiveRequestId;
+    let measuredMono = !!lastPostHistogram?.isMono;
+    const previousPipeline = getPipelineParams();
+    const previousObjectState = activeObjectFinishingState;
+    let mutationStarted = false;
+    if (status) {
+        status.textContent = tr("wavelets.adaptive.measuring", "Midiendo máster 16-bit, ruido y halos…");
+        status.dataset.state = "processing";
+    }
+    document.querySelectorAll("[data-object-preset], #btn-object-original").forEach((button) => {
+        button.disabled = true;
+        button.classList.toggle("is-analyzing", button.dataset.objectPreset === name);
+    });
+    try {
+        const measurement = await measureAdaptiveRecipeInput();
+        if (token !== objectAdaptiveRequestId) return;
+        const preset = adaptObjectFinishingPreset(name, measurement);
+        measuredMono = !!preset?.adaptation?.isMono;
+        preset.label = localizedObjectPresetLabel(name, preset.label);
+        const measuredApplicability = objectPresetApplicable(preset, { isMono: measuredMono });
+        if (!measuredApplicability.applicable) {
+            if (status) {
+                status.textContent = tr(
+                    "wavelets.object_lab.mono_color_unavailable",
+                    measuredApplicability.reason,
+                );
+                status.dataset.state = "warning";
+            }
+            return;
+        }
+        suppressPostprocessEvents = true;
+        try {
+            mutationStarted = true;
+            resetProcessingParams({ updateMemo: false });
+            const neutral = getPipelineParams();
+            const recipe = preset.pipeline || {};
+            applyWaveletPreset({
+                ...neutral,
+                ...recipe,
+                deconv: { ...neutral.deconv, ...(recipe.deconv || {}) },
+                advanced: { ...neutral.advanced, ...(recipe.advanced || {}) },
+            }, { trigger: false });
+        } finally {
+            suppressPostprocessEvents = false;
+        }
+        activeObjectFinishingState = { name, preset };
+        markObjectFinishingSelection(name);
+        renderObjectFinishingStatus();
+        updateDeconvolutionStatus();
+        drawPostprocessScopes();
+        triggerUpdate({ forceFastPreview: true });
+        queuePostHistoryCommit(trFormat(
+            "wavelets.object_lab.history_preset",
+            {
+                label: preset.label,
+                intent: preset.intent === "creative"
+                    ? tr("wavelets.object_lab.intent_recipe_creative", "creativa")
+                    : tr("wavelets.object_lab.intent_recipe_natural", "natural"),
+            },
+            `${preset.label} · receta ${preset.intent === "creative" ? "creativa" : "natural"}`,
+        ));
+        updateZenithGuide();
+    } catch (error) {
+        console.error("No se pudo aplicar la receta adaptativa de Luna/Planetas:", error);
+        if (mutationStarted) {
+            suppressPostprocessEvents = true;
+            try {
+                applyWaveletPreset(previousPipeline, { trigger: false });
+                activeObjectFinishingState = previousObjectState;
+                markObjectFinishingSelection(previousObjectState?.name || "");
+                renderObjectFinishingStatus();
+                updateDeconvolutionStatus();
+                drawPostprocessScopes();
+                triggerUpdate({ forceFastPreview: true });
+            } catch (rollbackError) {
+                console.error("No se pudo restaurar la receta anterior:", rollbackError);
+            } finally {
+                suppressPostprocessEvents = false;
+            }
+        }
+        if (token === objectAdaptiveRequestId && status) {
+            status.textContent = tr(
+                "wavelets.adaptive.error",
+                "No se pudo medir la señal; no se aplicaron cambios.",
+            );
+            status.dataset.state = "warning";
+        }
+    } finally {
+        suppressPostprocessEvents = false;
+        if (token === objectAdaptiveRequestId) restoreObjectPresetButtons(measuredMono);
+    }
+}
+
+function applyObjectFinishingOriginal() {
+    ++objectAdaptiveRequestId;
+    suppressPostprocessEvents = true;
+    try {
+        resetProcessingParams({ updateMemo: false });
+    } finally {
+        suppressPostprocessEvents = false;
+    }
+    activeObjectFinishingState = { name: "original", preset: null };
+    markObjectFinishingSelection("original");
+    renderObjectFinishingStatus();
+    restoreObjectPresetButtons();
+    drawPostprocessScopes();
+    triggerUpdate({ forceFastPreview: true });
+    queuePostHistoryCommit(tr("wavelets.object_lab.history_original", "Original apilado · receta neutra"));
+    updateZenithGuide();
+}
+
+function initObjectFinishingUi() {
+    document.querySelectorAll("[data-object-preset]").forEach((button) => {
+        button.addEventListener("click", () => applyObjectFinishingPreset(button.dataset.objectPreset));
+    });
+    document.getElementById("btn-object-original")?.addEventListener("click", applyObjectFinishingOriginal);
+}
+
+function setPostScopesOpen(open) {
+    const panel = document.getElementById("post-scopes-panel");
+    const button = document.getElementById("btn-toggle-post-scopes");
+    panel?.classList.toggle("open", !!open);
+    panel?.setAttribute("aria-hidden", String(!open));
+    button?.setAttribute("aria-pressed", String(!!open));
+    if (button) {
+        const label = button.querySelector("span");
+        if (label) label.textContent = open ? "Ocultar" : "Gráficas";
+        button.title = open ? "Ocultar gráficas flotantes" : "Mostrar gráficas flotantes";
+        button.setAttribute("aria-label", button.title);
+    }
+    if (open) requestAnimationFrame(drawPostprocessScopes);
+}
+
+function initPostScopesUi() {
+    const panel = document.getElementById("post-scopes-panel");
+    const handle = document.getElementById("post-scopes-drag-handle");
+    document.getElementById("btn-toggle-post-scopes")?.addEventListener("click", () => setPostScopesOpen(!panel?.classList.contains("open")));
+    document.getElementById("btn-close-post-scopes")?.addEventListener("click", () => setPostScopesOpen(false));
+    if (!panel || !handle) return;
+    let drag = null;
+    handle.addEventListener("pointerdown", (event) => {
+        if (event.target.closest("button")) return;
+        const rect = panel.getBoundingClientRect();
+        drag = { pointerId: event.pointerId, dx: event.clientX - rect.left, dy: event.clientY - rect.top };
+        panel.style.left = `${rect.left}px`;
+        panel.style.top = `${rect.top}px`;
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+        handle.setPointerCapture(event.pointerId);
+        panel.classList.add("dragging");
+    });
+    handle.addEventListener("pointermove", (event) => {
+        if (!drag || event.pointerId !== drag.pointerId) return;
+        const rect = panel.getBoundingClientRect();
+        const left = Math.max(8, Math.min(window.innerWidth - rect.width - 8, event.clientX - drag.dx));
+        const top = Math.max(8, Math.min(window.innerHeight - rect.height - 44, event.clientY - drag.dy));
+        panel.style.left = `${left}px`;
+        panel.style.top = `${top}px`;
+    });
+    const stop = (event) => {
+        if (!drag || event.pointerId !== drag.pointerId) return;
+        drag = null;
+        panel.classList.remove("dragging");
+    };
+    handle.addEventListener("pointerup", stop);
+    handle.addEventListener("pointercancel", stop);
+    window.addEventListener("resize", () => {
+        if (!panel.classList.contains("open")) return;
+        const rect = panel.getBoundingClientRect();
+        if (rect.right > window.innerWidth) panel.style.left = `${Math.max(8, window.innerWidth - rect.width - 8)}px`;
+        if (rect.bottom > window.innerHeight - 36) panel.style.top = `${Math.max(8, window.innerHeight - rect.height - 44)}px`;
+        drawPostprocessScopes();
+    });
+}
+
+function initAdvancedPostprocessControls() {
+    const advancedControls = document.querySelectorAll(
+        "[data-advanced-control], [data-hsl-index], [data-grade-amount], [data-grade-color]"
+    );
+    advancedControls.forEach((control) => {
+        updateAdvancedControlOutput(control);
+        const eventName = control.type === "color" ? "input" : "input";
+        control.addEventListener(eventName, () => {
+            if (control.dataset.advancedControl?.startsWith("levels")) {
+                constrainLevelControls(control);
+                updateLevelMarkers();
+            }
+            updateAdvancedControlOutput(control);
+            drawPostprocessScopes();
+            if (!suppressPostprocessEvents) triggerUpdate();
+        });
+        control.addEventListener("change", () => {
+            if (!suppressPostprocessEvents) queuePostHistoryCommit(postAdjustmentLabel(control));
+        });
+        if (control.type === "range") {
+            control.addEventListener("dblclick", () => {
+                control.value = control.dataset.default ?? "0";
+                updateAdvancedControlOutput(control);
+                if (control.dataset.advancedControl?.startsWith("levels")) updateLevelMarkers();
+                triggerUpdate();
+                queuePostHistoryCommit(postAdjustmentLabel(control));
+            });
+        }
+    });
+    updateLevelMarkers();
+
+    const panel = document.getElementById("panel-wavelets");
+    panel?.addEventListener("change", (event) => {
+        if (suppressPostprocessEvents || event.target.matches("[data-advanced-control], [data-hsl-index], [data-grade-amount], [data-grade-color]")) return;
+        if (event.target.matches("input, select")) queuePostHistoryCommit(postAdjustmentLabel(event.target));
+    });
+
+    document.getElementById("btn-refresh-histogram")?.addEventListener("click", () => refreshPostHistogram(true));
+    document.querySelectorAll("[data-tone-preset]").forEach((button) => button.addEventListener("click", () => applyTonePreset(button.dataset.tonePreset)));
+    document.querySelectorAll("[data-deconv-preset]").forEach((button) => button.addEventListener("click", () => applyDeconvolutionPreset(button.dataset.deconvPreset)));
+    initObjectFinishingUi();
+    ["sl-deconv-sigma", "num-deconv-sigma", "sl-deconv-iter", "num-deconv-iter", "sl-vc-sigma", "num-vc-sigma", "sl-vc-iter", "num-vc-iter"]
+        .forEach((id) => document.getElementById(id)?.addEventListener("input", updateDeconvolutionStatus));
+    document.getElementById("btn-post-undo")?.addEventListener("click", () => applyPostHistoryEntry(postProcessSession.undo()));
+    document.getElementById("btn-post-redo")?.addEventListener("click", () => applyPostHistoryEntry(postProcessSession.redo()));
+    document.getElementById("btn-post-compare")?.addEventListener("click", () => setPostCompareActive(!postCompareActive));
+    document.getElementById("post-compare-reference")?.addEventListener("change", refreshPostCompareReference);
+    document.getElementById("post-compare-split")?.addEventListener("input", (event) => {
+        const split = Math.max(0, Math.min(100, parseFloat(event.target.value) || 0));
+        const layer = document.getElementById("post-compare-layer");
+        const divider = layer?.querySelector(".compare-divider");
+        if (layer) layer.style.clipPath = `inset(0 ${100 - split}% 0 0)`;
+        if (divider) divider.style.left = `${split}%`;
+    });
+}
+
+initToneCurveUi();
+initSolarMonoUi();
+initAdvancedPostprocessControls();
+initPostScopesUi();
+
+function clampRgbShift(value) {
+    return Math.max(-6, Math.min(6, Number(value) || 0));
+}
+
+function updateAdcPadFromInputs() {
+    const values = {
+        r: { x: clampRgbShift(ui.rx?.value), y: clampRgbShift(ui.ry?.value) },
+        b: { x: clampRgbShift(ui.bx?.value), y: clampRgbShift(ui.by?.value) },
+    };
+    Object.entries(values).forEach(([channel, shift]) => {
+        const node = document.getElementById(`adc-node-${channel}`);
+        if (!node) return;
+        node.style.left = `${50 + (shift.x / 6) * 42}%`;
+        node.style.top = `${50 + (shift.y / 6) * 42}%`;
+        const bothCentered = Math.abs(shift.x) < 0.001 && Math.abs(shift.y) < 0.001;
+        node.style.transform = bothCentered
+            ? `translate(${channel === "r" ? -6 : 6}px, ${channel === "r" ? -4 : 4}px)`
+            : "none";
+    });
+}
+
+function setRgbShiftValues(channel, x, y, { process = true, commit = false, label = "Alineación RGB" } = {}) {
+    const xInput = channel === "r" ? ui.rx : ui.bx;
+    const yInput = channel === "r" ? ui.ry : ui.by;
+    if (!xInput || !yInput) return;
+    xInput.value = clampRgbShift(x).toFixed(2);
+    yInput.value = clampRgbShift(y).toFixed(2);
+    updateAdcPadFromInputs();
+    if (process && !suppressPostprocessEvents) triggerUpdate({ forceFastPreview: true });
+    if (commit && !suppressPostprocessEvents) queuePostHistoryCommit(label);
+}
+
+function initAtmosphericCorrectionUi() {
+    updateAdcPadFromInputs();
+    [ui.rx, ui.ry, ui.bx, ui.by].forEach((input) => {
+        input?.addEventListener("input", updateAdcPadFromInputs);
+        input?.addEventListener("change", () => queuePostHistoryCommit("Corrección atmosférica"));
+    });
+
+    let drag = null;
+    const moveNode = (event) => {
+        if (!drag) return;
+        const pad = document.getElementById("adc-pad");
+        const bounds = pad?.getBoundingClientRect();
+        if (!bounds?.width || !bounds?.height) return;
+        const normalizedX = (event.clientX - bounds.left) / bounds.width;
+        const normalizedY = (event.clientY - bounds.top) / bounds.height;
+        const x = ((normalizedX - 0.5) / 0.42) * 6;
+        const y = ((normalizedY - 0.5) / 0.42) * 6;
+        setRgbShiftValues(drag, x, y, { process: true });
+    };
+    ["r", "b"].forEach((channel) => {
+        const node = document.getElementById(`adc-node-${channel}`);
+        node?.addEventListener("pointerdown", (event) => {
+            event.preventDefault();
+            drag = channel;
+            node.setPointerCapture?.(event.pointerId);
+            moveNode(event);
+        });
+        node?.addEventListener("keydown", (event) => {
+            const delta = event.shiftKey ? 0.05 : 0.2;
+            let x = channel === "r" ? clampRgbShift(ui.rx?.value) : clampRgbShift(ui.bx?.value);
+            let y = channel === "r" ? clampRgbShift(ui.ry?.value) : clampRgbShift(ui.by?.value);
+            if (event.key === "ArrowLeft") x -= delta;
+            else if (event.key === "ArrowRight") x += delta;
+            else if (event.key === "ArrowUp") y -= delta;
+            else if (event.key === "ArrowDown") y += delta;
+            else return;
+            event.preventDefault();
+            setRgbShiftValues(channel, x, y, { process: true, commit: true });
+        });
+    });
+    window.addEventListener("pointermove", moveNode);
+    window.addEventListener("pointerup", () => {
+        if (!drag) return;
+        drag = null;
+        queuePostHistoryCommit("Corrección atmosférica visual");
+    });
+
+    document.getElementById("btn-reset-rgb-align")?.addEventListener("click", () => {
+        suppressPostprocessEvents = true;
+        setRgbShiftValues("r", 0, 0, { process: false });
+        setRgbShiftValues("b", 0, 0, { process: false });
+        suppressPostprocessEvents = false;
+        triggerUpdate();
+        queuePostHistoryCommit("Centrar canales RGB");
+        const status = document.getElementById("adc-status");
+        if (status) status.textContent = "Canales centrados · G es la referencia";
+    });
+
+    document.getElementById("btn-auto-rgb-align")?.addEventListener("click", async () => {
+        const button = document.getElementById("btn-auto-rgb-align");
+        const status = document.getElementById("adc-status");
+        if (button) button.disabled = true;
+        if (status) status.textContent = "Midiendo estructura RGB en el master 16-bit...";
+        try {
+            const estimate = await invoke("estimate_postprocess_rgb_alignment");
+            if (!estimate.applicable) {
+                if (status) status.textContent = estimate.reason;
+                return;
+            }
+            suppressPostprocessEvents = true;
+            setRgbShiftValues("r", estimate.redX, estimate.redY, { process: false });
+            setRgbShiftValues("b", estimate.blueX, estimate.blueY, { process: false });
+            suppressPostprocessEvents = false;
+            triggerUpdate();
+            queuePostHistoryCommit("Alineación RGB automática");
+            if (status) {
+                status.textContent = `R ${estimate.redX.toFixed(2)}, ${estimate.redY.toFixed(2)} · B ${estimate.blueX.toFixed(2)}, ${estimate.blueY.toFixed(2)} · confianza ${Math.round(estimate.confidence * 100)}%`;
+            }
+        } catch (error) {
+            if (status) status.textContent = `No fue posible medir: ${normalizeBackendText(error)}`;
+            log("ERROR", `Alineación RGB: ${error}`);
+        } finally {
+            if (button) button.disabled = false;
+        }
+    });
+}
+
+function initPostEyedropper() {
+    const button = document.getElementById("btn-post-eyedropper");
+    button?.addEventListener("click", () => {
+        postEyedropperActive = !postEyedropperActive;
+        button.classList.toggle("active", postEyedropperActive);
+        button.setAttribute("aria-pressed", String(postEyedropperActive));
+        document.getElementById("view-result")?.classList.toggle("eyedropper-active", postEyedropperActive);
+        const sample = document.getElementById("post-eyedropper-sample");
+        if (sample && postEyedropperActive) sample.textContent = "Haz clic en un punto que deba ser neutro";
+    });
+
+    document.getElementById("view-result")?.addEventListener("click", async (event) => {
+        if (!postEyedropperActive || event.target.closest?.(".view-label")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const image = ui.imgResult;
+        const bounds = image?.getBoundingClientRect();
+        if (!image?.naturalWidth || !bounds?.width || !bounds?.height) return;
+        const x = Math.max(0, Math.min(image.naturalWidth - 1, Math.floor((event.clientX - bounds.left) / bounds.width * image.naturalWidth)));
+        const y = Math.max(0, Math.min(image.naturalHeight - 1, Math.floor((event.clientY - bounds.top) / bounds.height * image.naturalHeight)));
+        try {
+            const pixel = await invoke("sample_postprocess_pixel", { x, y, preferProcessed: true });
+            const sample = document.getElementById("post-eyedropper-sample");
+            if (sample) sample.textContent = `(${pixel.x}, ${pixel.y}) · R ${pixel.red} · G ${pixel.green} · B ${pixel.blue}`;
+            const swatch = document.getElementById("post-eyedropper-swatch");
+            if (swatch) swatch.style.background = `rgb(${Math.round(pixel.redNormalized * 255)}, ${Math.round(pixel.greenNormalized * 255)}, ${Math.round(pixel.blueNormalized * 255)})`;
+            if (!pixel.isMono) {
+                const average = (pixel.redNormalized + pixel.greenNormalized + pixel.blueNormalized) / 3 || 1;
+                const temperature = Math.max(-1, Math.min(1, (pixel.blueNormalized - pixel.redNormalized) / average * 0.55));
+                const tint = Math.max(-1, Math.min(1, (pixel.greenNormalized - (pixel.redNormalized + pixel.blueNormalized) * 0.5) / average * 0.7));
+                const tempControl = document.querySelector('[data-advanced-control="temperature"]');
+                const tintControl = document.querySelector('[data-advanced-control="tint"]');
+                if (tempControl && tintControl) {
+                    tempControl.value = String(temperature * 100);
+                    tintControl.value = String(tint * 100);
+                    updateAdvancedControlOutput(tempControl);
+                    updateAdvancedControlOutput(tintControl);
+                    triggerUpdate();
+                    queuePostHistoryCommit("Balance con cuentagotas");
+                }
+            }
+        } catch (error) {
+            log("ERROR", `Cuentagotas: ${error}`);
+        } finally {
+            postEyedropperActive = false;
+            button?.classList.remove("active");
+            button?.setAttribute("aria-pressed", "false");
+            document.getElementById("view-result")?.classList.remove("eyedropper-active");
+        }
+    }, true);
+}
+
+function setLinkedNumber(id, value) {
+    const input = document.getElementById(`num-${id}`);
+    if (!input) return;
+    input.value = String(value);
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+async function analyzeActivePostprocessArtifacts() {
+    const repairButton = document.getElementById("btn-analyze-artifacts");
+    const assistantButton = document.getElementById("btn-assistant-analyze");
+    const summary = document.getElementById("artifact-analysis-summary");
+    [repairButton, assistantButton].forEach((button) => { if (button) button.disabled = true; });
+    if (summary) summary.textContent = tr(
+        "assistant.artifacts.analyzing",
+        "Analizando señal, vecindades y canales...",
+    );
+    try {
+        await refreshPostHistogram(true);
+        const analysis = await invoke("analyze_postprocess_artifacts", { preferProcessed: true });
+        lastArtifactSuggestion = analysis;
+        if (summary) {
+            summary.replaceChildren();
+            const heading = document.createElement("strong");
+            const summaryKey = analysis.ringingScore > 8
+                ? "ringing"
+                : analysis.hotPixels + analysis.deadPixels > analysis.sampledPixels / 500
+                    ? "defects"
+                    : "clear";
+            heading.textContent = tr(
+                `assistant.artifacts.summary_${summaryKey}`,
+                analysis.summary,
+            );
+            const metrics = document.createElement("span");
+            metrics.textContent = trFormat(
+                "assistant.artifacts.metrics",
+                {
+                    ringing: analysis.ringingScore.toFixed(2),
+                    fringe: analysis.colorFringeScore.toFixed(2),
+                    hot: analysis.hotPixels,
+                    dead: analysis.deadPixels,
+                    sample: analysis.sampledPixels.toLocaleString(),
+                },
+                `Halos ${analysis.ringingScore.toFixed(2)} · fringing ${analysis.colorFringeScore.toFixed(2)} · calientes ${analysis.hotPixels} · muertos ${analysis.deadPixels} · muestra ${analysis.sampledPixels.toLocaleString()}`,
+            );
+            summary.append(heading, document.createElement("br"), metrics);
+        }
+        const apply = document.getElementById("btn-apply-artifact-suggestion");
+        if (apply) apply.hidden = false;
+        updateZenithGuide();
+        return analysis;
+    } catch (error) {
+        if (summary) {
+            summary.textContent = trFormat(
+                "assistant.artifacts.unavailable",
+                { error: normalizeBackendText(error) },
+                `Análisis no disponible: ${normalizeBackendText(error)}`,
+            );
+        }
+        log("ERROR", `Artefactos: ${error}`);
+        return null;
+    } finally {
+        [repairButton, assistantButton].forEach((button) => { if (button) button.disabled = false; });
+    }
+}
+
+function initArtifactRepairUi() {
+    document.getElementById("btn-analyze-artifacts")?.addEventListener("click", analyzeActivePostprocessArtifacts);
+
+    document.getElementById("btn-apply-artifact-suggestion")?.addEventListener("click", async () => {
+        if (!lastArtifactSuggestion) return;
+        const confirmed = await showCustomChoice(
+            tr("assistant.artifacts.apply_title", "Aplicar corrección sugerida"),
+            tr(
+                "assistant.artifacts.apply_body",
+                "La corrección medida se aplicará de forma reversible y podrás compararla con A/B.",
+            ),
+            tr("assistant.artifacts.apply", "Aplicar"),
+            tr("general.cancel", "Cancelar"),
+        );
+        if (!confirmed) return;
+        suppressPostprocessEvents = true;
+        try {
+            if (ui.selDrMode) {
+                ui.selDrMode.value = String(lastArtifactSuggestion.suggestedDeringingMode);
+                ui.selDrMode.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            setLinkedNumber("dr-rad", lastArtifactSuggestion.suggestedDeringingRadius.toFixed(2));
+            setLinkedNumber("dr-dark", lastArtifactSuggestion.suggestedDeringingDark.toFixed(2));
+            setLinkedNumber("dr-light", lastArtifactSuggestion.suggestedDeringingLight.toFixed(2));
+            if (lastArtifactSuggestion.suggestedDenoise > 0.1) {
+                setLinkedNumber("master-denoise", lastArtifactSuggestion.suggestedDenoise.toFixed(1));
+            }
+        } finally {
+            suppressPostprocessEvents = false;
+        }
+        triggerUpdate();
+        queuePostHistoryCommit(tr(
+            "assistant.artifacts.history",
+            "Corrección inteligente de artefactos",
+        ));
+    });
+}
+
+function paintAssistantPrimaryAction() {
+    const button = document.getElementById("btn-assistant-analyze");
+    const label = document.getElementById("assistant-primary-label");
+    if (!button || !label) return;
+    const context = zenithGuide?.context || {};
+    if (context.hasResult) {
+        label.textContent = tr("assistant.primary.diagnose", "Diagnosticar resultado activo");
+        button.dataset.action = "diagnose";
+        return;
+    }
+    const key = `${context.flow || "individual"}:${context.stage || "empty"}`;
+    const actions = {
+        "individual:empty": ["load", "Elegir un video", "load"],
+        "individual:analyze": ["analyze", "Analizar video ahora", "analyze"],
+        "individual:stack": ["stack", "Continuar al apilado", "stack"],
+        "batch:scan": ["batch_scan", "Definir alcance del lote", "batch-scan"],
+        "batch:load": ["batch_load", "Elegir referencia del lote", "batch-load"],
+        "batch:analyze": ["batch_analyze", "Analizar referencia ahora", "analyze"],
+        "batch:run": ["batch_run", "Revisar ejecución del lote", "batch-run"],
+        "batch:complete": ["batch_complete", "Revisar resultados del lote", "batch-complete"],
+        "mosaic:load": ["mosaic_load", "Añadir paneles del mosaico", "mosaic-load"],
+        "mosaic:analyze": ["mosaic_analyze", "Analizar paneles ahora", "mosaic-analyze"],
+        "mosaic:stack": ["mosaic_stack", "Revisar apilado de paneles", "mosaic-stack"],
+        "mosaic:compose": ["mosaic_compose", "Continuar a composición", "mosaic-compose"],
+        "mosaic:result": ["mosaic_result", "Abrir postprocesado del mosaico", "mosaic-result"],
+        "deepsky:blocked": ["deepsky_review", "Revisar incompatibilidades", "deepsky-review"],
+    };
+    const [translationKey, fallback, action] = actions[key] || [
+        context.flow === "deepsky" ? "deepsky_step" : "next",
+        context.flow === "deepsky" ? "Volver al paso activo" : "Ver siguiente paso",
+        context.flow === "deepsky" ? "deepsky-step" : "next",
+    ];
+    label.textContent = tr(`assistant.primary.${translationKey}`, fallback);
+    button.dataset.action = action;
+}
+
+function pulseAssistantLauncher() {
+    const launcher = document.getElementById("btn-toggle-guide");
+    if (!launcher) return;
+    launcher.classList.remove("assistant-needs-attention");
+    requestAnimationFrame(() => launcher.classList.add("assistant-needs-attention"));
+    window.setTimeout(() => launcher.classList.remove("assistant-needs-attention"), 5200);
+}
+
+function setAssistantJourney(patch = {}, { open = false, announceKey = "" } = {}) {
+    assistantJourney = { ...assistantJourney, ...patch };
+    updateZenithGuide();
+    paintAssistantPrimaryAction();
+    if (announceKey && announceKey !== lastAssistantAnnouncement) {
+        lastAssistantAnnouncement = announceKey;
+        pulseAssistantLauncher();
+        if (open) setZenithGuideOpen(true);
+    }
+}
+window.updateIntelligentAssistantContext = (patch = {}, options = {}) => setAssistantJourney(patch, options);
+
+function setZenithGuideOpen(open) {
+    const panel = document.getElementById("zenith-guide-panel");
+    panel?.classList.toggle("open", !!open);
+    panel?.setAttribute("aria-hidden", String(!open));
+    document.getElementById("btn-toggle-guide")?.setAttribute("aria-pressed", String(!!open));
+}
+
+async function runAssistantPrimaryAction() {
+    const button = document.getElementById("btn-assistant-analyze");
+    const action = button?.dataset.action || "next";
+    if (action === "diagnose") {
+        await analyzeActivePostprocessArtifacts();
+        return;
+    }
+    const destinations = {
+        load: ["#btn-analyze", true],
+        analyze: ["#btn-run-analysis", true],
+        stack: ["#btn-stack", false],
+        "batch-scan": ["#btn-batch-mode", false],
+        "batch-load": ["#btn-batch-tune", true],
+        "batch-run": ["#btn-batch-run", false],
+        "batch-complete": ["#animation-modal", false],
+        "mosaic-load": ["#mosaic-dropzone", false],
+        "mosaic-analyze": ["#btn-mosaic-analyze-all", true],
+        "mosaic-stack": ["#btn-mosaic-stack-all", false],
+        "mosaic-compose": ["#mosaic-step-generate", false],
+        "mosaic-result": ["#btn-mosaic-edit", true],
+        "deepsky-review": ["#ds-preflight-review", false],
+        "deepsky-step": ["#ds-wizard-scroll", false],
+    };
+    const [target, activate] = destinations[action] || ["#zenith-guide-list", false];
+    navigateAssistantToControl(target, {
+        title: document.getElementById("assistant-primary-label")?.textContent || "Siguiente paso",
+        activate,
+    });
+}
+
+function navigateAssistantToControl(target, suggestion = {}) {
+    const element = document.querySelector(target);
+    if (!element) {
+        log("WARN", `Asistente: no se encontró el destino ${target}`);
+        return false;
+    }
+    let ancestor = element;
+    while (ancestor) {
+        if (ancestor.tagName === "DETAILS") ancestor.open = true;
+        ancestor = ancestor.parentElement;
+    }
+    setZenithGuideOpen(false);
+    requestAnimationFrame(() => {
+        element.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+        const focusTarget = element.matches("details") ? element.querySelector("summary") : element;
+        focusTarget?.focus?.({ preventScroll: true });
+        element.classList.add("assistant-target-pulse");
+        window.setTimeout(() => element.classList.remove("assistant-target-pulse"), 1450);
+        if (suggestion.activate && !element.disabled) element.click();
+    });
+    if (ui.statusText) {
+        ui.statusText.textContent = `Asistente · ${suggestion.title || "control localizado"}`;
+        ui.statusText.style.color = "#67e8f9";
+    }
+    if (suggestion.id === "control-help") updateZenithGuide({ helpTarget: null, helpTitle: "", helpMessage: "" });
+    return true;
+}
+
+const ASSISTANT_LEVEL_CONTROLS = new Set(["levelsBlack", "levelsMid", "levelsWhite"]);
+
+function assistantControlElement(name) {
+    return document.querySelector(`[data-advanced-control="${name}"]`);
+}
+
+// Una corrección del asistente ya no describe el preset tonal ni el acabado de
+// objeto anunciados: si no se retiran, los chips siguen afirmando una receta
+// que la imagen dejó de tener.
+function assistantInvalidateFinishingClaim() {
+    markTonePreset("custom");
+    if (!activeObjectFinishingState) return;
+    activeObjectFinishingState = null;
+    markObjectFinishingSelection("");
+    renderObjectFinishingStatus();
+}
+
+// Revela y resalta TODOS los controles que la corrección ha movido —abriendo
+// el módulo plegable en el que viven— en vez de llevar a un ancla fija. Así el
+// panel donde se espera la corrección muestra exactamente qué cambió.
+function revealAssistantEdits(names, label) {
+    const elements = [...new Set(names)].map(assistantControlElement).filter(Boolean);
+    if (!elements.length) return false;
+    for (const element of elements) {
+        let ancestor = element;
+        while (ancestor) {
+            if (ancestor.tagName === "DETAILS") ancestor.open = true;
+            ancestor = ancestor.parentElement;
+        }
+    }
+    setZenithGuideOpen(false);
+    requestAnimationFrame(() => {
+        elements[0].scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+        for (const element of elements) {
+            element.classList.add("assistant-target-pulse");
+            window.setTimeout(() => element.classList.remove("assistant-target-pulse"), 1450);
+        }
+    });
+    if (ui.statusText) {
+        ui.statusText.textContent = `Asistente · ${label}`;
+        ui.statusText.style.color = "#67e8f9";
+    }
+    return true;
+}
+
+function applyAssistantToneAdjustments(values, label, target = "#post-tone-module") {
+    const names = Object.keys(values);
+    suppressPostprocessEvents = true;
+    try {
+        names.forEach((name) => setAdvancedControlValue(name, values[name]));
+        // Los niveles comparten una invariante (hueco mínimo negro↔blanco): sin
+        // esta pasada el asistente puede dejar el par en un estado imposible que
+        // el panel sí muestra pero el render no respeta.
+        if (names.some((name) => ASSISTANT_LEVEL_CONTROLS.has(name))) {
+            constrainLevelControls(assistantControlElement("levelsWhite"));
+            constrainLevelControls(assistantControlElement("levelsBlack"));
+        }
+        updateLevelMarkers();
+        assistantInvalidateFinishingClaim();
+    } finally {
+        suppressPostprocessEvents = false;
+    }
+    drawPostprocessScopes();
+    triggerUpdate();
+    queuePostHistoryCommit(label);
+    // El destino es el control que REALMENTE se movió; el ancla declarada por
+    // la acción sólo se usa si la corrección no tocó ningún control.
+    if (!revealAssistantEdits(names, label)) navigateAssistantToControl(target, { title: label });
+}
+
+// Espera a que el render 1:1 pendiente termine (los cambios recién aplicados
+// aún no están medidos mientras el debounce/render corre). Sin esto, aplicar
+// dos tarjetas seguidas usaba métricas de ANTES del primer cambio y las
+// correcciones se acumulaban a ciegas (así se quemó Saturno con +1.50 EV × 2).
+async function waitForSettledPostPipeline(maxMs = 6000) {
+    const startedAt = performance.now();
+    while (performance.now() - startedAt < maxMs) {
+        const settled = JSON.stringify(getPipelineParams()) === lastProcessedParams
+            && !previewIsDownscaled;
+        if (settled) return true;
+        await new Promise((resolve) => setTimeout(resolve, 160));
+    }
+    return false;
+}
+
+async function applyAssistantRecommendation(action, suggestion, context) {
+    // Toda corrección se decide con el estado ACTIVO: pipeline asentado,
+    // histograma re-medido y métricas frescas fusionadas sobre la instantánea
+    // de la tarjeta. Tras aplicarse, el render 1:1 re-mide y el asistente
+    // re-sugiere solo (refreshPostHistogram → updateZenithGuide).
+    await waitForSettledPostPipeline();
+    await refreshPostHistogram(true);
+    context = { ...context, ...assistantHistogramContext() };
+    const advanced = getAdvancedPostprocessParams();
+    if (action === "solar-auto") {
+        const preset = cloneSolarPreset("ha-gold");
+        const low = Math.max(0, Math.min(.8, Number(context.percentileLow || 0)));
+        const high = Math.max(low + .02, Math.min(1, Number(context.percentileHigh || 1)));
+        const middle = low + (high - low) * .48;
+        preset.curvePoints = normalizeSolarCurvePoints([
+            [0, 0],
+            [Math.max(.015, low), .025],
+            [middle, .46],
+            [Math.min(.985, high), .97],
+            [1, 1],
+        ]);
+        const robustRange = Math.max(.01, Number(context.robustDynamicRange || high - low));
+        preset.filamentAmount = robustRange < .18 ? .24 : .34;
+        preset.noiseGuard = Number(context.medianLevel || 0) < .06 ? .8 : .7;
+        preset.backgroundProtect = Number(context.shadowClip || 0) > .001 ? .94 : .82;
+        preset.prominenceAmount = Number(context.medianLevel || 0) < .18 ? .34 : .18;
+        suppressPostprocessEvents = true;
+        try {
+            applySolarParamsToUi(preset, { presetName: "custom" });
+        } finally {
+            suppressPostprocessEvents = false;
+        }
+        triggerUpdate({ forceFastPreview: true });
+        queuePostHistoryCommit("Asistente · receta solar automática");
+        navigateAssistantToControl("#solar-mono-module", { title: "Receta solar automática" });
+        return;
+    }
+
+    if (action === "solar-filaments-auto") {
+        const amount = document.getElementById("sl-solar-filament");
+        const radius = document.getElementById("sl-solar-radius");
+        const guard = document.getElementById("sl-solar-noise-guard");
+        const enabled = document.getElementById("chk-solar-enabled");
+        suppressPostprocessEvents = true;
+        try {
+            if (enabled) enabled.checked = true;
+            if (amount) amount.value = "28";
+            if (radius) radius.value = "110";
+            if (guard) guard.value = "76";
+            markSolarPreset("custom");
+            updateSolarUiState();
+        } finally {
+            suppressPostprocessEvents = false;
+        }
+        triggerUpdate({ forceFastPreview: true });
+        queuePostHistoryCommit("Asistente · filamentos conservadores");
+        navigateAssistantToControl("#sl-solar-filament", { title: "Recuperación de filamentos" });
+        return;
+    }
+
+    if (action === "tone-curve-auto") {
+        const low = Math.max(0, Math.min(.8, Number(context.percentileLow || 0)));
+        const high = Math.max(low + .12, Math.min(1, Number(context.percentileHigh || 1)));
+        const span = high - low;
+        let lowX = Math.max(.04, Math.min(.32, low + span * .12));
+        let highX = Math.max(.68, Math.min(.96, high - span * .08));
+        if (highX - lowX < .25) {
+            lowX = .2;
+            highX = .8;
+        }
+        const measuredMid = Number(context.medianLevel);
+        const midX = Math.max(
+            lowX + .08,
+            Math.min(highX - .08, Number.isFinite(measuredMid) ? measuredMid : (lowX + highX) * .5),
+        );
+        const lowY = lowX * .72;
+        const highY = highX + (1 - highX) * .25;
+        const midY = Math.max(
+            lowY + .06,
+            Math.min(highY - .06, midX + (.5 - midX) * .16),
+        );
+        toneCurveEditor?.setPoints(normalizeToneCurvePoints([
+            [0, 0],
+            [lowX, lowY],
+            [midX, midY],
+            [highX, highY],
+            [1, 1],
+        ]));
+        markTonePreset("custom");
+        drawPostprocessScopes();
+        triggerUpdate({ forceFastPreview: true });
+        queuePostHistoryCommit("Asistente · curva tonal suave");
+        navigateAssistantToControl("#tone-curve-free", { title: "Curva tonal suave" });
+        return;
+    }
+
+    if (action === "protect-range") {
+        const values = {};
+        // Los niveles sólo se tocan cuando SON la causa del recorte: si el punto
+        // negro/blanco ya está en su extremo se escribía su valor neutro (0 y
+        // 65535, los `data-default` de los sliders), un no-op que dejaba el
+        // panel de niveles inmóvil mientras la imagen sí cambiaba. Cuando el
+        // recorte viene del dato, quien lo corrige es el módulo tonal, y ahí es
+        // donde el asistente lleva al usuario.
+        const measuredLow = Math.max(0, Math.min(1, Number(context.percentileLow ?? 0)));
+        const measuredHigh = Math.max(measuredLow, Math.min(1, Number(context.percentileHigh ?? 1)));
+        if (Number(context.shadowClip || 0) > 0.0001) {
+            if (advanced.levelsBlack > 0.0005) {
+                values.levelsBlack = Math.min(advanced.levelsBlack, Math.max(0, measuredLow - 0.01));
+            }
+            values.shadows = Math.max(advanced.shadows, 0.18);
+            values.blacks = Math.max(advanced.blacks, 0.06);
+        }
+        if (Number(context.highlightClip || 0) > 0.0001) {
+            if (advanced.levelsWhite < 0.9995) {
+                values.levelsWhite = Math.max(advanced.levelsWhite, Math.min(1, measuredHigh + 0.01));
+            }
+            values.highlights = Math.min(advanced.highlights, -0.18);
+            values.whites = Math.min(advanced.whites, -0.08);
+            values.exposure = Math.max(-4, advanced.exposure
+                - Math.min(0.35, 0.1 + Number(context.highlightClip || 0) * 2));
+        }
+        applyAssistantToneAdjustments(values, "Asistente · proteger rango", "#post-tone-module");
+        return;
+    }
+
+    if (action === "auto-levels") {
+        const low = Math.max(0, Math.min(1, Number(context.percentileLow || 0)));
+        const high = Math.max(low, Math.min(1, Number(context.percentileHigh || 1)));
+        const span = high - low;
+        if (span < 0.003) {
+            log("WARN", "Asistente: el rango medido es demasiado estrecho para expandirlo con seguridad.");
+            return;
+        }
+        const margin = Math.max(0.002, span * 0.035);
+        applyAssistantToneAdjustments({
+            levelsBlack: Math.max(0, low - margin),
+            levelsWhite: Math.min(1, high + margin),
+            levelsMid: 1,
+        }, "Asistente · expandir rango útil", "#post-histogram-card");
+        return;
+    }
+
+    if (action === "lift-midtones") {
+        // Recalculada AHORA con el tope anti-recorte: si ya no queda margen
+        // seguro, no se aplica nada (y no se ensucia el historial con no-ops).
+        const addition = Math.min(1.5, Number(context.recommendedExposureEv || 0));
+        if (addition < 0.05) {
+            log("INFO", tr(
+                "assistant.exposure_settled",
+                "Asistente: la señal brillante ya no admite más exposición sin recortar; no se aplicó nada.",
+            ));
+            updateZenithGuide();
+            return;
+        }
+        applyAssistantToneAdjustments({
+            exposure: Math.min(4, advanced.exposure + addition),
+        }, `Asistente · medios +${addition.toFixed(2)} EV`);
+        return;
+    }
+
+    if (action === "repair-ringing") {
+        navigateAssistantToControl("#artifact-repair-card", suggestion);
+        document.getElementById("btn-apply-artifact-suggestion")?.click();
+        return;
+    }
+
+    if (action === "align-rgb") {
+        navigateAssistantToControl(".atmospheric-module", suggestion);
+        document.getElementById("btn-auto-rgb-align")?.click();
+    }
+}
+
+function initZenithGuideUi() {
+    const panel = document.getElementById("zenith-guide-panel");
+    zenithGuide = new IntelligentAssistant({
+        panel,
+        list: document.getElementById("zenith-guide-list"),
+        status: document.getElementById("zenith-guide-status"),
+        summary: document.getElementById("intelligent-assistant-summary"),
+        onNavigate: navigateAssistantToControl,
+        onApply: applyAssistantRecommendation,
+        translate: (key, fallback, values = {}) => trFormat(key, values, fallback),
+    });
+    document.getElementById("btn-toggle-guide")?.addEventListener("click", () => setZenithGuideOpen(!panel?.classList.contains("open")));
+    document.getElementById("btn-close-guide")?.addEventListener("click", () => setZenithGuideOpen(false));
+    document.getElementById("btn-assistant-analyze")?.addEventListener("click", runAssistantPrimaryAction);
+    document.getElementById("btn-goto-solar-module")?.addEventListener("click", () => {
+        revealModulePanel("#solar-mono-module", tr("viewer.module_solar", "Laboratorio solar"));
+    });
+    document.getElementById("btn-goto-object-module")?.addEventListener("click", () => {
+        revealModulePanel("#object-finishing-module", tr("viewer.module_object", "Luna y planetas"));
+    });
+    updateZenithGuide();
+    paintAssistantPrimaryAction();
+}
+
+let contextualHelpTargetId = 0;
+function initPostprocessHelpUi() {
+    installPostprocessHelp({
+        root: document.getElementById("panel-wavelets"),
+        onAskAssistant: ({ control, info }) => {
+            if (!control.id) {
+                contextualHelpTargetId += 1;
+                control.id = `post-context-help-${contextualHelpTargetId}`;
+            }
+            updateZenithGuide({
+                helpTarget: `#${control.id}`,
+                helpTitle: info.title,
+                helpMessage: `${info.summary} ${info.caution}`,
+            });
+            setZenithGuideOpen(true);
+        },
+    });
+}
+
+initAtmosphericCorrectionUi();
+initPostEyedropper();
+initArtifactRepairUi();
+initZenithGuideUi();
+initPostprocessHelpUi();
+
+function triggerUpdate(options = {}) {
+    if (suppressPostprocessEvents) return;
+    const forceFastPreview = !!options?.forceFastPreview;
+    const pipelineParams = getPipelineParams();
+    const currentParams = JSON.stringify(pipelineParams);
+    if (currentParams === lastProcessedParams && !previewIsDownscaled) return;
+    const heavy = pipelineParams.deconv.i > 0 || pipelineParams.deconv.vi > 0
+        || pipelineParams.lce > 0 || pipelineParams.edgeAwareWavelets
+        || pipelineParams.autoMask > 0 || pipelineParams.psfFromLimb
+        || (pipelineParams.advanced?.solar?.enabled
+            && pipelineParams.advanced.solar.filamentAmount > 0);
+
+    // PREVIEW RÁPIDO EN VIVO: durante el arrastre (inputs rápidos) render a 1/4
+    // de resolución como máximo cada ~110 ms → feedback casi instantáneo; el
+    // render final exacto (resolución completa) lo hace el debounce de abajo al
+    // soltar. Solo para configuraciones PESADAS (deconv/lce/edge-aware/auto-máscara/
+    // PSF), donde el render completo tarda; en ligeras el debounce ya es rápido y
+    // así evitamos parpadeo.
+    if (currentFilePath) {
+        const nowT = performance.now();
+        if ((heavy || forceFastPreview) && nowT - lastFastPreview >= FAST_PREVIEW_MS) {
+            lastFastPreview = nowT;
+            pipelineRequestId++;
+            // RGB sub-pixel alignment needs a little more spatial fidelity than
+            // the heavy-filter preview; 1/2 keeps the drag smooth and visible.
+            processPipeline(pipelineRequestId, currentParams, forceFastPreview ? 2 : 4);
+        }
+    }
 
     clearTimeout(updateTimer);
     updateTimer = setTimeout(() => {
         const nowParams = JSON.stringify(getPipelineParams());
-        if (nowParams !== lastProcessedParams) {
+        if (nowParams !== lastProcessedParams || previewIsDownscaled) {
             pipelineRequestId++;
             showLocalProcessing("Pendiente...");
             showImgLoader();
@@ -4714,11 +7880,12 @@ function triggerUpdate() {
             if (ui.pBarContainer) { ui.pBarContainer.style.display = "block"; ui.pBarFill.style.width = "0%"; }
             processPipeline(pipelineRequestId, nowParams);
         }
-    }, 300);
+    }, heavy || forceFastPreview ? 760 : 300);
 }
 
-async function processPipeline(requestId, paramsString) {
-    if (!currentFilePath) { hideImgLoader(); hideLocalProcessing(); return; }
+async function processPipeline(requestId, paramsString, downscale = 1) {
+    if (!currentFilePath && !postProcessSession.current()) { hideImgLoader(); hideLocalProcessing(); return; }
+    const renderStartedAt = performance.now();
     const p = JSON.parse(paramsString);
     const msg = $("#local-msg");
     if (msg) msg.textContent = "Calculando...";
@@ -4749,11 +7916,35 @@ async function processPipeline(requestId, paramsString) {
             masterDenoise: p.masterDenoise,
             masterDenoiseDetail: p.denoiseDetail,
             masterDenoiseChroma: p.denoiseChroma,
-            useRgbSharpening: p.useRgbSharpening
+            useRgbSharpening: p.useRgbSharpening,
+            edgeAwareWavelets: p.edgeAwareWavelets,
+            psfFromLimb: p.psfFromLimb,
+            edgeAwareStrength: p.edgeAwareStrength,
+            autoMask: p.autoMask,
+            adaptiveUsm: p.adaptiveUsm,
+            previewDownscale: downscale,
+            gpuMode: getGpuMode(),
+            levelsBlack: p.levels.black,
+            levelsWhite: p.levels.white,
+            levelsGamma: p.levels.gamma,
+            advanced: p.advanced,
+            resultId: currentPostprocessResultId || null,
         });
 
         if (requestId !== pipelineRequestId) { console.log("Descartado."); return; }
-        lastProcessedParams = paramsString;
+        // Solo el render a resolución COMPLETA fija el memo; el preview rápido
+        // (downscale) marca la vista como baja-res para forzar luego el full.
+        if (downscale === 1) lastProcessedParams = paramsString;
+        const previewWidth = Number(ui.imgResult?.naturalWidth || currentFileMetadata?.width || 0);
+        const previewHeight = Number(ui.imgResult?.naturalHeight || currentFileMetadata?.height || 0);
+        previewDownscaleFactor = downscale > 1
+            && previewWidth >= 256 * downscale
+            && previewHeight >= 256 * downscale
+            ? downscale
+            : 1;
+        previewIsDownscaled = previewDownscaleFactor !== 1;
+        drawPostprocessScopes();
+        if (downscale === 1) postProcessSession.setPreview(b64);
 
         if (ui.imgResult) {
             if (msg) msg.textContent = "Renderizando...";
@@ -4761,10 +7952,33 @@ async function processPipeline(requestId, paramsString) {
             await setImageAndWait(ui.imgResult, b64, false);
             restoreViewportState(viewportBeforeRender);
 
-            if (ui.statusText) { ui.statusText.textContent = "Vista actualizada."; ui.statusText.style.color = "#94a3b8"; }
+            if (ui.statusText) {
+                const elapsed = Math.max(0, performance.now() - renderStartedAt);
+                const finalEngine = getGpuMode() === "cpu"
+                    ? "CPU exacta"
+                    : "GPU validada · respaldo CPU";
+                ui.statusText.textContent = !previewIsDownscaled
+                    ? `Vista 1:1 actualizada · ${(elapsed / 1000).toFixed(1)} s · ${finalEngine}`
+                    : `Vista rápida 1/${previewDownscaleFactor} · ${(elapsed / 1000).toFixed(1)} s · GPU si es apta`;
+                ui.statusText.style.color = !previewIsDownscaled ? "#94a3b8" : "#67e8f9";
+            }
+        }
+        // El historial y el histograma científico sólo aceptan el render 1:1;
+        // el preview rápido durante el arrastre es deliberadamente transitorio.
+        if (downscale === 1) {
+            if (historyPlaybackRequestId === requestId) {
+                postProcessSession.updateCurrentPreview(b64);
+                historyPlaybackRequestId = 0;
+            } else {
+                finishPendingHistoryCommit(paramsString, b64);
+            }
+            updatePostHistoryUi();
+            updateDeconvolutionStatus();
+            await refreshPostHistogram(true);
         }
     } catch (e) {
-        if (!e.toString().includes("Cancelled")) { log("ERROR", "Pipeline: " + e); }
+        const errorText = e.toString();
+        if (!errorText.includes("Cancelled") && !errorText.includes("Resultado sustituido")) { log("ERROR", "Pipeline: " + e); }
     } finally {
         if (requestId === pipelineRequestId) { hideImgLoader(); hideLocalProcessing(); }
     }
@@ -4776,6 +7990,14 @@ async function processPipeline(requestId, paramsString) {
 
 function resetDataAcquisitionUI() {
     console.log("Resetting Data Acquisition UI...");
+    setPlanetaryColorOptionsAvailability(null);
+    postBeginNonce += 1;
+    window.resetPipelineState();
+    postProcessSession.clear();
+    currentPostprocessResultId = 0;
+    lastPostHistogram = null;
+    setPostCompareActive(false);
+    updatePostHistoryUi();
     clearMosaicInfoOverlay();
 
     // Limpieza agresiva de memoria en el backend (soluciona el problema de ralentización entre videos)
@@ -4787,6 +8009,10 @@ function resetDataAcquisitionUI() {
     currentVideoStats = null;
     batchGeneratedImages = [];
     batchResultPaths = [];
+    batchOutputFolder = "";
+    batchOutputFoldersBySource = new Map();
+    batchSequencePlan = null;
+    batchNormalizedApPoints = [];
     if (chartInstance) {
         chartInstance.destroy();
         chartInstance = null;
@@ -4845,6 +8071,7 @@ function resetDataAcquisitionUI() {
     if (ui.apCount) ui.apCount.textContent = "0";
     isBatchMode = false;
     if (ui.selBayerOverride) ui.selBayerOverride.value = "auto";
+    updateBayerOverrideAvailability("");
     if (ui.statusText) ui.statusText.textContent = "Esperando accion.";
 
     // Reset Transforms
@@ -4866,6 +8093,13 @@ function resetDataAcquisitionUI() {
     isCropping = false;
     cropSelection = { x: 0, y: 0, w: 0, h: 0 };
     manualAnchorPoint = null; // Reset Anchor
+    assistantJourney = {
+        flow: "individual",
+        stage: "empty",
+        workflowStep: 0,
+        workflowTotal: 3,
+    };
+    updateZenithGuide({ hasResult: false, hasAnalysis: false });
 }
 
 function updateStackButtonState() {
@@ -4918,12 +8152,69 @@ function updateStackButtonState() {
             ? tr("batch.execution.ready_tooltip", "Ejecutar lote")
             : (hasFiles ? tip : tr("batch.execution.load_files_tooltip", "Carga archivos primero"));
     }
+    updateZenithGuide({ hasAnalysis });
 }
 
 // Listener para cambio de modo
 if (ui.alignMode) {
     ui.alignMode.addEventListener("change", updateStackButtonState);
 }
+
+function paintBatchOutputPolicy() {
+    const sourceSelected = batchOutputPolicy === BATCH_OUTPUT_POLICY_SOURCE_ADJACENT;
+    const paintButton = (button, selected) => {
+        if (!button) return;
+        button.classList.toggle("selected", selected);
+        button.setAttribute("aria-pressed", String(selected));
+        button.style.borderColor = selected ? "#a855f7" : "#334155";
+        button.style.color = selected ? "#e9d5ff" : "#94a3b8";
+        button.style.background = selected ? "rgba(168,85,247,0.14)" : "#0f172a";
+    };
+    paintButton(ui.btnBatchOutputSourceAdjacent, sourceSelected);
+    paintButton(ui.btnBatchOutputSingleDirectory, !sourceSelected);
+    if (ui.batchOutputPath) {
+        ui.batchOutputPath.textContent = sourceSelected
+            ? tr("batch.output.source_adjacent_hint", "Crea Zenith_Batch_<sesión>/<vídeo>/ junto a cada fuente, sin sobrescribir.")
+            : trFormat(
+                "batch.output.single_directory_hint",
+                { path: batchSingleOutputDirectory },
+                `Carpeta elegida: ${batchSingleOutputDirectory}`
+            );
+    }
+}
+
+function persistBatchOutputPolicy() {
+    localStorage.setItem("zas_batch_output_policy_v1", batchOutputPolicy);
+    if (batchSingleOutputDirectory) {
+        localStorage.setItem("zas_batch_output_directory_v1", batchSingleOutputDirectory);
+    }
+}
+
+if (ui.btnBatchOutputSourceAdjacent) {
+    ui.btnBatchOutputSourceAdjacent.addEventListener("click", () => {
+        batchOutputPolicy = BATCH_OUTPUT_POLICY_SOURCE_ADJACENT;
+        persistBatchOutputPolicy();
+        paintBatchOutputPolicy();
+    });
+}
+
+if (ui.btnBatchOutputSingleDirectory) {
+    ui.btnBatchOutputSingleDirectory.addEventListener("click", async () => {
+        const folder = await openDialog({
+            directory: true,
+            multiple: false,
+            title: tr("batch.output.choose_title", "Elegir carpeta única para el lote")
+        });
+        const selected = (typeof folder === "object" && folder && folder.path) ? folder.path : folder;
+        if (!selected) return;
+        batchSingleOutputDirectory = String(selected);
+        batchOutputPolicy = BATCH_OUTPUT_POLICY_SINGLE_DIRECTORY;
+        persistBatchOutputPolicy();
+        paintBatchOutputPolicy();
+    });
+}
+
+paintBatchOutputPolicy();
 
 // 1. Selector de Carpeta para Batch
 if (ui.btnBatchMode) {
@@ -4933,6 +8224,16 @@ if (ui.btnBatchMode) {
 
         // CLEANUP
         resetDataAcquisitionUI();
+        setAssistantJourney({
+            flow: "batch",
+            stage: "scan",
+            workflowStep: 0,
+            workflowTotal: 4,
+            itemCount: 0,
+        }, {
+            open: true,
+            announceKey: `batch:scan:${String(folder)}`,
+        });
 
         const selectedBatchTarget = normalizeZenithCategory(ui.selBatchTargetCategory?.value || getSelectedTargetCategory());
 
@@ -4975,6 +8276,16 @@ if (ui.btnBatchMode) {
 
             log("INFO", trFormat("batch.logs.activated", { count: files.length }, `Modo Batch activado. ${files.length} archivos.`));
             updateStackButtonState();
+            setAssistantJourney({
+                flow: "batch",
+                stage: "load",
+                workflowStep: 0,
+                workflowTotal: 4,
+                itemCount: files.length,
+            }, {
+                open: true,
+                announceKey: `batch:loaded:${folder}:${files.length}`,
+            });
             maybeStartTutorialFlow("batch", 1, 350);
 
             // Tutorial: Detect if images are loaded and skip to Step 4 if so
@@ -5020,6 +8331,15 @@ if ($("#btn-mosaic-mode")) {
             } else {
                 console.error("MAIN: panel-mosaic not found in DOM");
             }
+            setAssistantJourney({
+                flow: "mosaic",
+                stage: "load",
+                workflowStep: 0,
+                workflowTotal: 5,
+            }, {
+                open: true,
+                announceKey: "mosaic:opened",
+            });
 
             // Show Overlay
             if (mosaicManager) {
@@ -5094,7 +8414,11 @@ if ($("#btn-mosaic-mode")) {
     const planetRates = {
         jupiter: [877.9, 870.27, 870.536],
         saturn: [844.3, 812.0, 810.7938],
-        mars: [350.89198507, 350.89198507, 350.89198507]
+        mars: [350.89198507, 350.89198507, 350.89198507],
+        // Venus: tasa ATMOSFÉRICA (nubes UV, ~4.4 d retrógrado), no la sólida de 243 d.
+        venus: [-81.81818, -81.81818, -81.81818],
+        uranus: [-501.7928812, -501.7928812, -501.7928812],
+        neptune: [536.3128492, 536.3128492, 536.3128492]
     };
 
     function setDerotStatus(text, tone = "ready") {
@@ -5347,8 +8671,7 @@ if ($("#btn-mosaic-mode")) {
             triggerStackSuccessEffect();
         }
 
-        resetProcessingParams();
-        lastProcessedParams = null;
+        await beginNewPostprocessResult(result.preview_base64, "derotation");
     }
 
     async function loadDerotationPreflight(path, logPath = state.logPath || "") {
@@ -5674,6 +8997,56 @@ if ($("#btn-mosaic-mode")) {
         }
     });
 
+    // RGB POR CANAL (mono + rueda de filtros): 3 selecciones (R, G, B) en orden.
+    document.getElementById("btn-derot-fusion-rgb")?.addEventListener("click", async () => {
+        try {
+            const pick = async (label) => {
+                const r = await openDialog({
+                    multiple: false,
+                    title: label,
+                    filters: [{ name: "Planetary stack", extensions: ["png", "tif", "tiff", "jpg", "jpeg"] }]
+                });
+                if (!r) return null;
+                return (typeof r === "object" && r !== null && r.path) ? r.path : r;
+            };
+            const redPath = await pick(tr("derotation.rgb.pick_red", "Canal ROJO (R)"));
+            if (!redPath) return;
+            const greenPath = await pick(tr("derotation.rgb.pick_green", "Canal VERDE (G)"));
+            if (!greenPath) return;
+            const bluePath = await pick(tr("derotation.rgb.pick_blue", "Canal AZUL (B)"));
+            if (!bluePath) return;
+
+            state.disc = readDiscInputs() || state.disc;
+            const fallbackIntervalSec = parseFloat(fusionIntervalInput?.value || "0");
+            showProcessing(tr("derotation.rgb.processing", "DEROTANDO CANALES RGB..."));
+            const fusion = await invoke("fuse_planetary_derotation_rgb", {
+                redPath, greenPath, bluePath,
+                planet: state.planet,
+                cmSystem: parseInt(cmSelect?.value || "1", 10),
+                limbStrength: parseFloat(limbSlider?.value || "0.5"),
+                fallbackIntervalSec: Number.isFinite(fallbackIntervalSec) ? fallbackIntervalSec : 0,
+                subEarthLatDeg: getB0Value(),
+                northAngleDeg: state.disc ? Number(state.disc.angle_deg || 0) : null,
+                discOverride: state.disc || null
+            });
+            state.diagnostics = fusion.diagnostics || state.diagnostics;
+            state.disc = fusion.detected_disc || state.disc;
+            syncDiscInputs(state.disc);
+            await loadDerotationResultIntoWorkspace(fusion, "Derotation RGB");
+            const warningText = (fusion.warnings || []).length ? `\n\nAvisos:\n${fusion.warnings.join("\n")}` : "";
+            log("SUCCESS", `RGB por canal derotado · ${Number(fusion.time_span_sec || 0).toFixed(1)}s · ${fusion.output_path}`);
+            showCustomAlert(
+                tr("derotation.rgb.done", "Derotación RGB completada"),
+                `${tr("derotation.rgb.saved", "Resultado guardado")}:\n${fusion.output_path}\n\n${tr("derotation.rgb.time_span", "Ventana temporal")}: ${Number(fusion.time_span_sec || 0).toFixed(1)}s${warningText}`
+            );
+        } catch (e) {
+            showCustomAlert(tr("general.error", "Error"), normalizeBackendText(e));
+            log("ERROR", "Derotación RGB: " + normalizeBackendText(e));
+        } finally {
+            hideProcessing();
+        }
+    });
+
     document.getElementById("btn-derot-apply")?.addEventListener("click", async () => {
         if (!state.imagePath) {
             showCustomAlert(tr("general.info", "Info"), tr("derotation.errors.load_first", "Carga primero una imagen planetaria."));
@@ -5751,8 +9124,7 @@ if ($("#btn-mosaic-mode")) {
                 triggerStackSuccessEffect();
             }
 
-            resetProcessingParams();
-            lastProcessedParams = null;
+            await beginNewPostprocessResult(result.preview_base64, "derotation");
             log(
                 "SUCCESS",
                 trFormat(
@@ -5786,6 +9158,7 @@ if (ui.btnBatchTune) {
     ui.btnBatchTune.addEventListener("click", async () => {
         if (batchFiles.length === 0) return;
         currentFilePath = batchFiles[0];
+        updateBayerOverrideAvailability(currentFilePath);
 
         // Hide batch control during calibration
         if (ui.panelBatch) ui.panelBatch.style.display = "none";
@@ -5844,6 +9217,16 @@ if (ui.btnBatchTune) {
                 ui.btnBatchRun.disabled = true;
 
                 log("SUCCESS", tr("batch.logs.reference_ready", "Referencia cargada. Pulsa 'Analizar Video' para continuar."));
+                setAssistantJourney({
+                    flow: "batch",
+                    stage: "analyze",
+                    workflowStep: 1,
+                    workflowTotal: 4,
+                    itemCount: batchFiles.length,
+                }, {
+                    open: true,
+                    announceKey: `batch:reference:${currentFilePath}`,
+                });
                 if (tutorialManager?.currentFlowName === 'batch' && tutorialManager.currentStepIndex === 3) {
                     tutorialManager.nextStep();
                 }
@@ -5869,38 +9252,135 @@ if (ui.btnBatchRun) {
             tutorialManager.hideOverlay();
         }
 
-        const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-        const sep = batchSourcePath.includes("\\") ? "\\" : "/";
-        batchOutputFolder = `${batchSourcePath}${sep}Animacion_${timestamp}`;
         batchGeneratedImages = [];
         batchResultPaths = [];
+        batchOutputFolder = "";
+        batchOutputFoldersBySource = new Map();
+        batchSequencePlan = null;
+        batchNormalizedApPoints = [];
+        let frozenBatchContract = null;
 
         try {
-            await mkdir(batchOutputFolder);
+            const referenceWidth = Number(currentFileMetadata?.width || ui.imgSource?.naturalWidth || 0);
+            const referenceHeight = Number(currentFileMetadata?.height || ui.imgSource?.naturalHeight || 0);
+            const referenceApPoints = (activeAPoints || []).map(point => Array.isArray(point)
+                ? { x: Number(point[0]), y: Number(point[1]), size: parseInt(ui.apSize?.value || "48", 10) }
+                : {
+                    x: Number(point.x),
+                    y: Number(point.y),
+                    size: parseInt(point.size || ui.apSize?.value || "48", 10)
+                });
+            const frozenTarget = ui.selBatchTargetCategory?.value || getSelectedTargetCategory();
+            const frozenOutputSettings = normalizeBatchOutputSettings(
+                batchOutputPolicy,
+                batchSingleOutputDirectory
+            );
+            // Congelar una sola vez la receta ajustada sobre la referencia.
+            // El loop no vuelve a leer sliders ni toggles mientras Rust trabaja.
+            frozenBatchContract = freezeBatchProcessingContract({
+                pipeline: getPipelineParams(),
+                stackPct: parseFloat(ui.stackSlider.value),
+                drizzle: parseFloat(ui.drizzleScale.value),
+                target: frozenTarget,
+                flow: getZenithUltimateFlow(frozenTarget),
+                outputPolicy: frozenOutputSettings.policy,
+                singleOutputDirectory: frozenOutputSettings.directory,
+                referenceCanvas: [referenceWidth, referenceHeight],
+                referenceApPoints,
+                bayerOverrides: batchFiles.map(file => getBayerOverrideValue(file)),
+                anchorOverride: getManualAnchorOverrideValue(),
+                sharpened: document.getElementById("chk-sharpened").checked,
+                sharpenIntensity: parseFloat(ui.selSharpenIntensity?.value || "0.5"),
+                doublePass: document.getElementById("chk-double-pass").checked,
+                normalizeColors: document.getElementById("chk-normalize-colors")?.checked || false,
+                alignRgb: document.getElementById("chk-rgb-align")
+                    ? document.getElementById("chk-rgb-align").checked
+                    : true,
+                gpuMode: getGpuMode(),
+                computePolicy: getComputePolicy(),
+                decodePolicy: getDecodePolicy(),
+                qualityPolicy: getQualityPolicy()
+            });
+            const outputPlan = await invoke("prepare_batch_output", {
+                files: batchFiles.map(file => String(file)),
+                sourceRoot: String(batchSourcePath),
+                policy: frozenBatchContract.outputPolicy,
+                singleDirectory: frozenBatchContract.outputPolicy === BATCH_OUTPUT_POLICY_SINGLE_DIRECTORY
+                    ? frozenBatchContract.singleOutputDirectory
+                    : null,
+                referenceCanvas: frozenBatchContract.referenceCanvas,
+                referenceApPoints: frozenBatchContract.referenceApPoints
+            });
+            batchOutputFoldersBySource = buildBatchOutputLookup(outputPlan, batchFiles);
+            batchOutputFolder = outputPlan.animationFolder;
+            batchSequencePlan = freezeBatchProcessingContract(outputPlan.sequencePlan);
+            batchNormalizedApPoints = freezeBatchProcessingContract(outputPlan.normalizedApPoints || []);
+            if (ui.batchOutputPath) {
+                ui.batchOutputPath.textContent = trFormat(
+                    "batch.output.active_path",
+                    { path: batchOutputFolder },
+                    `Salida de esta sesión: ${batchOutputFolder}`
+                );
+            }
+            log("INFO", `Salida batch preparada (${outputPlan.policy}): ${batchOutputFolder}`);
         } catch (e) {
-            console.warn("No se pudo crear carpeta, se intentara guardar directo.", e);
-            batchOutputFolder = batchSourcePath;
+            const detail = formatBatchOutputError(e);
+            log("ERROR", `No se pudo preparar la salida del lote: ${detail}`);
+            showCustomAlert(
+                tr("general.error", "Error"),
+                trFormat(
+                    "batch.execution.output_preflight_failed",
+                    { error: detail },
+                    `No se pudo preparar la salida del lote antes de procesar.\n\n${detail}`
+                )
+            );
+            return;
         }
 
         ui.btnBatchRun.disabled = true;
         ui.btnBatchTune.disabled = true;
         setBatchModeUI(true);
+        // Nueva sesión de lote. El backend se rearma una sola vez abajo;
+        // ninguna entrada individual puede borrar una cancelación posterior.
+        isCancellationRequested = false;
+        const btnBatchCancel = document.getElementById("btn-batch-cancel");
+        if (btnBatchCancel) {
+            // No permitir cancelar durante el reset de sesión: dos invokes
+            // concurrentes (clear/cancel) no tienen un orden garantizado.
+            btnBatchCancel.style.display = "none";
+            btnBatchCancel.disabled = true;
+        }
 
         try {
-            const p = getPipelineParams();
-            const stackPct = parseFloat(ui.stackSlider.value);
-            const drizzle = parseFloat(ui.drizzleScale.value);
-            const batchTarget = ui.selBatchTargetCategory?.value || getSelectedTargetCategory();
-            const batchFlow = getZenithUltimateFlow(batchTarget);
+            const p = frozenBatchContract.pipeline;
+            const stackPct = frozenBatchContract.stackPct;
+            const drizzle = frozenBatchContract.drizzle;
+            const batchFlow = frozenBatchContract.flow;
             const align = batchFlow.alignMode;
 
             // Reset the shared batch anchor once, then keep it alive for all entries.
-            await invoke("clear_app_memory").catch(() => {});
+            await invoke("clear_app_memory");
+            if (btnBatchCancel) {
+                btnBatchCancel.style.display = "block";
+                btnBatchCancel.disabled = false;
+            }
 
             // Obtener la categoría del objetivo desde el nuevo selector o un default seguro
             const actualBatchMode = batchFlow.batchMode;
 
+            const batchFailedNames = [];
+            const batchFailureDetails = [];
+            let batchCancelled = false;
             for (let i = 0; i < batchFiles.length; i++) {
+                // PR-1.9: cierre del race de cancelación ENTRE vídeos — si el
+                // cancel llega durante clear_stack_memory o justo entre
+                // entradas, el siguiente process_batch_entry reseteaba el flag
+                // del backend y el lote seguía como si nada.
+                if (isCancellationRequested) {
+                    batchCancelled = true;
+                    log("WARN", tr("batch.logs.cancelled", "Lote cancelado por el usuario."));
+                    break;
+                }
                 const file = batchFiles[i];
                 const displayIdx = i + 1;
                 const fileName = pathBaseName(file);
@@ -5916,10 +9396,14 @@ if (ui.btnBatchRun) {
                 }, `[Batch ${displayIdx}/${batchFiles.length}] Procesando: ${fileName}...`));
 
                 try {
-                    const bOverride = getBayerOverrideValue();
+                    const bOverride = frozenBatchContract.bayerOverrides[i];
+                    const entryOutputFolder = batchOutputFoldersBySource.get(file);
+                    if (!entryOutputFolder) {
+                        throw new Error(`El plan de salida no contiene destino para ${file}`);
+                    }
                     const result = await invoke("process_batch_entry", {
                         filePath: file,
-                        outputFolder: batchOutputFolder,
+                        outputFolder: entryOutputFolder,
                         stackPct: stackPct,
                         drizzle: drizzle,
                         alignMode: align,
@@ -5931,7 +9415,10 @@ if (ui.btnBatchRun) {
                         rBal: p.color.rb, bBal: p.color.bb,
                         rX: p.shift.rx, rY: p.shift.ry, bX: p.shift.bx, bY: p.shift.by,
 
-                        deringingMode: 0, // Always Off in batch — prevents white blob artifacts
+                        // PR-1.7 (WYSIWYG): el lote respeta el deringing afinado en la
+                        // referencia — forzarlo a 0 hacía que la salida del lote no
+                        // coincidiera con el preview con el que el usuario lo ajustó.
+                        deringingMode: p.dr.mode,
                         deringingRadius: p.dr.rad,
                         deringingDark: p.dr.dark,
                         deringingLight: p.dr.light,
@@ -5946,51 +9433,125 @@ if (ui.btnBatchRun) {
                         masterDenoiseChroma: p.denoiseChroma,
                         blend: p.blend / 100.0,
                         useRgbSharpening: p.useRgbSharpening,
+                        edgeAwareWavelets: p.edgeAwareWavelets,
+                        psfFromLimb: p.psfFromLimb,
+                        edgeAwareStrength: p.edgeAwareStrength,
+                        autoMask: p.autoMask,
+                        adaptiveUsm: p.adaptiveUsm,
+                        levelsBlack: p.levels.black,
+                        levelsWhite: p.levels.white,
+                        levelsGamma: p.levels.gamma,
                         batchMode: actualBatchMode,
                         targetType: batchFlow.category,
                         bayerOverride: bOverride,
-                        anchorOverride: getManualAnchorOverrideValue(),
-                        sharpened: document.getElementById("chk-sharpened").checked,
-                        sharpenIntensity: parseFloat(ui.selSharpenIntensity?.value || "0.5"),
-                        doublePass: document.getElementById("chk-double-pass").checked,
+                        anchorOverride: frozenBatchContract.anchorOverride,
+                        sharpened: frozenBatchContract.sharpened,
+                        sharpenIntensity: frozenBatchContract.sharpenIntensity,
+                        doublePass: frozenBatchContract.doublePass,
                         warpingAnalysis: batchFlow.warpingAnalysis,
-                        normalizeColors: document.getElementById("chk-normalize-colors") ? document.getElementById("chk-normalize-colors").checked : true,
+                        normalizeColors: frozenBatchContract.normalizeColors,
                         isV3: batchFlow.isV3,
                         apGridSize: batchFlow.apSize,
                         apThreshold: batchFlow.apThreshold,
                         progressPrefix: `[${displayIdx}/${batchFiles.length}]`,
-                        alignRgb: document.getElementById("chk-rgb-align") ? document.getElementById("chk-rgb-align").checked : true
+                        alignRgb: frozenBatchContract.alignRgb,
+                        // gpuMode se conserva mientras las releases anteriores
+                        // sigan aceptando el contrato legado.
+                        gpuMode: frozenBatchContract.gpuMode,
+                        computePolicy: frozenBatchContract.computePolicy,
+                        decodePolicy: frozenBatchContract.decodePolicy,
+                        qualityPolicy: frozenBatchContract.qualityPolicy,
+                        sequencePlan: batchSequencePlan,
+                        normalizedApPoints: batchNormalizedApPoints,
+                        advanced: p.advanced
                     });
 
-                    const preview = result?.preview_base64 || result?.path;
-                    if (preview && result?.path) {
-                        batchGeneratedImages.push(preview);
-                        batchResultPaths.push(result.path);
-                    } else {
-                        log("WARN", trFormat("batch.logs.file_failed", {
-                            name: fileName,
-                            error: tr("animation.errors.no_valid_images", "No se generaron imagenes validas para reproducir.")
-                        }, `Fallo en ${fileName}: salida inválida`));
+                    // ASSET PROTOCOL: guardar la RUTA (string diminuto) en vez del
+                    // base64 — el reproductor ya convierte rutas con convertFileSrc.
+                    // Antes un lote grande retenia TODOS los PNG en base64 en el
+                    // heap del WebView (>1 GB → crash del renderer).
+                    const published = normalizeBatchEntryResult(result);
+                    if (batchSequencePlan?.planId) {
+                        try {
+                            await invoke("register_batch_output_result", {
+                                animationFolder: batchOutputFolder,
+                                sessionId: batchSequencePlan.planId,
+                                sourcePath: file,
+                                preparedPath: published.preparedPath,
+                                linearMasterPath: published.linearMasterPath
+                            });
+                        } catch (manifestError) {
+                            log("WARN", trFormat(
+                                "batch.output.manifest_warning",
+                                { error: formatBatchOutputError(manifestError) },
+                                `El resultado se guardó, pero no se pudo actualizar el manifiesto batch: ${formatBatchOutputError(manifestError)}`
+                            ));
+                        }
                     }
+                    batchGeneratedImages.push(published.preview);
+                    batchResultPaths.push(published.preparedPath);
 
                     // Cleanup per item without destroying the shared batch anchor/dimensions.
                     await invoke("clear_stack_memory").catch(() => {});
 
                 } catch (e) {
-                    log("ERROR", trFormat("batch.logs.file_failed", { name: fileName, error: e }, `Fallo en ${file}: ${e}`));
+                    const failureDetail = formatBatchOutputError(e);
+                    log("ERROR", trFormat("batch.logs.file_failed", { name: fileName, error: failureDetail }, `Fallo en ${file}: ${failureDetail}`));
                     if (isCancellationError(e)) {
+                        batchCancelled = true;
                         log("WARN", tr("batch.logs.cancelled", "Lote cancelado por el usuario."));
                         break; // no seguir con los archivos restantes
                     }
+                    batchFailedNames.push(fileName);
+                    batchFailureDetails.push(`${fileName}: ${failureDetail}`);
                 }
             }
 
+            // PR-1.9: resumen final — antes solo se alertaba con 0 éxitos y
+            // los fallos intermedios quedaban enterrados en el log.
+            if (batchFailedNames.length > 0) {
+                log("WARN", trFormat("batch.logs.summary_failures", {
+                    failed: batchFailedNames.length,
+                    total: batchFiles.length,
+                    names: batchFailedNames.join(", ")
+                }, `Lote: ${batchFailedNames.length}/${batchFiles.length} vídeos fallaron: ${batchFailedNames.join(", ")}`));
+            }
             if (batchGeneratedImages.length === 0) {
-                showCustomAlert(tr("general.error", "Error"), tr("batch.execution.no_outputs", "El lote terminó, pero no se generaron frames válidos."));
+                const details = batchFailureDetails.slice(0, 5).join("\n");
+                showCustomAlert(
+                    tr("general.error", "Error"),
+                    details
+                        ? trFormat(
+                            "batch.execution.no_outputs_detail",
+                            { details },
+                            `El lote terminó sin salidas publicadas.\n\n${details}`
+                        )
+                        : tr("batch.execution.no_outputs", "El lote terminó, pero no se generaron frames válidos.")
+                );
                 return;
             }
+            if (batchCancelled) {
+                log("WARN", trFormat("batch.logs.summary_cancelled", {
+                    done: batchGeneratedImages.length,
+                    total: batchFiles.length
+                }, `Lote cancelado: ${batchGeneratedImages.length}/${batchFiles.length} completados antes de cancelar.`));
+            }
 
-            log("SUCCESS", tr("batch.logs.completed", "Lote completado: PNGs Guardados. Iniciando modo Animacion..."));
+            log("SUCCESS", trFormat("batch.logs.completed_summary", {
+                ok: batchGeneratedImages.length,
+                total: batchFiles.length
+            }, `Lote completado: ${batchGeneratedImages.length}/${batchFiles.length} PNGs guardados. Iniciando modo Animacion...`));
+            setAssistantJourney({
+                flow: "batch",
+                stage: "complete",
+                workflowStep: 3,
+                workflowTotal: 4,
+                completedItems: batchGeneratedImages.length,
+                itemCount: batchFiles.length,
+            }, {
+                open: true,
+                announceKey: `batch:complete:${batchGeneratedImages.length}:${batchFiles.length}`,
+            });
             startAnimationPlayer(batchGeneratedImages);
             if (shouldPauseBatchRunTutorial) {
                 tutorialManager.showOverlay();
@@ -6003,9 +9564,34 @@ if (ui.btnBatchRun) {
             setBatchModeUI(false);
             ui.btnBatchRun.disabled = false;
             ui.btnBatchTune.disabled = false;
+            isCancellationRequested = false;
+            const btnBatchCancelEnd = document.getElementById("btn-batch-cancel");
+            if (btnBatchCancelEnd) {
+                btnBatchCancelEnd.style.display = "none";
+                btnBatchCancelEnd.disabled = true;
+            }
         }
     });
 }
+
+// PR-1.9: cancelación del LOTE — el único botón de cancelar vivía dentro de
+// #processing-overlay, que el modo lote nunca muestra: el usuario no tenía
+// forma de parar un lote salvo cerrar la app.
+(() => {
+    const btn = document.getElementById("btn-batch-cancel");
+    if (!btn) return;
+    btn.addEventListener("click", async () => {
+        if (isCancellationRequested) return;
+        isCancellationRequested = true;
+        btn.disabled = true;
+        log("WARN", tr("batch.logs.cancelling", "Cancelando lote... se detendrá al terminar la operación en curso."));
+        try {
+            await invoke("cancel_processing");
+        } catch (e) {
+            console.error("Error sending cancel command:", e);
+        }
+    });
+})();
 
 if (ui.btnAutoPsf) {
     ui.btnAutoPsf.addEventListener("click", async () => {
@@ -6016,8 +9602,19 @@ if (ui.btnAutoPsf) {
             log("INFO", res.msg);
             const mode = ui.selAutoMode.value;
             const sigma = Math.max(0.6, Math.min(parseFloat(res.sigma) || 1.2, 2.2));
-            const iter = Math.max(1, Math.min(parseInt(res.iterations, 10) || 2, 3));
-            const vcIter = mode === "vc" ? Math.max(1, Math.min(iter, 2)) : Math.max(1, Math.min(iter - 1, 2));
+            const iter = Math.max(6, Math.min(parseInt(res.iterations, 10) || 8, 18));
+            const confidence = Math.max(.18, Math.min(Number(res.confidence) || .45, .96));
+            const vcIter = mode === "vc"
+                ? Math.max(2, Math.min(Math.round(iter * .34), 6))
+                : Math.max(1, Math.min(Math.round(iter * .22), 4));
+            if (mode === "vc") {
+                ui.slDeconvIter.value = 0;
+                ui.valDeconvIter.value = 0;
+            }
+            if (mode === "rl") {
+                ui.slVcIter.value = 0;
+                ui.valVcIter.value = 0;
+            }
             if (mode === "rl" || mode === "both") {
                 ui.slDeconvSigma.value = Math.round(sigma * 10); ui.valDeconvSigma.value = sigma.toFixed(1);
                 ui.slDeconvIter.value = iter; ui.valDeconvIter.value = iter;
@@ -6027,8 +9624,15 @@ if (ui.btnAutoPsf) {
                 ui.slVcSigma.value = Math.round(vcSig * 10); ui.valVcSigma.value = vcSig.toFixed(1);
                 ui.slVcIter.value = vcIter; ui.valVcIter.value = vcIter;
             }
-            log("SUCCESS", `PSF conservador: Sigma=${sigma.toFixed(1)}, RL=${iter}, VC=${mode === "rl" ? 0 : vcIter}`);
-            triggerUpdate();
+            setLinkedControlValue("edge-strength", Math.round(52 + confidence * 24), 1);
+            setLinkedControlValue("auto-mask", Math.round(38 + (1 - confidence) * 28), 1);
+            const edgeAware = document.getElementById("chk-edge-wavelets");
+            if (edgeAware) edgeAware.checked = true;
+            log("SUCCESS", `PSF estimada: Sigma=${sigma.toFixed(1)}, confianza=${Math.round(confidence * 100)}%, RL=${mode === "vc" ? 0 : iter}, VC=${mode === "rl" ? 0 : vcIter}`);
+            updateDeconvolutionStatus();
+            drawPostprocessScopes();
+            triggerUpdate({ forceFastPreview: true });
+            queuePostHistoryCommit("Deconvolución · PSF automática estimada");
         } catch (e) { log("ERROR", "Auto PSF: " + e); showCustomAlert("Error", "Error: " + e); }
         finally { ui.btnAutoPsf.disabled = false; ui.btnAutoPsf.innerHTML = i18n.t("wavelets.deconvolution.auto_analyze"); }
     });
@@ -6042,10 +9646,20 @@ if (ui.btnAnalyze) {
         // CLEANUP (Keep file reference, but clean UI)
         resetDataAcquisitionUI();
         currentFilePath = file.path || file;
+        updateBayerOverrideAvailability(currentFilePath);
         // Nuevo archivo ⇒ el análisis anterior ya no es válido: bloquear Apilar
         // hasta que el nuevo análisis termine (evita errores de usuario).
         currentFileMetadata = null;
         updateStackButtonState();
+        setAssistantJourney({
+            flow: isBatchMode ? "batch" : "individual",
+            stage: "analyze",
+            workflowStep: isBatchMode ? 1 : 0,
+            workflowTotal: isBatchMode ? 4 : 3,
+        }, {
+            open: true,
+            announceKey: `${isBatchMode ? "batch" : "individual"}:source:${currentFilePath}`,
+        });
 
         // Comprobación de formato (Auto-Conversion a SER)
         const ext = currentFilePath.split('.').pop().toLowerCase();
@@ -6117,7 +9731,9 @@ if (ui.btnAnalyze) {
                 }
 
                 log("SUCCESS", "Video cargado.");
-                if (ui.statusText) ui.statusText.textContent = "Listo. Esperando accion.";
+                if (ui.statusText) {
+                    ui.statusText.textContent = tr("general.status_waiting", "Listo. Esperando acción.");
+                }
                 maybeStartTutorialFlow('individual', 1, 250);
 
                 // INITIATE GUIDED UI GLOW SEQUENCE
@@ -6158,6 +9774,7 @@ if (btnAnalyzeFits) {
         // CLEANUP (Keep file reference, but clean UI)
         resetDataAcquisitionUI();
         currentFilePath = folder;
+        updateBayerOverrideAvailability(currentFilePath);
 
         const modeChoice = await showCustomChoice(
             "Modo de Analisis (FITS)",
@@ -6289,13 +9906,20 @@ if (ui.btnRunAnalysis) {
                 const warpingAnalysis = flow.warpingAnalysis;
                 log("INFO", `Iniciando ${flow.name} con modo: ${analysisMode} (${flow.category}, Warping: ${warpingAnalysis})`);
 
-                const res = await invoke("analyze_video", {
-                    path: currentFilePath,
-                    mode: analysisMode,
-                    targetType: flow.category,
-                    warpingAnalysis, // NEW
-                    bayerOverride: bOverride,
-                    anchorOverride: getManualAnchorOverrideValue()
+                const computePolicy = getComputePolicy();
+                const res = await invoke("analyze_planetary", {
+                    request: {
+                        path: currentFilePath,
+                        isSurface: analysisMode.includes("surface"),
+                        targetType: flow.category,
+                        warpingAnalysis,
+                        bayerOverride: bOverride,
+                        anchorOverride: getManualAnchorOverrideValue(),
+                        computePolicy,
+                        decodePolicy: getDecodePolicy(),
+                        qualityPolicy: getQualityPolicy(),
+                        profile: "custom"
+                    }
                 });
 
                 const format = (v) => (v === undefined || v === null || isNaN(v)) ? "-" : Math.min(100, Math.max(0, v)).toFixed(2) + "%";
@@ -6325,8 +9949,6 @@ if (ui.btnRunAnalysis) {
                 } else {
                     ui.btnAnalyze.textContent = tr("general.load_another_video", "📂 Cargar Otro Video");
                 }
-                updateStackButtonState();
-
                 // AUTOMACION DE CONFIGURACION PARA VIDEO EN COLOR
                 if (res.metadata.is_color) {
                     log("INFO", "Video en color detectado. Aplicando sRGB y Bayer Auto.");
@@ -6345,13 +9967,10 @@ if (ui.btnRunAnalysis) {
                     }
                 }
 
-                // NORMALIZAR COLORES: sin efecto en video mono — se deshabilita
-                // para evitar confusión del usuario (el backend ya lo ignora).
-                const chkNorm = document.getElementById("chk-normalize-colors");
-                if (chkNorm) {
-                    chkNorm.disabled = !res.metadata.is_color;
-                    chkNorm.checked = !!res.metadata.is_color;
-                }
+                // Los dos ajustes cromáticos de apilado comparten el mismo
+                // contrato visual y funcional: mono los apaga, bloquea y
+                // explica; una fuente color restaura la preferencia del usuario.
+                setPlanetaryColorOptionsAvailability(!!res.metadata.is_color);
 
                 const shouldAdvanceAfterAnalysis =
                     (tutorialManager?.currentFlowName === 'individual' && tutorialManager.currentStepIndex === 3)
@@ -6365,6 +9984,19 @@ if (ui.btnRunAnalysis) {
                 currentBestFrame = res.best_frame_idx || 0; // NEW: Capture Ref Frame
                 currentVideoStats = res.stats; // NEW: Store stats for report
                 currentFileMetadata = res.metadata; // NEW: Store for report
+                // El estado del botón y del asistente depende de metadata y ruta.
+                // Antes se calculaba mientras metadata aún era null, dejando
+                // "Iniciar apilado" deshabilitado después de un análisis válido.
+                updateStackButtonState();
+                setAssistantJourney({
+                    flow: isBatchMode ? "batch" : "individual",
+                    stage: isBatchMode ? "run" : "stack",
+                    workflowStep: isBatchMode ? 2 : 1,
+                    workflowTotal: isBatchMode ? 4 : 3,
+                }, {
+                    open: true,
+                    announceKey: `${isBatchMode ? "batch" : "individual"}:analysis:${currentFilePath}`,
+                });
                 updateChartViz();
 
                 if (res.preview_base64) {
@@ -6376,7 +10008,7 @@ if (ui.btnRunAnalysis) {
                 }
 
                 log("SUCCESS", "Analisis completado.");
-                if (ui.statusText) ui.statusText.textContent = "Listo.";
+                if (ui.statusText) ui.statusText.textContent = tr("general.status_ready", "Listo.");
                 const btnToggle = $("#btn-toggle-source");
                 if (btnToggle) btnToggle.style.display = "block";
             } catch (e) {
@@ -6455,12 +10087,25 @@ function resetWorkflowForSettingsChange() {
     "#sel-color-space-override",
     "#sel-bayer-override",
     "#sel-quality-method",
+    "#sel-planetary-quality-policy",
     "#sel-target-category",
     "#align-mode"
 ].forEach(selector => {
     const el = document.querySelector(selector);
     if (el) {
         el.addEventListener("change", () => {
+            if (selector === "#sel-bayer-override") {
+                const requested = el.value;
+                if (requested !== "auto" && !canOverrideBayerForPath(currentFilePath)) {
+                    el.value = "auto";
+                    updateBayerOverrideAvailability(currentFilePath);
+                    showCustomAlert(
+                        tr("general.warning", "Aviso"),
+                        "El override Bayer solo es válido para CFA/mono RAW. MP4, MOV y codecs de vídeo comunes ya contienen RGB/YUV demosaiced; se usará Automático."
+                    );
+                    return;
+                }
+            }
             // Special case: sel-quality-method might already be synced via other logic, 
             // but we ensure workflow reset here.
             if (selector === "#sel-batch-target-category") {
@@ -6626,6 +10271,10 @@ function showStackingReport(duration, stackContext = {}) {
                                                 <td style="padding:6px 0; text-align:right; color:#cbd5e1;">${escapeHtml(engineLabel)}</td>
                                             </tr>
                                             <tr style="border-bottom: 1px solid rgba(255,255,255,0.03);">
+                                                <td style="padding:6px 0; color:#64748b;"><span class="report-led led-green"></span>${tr('report.accum_mode', 'Acumulación')}</td>
+                                                <td style="padding:6px 0; text-align:right; color:${(_lastStackTelemetry?.mode || "").startsWith("GPU") ? "#34d399" : "#cbd5e1"}; font-weight:500;">${escapeHtml(_lastStackTelemetry?.mode || "CPU")}${(_lastStackTelemetry?.mode || "").startsWith("GPU") ? ` · ${_lastStackTelemetry.vram_mb} MB VRAM` : ""}</td>
+                                            </tr>
+                                            <tr style="border-bottom: 1px solid rgba(255,255,255,0.03);">
                                                 <td style="padding:6px 0; color:#64748b;"><span class="report-led led-green"></span>${i18n.t('report.alignment_points')}</td>
                                                 <td style="padding:6px 0; text-align:right; color:#cbd5e1;">${escapeHtml(apLabel)}</td>
                                             </tr>
@@ -6784,49 +10433,40 @@ if (ui.btnStack) {
                 // FIX DISPATCH: zenith_v3 (now used for BOTH surface and planet in Zenith Ultimate)
                 // must route through stack_video_liquid_warping, not stack_video.
                 // Previously "zenith_v3" fell into the else-global branch without AP points.
-                if (!isZenithUltimateSelected() && alignModeStr === "elite_v4") {
-                    log("INFO", "Iniciando Zenith Elite V4 (Neural-Restoration)...");
-                    const eliteConfig = {
-                        psf_radius: parseInt(document.getElementById("elite-psf-radius").value) || 15,
-                        fwhm_pixels: parseFloat(document.getElementById("elite-fwhm").value) || 2.5,
-                        airy_weight: parseFloat(document.getElementById("elite-airy").value) || 0.3,
-                        auto_psf_from_limb: document.getElementById("elite-auto-psf").checked,
-                        deconv_iterations: parseInt(document.getElementById("elite-iter").value) || 15,
-                        tv_lambda: parseFloat(document.getElementById("elite-lambda").value) || 0.01,
-                        snr_floor: parseFloat(document.getElementById("elite-snr").value) || 5.0,
-                        rejection_threshold: 0.1, 
-                        post_sharpen: parseFloat(document.getElementById("elite-sharpen").value) || 0.5,
-                        feather_px: 20
-                    };
-                    b64 = await invoke("zas_stack_video_elite", {
-                        path: currentFilePath,
-                        percent: parseFloat(ui.stackSlider.value),
-                        config: eliteConfig,
-                        category: flow.category
-                    });
-                } else if (isZenithUltimateSelected() || alignModeStr === "liquid_warping" || alignModeStr === "liquid_v3" || alignModeStr === "zenith_v3") {
+                // (Zenith Elite V4 retirado del selector: backend legado sin lotes de RAM —
+                // cargaba TODO el video como 3 planos f32 (OOM) —, sin cancelacion y con la
+                // config ignorada. Si un ajuste guardado aun trae "elite_v4", cae al modo
+                // global estandar del motor unificado, que es seguro.)
+                if (isZenithUltimateSelected() || alignModeStr === "liquid_warping" || alignModeStr === "liquid_v3" || alignModeStr === "zenith_v3") {
                     // Zenith Ultimate (both categories) + legacy liquid_warping modes
                     log("INFO", `Iniciando ${isZenithUltimateSelected() ? flow.name : (alignModeStr === "liquid_v3" ? "Zenith Precision V3 (Multipoint)" : "Liquid Warping V2")}...`);
-                    b64 = await invoke("stack_video_liquid_warping", {
-                        path: currentFilePath,
-                        percent: parseFloat(ui.stackSlider.value),
-                        customPoints: pointsToSend,
-                        drizzle: drizzleFactor,
-                        isSurface: isSurfaceMode,
-                        bayerOverride: getBayerOverrideValue(),
-                        apSize: parseInt(ui.apSize.value) || flow.apSize || 48,
-                        sharpened: document.getElementById("chk-sharpened").checked,
-                        sharpenIntensity: sharpenIntensity,
-                        doublePass: document.getElementById("chk-double-pass").checked,
-                        warpingAnalysis, // NEW
-                        anchorOverride: getManualAnchorOverrideValue(),
-                        stackingRoi: getStackingRoiOverrideValue(),
-                        normalizeColors: document.getElementById("chk-normalize-colors") ? document.getElementById("chk-normalize-colors").checked : true,
-                        isV3: flow.isV3 || (alignModeStr === "liquid_v3") || (alignModeStr === "zenith_v3"), // V3 flag for all these modes
-                        keepFullFrame: document.getElementById("chk-keep-full-frame") ? document.getElementById("chk-keep-full-frame").checked : false,
-                        targetType: flow.category,
-                        alignRgb: document.getElementById("chk-rgb-align") ? document.getElementById("chk-rgb-align").checked : true
+                    const stackResponse = await invoke("run_planetary_stack", {
+                        request: {
+                            path: currentFilePath,
+                            percent: parseFloat(ui.stackSlider.value),
+                            customPoints: pointsToSend,
+                            drizzle: drizzleFactor,
+                            isSurface: isSurfaceMode,
+                            bayerOverride: getBayerOverrideValue(),
+                            apSize: parseInt(ui.apSize.value) || flow.apSize || 48,
+                            sharpened: document.getElementById("chk-sharpened").checked,
+                            sharpenIntensity: sharpenIntensity,
+                            doublePass: document.getElementById("chk-double-pass").checked,
+                            warpingAnalysis,
+                            anchorOverride: getManualAnchorOverrideValue(),
+                            stackingRoi: getStackingRoiOverrideValue(),
+                            normalizeColors: document.getElementById("chk-normalize-colors")?.checked || false,
+                            isV3: flow.isV3 || (alignModeStr === "liquid_v3") || (alignModeStr === "zenith_v3"),
+                            keepFullFrame: document.getElementById("chk-keep-full-frame") ? document.getElementById("chk-keep-full-frame").checked : false,
+                            targetType: flow.category,
+                            alignRgb: document.getElementById("chk-rgb-align") ? document.getElementById("chk-rgb-align").checked : true,
+                            computePolicy: getComputePolicy(),
+                            decodePolicy: getDecodePolicy(),
+                            qualityPolicy: getQualityPolicy(),
+                            profile: "custom"
+                        }
                     });
+                    b64 = stackResponse.previewSrc;
                 } else {
                     // MODO GLOBAL / STANDARD
                     b64 = await invoke("stack_video", {
@@ -6844,10 +10484,15 @@ if (ui.btnStack) {
                         warpingAnalysis, // NEW
                         anchorOverride: getManualAnchorOverrideValue(),
                         stackingRoi: getStackingRoiOverrideValue(),
-                        normalizeColors: document.getElementById("chk-normalize-colors") ? document.getElementById("chk-normalize-colors").checked : true,
+                        normalizeColors: document.getElementById("chk-normalize-colors")?.checked || false,
                         isV3: flow.isV3 || (alignModeStr === "zenith_v3"), // NEW FLAG
                         keepFullFrame: document.getElementById("chk-keep-full-frame") ? document.getElementById("chk-keep-full-frame").checked : false,
-                        targetType: flow.category
+                        targetType: flow.category,
+                        gpuMode: getGpuMode(),
+                        computePolicy: getComputePolicy(),
+                        decodePolicy: getDecodePolicy(),
+                        alignRgb: document.getElementById("chk-rgb-align")?.checked || false,
+                        qualityPolicy: getQualityPolicy()
                     });
                 }
 
@@ -6860,7 +10505,7 @@ if (ui.btnStack) {
                         btnRoi.classList.remove("primary");
                         btnRoi.style.background = "rgba(16, 185, 129, 0.15)";
                         btnRoi.style.color = "#6ee7b7";
-                        btnRoi.textContent = "📐 Definir Área de Apilado";
+                        btnRoi.innerHTML = `<svg class="zas-icon" style="width:14px; height:14px; fill:none; stroke:currentColor;"><use href="#icon-ruler"></use></svg><span>Definir Área de Apilado</span>`;
                     }
                     const roiBox = document.getElementById("stacking-roi-box");
                     if (roiBox) roiBox.style.display = "none";
@@ -6868,20 +10513,13 @@ if (ui.btnStack) {
 
                 if (ui.viewResult) ui.viewResult.style.display = "flex";
                 if (ui.imgResult) {
-                    await setImageAndWait(ui.imgResult, b64, false);
+                    // Pass the raw temp path/data URL. setImageAndWait performs
+                    // exactly one asset-protocol conversion.
+                    const resultVisible = await setImageAndWait(ui.imgResult, b64, false);
+                    if (!resultVisible) {
+                        throw new Error("El apilado terminó, pero no se pudo publicar su vista previa. El máster de 16 bits permanece intacto.");
+                    }
                     fitToScreen(); // Recenter the viewport symmetrically to feature both images
-                }
-
-                // RE-APLICAR POST-PROCESADO AL NUEVO STACK: el resultado recién
-                // apilado llega CRUDO y lastProcessedParams aún guarda los del
-                // stack anterior — sin esto, la configuración en curso (wavelets,
-                // deconv, color...) no se re-aplicaba hasta tocar un slider (y si
-                // nada cambiaba, ni así). Se resetea el memo y, si hay config
-                // activa (no-neutra), se relanza el pipeline automáticamente.
-                lastProcessedParams = null;
-                if (!isPostConfigNeutral(getPipelineParams())) {
-                    log("INFO", tr("wavelets.reapplying", "Re-aplicando post-procesado al nuevo apilado..."));
-                    triggerUpdate();
                 }
 
                 // PERSISTENCE: Mantener paneles de análisis e info visibles para permitir re-apilado rápido
@@ -6900,10 +10538,7 @@ if (ui.btnStack) {
                     if (btnArr) btnArr.style.display = "none";
                     if (chkGuideWrap) chkGuideWrap.style.display = "none";
 
-                    // HIDE Deringing UI in Stacking Flow (if we ever reuse this for mosaic, but mostly for safety)
-                    if (ui.selDrMode) ui.selDrMode.parentElement.style.display = "none";
-                } else {
-                    // SHOW Deringing UI in Standard Stacking Flow
+                    // Artifact repair is part of every post-processing flow.
                     if (ui.selDrMode) ui.selDrMode.parentElement.style.display = "block";
                 }
 
@@ -6940,7 +10575,7 @@ if (ui.btnStack) {
                     if (pBatchReanalyze) pBatchReanalyze.style.display = "block";
                 }
 
-                resetProcessingParams();
+                await beginNewPostprocessResult(b64, isBatchMode ? "batch" : "stack");
 
                 hideProcessing();
                 const totalTime = (Date.now() - startTime) / 1000;
@@ -7085,7 +10720,16 @@ async function fn_save(format_idx) {
                 masterDenoise: p.masterDenoise,
                 masterDenoiseDetail: p.denoiseDetail,
                 masterDenoiseChroma: p.denoiseChroma,
-                useRgbSharpening: p.useRgbSharpening
+                useRgbSharpening: p.useRgbSharpening,
+                edgeAwareWavelets: p.edgeAwareWavelets,
+                psfFromLimb: p.psfFromLimb,
+                edgeAwareStrength: p.edgeAwareStrength,
+                autoMask: p.autoMask,
+                adaptiveUsm: p.adaptiveUsm,
+                levelsBlack: p.levels.black,
+                levelsWhite: p.levels.white,
+                levelsGamma: p.levels.gamma,
+                advanced: p.advanced
             });
             log("SUCCESS", normalizeBackendText(msg)); showCustomAlert(tr("general.saved", "Guardado"), normalizeBackendText(msg));
         } catch (e) { log("ERROR", "Save: " + e); showCustomAlert("Error", "Error guardando: " + e); }
@@ -7095,8 +10739,33 @@ async function fn_save(format_idx) {
 
 if (ui.btnSavePng) ui.btnSavePng.addEventListener("click", () => fn_save(0));
 if (ui.btnSaveTiff) ui.btnSaveTiff.addEventListener("click", () => fn_save(1));
+// F3: FITS 16-bit de salida (WinJUPOS/derotación, fotometría).
+if (ui.btnSaveFits) ui.btnSaveFits.addEventListener("click", () => fn_save(2));
 
-if (ui.btnToggleLog) ui.btnToggleLog.addEventListener("click", () => ui.consolePanel.classList.toggle("open"));
+function setLogPanelOpen(open) {
+    ui.consolePanel?.classList.toggle("open", !!open);
+    ui.consolePanel?.setAttribute("aria-hidden", String(!open));
+    ui.btnToggleLog?.setAttribute("aria-pressed", String(!!open));
+}
+
+if (ui.btnToggleLog) ui.btnToggleLog.addEventListener("click", () => setLogPanelOpen(!ui.consolePanel?.classList.contains("open")));
+document.getElementById("btn-close-logs")?.addEventListener("click", () => setLogPanelOpen(false));
+document.getElementById("btn-clear-logs")?.addEventListener("click", () => {
+    ui.logContainer?.replaceChildren();
+    const count = document.getElementById("log-entry-count");
+    if (count) count.textContent = "0 eventos";
+});
+document.getElementById("btn-copy-logs")?.addEventListener("click", async () => {
+    const text = Array.from(ui.logContainer?.querySelectorAll(".log-entry") || [])
+        .map((entry) => `[${entry.querySelector(".log-time")?.textContent || ""}] [${entry.dataset.level || "INFO"}] ${entry.querySelector(".log-message")?.textContent || ""}`)
+        .join("\n");
+    try {
+        await navigator.clipboard.writeText(text);
+        if (ui.statusText) ui.statusText.textContent = "Registro copiado.";
+    } catch (error) {
+        log("ERROR", `No se pudo copiar el registro: ${error}`);
+    }
+});
 
 if (ui.btnAnimExport) {
     ui.btnAnimExport.addEventListener("click", async () => {
@@ -7242,12 +10911,26 @@ function log(level, msg) {
         }
     }
 
+    const normalizedLevel = String(level || "INFO").toUpperCase();
     const d = document.createElement("div");
-    d.className = "log-entry"; if (level === "ERROR") d.className += " log-err";
-    d.textContent = `[${new Date().toLocaleTimeString()}] [${level}] ${msg}`;
-    
+    d.className = "log-entry";
+    d.dataset.level = normalizedLevel;
+    if (normalizedLevel === "ERROR") d.className += " log-err";
+    const time = document.createElement("span");
+    time.className = "log-time";
+    time.textContent = new Date().toLocaleTimeString();
+    const levelNode = document.createElement("span");
+    levelNode.className = "log-level";
+    levelNode.textContent = normalizedLevel;
+    const message = document.createElement("span");
+    message.className = "log-message";
+    message.textContent = String(msg);
+    d.append(time, levelNode, message);
+
     ui.logContainer.appendChild(d);
     ui.logContainer.scrollTop = ui.logContainer.scrollHeight;
+    const count = document.getElementById("log-entry-count");
+    if (count) count.textContent = `${ui.logContainer.children.length} eventos`;
 }
 window.log = log;
 
@@ -7267,13 +10950,51 @@ function updateChartViz() {
         dataToShow = currentGraphData;
     }
 
-    drawChart(dataToShow, currentRecommendedPct, isSorted);
+    // drawChart es asincrono (carga la libreria bajo demanda); nadie espera su
+    // resultado, asi que absorbemos aqui cualquier fallo para no generar un
+    // rechazo sin gestionar.
+    drawChart(dataToShow, currentRecommendedPct, isSorted).catch((e) => {
+        console.error("Zenith: fallo al dibujar la grafica de calidad —", e);
+    });
 }
 
-function drawChart(data, cutVal, isSorted) {
+// Carga perezosa de Chart.js + su plugin de anotaciones. El import dinamico
+// resuelve contra un chunk local del bundle: sigue sin haber ninguna peticion
+// de red. Se cachea la promesa para no reimportar en cada redibujado.
+let chartLibPromise = null;
+function loadChartLib() {
+    if (!chartLibPromise) {
+        chartLibPromise = Promise.all([
+            import("chart.js/auto"),
+            import("chartjs-plugin-annotation"),
+        ]).then(([chartMod, annotationMod]) => {
+            const ChartCtor = chartMod.Chart || chartMod.default;
+            ChartCtor.register(annotationMod.default || annotationMod);
+            return ChartCtor;
+        }).catch((e) => {
+            // Que no quede cacheada una promesa rechazada: reintentar en el
+            // proximo redibujado en vez de dejar la grafica muerta para siempre.
+            chartLibPromise = null;
+            throw e;
+        });
+    }
+    return chartLibPromise;
+}
+
+async function drawChart(data, cutVal, isSorted) {
     const canvas = document.getElementById('qualityChart');
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
+
+    let Chart;
+    try {
+        Chart = await loadChartLib();
+    } catch (e) {
+        // La grafica es prescindible: si la libreria no carga se pierde el
+        // dibujo, no el analisis ni el resto de la interfaz.
+        console.error("Zenith: no se pudo cargar Chart.js —", e);
+        return;
+    }
 
     if (chartInstance) chartInstance.destroy();
 
@@ -7324,7 +11045,7 @@ function drawChart(data, cutVal, isSorted) {
                 borderWidth: 1.5,
                 borderDash: [3, 4],
                 label: {
-                    content: `⭐ ${analysisSuggestedPct.toFixed(0)}%`,
+                    content: `★ ${analysisSuggestedPct.toFixed(0)}%`,
                     display: true,
                     position: 'end',
                     backgroundColor: 'rgba(120, 53, 15, 0.85)',
@@ -7469,6 +11190,21 @@ listen("log_event", (e) => log(e.payload.level, e.payload.msg));
 listen("backend_panic", (e) => {
     const msg = (e && e.payload != null) ? String(e.payload) : "Error interno";
     log("ERROR", "Backend panic: " + msg);
+    // DESBLOQUEO UI: tras un panic en el backend la promesa del invoke nunca
+    // se resuelve — el finally del handler de apilado no corre, y el overlay
+    // "APILANDO FRAMES..." + el boton deshabilitado quedaban fijos hasta
+    // reiniciar la app. Restaurar aqui todos los controles de proceso.
+    try {
+        hideProcessing();
+        hideLocalProcessing();
+        if (typeof stopStackingTimer === "function") stopStackingTimer();
+        if (typeof stopTipsCarousel === "function") stopTipsCarousel();
+        if (typeof dsStacking !== "undefined" && dsStacking && typeof dsProgressStop === "function") {
+            dsProgressStop();
+        }
+        if (ui.btnStack) ui.btnStack.disabled = false;
+        if (ui.btnBatchRun) ui.btnBatchRun.disabled = false;
+    } catch (_) { }
     try {
         showCustomAlert(
             tr("general.backend_panic_title", "Error inesperado"),
@@ -7486,10 +11222,100 @@ listen("ds-report", (e) => {
     if (btn) btn.style.display = dsFrameReport && dsFrameReport.length ? "inline-flex" : "none";
 });
 
+// Estadísticas de calidad del máster (estrellas, FWHM, SNR, rechazo, cobertura).
+let dsMasterStats = null;
+listen("ds-master-stats", (e) => {
+    dsMasterStats = e.payload || null;
+    if (typeof dsUpdateHistogram === "function") { try { dsUpdateHistogram(); } catch (_) { } }
+});
+
+// TELEMETRIA EN VIVO del apilado: modo GPU/CPU, rendimiento y recursos.
+// El backend la emite cada ~25 frames; se muestra bajo la barra del overlay
+// y el ultimo snapshot alimenta el bloque GPU del reporte final.
+let _lastStackTelemetry = null;
+let _lastPipelineTelemetry = null;
+listen("pipeline_telemetry", (e) => {
+    const t = e.payload || {};
+    _lastPipelineTelemetry = t;
+    window._lastPipelineTelemetry = t;
+    if (typeof dsStacking !== "undefined" && dsStacking && t.domain === "deep_sky") {
+        const eta = Number.isFinite(t.eta_seconds) ? ` · ETA ${dsFmtClock(t.eta_seconds * 1000)}` : "";
+        const engine = t.engine ? ` · ${t.engine}` : "";
+        const cur = document.getElementById("ds-prog-current");
+        if (cur) cur.textContent = `${t.phase || "Proceso"}${engine}${eta}`;
+        if (typeof dsProgressPhaseUpdate === "function") {
+            dsProgressPhaseUpdate(t.phase || "", t.phase === "complete");
+        }
+        const resources = document.getElementById("ds-prog-resources");
+        if (resources) {
+            const throughput = Number.isFinite(t.throughput) ? `${t.throughput.toFixed(1)} elem/s` : "—";
+            const pct = (v) => Number.isFinite(v) ? `${v.toFixed(0)}%` : "—";
+            resources.style.display = "grid";
+            resources.innerHTML = `<span>Rendimiento <b style="color:#e2e8f0">${throughput}</b></span>
+                <span>CPU <b style="color:#e2e8f0">${pct(t.cpu_percent)}</b></span>
+                <span>GPU <b style="color:#e2e8f0">${pct(t.gpu_percent)}</b></span>
+                <span>RAM <b style="color:#e2e8f0">${t.ram_mb || 0} MB</b></span>
+                <span>VRAM <b style="color:#e2e8f0">${t.vram_mb || 0} MB</b></span>
+                <span>I/O <b style="color:#e2e8f0">${(t.io_read_mb || 0).toFixed(1)}/${(t.io_write_mb || 0).toFixed(1)} MB</b></span>
+                <span>Caché <b style="color:#e2e8f0">${t.cache_hits || 0}/${(t.cache_hits || 0) + (t.cache_misses || 0)}</b></span>
+                <span>Motor <b style="color:#e2e8f0">${escapeHtml(t.engine || "—")}</b></span>`;
+        }
+        const warning = document.getElementById("ds-prog-warning");
+        if (warning) {
+            warning.style.display = t.fallback_reason ? "block" : "none";
+            warning.textContent = t.fallback_reason ? `Fallback: ${t.fallback_reason}` : "";
+        }
+    }
+});
+listen("stack_telemetry", (e) => {
+    const t = e.payload || {};
+    _lastStackTelemetry = t;
+    const box = document.getElementById("stack-telemetry");
+    const modeEl = document.getElementById("stack-telemetry-mode");
+    const grid = document.getElementById("stack-telemetry-grid");
+    if (!box || !modeEl || !grid) return;
+    box.style.display = "block";
+    const isAnalysis = t.phase === "analysis";
+    const decodeGpu = t.decode_gpu === true || (t.mode || "").includes("HW-GPU");
+    const computeGpu = t.compute_gpu === true || (t.mode || "").includes("preprocess GPU");
+    const isGpu = (t.mode || "").startsWith("GPU") || computeGpu;
+    // Iconos SVG del sistema (mismos que el resto de la app) — no emojis.
+    const svgIcon = (id) =>
+        `<svg class="zas-icon" style="width:1em;height:1em;vertical-align:-0.14em;"><use href="#${id}"></use></svg>`;
+    const iconId = isAnalysis ? "icon-search" : (isGpu ? "icon-lightning" : "icon-settings");
+    const verb = isAnalysis ? "Análisis" : "Acumulación";
+    modeEl.innerHTML = `${svgIcon(iconId)} ${verb}: ${escapeHtml(t.mode || "—")}`;
+    modeEl.style.color = isAnalysis ? "#c084fc" : (isGpu ? "#34d399" : "#38bdf8");
+    const pair = (k, v) =>
+        `<span style="color:#64748b;">${k}</span><span style="color:#e2e8f0;">${v}</span>`;
+    const rows = [
+        pair("Frames", `${t.frames_done}/${t.frames_total}`),
+        pair("Velocidad", `${(t.fps || 0).toFixed(1)} fps`),
+        pair(isAnalysis ? "Análisis/f" : "Alineación", `${(t.align_ms || 0).toFixed(1)} ms/f`),
+    ];
+    if (isAnalysis) {
+        // El modo trae "decode HW-GPU" cuando FFmpeg decodifica por hardware.
+        rows.push(pair("Decode", decodeGpu ? `${svgIcon("icon-lightning")} HW-GPU` : "CPU/mmap"));
+        rows.push(pair("Cómputo", computeGpu ? `${svgIcon("icon-lightning")} GPU por lotes` : "CPU SIMD"));
+    } else {
+        rows.push(pair(isGpu ? "GPU acum." : "Acumulación", isGpu ? `${(t.accum_ms || 0).toFixed(1)} ms/f` : "en CPU"));
+    }
+    rows.push(
+        pair("RAM", `${t.ram_mb || 0} MB`),
+        pair("VRAM", isGpu ? `${t.vram_mb || 0} MB` : "—"),
+        pair("Upload", isGpu ? `${(t.upload_mbps || 0).toFixed(0)} MB/s` : "—"),
+        pair(isAnalysis ? "Hilos" : "Caché/Hilos", isAnalysis ? `${t.threads || 0}` : `${t.cache_hits || 0} · ${t.threads || 0}`),
+    );
+    grid.innerHTML = rows.join("");
+});
+
 listen("progress", (e) => {
     const step = translateBackendProgressText(e.payload.step);
     const details = translateBackendProgressText(e.payload.details);
-    const pct = Number(e.payload.pct ?? 0);
+    // El backend ya satura a [0,100]; este clamp evita que cualquier payload
+    // no numérico o fuera de rango deje la barra congelada o desbordada.
+    const rawPct = Number(e.payload.pct);
+    const pct = Number.isFinite(rawPct) ? Math.max(0, Math.min(100, rawPct)) : 0;
 
     // Cielo Profundo: ventana WBPP dedicada (no la pantalla de carga genérica).
     if (typeof dsStacking !== "undefined" && dsStacking) {
@@ -7602,7 +11428,7 @@ if (ui.btnAnimCancel) {
 // I18N INITIALIZATION
 // =========================================================================
 
-(async () => {
+const i18nReady = (async () => {
     try {
         await i18n.init();
 
@@ -7658,6 +11484,16 @@ window.addEventListener("languageChanged", (e) => {
     if (divAnimFrameManager?.style.display !== "none") {
         renderFrameManager();
     }
+    updateDeconvolutionStatus();
+    updateSolarUiState();
+    renderObjectFinishingStatus();
+    updatePostHistoryUi();
+    updateZenithGuide();
+    paintAssistantPrimaryAction();
+    if (document.getElementById("deepsky-modal")?.style.display !== "none") {
+        dsRenderSections(true);
+        dsUpdateUI();
+    }
 });
 
 // =========================================================================
@@ -7697,6 +11533,9 @@ window.drawGrid = function (points, imgW, imgH) {
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
 
+    const getX = (p) => (typeof p.x !== 'undefined') ? p.x : p[0];
+    const getY = (p) => (typeof p.y !== 'undefined') ? p.y : p[1];
+
     // 1. MESH CONNECTIONS (The Energy Net)
     if (points.length > 0) {
         // Handle size from object or array
@@ -7716,27 +11555,43 @@ window.drawGrid = function (points, imgW, imgH) {
         ctx.shadowBlur = 15;
         ctx.shadowColor = "rgba(0, 100, 255, 0.8)";
 
-        // Performance Limit
+        // Performance limit. La implementación anterior comparaba cada punto
+        // con todos los siguientes (O(N²)); una malla de 4 000 AP hacía casi
+        // ocho millones de comparaciones en el hilo de la UI y parecía que la
+        // generación seguía bloqueada. Una rejilla espacial conserva
+        // exactamente las mismas aristas dentro de connectDist en O(N·k).
         if (points.length < 5000) {
+            const cellSize = Math.max(1, connectDist);
+            const buckets = new Map();
+            const bucketKey = (cx, cy) => `${cx},${cy}`;
             for (let i = 0; i < points.length; i++) {
-                const p1 = points[i];
-                const x1 = (typeof p1.x !== 'undefined') ? p1.x : p1[0];
-                const y1 = (typeof p1.y !== 'undefined') ? p1.y : p1[1];
-
-                // Check forward only
-                for (let j = i + 1; j < points.length; j++) {
-                    const p2 = points[j];
-                    const x2 = (typeof p2.x !== 'undefined') ? p2.x : p2[0];
-                    const y2 = (typeof p2.y !== 'undefined') ? p2.y : p2[1];
-
-                    const dx = x1 - x2;
-                    const dy = y1 - y2;
-
-                    if (Math.abs(dx) > connectDist || Math.abs(dy) > connectDist) continue;
-
-                    if ((dx * dx + dy * dy) < connectDistSq) {
-                        ctx.moveTo(x1, y1);
-                        ctx.lineTo(x2, y2);
+                const cx = Math.floor(getX(points[i]) / cellSize);
+                const cy = Math.floor(getY(points[i]) / cellSize);
+                const key = bucketKey(cx, cy);
+                const bucket = buckets.get(key);
+                if (bucket) bucket.push(i);
+                else buckets.set(key, [i]);
+            }
+            for (let i = 0; i < points.length; i++) {
+                const x1 = getX(points[i]);
+                const y1 = getY(points[i]);
+                const cx = Math.floor(x1 / cellSize);
+                const cy = Math.floor(y1 / cellSize);
+                for (let by = cy - 1; by <= cy + 1; by++) {
+                    for (let bx = cx - 1; bx <= cx + 1; bx++) {
+                        const bucket = buckets.get(bucketKey(bx, by));
+                        if (!bucket) continue;
+                        for (const j of bucket) {
+                            if (j <= i) continue;
+                            const x2 = getX(points[j]);
+                            const y2 = getY(points[j]);
+                            const dx = x1 - x2;
+                            const dy = y1 - y2;
+                            if ((dx * dx + dy * dy) < connectDistSq) {
+                                ctx.moveTo(x1, y1);
+                                ctx.lineTo(x2, y2);
+                            }
+                        }
                     }
                 }
             }
@@ -7751,10 +11606,6 @@ window.drawGrid = function (points, imgW, imgH) {
     ctx.shadowBlur = 8;
     ctx.shadowColor = "#00ffff"; // Cyan Glow
     ctx.fillStyle = "rgba(0, 180, 255, 0.6)";
-
-    // Helper to get coords
-    const getX = (p) => (typeof p.x !== 'undefined') ? p.x : p[0];
-    const getY = (p) => (typeof p.y !== 'undefined') ? p.y : p[1];
 
     ctx.beginPath();
     // 2. NODES (The Data Points)
@@ -7880,13 +11731,7 @@ function renderFrameManager() {
 
         const img = document.createElement("img");
         // Ensure src is valid (convert if needed) matches startAnimationPlayer logic
-        let imgSrc = src;
-        if (typeof src === 'string' && src.startsWith("data:")) {
-            imgSrc = src;
-        } else {
-            imgSrc = convertFileSrc(src);
-        }
-        img.src = imgSrc;
+        img.src = toAnimationSrc(src);
 
         img.style.width = "100%";
         img.style.height = "100%";
@@ -7916,7 +11761,7 @@ function renderFrameManager() {
 
         // X Icon for excluded
         const icon = document.createElement("span");
-        icon.innerHTML = "✕";
+        icon.innerHTML = '<svg class="zas-icon zas-icon-inline" style="width:1em;height:1em;"><use href="#icon-cross"></use></svg>';
         icon.style.fontSize = "3rem";
         icon.style.color = "#ef4444";
         icon.style.fontWeight = "bold";
@@ -8127,15 +11972,25 @@ updateAlignModeUI();
 // con diagnóstico, e integración σ-clip. El resultado LINEAL entra al
 // mismo pipeline de post-procesado que los apilados planetarios.
 // ============================================================
-const dsFiles = { lights: [], darks: [], flats: [], bias: [] }; // DsProbe[]
+const DEEP_SKY_STACK_REQUEST_SCHEMA_VERSION = 4;
+const dsFiles = { lights: [], darks: [], flats: [], darkFlats: [], bias: [] }; // DsProbe[]
 let dsSelectedGroup = null; // keyword activa o null = todos
 
 const DS_SECTIONS = [
     { kind: "lights", icon: "icon-sequence", labelKey: "deepsky.pick_lights", fallback: "Lights (imágenes del objeto)", iconBg: "rgba(99,102,241,0.18)", iconColor: "#a5b4fc" },
     { kind: "darks", icon: "icon-moon", labelKey: "deepsky.pick_darks", fallback: "Darks (opcional)", iconBg: "rgba(100,116,139,0.18)", iconColor: "#94a3b8" },
     { kind: "flats", icon: "icon-lightbulb", labelKey: "deepsky.pick_flats", fallback: "Flats (opcional)", iconBg: "rgba(245,158,11,0.15)", iconColor: "#fbbf24" },
+    { kind: "darkFlats", icon: "icon-moon", labelKey: "deepsky.pick_dark_flats", fallback: "Dark-flats (opcional)", iconBg: "rgba(168,85,247,0.14)", iconColor: "#c4b5fd" },
     { kind: "bias", icon: "icon-film", labelKey: "deepsky.pick_bias", fallback: "Bias (opcional)", iconBg: "rgba(6,182,212,0.15)", iconColor: "#67e8f9" }
 ];
+
+// Suma tomas escaneadas a las ya cargadas, deduplicando por RUTA: una sesión
+// real vive en varias carpetas (una por noche, o lights y calibración aparte) y
+// escanear la segunda no puede borrar la primera. Reescanear la misma carpeta
+// no duplica nada. Devuelve cuántas entraron y cuántas ya estaban.
+function dsMergeScannedFiles(scanned) {
+    return mergeClassifiedDeepSkyFrames(dsFiles, scanned);
+}
 
 function dsKeywords() {
     const raw = document.getElementById("ds-keywords")?.value || "";
@@ -8152,9 +12007,9 @@ function dsActiveLights() {
     return dsFiles.lights.filter(f => f.ok && f.name.toLowerCase().includes(dsSelectedGroup));
 }
 
-// Calibración emparejada: si hay grupo activo, se prefieren los archivos de
-// calibración que contengan la misma palabra clave; los que no llevan NINGUNA
-// keyword se consideran globales (sirven para todos los grupos).
+// Pool PRELIMINAR por etiqueta de sesión. Una coincidencia de nombre nunca
+// significa compatibilidad científica: el preflight del backend decide por la
+// CalibrationSignature completa y puede bloquear cualquiera de estos raws.
 function dsMatchedCalib(kind) {
     const all = dsFiles[kind].filter(f => f.ok);
     if (!dsSelectedGroup) return all;
@@ -8178,8 +12033,9 @@ function dsRenderFileList(container, kind, files, lightsRef) {
         row.draggable = true;
         row.dataset.kind = kind;
         row.dataset.path = f.path;
-        // Grid: drag · estado · nombre COMPLETO · dims · exp · tags · borrar.
-        row.style.cssText = "display:grid; grid-template-columns:12px 14px minmax(0,1fr) 76px 48px auto 18px; align-items:center; gap:7px; padding:3px 4px; font-size:0.64rem; color:#94a3b8; font-family:'Courier New',monospace; border-radius:6px; cursor:grab;";
+        // Grid: drag · estado · nombre · dims · exp · tags · alternativa de
+        // reclasificación por teclado · borrar.
+        row.style.cssText = "display:grid; grid-template-columns:12px 14px minmax(0,1fr) 76px 48px auto 86px 24px; align-items:center; gap:7px; padding:3px 4px; font-size:0.64rem; color:#94a3b8; font-family:'Courier New',monospace; border-radius:6px; cursor:grab;";
         row.addEventListener("mouseenter", () => { row.style.background = "rgba(124,58,237,0.10)"; });
         row.addEventListener("mouseleave", () => { row.style.background = "transparent"; });
         row.addEventListener("dragstart", (e) => {
@@ -8190,13 +12046,17 @@ function dsRenderFileList(container, kind, files, lightsRef) {
         row.addEventListener("dragend", () => { row.style.opacity = "1"; });
 
         const grip = document.createElement("span");
-        grip.textContent = "⠿";
+        grip.innerHTML = '<svg class="zas-icon zas-icon-inline"><use href="#icon-grip"></use></svg>';
+        grip.setAttribute("aria-hidden", "true");
         grip.style.color = "#475569";
         let warn = "";
         if (!f.ok) { warn = f.error || "ilegible"; }
         else if (lightsRef && (f.w !== lightsRef.w || f.h !== lightsRef.h)) { warn = tr("deepsky.warn_dims", "dims ≠"); }
         const status = document.createElement("span");
-        status.textContent = f.ok && !warn ? "✓" : "⚠";
+        // Iconos del sprite zas-icon (regla del proyecto: nunca emoji).
+        status.innerHTML = f.ok && !warn
+            ? '<svg class="zas-icon zas-icon-inline"><use href="#icon-check"></use></svg>'
+            : '<svg class="zas-icon zas-icon-inline"><use href="#icon-warning"></use></svg>';
         status.style.color = f.ok && !warn ? "#34d399" : "#f59e0b";
         status.title = warn;
         const name = document.createElement("span");
@@ -8211,17 +12071,36 @@ function dsRenderFileList(container, kind, files, lightsRef) {
         exp.style.cssText = "text-align:right;";
         const tags = document.createElement("span");
         const parts = dsFileGroups(f);
+        const ff = dsFilterOfFile(f); // filtro por metadata O nombre
+        if (ff) parts.unshift(dsFilterLabel(ff));
         if (f.bayer) parts.unshift(f.bayer);
+        if (f.temp !== null && f.temp !== undefined) parts.push(`${f.temp.toFixed(0)}°`);
+        if (f.gain !== null && f.gain !== undefined) parts.push(`g${Math.round(f.gain)}`);
         tags.textContent = parts.join(" ");
         tags.style.cssText = "color:#7dd3fc; text-align:right; white-space:nowrap;";
-        const del = document.createElement("span");
-        del.textContent = "✕";
+        const move = document.createElement("select");
+        move.setAttribute("aria-label", `${tr("deepsky.reclassify", "Reclasificar")}: ${f.name}`);
+        move.title = tr("deepsky.reclassify", "Reclasificar");
+        move.style.cssText = "min-width:0; width:86px; height:25px; padding:1px 3px; border:1px solid #334155; border-radius:6px; background:#0f172a; color:#94a3b8; font:0.58rem 'Courier New',monospace;";
+        DS_SECTIONS.forEach(section => {
+            const option = document.createElement("option");
+            option.value = section.kind;
+            option.textContent = section.kind.toUpperCase();
+            option.selected = section.kind === kind;
+            move.appendChild(option);
+        });
+        move.addEventListener("click", e => e.stopPropagation());
+        move.addEventListener("change", e => dsMoveFile(kind, f.path, e.target.value));
+        const del = document.createElement("button");
+        del.type = "button";
+        del.innerHTML = '<svg class="zas-icon zas-icon-inline"><use href="#icon-cross"></use></svg>';
         del.title = tr("deepsky.remove_file", "Quitar este archivo");
-        del.style.cssText = "color:#64748b; cursor:pointer; text-align:center;";
+        del.setAttribute("aria-label", `${del.title}: ${f.name}`);
+        del.style.cssText = "width:24px; min-width:24px; height:24px; padding:0; border:0; background:transparent; color:#64748b; cursor:pointer; text-align:center;";
         del.addEventListener("click", (e) => { e.stopPropagation(); if (idx >= 0) { dsFiles[kind].splice(idx, 1); dsUpdateUI(); } });
         del.addEventListener("mouseenter", () => { del.style.color = "#f87171"; });
         del.addEventListener("mouseleave", () => { del.style.color = "#64748b"; });
-        row.append(grip, status, name, dims, exp, tags, del);
+        row.append(grip, status, name, dims, exp, tags, move, del);
         container.appendChild(row);
     });
     if (files.length > shown.length) {
@@ -8243,32 +12122,102 @@ function dsMoveFile(fromKind, path, toKind) {
     dsUpdateUI();
 }
 
-function dsRenderSections() {
+function dsRenderSections(force = false) {
     const host = document.getElementById("ds-sections");
-    if (!host || host.dataset.built) return;
+    const actionHost = document.getElementById("ds-session-actions");
+    if (!host || !actionHost) return;
+    if (force) {
+        host.innerHTML = "";
+        actionHost.innerHTML = "";
+        delete host.dataset.built;
+        delete actionHost.dataset.built;
+    }
+    if (host.dataset.built) return;
     host.dataset.built = "1";
+    actionHost.dataset.built = "1";
 
     // Botón de auto-clasificación de carpeta (una sola carpeta raíz →
-    // lights/darks/flats/bias por palabras clave del nombre, recursivo).
+    // lights/darks/flats/dark-flats/bias por palabras clave, recursivo).
     const auto = document.createElement("button");
+    auto.id = "btn-ds-scan-folder";
     auto.type = "button";
-    auto.className = "donation-option";
-    auto.style.cssText = "width:100%; min-height:52px; margin:0 0 4px;";
+    auto.className = "ds-session-action ds-session-action-import";
     auto.innerHTML = `
-        <span class="donation-option-icon" style="background:rgba(124,58,237,0.18); color:#c4b5fd; width:36px; height:36px;">
-            <svg class="zas-icon" style="width:18px; height:18px;"><use href="#icon-folder"></use></svg>
+        <span class="ds-session-action-icon" aria-hidden="true">
+            <svg class="zas-icon"><use href="#icon-search"></use></svg>
         </span>
-        <span class="donation-option-copy" style="min-width:0;">
-            <strong data-i18n="deepsky.scan_folder" style="letter-spacing:0.05em;">Escanear carpeta (auto-clasificar)</strong>
-            <small data-i18n="deepsky.scan_folder_hint">Detecta lights/darks/flats/bias en subcarpetas por nombre</small>
+        <span class="ds-session-action-copy">
+            <span class="ds-session-action-kicker">${escapeHtml(tr("deepsky.source_action", "1 · Origen"))}</span>
+            <strong>${escapeHtml(tr("deepsky.scan_folder", "Escanear carpeta (auto-clasificar)"))}</strong>
+            <small>${escapeHtml(tr("deepsky.scan_folder_hint", "Lee IMAGETYP; usa carpetas y nombres como respaldo seguro"))}</small>
+        </span>
+        <span class="ds-session-action-trail">
+            <span class="ds-session-action-cta">${escapeHtml(tr("deepsky.scan_action", "Elegir y escanear"))}</span>
         </span>`;
     auto.addEventListener("click", dsScanFolder);
-    host.appendChild(auto);
+    actionHost.appendChild(auto);
+
+    // CARPETA DE TRABAJO Y SALIDA (estilo PixInsight): cachés de calibración
+    // (varios GB), masters y exportaciones van aquí — imprescindible cuando el
+    // disco del sistema anda justo. Persistente en localStorage.
+    const workBtn = document.createElement("button");
+    workBtn.id = "btn-ds-work-folder";
+    workBtn.type = "button";
+    workBtn.className = "ds-session-action ds-session-action-output";
+    const renderWorkDir = async () => {
+        const dir = localStorage.getItem("zas_ds_workdir") || "";
+        let space = "";
+        if (dir) {
+            try {
+                const info = await invoke("disk_space_info", { path: dir });
+                space = ` · ${trFormat(
+                    "deepsky.free_space_gb",
+                    { amount: (info.availableMb / 1024).toFixed(1) },
+                    "{{amount}} GB libres",
+                )}`;
+            } catch (_) { }
+        }
+        workBtn.dataset.configured = dir ? "true" : "false";
+        workBtn.title = dir
+            ? tr("deepsky.work_dir_change_hint", "Clic para cambiar la carpeta de trabajo y salida")
+            : tr("deepsky.work_dir_choose_hint", "Clic para elegir dónde guardar cachés, masters y exportaciones");
+        workBtn.innerHTML = `
+        <span class="ds-session-action-icon" aria-hidden="true">
+            <svg class="zas-icon"><use href="#icon-save"></use></svg>
+        </span>
+        <span class="ds-session-action-copy">
+            <span class="ds-session-action-kicker">${escapeHtml(tr("deepsky.destination_action", "2 · Destino"))}</span>
+            <strong>${escapeHtml(tr("deepsky.work_dir", "Carpeta de trabajo y salida"))}</strong>
+            <small>${dir ? escapeHtml(dir) : escapeHtml(tr("deepsky.work_dir_hint", "Junto a los lights; elige otro disco para cachés, masters y exportaciones"))}</small>
+        </span>
+        <span class="ds-session-action-trail">
+            ${space ? `<span class="ds-session-action-space">${escapeHtml(space.replace(/^\s*·\s*/, ""))}</span>` : ""}
+            <span class="ds-session-action-cta">${escapeHtml(tr(dir ? "deepsky.change_action" : "deepsky.choose_action", dir ? "Cambiar" : "Elegir carpeta"))}</span>
+        </span>`;
+    };
+    workBtn.addEventListener("click", async () => {
+        const dir = await openDialog({ directory: true, multiple: false, title: tr("deepsky.work_dir_pick", "Carpeta de trabajo y salida (cachés, masters y exportaciones)") });
+        if (dir === null) return;
+        if (dir) localStorage.setItem("zas_ds_workdir", dir);
+        await renderWorkDir();
+        dsSchedulePreflight(true);
+        log("INFO", `Carpeta de trabajo: ${dir}`);
+    });
+    workBtn.addEventListener("contextmenu", async (e) => {
+        e.preventDefault();
+        localStorage.removeItem("zas_ds_workdir");
+        await renderWorkDir();
+        log("INFO", "Carpeta de trabajo restablecida (junto a los lights).");
+    });
+    renderWorkDir();
+    actionHost.appendChild(workBtn);
 
     for (const s of DS_SECTIONS) {
+        const sectionLabel = tr(s.labelKey, s.fallback);
         const wrap = document.createElement("div");
+        wrap.className = "ds-source-kind";
         wrap.dataset.kind = s.kind;
-        wrap.style.cssText = "display:flex; flex-direction:column; gap:4px; border-radius:12px; transition:background 0.15s, box-shadow 0.15s;";
+        wrap.style.cssText = "display:flex; flex-direction:column; gap:4px; transition:background 0.15s, box-shadow 0.15s;";
         // Zona de soltado: arrastrar un archivo aquí lo reclasifica.
         wrap.addEventListener("dragover", (e) => { e.preventDefault(); wrap.style.boxShadow = "inset 0 0 0 2px #7c3aed"; wrap.style.background = "rgba(124,58,237,0.06)"; });
         wrap.addEventListener("dragleave", () => { wrap.style.boxShadow = "none"; wrap.style.background = "transparent"; });
@@ -8289,11 +12238,11 @@ function dsRenderSections() {
         btn.className = "donation-option";
         btn.style.cssText = "flex:1 1 auto; width:auto; min-width:0; margin:0;";
         btn.innerHTML = `
-            <span class="donation-option-icon" style="background:${s.iconBg}; color:${s.iconColor};">
-                <svg class="zas-icon" style="width:18px; height:18px;"><use href="#${s.icon}"></use></svg>
+            <span class="donation-option-icon" style="background:${s.iconBg}; color:${s.iconColor}; display:inline-flex; align-items:center; justify-content:center; flex:none;">
+                <svg class="zas-icon" style="width:18px; height:18px; display:block;"><use href="#${s.icon}"></use></svg>
             </span>
             <span class="donation-option-copy" style="min-width:0;">
-                <strong data-i18n="${s.labelKey}" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${s.fallback}</strong>
+                <strong style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(sectionLabel)}</strong>
                 <small id="ds-${s.kind}-sub">${tr("deepsky.no_files", "Sin archivos")}</small>
             </span>
             <span id="ds-${s.kind}-count"
@@ -8303,26 +12252,2248 @@ function dsRenderSections() {
         // carpeta se asignan a esta categoría).
         const folder = document.createElement("button");
         folder.type = "button";
+        folder.className = "ds-kind-action";
+        folder.dataset.action = "folder";
         folder.title = tr("deepsky.pick_folder", "Cargar carpeta (recursivo)");
-        folder.innerHTML = `<svg class="zas-icon" style="width:14px;height:14px;"><use href="#icon-folder"></use></svg>`;
-        folder.style.cssText = "flex:0 0 auto; width:auto; background:none; border:1px solid #334155; color:#94a3b8; border-radius:8px; padding:6px 9px; cursor:pointer; display:flex; align-items:center;";
+        folder.setAttribute("aria-label", `${folder.title}: ${sectionLabel}`);
+        folder.innerHTML = `<svg class="zas-icon zas-icon-inline"><use href="#icon-folder"></use></svg>`;
         folder.addEventListener("click", () => dsPickFolder(s.kind));
 
         const clear = document.createElement("button");
         clear.type = "button";
+        clear.className = "ds-kind-action";
+        clear.dataset.action = "clear";
         clear.title = tr("deepsky.clear", "Limpiar");
-        clear.textContent = "✕";
-        clear.style.cssText = "flex:0 0 auto; width:auto; background:none; border:1px solid #334155; color:#64748b; border-radius:8px; padding:6px 10px; cursor:pointer; font-size:0.7rem;";
+        clear.setAttribute("aria-label", `${clear.title}: ${sectionLabel}`);
+        clear.innerHTML = '<svg class="zas-icon zas-icon-inline"><use href="#icon-cross"></use></svg>';
         clear.addEventListener("click", () => { dsFiles[s.kind] = []; dsUpdateUI(); });
 
         rowTop.append(btn, folder, clear);
+        const details = document.createElement("details");
+        details.id = `ds-details-${s.kind}`;
+        details.hidden = true;
+        const summary = document.createElement("summary");
+        summary.id = `ds-details-summary-${s.kind}`;
+        summary.textContent = trFormat("deepsky.view_files", { count: 0 }, "Ver 0 archivos");
         const list = document.createElement("div");
         list.id = `ds-list-${s.kind}`;
-        list.style.cssText = "display:none; max-height:190px; overflow-y:auto; margin:2px 4px 0; border-left:2px solid rgba(124,58,237,0.25); padding:2px 4px 2px 8px;";
-        wrap.append(rowTop, list);
+        list.style.cssText = "max-height:240px; overflow-y:auto; margin:5px 0 0; border-left:2px solid rgba(124,58,237,0.25); padding:2px 4px 2px 8px;";
+        details.append(summary, list);
+        wrap.append(rowTop, details);
         host.appendChild(wrap);
         btn.addEventListener("click", () => dsPick(s.kind));
     }
+}
+
+// ---- Vista preliminar estilo WBPP. Sólo presenta candidatos por etiqueta,
+// filtro y exposición; la matriz tipada del backend es la autoridad sobre la
+// compatibilidad de sensor/read-mode/gain/offset/binning/ROI/CFA/temperatura. ----
+function dsExpKey(f) {
+    if (f.exptime === null || f.exptime === undefined) return "?";
+    return f.exptime >= 10 ? String(Math.round(f.exptime)) : String(Math.round(f.exptime * 10) / 10);
+}
+function dsExactExposureMatch(a, b) {
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+    const tolerance = Math.max(0.001, Math.max(Math.abs(a), Math.abs(b)) * 1e-6);
+    return Math.abs(a - b) <= tolerance;
+}
+// Filtro canónico por TOKEN (mismo criterio que el backend). Las variantes
+// dual-band se detectan antes que las líneas individuales.
+function dsFilterToken(str) {
+    if (!str) return null;
+    const tokens = String(str).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    const has = (...values) => tokens.some(token => values.includes(token));
+    const hasHa = has("ha", "halpha", "h2");
+    const hasOiii = has("oiii", "o3");
+    const hasSii = has("sii", "s2");
+    const sv220 = has("sv220");
+    if (hasSii && (hasOiii || sv220)) return "SII_OIII";
+    if ((hasHa && hasOiii) || (sv220 && !hasSii)) return "HA_OIII";
+    for (const tok of tokens) {
+        switch (tok) {
+            case "ha": case "halpha": case "h2": return "HA";
+            case "oiii": case "o3": return "OIII";
+            case "sii": case "s2": return "SII";
+            case "r": case "red": case "rojo": return "R";
+            case "g": case "green": case "verde": return "G";
+            case "b": case "blue": case "azul": return "B";
+            case "l": case "lum": case "luminance": case "luminancia": return "L";
+        }
+    }
+    return null;
+}
+function dsFilterLabel(filter) {
+    return ({ HA_OIII: "Ha + OIII", SII_OIII: "SII + OIII", HA: "Ha" })[filter]
+        || filter
+        || tr("deepsky.broadband_osc", "Banda ancha / OSC");
+}
+function dsFilterComponents(filter) {
+    if (filter === "HA_OIII") return ["HA", "OIII"];
+    if (filter === "SII_OIII") return ["SII", "OIII"];
+    return filter ? [filter] : [];
+}
+// Filtro de UN archivo: cabecera FITS FILTER primero (autoritativa), nombre de
+// archivo como respaldo. null = banda ancha / OSC (sin filtro nombrado).
+function dsFilterOfFile(f) {
+    const metadata = dsFilterToken(f.filter);
+    const filename = dsFilterToken(f.name) || dsFilterToken(f.path);
+    // FILTER=SV220 es ambiguo: la variante SII+OIII suele sobrevivir sólo en
+    // el nombre generado por la sesión de captura.
+    if (metadata === "HA_OIII" && filename === "SII_OIII") return filename;
+    return metadata || filename;
+}
+// Filtro dominante de un conjunto (para etiquetar un grupo).
+function dsFilterOf(files) {
+    const fs = files.map(dsFilterOfFile).filter(Boolean);
+    if (!fs.length) return null;
+    return fs.sort((a, b) => fs.filter(x => x === b).length - fs.filter(x => x === a).length)[0];
+}
+// Filtros DISTINTOS detectados entre los lights (para avisar de mezclas).
+function dsDistinctFilters(files) {
+    return [...new Set(files.map(dsFilterOfFile).filter(Boolean))];
+}
+// Una sesión integra cada perfil espectral por separado, aunque dentro de un
+// perfil pueda haber varias exposiciones que el motor normaliza por grupos.
+function dsIntegrationGroups(files) {
+    const groups = new Map();
+    for (const file of files.filter(f => f.ok)) {
+        const filter = dsFilterOfFile(file) || "BROADBAND";
+        if (!groups.has(filter)) groups.set(filter, { filter, files: [] });
+        groups.get(filter).files.push(file);
+    }
+    return [...groups.values()].sort((a, b) => a.filter.localeCompare(b.filter));
+}
+// Agrupa lights por (filtro · exposición): cada combinación es un apilado
+// independiente (el backend integra un solo filtro por pasada). Orden: por
+// filtro y luego exposición desc.
+function dsGroupLights(files) {
+    const m = new Map();
+    for (const f of files) {
+        const filt = dsFilterOfFile(f) || "";
+        const key = `${filt}|${dsExpKey(f)}`;
+        if (!m.has(key)) m.set(key, { filter: filt || null, expKey: dsExpKey(f), files: [] });
+        m.get(key).files.push(f);
+    }
+    return [...m.values()].sort((a, b) => {
+        if ((a.filter || "") !== (b.filter || "")) return (a.filter || "~").localeCompare(b.filter || "~");
+        if (a.expKey === "?") return 1; if (b.expKey === "?") return -1;
+        return parseFloat(b.expKey) - parseFloat(a.expKey);
+    });
+}
+function dsMetaBits(files) {
+    const f0 = files.find(f => f.ok) || files[0];
+    const bits = [];
+    if (f0) bits.push(`${f0.w}×${f0.h}`);
+    if (f0 && f0.bayer) bits.push(f0.bayer);
+    const temps = files.map(f => f.temp).filter(t => t !== null && t !== undefined);
+    if (temps.length) bits.push(`${(temps.reduce((a, b) => a + b, 0) / temps.length).toFixed(0)}°C`);
+    const gains = files.map(f => f.gain).filter(g => g !== null && g !== undefined);
+    if (gains.length) bits.push(`gain ${Math.round(gains[0])}`);
+    const filt = dsFilterOf(files);
+    if (filt) bits.push(dsFilterLabel(filt));
+    return bits;
+}
+
+function dsSessionIdentity(file) {
+    const signatureSession = file?.signature?.session;
+    if (signatureSession) return String(signatureSession);
+    const observed = String(file?.date_obs || file?.dateObs || "");
+    if (/^\d{4}-\d{2}-\d{2}/.test(observed)) return observed.slice(0, 10);
+    const match = String(file?.path || file?.name || "").match(/20\d{2}[-_]\d{2}[-_]\d{2}/);
+    if (match) return match[0].replaceAll("_", "-");
+    return tr("deepsky.unknown_session", "Sesión sin fecha");
+}
+
+function dsPreparedSessionEntries() {
+    const plans = dsPreparedPlan?.sessionId
+        ? (dsPreparedPlan.groups || []).map(group => group.plan).filter(Boolean)
+        : [dsPreparedPlan].filter(Boolean);
+    return plans.flatMap(plan => plan.sessionMap || []);
+}
+
+function dsPreparedCalibrationDecisions() {
+    const plans = dsPreparedPlan?.sessionId
+        ? (dsPreparedPlan.groups || []).map(group => group.plan).filter(Boolean)
+        : [dsPreparedPlan].filter(Boolean);
+    return plans.flatMap(plan => plan.calibrationDecisions || []);
+}
+
+function dsFormatIntegrationSeconds(seconds) {
+    const value = Math.max(0, Number(seconds) || 0);
+    if (value >= 3600) return `${(value / 3600).toFixed(1)} h`;
+    if (value >= 60) return `${Math.round(value / 60)} min`;
+    return `${Math.round(value)} s`;
+}
+
+let dsSessionOrganizerExpanded = false;
+
+// Roles de calibración de la tabla. `linkable` marca los que el backend sabe
+// forzar por asignación manual (`DeepSkyCalibrationOverride`): flats y darks se
+// ligan de verdad; dark-flats y bias se emparejan por firma y aquí sólo se
+// informan, para no ofrecer un desplegable que no cambiaría nada.
+const DS_CALIBRATION_ROLES = [
+    { kind: "flats", labelKey: "deepsky.step_flat_s", fallback: "Flats", icon: "icon-lightbulb", linkable: true },
+    { kind: "darks", labelKey: "deepsky.step_dark_s", fallback: "Darks", icon: "icon-moon", linkable: true },
+    { kind: "darkFlats", labelKey: "deepsky.step_dark_flat_s", fallback: "Dark-flats", icon: "icon-moon", linkable: false },
+    { kind: "bias", labelKey: "deepsky.step_bias_s", fallback: "Bias", icon: "icon-film", linkable: false },
+];
+
+// Una fila por (noche × filtro × exposición): la unidad real de emparejamiento,
+// igual que los grupos de WBPP. Agrupar sólo por noche mezclaba Ha y OIII de la
+// misma noche en una única elección de flats.
+function dsCalibrationRows(lights) {
+    const rows = new Map();
+    for (const light of lights) {
+        const night = dsSessionIdentity(light);
+        const filter = dsFilterOfFile(light) || "";
+        const expKey = dsExpKey(light);
+        const key = `${night}|${filter}|${expKey}`;
+        if (!rows.has(key)) {
+            const exposure = Number(light.exptime);
+            rows.set(key, {
+                key,
+                night,
+                filter,
+                expKey,
+                exposure: Number.isFinite(exposure) ? exposure : null,
+                lights: [],
+            });
+        }
+        rows.get(key).lights.push(light);
+    }
+    return [...rows.values()].sort((a, b) => a.night.localeCompare(b.night)
+        || dsFilterLabel(a.filter || "").localeCompare(dsFilterLabel(b.filter || ""))
+        || (Number(b.exposure) || 0) - (Number(a.exposure) || 0));
+}
+
+// Etiqueta del BLOQUE al que pertenece un archivo de calibración: flats por
+// noche y filtro, darks/dark-flats por exposición, bias único. Mismo criterio
+// de agrupación que usa el backend para publicar sus lotes.
+function dsCalibrationBlockLabel(kind, file) {
+    if (kind === "flats") {
+        const filter = dsFilterOfFile(file);
+        const filterLabel = filter ? dsFilterLabel(filter) : tr("deepsky.broadband", "Banda ancha");
+        return `${dsSessionIdentity(file)} · ${filterLabel}`;
+    }
+    if (kind === "darks" || kind === "darkFlats") return dsFmtExp(file.exptime ?? null);
+    return tr("deepsky.session_all", "Todos");
+}
+
+// Bloques derivados de los ficheros cargados. Los ids no dependen del preflight
+// —el ligado manual viaja al backend como rutas explícitas—, así que la tabla
+// puede ligar antes de que exista un plan preparado.
+function dsCalibrationBlocks(kind) {
+    const blocks = new Map();
+    for (const file of dsMatchedCalib(kind)) {
+        const label = dsCalibrationBlockLabel(kind, file);
+        const id = `${kind}:${label}`;
+        if (!blocks.has(id)) blocks.set(id, { id, kind, label, files: [] });
+        blocks.get(id).files.push(file);
+    }
+    return [...blocks.values()].sort((a, b) => a.label.localeCompare(b.label));
+}
+
+// Compatibilidad PRELIMINAR de un bloque con una fila de lights (filtro para
+// flats, exposición exacta para darks). Sustituye al recuento global de la
+// biblioteca, que se repetía idéntico en todas las tarjetas y no decía nada.
+// La matriz tipada del backend sigue siendo la autoridad sobre la firma.
+function dsBlockFitsRow(kind, block, row) {
+    if (kind === "flats") {
+        if (!row.filter) return true;
+        return block.files.some(file => {
+            const filter = dsFilterOfFile(file) || "";
+            return !filter || filter === row.filter;
+        });
+    }
+    if (kind === "darks") {
+        if (!Number.isFinite(Number(row.exposure))) return false;
+        return block.files.some(file => dsExactExposureMatch(Number(file.exptime), Number(row.exposure)));
+    }
+    if (kind === "darkFlats") {
+        // Un dark-flat empareja con la exposición de los FLATS, no con la de los
+        // lights: se contrasta contra los flats compatibles con esta fila.
+        const flatExposures = dsCalibrationBlocks("flats")
+            .filter(flatBlock => dsBlockFitsRow("flats", flatBlock, row))
+            .flatMap(flatBlock => flatBlock.files.map(file => Number(file.exptime)))
+            .filter(Number.isFinite);
+        if (!flatExposures.length) return false;
+        return block.files.some(file => flatExposures
+            .some(exposure => dsExactExposureMatch(Number(file.exptime), exposure)));
+    }
+    return true; // bias: no hay exposición que casar
+}
+
+function dsCalibrationChoice(rowKey, kind) {
+    return dsCalibAssignments.get(rowKey)?.[kind] || "auto";
+}
+
+// Descarta elecciones de filas o bloques que ya no existen tras cambiar los
+// ficheros cargados, para que la tabla nunca muestre un ligado fantasma.
+function dsPruneCalibAssignments(rows) {
+    const validRows = new Set(rows.map(row => row.key));
+    for (const key of [...dsCalibAssignments.keys()]) {
+        if (!validRows.has(key)) dsCalibAssignments.delete(key);
+    }
+    const validBlocks = new Set(DS_CALIBRATION_ROLES
+        .flatMap(role => dsCalibrationBlocks(role.kind).map(block => block.id)));
+    for (const [key, assignment] of dsCalibAssignments) {
+        for (const kind of Object.keys(assignment)) {
+            const choice = assignment[kind];
+            if (choice !== "skip" && !validBlocks.has(choice)) delete assignment[kind];
+        }
+        if (!Object.keys(assignment).length) dsCalibAssignments.delete(key);
+    }
+    for (const id of [...dsDisabledCalibBatches]) {
+        if (!validBlocks.has(id)) dsDisabledCalibBatches.delete(id);
+    }
+}
+
+function dsRenderSessionOrganizer() {
+    const panel = document.getElementById("ds-session-organizer");
+    if (!panel) return;
+    const lights = dsActiveLights().filter(file => file.ok);
+    if (!lights.length) {
+        panel.hidden = true;
+        panel.replaceChildren();
+        return;
+    }
+    const strictEntries = new Map(dsPreparedSessionEntries().map(entry => [String(entry.night), entry]));
+    const decisionsByPath = new Map(dsPreparedCalibrationDecisions()
+        .map(decision => [String(decision.framePath || decision.frame_path || ""), decision]));
+    const totalExposure = lights.reduce((sum, light) => sum + (Number(light.exptime) || 0), 0);
+    const allRows = dsCalibrationRows(lights);
+    dsPruneCalibAssignments(allRows);
+    const blocksByKind = new Map(DS_CALIBRATION_ROLES
+        .map(role => [role.kind, dsCalibrationBlocks(role.kind)]));
+    const visibleRows = dsSessionOrganizerExpanded ? allRows : allRows.slice(0, 8);
+
+    // Desplegable de un rol ligable: Auto · cada bloque compatible · el resto de
+    // bloques agrupados aparte · Omitir. El recuento va en la propia opción para
+    // que elegir no exija abrir otra pantalla.
+    const linkSelect = (role, row) => {
+        const blocks = (blocksByKind.get(role.kind) || [])
+            .filter(block => !dsDisabledCalibBatches.has(block.id));
+        const choice = dsCalibrationChoice(row.key, role.kind);
+        const fitting = blocks.filter(block => dsBlockFitsRow(role.kind, block, row));
+        const others = blocks.filter(block => !dsBlockFitsRow(role.kind, block, row));
+        const option = (block) => `<option value="${escapeHtml(block.id)}"${choice === block.id ? " selected" : ""}>${escapeHtml(block.label)} · ${block.files.length}</option>`;
+        const autoLabel = fitting.length
+            ? `${tr("deepsky.linker_auto", "Auto (por firma)")} · ${fitting.length}`
+            : `${tr("deepsky.linker_auto", "Auto (por firma)")} · 0`;
+        const parts = [`<option value="auto"${choice === "auto" ? " selected" : ""}>${escapeHtml(autoLabel)}</option>`];
+        if (fitting.length) {
+            parts.push(`<optgroup label="${escapeHtml(tr("deepsky.blocks_compatible", "Bloques compatibles"))}">${fitting.map(option).join("")}</optgroup>`);
+        }
+        if (others.length) {
+            parts.push(`<optgroup label="${escapeHtml(tr("deepsky.blocks_other", "Otras firmas"))}">${others.map(option).join("")}</optgroup>`);
+        }
+        const skipLabel = role.kind === "flats"
+            ? tr("deepsky.linker_skip_flats", "Omitir flats")
+            : tr("deepsky.linker_skip_darks", "Omitir darks");
+        parts.push(`<option value="skip"${choice === "skip" ? " selected" : ""}>${escapeHtml(skipLabel)}</option>`);
+        const linked = choice !== "auto";
+        return `<select class="ds-sel ds-link-sel${linked ? " is-linked" : ""}" data-ds-link="${escapeHtml(row.key)}" data-ds-role="${role.kind}" aria-label="${escapeHtml(`${tr(role.labelKey, role.fallback)} · ${row.night}`)}">${parts.join("")}</select>`;
+    };
+
+    // Rol informativo (dark-flats / bias): el backend los empareja por firma y
+    // no admite asignación manual, así que se muestra el recuento compatible y
+    // el estado resuelto en vez de un desplegable inerte.
+    const statusCell = (role, row, resolved) => {
+        const blocks = (blocksByKind.get(role.kind) || [])
+            .filter(block => !dsDisabledCalibBatches.has(block.id));
+        const fitting = blocks.filter(block => dsBlockFitsRow(role.kind, block, row));
+        const count = fitting.reduce((sum, block) => sum + block.files.length, 0);
+        const state = resolved ? "confirmed" : "pending";
+        const detail = resolved
+            ? tr("deepsky.signature_confirmed", "firma y exposición confirmadas")
+            : `${count} ${tr("deepsky.candidates", "candidatos")}`;
+        return `<span class="ds-calibration-chip ${state}" title="${escapeHtml(detail)}"><svg class="zas-icon zas-icon-inline" aria-hidden="true"><use href="#${resolved ? "icon-check" : "icon-search"}"></use></svg> ${escapeHtml(detail)}</span>`;
+    };
+
+    const rowsHtml = visibleRows.map((row) => {
+        const strict = strictEntries.get(row.night);
+        const decisions = row.lights.map(light => decisionsByPath.get(light.path)).filter(Boolean);
+        const resolvedAll = decisions.length === row.lights.length && decisions.length > 0;
+        const darkFlatsResolved = resolvedAll
+            && decisions.every(decision => decision.darkFlatMasterPath || decision.dark_flat_master_path);
+        const biasResolved = resolvedAll
+            && decisions.every(decision => decision.biasMasterPath || decision.bias_master_path);
+        const flatsStrict = Boolean(strict && Number(strict.flatCount) > 0);
+        const darksStrict = Boolean(strict && strict.darks && strict.darks !== "—");
+        const state = flatsStrict && darksStrict ? "confirmed" : "pending";
+        const stateDetail = flatsStrict && darksStrict
+            ? tr("deepsky.signature_confirmed", "firma y exposición confirmadas")
+            : tr("deepsky.signature_pending_short", "firma pendiente");
+        const exposureLabel = row.expKey === "?" ? "—" : dsFmtExp(Number(row.expKey));
+        const integration = row.lights.reduce((sum, light) => sum + (Number(light.exptime) || 0), 0);
+        return `<tr data-ds-row="${escapeHtml(row.key)}">
+            <td class="ds-wbpp-group">
+                <strong>${escapeHtml(row.night)}</strong>
+                <span>${row.lights.length} lights · ${dsFormatIntegrationSeconds(integration)}</span>
+            </td>
+            <td><span class="ds-filter-badge">${escapeHtml(dsFilterLabel(row.filter) || tr("deepsky.broadband", "Banda ancha"))}</span></td>
+            <td class="ds-wbpp-exp">${escapeHtml(exposureLabel)}</td>
+            <td>${linkSelect(DS_CALIBRATION_ROLES[0], row)}</td>
+            <td>${linkSelect(DS_CALIBRATION_ROLES[1], row)}</td>
+            <td>${statusCell(DS_CALIBRATION_ROLES[2], row, darkFlatsResolved)}</td>
+            <td>${statusCell(DS_CALIBRATION_ROLES[3], row, biasResolved)}</td>
+            <td><span class="ds-calibration-chip ${state}" title="${escapeHtml(stateDetail)}">${escapeHtml(stateDetail)}</span></td>
+        </tr>`;
+    }).join("");
+
+    const blockChips = DS_CALIBRATION_ROLES.flatMap(role => (blocksByKind.get(role.kind) || [])
+        .map(block => `<label class="ds-block-chip">
+            <input type="checkbox" data-ds-batch="${escapeHtml(block.id)}"${dsDisabledCalibBatches.has(block.id) ? "" : " checked"}>
+            <span>${escapeHtml(tr(role.labelKey, role.fallback))} · ${escapeHtml(block.label)} · ${block.files.length}</span>
+        </label>`)).join("");
+
+    const toggle = allRows.length > 8
+        ? `<button type="button" id="ds-session-toggle" class="ds-session-toggle">${dsSessionOrganizerExpanded
+            ? tr("deepsky.groups_show_less", "Mostrar menos grupos")
+            : trFormat("deepsky.groups_show_all", { count: allRows.length }, `Mostrar los ${allRows.length} grupos`)}</button>`
+        : "";
+    const nights = new Set(allRows.map(row => row.night));
+    panel.hidden = false;
+    panel.innerHTML = `
+        <header class="ds-session-organizer-head">
+            <div>
+                <strong>${tr("deepsky.sessions_title", "Noches y calibración")}</strong>
+                <span>${tr("deepsky.wbpp_hint", "Una fila por noche, filtro y exposición. Elige el bloque de flats o darks que quieres ligar a cada grupo, o déjalo en Auto para que la firma decida.")}</span>
+            </div>
+            <div class="ds-session-summary">
+                <b>${nights.size} ${nights.size === 1 ? tr("deepsky.night", "noche") : tr("deepsky.nights", "noches")}</b>
+                <b>${allRows.length} ${tr("deepsky.groups", "grupos")}</b>
+                <b>${lights.length} lights</b>
+                <b>${dsFormatIntegrationSeconds(totalExposure)}</b>
+            </div>
+        </header>
+        <div class="ds-wbpp-scroll">
+            <table class="ds-wbpp-table">
+                <thead><tr>
+                    <th>${tr("deepsky.linker_night", "Noche (lights)")}</th>
+                    <th>${tr("deepsky.linker_filter", "Filtro")}</th>
+                    <th>${tr("deepsky.exposure", "Exposición")}</th>
+                    <th>${tr("deepsky.step_flat_s", "Flats")}</th>
+                    <th>${tr("deepsky.step_dark_s", "Darks")}</th>
+                    <th>${tr("deepsky.step_dark_flat_s", "Dark-flats")}</th>
+                    <th>${tr("deepsky.step_bias_s", "Bias")}</th>
+                    <th>${tr("deepsky.state", "Estado")}</th>
+                </tr></thead>
+                <tbody>${rowsHtml}</tbody>
+            </table>
+        </div>${toggle}
+        ${blockChips ? `<details class="ds-block-list"${dsDisabledCalibBatches.size ? " open" : ""}>
+            <summary>${tr("deepsky.linker_batches", "Lotes detectados")}</summary>
+            <div class="ds-block-chips">${blockChips}</div>
+        </details>` : ""}`;
+    panel.querySelector("#ds-session-toggle")?.addEventListener("click", () => {
+        dsSessionOrganizerExpanded = !dsSessionOrganizerExpanded;
+        dsRenderSessionOrganizer();
+    });
+    panel.querySelectorAll("select[data-ds-link]").forEach(select => {
+        select.addEventListener("change", () => {
+            const key = select.dataset.dsLink;
+            const kind = select.dataset.dsRole;
+            const assignment = dsCalibAssignments.get(key) || {};
+            if (select.value === "auto") delete assignment[kind];
+            else assignment[kind] = select.value;
+            if (Object.keys(assignment).length) dsCalibAssignments.set(key, assignment);
+            else dsCalibAssignments.delete(key);
+            // Re-render: la compatibilidad de dark-flats depende de los flats
+            // elegidos, así que la fila entera puede cambiar de estado.
+            dsRenderSessionOrganizer();
+            document.querySelector(`select[data-ds-link="${CSS.escape(key)}"][data-ds-role="${kind}"]`)?.focus();
+            dsSchedulePreflight(true);
+        });
+    });
+    panel.querySelectorAll("input[data-ds-batch]").forEach(checkbox => {
+        checkbox.addEventListener("change", () => {
+            const id = checkbox.dataset.dsBatch;
+            if (checkbox.checked) dsDisabledCalibBatches.delete(id);
+            else dsDisabledCalibBatches.add(id);
+            dsRenderSessionOrganizer();
+            dsSchedulePreflight(true);
+        });
+    });
+}
+
+// Renderiza el plan de calibración agrupado (una tarjeta por exposición).
+function dsRenderCalibrationPlan(container, lights) {
+    if (!lights.length) { container.style.display = "none"; return; }
+    container.style.display = "block";
+    const okLights = lights.filter(f => f.ok);
+    const groups = dsGroupLights(okLights);          // por filtro · exposición
+    const distinctFilters = dsDistinctFilters(okLights);
+    const biasPool = dsMatchedCalib("bias");
+    const darksPool = dsMatchedCalib("darks");
+    const flatsPool = dsMatchedCalib("flats");
+    const darkFlatsPool = dsMatchedCalib("darkFlats");
+
+    const chip = (icon, color, label, count, detail, status) => {
+        const col = status === "ok" ? "#34d399" : status === "candidate" ? "#7dd3fc" : status === "warn" ? "#fbbf24" : "#64748b";
+        const mark = status === "ok" ? "✓" : status === "candidate" ? "?" : status === "warn" ? "⚠︎" : "—"; // aviso en texto (VS15)
+        return `<div style="display:flex; align-items:center; gap:9px; padding:7px 13px; background:rgba(15,23,42,0.55); border:1px solid ${status === "warn" ? "rgba(245,158,11,0.35)" : "rgba(255,255,255,0.07)"}; border-radius:11px; flex:1 1 190px; min-width:170px;">
+            <svg class="zas-icon" style="width:16px;height:16px;color:${color};"><use href="#${icon}"></use></svg>
+            <div style="min-width:0; flex:1;">
+                <div style="font-size:0.72rem; color:#e2e8f0; font-weight:600;">${label}</div>
+                <div style="font-size:0.63rem; color:${status === "warn" ? "#fbbf24" : "#94a3b8"};">${count} ${detail}</div>
+            </div>
+            <span style="color:${col}; font-weight:700; font-size:0.9rem;">${mark}</span>
+        </div>`;
+    };
+
+    let warned = false;
+    let darkFlatWarned = false;
+    const cards = groups.map(({ filter: gFilterKey, expKey, files: gLights }) => {
+        const ref = gLights.find(f => f.ok);
+        const dimsOk = (arr) => !ref || arr.length === 0 || arr.every(f => f.w === ref.w && f.h === ref.h);
+        const nLights = gLights.filter(f => f.ok).length;
+        const gFilter = gFilterKey || dsFilterOf(gLights);
+
+        // BIAS: jamás universal. La UI sólo conoce candidatos; Strict exige
+        // identidad exacta de sensor/read-mode/gain/offset/binning/ROI.
+        const biasChip = biasPool.length
+            ? chip("icon-film", "#67e8f9", tr("deepsky.step_bias_s", "Bias"), biasPool.length, tr("deepsky.signature_pending", "candidatos · firma pendiente"), dimsOk(biasPool) ? "candidate" : "warn")
+            : chip("icon-film", "#475569", tr("deepsky.step_bias_s", "Bias"), 0, tr("deepsky.none_opt", "opcional"), "none");
+
+        // DARKS: exposición exacta según precisión de cabecera. Una exposición
+        // distinta sólo puede escalarse después de los gates físicos del
+        // backend (bias-subtracted, sin glow, correlación/R²/residuo).
+        let darkChip;
+        // Use the actual light header for compatibility; expKey is rounded
+        // only for grouping/display and must never define an exposure gate.
+        const expN = Number.isFinite(ref?.exptime)
+            ? ref.exptime
+            : (expKey === "?" ? null : parseFloat(expKey));
+        const exactD = expN !== null ? darksPool.filter(d => dsExactExposureMatch(d.exptime, expN)) : darksPool;
+        if (exactD.length) {
+            darkChip = chip("icon-moon", "#94a3b8", tr("deepsky.step_dark_s", "Darks"), exactD.length, `@ ${dsFmtExp(expN)} · ${tr("deepsky.signature_pending_short", "firma pendiente")}`, dimsOk(exactD) ? "candidate" : "warn");
+        } else if (darksPool.length) {
+            warned = true;
+            darkChip = chip("icon-moon", "#94a3b8", tr("deepsky.step_dark_s", "Darks"), darksPool.length, tr("deepsky.dark_scaled", "otra exp · requiere validación"), "warn");
+        } else {
+            darkChip = chip("icon-moon", "#475569", tr("deepsky.step_dark_s", "Darks"), 0, tr("deepsky.cosmetic_fallback", "→ cosmética"), "none");
+        }
+
+        // FLATS: por filtro si lo hay (metadata o nombre); si no, todos.
+        let flatsM = flatsPool;
+        if (gFilter) {
+            const byF = flatsPool.filter(f => dsFilterOfFile(f) === gFilter);
+            if (byF.length) flatsM = byF;
+        }
+        const flatChip = flatsM.length
+            ? chip("icon-lightbulb", "#fbbf24", tr("deepsky.step_flat_s", "Flats"), flatsM.length, gFilter ? `(${gFilter}) · ${tr("deepsky.signature_pending_short", "firma pendiente")}` : tr("deepsky.signature_pending", "candidatos · firma pendiente"), dimsOk(flatsM) ? "candidate" : "warn")
+            : chip("icon-lightbulb", "#475569", tr("deepsky.step_flat_s", "Flats"), 0, tr("deepsky.none_opt", "opcional"), "none");
+
+        // DARK-FLATS: deben coincidir con la exposición de los flats, no con
+        // la de los lights. El backend Strict valida además gain/offset/ROI.
+        const flatExposures = flatsM
+            .map(flat => flat.exptime)
+            .filter(exposure => exposure !== null && exposure !== undefined);
+        const darkFlatsM = flatExposures.length
+            ? darkFlatsPool.filter(darkFlat => darkFlat.exptime != null && flatExposures.some(flatExposure =>
+                dsExactExposureMatch(darkFlat.exptime, flatExposure)))
+            : darkFlatsPool;
+        let darkFlatChip;
+        if (darkFlatsM.length) {
+            darkFlatChip = chip("icon-moon", "#c4b5fd", tr("deepsky.step_dark_flat_s", "Dark-flats"), darkFlatsM.length, flatExposures.length ? `@ ${dsFmtExp(flatExposures[0])} · ${tr("deepsky.signature_pending_short", "firma pendiente")}` : tr("deepsky.signature_pending", "candidatos · firma pendiente"), dimsOk(darkFlatsM) ? "candidate" : "warn");
+        } else if (darkFlatsPool.length && flatsM.length) {
+            darkFlatWarned = true;
+            darkFlatChip = chip("icon-moon", "#c4b5fd", tr("deepsky.step_dark_flat_s", "Dark-flats"), darkFlatsPool.length, tr("deepsky.dark_flat_mismatch", "exposición distinta"), "warn");
+        } else {
+            darkFlatChip = chip("icon-moon", "#475569", tr("deepsky.step_dark_flat_s", "Dark-flats"), 0, tr("deepsky.dark_flat_or_bias", "o bias validado"), "none");
+        }
+
+        const meta = dsMetaBits(gLights).join(" · ");
+        return `<div style="border:1px solid rgba(124,58,237,0.22); border-radius:14px; padding:13px 15px; margin-bottom:10px; background:rgba(124,58,237,0.05);">
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom:11px; flex-wrap:wrap;">
+                <svg class="zas-icon" style="width:17px;height:17px;color:#a5b4fc;"><use href="#icon-sequence"></use></svg>
+                <strong style="font-size:0.86rem; color:#e2e8f0;">${dsFmtExp(expN)}</strong>
+                ${gFilter ? `<span class="ds-filter-badge">${escapeHtml(dsFilterLabel(gFilter))}${dsFilterComponents(gFilter).length > 1 ? " · dual-band" : ""}</span>` : ""}
+                <span style="font-size:0.74rem; color:#c4b5fd; font-weight:600;">${nLights} lights</span>
+                <span style="margin-left:auto; font-size:0.66rem; color:#94a3b8; font-family:'Courier New',monospace;">${meta}</span>
+            </div>
+            <div style="display:flex; gap:9px; flex-wrap:wrap; align-items:stretch;">
+                ${biasChip}${darkChip}${flatChip}${darkFlatChip}
+                <div style="display:flex; align-items:center; gap:7px; padding:7px 15px; background:rgba(240,171,252,0.08); border:1px solid rgba(240,171,252,0.22); border-radius:11px;">
+                    <svg class="zas-icon" style="width:16px;height:16px;color:#f0abfc;"><use href="#icon-galaxy"></use></svg>
+                    <span style="font-size:0.72rem; color:#f5d0fe; font-weight:600;">${tr("deepsky.step_integrate", "Integración κ-σ")}</span>
+                </div>
+            </div>
+        </div>`;
+    }).join("");
+
+    const note = warned
+        ? `<div style="font-size:0.62rem; color:#fbbf24; margin-top:2px;">⚠︎ ${tr("deepsky.plan_scale_note", "Hay darks de otra exposición. No se aceptarán ni escalarán salvo que el backend valide pedestal, ausencia de amp glow, linealidad, correlación y residuo.")}</div>`
+        : "";
+    const darkFlatNote = darkFlatWarned
+        ? `<div style="font-size:0.62rem; color:#fbbf24; margin-top:2px;">⚠︎ ${tr("deepsky.plan_dark_flat_note", "Los dark-flats no coinciden con la exposición de los flats. La política Strict bloqueará la calibración incompatible.")}</div>`
+        : "";
+    // Una sesión multibanda coordina varios masters sin mezclar sus muestras.
+    const mixNote = distinctFilters.length >= 2
+        ? `<div class="ds-session-note">
+            <svg class="zas-icon"><use href="#icon-sequence"></use></svg>
+            <div><strong>${tr("deepsky.multiband_note_title", "Sesión multibanda detectada")}</strong>
+            <span>${trFormat(
+                "deepsky.multiband_note_body",
+                {
+                    filters: distinctFilters.map(dsFilterLabel).join(" · "),
+                    count: distinctFilters.length,
+                },
+                `${distinctFilters.map(dsFilterLabel).join(" · ")}. Zenith ejecutará ${distinctFilters.length} integraciones separadas dentro de la misma sesión, extraerá sus líneas y conservará una receta común.`,
+            )}</span></div>
+        </div>`
+        : "";
+    container.innerHTML = `
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px;">
+            <span style="font-size:0.66rem; color:#a5b4fc; font-weight:700; letter-spacing:0.05em;">${tr("deepsky.plan_title", "PLAN PRELIMINAR DE CALIBRACIÓN")}</span>
+            <span style="font-size:0.62rem; color:#64748b;">${groups.length} ${groups.length === 1 ? tr("deepsky.plan_group", "grupo") : tr("deepsky.plan_groups", "grupos")}${distinctFilters.length ? ` · ${distinctFilters.length} ${distinctFilters.length === 1 ? tr("deepsky.filter_one", "filtro") : tr("deepsky.filter_many", "filtros")}` : ""}</span>
+        </div>
+        <div style="font-size:0.62rem; color:#7dd3fc; margin:-4px 0 9px;">${tr("deepsky.plan_candidate_note", "? = candidato por nombre/filtro/exposición. Sólo la matriz Strict del preflight confirma compatibilidad científica.")}</div>
+        ${cards}${note}${darkFlatNote}${mixNote}`;
+}
+
+function dsUpdateMultibandControls() {
+    const panel = document.getElementById("ds-multiband-options");
+    if (!panel) return;
+    const groups = dsIntegrationGroups(dsActiveLights());
+    const multiband = groups.length > 1;
+    panel.hidden = !multiband;
+    const summary = document.getElementById("ds-multiband-summary");
+    if (summary) {
+        const outputs = groups.flatMap(group => dsFilterComponents(group.filter));
+        summary.textContent = multiband
+            ? trFormat(
+                "deepsky.multiband_detected",
+                {
+                    count: groups.length,
+                    filters: groups.map(group => dsFilterLabel(group.filter)).join(" · "),
+                    outputs: outputs.join(" / "),
+                },
+                `${groups.length} integraciones: ${groups.map(group => dsFilterLabel(group.filter)).join(" · ")} · salidas ${outputs.join(" / ")}`,
+            )
+            : tr("deepsky.multiband_waiting", "Se mostrará cuando Zenith detecte dos o más perfiles espectrales.");
+    }
+    const runLabel = document.querySelector("#btn-deepsky-run span");
+    if (runLabel) runLabel.textContent = multiband
+        ? tr("deepsky.run_multiband", "Apilar sesión multibanda")
+        : tr("deepsky.run", "Apilar Cielo Profundo");
+}
+
+function dsRenderSessionResult(result) {
+    const panel = document.getElementById("ds-session-quality");
+    if (!panel || !result) return;
+    panel.hidden = false;
+    const cards = (result.groups || []).map(group => {
+        const q = group.quality || {};
+        const outputs = Object.entries(group.componentPaths || {})
+            .map(([name, path]) => `<li><b>${escapeHtml(name)}</b><span title="${escapeHtml(path)}">${escapeHtml(path.split(/[\\/]/).pop())}</span></li>`)
+            .join("");
+        const recommendations = (q.recommendations || []).map(item => `<li>${escapeHtml(item)}</li>`).join("");
+        // Manifiesto científico tipado del grupo: productos SCI/VAR/NEFF/DQ y
+        // diagnósticos con geometría y unidades, más fallbacks y avisos. Nunca
+        // un conteo opaco: cada producto publicado queda visible y localizable.
+        const bundle = group.scientificBundle || {};
+        const bundleProducts = (bundle.products || []).map(product => {
+            const fileName = String(product.path || "").split(/[\\/]/).pop();
+            const badge = product.derived
+                ? `<span style="color:#c4b5fd;">${tr("deepsky.product_derived", "derivado")}</span>`
+                : product.linear
+                    ? `<span style="color:#6ee7b7;">${tr("deepsky.product_linear", "lineal")}</span>`
+                    : "";
+            return `<tr style="border-top:1px solid rgba(148,163,184,.1);">
+                <td style="padding:3px 8px;color:#e2e8f0;font-weight:700;">${escapeHtml(product.kind || "")}</td>
+                <td style="padding:3px 8px;color:#94a3b8;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(product.path || "")}">${escapeHtml(fileName)}</td>
+                <td style="padding:3px 8px;text-align:right;color:#94a3b8;">${product.width || 0}×${product.height || 0}×${product.channels || 0}</td>
+                <td style="padding:3px 8px;color:#94a3b8;">${escapeHtml(product.bunit || "")}</td>
+                <td style="padding:3px 8px;">${badge}</td>
+            </tr>`;
+        }).join("");
+        const bundleChips = [
+            ...(bundle.fallbacks || []).map(item => `<span style="display:inline-block;margin:2px 4px 0 0;padding:2px 7px;border:1px solid rgba(251,191,36,.35);border-radius:999px;color:#fcd34d;">${escapeHtml(item)}</span>`),
+            ...(bundle.warnings || []).map(item => `<span style="display:inline-block;margin:2px 4px 0 0;padding:2px 7px;border:1px solid rgba(148,163,184,.3);border-radius:999px;color:#94a3b8;">${escapeHtml(item)}</span>`),
+        ].join("");
+        const bundleBlock = bundleProducts
+            ? `<details style="margin-top:7px;">
+                <summary style="cursor:pointer;color:#7dd3fc;font-size:.62rem;font-weight:700;letter-spacing:.04em;">${tr("deepsky.bundle_title", "PRODUCTOS CIENTÍFICOS")} · ${(bundle.products || []).length}</summary>
+                <div style="overflow:auto;border:1px solid rgba(148,163,184,.12);border-radius:8px;margin-top:4px;">
+                <table style="width:100%;border-collapse:collapse;font-size:.58rem;min-width:520px;">
+                    <thead style="background:#111827;color:#94a3b8;"><tr><th style="padding:3px 8px;text-align:left;">${tr("deepsky.product", "Producto")}</th><th style="padding:3px 8px;text-align:left;">${tr("deepsky.file", "Archivo")}</th><th style="padding:3px 8px;text-align:right;">${tr("deepsky.geometry", "Geometría")}</th><th style="padding:3px 8px;text-align:left;">${tr("deepsky.unit", "Unidad")}</th><th></th></tr></thead>
+                    <tbody>${bundleProducts}</tbody>
+                </table></div>
+                ${bundleChips ? `<div style="margin-top:4px;font-size:.58rem;">${bundleChips}</div>` : ""}
+            </details>`
+            : "";
+        const grade = String(q.grade || "review").toLowerCase();
+        const gradeLabel = /^(ok|good|excellent|buena|excelente)$/.test(grade)
+            ? tr("deepsky.quality_good", "Correcta")
+            : tr("deepsky.quality_review", "Revisar");
+        return `<article class="ds-quality-card">
+            <div class="ds-quality-head"><div><strong>${escapeHtml(dsFilterLabel(group.filterProfile))}</strong><span>${trFormat("deepsky.quality_frame_counts", { used: group.framesUsed, rejected: group.framesRejected }, `${group.framesUsed} usadas · ${group.framesRejected} rechazadas`)}</span></div><b data-grade="${escapeHtml(grade)}">${gradeLabel}</b></div>
+            <div class="ds-quality-metrics"><span>${tr("deepsky.quality_coverage", "Cobertura")} <b>${Number(q.coveragePercent || 0).toFixed(1)}%</b></span><span>${tr("deepsky.quality_rejection", "Rechazo")} <b>${Number(q.rejectionPercent || 0).toFixed(1)}%</b></span><span>${tr("deepsky.quality_background_noise", "Ruido de fondo")} <b>${Number(q.backgroundNoise || 0).toFixed(2)}</b></span></div>
+            ${outputs ? `<ul class="ds-output-list">${outputs}</ul>` : ""}
+            ${bundleBlock}
+            <ul class="ds-quality-recommendations">${recommendations}</ul>
+        </article>`;
+    }).join("");
+    panel.innerHTML = `<div class="ds-quality-title"><div><strong>${tr("deepsky.session_quality_title", "Control de calidad de la sesión")}</strong><span>${tr("deepsky.session_quality_hint", "Másters lineales y métricas medidos, no la vista STF.")}</span></div><span>${escapeHtml(result.outputDir || "")}</span></div>${cards}`;
+
+    const components = result.componentPaths || {};
+    if (components.SII?.[0] && components.HA?.[0] && components.OIII?.[0]) {
+        dsCombineFiles.r = components.SII[0];
+        dsCombineFiles.g = components.HA[0];
+        dsCombineFiles.b = components.OIII[0];
+        const preset = document.getElementById("ds-combine-preset");
+        if (preset) preset.value = "sho";
+    } else if (components.HA?.[0] && components.OIII?.[0]) {
+        dsCombineFiles.r = components.HA[0];
+        dsCombineFiles.g = components.OIII[0];
+        const preset = document.getElementById("ds-combine-preset");
+        if (preset) preset.value = "hoo";
+    }
+}
+
+// ============ PRESETS + DIAGRAMA DE PROCESO + TIEMPO ESTIMADO ============
+// Presets estilo WBPP: fijan todos los controles del modal con un clic.
+// AUTO por defecto: abrir el módulo → plan con receta medida y razones, cero
+// decisiones obligatorias. Los cuatro presets clásicos siguen disponibles.
+let dsActivePreset = "auto";
+let dsWizardStep = 0;
+let dsPreparedPlan = null;
+let dsPreflightSerial = 0;
+let dsPreflightTimer = null;
+let dsFrameInspection = [];
+// Ligado MANUAL de calibración por GRUPO (`noche|filtro|exposición`, la misma
+// unidad que muestra la tabla): clave → { flats, darks } con valores id de
+// bloque o "skip"; ausente = automático por firma. Los bloques se derivan de los
+// ficheros cargados (`dsCalibrationBlocks`), así que ligar no exige un plan
+// preparado y el override viaja al backend como rutas explícitas.
+const dsCalibAssignments = new Map();
+const dsDisabledCalibBatches = new Set();
+
+// Diagnósticos globales de la última inspección: predicción de dithering
+// (walking noise) y patrón de detector. Los publica inspect_deepsky_frames.
+let dsInspectionDiagnostics = null;
+// Descartes MANUALES de la inspección PSF: los lights marcados no viajan al
+// plan ni al apilado, pero siguen visibles en la tabla para poder restaurarlos.
+const dsDiscardedPaths = new Set();
+let dsInspectionFingerprint = "";
+let dsInspectionSerial = 0;
+// Preferencias del visor de tomas (solo vista, persistentes entre sesiones):
+// estirado STF 0..100 y balance por canal (quita el verde del OSC lineal).
+let dsFrameViewerStretch = (() => {
+    const stored = parseInt(localStorage.getItem("zas_ds_frame_stretch") ?? "50", 10);
+    return Number.isFinite(stored) ? Math.max(0, Math.min(100, stored)) : 50;
+})();
+let dsFrameViewerBalance = localStorage.getItem("zas_ds_frame_balance") !== "0";
+let dsFrameViewerRenderSerial = 0;
+const DS_PRESETS = {
+    fast:     { interp: "bilinear", drizzle: "1", rejection: "sigma", kappaLow: 3.0, kappaHigh: 3.0, clipIters: "1",    norm: "additive", autocrop: true, cosmetic: true, darkopt: true, gradient: false, pedestal: "0", localw: false },
+    // El backend resuelve Balanced con Winsorized (pipeline resolved_profile);
+    // el preset refleja EXACTAMENTE lo que se ejecutará.
+    balanced: { interp: "lanczos3", drizzle: "1", rejection: "winsorized", kappaLow: 3.0, kappaHigh: 3.0, clipIters: "auto", norm: "scaling",  autocrop: true, cosmetic: true, darkopt: true, gradient: false, pedestal: "0", localw: false },
+    // localw: rescate de detalle (pesos locales FWHM) — espejo del backend
+    // (PipelineProfile::MaximumQuality lo activa; Fast/Balanced lo apagan).
+    max:      { interp: "lanczos3", drizzle: "1", rejection: "winsorized", kappaLow: 2.5, kappaHigh: 3.0, clipIters: "3", norm: "local", autocrop: true, cosmetic: true, darkopt: true, gradient: false, pedestal: "0", localw: true },
+};
+
+function dsCalibrationForIntegration(kind, filter) {
+    let pool = dsMatchedCalib(kind);
+    // Bloques excluidos a mano en la tabla de calibración: fuera del request.
+    if (dsDisabledCalibBatches.size && ["flats", "darks", "darkFlats", "bias"].includes(kind)) {
+        const excluded = new Set();
+        for (const block of dsCalibrationBlocks(kind)) {
+            if (dsDisabledCalibBatches.has(block.id)) block.files.forEach(file => excluded.add(file.path));
+        }
+        if (excluded.size) pool = pool.filter(file => !excluded.has(file.path));
+    }
+    if (kind !== "flats" || !filter || filter === "BROADBAND") return pool;
+    const exact = pool.filter(file => dsFilterOfFile(file) === filter);
+    return exact.length ? exact : pool;
+}
+
+// `index.html` predates the v4 broadband-mono contract. Keep the extension
+// idempotent so hot reloads and repeated modal openings cannot duplicate it;
+// `data-i18n` also lets the global language manager update it normally.
+function dsEnsureCaptureModeOptions() {
+    const select = document.getElementById("sel-ds-capture-mode");
+    if (!select || select.querySelector('option[value="broadbandMono"]')) return;
+
+    const option = document.createElement("option");
+    option.value = "broadbandMono";
+    option.dataset.i18n = "deepsky.capture_broadband_mono";
+    option.textContent = tr("deepsky.capture_broadband_mono", "Banda ancha mono");
+    const dualBandOsc = select.querySelector('option[value="dualBandOsc"]');
+    select.insertBefore(option, dualBandOsc);
+}
+
+function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
+    // Los descartes manuales de la inspección PSF se excluyen SIEMPRE (plan,
+    // apilado individual y multibanda pasan por aquí).
+    const lights = (lightOverride || dsActiveLights())
+        .filter(f => !dsDiscardedPaths.has(f.path));
+    const filter = filterOverride || dsFilterOf(lights);
+    const value = (id, fallback) => document.getElementById(id)?.value ?? fallback;
+    const checked = (id, fallback = false) => document.getElementById(id)?.checked ?? fallback;
+    const rejection = value("sel-ds-rejection", "sigma");
+    // Método de integración (F3): con "classic" NO se envía el campo para que el
+    // backend use el motor clásico exacto; NebulaFusion viaja como objeto camelCase.
+    const dsMethod = value("sel-ds-method", "classic");
+    const pedestalRaw = value("sel-ds-pedestal", "0");
+    const profile = ({ auto: "auto", fast: "fast", balanced: "balanced", max: "maximum_quality" })[dsActivePreset] || "custom";
+    return {
+        schemaVersion: DEEP_SKY_STACK_REQUEST_SCHEMA_VERSION,
+        scientificProducts: true,
+        lights: lights.map(f => f.path),
+        darks: dsCalibrationForIntegration("darks", filter).map(f => f.path),
+        flats: dsCalibrationForIntegration("flats", filter).map(f => f.path),
+        darkFlats: dsCalibrationForIntegration("darkFlats", filter).map(f => f.path),
+        bias: dsCalibrationForIntegration("bias", filter).map(f => f.path),
+        captureMode: value("sel-ds-capture-mode", "auto"),
+        calibrationPolicy: value("sel-ds-calibration-policy", "strict"),
+        computePolicy: value("sel-ds-compute", "hybrid"),
+        profile,
+        rejection,
+        ...(dsMethod === "eidr"
+            ? {
+                integrationMethod: {
+                    method: "eidr",
+                    // F9: sucesor forward-model de drizzle. La escala Auto la
+                    // decide la PSF medida + la puerta de recuperabilidad; los
+                    // fallbacks quedan en receta (nunca silenciosos).
+                    scale: value("sel-ds-eidrscale", "auto"),
+                    solveMode: value("sel-ds-eidrmode", "scientificQuadratic"),
+                    cfaDirect: checked("chk-ds-cfadirect", false),
+                    refineRegistration: checked("chk-ds-eidrrefine", false),
+                },
+            }
+            : {}),
+        ...(dsMethod === "nebula_fusion" || dsMethod === "nebula_fusion_full" || dsMethod === "nebula_fusion_struct"
+            ? {
+                integrationMethod: {
+                    method: "nebula_fusion",
+                    // F6: Full recombina por frecuencia; F7: +STRUCT valida
+                    // las estructuras por mitades (requiere >=16 tomas).
+                    mode: dsMethod === "nebula_fusion_struct"
+                        ? "fullWithStruct"
+                        : dsMethod === "nebula_fusion_full" ? "full" : "lite",
+                    // F4: CFA directo y super-binning de salida (solo viajan con
+                    // NebulaFusion; el preflight valida cfaDirect sin lights CFA
+                    // y Full+cfaDirect).
+                    cfaDirect: checked("chk-ds-cfadirect", false),
+                    outputBin: value("sel-ds-outputbin", "native"),
+                },
+            }
+            : {}),
+        kappaLow: parseFloat(value("num-ds-kappa-low", "3")) || 3,
+        kappaHigh: parseFloat(value("num-ds-kappa-high", "3")) || 3,
+        clipIters: parseInt(value("sel-ds-clipiters", "")) || null,
+        normalization: value("sel-ds-normalization", "scaling"),
+        interpolation: value("sel-ds-interp", "lanczos3"),
+        drizzle: parseFloat(value("sel-ds-drizzle", "1")) || 1,
+        pixfrac: parseFloat(value("sel-ds-pixfrac", "0.8")) || 0.8,
+        cosmetic: checked("chk-ds-cosmetic", true),
+        gradient: checked("chk-ds-gradient", false),
+        optimizeDark: checked("chk-ds-darkopt", true),
+        autoCrop: checked("chk-ds-autocrop", true),
+        localWeighting: checked("chk-ds-localw", false),
+        workDir: localStorage.getItem("zas_ds_workdir") || null,
+        pedestal: parseFloat(pedestalRaw) || null,
+        calibrationOverrides: dsBuildCalibrationOverrides(lights, filter, value),
+    };
+}
+
+// Overrides de calibración manual del request: una regla por GRUPO ligado en la
+// tabla (bloque concreto u omisión) + los forzados globales de los selects
+// avanzados. Los bloques excluidos ya se filtraron de las listas de calibración.
+// Las rutas se resuelven contra los bloques vigentes, no contra un índice del
+// último plan: así una elección nunca viaja vacía por estar el plan caducado.
+function dsBuildCalibrationOverrides(lights, filter, value) {
+    const overrides = [];
+    const blockCache = new Map();
+    const blockPaths = (kind, id) => {
+        if (!blockCache.has(kind)) {
+            blockCache.set(kind, new Map(dsCalibrationBlocks(kind).map(block => [block.id, block])));
+        }
+        return (blockCache.get(kind).get(id)?.files || []).map(file => file.path);
+    };
+    for (const row of dsCalibrationRows(lights)) {
+        const assignment = dsCalibAssignments.get(row.key);
+        if (!assignment) continue;
+        const entry = {
+            lights: row.lights.map(file => file.path),
+            darks: [],
+            flats: [],
+            skipFlats: false,
+            skipDarks: false,
+        };
+        let meaningful = false;
+        for (const kind of ["flats", "darks"]) {
+            const choice = assignment[kind];
+            if (!choice || choice === "auto") continue;
+            if (choice === "skip") {
+                entry[kind === "flats" ? "skipFlats" : "skipDarks"] = true;
+                meaningful = true;
+                continue;
+            }
+            const paths = blockPaths(kind, choice);
+            if (paths.length) {
+                entry[kind] = paths;
+                meaningful = true;
+            }
+        }
+        if (meaningful) overrides.push(entry);
+    }
+    if (value("sel-ds-manual-darks", "auto") === "all") {
+        overrides.push({ lights: [], darks: dsCalibrationForIntegration("darks", filter).map(f => f.path), flats: [], skipFlats: false, skipDarks: false });
+    }
+    if (value("sel-ds-manual-flats", "auto") === "all") {
+        overrides.push({ lights: [], darks: [], flats: dsCalibrationForIntegration("flats", filter).map(f => f.path), skipFlats: false, skipDarks: false });
+    }
+    return overrides;
+}
+
+function dsIsMultibandSession() {
+    const enabled = document.getElementById("chk-ds-multiband-session")?.checked ?? true;
+    return enabled && dsIntegrationGroups(dsActiveLights()).length > 1;
+}
+
+function dsBuildSessionRequest() {
+    const lights = dsActiveLights();
+    // Los descartes manuales se excluyen ANTES de agrupar; un filtro cuyas
+    // tomas se descartaron por completo se omite (con las demás bandas
+    // intactas) en vez de invalidar la sesión entera (auditoría 2026-07-20).
+    const groups = dsIntegrationGroups(lights)
+        .map(group => ({ ...group, files: group.files.filter(f => !dsDiscardedPaths.has(f.path)) }))
+        .filter(group => group.files.length > 0)
+        .map((group, index) => ({
+        id: `${String(index + 1).padStart(2, "0")}_${group.filter.toLowerCase()}`,
+        label: `${dsFilterLabel(group.filter)} · ${group.files.length} lights`,
+        filterProfile: group.filter,
+        request: dsBuildStackRequest(group.files, group.filter),
+    }));
+    return {
+        groups,
+        // La sesión escribe sus resultados en la carpeta de trabajo si existe.
+        basePath: localStorage.getItem("zas_ds_workdir") || lights[0]?.path || "",
+        extraction: {
+            oiiiGreenWeight: parseFloat(document.getElementById("sel-ds-oiii-mix")?.value || "0.65"),
+            crosstalkSuppression: parseFloat(document.getElementById("sel-ds-crosstalk")?.value || "0"),
+        },
+        palette: document.getElementById("sel-ds-session-palette")?.value || "none",
+    };
+}
+
+function dsFormatSessionPreflight(plan) {
+    const sessionGroupedAlerts = (messages, cssClass, silenceable) => dsGroupAlertMessages(messages)
+        .filter(group => !(silenceable && dsSilencedAlerts.has(group.key)))
+        .map(group => {
+            const silenceBtn = silenceable
+                ? `<button type="button" class="ds-mini-btn ds-silence-alert" data-alert-key="${escapeHtml(group.key)}" title="${tr("deepsky.alert_silence_hint", "Ocultar este aviso durante esta sesión")}" style="float:right;margin-left:8px;">${tr("deepsky.alert_silence", "Silenciar")}</button>`
+                : "";
+            if (group.items.length === 1) {
+                return `<div class="ds-alert ${cssClass}">${silenceBtn}${escapeHtml(group.items[0])}</div>`;
+            }
+            const detail = group.items.map(item => `<div style="color:#94a3b8;margin-top:3px;">${escapeHtml(item)}</div>`).join("");
+            return `<details class="ds-alert ${cssClass}">
+                <summary style="cursor:pointer;list-style:none;">${silenceBtn}<b>×${group.items.length}</b> ${escapeHtml(group.items[0])} <span style="color:#64748b;">(${tr("deepsky.alert_expand", "ver detalle")})</span></summary>
+                <div style="margin-top:4px;max-height:160px;overflow:auto;border-left:2px solid rgba(148,163,184,.2);padding-left:8px;">${detail}</div>
+            </details>`;
+        }).join("");
+    const alerts = [
+        sessionGroupedAlerts(plan.errors || [], "error", false),
+        sessionGroupedAlerts(
+            (plan.warnings || []).filter(
+                warning => !/^(Sesión multibanda|Multiband session)/i.test(String(warning)),
+            ),
+            "warn",
+            true,
+        ),
+    ].join("");
+    const groups = (plan.groups || []).map(group => {
+        const p = group.plan || {};
+        const components = (group.componentFilters || []).map(component => `<span class="ds-component-chip">${escapeHtml(component)}</span>`).join("");
+        return `<article class="ds-session-group">
+            <div class="ds-session-group-head">
+                <div><strong>${escapeHtml(dsFilterLabel(group.filterProfile))}</strong><span>${escapeHtml(group.label)}</span></div>
+                <span class="ds-plan-state ${p.valid ? "ok" : "error"}">${p.valid ? tr("deepsky.state_ready", "Listo") : tr("deepsky.state_review", "Revisar")}</span>
+            </div>
+            <div class="ds-session-group-meta">
+                <span>${p.groups?.reduce((sum, item) => sum + (item.frameCount || 0), 0) || 0} lights</span>
+                <span>${escapeHtml(p.effectiveEngine || "")}</span>
+                <span>${escapeHtml(p.effectiveRejection || "")}</span>
+                <span>~${Math.max(1, Math.round(p.estimatedSeconds || 0))} s</span>
+            </div>
+            <div class="ds-component-flow"><span>${tr("deepsky.outputs", "Salidas")}:</span>${components || `<span class="ds-component-chip">${tr("deepsky.master", "Máster")}</span>`}</div>
+            ${dsFormatSamplingAdvisor(p.samplingAdvisor)}
+            ${dsFormatSessionMap(p.sessionMap)}
+            ${dsFormatCalibrationDecisions(p.calibrationDecisions)}
+        </article>`;
+    }).join("");
+    return `<div class="ds-session-overview">
+        <div><b>${plan.valid ? tr("deepsky.session_ready", "Sesión lista") : tr("deepsky.session_attention", "Sesión requiere atención")}</b><span>${trFormat("deepsky.session_integrations", { count: plan.groups?.length || 0, frames: plan.totalFrames || 0 }, `${plan.groups?.length || 0} integraciones coordinadas · ${plan.totalFrames || 0} lights`)}</span></div>
+        <span class="ds-session-time">~${Math.max(1, Math.round(plan.estimatedSeconds || 0))} s</span>
+    </div>
+    <div class="ds-resource-grid"><span>${tr("deepsky.peak_ram", "RAM pico")} <b>~${plan.estimatedRamMb || 0} MB</b></span><span>${tr("deepsky.peak_vram", "VRAM pico")} <b>~${plan.estimatedVramMb || 0} MB</b></span><span>${tr("deepsky.disk", "Disco")} <b>~${plan.estimatedDiskMb || 0} MB</b></span></div>
+    <div class="ds-session-groups">${groups}</div>${alerts}`;
+}
+
+// Matriz lights↔flats por sesión (estilo PixInsight): qué flats calibran cada
+// noche de lights, con exposición total y distancia en días.
+function dsFormatSessionMap(map) {
+    if (!map?.length) return "";
+    const fmtExp = (s) => s >= 3600 ? `${(s / 3600).toFixed(1)} h` : s >= 60 ? `${Math.round(s / 60)} min` : `${Math.round(s)} s`;
+    const rows = map.map(e => `<tr style="border-top:1px solid rgba(148,163,184,.1);">
+        <td style="padding:4px 8px;color:#e2e8f0;">${escapeHtml(e.night)}</td>
+        <td style="padding:4px 8px;text-align:right;">${e.lights}</td>
+        <td style="padding:4px 8px;text-align:right;">${fmtExp(e.exposureSeconds || 0)}</td>
+        <td style="padding:4px 8px;color:${e.flatDistanceDays > 30 ? "#fcd34d" : "#cbd5e1"};">${e.flatNight ? `${escapeHtml(e.flatNight)} · ${e.flatCount} ${tr("deepsky.frames_lower", "tomas")}${e.flatDistanceDays > 0 && e.flatDistanceDays < 3650 ? ` · Δ${e.flatDistanceDays} d` : ""}` : "—"}</td>
+        <td style="padding:4px 8px;color:#94a3b8;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(e.darks || "")}">${escapeHtml((e.darks || "—").replace(/^darks: /, ""))}</td>
+    </tr>`).join("");
+    return `<div style="margin-top:10px;">
+        <div style="font-size:.62rem;color:#a5b4fc;font-weight:700;letter-spacing:.05em;margin-bottom:4px;">${tr("deepsky.session_matrix", "CALIBRACIÓN POR SESIÓN")}</div>
+        <div style="overflow:auto;border:1px solid rgba(148,163,184,.12);border-radius:8px;">
+        <table style="width:100%;border-collapse:collapse;font-size:.6rem;min-width:540px;">
+            <thead style="background:#111827;color:#94a3b8;"><tr>
+                <th style="padding:4px 8px;text-align:left;">${tr("deepsky.session_night", "Noche (lights)")}</th><th style="padding:4px 8px;text-align:right;">Lights</th><th style="padding:4px 8px;text-align:right;">${tr("deepsky.exposure", "Exposición")}</th><th style="padding:4px 8px;text-align:left;">${tr("deepsky.session_flats", "Flats que aplicará")}</th><th style="padding:4px 8px;text-align:left;">Darks</th>
+            </tr></thead><tbody>${rows}</tbody>
+        </table></div></div>`;
+}
+
+// Matriz tipada por light. El backend nunca oculta decisiones dentro de un
+// warning: aquí se ve qué master se eligió, si hubo degradación y por qué.
+function dsFormatCalibrationDecisions(decisions) {
+    if (!decisions?.length) return "";
+    const visible = decisions.slice(0, 50);
+    const masterLabel = (path) => path ? escapeHtml(String(path).replace(/^master:\/\//, "")) : "—";
+    const rows = visible.map(decision => {
+        const ok = decision.compatible && !decision.degraded;
+        const reasons = (decision.reasons || []).join(" · ");
+        const status = decision.manual
+            ? tr("deepsky.decision_manual", "Manual")
+            : ok
+                ? tr("deepsky.decision_exact", "Exacta")
+                : decision.degraded
+                    ? tr("deepsky.decision_degraded", "Degradada")
+                    : tr("deepsky.decision_blocked", "Bloqueada");
+        const color = decision.manual ? "#7dd3fc" : ok ? "#6ee7b7" : decision.degraded ? "#fcd34d" : "#fca5a5";
+        return `<tr style="border-top:1px solid rgba(148,163,184,.1);">
+            <td style="padding:4px 8px;color:#e2e8f0;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(decision.framePath || "")}">${escapeHtml(pathBaseName(decision.framePath || ""))}</td>
+            <td style="padding:4px 8px;color:${color};font-weight:700;">${status}</td>
+            <td style="padding:4px 8px;color:#94a3b8;">${masterLabel(decision.biasMasterPath)}</td>
+            <td style="padding:4px 8px;color:#94a3b8;">${masterLabel(decision.darkMasterPath)}${decision.darkScale != null ? ` · k=${Number(decision.darkScale).toFixed(3)}` : ""}</td>
+            <td style="padding:4px 8px;color:#94a3b8;">${masterLabel(decision.darkFlatMasterPath)}</td>
+            <td style="padding:4px 8px;color:#94a3b8;">${masterLabel(decision.flatMasterPath)}</td>
+            <td style="padding:4px 8px;color:${ok ? "#64748b" : color};max-width:300px;" title="${escapeHtml(reasons)}">${escapeHtml(reasons || decision.fallback || "—")}</td>
+        </tr>`;
+    }).join("");
+    const omitted = decisions.length - visible.length;
+    return `<details style="margin-top:10px;" ${decisions.some(decision => !decision.compatible) ? "open" : ""}>
+        <summary style="cursor:pointer;color:#a5b4fc;font-size:.62rem;font-weight:700;letter-spacing:.05em;">${trFormat("deepsky.calibration_matrix", { count: decisions.length }, `MATRIZ DE CALIBRACIÓN · ${decisions.length} LIGHTS`)}</summary>
+        <div style="overflow:auto;max-height:260px;border:1px solid rgba(148,163,184,.12);border-radius:8px;margin-top:4px;">
+        <table style="width:100%;border-collapse:collapse;font-size:.58rem;min-width:980px;">
+            <thead style="background:#111827;color:#94a3b8;"><tr><th style="padding:4px 8px;text-align:left;">Light</th><th style="padding:4px 8px;text-align:left;">${tr("deepsky.status", "Estado")}</th><th style="padding:4px 8px;text-align:left;">Bias</th><th style="padding:4px 8px;text-align:left;">Dark</th><th style="padding:4px 8px;text-align:left;">Dark-flat</th><th style="padding:4px 8px;text-align:left;">Flat</th><th style="padding:4px 8px;text-align:left;">${tr("deepsky.reason_fallback", "Razón / fallback")}</th></tr></thead>
+            <tbody>${rows}</tbody>
+        </table></div>${omitted > 0 ? `<div style="color:#94a3b8;margin-top:4px;">${trFormat("deepsky.calibration_matrix_truncated", { count: decisions.length }, `Se muestran 50 de ${decisions.length}; la receta conserva todas.`)}</div>` : ""}
+    </details>`;
+}
+
+// Tarjeta "Fondo y muestreo" (asesor F2): FWHM mediana medida, clasificación
+// del muestreo y escala recomendada. Solo se pinta si el backend pudo medir
+// estrellas (plan.samplingAdvisor puede ser null/ausente).
+function dsFormatSamplingAdvisor(advisor) {
+    if (!advisor) return "";
+    const classInfo = {
+        undersampled: { key: "deepsky.advisor_undersampled", fallback: "Submuestreado", color: "#fcd34d" },
+        well_sampled: { key: "deepsky.advisor_well_sampled", fallback: "Muestreo correcto", color: "#6ee7b7" },
+        oversampled: { key: "deepsky.advisor_oversampled", fallback: "Sobremuestreado", color: "#7dd3fc" },
+    }[advisor.classification];
+    const classLabel = classInfo ? tr(classInfo.key, classInfo.fallback) : (advisor.classification || "");
+    const classColor = classInfo?.color || "#cbd5e1";
+    const scale = advisor.recommendedScale || "1x";
+    const scaleValue = parseFloat(scale);
+    const recommendation = !isFinite(scaleValue) || scaleValue === 1
+        ? tr("deepsky.advisor_reco_native", "Escala recomendada: 1x (resolución nativa)")
+        : scaleValue < 1
+            ? trFormat("deepsky.advisor_reco_binning", { scale }, `Escala recomendada: ${scale} (super-binning)`)
+            : trFormat("deepsky.advisor_reco_superres", { scale }, `Escala recomendada: ${scale} — candidata a super-resolución cuando EIDR esté disponible`);
+    const fwhm = Number(advisor.fwhmMedianPx || 0).toFixed(1);
+    const frame = escapeHtml(pathBaseName(advisor.sampledFrame || ""));
+    const stars = trFormat("deepsky.advisor_stars", { stars: advisor.starsMeasured ?? 0, frame }, `${advisor.starsMeasured ?? 0} estrellas · toma ${frame}`);
+    return `<div style="margin:0 0 8px;padding:7px 9px;border:1px solid rgba(124,58,237,.25);border-radius:8px;background:rgba(124,58,237,.06);color:#c4b5fd;">
+        <b>${tr("deepsky.advisor_title", "Fondo y muestreo")}</b>
+        <div style="margin-top:3px;color:#94a3b8;line-height:1.45;">
+            <div>${tr("deepsky.advisor_fwhm", "FWHM mediana")} <b style="color:#e2e8f0;">${fwhm} px</b> · ${stars}</div>
+            <div><span style="color:${classColor};font-weight:700;">${escapeHtml(classLabel)}</span> · ${recommendation}</div>
+        </div>
+    </div>`;
+}
+
+// Agrupa mensajes que solo difieren en el nombre citado ('...') para
+// presentarlos como una línea con contador + detalle desplegable.
+function dsGroupAlertMessages(messages) {
+    const groups = new Map();
+    for (const raw of messages || []) {
+        const text = String(raw);
+        const key = text
+            .replace(/'[^']*'/g, "'…'")
+            .replace(/"[^"]*"/g, '"…"')
+            .replace(/\d{4}-\d{2}-\d{2}/g, "····-··-··")
+            .replace(/\b\d+\b/g, "N");
+        if (!groups.has(key)) groups.set(key, { key, items: [] });
+        groups.get(key).items.push(text);
+    }
+    return [...groups.values()];
+}
+
+function dsPlanMembers(plan) {
+    if (!plan) return [];
+    if (plan.sessionId) return (plan.groups || []).map(group => group.plan).filter(Boolean);
+    return [plan];
+}
+
+function dsPlanFrameCount(plan) {
+    if (!plan) return 0;
+    if (Number.isFinite(Number(plan.totalFrames))) return Number(plan.totalFrames);
+    return dsPlanMembers(plan).reduce(
+        (total, member) => total + (member.groups || []).reduce(
+            (groupTotal, group) => groupTotal + (Number(group.frameCount) || 0),
+            0,
+        ),
+        0,
+    );
+}
+
+function dsRenderRecipeImpact(plan) {
+    const panel = document.getElementById("ds-recipe-impact");
+    if (!panel) return;
+    if (!plan || !dsActiveLights().length) {
+        panel.hidden = true;
+        panel.replaceChildren();
+        return;
+    }
+    const members = dsPlanMembers(plan);
+    const profile = dsActivePreset || "auto";
+    const profileLabel = {
+        auto: tr("deepsky.preset_auto_measured", "Auto (receta medida)"),
+        fast: tr("deepsky.preset_fast", "Rápido"),
+        balanced: tr("deepsky.preset_balanced", "Equilibrado"),
+        max: tr("deepsky.preset_max", "Máxima calidad"),
+        custom: tr("deepsky.preset_custom", "Personalizado"),
+    }[profile] || profile;
+    const impactLabel = {
+        auto: tr("deepsky.impact_auto", "Adaptado a las mediciones actuales"),
+        fast: tr("deepsky.impact_fast", "Prioriza tiempo y memoria"),
+        balanced: tr("deepsky.impact_balanced", "Equilibra detalle, rechazo y coste"),
+        max: tr("deepsky.impact_max", "Prioriza rechazo y normalización local"),
+        custom: tr("deepsky.impact_custom", "Usa tus controles visibles"),
+    }[profile] || "";
+    const reasons = [...new Set([
+        ...(plan.recommendationReasons || []),
+        ...members.flatMap(member => member.recommendationReasons || []),
+    ])].slice(0, 3);
+    const seconds = Number(plan.estimatedSeconds)
+        || members.reduce((total, member) => total + (Number(member.estimatedSeconds) || 0), 0);
+    const ram = Number(plan.estimatedRamMb)
+        || Math.max(0, ...members.map(member => Number(member.estimatedRamMb) || 0));
+    const disk = Number(plan.estimatedDiskMb)
+        || members.reduce((total, member) => total + (Number(member.estimatedDiskMb) || 0), 0);
+    const engines = [...new Set(members.map(member => member.effectiveEngine).filter(Boolean))];
+    panel.hidden = false;
+    panel.innerHTML = `
+        <div class="ds-impact-head">
+            <div><strong>${tr("deepsky.recipe_impact_title", "Impacto de la receta")}</strong><span>${escapeHtml(profileLabel)} · ${escapeHtml(impactLabel)}</span></div>
+            <span>${plan.valid ? tr("deepsky.state_ready", "Listo") : tr("deepsky.state_review", "Revisar")}</span>
+        </div>
+        <div class="ds-impact-metrics">
+            <span>${tr("deepsky.impact_frames", "Tomas efectivas")}<b>${dsPlanFrameCount(plan)}</b></span>
+            <span>${tr("deepsky.impact_time", "Tiempo estimado")}<b>~${Math.max(1, Math.round(seconds))} s</b></span>
+            <span>${tr("deepsky.impact_ram", "RAM pico")}<b>~${Math.round(ram)} MB</b></span>
+            <span>${tr("deepsky.impact_disk", "Disco temporal")}<b>~${Math.round(disk)} MB</b></span>
+        </div>
+        <div class="ds-impact-reasons">
+            <b>${tr("deepsky.impact_why", "Por qué Zenith eligió esto")}:</b>
+            ${reasons.length
+                ? reasons.map(reason => `<div>• ${escapeHtml(reason)}</div>`).join("")
+                : `<div>• ${escapeHtml(engines.join(" · ") || tr("deepsky.impact_waiting", "El análisis se actualiza con cada cambio."))}</div>`}
+        </div>`;
+}
+
+// Avisos silenciados por el usuario en ESTA sesión (clave = patrón agrupado).
+// Los errores bloqueantes nunca se silencian.
+const dsSilencedAlerts = new Set();
+
+function dsFormatPreflight(plan) {
+    if (!plan) return `<span style="color:#94a3b8;">${tr("deepsky.preparing_plan", "Preparando plan reproducible…")}</span>`;
+    if (plan.sessionId) return dsFormatSessionPreflight(plan);
+    const errors = plan.errors || [];
+    const warnings = plan.warnings || [];
+    const groups = plan.groups || [];
+    const stages = Object.entries(plan.stages || {})
+        .map(([stage, engine]) => `<span style="display:inline-flex;gap:5px;margin:2px 10px 2px 0;"><b style="color:#a5b4fc;">${escapeHtml(stage)}</b> ${escapeHtml(engine)}</span>`)
+        .join("");
+    const normModel = Object.entries(plan.normalizationModel || {})
+        .map(([key, value]) => `<span style="display:inline-flex;gap:5px;margin:2px 10px 2px 0;"><b style="color:#67e8f9;">${escapeHtml(key)}</b> ${escapeHtml(value)}</span>`)
+        .join("");
+    const groupRows = groups.map(g => `<div style="padding:5px 0;border-top:1px solid rgba(148,163,184,.1);">
+        <b style="color:#e2e8f0;">${g.frameCount} lights · ${g.width}×${g.height}×${g.channels}</b>
+        <span style="color:#64748b;"> · ${escapeHtml(g.bayerPattern || g.filter || "mono/RGB")} · ${escapeHtml(g.filter || tr("deepsky.no_filter", "sin filtro"))} · ${g.exposureSeconds ?? "?"} s · gain ${g.gain ?? "?"} · bin ${g.binning ?? "?"} · ${g.temperatureC ?? "?"} °C</span>
+    </div>`).join("");
+    const alertIcon = (icon) => `<svg class="zas-icon zas-icon-inline" style="margin-top:2px;"><use href="#icon-${icon}"></use></svg>`;
+    // Mensajes idénticos salvo el nombre entre comillas se agrupan en UNA
+    // línea con contador y detalle desplegable: 50 tomas con el mismo problema
+    // no deben inundar el panel.
+    const renderAlerts = (messages, color, icon, silenceable = false) => dsGroupAlertMessages(messages)
+        .filter(group => !(silenceable && dsSilencedAlerts.has(group.key)))
+        .map(group => {
+            const silenceBtn = silenceable
+                ? `<button type="button" class="ds-mini-btn ds-silence-alert" data-alert-key="${escapeHtml(group.key)}" title="${tr("deepsky.alert_silence_hint", "Ocultar este aviso durante esta sesión")}" style="margin-left:auto;flex:0 0 auto;">${tr("deepsky.alert_silence", "Silenciar")}</button>`
+                : "";
+            if (group.items.length === 1) {
+                return `<div style="color:${color};display:flex;gap:5px;align-items:flex-start;">${alertIcon(icon)}<span style="flex:1;">${escapeHtml(group.items[0])}</span>${silenceBtn}</div>`;
+            }
+            // El resumen muestra el PRIMER mensaje real (legible), nunca la
+            // clave enmascarada del agrupador.
+            const detail = group.items.map(item => `<div style="color:#94a3b8;">${escapeHtml(item)}</div>`).join("");
+            return `<details style="color:${color};">
+                <summary style="cursor:pointer;display:flex;gap:5px;align-items:flex-start;list-style:none;">${alertIcon(icon)}<span style="flex:1;"><b>×${group.items.length}</b> ${escapeHtml(group.items[0])} <span style="color:#64748b;">(${tr("deepsky.alert_expand", "ver detalle")})</span></span>${silenceBtn}</summary>
+                <div style="margin:4px 0 6px 22px;max-height:160px;overflow:auto;border-left:2px solid rgba(148,163,184,.2);padding-left:8px;">${detail}</div>
+            </details>`;
+        }).join("");
+    const policySelect = document.getElementById("sel-ds-calibration-policy");
+    const proceedOffer = !plan.valid && policySelect?.value === "strict"
+        ? `<div style="margin:7px 0;padding:7px 9px;border:1px solid rgba(251,191,36,.35);border-radius:8px;background:rgba(120,53,15,.08);color:#fcd34d;">
+            ${tr("deepsky.proceed_hint", "La política Estricta bloquea al primer incumplimiento del contrato. Puedes continuar en modo degradado: el apilado procede, cada concesión queda registrada y el resultado se marca como no científico si aplica.")}
+            <button type="button" id="btn-ds-proceed-degraded" class="ds-mini-btn" style="margin-top:6px;">${tr("deepsky.proceed_degraded", "Continuar en modo degradado")}</button>
+        </div>`
+        : "";
+    const alerts = [
+        renderAlerts(errors, "#fca5a5", "cross"),
+        proceedOffer,
+        renderAlerts(warnings, "#fcd34d", "warning", true),
+        ...(plan.scientificEligible === false
+            ? [(() => {
+                const reasons = plan.scientificEligibilityReasons || [];
+                const text = reasons.length
+                    ? `${tr("deepsky.method_needs", "Para activar NebulaFusion/EIDR:")} ${reasons.join(" · ")}`
+                    : tr("deepsky.method_blocked_nonlinear", "EIDR y NebulaFusion requieren entradas científicas lineales (FITS/TIFF); revisa los avisos del plan.");
+                return `<div style="color:#fcd34d;display:flex;gap:5px;align-items:flex-start;">${alertIcon("warning")}<span>${escapeHtml(text)}</span></div>`;
+            })()]
+            : []),
+    ].join("");
+    const recommendedKey = plan.recommendedProfile || "balanced";
+    const recommendedLabel = {
+        auto: tr("deepsky.preset_auto_measured", "Auto (receta medida)"),
+        fast: tr("deepsky.preset_fast", "Rápido"),
+        balanced: tr("deepsky.preset_balanced", "Equilibrado"),
+        maximum_quality: tr("deepsky.preset_max", "Máxima calidad"),
+        custom: tr("deepsky.preset_custom", "Personalizado"),
+    }[recommendedKey] || recommendedKey;
+    const recommendation = (plan.recommendationReasons || [])
+        .map(reason => `<div>• ${escapeHtml(reason)}</div>`)
+        .join("");
+    // Receta AUTO resuelta: el plan que ve el usuario ES la receta que se
+    // ejecutará (paridad plan↔run garantizada por el resolver compartido).
+    const resolved = plan.resolvedRecipe || {};
+    const RESOLVED_PARAM_KEYS = ["rejection", "kappa_low", "kappa_high", "clip_iters", "normalization", "interpolation", "drizzle", "pixfrac", "pedestal"];
+    const resolvedChips = RESOLVED_PARAM_KEYS
+        .filter(key => resolved[key] !== undefined)
+        .map(key => `<span style="display:inline-block;margin:2px 4px 0 0;padding:2px 8px;border:1px solid rgba(52,211,153,.3);border-radius:999px;color:#a7f3d0;">${escapeHtml(key)} <b style="color:#e2e8f0;">${escapeHtml(resolved[key])}</b></span>`)
+        .join("");
+    const resolvedSignals = ["n_lights", "sessions", "narrowband", "dark_nebula", "background_over_noise", "gradient_strength", "stars_per_mpx", "fwhm_px", "dithering_rms_px"]
+        .filter(key => resolved[key] !== undefined)
+        .map(key => `${escapeHtml(key)}=${escapeHtml(resolved[key])}`)
+        .join(" · ");
+    const resolvedBlock = resolvedChips
+        ? `<div style="margin:0 0 8px;padding:7px 9px;border:1px solid rgba(52,211,153,.25);border-radius:8px;background:rgba(16,185,129,.05);">
+            <b style="color:#6ee7b7;">${tr("deepsky.resolved_recipe_title", "Receta resuelta (AUTO)")}</b>
+            <div style="margin-top:4px;">${resolvedChips}</div>
+            ${resolvedSignals ? `<div style="margin-top:4px;color:#64748b;font-size:.58rem;">${tr("deepsky.resolved_signals", "Señales medidas")}: ${resolvedSignals}</div>` : ""}
+        </div>`
+        : "";
+    const requestedRejection = plan.requestedRejection || "";
+    const effectiveRejection = plan.effectiveRejection || requestedRejection;
+    const methodLabel = requestedRejection && requestedRejection !== effectiveRejection
+        ? `${requestedRejection} → ${effectiveRejection}`
+        : effectiveRejection;
+    return `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:7px;">
+        <b style="color:${plan.valid ? "#6ee7b7" : "#fca5a5"};">${plan.valid ? tr("deepsky.plan_valid", "Plan válido") : tr("deepsky.plan_attention", "Requiere atención")}</b>
+        <span>${escapeHtml(plan.effectiveEngine || "")}</span>
+        <span style="color:#c4b5fd;">${tr("deepsky.effective_method", "Método real")} <b>${escapeHtml(methodLabel)}</b></span>
+        <span style="margin-left:auto;color:#7dd3fc;">~${Math.max(1, Math.round(plan.estimatedSeconds || 0))} s</span>
+    </div>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;color:#94a3b8;margin-bottom:7px;">
+        <span>RAM <b style="color:#e2e8f0;">~${plan.estimatedRamMb || 0} MB</b></span>
+        <span>VRAM <b style="color:#e2e8f0;">~${plan.estimatedVramMb || 0} MB</b></span>
+        <span>${tr("deepsky.disk", "Disco")} <b style="color:#e2e8f0;">~${plan.estimatedDiskMb || 0} MB</b></span>
+        <span>${trFormat("deepsky.groups_count", { count: `<b style="color:#e2e8f0;">${groups.length}</b>` }, `<b style="color:#e2e8f0;">${groups.length}</b> grupo(s)`)}</span>
+        ${plan.gpuName ? `<span>GPU <b style="color:#e2e8f0;">${escapeHtml(plan.gpuName)}</b></span>` : ""}
+    </div>
+    <div style="margin:0 0 8px;padding:7px 9px;border:1px solid rgba(34,211,238,.2);border-radius:8px;background:rgba(8,145,178,.06);color:#a5f3fc;">
+        <b>${tr("deepsky.recommended_profile", "Perfil recomendado")}: ${escapeHtml(recommendedLabel)}</b>
+        ${recommendation ? `<div style="margin-top:3px;color:#94a3b8;line-height:1.45;">${recommendation}</div>` : ""}
+    </div>${resolvedBlock}${dsFormatSamplingAdvisor(plan.samplingAdvisor)}${alerts}${groupRows}${dsFormatSessionMap(plan.sessionMap)}${dsFormatCalibrationDecisions(plan.calibrationDecisions)}<div style="margin-top:8px;">${stages}</div>
+    ${normModel ? `<details style="margin-top:7px;"><summary style="cursor:pointer;color:#a5f3fc;">${tr("deepsky.normalization_model", "Modelo de normalización a inspeccionar")}</summary><div style="padding-top:5px;">${normModel}</div></details>` : ""}`;
+}
+
+function dsFormatReviewPlan(plan) {
+    if (!plan) return `<span style="color:#94a3b8;">${tr("deepsky.preparing_plan", "Preparando plan reproducible…")}</span>`;
+    const members = dsPlanMembers(plan);
+    const errors = [...new Set([
+        ...(plan.errors || []),
+        ...members.flatMap(member => member.errors || []),
+    ])];
+    const warnings = [...new Set([
+        ...(plan.warnings || []),
+        ...members.flatMap(member => member.warnings || []),
+    ])];
+    const blockerGroups = dsGroupAlertMessages(errors);
+    const warningGroups = dsGroupAlertMessages(warnings);
+    const engines = [...new Set(members.map(member => member.effectiveEngine).filter(Boolean))];
+    const methods = [...new Set(members.map(member => member.effectiveRejection || member.requestedRejection).filter(Boolean))];
+    const seconds = Number(plan.estimatedSeconds)
+        || members.reduce((total, member) => total + (Number(member.estimatedSeconds) || 0), 0);
+    const ram = Number(plan.estimatedRamMb)
+        || Math.max(0, ...members.map(member => Number(member.estimatedRamMb) || 0));
+    const disk = Number(plan.estimatedDiskMb)
+        || members.reduce((total, member) => total + (Number(member.estimatedDiskMb) || 0), 0);
+    const compactAlerts = blockerGroups.slice(0, 2)
+        .map(group => `<div>• ${group.items.length > 1 ? `×${group.items.length} ` : ""}${escapeHtml(group.items[0])}</div>`)
+        .join("");
+    return `
+        <div class="ds-review-grid">
+            <section class="ds-review-card" data-state="${plan.valid ? "ready" : "review"}">
+                <strong>${tr("deepsky.review_blockers", "Bloqueos")}</strong>
+                <div>${plan.valid
+                    ? tr("deepsky.review_no_blockers", "Sin bloqueos; el contrato está listo.")
+                    : compactAlerts || tr("deepsky.review_has_blockers", "Revisa los avisos antes de ejecutar.")}</div>
+                ${warningGroups.length ? `<span>${warningGroups.length} ${tr("deepsky.review_warnings", "aviso(s) no bloqueante(s)")}</span>` : ""}
+            </section>
+            <section class="ds-review-card" data-state="ready">
+                <strong>${tr("deepsky.review_outputs", "Salidas")}</strong>
+                <div>${tr("deepsky.review_outputs_body", "Máster lineal y receta reproducible; SCI/VAR/NEFF/DQ cuando el plan es científicamente elegible.")}</div>
+                <span>${dsPlanFrameCount(plan)} lights</span>
+            </section>
+            <section class="ds-review-card" data-state="${plan.valid ? "ready" : "review"}">
+                <strong>${tr("deepsky.review_method_resources", "Método y recursos")}</strong>
+                <div>${escapeHtml(methods.join(" · ") || "—")} · ${escapeHtml(engines.join(" · ") || "—")}</div>
+                <span>~${Math.max(1, Math.round(seconds))} s · RAM ~${Math.round(ram)} MB · ${tr("deepsky.disk", "Disco")} ~${Math.round(disk)} MB</span>
+            </section>
+        </div>
+        <details class="ds-review-technical">
+            <summary>${tr("deepsky.review_technical", "Ver plan técnico, firmas y fallbacks")}</summary>
+            <div class="ds-review-technical-body">${dsFormatPreflight(plan)}</div>
+        </details>`;
+}
+
+// ============ GUÍA INTERACTIVA: qué falta para poder apilar ============
+// Tarjeta flotante dentro del asistente: lista los bloqueos ACTUALES y cada
+// uno lleva al control exacto (paso + scroll + resalte pulsante). Con el plan
+// válido se convierte en el atajo "Ir a Revisar y apilar".
+let dsGuideCollapsed = false;
+
+function dsSpotlight(target) {
+    if (!target) return;
+    target.scrollIntoView({ block: "center", behavior: "smooth" });
+    target.classList.add("ds-spotlight");
+    setTimeout(() => target.classList.remove("ds-spotlight"), 2800);
+}
+
+// Lleva a la tabla de calibración (paso "Datos"), que es donde se liga cada
+// grupo de lights con su bloque de flats o darks.
+function dsOpenLinkerAndSpotlight() {
+    dsSetWizardStep(0, true);
+    requestAnimationFrame(() => {
+        const table = document.getElementById("ds-session-organizer");
+        dsSpotlight(table || document.getElementById("ds-preflight-inspection"));
+    });
+}
+
+function dsGuideItems(plan) {
+    const items = [];
+    if (!dsActiveLights().length) {
+        items.push({
+            kind: "error",
+            text: tr("deepsky.guide_add_lights", "Añade lights para empezar"),
+            actionLabel: tr("deepsky.guide_go_data", "Ir a Datos"),
+            run: () => { dsSetWizardStep(0, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("btn-ds-scan-folder") || document.getElementById("btn-ds-lights"))); },
+        });
+        return items;
+    }
+    if (!plan) return items;
+    const errors = plan.errors || [];
+    for (const group of dsGroupAlertMessages(errors).slice(0, 4)) {
+        const sample = group.items[0].length > 160 ? `${group.items[0].slice(0, 157)}…` : group.items[0];
+        const item = {
+            kind: "error",
+            text: (group.items.length > 1 ? `×${group.items.length} · ` : "") + sample,
+        };
+        if (/flat|dark|bias|calibraci/i.test(group.key)) {
+            item.actionLabel = tr("deepsky.guide_fix_linker", "Ligar calibración");
+            item.run = dsOpenLinkerAndSpotlight;
+        } else if (/light|lineal|PNG|JPEG/i.test(group.key)) {
+            item.actionLabel = tr("deepsky.guide_go_data", "Ir a Datos");
+            item.run = () => { dsSetWizardStep(0, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("btn-ds-scan-folder") || document.getElementById("btn-ds-lights"))); };
+        } else {
+            item.actionLabel = tr("deepsky.guide_view", "Ver detalle");
+            item.run = () => { dsSetWizardStep(1, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("ds-preflight-inspection"))); };
+        }
+        items.push(item);
+    }
+    const eligibility = dsCollectEligibility(plan);
+    if (!eligibility.eligible && eligibility.reasons.length) {
+        const firstReason = eligibility.reasons[0];
+        items.push({
+            kind: "warn",
+            text: `${tr("deepsky.guide_engines_off", "NebulaFusion/EIDR desactivados")}: ${firstReason}`,
+            actionLabel: /flat|dark/i.test(firstReason)
+                ? (/añade/i.test(firstReason) ? tr("deepsky.guide_go_data", "Ir a Datos") : tr("deepsky.guide_fix_linker", "Ligar calibración"))
+                : tr("deepsky.guide_go_data", "Ir a Datos"),
+            run: /añade|PNG|JPEG/i.test(firstReason)
+                ? () => { dsSetWizardStep(0, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("btn-ds-scan-folder") || document.getElementById("btn-ds-lights"))); }
+                : dsOpenLinkerAndSpotlight,
+        });
+    }
+    if (!plan.valid && document.getElementById("sel-ds-calibration-policy")?.value === "strict") {
+        items.push({
+            kind: "warn",
+            text: tr("deepsky.guide_strict", "La política Estricta bloquea al primer incumplimiento; puedes continuar en modo degradado (queda registrado)"),
+            actionLabel: tr("deepsky.proceed_degraded", "Continuar en modo degradado"),
+            run: () => {
+                const policy = document.getElementById("sel-ds-calibration-policy");
+                if (policy) {
+                    policy.value = "allowDegraded";
+                    policy.dispatchEvent(new Event("change", { bubbles: true }));
+                }
+                dsSchedulePreflight(true);
+            },
+        });
+    }
+    if (plan.valid) {
+        items.push({
+            kind: "ok",
+            text: tr("deepsky.guide_ready", "Plan válido: todo listo para apilar"),
+            actionLabel: tr("deepsky.guide_go_run", "Ir a Revisar y apilar"),
+            run: () => { dsSetWizardStep(3, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("btn-deepsky-run"))); },
+        });
+    }
+    return items;
+}
+
+function dsRenderGuide(plan) {
+    const host = document.getElementById("ds-guide-dock");
+    if (!host) return;
+    let card = document.getElementById("ds-guide");
+    const items = dsGuideItems(plan);
+    if (!items.length) {
+        card?.remove();
+        return;
+    }
+    if (!card) {
+        card = document.createElement("div");
+        card.id = "ds-guide";
+        host.appendChild(card);
+    }
+    const blockers = items.filter(item => item.kind === "error").length;
+    const dotColor = { error: "#f87171", warn: "#fbbf24", ok: "#34d399" };
+    card.classList.toggle("collapsed", dsGuideCollapsed);
+    card.innerHTML = `
+        <div class="ds-guide-head">
+            <svg class="zas-icon zas-icon-inline" style="color:#a78bfa;"><use href="#icon-${blockers ? "warning" : "check"}"></use></svg>
+            <b>${tr("deepsky.guide_title", "Asistente inteligente")}</b>
+            <span style="color:#94a3b8;">${blockers
+                ? trFormat("deepsky.guide_pending", { n: blockers }, `${blockers} por resolver`)
+                : tr("deepsky.guide_all_clear", "sin bloqueos")}</span>
+            <button type="button" id="ds-guide-toggle" class="ds-mini-btn" title="${tr("deepsky.guide_toggle", "Mostrar u ocultar la guía")}">${dsGuideCollapsed ? "▲" : "▼"}</button>
+        </div>
+        <div class="ds-guide-body">
+            ${items.map((item, index) => `
+                <div class="ds-guide-item">
+                    <span class="ds-guide-dot" style="background:${dotColor[item.kind]};"></span>
+                    <span class="ds-guide-text" title="${escapeHtml(item.text)}">${escapeHtml(item.text)}</span>
+                    ${item.run ? `<button type="button" class="ds-guide-action" data-guide="${index}">${escapeHtml(item.actionLabel)}</button>` : ""}
+                </div>`).join("")}
+        </div>`;
+    card.querySelector("#ds-guide-toggle")?.addEventListener("click", () => {
+        dsGuideCollapsed = !dsGuideCollapsed;
+        dsRenderGuide(plan);
+    });
+    card.querySelectorAll(".ds-guide-action").forEach(button => {
+        button.addEventListener("click", () => items[Number(button.dataset.guide)]?.run?.());
+    });
+}
+
+// Elegibilidad NF/EIDR del plan actual (stack simple o sesión): estado y
+// razones únicas, para el selector de método, la caja explicativa y la guía.
+function dsCollectEligibility(plan) {
+    const sessionPlans = plan?.sessionId ? (plan.groups || []).map(g => g.plan).filter(Boolean) : [];
+    const plans = sessionPlans.length ? sessionPlans : [plan].filter(Boolean);
+    const eligible = plans.length ? plans.every(p => p?.scientificEligible !== false) : true;
+    const reasons = [...new Set(plans.flatMap(p => p?.scientificEligibilityReasons || []))];
+    return { eligible, reasons };
+}
+
+function dsApplyPreparedPlan(plan) {
+    dsPreparedPlan = plan;
+    // El ligado manual ya NO se indexa desde el plan: sus claves son grupos
+    // (`noche|filtro|exposición`) y sus bloques se derivan de los ficheros
+    // cargados, así que `dsRenderSessionOrganizer` los poda por sí solo. Purgar
+    // aquí contra `sessionMap` borraba cada elección en cuanto llegaba un plan.
+    const firstSessionPlan = plan?.groups?.[0]?.plan;
+    const recommendedProfile = plan?.recommendedProfile || firstSessionPlan?.recommendedProfile;
+    const recommendedPreset = recommendedProfile === "maximum_quality" ? "max" : recommendedProfile;
+    document.querySelectorAll("#deepsky-modal .ds-preset").forEach(button => {
+        const recommended = button.dataset.preset === recommendedPreset;
+        button.classList.toggle("recommended", recommended);
+        if (recommended) button.setAttribute(
+            "aria-description",
+            tr("deepsky.recommended_current", "Recomendado para los datos actuales"),
+        );
+        else button.removeAttribute("aria-description");
+    });
+    // Gating de motores experimentales: si los datos no son elegibles
+    // científicamente (p. ej. entradas no lineales), EIDR/NebulaFusion no
+    // pueden ejecutarse — se deshabilitan las opciones SIN revertir la
+    // selección del usuario (el preflight ya publica el error bloqueante).
+    const { eligible: scientificEligible, reasons: eligibilityReasons } = dsCollectEligibility(plan);
+    const methodSelect = document.getElementById("sel-ds-method");
+    if (methodSelect) {
+        for (const value of ["nebula_fusion", "nebula_fusion_full", "nebula_fusion_struct", "eidr"]) {
+            const option = methodSelect.querySelector(`option[value="${value}"]`);
+            if (option) option.disabled = !scientificEligible;
+        }
+        methodSelect.title = scientificEligible ? "" : eligibilityReasons.join(" · ");
+    }
+    // Caja "para activar NF/EIDR falta…": razones accionables junto al método.
+    const eligibilityBox = document.getElementById("ds-method-eligibility");
+    if (eligibilityBox) {
+        if (!scientificEligible && eligibilityReasons.length) {
+            eligibilityBox.style.display = "block";
+            eligibilityBox.innerHTML = `<b>${tr("deepsky.method_needs", "Para activar NebulaFusion/EIDR:")}</b> ${eligibilityReasons.map(reason => escapeHtml(reason)).join(" · ")}`;
+        } else {
+            eligibilityBox.style.display = "none";
+            eligibilityBox.innerHTML = "";
+        }
+    }
+    // El re-render de los paneles no debe mover al usuario: se captura el
+    // scroll del asistente y de cada panel y se restaura tras pintar.
+    const wizardScroller = document.getElementById("ds-wizard-scroll");
+    const wizardScrollTop = wizardScroller ? wizardScroller.scrollTop : 0;
+    for (const id of ["ds-preflight-inspection", "ds-preflight-review"]) {
+        const panel = document.getElementById(id);
+        if (!panel) continue;
+        panel.classList.remove("ds-refreshing");
+        panel.dataset.state = plan?.valid ? "ok" : "error";
+        panel.innerHTML = (id === "ds-preflight-review"
+            ? dsFormatReviewPlan(plan)
+            : dsFormatPreflight(plan))
+            + (id === "ds-preflight-review" ? dsFormatInspectionDiagnostics() : "");
+        // "Continuar en modo degradado": cambia la política y re-prepara. La
+        // decisión es del usuario y queda divulgada en el plan y la receta.
+        panel.querySelector("#btn-ds-proceed-degraded")?.addEventListener("click", () => {
+            const policy = document.getElementById("sel-ds-calibration-policy");
+            if (policy) {
+                policy.value = "allowDegraded";
+                policy.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            dsSchedulePreflight(true);
+        });
+        // El ligado manual vive ahora en la tabla de calibración del paso
+        // "Datos" (`dsRenderSessionOrganizer`), que enlaza sus propios controles.
+        panel.querySelectorAll(".ds-silence-alert").forEach(button => {
+            button.addEventListener("click", (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                dsSilencedAlerts.add(button.dataset.alertKey);
+                dsApplyPreparedPlan(dsPreparedPlan);
+            });
+        });
+    }
+    dsRenderRecipeImpact(plan);
+    const run = document.getElementById("btn-deepsky-run");
+    if (run) {
+        run.disabled = !plan?.valid;
+        run.style.opacity = plan?.valid ? "1" : ".5";
+    }
+    if (wizardScroller) {
+        requestAnimationFrame(() => { wizardScroller.scrollTop = wizardScrollTop; });
+    }
+    dsRenderSessionOrganizer();
+    dsRenderGuide(plan);
+    dsSyncWizard();
+}
+
+// Tarjetas QC de la inspección: predicción de dithering (walking noise) y
+// patrón de detector (banding), medidas por el backend antes de reservar el
+// stack. La predicción es pre-registro; el diagnóstico definitivo se recalcula
+// durante el apilado con el registro real.
+function dsFormatInspectionDiagnostics() {
+    const diag = dsInspectionDiagnostics;
+    if (!diag) return "";
+    const cards = [];
+    const dither = diag.dither;
+    if (dither) {
+        const risk = !!dither.walkingNoiseRisk;
+        const color = risk ? "#fca5a5" : "#6ee7b7";
+        const border = risk ? "rgba(248,113,113,.35)" : "rgba(52,211,153,.25)";
+        const reasons = (dither.reasons || []).map(reason => `<div>• ${escapeHtml(reason)}</div>`).join("");
+        cards.push(`<div style="flex:1 1 260px;padding:7px 9px;border:1px solid ${border};border-radius:8px;background:rgba(15,23,42,.35);font-size:.6rem;">
+            <b style="color:${color};display:inline-flex;align-items:center;gap:5px;"><svg class="zas-icon zas-icon-inline"><use href="#icon-${risk ? "warning" : "check"}"></use></svg>${risk ? tr("deepsky.dither_risk", "Riesgo de walking noise") : tr("deepsky.dither_ok", "Dithering suficiente (predicción)")}</b>
+            <div style="margin-top:3px;color:#94a3b8;line-height:1.5;">
+                <div>${dither.frames} tomas · ${dither.uniqueQuarterPixelCells} posiciones (0.25 px) · recorrido ${Number(dither.spanXPx || 0).toFixed(1)}×${Number(dither.spanYPx || 0).toFixed(1)} px</div>
+                <div>RMS ${Number(dither.rmsRadiusPx || 0).toFixed(2)} px · isotropía ${Number(dither.isotropy || 0).toFixed(2)} · deriva temporal ${Number(dither.temporalDriftCorrelation || 0).toFixed(2)}</div>
+                ${reasons}
+                <div style="color:#64748b;">${tr("deepsky.dither_prediction_note", "Predicción pre-registro por offsets de estrellas; el apilado la recalcula con el registro real.")}</div>
+            </div>
+        </div>`);
+    }
+    const pattern = diag.detectorPattern;
+    if (pattern) {
+        const detected = !!pattern.bandingDetected;
+        const color = detected ? "#fcd34d" : "#6ee7b7";
+        const border = detected ? "rgba(251,191,36,.35)" : "rgba(52,211,153,.25)";
+        cards.push(`<div style="flex:1 1 260px;padding:7px 9px;border:1px solid ${border};border-radius:8px;background:rgba(15,23,42,.35);font-size:.6rem;">
+            <b style="color:${color};display:inline-flex;align-items:center;gap:5px;"><svg class="zas-icon zas-icon-inline"><use href="#icon-${detected ? "warning" : "check"}"></use></svg>${detected ? tr("deepsky.pattern_detected", "Banding de detector detectado") : tr("deepsky.pattern_ok", "Sin patrón de detector aparente")}</b>
+            <div style="margin-top:3px;color:#94a3b8;line-height:1.5;">
+                <div>${Number(pattern.bandingSigma || 0).toFixed(2)}σ sobre el ruido · filas ${Number(pattern.rowOffsetRmsAdu || 0).toFixed(2)} ADU · columnas ${Number(pattern.columnOffsetRmsAdu || 0).toFixed(2)} ADU</div>
+                <div>correlación lag-1 filas ${Number(pattern.rowLag1Correlation || 0).toFixed(2)} · columnas ${Number(pattern.columnLag1Correlation || 0).toFixed(2)}</div>
+                ${detected ? `<div>${tr("deepsky.pattern_hint", "Dithering + rechazo robusto mitigan el banding; revisa darks/bias de la misma sesión.")}</div>` : ""}
+            </div>
+        </div>`);
+    }
+    if (!cards.length) return "";
+    return `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">${cards.join("")}</div>`;
+}
+
+function dsRenderFrameInspection(rows) {
+    const panel = document.getElementById("ds-frame-inspection");
+    if (!panel) return;
+    if (!rows?.length) {
+        panel.dataset.state = "idle";
+        panel.textContent = tr("deepsky.inspect_no_frames", "No hay tomas inspeccionables.");
+        return;
+    }
+    const rejected = rows.filter(row => row.rejectable).length;
+    const discarded = rows.filter(row => dsDiscardedPaths.has(row.path)).length;
+    const reference = rows.find(row => row.recommendedReference);
+    const tableRows = rows.map((row, index) => {
+        const isDiscarded = dsDiscardedPaths.has(row.path);
+        const status = isDiscarded
+            ? `<span style="color:#94a3b8;font-weight:700;text-decoration:line-through;">${tr("deepsky.frame_discarded", "descartada")}</span>`
+            : row.recommendedReference
+                ? `<span style="color:#fde68a;font-weight:700;">★ ${tr("deepsky.frame_reference", "referencia")}</span>`
+                : row.rejectable
+                    ? `<span style="color:#fca5a5;font-weight:700;">${tr("deepsky.frame_review", "revisar")}</span>`
+                    : `<span style="color:#6ee7b7;">${tr("deepsky.frame_usable", "utilizable")}</span>`;
+        const rowBg = isDiscarded
+            ? "opacity:.45;"
+            : row.rejectable
+                ? "background:rgba(127,29,29,.08);"
+                : "";
+        return `<tr data-ds-row="${index}" style="border-top:1px solid rgba(148,163,184,.12);cursor:pointer;${rowBg}" title="${tr("deepsky.frame_open_hint", "Clic para ver la toma y el motivo")}">
+            <td style="padding:6px 7px;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(row.path)}">${escapeHtml(row.name)}</td>
+            <td style="padding:6px 7px;text-align:right;">${row.stars}</td>
+            <td style="padding:6px 7px;text-align:right;">${Number(row.fwhm || 0).toFixed(2)}</td>
+            <td style="padding:6px 7px;text-align:right;">${Math.round(row.noise || 0)}</td>
+            <td style="padding:6px 7px;text-align:right;color:${row.eccentricity > .55 ? "#fca5a5" : "#cbd5e1"};">${Number(row.eccentricity || 0).toFixed(2)}</td>
+            <td style="padding:6px 7px;">${status}${row.rejectionReason ? `<div style="color:#94a3b8;font-size:.58rem;">${escapeHtml(row.rejectionReason)}</div>` : ""}</td>
+            <td style="padding:6px 7px;text-align:center;">
+                <button data-ds-discard="${index}" class="secondary" style="font-size:.58rem;padding:2px 8px;border-radius:6px;">${isDiscarded ? tr("deepsky.frame_restore", "Restaurar") : tr("deepsky.frame_discard", "Descartar")}</button>
+            </td>
+        </tr>`;
+    }).join("");
+    panel.dataset.state = rejected ? "error" : "ok";
+    panel.innerHTML = `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:7px;">
+        <b style="color:#e2e8f0;">${tr("deepsky.psf_inspection_title", "Inspección PSF previa")}</b>
+        <span style="color:#94a3b8;">${trFormat("deepsky.psf_inspection_counts", { total: rows.length, review: rejected }, `${rows.length} tomas · ${rejected} para revisar`)}${discarded ? ` · ${trFormat("deepsky.psf_manual_discards", { count: discarded }, `${discarded} descartadas a mano`)}` : ""}</span>
+        ${reference ? `<span style="margin-left:auto;color:#fde68a;">${tr("deepsky.suggested_reference", "Referencia sugerida")}: ${escapeHtml(reference.name)}</span>` : ""}
+    </div>
+    <div style="overflow:auto;max-height:260px;border:1px solid rgba(148,163,184,.12);border-radius:8px;">
+        <table style="width:100%;border-collapse:collapse;font-size:.62rem;min-width:650px;">
+            <thead style="position:sticky;top:0;background:#111827;color:#94a3b8;"><tr>
+                <th style="padding:6px 7px;text-align:left;">${tr("deepsky.frame", "Toma")}</th><th>${tr("deepsky.report_stars", "Estrellas")}</th><th>FWHM</th><th>${tr("deepsky.noise", "Ruido")}</th><th>Ecc</th><th style="text-align:left;padding-left:7px;">${tr("deepsky.provisional_decision", "Decisión provisional")}</th><th>${tr("deepsky.action", "Acción")}</th>
+            </tr></thead><tbody>${tableRows}</tbody>
+        </table>
+    </div>
+    <div style="margin-top:6px;color:#64748b;font-size:.58rem;">${tr("deepsky.psf_inspection_hint", "Clic en una fila para ver la toma estirada y su motivo. Descartar la excluye del plan y del apilado de forma reversible; la decisión final se recalcula con los datos calibrados completos.")}</div>
+    ${dsFormatInspectionDiagnostics()}`;
+
+    // Delegación: el tbody se regenera con cada render, los listeners van con él.
+    panel.querySelectorAll("[data-ds-discard]").forEach(btn => {
+        btn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            const row = rows[parseInt(btn.dataset.dsDiscard, 10)];
+            if (!row) return;
+            if (dsDiscardedPaths.has(row.path)) dsDiscardedPaths.delete(row.path);
+            else dsDiscardedPaths.add(row.path);
+            dsPreserveInspectionScroll(panel, () => dsRenderFrameInspection(rows));
+            dsSchedulePreflight(true);
+        });
+    });
+    panel.querySelectorAll("[data-ds-row]").forEach(tr => {
+        tr.addEventListener("click", () => {
+            const row = rows[parseInt(tr.dataset.dsRow, 10)];
+            if (row) dsOpenFramePreview(row, rows);
+        });
+    });
+}
+
+// Conserva el scroll de la tabla y de los contenedores del asistente al
+// re-renderizar la inspección (antes, descartar una toma saltaba al inicio
+// del paso).
+function dsPreserveInspectionScroll(panel, action) {
+    const ancestors = [];
+    let node = panel;
+    while (node) {
+        if (node.scrollTop > 0) ancestors.push([node, node.scrollTop]);
+        node = node.parentElement;
+    }
+    const table = panel.querySelector("div[style*='overflow']");
+    const tableTop = table ? table.scrollTop : 0;
+    action();
+    for (const [el, top] of ancestors) {
+        if (document.contains(el)) el.scrollTop = top;
+    }
+    const newTable = panel.querySelector("div[style*='overflow']");
+    if (newTable) newTable.scrollTop = tableTop;
+}
+
+// Diálogo propio para el seed de SPCC (RA / Dec / escala): el webview de
+// Tauri no implementa window.prompt. Devuelve {ra, dec, scale} o null.
+function dsPromptSpccSeed() {
+    return new Promise(resolve => {
+        document.getElementById("ds-spcc-seed")?.remove();
+        const overlay = document.createElement("div");
+        overlay.id = "ds-spcc-seed";
+        overlay.style.cssText = "position:fixed;inset:0;z-index:12500;background:rgba(2,6,23,.82);display:flex;align-items:center;justify-content:center;padding:24px;";
+        overlay.innerHTML = `<div style="background:#0f172a;border:1px solid rgba(124,58,237,.4);border-radius:14px;width:min(420px,92vw);padding:18px;">
+            <b style="color:#e2e8f0;font-size:.82rem;">${tr("deepsky.spcc_seed_title", "SPCC: apuntado del campo")}</b>
+            <div style="color:#94a3b8;font-size:.64rem;margin:6px 0 12px;line-height:1.5;">${tr("deepsky.spcc_seed_hint", "La cabecera FITS no trae RA/Dec ni escala. Indica el centro aproximado del campo y la escala de tu equipo.")}</div>
+            <label style="display:block;color:#cbd5e1;font-size:.66rem;margin-bottom:8px;">${tr("deepsky.spcc_ra", "RA del objetivo (p.ej. 18 18 48 o 274.7)")}<input id="spcc-seed-ra" type="text" style="width:100%;margin-top:3px;" placeholder="18 18 48"></label>
+            <label style="display:block;color:#cbd5e1;font-size:.66rem;margin-bottom:8px;">${tr("deepsky.spcc_dec", "Dec del objetivo (p.ej. -13 49 00 o -13.8)")}<input id="spcc-seed-dec" type="text" style="width:100%;margin-top:3px;" placeholder="-13 49 00"></label>
+            <label style="display:block;color:#cbd5e1;font-size:.66rem;margin-bottom:8px;">${tr("deepsky.spcc_scale", "Escala (arcsec/píxel, p.ej. 1.30)")}<input id="spcc-seed-scale" type="text" style="width:100%;margin-top:3px;" placeholder="1.30"></label>
+            <label style="display:block;color:#cbd5e1;font-size:.66rem;margin-bottom:14px;">${tr("deepsky.spcc_reference", "Referencia blanca")}<select id="spcc-seed-ref" class="ds-sel" style="width:100%;margin-top:3px;">
+                <option value="averageSpiral" selected>${tr("deepsky.spcc_ref_asg", "Galaxia espiral promedio (estilo PixInsight)")}</option>
+                <option value="g2v">${tr("deepsky.spcc_ref_g2v", "G2V (estrella solar)")}</option>
+            </select></label>
+            <div style="display:flex;gap:9px;justify-content:flex-end;">
+                <button type="button" id="spcc-seed-cancel" class="secondary" style="width:auto;font-size:.66rem;padding:7px 16px;border-radius:9px;">${tr("general.cancel", "Cancelar")}</button>
+                <button type="button" id="spcc-seed-ok" style="width:auto;font-size:.66rem;padding:7px 18px;border-radius:9px;background:linear-gradient(135deg,#2563eb,#7c3aed);color:white;">${tr("general.accept", "Aceptar")}</button>
+            </div>
+        </div>`;
+        const done = (value) => { overlay.remove(); resolve(value); };
+        overlay.addEventListener("click", (e) => { if (e.target === overlay) done(null); });
+        overlay.querySelector("#spcc-seed-cancel").addEventListener("click", () => done(null));
+        overlay.querySelector("#spcc-seed-ok").addEventListener("click", () => {
+            const ra = overlay.querySelector("#spcc-seed-ra").value.trim();
+            const dec = overlay.querySelector("#spcc-seed-dec").value.trim();
+            const scale = parseFloat(overlay.querySelector("#spcc-seed-scale").value.trim());
+            const reference = overlay.querySelector("#spcc-seed-ref").value;
+            if (!ra || !dec) return;
+            localStorage.setItem("zas_spcc_reference", reference);
+            done({ ra, dec, scale: Number.isFinite(scale) ? scale : null, reference });
+        });
+        overlay.addEventListener("keydown", (e) => {
+            if (e.key === "Escape") done(null);
+            else if (e.key === "Enter") overlay.querySelector("#spcc-seed-ok").click();
+        });
+        document.body.appendChild(overlay);
+        requestAnimationFrame(() => overlay.querySelector("#spcc-seed-ra").focus());
+    });
+}
+
+// Visor de una toma individual: imagen estirada (deepsky_frame_preview) +
+// métricas + motivo + descarte reversible, en un overlay ligero.
+async function dsOpenFramePreview(row, allRows) {
+    let overlay = document.getElementById("ds-frame-viewer");
+    if (overlay) overlay.remove();
+    overlay = document.createElement("div");
+    overlay.id = "ds-frame-viewer";
+    overlay.style.cssText = "position:fixed;inset:0;z-index:12000;background:rgba(2,6,23,.88);display:flex;align-items:center;justify-content:center;padding:24px;";
+    const isDiscarded = () => dsDiscardedPaths.has(row.path);
+    const rows = allRows || dsFrameInspection;
+    const rowIndex = rows.indexOf(row);
+    const reason = row.rejectionReason
+        ? escapeHtml(row.rejectionReason)
+        : (row.rejectable
+            ? tr("deepsky.frame_reason_outlier", "Métricas fuera de la mediana del lote")
+            : tr("deepsky.frame_reason_ok", "Sin observaciones: métricas dentro del lote"));
+    overlay.innerHTML = `<div class="ds-viewer-shell">
+        <div class="ds-viewer-bar top">
+            <button id="ds-viewer-prev" class="secondary" style="font-size:.62rem;padding:4px 10px;border-radius:8px;" ${rowIndex > 0 ? "" : "disabled"} title="${tr("deepsky.previous_frame", "Toma anterior (flecha izquierda)")}">‹</button>
+            <button id="ds-viewer-next" class="secondary" style="font-size:.62rem;padding:4px 10px;border-radius:8px;" ${rowIndex >= 0 && rowIndex < rows.length - 1 ? "" : "disabled"} title="${tr("deepsky.next_frame", "Toma siguiente (flecha derecha)")}">›</button>
+            <b style="color:#e2e8f0;font-size:.72rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(row.path)}">${escapeHtml(row.name)}</b>
+            <span style="color:#64748b;font-size:.6rem;">${rowIndex + 1}/${rows.length}</span>
+            <span style="margin-left:auto;display:flex;align-items:center;gap:12px;">
+                <label style="display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:.6rem;white-space:nowrap;cursor:pointer;" title="${tr("deepsky.viewer_stretch_hint", "Estirado de la vista (STF). No modifica los datos del apilado.")}">
+                    ${tr("deepsky.stf_intensity", "Intensidad")}
+                    <input id="ds-viewer-stretch" type="range" min="0" max="100" step="1" value="${dsFrameViewerStretch}" style="width:110px;">
+                </label>
+                <label style="display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:.6rem;white-space:nowrap;cursor:pointer;" title="${tr("deepsky.viewer_balance_hint", "Neutraliza el fondo por canal (quita el verde del OSC lineal) solo en la vista.")}">
+                    <input id="ds-viewer-balance" type="checkbox" ${dsFrameViewerBalance ? "checked" : ""} style="accent-color:#7c3aed;">
+                    ${tr("deepsky.viewer_balance", "Balance color")}
+                </label>
+            </span>
+            <button id="ds-viewer-discard" class="secondary" style="font-size:.62rem;padding:4px 12px;border-radius:8px;">${isDiscarded() ? tr("deepsky.frame_restore", "Restaurar") : tr("deepsky.discard_from_stack", "Descartar del apilado")}</button>
+            <button id="ds-viewer-close" class="secondary" style="font-size:.62rem;padding:4px 12px;border-radius:8px;">${tr("deepsky.close", "Cerrar")}</button>
+        </div>
+        <div id="ds-viewer-body" class="ds-viewer-body">${tr("deepsky.loading_frame", "Cargando y estirando la toma…")}</div>
+        <div class="ds-viewer-bar bottom">
+            <span>${tr("deepsky.report_stars", "Estrellas")} <b>${row.stars}</b></span>
+            <span>FWHM <b>${Number(row.fwhm || 0).toFixed(2)}</b></span>
+            <span>${tr("deepsky.noise", "Ruido")} <b>${Math.round(row.noise || 0)}</b></span>
+            <span>Ecc <b>${Number(row.eccentricity || 0).toFixed(2)}</b></span>
+            <span style="color:${row.rejectable ? "#fca5a5" : "#6ee7b7"};">${tr("deepsky.reason", "Motivo")}: ${reason}</span>
+        </div>
+    </div>`;
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+    overlay.querySelector("#ds-viewer-close").addEventListener("click", () => overlay.remove());
+    const goTo = (delta) => {
+        const target = rows[rowIndex + delta];
+        if (target) dsOpenFramePreview(target, rows);
+    };
+    overlay.querySelector("#ds-viewer-prev").addEventListener("click", () => goTo(-1));
+    overlay.querySelector("#ds-viewer-next").addEventListener("click", () => goTo(1));
+    const onKeys = (e) => {
+        if (!document.getElementById("ds-frame-viewer")) {
+            document.removeEventListener("keydown", onKeys);
+            return;
+        }
+        if (e.key === "ArrowLeft") goTo(-1);
+        else if (e.key === "ArrowRight") goTo(1);
+        else if (e.key === "Escape") { overlay.remove(); document.removeEventListener("keydown", onKeys); }
+    };
+    document.addEventListener("keydown", onKeys);
+    overlay.querySelector("#ds-viewer-discard").addEventListener("click", (e) => {
+        if (isDiscarded()) dsDiscardedPaths.delete(row.path);
+        else dsDiscardedPaths.add(row.path);
+        e.target.textContent = isDiscarded()
+            ? tr("deepsky.frame_restore", "Restaurar")
+            : tr("deepsky.discard_from_stack", "Descartar del apilado");
+        const panel = document.getElementById("ds-frame-inspection");
+        if (panel) dsPreserveInspectionScroll(panel, () => dsRenderFrameInspection(allRows || dsFrameInspection));
+        dsSchedulePreflight(true);
+    });
+    document.body.appendChild(overlay);
+    // Render de la vista con estirado/balance elegibles. El backend cachea el
+    // último frame decodificado, así que mover los controles no relee el
+    // archivo; el serial descarta respuestas fuera de orden al arrastrar.
+    const renderPreview = async () => {
+        const serial = ++dsFrameViewerRenderSerial;
+        try {
+            const dataUrl = await invoke("deepsky_frame_preview", {
+                path: row.path,
+                strength: dsFrameViewerStretch / 100,
+                balanced: dsFrameViewerBalance,
+            });
+            if (serial !== dsFrameViewerRenderSerial) return;
+            const body = overlay.querySelector("#ds-viewer-body");
+            if (!body) return;
+            const img = body.querySelector("#ds-viewer-img");
+            if (img) img.src = dataUrl;
+            else body.innerHTML = `<img id="ds-viewer-img" src="${dataUrl}" style="max-width:100%;max-height:100%;object-fit:contain;" alt="">`;
+        } catch (error) {
+            if (serial !== dsFrameViewerRenderSerial) return;
+            const body = overlay.querySelector("#ds-viewer-body");
+            if (body) {
+                body.textContent = trFormat(
+                    "deepsky.preview_failed",
+                    { error },
+                    `No se pudo generar el preview: ${error}`,
+                );
+            }
+        }
+    };
+    overlay.querySelector("#ds-viewer-stretch")?.addEventListener("input", (e) => {
+        const value = parseInt(e.target.value, 10);
+        dsFrameViewerStretch = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 50;
+        localStorage.setItem("zas_ds_frame_stretch", String(dsFrameViewerStretch));
+        renderPreview();
+    });
+    overlay.querySelector("#ds-viewer-balance")?.addEventListener("change", (e) => {
+        dsFrameViewerBalance = !!e.target.checked;
+        localStorage.setItem("zas_ds_frame_balance", dsFrameViewerBalance ? "1" : "0");
+        renderPreview();
+    });
+    await renderPreview();
+}
+
+async function dsInspectFrames(force = false) {
+    const lights = dsActiveLights();
+    const fingerprint = lights.map(light => light.path).sort().join("\n");
+    if (!lights.length) {
+        dsFrameInspection = [];
+        dsInspectionDiagnostics = null;
+        dsInspectionFingerprint = "";
+        dsRenderFrameInspection([]);
+        return [];
+    }
+    if (!force && fingerprint === dsInspectionFingerprint && dsFrameInspection.length) {
+        dsRenderFrameInspection(dsFrameInspection);
+        return dsFrameInspection;
+    }
+    const serial = ++dsInspectionSerial;
+    const panel = document.getElementById("ds-frame-inspection");
+    if (panel) {
+        panel.dataset.state = "idle";
+        panel.textContent = tr("deepsky.inspecting_frames", "Midiendo estrellas, PSF/FWHM, ruido y eccentricidad…");
+    }
+    try {
+        const report = await invoke("inspect_deepsky_frames", { paths: lights.map(light => light.path) });
+        if (serial !== dsInspectionSerial) return dsFrameInspection;
+        // Contrato tipado: { frames, dither, detectorPattern }. Se acepta el
+        // array plano histórico por robustez ante una versión mixta.
+        const rows = Array.isArray(report) ? report : (report?.frames || []);
+        dsInspectionDiagnostics = Array.isArray(report)
+            ? null
+            : { dither: report?.dither || null, detectorPattern: report?.detectorPattern || null };
+        dsFrameInspection = rows || [];
+        dsInspectionFingerprint = fingerprint;
+        // Descarte huérfano (el archivo ya no está en la lista): limpiarlo.
+        const currentPaths = new Set(lights.map(light => light.path));
+        for (const discarded of [...dsDiscardedPaths]) {
+            if (!currentPaths.has(discarded)) dsDiscardedPaths.delete(discarded);
+        }
+        dsRenderFrameInspection(dsFrameInspection);
+        dsSyncWizard();
+        return dsFrameInspection;
+    } catch (error) {
+        if (serial !== dsInspectionSerial) return dsFrameInspection;
+        if (panel) {
+            panel.dataset.state = "error";
+            panel.textContent = trFormat(
+                "deepsky.inspection_failed",
+                { error },
+                `No se pudo completar la inspección: ${error}`,
+            );
+        }
+        return [];
+    }
+}
+
+async function dsPreparePlan() {
+    const serial = ++dsPreflightSerial;
+    const stackRequest = dsBuildStackRequest();
+    if (!stackRequest.lights.length) {
+        dsPreparedPlan = null;
+        dsRenderRecipeImpact(null);
+        for (const id of ["ds-preflight-inspection", "ds-preflight-review"]) {
+            const panel = document.getElementById(id);
+            if (panel) {
+                panel.dataset.state = "idle";
+                panel.textContent = tr("deepsky.preflight_empty", "Añade lights para preparar el plan.");
+            }
+        }
+        // Sin lights efectivos no hay plan: Ejecutar no puede quedar armado
+        // con el estado del último plan válido (auditoría 2026-07-20).
+        const run = document.getElementById("btn-deepsky-run");
+        if (run) { run.disabled = true; run.style.opacity = ".5"; }
+        dsSyncWizard();
+        return null;
+    }
+    for (const id of ["ds-preflight-inspection", "ds-preflight-review"]) {
+        const panel = document.getElementById(id);
+        if (!panel) continue;
+        // Con un plan previo visible NO se borra el contenido (borrarlo
+        // colapsaba la altura y el scroll saltaba al inicio): se atenúa hasta
+        // que llegue el plan nuevo.
+        if (dsPreparedPlan) {
+            panel.classList.add("ds-refreshing");
+        } else {
+            panel.dataset.state = "idle";
+            panel.textContent = tr("deepsky.reading_headers", "Leyendo cabeceras y preparando el plan…");
+        }
+    }
+    try {
+        const multiband = dsIsMultibandSession();
+        const command = multiband ? "prepare_deepsky_session" : "prepare_deepsky_stack";
+        const request = multiband ? dsBuildSessionRequest() : stackRequest;
+        const plan = await invoke(command, { request });
+        if (serial !== dsPreflightSerial) return null;
+        dsApplyPreparedPlan(plan);
+        return plan;
+    } catch (e) {
+        if (serial !== dsPreflightSerial) return null;
+        dsApplyPreparedPlan({ valid: false, errors: [String(e)], warnings: [], groups: [], stages: {} });
+        return null;
+    }
+}
+
+function dsSchedulePreflight(immediate = false) {
+    clearTimeout(dsPreflightTimer);
+    dsPreflightTimer = setTimeout(dsPreparePlan, immediate ? 0 : 180);
+}
+
+function dsSetWizardStep(next, force = false) {
+    const requested = Math.max(0, Math.min(3, Number(next) || 0));
+    if (!force && requested > 2 && dsPreparedPlan && !dsPreparedPlan.valid) {
+        dsWizardStep = 1;
+    } else {
+        dsWizardStep = requested;
+    }
+    dsSyncWizard();
+    if (dsWizardStep === 1 || dsWizardStep === 3) dsSchedulePreflight(true);
+    if (dsWizardStep === 1) dsInspectFrames();
+    const scroll = document.getElementById("ds-wizard-scroll");
+    if (scroll) scroll.scrollTop = 0;
+    const box = document.querySelector("#deepsky-modal .ds-wizard-box");
+    if (box) {
+        box.scrollTop = 0;
+        requestAnimationFrame(() => { box.scrollTop = 0; });
+    }
+    const blocked = dsWizardStep === 3 && dsPreparedPlan && !dsPreparedPlan.valid;
+    setAssistantJourney({
+        flow: "deepsky",
+        stage: blocked ? "blocked" : "guide",
+        workflowStep: dsWizardStep,
+        workflowTotal: 4,
+    }, {
+        open: dsWizardStep === 0,
+        announceKey: `deepsky:step:${dsWizardStep}:${blocked ? "blocked" : "ready"}`,
+    });
+}
+
+function dsWizardStepState(step) {
+    const hasLights = dsActiveLights().length > 0;
+    if (!hasLights) return "pending";
+    if (step === 0) return "ready";
+    if (!dsPreparedPlan) return step === 1 ? "review" : "pending";
+    if (!dsPreparedPlan.valid) return "review";
+    if (step === 1 && !dsFrameInspection?.length) return "review";
+    return "ready";
+}
+
+function dsSyncWizard() {
+    document.querySelectorAll("#deepsky-modal .ds-wizard-page").forEach(p => {
+        const active = Number(p.dataset.step) === dsWizardStep;
+        p.classList.toggle("active", active);
+        p.setAttribute("aria-hidden", String(!active));
+    });
+    document.querySelectorAll("#deepsky-modal .ds-wizard-step").forEach(b => {
+        const step = Number(b.dataset.step);
+        const state = dsWizardStepState(step);
+        b.classList.toggle("active", step === dsWizardStep);
+        b.classList.toggle("done", state === "ready");
+        b.dataset.state = state;
+        const stateLabel = {
+            pending: tr("deepsky.state_pending", "Pendiente"),
+            review: tr("deepsky.state_review", "Revisar"),
+            ready: tr("deepsky.state_ready", "Listo"),
+        }[state];
+        const stateNode = b.querySelector(".ds-step-state");
+        if (stateNode) stateNode.textContent = stateLabel;
+        const stepLabel = b.querySelector(".ds-step-label")?.textContent?.trim() || "";
+        b.setAttribute("aria-label", `${stepLabel}: ${stateLabel}`);
+        if (step === dsWizardStep) b.setAttribute("aria-current", "step"); else b.removeAttribute("aria-current");
+    });
+    const prev = document.getElementById("btn-deepsky-prev");
+    const next = document.getElementById("btn-deepsky-next");
+    const run = document.getElementById("btn-deepsky-run");
+    const combine = document.getElementById("btn-deepsky-combine-open");
+    if (prev) prev.style.visibility = dsWizardStep === 0 ? "hidden" : "visible";
+    if (next) next.style.display = dsWizardStep < 3 ? "block" : "none";
+    if (run) run.style.display = dsWizardStep === 3 ? "flex" : "none";
+    if (combine) combine.style.display = dsWizardStep === 0 ? "flex" : "none";
+    const status = document.getElementById("ds-wizard-status");
+    if (status) {
+        const messageKey = dsWizardStep === 3
+            ? (dsPreparedPlan?.valid
+                ? "footer_ready"
+                : (dsActiveLights().length ? "footer_fix" : "footer_add_lights"))
+            : `footer_${dsWizardStep}`;
+        const fallbacks = {
+            footer_0: "selecciona y agrupa los datos",
+            footer_1: "revisa compatibilidad y calibraciones",
+            footer_2: "elige perfil u opciones avanzadas",
+            footer_ready: "plan listo para ejecutar",
+            footer_fix: "corrige las alertas del plan",
+            footer_add_lights: "añade lights para preparar el plan",
+        };
+        status.textContent = trFormat(
+            "deepsky.footer_status",
+            {
+                current: dsWizardStep + 1,
+                total: 4,
+                message: tr(`deepsky.${messageKey}`, fallbacks[messageKey]),
+            },
+            `Paso ${dsWizardStep + 1} de 4 · ${fallbacks[messageKey]}`,
+        );
+    }
+    const assistant = document.getElementById("ds-step-assistant");
+    const assistantText = document.getElementById("ds-step-assistant-text");
+    const assistantProgress = document.getElementById("ds-step-assistant-progress");
+    if (assistant && assistantText) {
+        const blocked = dsWizardStep === 3 && !!dsActiveLights().length && !dsPreparedPlan?.valid;
+        const stepKey = dsWizardStep === 3
+            ? (dsPreparedPlan?.valid
+                ? "step_assistant_ready"
+                : dsActiveLights().length
+                    ? "step_assistant_blocked"
+                    : "step_assistant_empty")
+            : `step_assistant_${dsWizardStep}`;
+        const fallbacks = {
+            step_assistant_0: "Añade lights; las calibraciones son opcionales. Zenith agrupará firmas compatibles y evitará mezclas silenciosas.",
+            step_assistant_1: "Revisa agrupación, PSF y calibraciones. Los avisos explican qué corregir antes de integrar.",
+            step_assistant_2: "Auto es el punto de partida recomendado. Abre los controles avanzados sólo cuando tu objetivo lo necesite.",
+            step_assistant_ready: "El plan es compatible. Confirma las salidas lineales y ejecuta cuando estés listo.",
+            step_assistant_blocked: "Hay bloqueos pendientes. La guía te lleva al control exacto que debes corregir.",
+            step_assistant_empty: "Añade lights para que pueda preparar y validar el plan de integración.",
+        };
+        assistantText.textContent = tr(`deepsky.${stepKey}`, fallbacks[stepKey]);
+        assistant.dataset.state = blocked ? "warning" : "active";
+    }
+    if (assistantProgress) assistantProgress.textContent = `${dsWizardStep + 1} / 4`;
+}
+
+function dsSetPresetButtons(name) {
+    document.querySelectorAll("#deepsky-modal .ds-preset").forEach(b =>
+        b.classList.toggle("active", b.dataset.preset === name));
+}
+
+function dsApplyPreset(name) {
+    dsActivePreset = name;
+    dsSetPresetButtons(name);
+    const p = DS_PRESETS[name];
+    if (!p) {
+        // "custom" y "auto" no tocan controles; AUTO además refresca el plan
+        // para que la receta resuelta y sus motivos aparezcan de inmediato.
+        dsRenderProcessPreview();
+        dsRenderRecipeImpact(dsPreparedPlan);
+        if (name === "auto") dsSchedulePreflight();
+        return;
+    }
+    const set = (id, val) => { const el = document.getElementById(id); if (el) el.value = String(val); };
+    const chk = (id, val) => { const el = document.getElementById(id); if (el) { el.checked = val; el.dataset.touched = "1"; } };
+    set("sel-ds-interp", p.interp);
+    set("sel-ds-drizzle", p.drizzle);
+    set("sel-ds-rejection", p.rejection);
+    set("num-ds-kappa-low", p.kappaLow);
+    set("num-ds-kappa-high", p.kappaHigh);
+    set("sel-ds-clipiters", p.clipIters);
+    set("sel-ds-normalization", p.norm);
+    set("sel-ds-pedestal", p.pedestal);
+    chk("chk-ds-autocrop", p.autocrop);
+    chk("chk-ds-cosmetic", p.cosmetic);
+    chk("chk-ds-darkopt", p.darkopt);
+    chk("chk-ds-gradient", p.gradient);
+    if (p.localw !== undefined) chk("chk-ds-localw", p.localw);
+    const dz = document.getElementById("sel-ds-drizzle");
+    const pixfrac = document.getElementById("lbl-ds-pixfrac");
+    if (pixfrac) pixfrac.style.display = (parseFloat(dz?.value) > 1) ? "flex" : "none";
+    dsRenderProcessPreview();
+    dsRenderRecipeImpact(dsPreparedPlan);
+    dsSchedulePreflight();
+}
+
+// Un cambio manual pasa el preset a "Personalizado".
+function dsMarkCustomPreset() {
+    if (dsActivePreset !== "custom") { dsActivePreset = "custom"; dsSetPresetButtons("custom"); }
+    dsRenderProcessPreview();
+    dsRenderRecipeImpact(dsPreparedPlan);
+    dsSchedulePreflight();
+}
+
+// Heurística de tiempo de apilado (segundos). Aproximada: varía por equipo/disco.
+function dsEstimateTime(frames, mpIn, mpOut, nIters, drz, engineMult) {
+    const cores = Math.max(2, navigator.hardwareConcurrency || 8);
+    const coresFactor = Math.min(cores, 8) * 0.7; // paralelismo real efectivo
+    const kCal = 0.06, kReg = 0.10, kInt = 0.02;  // s por megapíxel por frame
+    const tCalReg = frames * (kCal + kReg) * mpIn;
+    const tInt = frames * kInt * mpOut * (1 + nIters) * (drz * drz) * engineMult;
+    return (tCalReg + tInt) / coresFactor + 2; // +2 s de sobrecarga fija
+}
+
+// Diagrama del pipeline + datos técnicos + tiempo estimado según los ajustes.
+function dsRenderProcessPreview() {
+    const panel = document.getElementById("ds-diagram");
+    if (!panel) return;
+    const lights = dsActiveLights();
+    if (!lights.length) { panel.style.display = "none"; return; }
+    panel.style.display = "block";
+    const used = lights.filter(f => f.ok);
+    const n = Math.max(used.length, 1);
+    const ref = used[0] || lights[0];
+    const w = ref?.w || 0, h = ref?.h || 0;
+    const ch = ref?.bayer ? 3 : (ref?.ch || 1);
+
+    const val = (id, d) => document.getElementById(id)?.value ?? d;
+    const on = (id) => document.getElementById(id)?.checked;
+    const drz = parseFloat(val("sel-ds-drizzle", "1")) || 1;
+    const wOut = Math.round(w * drz), hOut = Math.round(h * drz);
+    const requestedRejection = val("sel-ds-rejection", "sigma");
+    const rejection = dsPreparedPlan?.requestedRejection === requestedRejection
+        ? (dsPreparedPlan.effectiveRejection || requestedRejection)
+        : requestedRejection;
+    const norm = val("sel-ds-normalization", "scaling");
+    const gradient = on("chk-ds-gradient");
+    const autocrop = on("chk-ds-autocrop");
+    const nCalib = dsMatchedCalib("darks").length + dsMatchedCalib("flats").length
+        + dsMatchedCalib("darkFlats").length + dsMatchedCalib("bias").length;
+    const clipSel = val("sel-ds-clipiters", "auto");
+    const nIters = rejection === "average" ? 0 : (clipSel === "auto" ? (n >= 6 ? 2 : 1) : (parseInt(clipSel) || 1));
+
+    const stage = (active, icon, label) =>
+        `<span class="ds-stage ${active ? "on" : "off"}"><svg class="zas-icon"><use href="#${icon}"></use></svg>${label}</span>`;
+    const arrow = `<span class="ds-arrow">→</span>`;
+    const rejectionLabels = { sigma: "σ-clip", average: tr("deepsky.rej_average_s", "media"), winsorized: "Winsorized", median: tr("deepsky.rej_med_s", "mediana"), percentile: "percentil" };
+    const effectiveRejLabel = rejectionLabels[rejection] || rejection;
+    const requestedRejLabel = rejectionLabels[requestedRejection] || requestedRejection;
+    const rejLabel = requestedRejection !== rejection
+        ? `${requestedRejLabel} → ${effectiveRejLabel}`
+        : effectiveRejLabel;
+    const stages = [
+        stage(nCalib > 0, "icon-moon", tr("deepsky.st_calib", "Calibración")),
+        stage(true, "icon-star", tr("deepsky.st_register", "Registro")),
+        stage(norm !== "none", "icon-sequence", tr("deepsky.st_normalize", "Normalización")),
+        stage(true, "icon-batch", `${tr("deepsky.st_integrate", "Integración")} · ${rejLabel}`),
+    ];
+    if (drz > 1) stages.push(stage(true, "icon-galaxy", `Drizzle ${drz}×`));
+    // El recorte SIEMPRE aparece con su estado: antes el chip "Recorte" surgía
+    // sin contexto y no se veía dónde configurarlo (paso 3 › Acabado).
+    stages.push(stage(autocrop, "icon-scissors", autocrop
+        ? tr("deepsky.st_crop_on", "Recorte de bordes (Acabado): activado")
+        : tr("deepsky.st_crop_off", "Recorte de bordes: desactivado")));
+    if (gradient) stages.push(stage(true, "icon-magic", tr("deepsky.st_cleanup", "Limpieza")));
+    stages.push(stage(true, "icon-chart", tr("deepsky.st_stretch", "Estirado STF")));
+
+    // Los métodos por-píxel cargan el stack completo por franjas → más pesados.
+    const perPixel = ["winsorized", "median", "percentile", "minmax"].includes(rejection);
+    const gi = window._gpuInfo;
+    const compute = val("sel-ds-compute", "hybrid");
+    const gpuTiled = gi?.available && compute !== "cpu_only"
+        && rejection === "winsorized" && drz <= 1;
+    const engineMult = perPixel && drz <= 1 ? (gpuTiled ? 1.15 : 1.7) : 1.0;
+    const mpIn = (w * h) / 1e6, mpOut = (wOut * hOut) / 1e6;
+    const secs = dsEstimateTime(n, mpIn, mpOut, perPixel ? 1 : nIters, drz, engineMult);
+    const fmtT = (s) => s < 90 ? `${Math.max(1, Math.round(s))} s` : `${(s / 60).toFixed(s < 600 ? 1 : 0)} min`;
+    const fmtSize = (mb) => mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+    const ramMB = (wOut * hOut * ch * 8 * 3 + w * h * ch * 4) / 1e6; // acumuladores f64 + 1 frame
+    const outMB = (wOut * hOut * 3 * 2) / 1e6;                        // TIFF 16-bit RGB
+    // Indicador del motor previsto. Winsorized ejecuta el rechazo
+    // tiled en GPU; la CPU conserva warp/modelos y valida paridad.
+    const canGpuIntegrate = gi?.available && compute !== "cpu_only"
+        && (!perPixel || gpuTiled) && drz <= 1;
+    const accel = canGpuIntegrate
+        ? `<span>${tr("deepsky.accel", "motor")}: <b>${gpuTiled ? "Hybrid CPU warp + GPU tiled" : "Hybrid CPU+GPU"}</b> · ${escapeHtml(gi.name)} · wgpu</span>`
+        : gi?.available && compute !== "cpu_only"
+            ? `<span>${tr("deepsky.accel", "motor")}: <b>Hybrid</b> · GPU calibración / CPU integración</span>`
+            : `<span>${tr("deepsky.accel", "motor")}: <b>CPU</b> (rayon)</span>`;
+    const tech = [
+        `<span><b>${used.length}</b>/${lights.length} lights</span>`,
+        w ? `<span>${w}×${h}${drz > 1 ? ` → <b>${wOut}×${hOut}</b>` : ""} · ${ch === 1 ? "mono" : "RGB"}</span>` : "",
+        `<span>RAM ~<b>${fmtSize(ramMB)}</b></span>`,
+        `<span>${tr("deepsky.tech_out", "salida")} ~<b>${fmtSize(outMB)}</b></span>`,
+        accel,
+        `<span class="ds-tech-time">${tr("deepsky.time_est", "tiempo est.")} <b>~${fmtT(secs * 0.6)}–${fmtT(secs * 1.4)}</b></span>`,
+    ].filter(Boolean).join("");
+
+    panel.innerHTML = `
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:9px;">
+            <svg class="zas-icon" style="width:13px;height:13px;color:#38bdf8;"><use href="#icon-batch"></use></svg>
+            <span style="font-size:0.6rem; color:#7dd3fc; font-weight:700; letter-spacing:0.08em; text-transform:uppercase;">${tr("deepsky.process_title", "Proceso que se ejecutará")}</span>
+        </div>
+        <div class="ds-diagram-flow">${stages.join(arrow)}</div>
+        <div class="ds-techrow">${tech}</div>`;
 }
 
 function dsUpdateUI() {
@@ -8332,6 +14503,8 @@ function dsUpdateUI() {
     for (const s of DS_SECTIONS) {
         const badge = document.getElementById(`ds-${s.kind}-count`);
         const list = document.getElementById(`ds-list-${s.kind}`);
+        const details = document.getElementById(`ds-details-${s.kind}`);
+        const detailsSummary = document.getElementById(`ds-details-summary-${s.kind}`);
         const sub = document.getElementById(`ds-${s.kind}-sub`);
         const files = dsFiles[s.kind];
         const usable = s.kind === "lights" ? lights.length : dsMatchedCalib(s.kind).length;
@@ -8353,6 +14526,14 @@ function dsUpdateUI() {
             }
         }
         if (list) dsRenderFileList(list, s.kind, files, s.kind === "lights" ? null : lightsRef);
+        if (details) details.hidden = files.length === 0;
+        if (detailsSummary) {
+            detailsSummary.textContent = trFormat(
+                "deepsky.view_files",
+                { count: files.length },
+                `Ver ${files.length} ${tr("deepsky.files", "archivos")}`,
+            );
+        }
     }
 
     // Cosmética inteligente: con darks el master ya elimina los píxeles
@@ -8388,77 +14569,23 @@ function dsUpdateUI() {
         }
     }
 
-    // MAPA DE CALIBRACIÓN (pipeline visual estilo WBPP): pasos encadenados de
-    // cómo se calibrará cada light, con validación de dims y exposición.
+    // PLAN DE CALIBRACIÓN estilo WBPP: una tarjeta por grupo de exposición, cada
+    // una con su lote de bias/darks/flats emparejado → el usuario ve con qué se
+    // calibra cada light.
     const sum = document.getElementById("ds-match-summary");
-    if (sum) {
-        if (dsFiles.lights.length === 0) {
-            sum.style.display = "none";
-        } else {
-            sum.style.display = "block";
-            const expOf = (arr) => {
-                const es = arr.map(f => f.exptime).filter(e => e !== null && e !== undefined);
-                if (es.length === 0) return null;
-                return es.reduce((a, b) => a + b, 0) / es.length;
-            };
-            const lExp = expOf(lights);
-            const usedB = dsMatchedCalib("bias");
-            const usedD = dsMatchedCalib("darks");
-            const usedF = dsMatchedCalib("flats");
-            const dimsWarn = (arr) => lightsRef && arr.length > 0 && !arr.every(f => f.w === lightsRef.w && f.h === lightsRef.h);
-
-            const step = (icon, color, title, detail, warn) => `
-                <div style="display:flex; align-items:center; gap:7px; padding:4px 8px; border-radius:8px; background:rgba(15,23,42,0.55); border:1px solid ${warn ? 'rgba(245,158,11,0.4)' : 'rgba(255,255,255,0.06)'};">
-                    <svg class="zas-icon" style="width:14px;height:14px;color:${color};"><use href="#${icon}"></use></svg>
-                    <div style="min-width:0;">
-                        <div style="font-weight:600;color:#e2e8f0;font-size:0.66rem;">${title}</div>
-                        <div style="font-size:0.6rem;color:${warn ? '#fbbf24' : '#94a3b8'};">${detail}</div>
-                    </div>
-                </div>`;
-            const arrow = `<div style="color:#475569; align-self:center;">→</div>`;
-
-            const parts = [];
-            const grpTxt = dsSelectedGroup ? ` · «${dsSelectedGroup}»` : "";
-            parts.push(step("icon-sequence", "#a5b4fc", `${lights.length} Lights${grpTxt}`,
-                `${lightsRef ? lightsRef.w + "×" + lightsRef.h : "—"} · ${dsFmtExp(lExp)}${(lightsRef && lightsRef.bayer) ? " · " + lightsRef.bayer : ""}`, false));
-
-            if (usedB.length) {
-                parts.push(arrow);
-                parts.push(step("icon-film", "#67e8f9", tr("deepsky.step_bias", "− Master Bias"),
-                    `${usedB.length} bias`, dimsWarn(usedB)));
-            }
-            if (usedD.length) {
-                const dExp = expOf(usedD);
-                const expWarn = lExp !== null && dExp !== null && Math.abs(dExp - lExp) > lExp * 0.05;
-                parts.push(arrow);
-                parts.push(step("icon-moon", "#94a3b8", tr("deepsky.step_dark", "− Master Dark"),
-                    `${usedD.length} darks${dExp !== null ? " · " + dsFmtExp(dExp) : ""}`, dimsWarn(usedD) || expWarn));
-            }
-            if (usedF.length) {
-                parts.push(arrow);
-                parts.push(step("icon-lightbulb", "#fbbf24", tr("deepsky.step_flat", "÷ Master Flat"),
-                    `${usedF.length} flats`, dimsWarn(usedF)));
-            }
-            // Cosmética si aplica (sin darks) + integración
-            if (usedD.length === 0) {
-                parts.push(arrow);
-                parts.push(step("icon-magic", "#c4b5fd", tr("deepsky.step_cosmetic", "Cosmética"),
-                    tr("deepsky.step_cosmetic_d", "píxeles calientes"), false));
-            }
-            parts.push(arrow);
-            parts.push(step("icon-galaxy", "#f0abfc", tr("deepsky.step_integrate", "Integración κ-σ"),
-                tr("deepsky.step_integrate_d", "registro + peso FWHM"), false));
-
-            sum.innerHTML = `<div style="font-size:0.62rem;color:#64748b;margin-bottom:6px;font-weight:600;letter-spacing:0.05em;">${tr("deepsky.plan_title", "PLAN DE CALIBRACIÓN")}</div><div style="display:flex;flex-wrap:wrap;gap:6px;align-items:stretch;">${parts.join("")}</div>`;
-        }
-    }
+    if (sum) dsRenderCalibrationPlan(sum, lights);
+    dsRenderSessionOrganizer();
+    dsUpdateMultibandControls();
+    dsRenderProcessPreview(); // diagrama + datos técnicos + tiempo estimado
 
     const run = document.getElementById("btn-deepsky-run");
     if (run) {
         // 1 light = flujo valido (calibrar + estirar); ≥2 = integracion completa.
-        run.disabled = lights.length < 1;
-        run.style.opacity = lights.length < 1 ? "0.5" : "1";
+        run.disabled = lights.length < 1 || (dsPreparedPlan && !dsPreparedPlan.valid);
+        run.style.opacity = run.disabled ? "0.5" : "1";
     }
+    dsSchedulePreflight();
+    dsSyncWizard();
 }
 
 async function dsPick(kind) {
@@ -8466,14 +14593,14 @@ async function dsPick(kind) {
         const sel = await openDialog({
             multiple: true,
             title: kind === "lights" ? "Selecciona tus LIGHTS" : `Selecciona ${kind.toUpperCase()} (opcional)`,
-            filters: [{ name: "Astro (FITS/TIF/PNG)", extensions: ["fits", "fit", "tif", "tiff", "png", "jpg", "jpeg"] }]
+            filters: [{ name: tr("deepsky.scientific_files", "Ciencia lineal (FITS/TIFF)"), extensions: ["fits", "fit", "fts", "tif", "tiff"] }]
         });
         if (!sel) return;
         const paths = Array.isArray(sel) ? sel : [sel];
         const probes = await invoke("deepsky_probe", { paths });
         dsFiles[kind] = probes;
         const bad = probes.filter(p => !p.ok).length;
-        if (bad > 0) log("WARN", `${kind}: ${bad} archivo(s) ilegibles (marcados ⚠).`);
+        if (bad > 0) log("WARN", `${kind}: ${bad} archivo(s) ilegibles (marcados ⚠︎).`);
         dsUpdateUI();
     } catch (e) {
         console.error("deepsky pick:", e);
@@ -8487,10 +14614,13 @@ async function dsPickFolder(kind) {
         const dir = await openDialog({ directory: true, multiple: false, title: `Carpeta de ${kind.toUpperCase()}` });
         if (!dir) return;
         const cl = await invoke("deepsky_scan_classify", { root: dir });
-        const all = [...cl.lights, ...cl.darks, ...cl.flats, ...cl.bias];
+        const classifiedDarkFlats = cl.darkFlats || cl.dark_flats || [];
+        const all = [...cl.lights, ...cl.darks, ...cl.flats, ...classifiedDarkFlats, ...cl.bias];
         if (all.length === 0) { log("WARN", "No se encontraron imágenes en la carpeta."); return; }
-        dsFiles[kind] = all;
-        log("INFO", `${kind}: ${all.length} archivo(s) cargados de la carpeta (recursivo).`);
+        // También acumula: cargar una segunda carpeta de darks se suma a la
+        // primera en vez de sustituirla (✕ del grupo sigue vaciándolo).
+        const added = dsMergeScannedFiles({ [kind]: all });
+        log("INFO", `${kind}: +${added.total} archivo(s) de la carpeta (recursivo)${added.duplicates ? `, ${added.duplicates} ya estaban` : ""} · total ${dsFiles[kind].length}.`);
         dsUpdateUI();
     } catch (e) { log("ERROR", `Cielo Profundo carpeta (${kind}): ${e}`); }
 }
@@ -8501,15 +14631,20 @@ async function dsPickFolder(kind) {
 let dsStacking = false;
 let dsProgTimer = null;
 let dsProgStart = 0;
+let dsSessionProgressTotal = 1;
+let dsSessionProgressIndex = 1;
 const DS_PHASES = [
-    { id: "calib", label: "Calibración y detección de estrellas", rx: /calibr|master|detect/i },
-    { id: "register", label: "Registro estelar (triángulos)", rx: /registr/i },
-    { id: "int1", label: "Integración · pasada 1", rx: /pasada 1/i },
-    { id: "int2", label: "Integración · pasada 2 (σ-clip)", rx: /pasada 2/i },
-    { id: "bg", label: "Fondo: ABE + SCNR + neutralización", rx: /abe|gradiente|scnr|neutraliz/i },
-    { id: "stretch", label: "Estiramiento automático (STF)", rx: /estir|stf/i }
+    { id: "calib", label: "Lectura, masters, calibración y estrellas", rx: /read|calibr|master|detect/i },
+    { id: "register", label: "Registro PSF + RANSAC", rx: /registr/i },
+    { id: "normalize", label: "Normalización robusta", rx: /normaliz/i },
+    { id: "integrate", label: "Integración · pasada base", rx: /integrate_pass_1|integrate_fallback|integrate_method_fallback|pasada 1/i },
+    { id: "reject", label: "Rechazo de píxeles", rx: /sigma_clip|tiled|reject|rechazo|pasada 2|por-píxel|franja/i },
+    { id: "drizzle", label: "Drizzle y cobertura", rx: /drizzle|cobertura/i, when: () => parseFloat(document.getElementById("sel-ds-drizzle")?.value || "1") > 1 },
+    { id: "bg", label: "Derivado opcional ABE + SCNR (SCI intacto)", rx: /abe|gradiente|scnr|neutraliz/i, when: () => !!document.getElementById("chk-ds-gradient")?.checked },
+    { id: "publish", label: "Vista previa y publicación del máster", rx: /preview|vista|public|complete|estir|stf/i }
 ];
 let dsPhaseTimes = {};
+let dsVisiblePhases = DS_PHASES;
 
 function dsFmtClock(ms) {
     const s = Math.floor(ms / 1000);
@@ -8520,51 +14655,137 @@ function dsProgressStart() {
     dsStacking = true;
     dsProgStart = Date.now();
     dsPhaseTimes = {};
+    dsVisiblePhases = DS_PHASES.filter(phase => !phase.when || phase.when());
     const steps = document.getElementById("ds-prog-steps");
     if (steps) {
         steps.innerHTML = "";
-        DS_PHASES.forEach(ph => {
+        dsVisiblePhases.forEach(ph => {
             const row = document.createElement("div");
             row.id = `ds-ph-${ph.id}`;
-            row.style.cssText = "display:flex; align-items:center; gap:9px; padding:4px 6px; border-radius:8px; font-size:0.72rem; color:#64748b;";
+            row.className = "ds-ph-row";
             row.innerHTML = `<span class="ds-ph-mark" style="width:16px; text-align:center;">○</span><span class="ds-ph-label" style="flex:1;">${ph.label}</span><span class="ds-ph-time" style="font-family:'Courier New',monospace; font-size:0.66rem; color:#475569;"></span>`;
             steps.appendChild(row);
         });
     }
-    const bar = document.getElementById("ds-prog-bar"); if (bar) bar.style.width = "0%";
+    const bar = document.getElementById("ds-prog-bar"); if (bar) { bar.style.width = "0%"; bar.setAttribute("aria-valuenow", "0"); }
     const pct = document.getElementById("ds-prog-pct"); if (pct) pct.textContent = "0%";
     const cur = document.getElementById("ds-prog-current"); if (cur) cur.textContent = "";
-    const ov = document.getElementById("ds-progress"); if (ov) ov.style.display = "flex";
+    // Chips de recursos visibles desde el arranque (con marcadores): la
+    // telemetría real los reemplaza en cuanto llega el primer evento.
+    const resources = document.getElementById("ds-prog-resources");
+    if (resources) {
+        resources.style.display = "grid";
+        resources.innerHTML = ["Motor", "Velocidad", "CPU", "RAM", "VRAM", "Caché"]
+            .map(label => `<span>${label} <b style="color:#64748b;">—</b></span>`)
+            .join("");
+    }
+    const warning = document.getElementById("ds-prog-warning"); if (warning) { warning.style.display = "none"; warning.textContent = ""; }
+    const ov = document.getElementById("ds-progress");
+    if (ov) {
+        ov.style.display = "flex";
+        requestAnimationFrame(() => document.getElementById("ds-prog-cancel")?.focus());
+    }
     clearInterval(dsProgTimer);
     dsProgTimer = setInterval(() => {
         const el = document.getElementById("ds-prog-elapsed");
         if (el) el.textContent = dsFmtClock(Date.now() - dsProgStart);
     }, 1000);
+    dsAttachSkyParallax();
+}
+
+// Parallax de puntero sobre el cielo del progreso: cada capa se desplaza a
+// distinta profundidad (nebulosa > estrellas cercanas > lejanas). Ligado una
+// sola vez; respeta prefers-reduced-motion.
+function dsAttachSkyParallax() {
+    const sky = document.getElementById("ds-sky");
+    if (!sky || sky.dataset.parallax) return;
+    sky.dataset.parallax = "1";
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    const box = sky.closest(".donation-modal-box") || sky;
+    const layers = () => ({
+        neb: sky.querySelector(".ds-sky-neb-wrap"),
+        s1: sky.querySelector(".ds-sky-stars.s1"),
+        s2: sky.querySelector(".ds-sky-stars.s2"),
+        s3: sky.querySelector(".ds-sky-stars.s3"),
+    });
+    const apply = (dx, dy) => {
+        const { neb, s1, s2, s3 } = layers();
+        if (neb) neb.style.transform = `translate3d(${dx * 14}px, ${dy * 8}px, 0)`;
+        if (s1) s1.style.transform = `translate3d(${dx * 10}px, ${dy * 6}px, 0)`;
+        if (s2) s2.style.transform = `translate3d(${dx * 6}px, ${dy * 3.5}px, 0)`;
+        if (s3) s3.style.transform = `translate3d(${dx * 3}px, ${dy * 2}px, 0)`;
+    };
+    box.addEventListener("pointermove", (event) => {
+        const rect = sky.getBoundingClientRect();
+        const dx = ((event.clientX - rect.left) / Math.max(1, rect.width) - 0.5) * 2;
+        const dy = ((event.clientY - rect.top) / Math.max(1, rect.height) - 0.5) * 2;
+        apply(Math.max(-1.5, Math.min(1.5, dx)), Math.max(-1.5, Math.min(1.5, dy)));
+    });
+    box.addEventListener("pointerleave", () => apply(0, 0));
 }
 
 function dsProgressUpdate(step, pct) {
     if (!dsStacking) return;
-    const bar = document.getElementById("ds-prog-bar"); if (bar) bar.style.width = `${Math.min(100, pct)}%`;
-    const pe = document.getElementById("ds-prog-pct"); if (pe) pe.textContent = `${Math.round(pct)}%`;
-    const cur = document.getElementById("ds-prog-current"); if (cur) cur.textContent = step || "";
+    const sessionMarker = String(step || "").match(/Sesión multibanda\s+(\d+)\/(\d+)/i);
+    if (sessionMarker) {
+        const nextIndex = Number(sessionMarker[1]);
+        dsSessionProgressTotal = Math.max(1, Number(sessionMarker[2]));
+        if (nextIndex !== dsSessionProgressIndex) {
+            dsSessionProgressIndex = nextIndex;
+            dsPhaseTimes = {};
+            dsVisiblePhases.forEach(phase => {
+                const row = document.getElementById(`ds-ph-${phase.id}`);
+                if (!row) return;
+                const mark = row.querySelector(".ds-ph-mark");
+                const time = row.querySelector(".ds-ph-time");
+                if (mark) { mark.textContent = "○"; mark.style.color = ""; }
+                if (time) time.textContent = "";
+                row.style.color = "#94a3b8";
+                row.style.background = "transparent";
+            });
+        }
+    }
+    const effectivePct = dsSessionProgressTotal > 1 && !sessionMarker
+        ? ((dsSessionProgressIndex - 1) * 100 + pct) / dsSessionProgressTotal
+        : pct;
+    const effectiveStep = dsSessionProgressTotal > 1 && !sessionMarker
+        ? `Grupo ${dsSessionProgressIndex}/${dsSessionProgressTotal} · ${step}`
+        : step;
+    const bar = document.getElementById("ds-prog-bar");
+    if (bar) {
+        const value = Math.min(100, Math.max(0, effectivePct));
+        bar.style.width = `${value}%`;
+        bar.setAttribute("aria-valuenow", String(Math.round(value)));
+    }
+    const pe = document.getElementById("ds-prog-pct"); if (pe) pe.textContent = `${Math.round(effectivePct)}%`;
+    const cur = document.getElementById("ds-prog-current"); if (cur) cur.textContent = effectiveStep || "";
 
-    let active = DS_PHASES.findIndex(ph => ph.rx.test(step || ""));
-    if (pct >= 99.5) active = DS_PHASES.length; // todo hecho
+    dsProgressPhaseUpdate(step, !sessionMarker && pct >= 99.5);
+}
+
+function dsProgressPhaseUpdate(step, complete = false) {
+    let active = dsVisiblePhases.findIndex(ph => ph.rx.test(step || ""));
+    if (complete) active = dsVisiblePhases.length;
     if (active < 0) return;
-    DS_PHASES.forEach((ph, i) => {
+    dsVisiblePhases.forEach((ph, i) => {
         const row = document.getElementById(`ds-ph-${ph.id}`);
         if (!row) return;
         const mark = row.querySelector(".ds-ph-mark");
         const time = row.querySelector(".ds-ph-time");
         if (i < active) {
             if (!dsPhaseTimes[ph.id]) dsPhaseTimes[ph.id] = Date.now();
-            mark.textContent = "✓"; mark.style.color = "#34d399";
-            row.style.color = "#94a3b8";
+            mark.textContent = "✓";
+            row.classList.add("done");
+            row.classList.remove("active");
+            row.style.background = "transparent";
             if (time && dsPhaseTimes[ph.id + "_start"]) time.textContent = dsFmtClock(dsPhaseTimes[ph.id] - dsPhaseTimes[ph.id + "_start"]);
         } else if (i === active) {
             if (!dsPhaseTimes[ph.id + "_start"]) dsPhaseTimes[ph.id + "_start"] = Date.now();
-            mark.textContent = "▸"; mark.style.color = "#c4b5fd";
-            row.style.color = "#e2e8f0"; row.style.background = "rgba(124,58,237,0.08)";
+            mark.textContent = "▸";
+            row.classList.add("active");
+            row.classList.remove("done");
+        } else {
+            row.classList.remove("active", "done");
         }
     });
 }
@@ -8600,9 +14821,37 @@ function dsExitResultMode() {
     delete document.body.dataset.dsResult;
 }
 
+function dsTrapDialogFocus(event, dialog) {
+    if (event.key !== "Tab" || !dialog) return;
+    const focusable = [...dialog.querySelectorAll(
+        'button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'
+    )].filter(element => {
+        const style = getComputedStyle(element);
+        return element.offsetParent !== null && style.visibility !== "hidden" && style.display !== "none";
+    });
+    if (!focusable.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (!dialog.contains(document.activeElement)) {
+        event.preventDefault();
+        first.focus();
+    } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+    }
+}
+
 // ---- Barra de estirado final (SIRIL-style screen transfer function) ----
 let dsStretchMode = "linked";
 let dsStretchStrength = 0.5;
+let dsResultView = "master";
 let dsResultBasePath = null; // primer light del apilado → carpeta de exportación
 
 // Exporta el resultado de cielo profundo (estirado 16-bit/PNG y/o lineal 16-bit).
@@ -8615,14 +14864,31 @@ async function dsExportResult(opts, triggerBtn) {
     const prevTxt = triggerBtn ? triggerBtn.textContent : null;
     if (triggerBtn) { triggerBtn.disabled = true; triggerBtn.style.opacity = "0.6"; triggerBtn.textContent = tr("deepsky.exporting", "Exportando…"); }
     try {
-        const msg = await invoke("deepsky_export", {
-            basePath: dsResultBasePath,
-            mode: dsStretchMode,
-            strength: dsStretchStrength,
-            saveStretched: !!opts.stretched,
-            saveLinear: !!opts.linear,
-            asPng: !!opts.png
-        });
+        const messages = [];
+        if (opts.stretched || opts.linear) {
+            messages.push(await invoke("deepsky_export", {
+                basePath: dsResultBasePath,
+                mode: dsStretchMode,
+                strength: dsStretchStrength,
+                saveStretched: !!opts.stretched,
+                saveLinear: !!opts.linear,
+                asPng: !!opts.png
+            }));
+        }
+        if (opts.float32) {
+            const scientific = await invoke("deepsky_export_float32", {
+                basePath: dsResultBasePath,
+                includeMaps: true,
+            });
+            // Cada mapa científico exportado queda listado por nombre, no como
+            // un conteo opaco: el usuario ve exactamente qué productos tiene.
+            const maps = scientific.diagnosticFits || [];
+            const mapLines = maps.length
+                ? `\nMapas (${maps.length}):\n${maps.map(p => `  · ${String(p).split(/[\\/]/).pop()}`).join("\n")}`
+                : "";
+            messages.push(`FITS float32: ${scientific.masterFits}\nJSON: ${scientific.recipeJson}${mapLines}`);
+        }
+        const msg = messages.join("\n");
         log("SUCCESS", normalizeBackendText(msg));
         showCustomAlert(tr("general.saved", "Guardado"), normalizeBackendText(msg));
     } catch (e) {
@@ -8639,6 +14905,106 @@ async function dsApplyStretch() {
         if (ui.imgResult) await setImageAndWait(ui.imgResult, b64, false);
         dsUpdateHistogram();
     } catch (e) { log("ERROR", `Re-estirado: ${e}`); }
+}
+
+async function dsShowResultView(kind) {
+    dsResultView = kind;
+    const selector = document.getElementById("ds-result-view");
+    if (selector) selector.value = kind;
+    const hist = document.getElementById("ds-histogram");
+    if (kind === "master") {
+        if (hist) hist.style.display = "block";
+        dsPositionHistogram();
+        await dsApplyStretch();
+        return;
+    }
+    if (hist) hist.style.display = "none";
+    // Vistas de sesión multibanda: preview PNG de un grupo (ya renderizado en
+    // disco) o componente FITS float32 estirado bajo demanda por el backend.
+    if (kind.startsWith("session:")) {
+        const path = kind.slice("session:".length);
+        if (ui.imgResult) {
+            const shown = await setImageAndWait(ui.imgResult, path, false);
+            if (!shown) log("ERROR", "No se pudo cargar la vista de esa integración.");
+        }
+        return;
+    }
+    if (kind.startsWith("component:")) {
+        const path = kind.slice("component:".length);
+        try {
+            const image = await invoke("deepsky_frame_preview", { path });
+            if (ui.imgResult) await setImageAndWait(ui.imgResult, image, false);
+        } catch (e) {
+            log("ERROR", `Componente: ${e}`);
+        }
+        return;
+    }
+    try {
+        const image = await invoke("deepsky_result_view", { kind });
+        if (ui.imgResult) await setImageAndWait(ui.imgResult, image, false);
+    } catch (e) {
+        // Explicar QUÉ produce cada vista en vez de fallar en silencio: los
+        // mapas científicos dependen del motor con el que se integró.
+        const requirement = {
+            variance: "NebulaFusion (Lite o Full)",
+            neff: "NebulaFusion (Lite o Full)",
+            dq: "NebulaFusion (Lite o Full)",
+            struct: "NebulaFusion Full + STRUCT",
+            struct_residual: "NebulaFusion Full + STRUCT",
+            recoverability: "EIDR",
+        }[kind];
+        const label = selector?.selectedOptions?.[0]?.textContent?.trim() || kind;
+        showCustomAlert(
+            tr("deepsky.view_unavailable", "Vista no disponible"),
+            requirement
+                ? trFormat("deepsky.view_requires", { view: label, engine: requirement },
+                    `La vista "${label}" solo se genera al apilar con ${requirement}. Este máster se integró con otro motor: usa Reintegrar y elige ese método para producirla.`)
+                : `${label}: ${normalizeBackendText(String(e))}`,
+        );
+        log("WARN", `Vista diagnóstica '${kind}' no disponible: ${e}`);
+        dsResultView = "master";
+        if (selector) selector.value = "master";
+        if (hist) hist.style.display = "block";
+        await dsApplyStretch();
+    }
+}
+
+// Rellena el selector de vistas con las integraciones y componentes de la
+// sesión multibanda terminada (se conservan hasta la siguiente sesión).
+function dsPopulateSessionViews(result) {
+    const view = document.getElementById("ds-result-view");
+    if (!view || !result) return;
+    view.querySelectorAll("[data-session]").forEach(el => el.remove());
+    const addGroup = (label, entries) => {
+        if (!entries.length) return;
+        const og = document.createElement("optgroup");
+        og.label = label;
+        og.dataset.session = "1";
+        for (const { text, value } of entries) {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = text;
+            og.appendChild(opt);
+        }
+        view.appendChild(og);
+    };
+    addGroup(
+        tr("deepsky.session_views", "Integraciones de la sesión"),
+        (result.groups || [])
+            .filter(group => group.previewPath)
+            .map(group => ({
+                text: `${dsFilterLabel(group.filterProfile)} · ${group.framesUsed} lights`,
+                value: `session:${group.previewPath}`,
+            }))
+    );
+    const components = [];
+    for (const [name, paths] of Object.entries(result.componentPaths || {})) {
+        (paths || []).forEach((path, index) => components.push({
+            text: paths.length > 1 ? `${name} (${index + 1})` : name,
+            value: `component:${path}`,
+        }));
+    }
+    addGroup(tr("deepsky.session_components", "Componentes extraídos"), components);
 }
 
 // Histograma RGB + lectura de fondo/recorte de la vista final (estilo PixInsight).
@@ -8675,8 +15041,24 @@ async function dsUpdateHistogram() {
         if (info) {
             const bg = hp.bg.map(v => Math.round(v));
             const bgTxt = hp.is_mono ? `${bg[0]}` : `${bg[0]}/${bg[1]}/${bg[2]}`;
-            info.innerHTML = `${tr("deepsky.hist_bg", "Fondo")}: <b>${bgTxt}</b> ADU · ` +
+            let html = `${tr("deepsky.hist_bg", "Fondo")}: <b>${bgTxt}</b> ADU · ` +
                 `${tr("deepsky.hist_clip", "recorte")} ▼${hp.clip_low.toFixed(2)}% ▲${hp.clip_high.toFixed(2)}%`;
+            // Calidad del máster (estrellas · FWHM · SNR · rechazo · cobertura).
+            const s = dsMasterStats;
+            if (s) {
+                html += `<br><span style="color:#7dd3fc;">${tr("deepsky.quality", "Calidad")}:</span> ` +
+                    `<b>${s.stars}</b> ${tr("deepsky.q_stars", "estrellas")} · FWHM <b>${s.fwhm}</b>px · SNR <b>~${s.snr}</b> · ` +
+                    `${tr("deepsky.q_reject", "rechazo")} <b>${s.rej_pct}%</b> · <b>${s.mean_cov}</b> ${tr("deepsky.q_cov", "tomas/px")}`;
+                const pattern = s.detectorPattern;
+                if (pattern && Number.isFinite(pattern.bandingSigma)) {
+                    const detected = pattern.bandingDetected === true;
+                    html += `<br><span style="color:${detected ? "#fbbf24" : "#34d399"};">` +
+                        `${tr("deepsky.q_detector_pattern", "Patrón detector")}: <b>${pattern.bandingSigma.toFixed(2)}σ</b>` +
+                        `${detected ? ` · ${tr("deepsky.q_banding_detected", "banding detectado")}` : ` · ${tr("deepsky.q_banding_clear", "sin banding significativo")}`}` +
+                        `</span>`;
+                }
+            }
+            info.innerHTML = html;
         }
     } catch (e) { /* sin resultado o incompatible — silencioso */ }
 }
@@ -8693,7 +15075,12 @@ function dsBuildHistogramPanel() {
     if (document.getElementById("ds-histogram")) return;
     const panel = document.createElement("div");
     panel.id = "ds-histogram";
-    panel.style.cssText = "position:fixed; bottom:78px; left:50%; transform:translateX(-50%); z-index:499; width:260px; padding:8px 10px 6px; background:rgba(15,23,42,0.94); border:1px solid rgba(124,58,237,0.35); border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(6px);";
+    // bottom clears the STF control bar even when it wraps to 2 rows (its top is
+    // ~112px), and z-index sits ABOVE the bar so the histogram is never hidden.
+    // dsPositionHistogram() refines the offset to the bar's real height on show.
+    // Anclado al COSTADO derecho: centrado se encimaba con los botones de la
+    // barra STF cuando la tarjeta crece (calidad + patrón de detector).
+    panel.style.cssText = "position:fixed; bottom:132px; right:18px; z-index:501; width:280px; padding:8px 10px 6px; background:rgba(15,23,42,0.94); border:1px solid rgba(124,58,237,0.35); border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(6px);";
     const cv = document.createElement("canvas");
     cv.width = 240; cv.height = 66;
     cv.style.cssText = "width:100%; height:66px; display:block; background:rgba(2,6,23,0.6); border-radius:6px;";
@@ -8703,6 +15090,22 @@ function dsBuildHistogramPanel() {
     info.textContent = tr("deepsky.hist_title", "Histograma");
     panel.append(cv, info);
     document.body.appendChild(panel);
+}
+
+// Coloca el histograma JUSTO encima de la barra STF, midiendo su altura real
+// (crece al hacer wrap en pantallas estrechas) para que nunca se solapen.
+function dsPositionHistogram() {
+    const hist = document.getElementById("ds-histogram");
+    if (!hist || hist.style.display === "none") return;
+    requestAnimationFrame(() => {
+        const bar = document.getElementById("ds-stretch-bar");
+        const barBottom = 12; // debe coincidir con el bottom de la barra STF
+        const barH = bar && bar.offsetParent !== null ? bar.getBoundingClientRect().height : 46;
+        hist.style.bottom = Math.round(barBottom + barH + 12) + "px";
+    });
+}
+if (typeof window !== "undefined") {
+    window.addEventListener("resize", () => dsPositionHistogram());
 }
 
 // Tabla de calidad por-toma (WBPP-style): FWHM, excentricidad, ruido, peso.
@@ -8766,7 +15169,25 @@ function dsShowStretchBar() {
     if (!bar) {
         bar = document.createElement("div");
         bar.id = "ds-stretch-bar";
-        bar.style.cssText = "position:fixed; bottom:22px; left:50%; transform:translateX(-50%); z-index:500; display:flex; align-items:center; gap:10px; padding:8px 14px; background:rgba(15,23,42,0.94); border:1px solid rgba(124,58,237,0.35); border-radius:14px; box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(6px);";
+        bar.style.cssText = "position:fixed; bottom:12px; left:50%; transform:translateX(-50%); z-index:500; display:flex; align-items:center; justify-content:center; flex-wrap:wrap; max-width:calc(100vw - 20px); gap:8px; padding:8px 12px; background:rgba(15,23,42,0.94); border:1px solid rgba(124,58,237,0.35); border-radius:14px; box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(6px);";
+        const view = document.createElement("select");
+        view.id = "ds-result-view";
+        view.title = tr("deepsky.result_view_hint", "Alternar máster y mapas científicos");
+        view.style.cssText = "width:auto; padding:5px 8px; border-radius:9px; font-size:0.7rem; border:1px solid #334155; background:#0f172a; color:#cbd5e1;";
+        view.innerHTML = `<option value="master">${tr("deepsky.view_master", "Máster")}</option>
+            <option value="rejection_low">${tr("deepsky.view_rejection_low", "Rechazo bajo")}</option>
+            <option value="rejection_high">${tr("deepsky.view_rejection_high", "Rechazo alto")}</option>
+            <option value="coverage">${tr("deepsky.view_coverage", "Cobertura")}</option>
+            <option value="weight">${tr("deepsky.view_weight", "Peso")}</option>
+            <option value="registration_residuals">${tr("deepsky.view_residuals", "Residuales")}</option>
+            <option value="background_model">${tr("deepsky.view_background_model", "Modelo de fondo (CL)")}</option>
+            <option value="variance">${tr("deepsky.view_variance", "Varianza (NF)")}</option>
+            <option value="neff">${tr("deepsky.view_neff", "NEFF — tomas efectivas (NF)")}</option>
+            <option value="dq">${tr("deepsky.view_dq", "Calidad de datos DQ (NF)")}</option>
+            <option value="struct">${tr("deepsky.view_struct", "STRUCT (evidencia A/B)")}</option>
+            <option value="recoverability">${tr("deepsky.view_recoverability", "Recuperabilidad (EIDR)")}</option>
+            <option value="struct_residual">${tr("deepsky.view_struct_residual", "Residual de STRUCT")}</option>`;
+        view.addEventListener("change", () => dsShowResultView(view.value));
         const modes = [
             { m: "linked", label: tr("deepsky.stf_auto", "Auto (color)") },
             { m: "unlinked", label: tr("deepsky.stf_balanced", "Balanceado") },
@@ -8780,7 +15201,7 @@ function dsShowStretchBar() {
             b.dataset.mode = m;
             b.textContent = label;
             b.style.cssText = "width:auto; padding:5px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1;";
-            b.addEventListener("click", () => { dsStretchMode = m; dsSyncStretchBar(); dsApplyStretch(); });
+            b.addEventListener("click", () => { dsStretchMode = m; dsSyncStretchBar(); dsShowResultView("master"); });
             seg.appendChild(b);
         });
         const sldWrap = document.createElement("label");
@@ -8790,7 +15211,7 @@ function dsShowStretchBar() {
         sld.type = "range"; sld.min = "0"; sld.max = "1"; sld.step = "0.05"; sld.value = String(dsStretchStrength);
         sld.style.width = "90px";
         sld.addEventListener("input", () => { dsStretchStrength = parseFloat(sld.value); });
-        sld.addEventListener("change", () => dsApplyStretch());
+        sld.addEventListener("change", () => dsShowResultView("master"));
         sldWrap.appendChild(sld);
         const note = document.createElement("span");
         note.style.cssText = "font-size:0.6rem; color:#64748b; max-width:140px;";
@@ -8803,7 +15224,7 @@ function dsShowStretchBar() {
         exportWrap.style.cssText = "position:relative;";
         const btnExport = document.createElement("button");
         btnExport.type = "button";
-        btnExport.textContent = "⤓ " + tr("deepsky.export", "Exportar");
+        btnExport.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;vertical-align:-2px;margin-right:5px;"><use href="#icon-download"></use></svg>${tr("deepsky.export", "Exportar")}`;
         btnExport.style.cssText = "width:auto; padding:6px 13px; border-radius:9px; font-size:0.74rem; font-weight:600; cursor:pointer; border:1px solid #7c3aed; background:linear-gradient(135deg,#7c3aed,#db2777); color:#fff;";
         const pop = document.createElement("div");
         pop.style.cssText = "display:none; position:absolute; bottom:44px; right:0; width:250px; padding:12px; background:rgba(15,23,42,0.98); border:1px solid rgba(124,58,237,0.4); border-radius:12px; box-shadow:0 10px 34px rgba(0,0,0,0.6); flex-direction:column; gap:9px;";
@@ -8823,7 +15244,10 @@ function dsShowStretchBar() {
             <label style="display:flex; align-items:center; gap:7px; font-size:0.7rem; color:#cbd5e1; cursor:pointer;">
                 <input type="checkbox" id="ds-exp-linear" style="width:auto;"> ${tr("deepsky.export_linear", "Lineal 16-bit (PixInsight/PS)")}
             </label>
-            <div style="font-size:0.6rem; color:#64748b; line-height:1.3;">${tr("deepsky.export_hint", "Se guarda junto a tus lights. El estirado usa el modo/intensidad actual.")}</div>
+            <label style="display:flex; align-items:center; gap:7px; font-size:0.7rem; color:#c4b5fd; cursor:pointer;">
+                <input type="checkbox" id="ds-exp-float32" checked style="width:auto;"> ${tr("deepsky.export_float32", "FITS float32 + receta + mapas científicos")}
+            </label>
+            <div style="font-size:0.6rem; color:#64748b; line-height:1.3;">${tr("deepsky.export_hint", "Se guarda en tu carpeta de trabajo (o junto a tus lights si no elegiste una). El estirado usa el modo/intensidad actual.")}</div>
             <button type="button" id="ds-exp-go" style="width:100%; padding:8px; border-radius:8px; border:none; background:linear-gradient(135deg,#7c3aed,#db2777); color:#fff; font-weight:600; font-size:0.72rem; cursor:pointer;">${tr("deepsky.export_do", "Guardar")}</button>
         `;
         btnExport.addEventListener("click", (ev) => {
@@ -8835,13 +15259,14 @@ function dsShowStretchBar() {
         pop.querySelector("#ds-exp-go").addEventListener("click", () => {
             const stretched = pop.querySelector("#ds-exp-stretched").checked;
             const linear = pop.querySelector("#ds-exp-linear").checked;
+            const float32 = pop.querySelector("#ds-exp-float32").checked;
             const png = pop.querySelector("#ds-exp-png").checked;
-            if (!stretched && !linear) {
+            if (!stretched && !linear && !float32) {
                 showCustomAlert(tr("general.error", "Error"), tr("deepsky.export_pick", "Elige al menos una salida."));
                 return;
             }
             pop.style.display = "none";
-            dsExportResult({ stretched, linear, png }, pop.querySelector("#ds-exp-go"));
+            dsExportResult({ stretched, linear, float32, png }, pop.querySelector("#ds-exp-go"));
         });
         exportWrap.append(btnExport, pop);
 
@@ -8852,18 +15277,129 @@ function dsShowStretchBar() {
         const btnReport = document.createElement("button");
         btnReport.id = "ds-report-btn";
         btnReport.type = "button";
-        btnReport.textContent = "📋 " + tr("deepsky.report", "Tomas");
-        btnReport.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; display:" + (dsFrameReport && dsFrameReport.length ? "inline-flex" : "none") + ";";
+        btnReport.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-clipboard"></use></svg>${tr("deepsky.report", "Tomas")}`;
+        btnReport.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; align-items:center; display:" + (dsFrameReport && dsFrameReport.length ? "inline-flex" : "none") + ";";
         btnReport.addEventListener("click", (ev) => { ev.stopPropagation(); dsShowReportPanel(); });
-        bar.append(seg, sldWrap, note, divider, btnReport, exportWrap, close);
+        const btnRepeat = document.createElement("button");
+        btnRepeat.type = "button";
+        btnRepeat.textContent = tr("deepsky.repeat_integration", "Reintegrar");
+        btnRepeat.title = tr("deepsky.repeat_integration_hint", "Conservar tomas y registro; revisar sólo la receta de integración");
+        btnRepeat.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1;";
+        btnRepeat.addEventListener("click", () => {
+            const modal = document.getElementById("deepsky-modal");
+            if (modal) {
+                modal.style.display = "flex";
+                dsSetWizardStep(2, true);
+                dsPreparePlan();
+            }
+        });
+        // Separar canales (R/G/B/L) → másters mono para el flujo LRGB/SHO.
+        const btnSplit = document.createElement("button");
+        btnSplit.id = "ds-split-btn";
+        btnSplit.type = "button";
+        btnSplit.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-palette"></use></svg>${tr("deepsky.split", "Separar canales")}`;
+        btnSplit.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; align-items:center; display:inline-flex;";
+        btnSplit.title = tr("deepsky.split_hint", "Guarda R, G, B y una L sintética como TIFF mono 16-bit para retocar por canal y recombinar (LRGB/SHO).");
+        btnSplit.addEventListener("click", async (ev) => {
+            ev.stopPropagation();
+            if (!dsResultBasePath) { log("WARN", tr("deepsky.no_base", "No hay carpeta de destino para exportar.")); return; }
+            const prev = btnSplit.innerHTML;
+            btnSplit.disabled = true; btnSplit.style.opacity = "0.6";
+            btnSplit.innerHTML = `<svg class="zas-icon icon-spin" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-settings"></use></svg>${tr("deepsky.splitting", "Separando…")}`;
+            try {
+                const msg = await invoke("deepsky_split_channels", { basePath: dsResultBasePath, includeLuma: true });
+                log("SUCCESS", msg);
+                showCustomAlert(tr("deepsky.split", "Separar canales"), msg);
+            } catch (e) {
+                log("ERROR", `${e}`);
+                showCustomAlert(tr("general.error", "Error"), String(e));
+            } finally {
+                btnSplit.disabled = false; btnSplit.style.opacity = "1"; btnSplit.innerHTML = prev;
+            }
+        });
+        // HOO dual-band: convierte el máster OSC dual-band verde en Ha→R, OIII→G/B.
+        const btnHoo = document.createElement("button");
+        btnHoo.id = "ds-hoo-btn";
+        btnHoo.type = "button";
+        btnHoo.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-palette"></use></svg>${tr("deepsky.hoo", "HOO dual-band")}`;
+        btnHoo.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; align-items:center; display:inline-flex;";
+        btnHoo.title = tr("deepsky.hoo_hint", "Vista HOO derivada del máster dual-band: Ha→R, OIII→G y B (fondo neutralizado). Solo cambia la VISTA — el máster lineal float32 (SCI/VAR/NEFF/DQ) queda intacto; Reintegrar o cambiar de vista vuelve al RGB original.");
+        btnHoo.addEventListener("click", async (ev) => {
+            ev.stopPropagation();
+            const prev = btnHoo.innerHTML;
+            btnHoo.disabled = true; btnHoo.style.opacity = "0.6";
+            btnHoo.innerHTML = `<svg class="zas-icon icon-spin" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-settings"></use></svg>${tr("deepsky.hoo_running", "Combinando HOO…")}`;
+            try {
+                const png = await invoke("deepsky_dualband_hoo", {});
+                if (ui.imgResult && png) await setImageAndWait(ui.imgResult, png, false);
+                dsResultView = "master";
+                dsUpdateHistogram();
+                log("SUCCESS", tr("deepsky.hoo_done", "HOO aplicado (Ha→R, OIII→G/B)."));
+            } catch (e) {
+                log("ERROR", `${e}`);
+                showCustomAlert(tr("general.error", "Error"), String(e));
+            } finally {
+                btnHoo.disabled = false; btnHoo.style.opacity = "1"; btnHoo.innerHTML = prev;
+            }
+        });
+        // SPCC: calibración de color fotométrica contra Gaia DR3 (banda ancha).
+        const btnSpcc = document.createElement("button");
+        btnSpcc.id = "ds-spcc-btn";
+        btnSpcc.type = "button";
+        btnSpcc.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-palette"></use></svg>${tr("deepsky.spcc", "SPCC color")}`;
+        btnSpcc.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; align-items:center; display:inline-flex;";
+        btnSpcc.title = tr("deepsky.spcc_hint", "Calibración de color fotométrica contra Gaia DR3 (banda ancha OSC/RGB, requiere internet). Para banda estrecha/dual-band usa HOO/SHO.");
+        btnSpcc.addEventListener("click", async (ev) => {
+            ev.stopPropagation();
+            const prev = btnSpcc.innerHTML;
+            const run = async (params) => await invoke("spcc_calibrate", { req: params });
+            btnSpcc.disabled = true; btnSpcc.style.opacity = "0.6";
+            btnSpcc.innerHTML = `<svg class="zas-icon icon-spin" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-settings"></use></svg>${tr("deepsky.spcc_running", "Calibrando color…")}`;
+            try {
+                let res;
+                try {
+                    res = await run({ whiteReference: localStorage.getItem("zas_spcc_reference") || "averageSpiral" });
+                } catch (e) {
+                    const msg = String(e);
+                    if (/RA\/Dec|apuntado|escala|RA, Dec/i.test(msg)) {
+                        // window.prompt NO existe en el webview de Tauri
+                        // (devolvía null → "Cancelado" instantáneo): diálogo
+                        // propio con los tres campos.
+                        const seed = await dsPromptSpccSeed();
+                        if (!seed) throw new Error(tr("general.cancelled", "Cancelado"));
+                        res = await run({ ra: seed.ra, dec: seed.dec, scaleArcsecPx: seed.scale, whiteReference: seed.reference });
+                    } else { throw e; }
+                }
+                if (ui.imgResult && res && res.preview) await setImageAndWait(ui.imgResult, res.preview, false);
+                dsResultView = "master";
+                dsUpdateHistogram();
+                const rep = tr("deepsky.spcc_report", "SPCC: {matched} estrellas Gaia · ganancias R/G/B {gr}/{gg}/{gb}")
+                    .replace("{matched}", res.matched)
+                    .replace("{gr}", res.gainR.toFixed(3))
+                    .replace("{gg}", res.gainG.toFixed(3))
+                    .replace("{gb}", res.gainB.toFixed(3));
+                log("SUCCESS", rep);
+                showCustomAlert(tr("deepsky.spcc", "SPCC color"), `${rep}\n\n${res.note || ""}`);
+            } catch (e) {
+                log("ERROR", `${e}`);
+                showCustomAlert(tr("general.error", "Error"), String(e));
+            } finally {
+                btnSpcc.disabled = false; btnSpcc.style.opacity = "1"; btnSpcc.innerHTML = prev;
+            }
+        });
+        bar.append(view, seg, sldWrap, note, divider, btnSplit, btnHoo, btnSpcc, btnReport, btnRepeat, exportWrap, close);
         document.body.appendChild(bar);
     }
     bar.style.display = "flex";
+    dsResultView = "master";
+    const view = document.getElementById("ds-result-view");
+    if (view) view.value = "master";
     dsBuildHistogramPanel();
     const hist = document.getElementById("ds-histogram");
     if (hist) hist.style.display = "block";
     dsSyncStretchBar();
     dsUpdateHistogram();
+    dsPositionHistogram();
 }
 
 function dsSyncStretchBar() {
@@ -8880,16 +15416,72 @@ function dsSyncStretchBar() {
 // Carpeta raíz → auto-clasificación WBPP (por subcarpetas/nombres).
 async function dsScanFolder() {
     try {
-        const dir = await openDialog({ directory: true, multiple: false, title: "Carpeta raíz de la sesión (auto-clasificar)" });
+        const dir = await openDialog({
+            directory: true,
+            multiple: false,
+            title: tr("deepsky.scan_folder_pick", "Carpeta raíz de la sesión (auto-clasificar)"),
+        });
         if (!dir) return;
         showProcessing(tr("deepsky.scanning", "ESCANEANDO Y CLASIFICANDO..."));
         const cl = await invoke("deepsky_scan_classify", { root: dir });
         hideProcessing();
-        if (cl.lights.length) dsFiles.lights = cl.lights;
-        if (cl.darks.length) dsFiles.darks = cl.darks;
-        if (cl.flats.length) dsFiles.flats = cl.flats;
-        if (cl.bias.length) dsFiles.bias = cl.bias;
-        log("SUCCESS", `Auto-clasificación: ${cl.lights.length} lights · ${cl.darks.length} darks · ${cl.flats.length} flats · ${cl.bias.length} bias.`);
+        let classifiedFlats = [...(cl.flats || [])];
+        let classifiedDarkFlats = [...(cl.darkFlats || cl.dark_flats || [])];
+        // Defensa ante una app/backend mezclados durante una actualización:
+        // IMAGETYP='DARK' + OBJECT/archivo FlatWizard es un dark-flat de N.I.N.A.
+        const recoveredDarkFlats = classifiedFlats.filter(probe => {
+            const frameType = String(probe.frameType || probe.frame_type || "").toLowerCase();
+            const context = `${probe.object || ""} ${probe.name || ""} ${probe.path || ""}`.toLowerCase();
+            return frameType.includes("dark")
+                && (/flatwizard/.test(context) || /dark[\s_-]*flat|flat[\s_-]*dark/.test(context));
+        });
+        if (recoveredDarkFlats.length) {
+            const recoveredPaths = new Set(recoveredDarkFlats.map(probe => probe.path));
+            classifiedFlats = classifiedFlats.filter(probe => !recoveredPaths.has(probe.path));
+            classifiedDarkFlats.push(...recoveredDarkFlats);
+        }
+        // Los escaneos se ACUMULAN: una sesión real suele vivir en varias
+        // carpetas (una por noche, o lights y calibración separadas), así que
+        // escanear la segunda no puede borrar la primera. Se deduplica por ruta
+        // para que reescanear la misma carpeta no duplique tomas.
+        const added = dsMergeScannedFiles({
+            lights: cl.lights || [],
+            darks: cl.darks || [],
+            flats: classifiedFlats,
+            darkFlats: classifiedDarkFlats,
+            bias: cl.bias || [],
+        });
+        // El ligado y los descartes se conservan: `dsRenderSessionOrganizer`
+        // poda por su cuenta lo que deje de existir. Sólo caducan los productos
+        // derivados del conjunto anterior de ficheros.
+        dsSilencedAlerts.clear();
+        dsFrameInspection = [];
+        dsInspectionFingerprint = "";
+        dsInspectionDiagnostics = null;
+        dsPreparedPlan = null;
+        const headerDetectedDarkFlats = classifiedDarkFlats.filter(probe =>
+            String(probe.frameType || probe.frame_type || "").toLowerCase().includes("dark")
+        ).length;
+        log("SUCCESS", `Auto-clasificación: +${added.total} nuevos · ${added.reclassified} reclasificados · ${added.duplicates} ya estaban · total ${dsFiles.lights.length} lights · ${dsFiles.darks.length} darks · ${dsFiles.flats.length} flats · ${dsFiles.darkFlats.length} dark-flats · ${dsFiles.bias.length} bias.`);
+        const report = document.getElementById("ds-auto-classify-report");
+        if (report) {
+            report.hidden = false;
+            report.innerHTML = `<svg class="zas-icon zas-icon-inline" aria-hidden="true"><use href="#icon-check"></use></svg>
+                <span><b>${tr("deepsky.scan_complete", "Clasificación automática completada")}</b> ·
+                ${trFormat("deepsky.scan_added", { count: added.total }, `${added.total} tomas añadidas`)}${added.duplicates
+                    ? ` · ${trFormat("deepsky.scan_duplicates", { count: added.duplicates }, `${added.duplicates} ya estaban`)}`
+                    : ""}${added.reclassified
+                    ? ` · ${trFormat("deepsky.scan_reclassified", { count: added.reclassified }, `${added.reclassified} reclasificadas por su cabecera FITS`)}`
+                    : ""}.<br>
+                <b>${tr("deepsky.scan_total", "Total acumulado")}:</b>
+                ${dsFiles.lights.length} lights · ${dsFiles.darks.length} darks · ${dsFiles.flats.length} flats ·
+                <b>${dsFiles.darkFlats.length} dark-flats</b> · ${dsFiles.bias.length} bias.
+                ${headerDetectedDarkFlats
+                    ? trFormat("deepsky.dark_flats_header_detected", { count: headerDetectedDarkFlats }, `${headerDetectedDarkFlats} identificados por IMAGETYP + contexto FlatWizard.`)
+                    : ""}
+                ${tr("deepsky.scan_accumulates", "Puedes escanear más carpetas: se suman a las anteriores. Usa ✕ en cada grupo para vaciarlo.")}
+                ${tr("deepsky.scan_signature_note", "Zenith validará después cada firma antes de usarla.")}</span>`;
+        }
         dsUpdateUI();
     } catch (e) {
         hideProcessing();
@@ -8897,24 +15489,156 @@ async function dsScanFolder() {
     }
 }
 
+// Fixture visual reproducible para auditoría responsive. Sólo existe en Vite
+// dev o en un build QA explícito; el build normal lo elimina y nunca sustituye
+// lecturas FITS ni respuestas del backend.
+const DS_UX_FIXTURE_BUILD = import.meta.env.VITE_UX_FIXTURE === "multiband";
+if (import.meta.env.DEV || DS_UX_FIXTURE_BUILD) {
+    // Hook de QA visual: permite abrir la ventana de progreso sin apilar.
+    window.__dsProgressDemo = () => { dsProgressStart(); dsProgressUpdate("Registro PSF + RANSAC", 42); };
+}
+
+function dsLoadUxFixtureIfRequested(modal) {
+    const requestedInDev = import.meta.env.DEV
+        && new URLSearchParams(window.location.search).get("ux-fixture") === "multiband";
+    if (!DS_UX_FIXTURE_BUILD && !requestedInDev) return;
+    const probe = (name, filter, exptime, temp = -8, session = null) => ({
+        path: `/ux-fixture/${name}.fits`, name: `${name}.fits`, ok: true,
+        w: 4144, h: 2822, ch: 1, bayer: "GRBG", filter, exptime,
+        gain: 160, binning: 1, temp, error: null,
+        date_obs: session ? `${session}T22:00:00Z` : null,
+        signature: { session },
+    });
+    dsFiles.lights = [
+        ...Array.from({ length: 53 }, (_, index) => probe(
+            `M42_SV220_Ha_OIII_${String(index + 1).padStart(3, "0")}`,
+            "SV220 Ha OIII",
+            600,
+            -8.1,
+            index < 27 ? "2026-03-01" : "2026-05-11",
+        )),
+        ...Array.from({ length: 72 }, (_, index) => probe(
+            `M42_SV220_SII_OIII_${String(index + 1).padStart(3, "0")}`,
+            "SV220 SII OIII",
+            600,
+            -8.0,
+            index < 36 ? "2026-03-02" : "2026-05-12",
+        )),
+    ];
+    dsFiles.darks = Array.from({ length: 20 }, (_, index) => probe(`Dark_600s_${index + 1}`, null, 600));
+    dsFiles.flats = [
+        ...Array.from({ length: 180 }, (_, index) => probe(`Flat_SV220_Ha_OIII_${index + 1}`, "SV220 Ha OIII", .5)),
+        ...Array.from({ length: 300 }, (_, index) => probe(`Flat_SV220_SII_OIII_${index + 1}`, "SV220 SII OIII", .5)),
+    ];
+    dsFiles.darkFlats = Array.from({ length: 30 }, (_, index) => probe(`DarkFlat_0.5s_${index + 1}`, null, .5));
+    dsFiles.bias = [];
+    dsRenderSections();
+    modal.style.display = "flex";
+    dsWizardStep = 1;
+    dsUpdateUI();
+    clearTimeout(dsPreflightTimer);
+    dsPreflightSerial += 1;
+    dsInspectionSerial += 1;
+    dsSyncWizard();
+    const groupPlan = (frames, seconds, tag) => ({
+        valid: true, groups: [{ frameCount: frames }], recommendedProfile: "maximum_quality",
+        effectiveEngine: "Hybrid CPU+GPU · Apple M5 (Metal)", effectiveRejection: "winsorized",
+        estimatedSeconds: seconds, warnings: [], errors: [],
+        sessionMap: [
+            { night: `2026-03-0${tag}`, lights: Math.ceil(frames / 2), exposureSeconds: 21000, flatNight: null, flatCount: 0, flatDistanceDays: 0, darks: "darks: 600s", filter: "HA_OIII", lightPaths: Array.from({ length: Math.ceil(frames / 2) }, (_, i) => `/ux-fixture/L${tag}a_${i}.fits`) },
+            { night: `2026-05-1${tag}`, lights: Math.floor(frames / 2), exposureSeconds: 19000, flatNight: null, flatCount: 0, flatDistanceDays: 0, darks: "darks: 600s", filter: "HA_OIII", lightPaths: Array.from({ length: Math.floor(frames / 2) }, (_, i) => `/ux-fixture/L${tag}b_${i}.fits`) },
+        ],
+        calibrationBatches: {
+            flats: [
+                { id: `flats:2026-03-0${tag} · HA_OIII`, label: `2026-03-0${tag} · HA_OIII · 90 flats`, count: 90, paths: Array.from({ length: 3 }, (_, i) => `/ux-fixture/F${tag}a_${i}.fits`) },
+                { id: `flats:2026-05-1${tag} · HA_OIII`, label: `2026-05-1${tag} · HA_OIII · 90 flats`, count: 90, paths: Array.from({ length: 3 }, (_, i) => `/ux-fixture/F${tag}b_${i}.fits`) },
+            ],
+            darks: [{ id: "darks:600 s", label: "600 s · 20 darks", count: 20, paths: Array.from({ length: 3 }, (_, i) => `/ux-fixture/D_${i}.fits`) }],
+        },
+    });
+    dsApplyPreparedPlan({
+        sessionId: "ux-session", valid: true, totalFrames: 125,
+        estimatedRamMb: 620, estimatedVramMb: 410, estimatedDiskMb: 11800, estimatedSeconds: 86,
+        componentFilters: ["HA", "OIII", "SII"],
+        warnings: [tr("deepsky.multiband_fixture_warning", "Multiband session: 2 coordinated integrations")],
+        errors: [],
+        groups: [
+            { id: "ha_oiii", label: "Ha + OIII · 53 lights", filterProfile: "HA_OIII", componentFilters: ["HA", "OIII"], plan: groupPlan(53, 38, 1) },
+            { id: "sii_oiii", label: "SII + OIII · 72 lights", filterProfile: "SII_OIII", componentFilters: ["SII", "OIII"], plan: groupPlan(72, 48, 2) },
+        ],
+    });
+    dsRenderFrameInspection([
+        { path: "/ux-fixture/M42_001.fits", name: "M42_SV220_Ha_OIII_001.fits", stars: 386, fwhm: 2.31, noise: 84, eccentricity: .41, score: .94, rejectable: false, recommendedReference: true },
+        { path: "/ux-fixture/M42_002.fits", name: "M42_SV220_SII_OIII_002.fits", stars: 352, fwhm: 2.57, noise: 91, eccentricity: .45, score: .89, rejectable: false, recommendedReference: false },
+        {
+            path: "/ux-fixture/M42_003.fits",
+            name: "M42_SV220_SII_OIII_003.fits",
+            stars: 128,
+            fwhm: 4.92,
+            noise: 166,
+            eccentricity: .72,
+            score: .34,
+            rejectable: true,
+            recommendedReference: false,
+            rejectionReason: tr(
+                "deepsky.fixture_rejection_reason",
+                "FWHM and eccentricity are outside the robust range",
+            ),
+        },
+    ]);
+}
+
 (function initDeepSky() {
     const modal = document.getElementById("deepsky-modal");
     const btnOpen = document.getElementById("btn-deepsky-mode");
     if (!modal || !btnOpen) return;
+    dsEnsureCaptureModeOptions();
 
     btnOpen.addEventListener("click", () => {
         dsRenderSections();
         if (typeof applyTranslations === "function") { try { applyTranslations(); } catch (_) { } }
         modal.style.display = "flex";
+        dsSetWizardStep(0, true);
         dsUpdateUI();
+        setTimeout(() => modal.querySelector('.ds-wizard-step[data-step="0"]')?.focus(), 0);
     });
-    document.getElementById("btn-deepsky-close")?.addEventListener("click", () => { modal.style.display = "none"; });
-    modal.addEventListener("click", (e) => { if (e.target === modal) modal.style.display = "none"; });
+    const closeWizard = () => {
+        modal.style.display = "none";
+        btnOpen.focus();
+        setAssistantJourney({
+            flow: "individual",
+            stage: postProcessSession.current() ? "postprocess" : currentFileMetadata ? "stack" : currentFilePath ? "analyze" : "empty",
+            workflowStep: postProcessSession.current() ? 2 : currentFileMetadata ? 1 : 0,
+            workflowTotal: 3,
+        });
+    };
+    document.getElementById("btn-deepsky-close")?.addEventListener("click", closeWizard);
+    modal.addEventListener("click", (e) => { if (e.target === modal) closeWizard(); });
+    document.getElementById("btn-deepsky-prev")?.addEventListener("click", () => dsSetWizardStep(dsWizardStep - 1));
+    document.getElementById("btn-deepsky-next")?.addEventListener("click", () => dsSetWizardStep(dsWizardStep + 1));
+    modal.querySelectorAll(".ds-wizard-step").forEach(btn => {
+        btn.addEventListener("click", () => dsSetWizardStep(Number(btn.dataset.step)));
+    });
+    modal.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") { e.preventDefault(); closeWizard(); }
+        if (e.altKey && e.key === "ArrowLeft") { e.preventDefault(); dsSetWizardStep(dsWizardStep - 1); }
+        if (e.altKey && e.key === "ArrowRight") { e.preventDefault(); dsSetWizardStep(dsWizardStep + 1); }
+        dsTrapDialogFocus(e, modal);
+    });
+    const progressDialog = document.getElementById("ds-progress");
+    progressDialog?.addEventListener("keydown", (e) => dsTrapDialogFocus(e, progressDialog));
     document.getElementById("ds-prog-cancel")?.addEventListener("click", async () => {
         try { await invoke("cancel_processing"); } catch (_) { }
         const c = document.getElementById("ds-prog-current"); if (c) c.textContent = tr("general.cancelling", "Cancelando...");
     });
     document.getElementById("ds-keywords")?.addEventListener("input", () => { dsSelectedGroup = null; dsUpdateUI(); });
+    document.getElementById("chk-ds-multiband-session")?.addEventListener("change", () => { dsUpdateMultibandControls(); dsSchedulePreflight(true); });
+    ["sel-ds-oiii-mix", "sel-ds-crosstalk", "sel-ds-session-palette"].forEach(id => {
+        document.getElementById(id)?.addEventListener("change", () => dsSchedulePreflight(true));
+    });
+    ["sel-ds-capture-mode", "sel-ds-calibration-policy", "sel-ds-manual-darks", "sel-ds-manual-flats"].forEach(id => {
+        document.getElementById(id)?.addEventListener("change", () => dsSchedulePreflight(true));
+    });
     document.getElementById("chk-ds-cosmetic")?.addEventListener("change", (e) => { e.target.dataset.touched = "1"; });
     // El control de gota (pixfrac) solo aplica con drizzle activo.
     const dsDrizzleSel = document.getElementById("sel-ds-drizzle");
@@ -8924,6 +15648,48 @@ async function dsScanFolder() {
     };
     dsDrizzleSel?.addEventListener("change", dsSyncPixfrac);
     dsSyncPixfrac();
+    // Los controles F4 de NebulaFusion (CFA directo y escala de salida) solo
+    // aplican con ese método: con "classic" se deshabilitan y atenúan (y
+    // dsBuildStackRequest tampoco los envía).
+    const dsMethodSel = document.getElementById("sel-ds-method");
+    const dsSyncNebulaFusionControls = () => {
+        const nfActive =
+            dsMethodSel?.value === "nebula_fusion" ||
+            dsMethodSel?.value === "nebula_fusion_full" ||
+            dsMethodSel?.value === "nebula_fusion_struct";
+        const eidrActive = dsMethodSel?.value === "eidr";
+        // CFA directo aplica a NF y a EIDR; super-binning solo a NF; la
+        // escala solo a EIDR.
+        [["chk-ds-cfadirect", "lbl-ds-cfadirect", nfActive || eidrActive],
+         ["sel-ds-outputbin", "lbl-ds-outputbin", nfActive],
+         ["sel-ds-eidrscale", "lbl-ds-eidrscale", eidrActive],
+         ["sel-ds-eidrmode", "lbl-ds-eidrmode", eidrActive],
+         ["chk-ds-eidrrefine", "lbl-ds-eidrrefine", eidrActive]].forEach(([inputId, labelId, active]) => {
+            const input = document.getElementById(inputId);
+            if (input) input.disabled = !active;
+            const label = document.getElementById(labelId);
+            if (label) label.style.opacity = active ? "1" : "0.5";
+        });
+    };
+    dsMethodSel?.addEventListener("change", dsSyncNebulaFusionControls);
+    dsSyncNebulaFusionControls();
+
+    // Presets: cada botón fija todos los controles; "Personalizado" no toca nada.
+    document.querySelectorAll("#deepsky-modal .ds-preset").forEach(btn => {
+        btn.addEventListener("click", () => dsApplyPreset(btn.dataset.preset));
+    });
+    // Cambiar cualquier control manualmente pasa el preset a "Personalizado" y
+    // refresca el diagrama/tiempo estimado.
+    // sel-ds-method (NebulaFusion) también refresca el plan: el preflight es quien
+    // avisa de incompatibilidades (drizzle, GPU only, metadata). Los presets no lo tocan.
+    ["sel-ds-interp", "sel-ds-drizzle", "sel-ds-pixfrac", "sel-ds-rejection", "sel-ds-method", "chk-ds-cfadirect",
+        "sel-ds-outputbin", "num-ds-kappa-low",
+        "num-ds-kappa-high", "sel-ds-clipiters", "sel-ds-normalization", "sel-ds-pedestal",
+        "sel-ds-compute", "chk-ds-autocrop", "chk-ds-cosmetic", "chk-ds-darkopt", "chk-ds-gradient",
+        "sel-ds-eidrscale", "sel-ds-eidrmode", "chk-ds-eidrrefine", "chk-ds-localw"].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener("change", dsMarkCustomPreset);
+        });
 
     document.getElementById("btn-deepsky-run")?.addEventListener("click", async () => {
         const lights = dsActiveLights();
@@ -8931,45 +15697,62 @@ async function dsScanFolder() {
             log("WARN", tr("deepsky.need_lights", "Selecciona al menos 1 light."));
             return;
         }
+        await dsInspectFrames();
+        const plan = await dsPreparePlan();
+        if (!plan?.valid) {
+            dsSetWizardStep(1, true);
+            showCustomAlert(tr("general.error", "Error"), (plan?.errors || ["El plan contiene incompatibilidades."]).join("\n"));
+            return;
+        }
+        // El request se construye DESPUÉS de validar: el plan mostrado y lo
+        // ejecutado salen del MISMO estado del formulario (auditoría 2026-07-20).
+        const multiband = dsIsMultibandSession();
+        const request = multiband ? dsBuildSessionRequest() : dsBuildStackRequest();
         modal.style.display = "none";
-        dsResultBasePath = lights[0]?.path || null; // carpeta destino de exportación
+        dsResultBasePath = localStorage.getItem("zas_ds_workdir") || lights[0]?.path || null; // carpeta destino de exportación
+        dsSessionProgressTotal = multiband ? Math.max(1, request.groups.length) : 1;
+        dsSessionProgressIndex = 1;
         dsProgressStart(); // ventana WBPP dedicada (no la pantalla genérica)
         try {
-            const b64 = await invoke("stack_deepsky", {
-                lights: lights.map(f => f.path),
-                darks: dsMatchedCalib("darks").map(f => f.path),
-                flats: dsMatchedCalib("flats").map(f => f.path),
-                bias: dsMatchedCalib("bias").map(f => f.path),
-                kappa: parseFloat(document.getElementById("num-ds-kappa")?.value) || 3.0,
-                sigmaClip: document.getElementById("chk-ds-sigma")?.checked ?? true,
-                cosmetic: document.getElementById("chk-ds-cosmetic")?.checked ?? null,
-                gradient: document.getElementById("chk-ds-gradient")?.checked ?? false,
-                drizzle: parseFloat(document.getElementById("sel-ds-drizzle")?.value) || 1.0,
-                optimizeDark: document.getElementById("chk-ds-darkopt")?.checked ?? null,
-                pixfrac: parseFloat(document.getElementById("sel-ds-pixfrac")?.value) || 0.8,
-                localNorm: document.getElementById("chk-ds-localnorm")?.checked ?? false,
-                autoCrop: document.getElementById("chk-ds-autocrop")?.checked ?? true
-            });
+            const result = await invoke(multiband ? "run_deepsky_session" : "run_deepsky_stack", { request });
             dsProgressStop();
             // FLUJO DEDICADO DE CIELO PROFUNDO: solo la imagen final (sin vista
             // fuente ni el post-procesado planetario de wavelets).
             dsEnterResultMode();
             if (ui.imgResult) {
-                await setImageAndWait(ui.imgResult, b64, false);
+                await setImageAndWait(ui.imgResult, result.previewPath, false);
                 fitToScreen();
             }
             dsShowStretchBar();
-            log("SUCCESS", tr("deepsky.done", "Cielo Profundo apilado. Usa la barra inferior para ajustar el estirado (los datos quedan lineales)."));
+            if (multiband) {
+                dsRenderSessionResult(result);
+                // Vistas conmutables de la sesión: cada integración (Ha+OIII /
+                // SII+OIII) y cada componente extraído quedan en el selector.
+                dsPopulateSessionViews(result);
+                log("SUCCESS", `Sesión multibanda terminada: ${result.groups.length} masters · ${result.framesUsed} lights usadas · ${result.elapsedSeconds.toFixed(1)} s\nResultados: ${result.outputDir}`);
+            } else {
+                log("SUCCESS", `${tr("deepsky.done", "Cielo Profundo apilado. Usa la barra inferior para ajustar el estirado (los datos quedan lineales).")}
+Motor: ${result.engine} · ${result.framesUsed} usadas · ${result.framesRejected} rechazadas · ${result.elapsedSeconds.toFixed(1)} s${result.recipePath ? `\nReceta: ${result.recipePath}` : ""}`);
+            }
         } catch (e) {
             dsProgressStop();
             if (isCancellationError(e)) {
                 log("WARN", tr("general.cancelled", "Operación cancelada."));
+                modal.style.display = "flex";
+                dsSetWizardStep(3, true);
+                requestAnimationFrame(() => document.getElementById("btn-deepsky-run")?.focus());
             } else {
                 log("ERROR", `Cielo Profundo: ${e}`);
                 showCustomAlert(tr("general.error", "Error"), String(e));
+                modal.style.display = "flex";
+                dsSetWizardStep(3, true);
             }
         }
     });
+    // The fixture contains dynamically generated text, so wait for the locale
+    // before rendering it. This prevents mixed-language QA states without
+    // changing the normal production path.
+    void i18nReady.finally(() => dsLoadUxFixtureIfRequested(modal));
 })();
 
 // ============ COMBINAR CANALES (LRGB / SHO / HOO) ============
@@ -9014,6 +15797,7 @@ function dsRenderCombineSlots() {
         const pick = document.createElement("button");
         pick.type = "button";
         pick.textContent = tr("deepsky.slot_pick", "Elegir");
+        pick.setAttribute("aria-label", `${pick.textContent}: ${slot.label()}`);
         pick.style.cssText = "flex:0 0 auto; width:auto; padding:6px 12px; border-radius:8px; font-size:0.7rem; cursor:pointer; border:1px solid #7c3aed; background:rgba(124,58,237,0.2); color:#ddd6fe;";
         pick.addEventListener("click", async () => {
             const f = await openDialog({ multiple: false, title: slot.label(), filters: [{ name: "Imagen", extensions: ["fit", "fits", "tif", "tiff", "png", "jpg", "jpeg"] }] });
@@ -9023,6 +15807,7 @@ function dsRenderCombineSlots() {
         if (path) {
             const clr = document.createElement("button");
             clr.type = "button"; clr.textContent = "✕";
+            clr.setAttribute("aria-label", `${tr("deepsky.clear", "Limpiar")}: ${slot.label()}`);
             clr.style.cssText = "flex:0 0 auto; width:auto; padding:6px 8px; border-radius:8px; border:none; background:none; color:#64748b; cursor:pointer;";
             clr.addEventListener("click", () => { dsCombineFiles[slot.key] = null; dsRenderCombineSlots(); });
             row.appendChild(clr);
@@ -9035,14 +15820,26 @@ function dsRenderCombineSlots() {
     const modal = document.getElementById("ds-combine-modal");
     const btnOpen = document.getElementById("btn-deepsky-combine-open");
     if (!modal || !btnOpen) return;
+    const wizard = document.getElementById("deepsky-modal");
+    const closeCombine = () => {
+        modal.style.display = "none";
+        if (wizard) wizard.style.display = "flex";
+        dsSyncWizard();
+        requestAnimationFrame(() => btnOpen.focus());
+    };
     btnOpen.addEventListener("click", () => {
-        document.getElementById("deepsky-modal").style.display = "none";
+        if (wizard) wizard.style.display = "none";
         dsRenderCombineSlots();
         if (typeof applyTranslations === "function") { try { applyTranslations(); } catch (_) { } }
         modal.style.display = "flex";
+        requestAnimationFrame(() => document.getElementById("ds-combine-close")?.focus());
     });
-    document.getElementById("ds-combine-close")?.addEventListener("click", () => { modal.style.display = "none"; });
-    modal.addEventListener("click", (e) => { if (e.target === modal) modal.style.display = "none"; });
+    document.getElementById("ds-combine-close")?.addEventListener("click", closeCombine);
+    modal.addEventListener("click", (e) => { if (e.target === modal) closeCombine(); });
+    modal.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") { e.preventDefault(); closeCombine(); return; }
+        dsTrapDialogFocus(e, modal);
+    });
     document.getElementById("ds-combine-preset")?.addEventListener("change", () => dsRenderCombineSlots());
 
     document.getElementById("ds-combine-run")?.addEventListener("click", async () => {
@@ -9100,6 +15897,20 @@ if (btnCancelProcess) {
 
             // Invoke Backend Command
             await invoke("cancel_processing");
+
+            // RECUPERACIÓN: si tras 10 s el overlay sigue visible (backend
+            // ocupado terminando un lote/espera GPU), re-armar el botón para
+            // que el usuario pueda reintentar en vez de quedarse sin salida.
+            setTimeout(() => {
+                const overlay = $("#processing-overlay");
+                if (overlay && overlay.style.display !== "none") {
+                    isCancellationRequested = false;
+                    btnCancelProcess.disabled = false;
+                    btnCancelProcess.style.opacity = "";
+                    btnCancelProcess.style.cursor = "";
+                    if (detEl) detEl.textContent = "El backend sigue deteniéndose... puedes reintentar.";
+                }
+            }, 10000);
 
         } catch (e) {
             console.error("Error sending cancel command:", e);
@@ -9547,17 +16358,26 @@ is commented out in index.html and this handler remains commented for reference.
 
     const profileCard = (preflight, profile, title, tag, desc, toneClass) => {
         const estimate = estimateForProfile(preflight, profile);
+        const isSupported = estimate.supported !== false;
         const isRecommended = Boolean(estimate.recommended);
         const bitDepth = estimate.bit_depth || "-";
-        const colorMode = estimate.is_color ? "RGB" : "Mono";
+        const colorMode = estimate.color_label || (estimate.is_color ? "RGB" : "Mono");
         const size = formatBytes(estimate.estimated_size_bytes);
         const perFrame = formatBytes(estimate.bytes_per_frame);
-        const badge = isRecommended
+        const badge = !isSupported
+            ? `<span class="ser-profile-badge">${tr("converter.unsupported_badge", "No compatible")}</span>`
+            : isRecommended
             ? `<span class="ser-profile-badge">${tr("converter.recommended_badge", "Recomendado")}</span>`
             : "";
+        const reason = !isSupported && estimate.reason
+            ? `<span class="ser-profile-desc" style="color:#fbbf24;">${escapeHtml(estimate.reason)}</span>`
+            : "";
+        const action = isSupported
+            ? `data-modal-result="${profile}"`
+            : `disabled aria-disabled="true" style="opacity:.52; cursor:not-allowed;"`;
 
         return `
-            <button class="ser-profile-card ${toneClass}" data-modal-result="${profile}">
+            <button class="ser-profile-card ${toneClass}" ${action}>
                 <span class="ser-profile-card-top">
                     <span>
                         <strong>${title}</strong>
@@ -9566,6 +16386,7 @@ is commented out in index.html and this handler remains commented for reference.
                     ${badge}
                 </span>
                 <span class="ser-profile-desc">${desc}</span>
+                ${reason}
                 <span class="ser-profile-metrics">
                     <span><b>${tr("converter.estimate_label", "SER estimado")}</b>${size}</span>
                     <span><b>${tr("converter.report_depth", "Profundidad")}</b>${colorMode} ${bitDepth}-bit</span>
@@ -9576,7 +16397,7 @@ is commented out in index.html and this handler remains commented for reference.
     };
 
     async function chooseSerConversionProfile(preflight) {
-        const sourceType = preflight?.source_is_color ? "Color" : "Mono";
+        const sourceType = preflight?.source_color_pattern || (preflight?.source_is_color ? "Color" : "Mono");
         const html = `
             <div class="ser-converter-modal">
                 <div class="ser-converter-layout">
@@ -9607,6 +16428,7 @@ is commented out in index.html and this handler remains commented for reference.
                             ${tr("converter.profile_intro", "Elige cómo crear el SER de trabajo. Para MP4/MOV el video se decodifica a frames útiles para apilado; no se aplica sharpening ni filtros destructivos.")}
                         </p>
                         <p class="ser-profile-note">${tr("converter.size_note", "SER no usa compresión: por eso el tamaño final puede ser mucho mayor que el video original.")}</p>
+                        <p class="ser-profile-note">${escapeHtml(preflight?.conversion_policy || "")}</p>
                     </div>
                     <div class="ser-profile-grid">
                         ${profileCard(
@@ -9690,7 +16512,6 @@ is commented out in index.html and this handler remains commented for reference.
             cancelBtn = document.getElementById("btn-cancel-process");
             if (cancelBtn) {
                 previousCancelDisplay = cancelBtn.style.display;
-                cancelBtn.style.display = "none";
             }
 
             // Setup Progress Listener
@@ -9802,9 +16623,13 @@ is commented out in index.html and this handler remains commented for reference.
 
         } catch (e) {
             const errStr = typeof e === 'string' ? e : JSON.stringify(e);
-            log("ERROR", "Convert: " + errStr);
-            console.error(e);
-            showCustomAlert(tr("converter.error_title", "Error de conversión"), errStr);
+            if (isCancellationError(errStr)) {
+                log("WARN", tr("converter.cancelled", "Conversión SER cancelada; no se publicó ningún archivo parcial."));
+            } else {
+                log("ERROR", "Convert: " + errStr);
+                console.error(e);
+                showCustomAlert(tr("converter.error_title", "Error de conversión"), errStr);
+            }
         } finally {
             if (unlisten) unlisten();
             hideProcessing();
@@ -10424,3 +17249,12 @@ window._clearStackingRoi = function () {
         });
     }
 })();
+
+// Senal de vida para la red de seguridad de index.html. Va al FINAL a
+// proposito: significa "el modulo se evaluo ENTERO", que es la unica garantia
+// de que la secuencia de arranque quedo registrada y los manejadores enlazados.
+// Puesta al principio mentia — un ReferenceError a media evaluacion (TDZ)
+// dejaba la bandera en true, la red daba el arranque por bueno y destapaba una
+// interfaz completa donde ningun boton respondia. Aqui, si el modulo muere a
+// medias, la bandera se queda en false y sale el panel de fallo con la pila.
+window.__zasBootOk = true;

@@ -13,7 +13,8 @@ export class I18nManager {
     }
 
     normalizeLang(lang) {
-        return lang === 'en' ? 'en' : 'es';
+        const normalized = String(lang || '').toLowerCase().split('-')[0];
+        return ['es', 'en', 'it', 'fr'].includes(normalized) ? normalized : 'es';
     }
 
     async init() {
@@ -47,17 +48,34 @@ export class I18nManager {
             // Note: In Vite, dynamic imports with variables can be tricky. 
             // We use a switch or explicit map for known languages to be safe and robust.
             let data;
-            if (lang === 'en') {
-                data = await import('./locales/en.json');
-            } else {
-                data = await import('./locales/es.json'); // Default to es for 'es' or others
-            }
+            if (lang === 'en') data = await import('./locales/en.json');
+            else if (lang === 'it') data = await import('./locales/it.json');
+            else if (lang === 'fr') data = await import('./locales/fr.json');
+            else data = await import('./locales/es.json');
 
-            this.translations[lang] = data.default || data;
+            const loaded = data.default || data;
+            if (lang === 'it' || lang === 'fr') {
+                const englishModule = await import('./locales/en.json');
+                const english = englishModule.default || englishModule;
+                this.translations[lang] = this.mergeTranslations(english, loaded);
+            } else {
+                this.translations[lang] = loaded;
+            }
         } catch (e) {
             console.error(`Failed to load language: ${lang}`, e);
             throw e;
         }
+    }
+
+    mergeTranslations(base, overlay) {
+        if (!base || typeof base !== 'object' || Array.isArray(base)) return overlay;
+        const output = { ...base };
+        Object.entries(overlay || {}).forEach(([key, value]) => {
+            output[key] = value && typeof value === 'object' && !Array.isArray(value)
+                ? this.mergeTranslations(base[key] || {}, value)
+                : value;
+        });
+        return output;
     }
 
     async setLanguage(lang) {
@@ -130,6 +148,24 @@ export class I18nManager {
             const translation = this.t(key);
             if (translation) {
                 el.setAttribute('title', translation);
+            }
+        });
+
+        const ariaElements = document.querySelectorAll('[data-i18n-aria-label]');
+        ariaElements.forEach(el => {
+            const key = el.getAttribute('data-i18n-aria-label');
+            const translation = this.t(key);
+            if (translation && translation !== key) {
+                el.setAttribute('aria-label', translation);
+            }
+        });
+
+        const placeholderElements = document.querySelectorAll('[data-i18n-placeholder]');
+        placeholderElements.forEach(el => {
+            const key = el.getAttribute('data-i18n-placeholder');
+            const translation = this.t(key);
+            if (translation && translation !== key) {
+                el.setAttribute('placeholder', translation);
             }
         });
 

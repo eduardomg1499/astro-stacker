@@ -1,6 +1,6 @@
 [package]
 name = "astro-stacker"
-version = "0.2.8"
+version = "0.3.0"
 description = "ZenithAstroCode"
 authors = ["ZenithAstroCode-by-EduardoMG"]
 edition = "2021"
@@ -10,23 +10,42 @@ default-run = "astro-stacker"
 name = "astro_stacker_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Compila el simulador de verdad conocida (deepsky_sim) fuera de los tests,
+# p.ej. para generar datasets sintéticos de benchmark desde un binario.
+deepsky-sim = []
+# Ídem para el simulador planetario (planetary_sim, arnés A/B F0).
+planetary-sim = []
+# Bypass de licencia SOLO para builds locales de desarrollo/benchmark:
+# ademas de compilar con esta feature hay que exportar ZAS_DEV_LICENSE=1.
+# Los binarios distribuidos NO llevan esta feature (el codigo ni se compila).
+dev-license = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2.0.0", features = [] }
+# protocol-asset: sirve archivos locales al WebView via convertFileSrc().
+# Sin esta feature, los previews nativos del mosaico (file_path:) y el
+# reproductor de animacion desde rutas estaban ROTOS, y los resultados de
+# apilado tenian que viajar como base64 por IPC (pico de RAM del WebView).
+tauri = { version = "2.0.0", features = ["macos-private-api", "protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2.9.0"
 tauri-plugin-shell = "2"
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rayon = "1.10"
+# FFT CPU para NF-Full (coadición GLS por frecuencia, tiles con overlap-add).
+rustfft = "6"
 libc = "0.2"
 memmap2 = "0.9"
 byteorder = "1.5"
 image = "0.23.14"
+tiff = "0.6.1"
 base64 = "0.22"
 bincode = "1.3.3"
 sysinfo = "0.30"
@@ -44,8 +63,15 @@ rand = "0.8"
 akaze = { git = "https://github.com/rust-cv/akaze" }
 num_cpus = "1.16.0"
 crossbeam-channel = "0.5"
+crc32fast = "1.4"
 fitrs = "0.5.0"
 lz4_flex = "0.11.1"
+# GPU COMPUTE (etapa de acumulacion del apilado): wgpu = Metal en macOS,
+# DX12/Vulkan/GL en Windows. La ruta CPU queda intacta como referencia y
+# fallback total; ver src/gpu_stack.rs.
+wgpu = "23"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

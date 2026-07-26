@@ -1,0 +1,358 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+const [main, html, en, es, fr, it, abSchema, deepskyRust] = await Promise.all([
+    readFile(new URL("../src/main.js", import.meta.url), "utf8"),
+    readFile(new URL("../index.html", import.meta.url), "utf8"),
+    readFile(new URL("../src/locales/en.json", import.meta.url), "utf8").then(JSON.parse),
+    readFile(new URL("../src/locales/es.json", import.meta.url), "utf8").then(JSON.parse),
+    readFile(new URL("../src/locales/fr.json", import.meta.url), "utf8").then(JSON.parse),
+    readFile(new URL("../src/locales/it.json", import.meta.url), "utf8").then(JSON.parse),
+    readFile(new URL("../benchmarks/deepsky-ab-run.schema.json", import.meta.url), "utf8").then(JSON.parse),
+    readFile(new URL("../src-tauri/src/deepsky.rs", import.meta.url), "utf8"),
+]);
+
+const requestBuilder = main.match(
+    /function dsBuildStackRequest\([\s\S]*?\n}\n\nfunction dsIsMultibandSession/,
+)?.[0];
+const picker = main.match(
+    /async function dsPick\(kind\)[\s\S]*?\n}\n\n\/\/ Carpeta recursiva/,
+)?.[0];
+const captureModeOptions = main.match(
+    /function dsEnsureCaptureModeOptions\(\)[\s\S]*?\n}\n\nfunction dsBuildStackRequest/,
+)?.[0];
+
+test("deep-sky v4 request carries dark-flats and strict capture defaults", () => {
+    assert.ok(requestBuilder, "dsBuildStackRequest must remain identifiable");
+    assert.match(requestBuilder, /schemaVersion:\s*DEEP_SKY_STACK_REQUEST_SCHEMA_VERSION/);
+    assert.match(requestBuilder, /scientificProducts:\s*true/);
+    assert.match(requestBuilder, /darkFlats:\s*dsCalibrationForIntegration\("darkFlats"/);
+    assert.match(requestBuilder, /captureMode:\s*value\("sel-ds-capture-mode",\s*"auto"\)/);
+    assert.match(requestBuilder, /calibrationPolicy:\s*value\("sel-ds-calibration-policy",\s*"strict"\)/);
+});
+
+test("science picker exposes only linear FITS and TIFF inputs", () => {
+    assert.ok(picker, "dsPick must remain identifiable");
+    assert.match(picker, /"fits",\s*"fit",\s*"fts",\s*"tif",\s*"tiff"/);
+    assert.doesNotMatch(picker, /"png"|"jpg"|"jpeg"/);
+});
+
+test("session folders are actions with a hierarchy separate from frame groups", () => {
+    assert.match(html, /id="ds-session-actions" class="ds-session-actions"/);
+    assert.match(html, /class="ds-frame-groups-head"/);
+    assert.match(main, /id = "btn-ds-scan-folder"/);
+    assert.match(main, /className = "ds-session-action ds-session-action-import"/);
+    assert.match(main, /id = "btn-ds-work-folder"/);
+    assert.match(main, /className = "ds-session-action ds-session-action-output"/);
+    for (const locale of [en, es, fr, it]) {
+        assert.ok(locale.deepsky.session_folders_aria);
+        assert.ok(locale.deepsky.source_action);
+        assert.ok(locale.deepsky.destination_action);
+        assert.ok(locale.deepsky.frame_groups_title);
+        assert.ok(locale.deepsky.frame_groups_hint);
+    }
+});
+
+test("N.I.N.A. FlatWizard dark-flats use FITS evidence before generic filenames", () => {
+    assert.match(deepskyRust, /IMAGETYP/);
+    assert.match(deepskyRust, /OBJECT/);
+    assert.match(deepskyRust, /flat_wizard/);
+    assert.match(deepskyRust, /ds_classify_probe\(&pr\)/);
+    assert.match(deepskyRust, /fn ds_calibration_role_from_object/);
+    assert.match(
+        deepskyRust,
+        /Some\("LIGHT"\),\s*Some\("DARK 600SEG"\)/,
+        "a contradictory LIGHT header needs matching OBJECT and path evidence",
+    );
+    assert.match(main, /frameType \|\| probe\.frame_type/);
+    // Los dark-flats recuperados por evidencia FITS entran en SU categoría al
+    // fusionar el escaneo (antes se asignaba directamente a `dsFiles`).
+    assert.match(main, /darkFlats: classifiedDarkFlats,/);
+    assert.match(main, /flats: classifiedFlats,/);
+    assert.match(html, /id="ds-auto-classify-report"/);
+});
+
+test("wizard states, guide dock, recipe impact and compact review stay visible", () => {
+    assert.match(html, /class="ds-step-state"/);
+    assert.match(main, /function dsWizardStepState\(step\)/);
+    assert.match(html, /id="ds-guide-dock" class="ds-guide-dock"/);
+    assert.match(main, /getElementById\("ds-guide-dock"\)/);
+    assert.doesNotMatch(html, /#ds-guide \{ position:absolute/);
+    assert.match(html, /id="ds-recipe-impact"/);
+    assert.match(main, /function dsRenderRecipeImpact\(plan\)/);
+    assert.match(main, /function dsFormatReviewPlan\(plan\)/);
+    assert.match(main, /class="ds-review-technical"/);
+    for (const locale of [en, es, fr, it]) {
+        assert.ok(locale.deepsky.state_pending);
+        assert.ok(locale.deepsky.recipe_impact_title);
+        assert.ok(locale.deepsky.review_technical);
+    }
+});
+
+test("folder and clear actions meet the centered touch-target contract", () => {
+    assert.match(main, /className = "ds-kind-action"/);
+    assert.match(html, /\.ds-kind-action \{[\s\S]*?width:42px; height:42px/);
+    assert.match(html, /\.ds-session-action-icon \.zas-icon \{[\s\S]*?margin:0 !important/);
+});
+
+test("deep-sky UI makes safe defaults and experimental engines explicit", () => {
+    assert.match(html, /id="sel-ds-capture-mode"[\s\S]*?<option value="auto" selected/);
+    assert.match(html, /id="sel-ds-calibration-policy"[\s\S]*?<option value="strict" selected/);
+    assert.match(html, /option disabled data-i18n="deepsky\.method_experimental_group"/);
+    assert.match(html, /option value="classic" selected/);
+    assert.doesNotMatch(
+        html,
+        /<option[^>]+value="linearfit"/,
+        "the rank-based approximation must not be offered as linear-fit clipping",
+    );
+    assert.match(html, /SCI, VAR, NEFF y DQ permanecen intactos y lineales/);
+});
+
+test("deep-sky UI exposes the localized broadband-mono capture contract", () => {
+    assert.ok(captureModeOptions, "capture-mode extension must remain identifiable");
+    assert.match(captureModeOptions, /option\.value\s*=\s*"broadbandMono"/);
+    assert.match(captureModeOptions, /deepsky\.capture_broadband_mono/);
+    assert.match(main, /dsEnsureCaptureModeOptions\(\);/);
+    assert.equal(en.deepsky.capture_broadband_mono, "Broadband mono");
+    assert.equal(es.deepsky.capture_broadband_mono, "Banda ancha mono");
+    assert.ok(abSchema.properties.captureClass.enum.includes("broadbandMono"));
+});
+
+test("both locales describe the fifth calibration category and policies", () => {
+    for (const locale of [en, es]) {
+        assert.ok(locale.deepsky.pick_dark_flats);
+        assert.ok(locale.deepsky.capture_mode);
+        assert.ok(locale.deepsky.capture_broadband_mono);
+        assert.ok(locale.deepsky.calibration_strict);
+        assert.match(locale.deepsky.method_nebula_fusion, /experimental/i);
+        assert.match(locale.deepsky.gradient, /SCI/i);
+    }
+});
+
+test("preflight renders typed per-light calibration decisions", () => {
+    assert.match(main, /function dsFormatCalibrationDecisions\(decisions\)/);
+    assert.match(main, /dsFormatCalibrationDecisions\(plan\.calibrationDecisions\)/);
+    assert.match(main, /decision\.darkFlatMasterPath/);
+    assert.match(main, /decision\.darkScale/);
+    assert.doesNotMatch(main, /warning\.startsWith\("CALIBRATION_DECISIONS="\)/);
+});
+
+test("preliminary calibration cards never claim scientific compatibility", () => {
+    assert.match(main, /function dsExactExposureMatch\(a, b\)/);
+    assert.match(main, /Math\.max\(0\.001,[\s\S]*?1e-6\)/);
+    assert.match(main, /status === "candidate"/);
+    assert.match(main, /la matriz tipada del backend es la autoridad/);
+    assert.doesNotMatch(main, /BIAS: universal/);
+    assert.doesNotMatch(main, /se escalarán automáticamente/);
+    assert.match(es.deepsky.plan_scale_note, /No se aceptarán ni escalarán/);
+    assert.match(en.deepsky.plan_scale_note, /will not be accepted or scaled/);
+});
+
+test("master quality UI exposes detector-pattern diagnostics", () => {
+    assert.match(main, /const pattern = s\.detectorPattern/);
+    assert.match(main, /pattern\.bandingSigma\.toFixed\(2\)/);
+    assert.ok(es.deepsky.q_banding_detected);
+    assert.ok(en.deepsky.q_banding_clear);
+});
+
+test("inspection consumes the typed report with dither prediction and pattern", () => {
+    assert.match(main, /invoke\("inspect_deepsky_frames"/);
+    assert.match(main, /report\?\.frames/);
+    assert.match(main, /dither:\s*report\?\.dither/);
+    assert.match(main, /detectorPattern:\s*report\?\.detectorPattern/);
+    assert.match(main, /function dsFormatInspectionDiagnostics\(\)/);
+    assert.match(main, /dither\.walkingNoiseRisk/);
+    for (const locale of [en, es]) {
+        assert.ok(locale.deepsky.dither_risk);
+        assert.ok(locale.deepsky.dither_ok);
+        assert.ok(locale.deepsky.dither_prediction_note);
+        assert.ok(locale.deepsky.pattern_detected);
+        assert.ok(locale.deepsky.pattern_ok);
+    }
+});
+
+test("experimental engines are gated by scientific eligibility", () => {
+    assert.match(main, /function dsCollectEligibility\(plan\)/);
+    assert.match(main, /scientificEligibilityReasons/);
+    assert.match(main, /ds-method-eligibility/);
+    assert.match(
+        main,
+        /\["nebula_fusion", "nebula_fusion_full", "nebula_fusion_struct", "eidr"\]/,
+    );
+    assert.match(main, /option\.disabled = !scientificEligible/);
+    for (const locale of [en, es]) {
+        assert.ok(locale.deepsky.method_blocked_nonlinear);
+    }
+});
+
+test("balanced preset mirrors the backend resolved profile (winsorized)", () => {
+    assert.match(
+        main,
+        /balanced:\s*\{[^}]*rejection:\s*"winsorized"/,
+        "DS_PRESETS.balanced must match PipelineProfile::Balanced (winsorized)",
+    );
+    assert.match(
+        html,
+        /<b data-i18n="deepsky\.preset_balanced">Equilibrado<\/b>\s*<span data-i18n="deepsky\.profile_balanced_note">[^<]*Winsorized/,
+    );
+    assert.match(en.deepsky.profile_balanced_note, /Winsorized/);
+    assert.match(es.deepsky.profile_balanced_note, /Winsorized/);
+});
+
+test("session results render the typed scientific bundle manifest", () => {
+    assert.match(main, /group\.scientificBundle/);
+    assert.match(main, /bundle\.products/);
+    assert.match(main, /product\.bunit/);
+    assert.match(main, /bundle\.fallbacks/);
+    for (const locale of [en, es]) {
+        assert.ok(locale.deepsky.bundle_title);
+        assert.ok(locale.deepsky.product_derived);
+        assert.ok(locale.deepsky.product_linear);
+    }
+});
+
+test("AUTO preset is the default and its resolved recipe is displayed", () => {
+    assert.match(
+        html,
+        /<button type="button" class="ds-preset active" data-preset="auto" data-i18n="deepsky\.preset_auto">Auto<\/button>/,
+        "Auto must be the first, active preset",
+    );
+    assert.doesNotMatch(
+        html,
+        /class="ds-preset active" data-preset="balanced"/,
+        "balanced must no longer be the default preset",
+    );
+    assert.match(main, /let dsActivePreset = "auto";/);
+    assert.match(main, /auto: "auto", fast: "fast", balanced: "balanced", max: "maximum_quality"/);
+    assert.match(main, /plan\.resolvedRecipe/);
+    assert.match(main, /deepsky\.resolved_recipe_title/);
+    for (const locale of [en, es]) {
+        assert.ok(locale.deepsky.preset_auto);
+        assert.ok(locale.deepsky.profile_auto_note);
+        assert.ok(locale.deepsky.resolved_recipe_title);
+        assert.ok(locale.deepsky.resolved_signals);
+    }
+});
+
+test("session request excludes manual discards and drops emptied groups", () => {
+    assert.match(main, /files: group\.files\.filter\(f => !dsDiscardedPaths\.has\(f\.path\)\)/);
+    assert.match(main, /\.filter\(group => group\.files\.length > 0\)/);
+});
+
+test("manual calibration assignment is wired end to end", () => {
+    assert.ok(requestBuilder, "dsBuildStackRequest must remain identifiable");
+    assert.match(requestBuilder, /calibrationOverrides:\s*dsBuildCalibrationOverrides\(/);
+    assert.match(main, /sel-ds-manual-darks/);
+    assert.match(main, /sel-ds-manual-flats/);
+    assert.match(html, /id="sel-ds-manual-darks"[\s\S]*?<option value="auto" selected/);
+    assert.match(html, /id="sel-ds-manual-flats"[\s\S]*?<option value="auto" selected/);
+    assert.match(main, /decision\.manual/);
+    for (const locale of [en, es]) {
+        assert.ok(locale.deepsky.manual_darks_label);
+        assert.ok(locale.deepsky.manual_flats_label);
+        assert.ok(locale.deepsky.manual_hint);
+        assert.ok(locale.deepsky.decision_manual);
+    }
+});
+
+// El ligado manual pasó de una fila por NOCHE (en un desplegable del paso de
+// inspección) a una fila por GRUPO —noche × filtro × exposición— en la tabla de
+// calibración del paso de datos: una noche con Ha y OIII ya no comparte una
+// única elección de flats.
+test("manual calibration linking works per light group with skippable batches", () => {
+    assert.match(main, /function dsCalibrationRows\(lights\)/);
+    assert.match(main, /function dsCalibrationBlocks\(kind\)/);
+    assert.match(main, /`\$\{night\}\|\$\{filter\}\|\$\{expKey\}`/);
+    assert.match(main, /data-ds-link/);
+    assert.match(main, /data-ds-batch/);
+    assert.match(main, /skipFlats/);
+    assert.match(main, /skipDarks/);
+    assert.match(main, /function dsBuildCalibrationOverrides\(/);
+    // Las rutas del override se resuelven contra los bloques vigentes, no contra
+    // un índice del último plan preparado.
+    assert.match(main, /dsCalibrationBlocks\(kind\)\.map\(block => \[block\.id, block\]\)/);
+    for (const locale of [en, es]) {
+        assert.ok(locale.deepsky.linker_auto);
+        assert.ok(locale.deepsky.linker_skip_flats);
+        assert.ok(locale.deepsky.wbpp_hint);
+        assert.ok(locale.deepsky.blocks_compatible);
+    }
+});
+
+test("frame viewer overlays the deep-sky modal", () => {
+    const viewer = main.match(/ds-frame-viewer[\s\S]{0,400}?z-index:(\d+)/);
+    assert.ok(viewer, "viewer overlay style must be identifiable");
+    assert.ok(Number(viewer[1]) > 10000,
+        "el visor debe quedar por ENCIMA del modal (modal-overlay usa z-index 10000)");
+});
+
+test("interactive guide points the user at every blocker", () => {
+    assert.match(main, /function dsRenderGuide\(plan\)/);
+    assert.match(main, /function dsSpotlight\(target\)/);
+    assert.match(main, /ds-guide-action/);
+    assert.match(main, /dsRenderGuide\(plan\);/);
+    for (const locale of [en, es]) {
+        assert.ok(locale.deepsky.guide_title);
+        assert.ok(locale.deepsky.guide_ready);
+        assert.ok(locale.deepsky.guide_fix_linker);
+        assert.ok(locale.deepsky.guide_strict);
+    }
+});
+
+test("scanning another folder adds to the session instead of replacing it", () => {
+    // Una sesión real vive en varias carpetas (una por noche, o lights y
+    // calibración aparte): escanear la segunda no puede borrar la primera.
+    assert.match(main, /function dsMergeScannedFiles\(scanned\)/);
+    assert.match(main, /mergeClassifiedDeepSkyFrames\(dsFiles, scanned\)/,
+        "debe deduplicar y reclasificar por ruta con el probe más reciente");
+    assert.match(main, /const added = dsMergeScannedFiles\(\{/);
+    assert.match(main, /added\.reclassified/,
+        "debe informar cuando una cabecera corregida mueve la toma a otro grupo");
+    // El escaneo ya no reinicia el ligado ni los descartes del usuario.
+    assert.doesNotMatch(main, /dsFiles\.lights = \[\.\.\.\(cl\.lights \|\| \[\]\)\]/);
+    const scan = main.match(/async function dsScanFolder\(\)[\s\S]*?\n}\n/)?.[0] || "";
+    assert.ok(scan, "dsScanFolder debe seguir siendo identificable");
+    assert.doesNotMatch(scan, /dsCalibAssignments\.clear\(\)/);
+    assert.doesNotMatch(scan, /dsDiscardedPaths\.clear\(\)/);
+    for (const locale of [en, es, fr, it]) {
+        assert.ok(locale.deepsky.scan_added);
+        assert.ok(locale.deepsky.scan_reclassified);
+        assert.ok(locale.deepsky.scan_total);
+        assert.ok(locale.deepsky.scan_accumulates);
+    }
+});
+
+test("all four calibration batch kinds are detectable and excludable", () => {
+    // Los cuatro roles se agrupan en bloques y se pueden excluir; sólo flats y
+    // darks admiten asignación manual, porque son los únicos que el backend sabe
+    // forzar (`DeepSkyCalibrationOverride`). Ofrecer desplegable para los otros
+    // dos sería un control que no cambia nada.
+    assert.match(main, /kind: "darkFlats"[\s\S]{0,140}linkable: false/);
+    assert.match(main, /kind: "bias"[\s\S]{0,140}linkable: false/);
+    assert.match(main, /kind: "flats"[\s\S]{0,140}linkable: true/);
+    assert.match(main, /kind: "darks"[\s\S]{0,140}linkable: true/);
+    assert.match(main, /\["flats", "darks", "darkFlats", "bias"\]\.includes\(kind\)/);
+});
+
+test("preflight floods are grouped and strict offers a degraded path", () => {
+    assert.match(main, /function dsGroupAlertMessages\(messages\)/);
+    assert.match(main, /btn-ds-proceed-degraded/);
+    assert.match(main, /policy\.value = "allowDegraded"/);
+    for (const locale of [en, es]) {
+        assert.ok(locale.deepsky.proceed_degraded);
+        assert.ok(locale.deepsky.proceed_hint);
+        assert.ok(locale.deepsky.alert_expand);
+    }
+});
+
+test("dynamic UI strings resolve through both locales", () => {
+    for (const locale of [en, es]) {
+        assert.ok(locale.deepsky.reclassify);
+        assert.ok(locale.deepsky.export_float32);
+        assert.ok(locale.deepsky.repeat_integration);
+        assert.ok(locale.deepsky.repeat_integration_hint);
+        assert.equal(locale.deepsky.rej_linearfit, undefined,
+            "linearfit locale leftovers must stay removed");
+    }
+});

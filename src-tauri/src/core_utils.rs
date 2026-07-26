@@ -22,6 +22,42 @@ fn log_to_front(app: &tauri::AppHandle, level: &str, msg: &str) {
 }
 
 fn emit_progress(app: &tauri::AppHandle, step: &str, pct: f32, details: Option<String>) {
+    // SANEO CENTRAL: con totales estimados (MP4/MOV sin nb_frames) el cálculo
+    // c/total puede pasarse de 100 o producir NaN/inf; serde serializa NaN
+    // como null y el frontend lo lee como 0 → barra congelada en 0. Ningún
+    // emisor puede volver a romper la barra desde aquí.
+    let pct = if pct.is_finite() {
+        pct.clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    // PR-2.5: THROTTLE temporal (~80 ms). Los bucles calientes se autolimitan
+    // por módulo de frames, pero en SER mono muy rápidos la frecuencia real
+    // seguía acoplada a los fps (decenas de eventos IPC/seg → jank en el
+    // WebView). Se agrupan solo los mensajes que difieren ÚNICAMENTE en sus
+    // números ("Frame 12/500" vs "Frame 37/500"): los hitos con texto
+    // distinto y los extremos de la barra pasan siempre.
+    {
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        static LAST_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+        static LAST_KEY: AtomicU64 = AtomicU64::new(0);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for b in step.bytes().filter(|b| !b.is_ascii_digit()) {
+            b.hash(&mut hasher);
+        }
+        let key = hasher.finish();
+        let now_ms = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+        if pct > 0.5 && pct < 99.5 && key == LAST_KEY.load(Ordering::Relaxed) {
+            let last = LAST_MS.load(Ordering::Relaxed);
+            if now_ms.wrapping_sub(last) < 80 {
+                return;
+            }
+        }
+        LAST_KEY.store(key, Ordering::Relaxed);
+        LAST_MS.store(now_ms, Ordering::Relaxed);
+    }
     let _ = app.emit(
         "progress",
         Progress {
@@ -30,6 +66,304 @@ fn emit_progress(app: &tauri::AppHandle, step: &str, pct: f32, details: Option<S
             details,
         },
     );
+}
+
+fn emit_pipeline_telemetry(app: &tauri::AppHandle, telemetry: PipelineTelemetry) {
+    crate::pipeline::record_pipeline_telemetry(&telemetry);
+    let _ = app.emit("pipeline_telemetry", telemetry);
+}
+
+/// Telemetria EN VIVO de la FASE DE ANALISIS (mismo evento "stack_telemetry"
+/// que el apilado, con phase="analysis" para que la UI etiquete bien).
+/// MATICES de aceleracion en el analisis (importante para no confundir):
+///  - wgpu procesa por lotes luma/pirámide/Laplaciano/CoG/calidad/SAD grueso;
+///    CPU/SIMD conserva refinamiento, validación y decisiones globales.
+///  - La DECODIFICACION de videos comprimidos también puede usar GPU hardware
+///    (VideoToolbox/NVDEC/D3D11VA via FFmpeg, el "Modo Turbo"). `decode_gpu`:
+///    Some(true) = decode HW-GPU activo, Some(false) = decode CPU (fallback),
+///    None = lector nativo SER/AVI/FITS (mmap, sin decode).
+/// `sys` se refresca bajo lock (barato, cada N frames). align_ms = ms/frame.
+#[allow(clippy::too_many_arguments)]
+fn emit_analysis_telemetry(
+    app: &tauri::AppHandle,
+    job_id: &str,
+    reader_kind: &str,
+    decode_gpu: Option<bool>,
+    compute_gpu: bool,
+    // Motivo visible cuando el cómputo cayó a CPU ("Auto eligió CPU",
+    // "VRAM insuficiente", "la GPU falló en un lote"...): el usuario no debe
+    // adivinar por qué la etiqueta dice "scoring CPU".
+    cpu_reason: Option<String>,
+    uploaded_bytes_per_frame: usize,
+    estimated_vram_mb: u64,
+    done: usize,
+    total: usize,
+    start: std::time::Instant,
+    threads: usize,
+    sys: &std::sync::Mutex<sysinfo::System>,
+) {
+    let elapsed = start.elapsed().as_secs_f32().max(0.001);
+    let d = done.max(1);
+    let (ram_mb, cpu_percent, io_read_mb, io_write_mb) = {
+        let mut s = sys.lock().unwrap();
+        // refresh_all() enumeraba TODOS los procesos del sistema bajo lock en
+        // cada emisión (cada 10-50 frames); estos refrescos puntuales producen
+        // exactamente los campos consumidos a una fracción del coste.
+        s.refresh_memory();
+        s.refresh_cpu();
+        let pid = sysinfo::get_current_pid().ok();
+        if let Some(p) = pid {
+            s.refresh_process(p);
+        }
+        let process = pid.and_then(|p| s.process(p));
+        let disk = process.map(|p| p.disk_usage());
+        (
+            process.map(|p| p.memory() / (1024 * 1024)).unwrap_or_else(|| s.used_memory() / (1024 * 1024)),
+            Some(s.global_cpu_info().cpu_usage()),
+            disk.map(|d| d.total_read_bytes as f64 / 1_048_576.0).unwrap_or(0.0),
+            disk.map(|d| d.total_written_bytes as f64 / 1_048_576.0).unwrap_or(0.0),
+        )
+    };
+    let decode_lbl = match decode_gpu {
+        Some(true) => " · decode HW-GPU",
+        Some(false) => " · decode CPU",
+        None => "",
+    };
+    let compute_lbl = if compute_gpu {
+        " · preprocess GPU + decisiones CPU".to_string()
+    } else {
+        match &cpu_reason {
+            Some(reason) => format!(" · scoring CPU — {reason}"),
+            None => " · scoring CPU".to_string(),
+        }
+    };
+    let _ = app.emit(
+        "stack_telemetry",
+        StackTelemetry {
+            phase: "analysis".to_string(),
+            // La UI ya antepone "Análisis:", asi que el modo NO lo repite
+            // (antes mostraba "Análisis: Analisis · SER..." duplicado).
+            mode: format!(
+                "{}{}{} {}",
+                reader_kind,
+                decode_lbl,
+                compute_lbl,
+                simd_backend_label()
+            ),
+            decode_gpu,
+            compute_gpu,
+            frames_done: done,
+            frames_total: total,
+            fps: d as f32 / elapsed,
+            align_ms: (elapsed * 1000.0) / d as f32,
+            accum_ms: 0.0,
+            upload_mbps: if compute_gpu {
+                (done.saturating_mul(uploaded_bytes_per_frame) as f32)
+                    / elapsed
+                    / 1_048_576.0
+            } else {
+                0.0
+            },
+            ram_mb,
+            vram_mb: if compute_gpu {
+                estimated_vram_mb.min(crate::gpu_stack::gpu_info().vram_budget_mb)
+            } else {
+                0
+            },
+            cache_hits: 0,
+            threads,
+        },
+    );
+    emit_pipeline_telemetry(
+        app,
+        PipelineTelemetry {
+            job_id: job_id.into(),
+            domain: PipelineDomain::Planetary,
+            phase: "analysis".into(),
+            engine: format!("{}{}{} {}", reader_kind, decode_lbl, compute_lbl, simd_backend_label()),
+            progress: done as f32 / total.max(1) as f32 * 100.0,
+            eta_seconds: if done > 0 && done < total {
+                Some(elapsed / done as f32 * (total - done) as f32)
+            } else { None },
+            items_done: done,
+            items_total: total,
+            throughput: Some(d as f32 / elapsed),
+            cpu_percent,
+            gpu_percent: None,
+            ram_mb,
+            vram_mb: if compute_gpu {
+                estimated_vram_mb.min(crate::gpu_stack::gpu_info().vram_budget_mb)
+            } else {
+                0
+            },
+            io_read_mb,
+            io_write_mb,
+            cache_hits: 0,
+            cache_misses: 0,
+            fallback_reason: None,
+        },
+    );
+}
+
+/// Escribe un preview PNG a un archivo temporal y devuelve su ruta absoluta
+/// (el frontend la carga via asset protocol / convertFileSrc). Transportar el
+/// PNG como data-URL base64 por IPC multiplicaba el pico de RAM del WebView.
+/// NOMBRE UNICO por llamada: el WebView cachea por URL — reutilizar el mismo
+/// nombre mostraria la imagen ANTERIOR. Los previews de sesiones pasadas
+/// (>24 h) se purgan en cada escritura. Devuelve None si el temp no es
+/// escribible (el caller cae al data-URL clasico).
+/// F3: escritor FITS 16-bit para SALIDA planetaria/lunar/solar (WinJUPOS,
+/// fotometría, apilado posterior). `rgb` interleaved u16 (w*h*3). Estándar
+/// FITS: BITPIX=16 (i16 con BZERO=32768 para el rango sin signo 0..65535),
+/// big-endian, datos PLANARES por canal (todo R, luego G, luego B) con
+/// NAXIS=3/NAXIS3=3; el bloque de datos se rellena a múltiplo de 2880 bytes.
+fn write_rgb16_fits(path: &str, rgb: &[u16], width: usize, height: usize) -> Result<(), String> {
+    if rgb.len() != width * height * 3 {
+        return Err("Buffer RGB16 inválido para FITS".into());
+    }
+    let mut header = String::new();
+    let mut card = |kw: &str, val: &str| {
+        // Cada card ocupa EXACTAMENTE 80 caracteres.
+        let line = if val.is_empty() {
+            format!("{:<80}", kw)
+        } else {
+            format!("{:<8}= {:>20}{:<50}", kw, val, "")
+        };
+        header.push_str(&line[..80]);
+    };
+    card("SIMPLE", "T");
+    card("BITPIX", "16");
+    card("NAXIS", "3");
+    card("NAXIS1", &width.to_string());
+    card("NAXIS2", &height.to_string());
+    card("NAXIS3", "3");
+    card("BZERO", "32768");
+    card("BSCALE", "1");
+    card("COMMENT   Zenith Astro Stacker — planetary 16-bit RGB", "");
+    card("END", "");
+    // Relleno del header a múltiplo de 2880 con espacios.
+    while header.len() % 2880 != 0 {
+        header.push(' ');
+    }
+
+    let n = width * height;
+    let mut data = Vec::with_capacity(n * 3 * 2 + 2880);
+    // Planar R,G,B; i16 big-endian con offset −32768 (BZERO lo revierte).
+    for c in 0..3 {
+        for i in 0..n {
+            let signed = rgb[i * 3 + c] as i32 - 32768;
+            data.extend_from_slice(&(signed as i16).to_be_bytes());
+        }
+    }
+    while data.len() % 2880 != 0 {
+        data.push(0);
+    }
+    let mut out = header.into_bytes();
+    out.extend_from_slice(&data);
+    std::fs::write(path, out).map_err(|e| e.to_string())
+}
+
+fn save_preview_png_to_temp(png_bytes: &[u8], tag: &str) -> Option<String> {
+    let dir = std::env::temp_dir().join("astro_stacker_previews");
+    std::fs::create_dir_all(&dir).ok()?;
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        let now = std::time::SystemTime::now();
+        for e in rd.flatten() {
+            let stale = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .map(|d| d.as_secs() > 24 * 3600)
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let path = dir.join(format!("{}_{}_{}.png", tag, std::process::id(), nanos));
+    std::fs::write(&path, png_bytes).ok()?;
+    Some(clean_windows_path(path))
+}
+
+/// Keeps the full-resolution previews required by undo/A-B for the active
+/// session, while bounding disk usage. Fast drag previews are transient; full
+/// previews retain a margin above the frontend's 50-entry history limit.
+fn prune_editor_previews() {
+    let dir = std::env::temp_dir().join("astro_stacker_previews");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut full = Vec::new();
+    let mut fast = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if name.starts_with("editor_fast_") {
+            fast.push((modified, entry.path()));
+        } else if name.starts_with("editor_") {
+            full.push((modified, entry.path()));
+        }
+    }
+    fast.sort_by(|left, right| right.0.cmp(&left.0));
+    for (_, path) in fast.into_iter().skip(2) {
+        let _ = std::fs::remove_file(path);
+    }
+    full.sort_by(|left, right| right.0.cmp(&left.0));
+    for (_, path) in full.into_iter().skip(64) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// A new stack/mosaic/batch result starts a new atomic editor session, so no
+/// preview from the prior result may remain addressable by the new history.
+fn clear_editor_previews() {
+    let dir = std::env::temp_dir().join("astro_stacker_previews");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("editor_") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// PR-2.2: deinterleave del canal VERDE (RGB u16 interleaved → mono) con
+/// vld3q_u16 en aarch64 (8 píxeles por iteración). El gather escalar con
+/// stride 3 corría por frame y por pasada en el bucle de acumulación color
+/// (~8.3M iteraciones/frame a 4K, hostil al prefetcher). En x86 se deja el
+/// escalar: LLVM lo autovectoriza con shuffles y no hay vld3 equivalente.
+fn extract_green_channel_into(rgb: &[u16], out: &mut [u16]) {
+    let n = out.len().min(rgb.len() / 3);
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            use std::arch::aarch64::*;
+            let mut i = 0usize;
+            while i + 8 <= n {
+                let v = vld3q_u16(rgb.as_ptr().add(i * 3));
+                vst1q_u16(out.as_mut_ptr().add(i), v.1);
+                i += 8;
+            }
+            for k in i..n {
+                out[k] = rgb[k * 3 + 1];
+            }
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for k in 0..n {
+        out[k] = rgb[k * 3 + 1];
+    }
 }
 
 fn load_font_from_path(path: &str) -> Option<Font<'static>> {
@@ -384,6 +718,31 @@ fn raw_to_u16_buffer_into(
         width * height
     };
 
+    // GUARD SIMD: los kernels AVX2/NEON leen `size` elementos confiando en los
+    // metadatos (width*height), no en data.len(). Un SER/AVI truncado
+    // (captura interrumpida) devuelve el ultimo frame corto o vacio (&[]) y la
+    // lectura fuera de limites cerraba la app en seco (0xC0000005 / SIGSEGV)
+    // sin pasar por el panic hook. Camino frio (solo frames incompletos):
+    // convierte lo disponible y rellena el resto con negro.
+    let elem_bytes: usize = if bpp == 2 || bpp == 6 { 2 } else { 1 };
+    if data.len() < size * elem_bytes {
+        out_buf.clear();
+        out_buf.reserve(size);
+        let avail = (data.len() / elem_bytes).min(size);
+        if elem_bytes == 2 {
+            for i in 0..avail {
+                let s = i * 2;
+                out_buf.push((data[s + 1] as u16) << 8 | data[s] as u16);
+            }
+        } else {
+            for &v in data.iter().take(avail) {
+                out_buf.push(v as u16 * 257);
+            }
+        }
+        out_buf.resize(size, 0);
+        return;
+    }
+
     // AVX2 OPTIMIZATION CHECK
     #[cfg(target_arch = "x86_64")]
     {
@@ -584,9 +943,38 @@ fn select_signal_frame_index(
     }
 
     // Native readers are cheap random access. FFmpeg random seeks are expensive,
-    // so keep their existing behavior.
+    // pero devolver el preferido A CIEGAS era peligroso: si el total es una
+    // estimación alta o el seek cae en EOF, la referencia queda NEGRA y todas
+    // las puntuaciones del análisis salen 0. Se valida la señal del preferido
+    // y sólo si está vacío se sondean unos pocos candidatos baratos.
     if reader.is_ffmpeg() {
-        return preferred_idx.min(total - 1);
+        let preferred = preferred_idx.min(total - 1);
+        let raw = reader.get_frame(preferred, cid);
+        let (max_v, avg) = estimate_raw_frame_signal(&raw, width, height, bpp);
+        if max_v as f32 + avg * 8.0 > 512.0 {
+            return preferred;
+        }
+        let mut best_idx = preferred;
+        let mut best_score = max_v as f32 + avg * 8.0;
+        for idx in [total / 4, total / 10, (total * 3) / 4, 0] {
+            let idx = idx.min(total - 1);
+            if idx == preferred {
+                continue;
+            }
+            let raw = reader.get_frame(idx, cid);
+            let (max_v, avg) = estimate_raw_frame_signal(&raw, width, height, bpp);
+            let score = max_v as f32 + avg * 8.0;
+            if score > best_score {
+                best_score = score;
+                best_idx = idx;
+            }
+            // Con señal clara no hace falta seguir sondeando (cada probe es un
+            // seek+spawn de FFmpeg).
+            if best_score > 512.0 {
+                break;
+            }
+        }
+        return best_idx;
     }
 
     let mut candidates = vec![
@@ -680,6 +1068,15 @@ fn raw_to_u16_buffer_into_roi(
     }
 
     if bpp == 6 {
+        // GUARD: mismo caso que raw_to_u16_buffer_into — un frame truncado o
+        // vacio (SER/AVI interrumpido) hacia que los get_unchecked de abajo
+        // leyeran fuera de limites (cierre en seco). Tambien cubre un ROI que
+        // exceda la altura real. El fallback negro es el mismo que el del ROI
+        // horizontal invalido de arriba.
+        if data.len() < (roi_y + roi_h) * width * 6 {
+            out_buf.resize(size, 0);
+            return;
+        }
         // RGB 16-bit Optimized -> MONO (Average)
         // Access pattern: y from roi_y to roi_y + roi_h
         unsafe {
@@ -813,160 +1210,7 @@ fn auto_detect_sigma(data: &[f32], width: usize, _height: usize) -> f32 {
     sigma.clamp(0.6, 2.5)
 }
 
-/// PHASE 8: Multi-Scale Local Contrast Enhancement (LCE)
-/// Targets both solar granulation (fine) and filaments (medium) scales.
-/// PHASE 10: Multi-Scale Detail Bank (Fine/Med/Deep)
-/// Evolution of LCE to give volumetric "3D" depth to filaments.
-fn apply_micro_contrast_boost(buffer: &mut [u16], width: usize, height: usize, amount: f32) {
-    if amount <= 1.0 {
-        return;
-    }
-    let read_buf = buffer.to_vec();
 
-    // We use a progressive multi-scale sharpen
-    // Fine: 3x3 for granulation
-    // Med: 7x7 for filament threads
-    // Structural: 15x15 for larger filament volume
-    buffer
-        .par_chunks_exact_mut(width * 3)
-        .enumerate()
-        .for_each(|(y, row)| {
-            if y < 8 || y >= height - 8 {
-                return;
-            }
-            for x in 8..width - 8 {
-                let idx = x * 3;
-
-                // Scale 1: Fine (3x3)
-                let mut sum3 = 0u32;
-                for ky in -1..=1 {
-                    let r_off = (y as isize + ky) as usize * width * 3;
-                    for kx in -1..=1 {
-                        let p_idx = r_off + (x as isize + kx) as usize * 3;
-                        // Use max of channels for robustness (H-alpha is Red, Mono is R=G=B)
-                        let v_p = read_buf[p_idx]
-                            .max(read_buf[p_idx + 1])
-                            .max(read_buf[p_idx + 2]);
-                        sum3 += v_p as u32;
-                    }
-                }
-                let avg3 = (sum3 / 9) as f32;
-
-                // Scale 2: Medium (7x7)
-                let mut sum7 = 0u32;
-                for ky in -3..=3 {
-                    let r_off = (y as isize + ky) as usize * width * 3;
-                    for kx in -3..=3 {
-                        let p_idx = r_off + (x as isize + kx) as usize * 3;
-                        let v_p = read_buf[p_idx]
-                            .max(read_buf[p_idx + 1])
-                            .max(read_buf[p_idx + 2]);
-                        sum7 += v_p as u32;
-                    }
-                }
-                let avg7 = (sum7 / 49) as f32;
-
-                // Scale 3: Structural (15x15) - Sampled for speed
-                let mut sum15 = 0u32;
-                for ky in [-7, -4, 0, 4, 7] {
-                    let r_off = (y as isize + ky) as usize * width * 3;
-                    for kx in [-7, -4, 0, 4, 7] {
-                        let p_idx = r_off + (x as isize + kx) as usize * 3;
-                        let v_p = read_buf[p_idx]
-                            .max(read_buf[p_idx + 1])
-                            .max(read_buf[p_idx + 2]);
-                        sum15 += v_p as u32;
-                    }
-                }
-                let avg15 = (sum15 / 25) as f32;
-
-                for c in 0..3 {
-                    let v = row[idx + c] as f32;
-
-                    // Multi-scale contribution
-                    let d_fine = (v - avg3) * 0.8;
-                    let d_med = (v - avg7) * 0.5;
-                    let d_struct = (v - avg15) * 0.3;
-
-                    let boost = (d_fine + d_med + d_struct) * (amount - 1.0);
-
-                    // Shadow Emphasis: Sharpen more in dark filament areas
-                    let shadow_factor = if v < avg15 { 1.25 } else { 1.0 };
-
-                    let final_v = v + boost * shadow_factor;
-                    row[idx + c] = final_v.clamp(0.0, 65535.0) as u16;
-                }
-            }
-        });
-}
-
-/// PHASE 10: Volumetric Solar Normalization (CLAHE-Lite)
-/// Eliminates global "flatness" by normalizing contrast locally.
-fn apply_volumetric_solar_boost(buffer: &mut [u16], width: usize, height: usize, strength: f32) {
-    if strength <= 0.0 {
-        return;
-    }
-    let read_buf = buffer.to_vec();
-
-    // Global mean for baseline (robust max sampling)
-    let mut _global_sum = 0f64;
-    for i in 0..width * height {
-        let p_idx = i * 3;
-        let v = read_buf[p_idx]
-            .max(read_buf[p_idx + 1])
-            .max(read_buf[p_idx + 2]);
-        _global_sum += v as f64;
-    }
-    // let global_avg = (global_sum / (width * height) as f64) as f32;
-
-    buffer
-        .par_chunks_exact_mut(width * 3)
-        .enumerate()
-        .for_each(|(y, row)| {
-            let radius = 31; // Large scale for volume
-            if y < radius || y >= height - radius {
-                return;
-            }
-
-            for x in radius..width - radius {
-                let idx = x * 3;
-
-                // Sample regional average (Sparse 25pt grid for performance)
-                let mut local_sum = 0u32;
-                let r_i = radius as isize;
-                let s_i = radius as isize / 2;
-                for ky in [-r_i, -s_i, 0, s_i, r_i] {
-                    let r_off = (y as isize + ky) as usize * width * 3;
-                    for kx in [-r_i, -s_i, 0, s_i, r_i] {
-                        let p_idx = r_off + (x as isize + kx as isize) as usize * 3;
-                        let v = read_buf[p_idx]
-                            .max(read_buf[p_idx + 1])
-                            .max(read_buf[p_idx + 2]);
-                        local_sum += v as u32;
-                    }
-                }
-                let local_avg = (local_sum / 25) as f32;
-
-                // CLAHE-style local stretch
-                // We normalize the pixel based on local mean vs global mean
-                for c in 0..3 {
-                    let v = row[idx + c] as f32;
-                    let diff = v - local_avg;
-
-                    // Push local contrast: pixels farther from local mean get boosted
-                    let contrast_push = 1.0 + (strength * 0.5);
-                    let mut final_v = local_avg + (diff * contrast_push);
-
-                    // Shadow Curve: Make deep filaments deeper
-                    if final_v < local_avg * 0.8 {
-                        final_v *= 0.95; // Darken shadows
-                    }
-
-                    row[idx + c] = final_v.clamp(0.0, 65535.0) as u16;
-                }
-            }
-        });
-}
 
 /// POST-STACK CHROMA NOISE REDUCTION (Mejora 5)
 /// Smooths only the Cb/Cr chroma channels in YCbCr space while preserving
@@ -1110,6 +1354,92 @@ fn normalize_surface_frame_exposure_mono_inplace(data: &mut [u16], target_p90: f
     }
 }
 
+/// Percentil de luma SOLO sobre los píxeles del DISCO (por encima de un
+/// suelo del 2 % del p99.9 muestreado): en un planeta pequeño el p90 global
+/// cae en el cielo negro y no mide la exposición del objeto. Devuelve 0.0
+/// si no hay suficientes píxeles con señal (sin disco → sin normalizar).
+fn planetary_disc_luma_percentile_rgb(data: &[u16], percentile: usize) -> f32 {
+    if data.len() < 3 {
+        return 0.0;
+    }
+    let pixels = data.len() / 3;
+    let step = (pixels / 250_000).max(1);
+    let mut sample = Vec::with_capacity((pixels / step).max(1));
+    for i in (0..pixels).step_by(step) {
+        let off = i * 3;
+        let luma = 0.299 * data[off] as f32
+            + 0.587 * data[off + 1] as f32
+            + 0.114 * data[off + 2] as f32;
+        sample.push(luma);
+    }
+    planetary_disc_percentile_from_samples(sample, percentile)
+}
+
+/// Variante mono de `planetary_disc_luma_percentile_rgb`.
+fn planetary_disc_percentile_mono(data: &[u16], percentile: usize) -> f32 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let step = (data.len() / 250_000).max(1);
+    let sample: Vec<f32> = data.iter().step_by(step).map(|&v| v as f32).collect();
+    planetary_disc_percentile_from_samples(sample, percentile)
+}
+
+fn planetary_disc_percentile_from_samples(mut sample: Vec<f32>, percentile: usize) -> f32 {
+    if sample.is_empty() {
+        return 0.0;
+    }
+    sample.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p999 = sample[(sample.len() * 999 / 1000).min(sample.len() - 1)];
+    let floor = (p999 * 0.02).max(64.0);
+    // sample está ordenado: los píxeles de disco son el sufijo >= floor.
+    let first = sample.partition_point(|&v| v < floor);
+    let disc = &sample[first..];
+    if disc.len() < 64 {
+        return 0.0;
+    }
+    disc[(disc.len() * percentile / 100).min(disc.len() - 1)]
+}
+
+/// PR-1.4: normalización de exposición per-frame para PLANETAS. Igual que
+/// la de superficie pero midiendo el percentil solo en el disco. Sin esto,
+/// con transparencia variable (nubes finas, extinción) los frames más
+/// brillantes dominaban la media ponderada sesgando fotometría y contraste.
+fn normalize_planetary_frame_exposure_mono_inplace(data: &mut [u16], target_p90: f32) {
+    if target_p90 < 1.0 || data.is_empty() {
+        return;
+    }
+    let current_p90 = planetary_disc_percentile_mono(data, 90);
+    if current_p90 < 1.0 {
+        return;
+    }
+    let gain = (target_p90 / current_p90).clamp(0.70, 1.45);
+    if (gain - 1.0).abs() < 0.003 {
+        return;
+    }
+    for v in data.iter_mut() {
+        *v = (*v as f32 * gain + 0.5).clamp(0.0, 65535.0) as u16;
+    }
+}
+
+/// Variante RGB de `normalize_planetary_frame_exposure_mono_inplace`.
+fn normalize_planetary_frame_exposure_rgb_inplace(data: &mut [u16], target_p90: f32) {
+    if target_p90 < 1.0 || data.len() < 3 {
+        return;
+    }
+    let current_p90 = planetary_disc_luma_percentile_rgb(data, 90);
+    if current_p90 < 1.0 {
+        return;
+    }
+    let gain = (target_p90 / current_p90).clamp(0.78, 1.30);
+    if (gain - 1.0).abs() < 0.003 {
+        return;
+    }
+    for v in data.iter_mut() {
+        *v = (*v as f32 * gain + 0.5).clamp(0.0, 65535.0) as u16;
+    }
+}
+
 fn normalize_surface_frame_exposure_inplace(data: &mut [u16], target_p90: f32, is_mono: bool) {
     if target_p90 < 1.0 || data.len() < 3 {
         return;
@@ -1129,46 +1459,4 @@ fn normalize_surface_frame_exposure_inplace(data: &mut [u16], target_p90: f32, i
     for v in data.iter_mut() {
         *v = (*v as f32 * gain + 0.5).clamp(0.0, 65535.0) as u16;
     }
-}
-
-// FUNCION AnADIDA: Relleno de agujeros para Drizzle > 1.0
-fn fill_black_holes(data: &mut [u16], width: usize, height: usize) {
-    let mut buffer = data.to_vec();
-    for _ in 0..2 {
-        let original = buffer.clone();
-        for y in 1..height - 1 {
-            let r_off = y * width;
-            for x in 1..width - 1 {
-                let idx = (r_off + x) * 3;
-                if original[idx] == 0 && original[idx + 1] == 0 && original[idx + 2] == 0 {
-                    let mut s_r = 0u32;
-                    let mut s_g = 0u32;
-                    let mut s_b = 0u32;
-                    let mut c = 0;
-                    for dy in -1..=1 {
-                        for dx in -1..=1 {
-                            if dx == 0 && dy == 0 {
-                                continue;
-                            }
-                            let n_idx = ((y as isize + dy) as usize * width
-                                + (x as isize + dx) as usize)
-                                * 3;
-                            if original[n_idx] > 0 || original[n_idx + 1] > 0 {
-                                s_r += original[n_idx] as u32;
-                                s_g += original[n_idx + 1] as u32;
-                                s_b += original[n_idx + 2] as u32;
-                                c += 1;
-                            }
-                        }
-                    }
-                    if c > 0 {
-                        buffer[idx] = (s_r / c) as u16;
-                        buffer[idx + 1] = (s_g / c) as u16;
-                        buffer[idx + 2] = (s_b / c) as u16;
-                    }
-                }
-            }
-        }
-    }
-    data.copy_from_slice(&buffer);
 }

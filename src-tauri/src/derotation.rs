@@ -6,6 +6,7 @@
 
 use rayon::prelude::*;
 use std::f64::consts::PI;
+use sysinfo::System;
 
 // =============================================================================
 // 1. DATA STRUCTURES
@@ -68,11 +69,58 @@ pub const MARS: PlanetaryBody = PlanetaryBody {
     oblateness: 0.00589,
 };
 
+/// Venus: la superficie sólida gira en 243 días (retrógrada), pero el imaging
+/// amateur en UV/IR sigue los TOPES DE NUBE, que super-rotan retrógrados con un
+/// periodo de ~4.4 días. Para derotar rasgos de nube hay que usar la tasa
+/// ATMOSFÉRICA, no la sólida (si no, apenas rotaría y la derotación fallaría).
+/// El "CM" resultante es la longitud del patrón de nubes, no una superficie fija.
+pub const VENUS: PlanetaryBody = PlanetaryBody {
+    name: "Venus",
+    equatorial_radius_km: 6051.8,
+    polar_radius_km: 6051.8,
+    rotation_rates: [-81.818_18, -81.818_18, -81.818_18], // 360/4.4 días, retrógrada
+    pole_ra_deg: 272.76,
+    pole_dec_deg: 67.16,
+    w0_deg: [160.20, 160.20, 160.20],
+    w_dot: [-81.818_18, -81.818_18, -81.818_18],
+    oblateness: 0.0,
+};
+
+/// Uranus: rotación RETRÓGRADA (eje volcado ~98°). IAU 2015: W = 203.81 − 501.7928812·d.
+pub const URANUS: PlanetaryBody = PlanetaryBody {
+    name: "Uranus",
+    equatorial_radius_km: 25559.0,
+    polar_radius_km: 24973.0,
+    rotation_rates: [-501.792_881_2, -501.792_881_2, -501.792_881_2],
+    pole_ra_deg: 257.311,
+    pole_dec_deg: -15.175,
+    w0_deg: [203.81, 203.81, 203.81],
+    w_dot: [-501.792_881_2, -501.792_881_2, -501.792_881_2],
+    oblateness: 0.02293,
+};
+
+/// Neptune: la W IAU se refiere a los rasgos ATMOSFÉRICOS observados (Sistema II),
+/// W = 253.18 + 536.3128492·d (periodo ~16.11 h). Se omite el término −0.48·sinN.
+pub const NEPTUNE: PlanetaryBody = PlanetaryBody {
+    name: "Neptune",
+    equatorial_radius_km: 24764.0,
+    polar_radius_km: 24341.0,
+    rotation_rates: [536.312_849_2, 536.312_849_2, 536.312_849_2],
+    pole_ra_deg: 299.36,
+    pole_dec_deg: 43.46,
+    w0_deg: [253.18, 253.18, 253.18],
+    w_dot: [536.312_849_2, 536.312_849_2, 536.312_849_2],
+    oblateness: 0.0171,
+};
+
 pub fn get_planet(id: &str) -> Option<&'static PlanetaryBody> {
     match id.to_lowercase().as_str() {
         "jupiter" => Some(&JUPITER),
         "saturn" => Some(&SATURN),
         "mars" => Some(&MARS),
+        "venus" => Some(&VENUS),
+        "uranus" => Some(&URANUS),
+        "neptune" => Some(&NEPTUNE),
         _ => None,
     }
 }
@@ -222,6 +270,220 @@ pub fn earth_ecliptic_longitude(t_centuries: f64) -> f64 {
 /// Uses IAU 2015 rotation elements + light-time corrected position.
 ///
 /// Returns (CM1, CM2, CM3) in degrees [0, 360).
+// =============================================================================
+// EFEMÉRIDES KEPLERIANAS (Standish/JPL, elementos J2000 + tasas/siglo, válido
+// ~1800–2050). Sustituye el modelo de órbita circular por órbitas ELÍPTICAS con
+// inclinación (excentricidad + ecuación de Kepler) → posiciones geocéntricas
+// (α, δ, Δ) precisas a ~1 arcmin, más que suficiente para B0/CM/diámetro. No es
+// VSOP87 completo (arcsec) pero es la mejora que de verdad importa para derotar.
+// =============================================================================
+
+#[derive(Clone, Copy)]
+struct KeplerElements {
+    a0: f64,
+    a_dot: f64, // semieje mayor (AU) + tasa/siglo
+    e0: f64,
+    e_dot: f64, // excentricidad
+    i0: f64,
+    i_dot: f64, // inclinación (deg)
+    l0: f64,
+    l_dot: f64, // longitud media (deg)
+    peri0: f64,
+    peri_dot: f64, // longitud del perihelio ϖ (deg)
+    node0: f64,
+    node_dot: f64, // longitud del nodo ascendente Ω (deg)
+}
+
+/// Baricentro Tierra-Luna (Standish).
+const EARTH_ELEMENTS: KeplerElements = KeplerElements {
+    a0: 1.00000261,
+    a_dot: 0.00000562,
+    e0: 0.01671123,
+    e_dot: -0.00004392,
+    i0: -0.00001531,
+    i_dot: -0.01294668,
+    l0: 100.46457166,
+    l_dot: 35999.37244981,
+    peri0: 102.93768193,
+    peri_dot: 0.32327364,
+    node0: 0.0,
+    node_dot: 0.0,
+};
+
+fn planet_elements(name: &str) -> Option<KeplerElements> {
+    Some(match name {
+        "Mercury" => KeplerElements {
+            a0: 0.38709927,
+            a_dot: 0.00000037,
+            e0: 0.20563593,
+            e_dot: 0.00001906,
+            i0: 7.00497902,
+            i_dot: -0.00594749,
+            l0: 252.25032350,
+            l_dot: 149472.67411175,
+            peri0: 77.45779628,
+            peri_dot: 0.16047689,
+            node0: 48.33076593,
+            node_dot: -0.12534081,
+        },
+        "Venus" => KeplerElements {
+            a0: 0.72333566,
+            a_dot: 0.00000390,
+            e0: 0.00677672,
+            e_dot: -0.00004107,
+            i0: 3.39467605,
+            i_dot: -0.00078890,
+            l0: 181.97909950,
+            l_dot: 58517.81538729,
+            peri0: 131.60246718,
+            peri_dot: 0.00268329,
+            node0: 76.67984255,
+            node_dot: -0.27769418,
+        },
+        "Mars" => KeplerElements {
+            a0: 1.52371034,
+            a_dot: 0.00001847,
+            e0: 0.09339410,
+            e_dot: 0.00007882,
+            i0: 1.84969142,
+            i_dot: -0.00813131,
+            l0: -4.55343205,
+            l_dot: 19140.30268499,
+            peri0: -23.94362959,
+            peri_dot: 0.44441088,
+            node0: 49.55953891,
+            node_dot: -0.29257343,
+        },
+        "Jupiter" => KeplerElements {
+            a0: 5.20288700,
+            a_dot: -0.00011607,
+            e0: 0.04838624,
+            e_dot: -0.00013253,
+            i0: 1.30439695,
+            i_dot: -0.00183714,
+            l0: 34.39644051,
+            l_dot: 3034.74612775,
+            peri0: 14.72847983,
+            peri_dot: 0.21252668,
+            node0: 100.47390909,
+            node_dot: 0.20469106,
+        },
+        "Saturn" => KeplerElements {
+            a0: 9.53667594,
+            a_dot: -0.00125060,
+            e0: 0.05386179,
+            e_dot: -0.00050991,
+            i0: 2.48599187,
+            i_dot: 0.00193609,
+            l0: 49.95424423,
+            l_dot: 1222.49362201,
+            peri0: 92.59887831,
+            peri_dot: -0.41897216,
+            node0: 113.66242448,
+            node_dot: -0.28867794,
+        },
+        "Uranus" => KeplerElements {
+            a0: 19.18916464,
+            a_dot: -0.00196176,
+            e0: 0.04725744,
+            e_dot: -0.00004397,
+            i0: 0.77263783,
+            i_dot: -0.00242939,
+            l0: 313.23810451,
+            l_dot: 428.48202785,
+            peri0: 170.95427630,
+            peri_dot: 0.40805281,
+            node0: 74.01692503,
+            node_dot: 0.04240589,
+        },
+        "Neptune" => KeplerElements {
+            a0: 30.06992276,
+            a_dot: 0.00026291,
+            e0: 0.00859048,
+            e_dot: 0.00005105,
+            i0: 1.77004347,
+            i_dot: 0.00035372,
+            l0: -55.12002969,
+            l_dot: 218.45945325,
+            peri0: 44.96476227,
+            peri_dot: -0.32241464,
+            node0: 131.78422574,
+            node_dot: -0.00508664,
+        },
+        _ => return None,
+    })
+}
+
+/// Posición heliocéntrica ECLÍPTICA (J2000) rectangular en AU, resolviendo la
+/// ecuación de Kepler (E = M + e·sinE) por Newton.
+fn kepler_heliocentric_ecliptic(el: &KeplerElements, jd: f64) -> [f64; 3] {
+    let t = (jd - 2451545.0) / 36525.0;
+    let a = el.a0 + el.a_dot * t;
+    let e = el.e0 + el.e_dot * t;
+    let inc = (el.i0 + el.i_dot * t).to_radians();
+    let l = el.l0 + el.l_dot * t;
+    let peri = el.peri0 + el.peri_dot * t;
+    let node = (el.node0 + el.node_dot * t).to_radians();
+    let arg_peri = (peri - (el.node0 + el.node_dot * t)).to_radians();
+    // Anomalía media en [-180,180].
+    let mut m = (l - peri) % 360.0;
+    if m > 180.0 {
+        m -= 360.0;
+    } else if m < -180.0 {
+        m += 360.0;
+    }
+    let m_rad = m.to_radians();
+    // Newton para E.
+    let mut ea = m_rad + e * m_rad.sin();
+    for _ in 0..12 {
+        let de = (m_rad - (ea - e * ea.sin())) / (1.0 - e * ea.cos());
+        ea += de;
+        if de.abs() < 1e-10 {
+            break;
+        }
+    }
+    // Posición en el plano orbital.
+    let x_orb = a * (ea.cos() - e);
+    let y_orb = a * (1.0 - e * e).max(0.0).sqrt() * ea.sin();
+    // Rotación ω (arg_peri) → i (inc) → Ω (node) al plano eclíptico.
+    let (cw, sw) = (arg_peri.cos(), arg_peri.sin());
+    let (co, so) = (node.cos(), node.sin());
+    let (ci, si) = (inc.cos(), inc.sin());
+    let x = (cw * co - sw * so * ci) * x_orb + (-sw * co - cw * so * ci) * y_orb;
+    let y = (cw * so + sw * co * ci) * x_orb + (-sw * so + cw * co * ci) * y_orb;
+    let z = (sw * si) * x_orb + (cw * si) * y_orb;
+    [x, y, z]
+}
+
+/// (α, δ) geocéntricas ECUATORIALES J2000 (radianes) y distancia Δ (AU) del
+/// planeta, con corrección de tiempo-luz iterada.
+fn geocentric_equatorial(el: &KeplerElements, jd: f64) -> (f64, f64, f64) {
+    let earth = kepler_heliocentric_ecliptic(&EARTH_ELEMENTS, jd);
+    let mut tau = 0.0f64;
+    let mut geo = [0.0f64; 3];
+    let mut dist = 1.0f64;
+    for _ in 0..3 {
+        let planet = kepler_heliocentric_ecliptic(el, jd - tau);
+        geo = [
+            planet[0] - earth[0],
+            planet[1] - earth[1],
+            planet[2] - earth[2],
+        ];
+        dist = (geo[0] * geo[0] + geo[1] * geo[1] + geo[2] * geo[2])
+            .sqrt()
+            .max(1e-6);
+        tau = dist * 0.005_775_518_3; // días-luz por AU
+    }
+    // Eclíptica → ecuatorial (oblicuidad J2000).
+    let eps = 23.439_291_1_f64.to_radians();
+    let xe = geo[0];
+    let ye = geo[1] * eps.cos() - geo[2] * eps.sin();
+    let ze = geo[1] * eps.sin() + geo[2] * eps.cos();
+    let alpha = ye.atan2(xe);
+    let delta = (ze / dist).clamp(-1.0, 1.0).asin();
+    (alpha, delta, dist)
+}
+
 pub fn calculate_central_meridian(planet: &PlanetaryBody, jd: f64) -> (f64, f64, f64) {
     let d = jd_to_days(jd);
     let t = jd_to_centuries(jd);
@@ -231,19 +493,17 @@ pub fn calculate_central_meridian(planet: &PlanetaryBody, jd: f64) -> (f64, f64,
     let planet_lon = planet_ecliptic_longitude(planet, t).to_radians();
     let earth_lon = earth_ecliptic_longitude(t).to_radians();
 
-    // Approximate semi-major axes (AU)
-    let (a_planet, a_earth) = match planet.name {
-        "Jupiter" => (5.2026, 1.0000),
-        "Saturn" => (9.5549, 1.0000),
-        "Mars" => (1.5237, 1.0000),
-        _ => (5.2026, 1.0000),
+    // Distancia geocéntrica: efeméride kepleriana precisa si hay elementos; si
+    // no, aproximación de órbita circular (law of cosines) como respaldo.
+    let dist_au = match planet_elements(planet.name) {
+        Some(el) => geocentric_equatorial(&el, jd).2,
+        None => {
+            let (a_planet, a_earth) = (5.2026_f64, 1.0000_f64);
+            let delta_lon = planet_lon - earth_lon;
+            (a_planet * a_planet + a_earth * a_earth - 2.0 * a_planet * a_earth * delta_lon.cos())
+                .sqrt()
+        }
     };
-
-    // Distance via law of cosines (ecliptic plane approximation)
-    let delta_lon = planet_lon - earth_lon;
-    let dist_au = (a_planet * a_planet + a_earth * a_earth
-        - 2.0 * a_planet * a_earth * delta_lon.cos())
-    .sqrt();
 
     // Light-time in days (AU / speed_of_light_AU_per_day)
     let light_time_days = dist_au / 173.144_633;
@@ -337,49 +597,53 @@ fn normalize_signed_deg(mut deg: f64) -> f64 {
 /// It is not a full JPL/SPICE ephemeris, but gives the user realistic starting values and exposes
 /// them for manual correction when the camera angle is unknown.
 pub fn calculate_observer_geometry(planet: &PlanetaryBody, jd: f64) -> ObserverGeometry {
-    let t = jd_to_centuries(jd);
-    let planet_lon = planet_ecliptic_longitude(planet, t).to_radians();
-    let earth_lon = earth_ecliptic_longitude(t).to_radians();
-    let (a_planet, planet_radius_km) = match planet.name {
-        "Jupiter" => (5.2026, planet.equatorial_radius_km),
-        "Saturn" => (9.5549, planet.equatorial_radius_km),
-        "Mars" => (1.5237, planet.equatorial_radius_km),
-        _ => (5.2026, planet.equatorial_radius_km),
+    // (α, δ) geocéntricas + distancias, con efeméride kepleriana precisa. Si el
+    // planeta no tiene elementos (no debería), respaldo al modelo circular.
+    let (ra, dec, distance_au, sun_dist_au) = match planet_elements(planet.name) {
+        Some(el) => {
+            let (ra, dec, dist) = geocentric_equatorial(&el, jd);
+            let helio = kepler_heliocentric_ecliptic(&el, jd);
+            let sun_dist = (helio[0] * helio[0] + helio[1] * helio[1] + helio[2] * helio[2]).sqrt();
+            (ra, dec, dist, sun_dist)
+        }
+        None => {
+            let t = jd_to_centuries(jd);
+            let planet_lon = planet_ecliptic_longitude(planet, t).to_radians();
+            let earth_lon = earth_ecliptic_longitude(t).to_radians();
+            let a_planet = 5.2026_f64;
+            let geo_x = a_planet * planet_lon.cos() - earth_lon.cos();
+            let geo_y = a_planet * planet_lon.sin() - earth_lon.sin();
+            let dist = (geo_x * geo_x + geo_y * geo_y).sqrt().max(0.001);
+            let obliquity = 23.439_291_f64.to_radians();
+            let (eq_x, eq_y, eq_z) = (geo_x, geo_y * obliquity.cos(), geo_y * obliquity.sin());
+            let ra = eq_y.atan2(eq_x);
+            let dec = eq_z.atan2((eq_x * eq_x + eq_y * eq_y).sqrt());
+            (ra, dec, dist, a_planet)
+        }
     };
-    let earth_x = earth_lon.cos();
-    let earth_y = earth_lon.sin();
-    let planet_x = a_planet * planet_lon.cos();
-    let planet_y = a_planet * planet_lon.sin();
-    let geo_x = planet_x - earth_x;
-    let geo_y = planet_y - earth_y;
-    let distance_au = (geo_x * geo_x + geo_y * geo_y).sqrt().max(0.001);
-
-    let obliquity = 23.439_291_f64.to_radians();
-    let eq_x = geo_x;
-    let eq_y = geo_y * obliquity.cos();
-    let eq_z = geo_y * obliquity.sin();
-    let ra = eq_y.atan2(eq_x);
-    let dec = eq_z.atan2((eq_x * eq_x + eq_y * eq_y).sqrt());
 
     let pole_ra = planet.pole_ra_deg.to_radians();
     let pole_dec = planet.pole_dec_deg.to_radians();
     let dra = pole_ra - ra;
 
+    // B0 = latitud planetocéntrica del punto sub-Terrestre (inclinación del eje
+    // hacia el observador); P = ángulo de posición del polo norte en el cielo.
     let b0 = (pole_dec.sin() * dec.sin() + pole_dec.cos() * dec.cos() * dra.cos()).asin();
     let p = (pole_dec.cos() * dra.sin())
         .atan2(pole_dec.sin() * dec.cos() - pole_dec.cos() * dec.sin() * dra.cos());
 
-    // Circular-orbit phase approximation via triangle Sun-Planet-Earth.
-    let sun_planet_au = a_planet;
+    // Fase Sol-planeta-observador con distancias REALES (radio heliocéntrico).
     let sun_earth_au = 1.0_f64;
-    let cos_phase = ((sun_planet_au * sun_planet_au) + (distance_au * distance_au)
+    let cos_phase = ((sun_dist_au * sun_dist_au) + (distance_au * distance_au)
         - (sun_earth_au * sun_earth_au))
-        / (2.0 * sun_planet_au * distance_au);
+        / (2.0 * sun_dist_au * distance_au).max(1e-6);
     let phase_angle_deg = cos_phase.clamp(-1.0, 1.0).acos().to_degrees();
+
     let au_km = 149_597_870.7_f64;
     let apparent_diameter_arcsec = 2.0
-        * (planet_radius_km / (distance_au * au_km))
-            .atan()
+        * (planet.equatorial_radius_km / (distance_au * au_km))
+            .clamp(-1.0, 1.0)
+            .asin()
             .to_degrees()
         * 3600.0;
 
@@ -1313,6 +1577,445 @@ pub fn apply_edge_blend(
 }
 
 // =============================================================================
+// 7b. BOUNDED / CANCELABLE DEROTATION RESOURCES
+// =============================================================================
+
+const DEROTATION_OS_RESERVE_BYTES: u64 = 768 * 1024 * 1024;
+const DEROTATION_MIN_OPERATION_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DerotationMemoryPlan {
+    cyl_width: usize,
+    cyl_height: usize,
+    working_budget: u64,
+    required_peak_bytes: u64,
+}
+
+#[inline]
+fn derotation_checked_mul(a: u64, b: u64, label: &str) -> Result<u64, String> {
+    a.checked_mul(b)
+        .ok_or_else(|| format!("Overflow al calcular {label} de derotación"))
+}
+
+#[inline]
+fn derotation_checked_add(a: u64, b: u64, label: &str) -> Result<u64, String> {
+    a.checked_add(b)
+        .ok_or_else(|| format!("Overflow al calcular {label} de derotación"))
+}
+
+fn derotation_cylindrical_dimensions(disc: &PlanetDisc) -> Result<(usize, usize), String> {
+    if !disc.radius_x.is_finite()
+        || !disc.radius_y.is_finite()
+        || disc.radius_x <= 0.0
+        || disc.radius_y <= 0.0
+    {
+        return Err("La geometría del disco no tiene radios positivos y finitos".into());
+    }
+    let width_f = disc.radius_x * PI;
+    let height_f = disc.radius_y * 2.0;
+    if !width_f.is_finite()
+        || !height_f.is_finite()
+        || width_f > usize::MAX as f64
+        || height_f > usize::MAX as f64
+    {
+        return Err("La proyección cilíndrica excede el espacio direccionable".into());
+    }
+    Ok(((width_f as usize).max(64), (height_f as usize).max(32)))
+}
+
+fn plan_derotation_memory_with_available(
+    w: usize,
+    h: usize,
+    channels: usize,
+    disc: &PlanetDisc,
+    available_ram: u64,
+) -> Result<DerotationMemoryPlan, String> {
+    if w == 0 || h == 0 || !matches!(channels, 1 | 3) {
+        return Err(format!(
+            "Geometría de derotación inválida: {w}x{h}, {channels} canales"
+        ));
+    }
+    let (cyl_width, cyl_height) = derotation_cylindrical_dimensions(disc)?;
+    let image_pixels = derotation_checked_mul(w as u64, h as u64, "píxeles de imagen")?;
+    let image_samples = derotation_checked_mul(
+        image_pixels,
+        channels as u64,
+        "muestras de imagen",
+    )?;
+    let image_bytes = derotation_checked_mul(image_samples, 2, "buffer de imagen")?;
+    let cyl_pixels = derotation_checked_mul(
+        cyl_width as u64,
+        cyl_height as u64,
+        "píxeles cilíndricos",
+    )?;
+    let cyl_samples = derotation_checked_mul(
+        cyl_pixels,
+        channels as u64,
+        "muestras cilíndricas",
+    )?;
+    let accum_bytes = derotation_checked_mul(cyl_samples, 4, "acumulador cilíndrico")?;
+    let weight_bytes = derotation_checked_mul(cyl_pixels, 4, "pesos cilíndricos")?;
+    let map_bytes = derotation_checked_mul(cyl_samples, 2, "mapa cilíndrico")?;
+
+    // Pico 1: copia corregida + accum f32 + pesos + mapa u16 durante la
+    // normalización. Pico 2: mapa + salida reprojectada. El shift se hace in
+    // place y el blend reutiliza la salida, por lo que no se cuentan copias que
+    // ya no existen en la implementación cancelable.
+    let projection_peak = derotation_checked_add(
+        image_bytes,
+        derotation_checked_add(
+            accum_bytes,
+            derotation_checked_add(weight_bytes, map_bytes, "pesos+mapa")?,
+            "acumulador+mapas",
+        )?,
+        "pico de proyección",
+    )?;
+    let reprojection_peak = derotation_checked_add(map_bytes, image_bytes, "pico de reproyección")?;
+    let raw_peak = projection_peak.max(reprojection_peak);
+    // 20% cubre cabeceras Vec, allocator, TIFF/preview concurrentes del caller
+    // y pequeñas tablas temporales sin inflar el resultado científico.
+    let required_peak_bytes = derotation_checked_mul(raw_peak, 6, "margen de memoria")? / 5;
+    // No conviertas la reserva del SO en un umbral mínimo artificial. En
+    // equipos con presión de memoria (y en contenedores) `available_memory`
+    // puede ser menor que la reserva nominal aun cuando una operación pequeña
+    // cabe holgadamente. Conservamos hasta 768 MiB, pero nunca apartamos más
+    // de una cuarta parte de la memoria que el sistema declara disponible.
+    let os_reserve = DEROTATION_OS_RESERVE_BYTES.min(available_ram / 4);
+    let usable = available_ram.saturating_sub(os_reserve);
+    // `available_memory` es una instantánea y puede caer casi a cero mientras
+    // el compilador u otra app libera páginas. Dejar un suelo pequeño evita
+    // falsos negativos para trabajos de unos KiB; todas las reservas reales
+    // siguen siendo fallibles, por lo que no se oculta un OOM auténtico.
+    let working_budget = (derotation_checked_mul(usable, 80, "presupuesto de memoria")? / 100)
+        .max(DEROTATION_MIN_OPERATION_BUDGET_BYTES);
+    if required_peak_bytes > working_budget {
+        return Err(format!(
+            "RAM insuficiente para derotación: el pico seguro requiere ~{} MiB y hay ~{} MiB disponibles tras reservar memoria del sistema. Reduce resolución/ROI.",
+            required_peak_bytes / (1024 * 1024),
+            working_budget / (1024 * 1024)
+        ));
+    }
+    Ok(DerotationMemoryPlan {
+        cyl_width,
+        cyl_height,
+        working_budget,
+        required_peak_bytes,
+    })
+}
+
+fn plan_derotation_memory(
+    w: usize,
+    h: usize,
+    channels: usize,
+    disc: &PlanetDisc,
+) -> Result<DerotationMemoryPlan, String> {
+    let mut system = System::new();
+    system.refresh_memory();
+    plan_derotation_memory_with_available(w, h, channels, disc, system.available_memory())
+}
+
+fn try_derotation_vec<T: Clone>(len: usize, value: T, label: &str) -> Result<Vec<T>, String> {
+    let bytes = len
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| format!("{label} excede el espacio direccionable"))?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|error| {
+        format!(
+            "No se pudo reservar {:.1} MiB para {label}: {error}",
+            bytes as f64 / (1024.0 * 1024.0)
+        )
+    })?;
+    values.resize(len, value);
+    Ok(values)
+}
+
+fn try_clone_derotation_image(image: &[u16], label: &str) -> Result<Vec<u16>, String> {
+    let mut output = Vec::new();
+    output.try_reserve_exact(image.len()).map_err(|error| {
+        format!(
+            "No se pudo reservar la copia de {label} ({:.1} MiB): {error}",
+            image.len() as f64 * 2.0 / (1024.0 * 1024.0)
+        )
+    })?;
+    output.extend_from_slice(image);
+    Ok(output)
+}
+
+#[inline]
+fn derotation_cancel_checkpoint(cancel: &dyn Fn() -> bool, phase: &str) -> Result<(), String> {
+    if cancel() {
+        Err(format!("Derotación cancelada durante {phase}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn apply_limb_correction_cancelable(
+    image: &mut [u16],
+    w: usize,
+    h: usize,
+    channels: usize,
+    disc: &PlanetDisc,
+    strength: f64,
+    cancel: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    if strength <= 0.001 {
+        return Ok(());
+    }
+    let (rx, ry) = (disc.radius_x, disc.radius_y);
+    let y_start = (disc.cy - ry).max(0.0) as usize;
+    let y_end = ((disc.cy + ry) as usize + 1).min(h);
+    let x_start = (disc.cx - rx).max(0.0) as usize;
+    let x_end = ((disc.cx + rx) as usize + 1).min(w);
+    for py in y_start..y_end {
+        derotation_cancel_checkpoint(cancel, "la corrección de limbo")?;
+        for px in x_start..x_end {
+            let nx = (px as f64 - disc.cx) / rx;
+            let ny = (py as f64 - disc.cy) / ry;
+            let r2 = nx * nx + ny * ny;
+            if r2 >= 1.0 {
+                continue;
+            }
+            let correction = (1.0 / (1.0 - r2).sqrt().powf(strength)).min(3.0);
+            let idx = (py * w + px) * channels;
+            for c in 0..channels {
+                image[idx + c] =
+                    (image[idx + c] as f64 * correction).clamp(0.0, 65535.0) as u16;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_to_cylindrical_cancelable(
+    image: &[u16],
+    w: usize,
+    h: usize,
+    channels: usize,
+    disc: &PlanetDisc,
+    planet: &PlanetaryBody,
+    sub_earth_lat_deg: f64,
+    plan: DerotationMemoryPlan,
+    cancel: &dyn Fn() -> bool,
+) -> Result<CylMap, String> {
+    let cyl_w = plan.cyl_width;
+    let cyl_h = plan.cyl_height;
+    let cyl_pixels = cyl_w
+        .checked_mul(cyl_h)
+        .ok_or_else(|| "Overflow de píxeles cilíndricos".to_string())?;
+    let cyl_samples = cyl_pixels
+        .checked_mul(channels)
+        .ok_or_else(|| "Overflow de muestras cilíndricas".to_string())?;
+    let mut accum = try_derotation_vec(cyl_samples, 0.0f32, "acumulador cilíndrico")?;
+    let mut weight = try_derotation_vec(cyl_pixels, 0.0f32, "pesos cilíndricos")?;
+    let oblate_factor = 1.0 - planet.oblateness;
+    let b0 = sub_earth_lat_deg.to_radians().clamp(-PI / 3.0, PI / 3.0);
+    let axis_angle = disc.angle_deg.to_radians();
+    let (cos_axis, sin_axis) = (axis_angle.cos(), axis_angle.sin());
+    let (rx, ry) = (disc.radius_x, disc.radius_y);
+    let y_start = (disc.cy - ry - 1.0).max(0.0) as usize;
+    let y_end = ((disc.cy + ry + 1.0) as usize).min(h);
+    let x_start = (disc.cx - rx - 1.0).max(0.0) as usize;
+    let x_end = ((disc.cx + rx + 1.0) as usize).min(w);
+
+    for py in y_start..y_end {
+        derotation_cancel_checkpoint(cancel, "la proyección cilíndrica")?;
+        for px in x_start..x_end {
+            let dx = px as f64 - disc.cx;
+            let dy = py as f64 - disc.cy;
+            let planet_x = dx * cos_axis + dy * sin_axis;
+            let planet_y = -dx * sin_axis + dy * cos_axis;
+            let nx = planet_x / rx;
+            let ny = planet_y / ry;
+            let r2 = nx * nx + ny * ny;
+            if r2 >= 1.0 {
+                continue;
+            }
+            let nz = (1.0 - r2).sqrt();
+            let corrected_y = ny / oblate_factor;
+            let lat = (corrected_y * b0.cos() + nz * b0.sin())
+                .asin()
+                .clamp(-PI / 2.0, PI / 2.0);
+            let lon = nx.atan2(nz * b0.cos() - corrected_y * b0.sin());
+            let cx_idx =
+                ((lon / PI + 0.5) * cyl_w as f64).clamp(0.0, (cyl_w - 1) as f64) as usize;
+            let cy_idx = ((lat / (PI / 2.0) + 1.0) * 0.5 * cyl_h as f64)
+                .clamp(0.0, (cyl_h - 1) as f64) as usize;
+            let cyl_offset = cy_idx * cyl_w + cx_idx;
+            let img_offset = py * w + px;
+            let limb_weight = nz as f32;
+            for c in 0..channels {
+                accum[cyl_offset * channels + c] +=
+                    image[img_offset * channels + c] as f32 * limb_weight;
+            }
+            weight[cyl_offset] += limb_weight;
+        }
+    }
+
+    // Esta reserva sucede en el pico planificado (accum + weight + mapa) y es
+    // fallible: una presión de memoria tardía devuelve error, nunca aborta.
+    let mut data = try_derotation_vec(cyl_samples, 0u16, "mapa cilíndrico")?;
+    for i in 0..cyl_pixels {
+        if (i & 0xffff) == 0 {
+            derotation_cancel_checkpoint(cancel, "la normalización cilíndrica")?;
+        }
+        if weight[i] > 0.0 {
+            for c in 0..channels {
+                data[i * channels + c] =
+                    (accum[i * channels + c] / weight[i]).clamp(0.0, 65535.0) as u16;
+            }
+        }
+    }
+    Ok(CylMap {
+        data,
+        width: cyl_w,
+        height: cyl_h,
+        channels,
+    })
+}
+
+fn shift_cylindrical_inplace_cancelable(
+    cyl: &mut CylMap,
+    delta_deg: f64,
+    cancel: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    if cyl.width == 0 || cyl.channels == 0 {
+        return Err("Mapa cilíndrico vacío".into());
+    }
+    let signed = (delta_deg / 360.0 * cyl.width as f64).round() as isize;
+    let shift_pixels = signed.rem_euclid(cyl.width as isize) as usize;
+    let row_samples = cyl
+        .width
+        .checked_mul(cyl.channels)
+        .ok_or_else(|| "Overflow de fila cilíndrica".to_string())?;
+    let shift_samples = shift_pixels
+        .checked_mul(cyl.channels)
+        .ok_or_else(|| "Overflow del shift cilíndrico".to_string())?;
+    for row in cyl.data.chunks_exact_mut(row_samples) {
+        derotation_cancel_checkpoint(cancel, "el desplazamiento cilíndrico")?;
+        row.rotate_right(shift_samples);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reproject_to_disc_cancelable(
+    cyl: &CylMap,
+    original: &[u16],
+    disc: &PlanetDisc,
+    out_w: usize,
+    out_h: usize,
+    channels: usize,
+    planet: &PlanetaryBody,
+    sub_earth_lat_deg: f64,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<u16>, String> {
+    // Igual que la ruta científica histórica: la reproyección parte de negro
+    // y el blend posterior restaura el original fuera del disco. Iniciar aquí
+    // con `original` cambia píxeles de la elipse rotada que quedan fuera de la
+    // máscara de blend no rotada (`disc.angle_deg != 0`).
+    let mut out = try_derotation_vec(original.len(), 0u16, "salida derotada")?;
+    let (rx, ry) = (disc.radius_x, disc.radius_y);
+    let oblate_factor = 1.0 - planet.oblateness;
+    let b0 = sub_earth_lat_deg.to_radians().clamp(-PI / 3.0, PI / 3.0);
+    let axis_angle = disc.angle_deg.to_radians();
+    let (cos_axis, sin_axis) = (axis_angle.cos(), axis_angle.sin());
+    let y_start = (disc.cy - ry - 1.0).max(0.0) as usize;
+    let y_end = ((disc.cy + ry + 1.0) as usize).min(out_h);
+    let x_start = (disc.cx - rx - 1.0).max(0.0) as usize;
+    let x_end = ((disc.cx + rx + 1.0) as usize).min(out_w);
+    let cw = cyl.width as isize;
+    let ch = cyl.height as isize;
+
+    for py in y_start..y_end {
+        derotation_cancel_checkpoint(cancel, "la reproyección al disco")?;
+        for px in x_start..x_end {
+            let dx = px as f64 - disc.cx;
+            let dy = py as f64 - disc.cy;
+            let planet_x = dx * cos_axis + dy * sin_axis;
+            let planet_y = -dx * sin_axis + dy * cos_axis;
+            let nx = planet_x / rx;
+            let ny = planet_y / ry;
+            let r2 = nx * nx + ny * ny;
+            if r2 >= 1.0 {
+                continue;
+            }
+            let nz = (1.0 - r2).sqrt();
+            let corrected_y = ny / oblate_factor;
+            let lat = (corrected_y * b0.cos() + nz * b0.sin())
+                .asin()
+                .clamp(-PI / 2.0, PI / 2.0);
+            let lon = nx.atan2(nz * b0.cos() - corrected_y * b0.sin());
+            let cx_f = (lon / PI + 0.5) * cyl.width as f64;
+            let cy_f = (lat / (PI / 2.0) + 1.0) * 0.5 * cyl.height as f64;
+            let ix = cx_f.floor() as isize;
+            let iy = cy_f.floor() as isize;
+            let fx = (cx_f - ix as f64) as f32;
+            let fy = (cy_f - iy as f64) as f32;
+            let sample = |sx: isize, sy: isize, c: usize| -> f32 {
+                let sx = sx.rem_euclid(cw);
+                let sy = sy.clamp(0, ch - 1);
+                cyl.data[(sy as usize * cyl.width + sx as usize) * cyl.channels + c] as f32
+            };
+            let out_idx = (py * out_w + px) * channels;
+            for c in 0..channels {
+                let v00 = sample(ix, iy, c);
+                let v10 = sample(ix + 1, iy, c);
+                let v01 = sample(ix, iy + 1, c);
+                let v11 = sample(ix + 1, iy + 1, c);
+                out[out_idx + c] = (v00 * (1.0 - fx) * (1.0 - fy)
+                    + v10 * fx * (1.0 - fy)
+                    + v01 * (1.0 - fx) * fy
+                    + v11 * fx * fy)
+                    .clamp(0.0, 65535.0) as u16;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn apply_edge_blend_inplace_cancelable(
+    derotated: &mut [u16],
+    original: &[u16],
+    w: usize,
+    h: usize,
+    channels: usize,
+    disc: &PlanetDisc,
+    blend_width: f64,
+    cancel: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    let (rx, ry) = (disc.radius_x, disc.radius_y);
+    for py in 0..h {
+        derotation_cancel_checkpoint(cancel, "la mezcla del borde")?;
+        for px in 0..w {
+            let nx = (px as f64 - disc.cx) / rx;
+            let ny = (py as f64 - disc.cy) / ry;
+            let r = (nx * nx + ny * ny).sqrt();
+            let idx = (py * w + px) * channels;
+            if r >= 1.0 {
+                derotated[idx..idx + channels]
+                    .copy_from_slice(&original[idx..idx + channels]);
+                continue;
+            }
+            let inner_r = 1.0 - blend_width;
+            let blend_factor = if r < inner_r {
+                1.0
+            } else {
+                let t = (r - inner_r) / blend_width;
+                0.5 * (1.0 + (t * PI).cos())
+            };
+            for c in 0..channels {
+                derotated[idx + c] = (derotated[idx + c] as f64 * blend_factor
+                    + original[idx + c] as f64 * (1.0 - blend_factor))
+                    .clamp(0.0, 65535.0) as u16;
+            }
+        }
+    }
+    Ok(())
+}
+
+// =============================================================================
 // 8. FULL DEROTATION PIPELINE
 // =============================================================================
 
@@ -1359,6 +2062,126 @@ pub fn derotate_single(
         0.0,
         disc_override,
     )
+}
+
+/// Ruta de producción: mismo modelo científico que `derotate_single_advanced`,
+/// pero con preflight de RAM, reservas fallibles, shift in-place y checkpoints
+/// en cada fase larga. Un error/cancelación nunca devuelve una imagen parcial.
+#[allow(clippy::too_many_arguments)]
+pub fn derotate_single_advanced_cancelable<F>(
+    image: &[u16],
+    w: usize,
+    h: usize,
+    channels: usize,
+    planet: &PlanetaryBody,
+    capture_time_jd: f64,
+    reference_time_jd: f64,
+    limb_strength: f64,
+    cm_system: usize,
+    sub_earth_lat_deg: f64,
+    disc_override: Option<&PlanetDisc>,
+    cancel: F,
+) -> Result<Vec<u16>, String>
+where
+    F: Fn() -> bool,
+{
+    derotation_cancel_checkpoint(&cancel, "el inicio")?;
+    let pixels = w
+        .checked_mul(h)
+        .ok_or_else(|| "Overflow de píxeles de derotación".to_string())?;
+    let expected_samples = pixels
+        .checked_mul(channels)
+        .ok_or_else(|| "Overflow de muestras de derotación".to_string())?;
+    if w == 0
+        || h == 0
+        || !matches!(channels, 1 | 3)
+        || image.len() != expected_samples
+    {
+        return Err(format!(
+            "Buffer de derotación inválido: {} muestras para {w}x{h}x{channels}",
+            image.len()
+        ));
+    }
+
+    let raw_disc = if let Some(disc) = disc_override {
+        disc.clone()
+    } else {
+        let mut mono = try_derotation_vec(pixels, 0u16, "detección del disco")?;
+        if channels == 1 {
+            mono.copy_from_slice(image);
+        } else {
+            for (index, value) in mono.iter_mut().enumerate() {
+                if (index & 0xffff) == 0 {
+                    derotation_cancel_checkpoint(&cancel, "la detección del disco")?;
+                }
+                *value = image[index * channels + 1];
+            }
+        }
+        detect_planet_disc(&mono, w, h)
+    };
+    let disc = validate_disc_aspect(&raw_disc, planet);
+    let delta_deg = rotation_delta_deg(planet, reference_time_jd, capture_time_jd, cm_system);
+    if delta_deg.abs() < 0.01 {
+        derotation_cancel_checkpoint(&cancel, "la copia sin desplazamiento")?;
+        return try_clone_derotation_image(image, "resultado sin desplazamiento");
+    }
+
+    let plan = plan_derotation_memory(w, h, channels, &disc)?;
+    eprintln!(
+        "[DEROT] plan RAM: cilindro {}x{} · pico {} MiB / presupuesto {} MiB",
+        plan.cyl_width,
+        plan.cyl_height,
+        plan.required_peak_bytes / (1024 * 1024),
+        plan.working_budget / (1024 * 1024)
+    );
+
+    let mut corrected = try_clone_derotation_image(image, "corrección de limbo")?;
+    apply_limb_correction_cancelable(
+        &mut corrected,
+        w,
+        h,
+        channels,
+        &disc,
+        limb_strength,
+        &cancel,
+    )?;
+    let mut cylindrical = project_to_cylindrical_cancelable(
+        &corrected,
+        w,
+        h,
+        channels,
+        &disc,
+        planet,
+        sub_earth_lat_deg,
+        plan,
+        &cancel,
+    )?;
+    drop(corrected);
+    shift_cylindrical_inplace_cancelable(&mut cylindrical, delta_deg, &cancel)?;
+    let mut output = reproject_to_disc_cancelable(
+        &cylindrical,
+        image,
+        &disc,
+        w,
+        h,
+        channels,
+        planet,
+        sub_earth_lat_deg,
+        &cancel,
+    )?;
+    drop(cylindrical);
+    apply_edge_blend_inplace_cancelable(
+        &mut output,
+        image,
+        w,
+        h,
+        channels,
+        &disc,
+        0.08,
+        &cancel,
+    )?;
+    derotation_cancel_checkpoint(&cancel, "el cierre")?;
+    Ok(output)
 }
 
 /// Derotate a single frame with observer geometry (B0) and image-axis orientation.
@@ -1532,6 +2355,62 @@ mod tests {
     }
 
     #[test]
+    fn test_new_planets_rotation_rates() {
+        // Los 3 planetas nuevos existen y tienen la tasa/dirección correcta.
+        assert!(get_planet("venus").is_some());
+        assert!(get_planet("uranus").is_some());
+        assert!(get_planet("neptune").is_some());
+        // Venus: super-rotación atmosférica retrógrada ~4.4 d → ~-81.8°/día.
+        let venus = rotation_delta_deg(&VENUS, 2451545.0, 2451545.0 + 1.0, 0);
+        assert!(
+            (venus + 81.82).abs() < 0.1,
+            "Venus ~-81.8°/día, dio {venus:.2}"
+        );
+        // Urano: retrógrado (negativo).
+        let uranus = rotation_delta_deg(&URANUS, 2451545.0, 2451545.0 + 1.0, 0);
+        assert!(
+            uranus < 0.0 && (uranus + 501.79).abs() < 0.1,
+            "Urano ~-501.79°/día, dio {uranus:.2}"
+        );
+        // Neptuno: prógrado ~536.3°/día (periodo ~16.1 h).
+        let neptune = rotation_delta_deg(&NEPTUNE, 2451545.0, 2451545.0 + 1.0, 0);
+        assert!(
+            (neptune - 536.31).abs() < 0.1,
+            "Neptuno ~536.31°/día, dio {neptune:.2}"
+        );
+    }
+
+    #[test]
+    fn test_kepler_ephemeris_sanity() {
+        // Tierra: radio heliocéntrico ≈ 1 AU.
+        let earth = kepler_heliocentric_ecliptic(&EARTH_ELEMENTS, 2451545.0);
+        let r_earth = (earth[0] * earth[0] + earth[1] * earth[1] + earth[2] * earth[2]).sqrt();
+        assert!(
+            (r_earth - 1.0).abs() < 0.02,
+            "Tierra |r| = {r_earth:.4} AU (esperado ~1)"
+        );
+
+        // Júpiter en su oposición 2024-12-07: Δ ≈ 4.1 AU, diámetro ≈ 48″, B0 pequeño.
+        let jd = datetime_to_jd(2024, 12, 7, 0, 0, 0.0);
+        let geo = calculate_observer_geometry(&JUPITER, jd);
+        assert!(
+            geo.distance_au > 3.9 && geo.distance_au < 4.35,
+            "Júpiter Δ = {:.3} AU (esperado ~4.1 en oposición)",
+            geo.distance_au
+        );
+        assert!(
+            geo.apparent_diameter_arcsec > 44.0 && geo.apparent_diameter_arcsec < 52.0,
+            "Júpiter diámetro = {:.1}″ (esperado ~48)",
+            geo.apparent_diameter_arcsec
+        );
+        assert!(
+            geo.sub_earth_lat_deg.abs() < 4.0,
+            "Júpiter B0 = {:.2}° (su eje solo se inclina ~3.1°)",
+            geo.sub_earth_lat_deg
+        );
+    }
+
+    #[test]
     fn test_central_meridian_returns_valid_range() {
         let (cm1, cm2, cm3) = calculate_central_meridian(&JUPITER, 2460676.5);
         assert!(cm1 >= 0.0 && cm1 < 360.0, "CM1 out of range: {}", cm1);
@@ -1604,5 +2483,251 @@ mod tests {
             "Detected rx should be ~50, got {:.1}",
             disc.radius_x
         );
+    }
+
+    #[test]
+    fn derotation_memory_plan_rejects_before_a_giant_allocation() {
+        let disc = PlanetDisc {
+            cx: 5_000.0,
+            cy: 5_000.0,
+            radius_x: 4_500.0,
+            radius_y: 4_300.0,
+            angle_deg: 0.0,
+            phase: 1.0,
+        };
+        let error = plan_derotation_memory_with_available(
+            10_000,
+            10_000,
+            3,
+            &disc,
+            2 * 1024 * 1024 * 1024,
+        )
+        .unwrap_err();
+        assert!(error.contains("RAM insuficiente"), "{error}");
+    }
+
+    #[test]
+    fn derotation_memory_plan_allows_small_work_under_memory_pressure() {
+        let disc = PlanetDisc {
+            cx: 48.0,
+            cy: 40.0,
+            radius_x: 31.0,
+            radius_y: 29.0,
+            angle_deg: 0.0,
+            phase: 1.0,
+        };
+        let plan = plan_derotation_memory_with_available(
+            96,
+            80,
+            3,
+            &disc,
+            256 * 1024 * 1024,
+        )
+        .expect("a tiny derotation must not be rejected by a fixed OS reserve");
+        assert!(plan.required_peak_bytes < plan.working_budget);
+    }
+
+    #[test]
+    fn cancelable_derotation_matches_legacy_pipeline_bit_for_bit() {
+        let (w, h) = (96usize, 80usize);
+        let disc = PlanetDisc {
+            cx: 48.0,
+            cy: 40.0,
+            radius_x: 31.0,
+            radius_y: 29.0,
+            angle_deg: 4.0,
+            phase: 1.0,
+        };
+        let mut image = vec![0u16; w * h * 3];
+        for (index, value) in image.iter_mut().enumerate() {
+            *value = ((index * 97 + index / 11 * 31) & 0xffff) as u16;
+        }
+        let capture = 2_460_676.5;
+        let reference = capture + 12.0 / 86_400.0;
+        let legacy = derotate_single_advanced(
+            &image,
+            w,
+            h,
+            3,
+            &JUPITER,
+            capture,
+            reference,
+            0.35,
+            1,
+            1.5,
+            Some(&disc),
+        );
+        let validated_disc = validate_disc_aspect(&disc, &JUPITER);
+        let diagnostic_plan = plan_derotation_memory_with_available(
+            w,
+            h,
+            3,
+            &validated_disc,
+            256 * 1024 * 1024,
+        )
+        .unwrap();
+        let mut legacy_corrected = image.clone();
+        apply_limb_correction(
+            &mut legacy_corrected,
+            w,
+            h,
+            3,
+            &validated_disc,
+            0.35,
+        );
+        let mut bounded_corrected = image.clone();
+        apply_limb_correction_cancelable(
+            &mut bounded_corrected,
+            w,
+            h,
+            3,
+            &validated_disc,
+            0.35,
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(bounded_corrected, legacy_corrected, "limb correction");
+        let legacy_cyl = project_to_cylindrical(
+            &legacy_corrected,
+            w,
+            h,
+            3,
+            &validated_disc,
+            &JUPITER,
+            1.5,
+        );
+        let bounded_cyl = project_to_cylindrical_cancelable(
+            &bounded_corrected,
+            w,
+            h,
+            3,
+            &validated_disc,
+            &JUPITER,
+            1.5,
+            diagnostic_plan,
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(bounded_cyl.data, legacy_cyl.data, "cylindrical projection");
+        let delta = rotation_delta_deg(&JUPITER, reference, capture, 1);
+        let legacy_shifted = shift_cylindrical(&legacy_cyl, delta);
+        let mut bounded_shifted = bounded_cyl;
+        shift_cylindrical_inplace_cancelable(&mut bounded_shifted, delta, &|| false).unwrap();
+        assert_eq!(
+            bounded_shifted.data, legacy_shifted.data,
+            "cylindrical shift"
+        );
+        let legacy_reprojected = reproject_to_disc(
+            &legacy_shifted,
+            &validated_disc,
+            w,
+            h,
+            3,
+            &JUPITER,
+            1.5,
+        );
+        let mut bounded_reprojected = reproject_to_disc_cancelable(
+            &bounded_shifted,
+            &image,
+            &validated_disc,
+            w,
+            h,
+            3,
+            &JUPITER,
+            1.5,
+            &|| false,
+        )
+        .unwrap();
+        apply_edge_blend_inplace_cancelable(
+            &mut bounded_reprojected,
+            &image,
+            w,
+            h,
+            3,
+            &validated_disc,
+            0.08,
+            &|| false,
+        )
+        .unwrap();
+        let legacy_blended = apply_edge_blend(
+            &legacy_reprojected,
+            &image,
+            w,
+            h,
+            3,
+            &validated_disc,
+            0.08,
+        );
+        if bounded_reprojected != legacy_blended {
+            let first = bounded_reprojected
+                .iter()
+                .zip(&legacy_blended)
+                .position(|(bounded, legacy)| bounded != legacy)
+                .unwrap();
+            panic!(
+                "reprojection and edge blend diverged at {first}: bounded={} legacy={}",
+                bounded_reprojected[first], legacy_blended[first]
+            );
+        }
+        let bounded = derotate_single_advanced_cancelable(
+            &image,
+            w,
+            h,
+            3,
+            &JUPITER,
+            capture,
+            reference,
+            0.35,
+            1,
+            1.5,
+            Some(&disc),
+            || false,
+        )
+        .unwrap();
+        if bounded != legacy {
+            let first = bounded
+                .iter()
+                .zip(&legacy)
+                .position(|(bounded, legacy)| bounded != legacy)
+                .unwrap_or(0);
+            let differing = bounded
+                .iter()
+                .zip(&legacy)
+                .filter(|(bounded, legacy)| bounded != legacy)
+                .count();
+            panic!(
+                "cancelable derotation diverged at sample {first}: bounded={} legacy={} ({differing} differing samples)",
+                bounded[first], legacy[first]
+            );
+        }
+    }
+
+    #[test]
+    fn cancelable_derotation_stops_before_work_when_generation_is_stale() {
+        let image = vec![1_000u16; 64 * 64 * 3];
+        let disc = PlanetDisc {
+            cx: 32.0,
+            cy: 32.0,
+            radius_x: 24.0,
+            radius_y: 23.0,
+            angle_deg: 0.0,
+            phase: 1.0,
+        };
+        let error = derotate_single_advanced_cancelable(
+            &image,
+            64,
+            64,
+            3,
+            &JUPITER,
+            2_460_676.5,
+            2_460_676.6,
+            0.0,
+            1,
+            0.0,
+            Some(&disc),
+            || true,
+        )
+        .unwrap_err();
+        assert!(error.contains("cancelada"), "{error}");
     }
 }

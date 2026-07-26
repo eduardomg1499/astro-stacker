@@ -1,0 +1,324 @@
+{
+  "schemaVersion": "zenith-planetary-optimization-review-v1",
+  "generatedAt": "2026-07-16T10:48:57Z",
+  "scope": {
+    "uiFlow": "Planetario > General/Superficie",
+    "targetGeometry": {
+      "width": 3312,
+      "height": 5888,
+      "pixelsPerFrame": 19501056,
+      "sourceFrames": 2055,
+      "selectedFrames": 1028
+    },
+    "included": [
+      "MOV/MP4 mediante FFmpeg",
+      "SER nativo",
+      "analisis planetario",
+      "referencia maestra robusta",
+      "malla de puntos AP",
+      "alineacion y warping",
+      "acumulacion CPU/GPU",
+      "planificacion de RAM",
+      "cache planetaria"
+    ],
+    "excluded": [
+      "cambios matematicos en deepsky.rs",
+      "cambios matematicos en gpu_deepsky.rs",
+      "demostracion competitiva end-to-end contra AutoStakkert!4"
+    ]
+  },
+  "objectives": [
+    "Superar a AutoStakkert!4 y a los comparadores declarados en calidad y rendimiento, sin degradar calidad",
+    "Usar CPU, GPU o modo hibrido segun la ruta que mida mejor rendimiento real",
+    "Cubrir SER, AVI, MOV y MP4; mono, RGB y Bayer; 8 a 16 bits",
+    "Cubrir superficie solar/lunar, disco completo, fases lunares y planetas pequenos o completos",
+    "Operar en Apple Silicon y Windows moderno sin TDR, swap ni fallos silenciosos",
+    "Mantener cielo profundo fuera del alcance funcional de esta optimizacion"
+  ],
+  "objectiveCoverage": [
+    {
+      "order": 1,
+      "objective": "Superficie General en MOV/MP4",
+      "implementation": "Ruta compacta y selector exacto implementados",
+      "evidence": "Exactitud H.264/B-frames a 64x48 y modelado a 20 MP",
+      "gap": "E2E real, HEVC/ProRes 20 MP y cold/warm cache"
+    },
+    {
+      "order": 2,
+      "objective": "SER mono, color y Bayer",
+      "implementation": "Lector nativo, CFA y profundidades de 8 a 16 bits",
+      "evidence": "Suite funcional y analisis rapido observado",
+      "gap": "Reapertura por lote y E2E de segunda pasada"
+    },
+    {
+      "order": 3,
+      "objective": "CPU, GPU e Hybrid",
+      "implementation": "Politicas, paridad y fallback integro",
+      "evidence": "Metal fisico en Apple M5",
+      "gap": "Ventaja E2E y scheduler unificado"
+    },
+    {
+      "order": 4,
+      "objective": "Solar, lunar, fases y planetas",
+      "implementation": "Ruteo y matriz de escenarios definidos",
+      "evidence": "Fixtures y pruebas unitarias",
+      "gap": "Corpus real por modalidad y holdout independiente"
+    },
+    {
+      "order": 5,
+      "objective": "Matrices Bayer de camara",
+      "implementation": "RGGB, GRBG, GBRG y BGGR; profundidades SER cubiertas",
+      "evidence": "Pruebas de CFA y paridad",
+      "gap": "Camaras reales, ROI/rotacion y politica para CFA no Bayer"
+    },
+    {
+      "order": 6,
+      "objective": "macOS y Windows",
+      "implementation": "Metal y backends wgpu previstos",
+      "evidence": "Apple M5 fisico",
+      "gap": "NVIDIA, AMD, Intel iGPU, TDR y fallback fisicos"
+    },
+    {
+      "order": 7,
+      "objective": "Superar AutoStakkert!4",
+      "implementation": "Arnes y gates competitivos definidos",
+      "evidence": "Sin A/B real autorizado",
+      "gap": "Misma captura, hardware, configuracion y evaluacion ciega"
+    },
+    {
+      "order": 8,
+      "objective": "No tocar cielo profundo",
+      "implementation": "Sin cambio matematico intencional en esta optimizacion",
+      "evidence": "Smoke test previo del runtime GPU compartido",
+      "gap": "Resolver cambios concurrentes y repetir regresion completa"
+    }
+  ],
+  "sourceSnapshot": {
+    "branch": "codex/planetary-world-class",
+    "baseCommit": "4181a933218f3e30eeb7ce065211fcefb9cdf12d",
+    "workingTree": "dirty",
+    "attributionCaveat": "La rama contiene cambios planetarios previos y cambios concurrentes no relacionados; no existe todavia un commit aislado para esta optimizacion."
+  },
+  "componentBenchmarks": [
+    {
+      "component": "Malla AP directa",
+      "scenario": "3840x2160 sintetico, paridad exacta contra integral image",
+      "baselineMs": 10.073,
+      "optimizedMs": 1.373,
+      "speedup": 7.34,
+      "timeReductionPercent": 86.37,
+      "qualityContract": "salida exacta",
+      "evidenceClass": "A-microbenchmark-in-tree",
+      "currentReproduction": "blocked-by-unrelated-deepsky-release-build"
+    },
+    {
+      "component": "Warp CPU RGB",
+      "scenario": "3312x5888, checksum identico",
+      "baselineMs": 309.0,
+      "optimizedMs": 63.0,
+      "speedup": 4.9,
+      "timeReductionPercent": 79.61,
+      "qualityContract": "checksum identico",
+      "evidenceClass": "A-microbenchmark-in-tree",
+      "currentReproduction": "blocked-by-unrelated-deepsky-release-build"
+    },
+    {
+      "component": "Referencia robusta, 12 frames",
+      "scenario": "3312x5888 RGB16",
+      "baselineMs": 2718.0,
+      "optimizedMs": 2046.0,
+      "speedup": 1.33,
+      "timeReductionPercent": 24.72,
+      "qualityContract": "bit-exact en harness",
+      "evidenceClass": "B-one-off-release-harness",
+      "currentReproduction": "not-packaged-as-repo-benchmark"
+    },
+    {
+      "component": "Referencia robusta, 20 frames",
+      "scenario": "3312x5888 RGB16",
+      "baselineMs": 5759.0,
+      "optimizedMs": 4740.0,
+      "speedup": 1.22,
+      "timeReductionPercent": 17.69,
+      "qualityContract": "bit-exact en harness",
+      "evidenceClass": "B-one-off-release-harness",
+      "currentReproduction": "not-packaged-as-repo-benchmark"
+    }
+  ],
+  "throughputAndMemoryEffects": [
+    {
+      "component": "Pipe de analisis MOV color",
+      "baseline": 6.0,
+      "optimized": 2.0,
+      "unit": "bytes por pixel",
+      "reductionPercent": 66.67,
+      "derivedTotalGiB": {
+        "baseline": 223.935,
+        "optimized": 74.645,
+        "frames": 2055
+      },
+      "derivation": "RGB48 completo frente a plano verde gray16le",
+      "evidenceClass": "A-byte-exact-physical-ffmpeg-test",
+      "limitation": "No equivale a una reduccion de 66.67% del tiempo total de analisis."
+    },
+    {
+      "component": "Pipe RGB48 del apilado MOV con seleccion de 50%",
+      "baseline": 223.93,
+      "optimized": 112.02,
+      "unit": "GiB calculados por pasada",
+      "reductionPercent": 49.98,
+      "derivation": "geometria 3312x5888, 2055 frente a 1028 frames materializados",
+      "evidenceClass": "B-derived-volume-plus-small-physical-fixture",
+      "limitation": "El codec todavia decodifica GOPs y el test de exactitud 1028/2056 usa 64x48; no es tiempo E2E medido."
+    },
+    {
+      "component": "Readback GPU de analisis de superficie",
+      "baseline": 55.793,
+      "optimized": 18.598,
+      "unit": "MiB por frame a 3312x5888",
+      "reductionPercent": 66.67,
+      "derivation": "se omite el producto half y se empaqueta u16",
+      "evidenceClass": "A-layout-test-plus-physical-parity",
+      "limitation": "No mide por si solo el analisis completo."
+    },
+    {
+      "component": "Preprocesamiento GPU de analisis",
+      "baseline": null,
+      "optimized": 17.53,
+      "unit": "ms por frame; aproximadamente 57 FPS",
+      "reductionPercent": null,
+      "derivation": "lote de 6 frames a 3312x5888 en Apple M5",
+      "evidenceClass": "B-isolated-physical-measurement",
+      "limitation": "Excluye decode, ranking completo, AP, referencia, ambas pasadas y exportacion."
+    },
+    {
+      "component": "Copias transitorias de referencia",
+      "baseline": 1.308,
+      "optimized": 0.0,
+      "unit": "GiB eliminados para 12 frames; hasta 2.179 GiB para 20",
+      "reductionPercent": 100.0,
+      "derivation": "movimiento de buffers en vez de clonacion de RGB16 completo",
+      "evidenceClass": "B-static-memory-accounting",
+      "limitation": "No incluye el almacenamiento necesario de los frames fuente."
+    },
+    {
+      "component": "Concurrencia planificada",
+      "baseline": 2.0,
+      "optimized": 7.5,
+      "unit": "hilos, estimacion 7 a 8 sobre 10",
+      "reductionPercent": null,
+      "derivation": "plan de picos por fase con 10 GiB seguros",
+      "evidenceClass": "C-resource-model",
+      "limitation": "Debe verificarse E2E para descartar sobresuscripcion entre Rayon, FFmpeg y GPU."
+    }
+  ],
+  "validationSnapshot": {
+    "status": "passed-before-concurrent-deepsky-edit",
+    "rustSuite": {
+      "command": "cargo test --bin astro-stacker",
+      "passed": 355,
+      "failed": 0,
+      "ignored": 24
+    },
+    "physicalMetal": [
+      "planetary_analysis_gpu_batch_parity_physical: passed",
+      "planetary_sad_batch_gpu_parity_physical: passed",
+      "gpu_parity_matches_cpu_reference: passed; worst RMSE 0.0030 ADU16; coverage difference 0 px",
+      "deepsky_gpu_parity_physical: passed as shared-runtime regression"
+    ],
+    "physicalFfmpeg": [
+      "ffmpeg_cancelable_select_handles_more_than_256_exact_rgb_frames: passed for 1028 selected of 2056 at 64x48",
+      "ffmpeg_analysis_green_is_bit_exact_to_rgb48_green_channel: passed"
+    ],
+    "buildChecks": [
+      "cargo check --bin astro-stacker: passed before concurrent deep-sky edit",
+      "npm run build: passed",
+      "git diff --check: passed"
+    ],
+    "currentIntegrationBlocker": {
+      "command": "cargo test --release --bin astro-stacker benchmark_surface_rgb_3312x5888 -- --ignored --nocapture",
+      "result": "failed-before-benchmark",
+      "errors": 8,
+      "area": "concurrent deep-sky changes",
+      "files": [
+        "src-tauri/src/deepsky.rs",
+        "src-tauri/src/nebula_fusion.rs",
+        "src-tauri/src/pipeline.rs"
+      ],
+      "missingFields": [
+        "struct_mode",
+        "struct_map",
+        "struct_residual",
+        "struct_accepted"
+      ],
+      "scopeConclusion": "No atribuir el fallo a la ruta planetaria, pero no declarar el arbol actual listo para release hasta resolverlo y repetir todas las pruebas."
+    }
+  },
+  "implementationAreas": [
+    {
+      "area": "FFmpeg metadata and streaming",
+      "files": ["src-tauri/src/types.rs", "src-tauri/src/frame_source.rs"],
+      "changes": ["timeouts acotados", "probe reducido", "plano verde exacto", "selector exacto balanceado", "watchdog adaptativo"]
+    },
+    {
+      "area": "Planetary orchestration",
+      "files": ["src-tauri/src/commands_v2_v3.rs"],
+      "changes": ["cache todo-o-nada", "seleccion FFmpeg de salida", "plan RAM por fase", "referencia robusta sin clones", "probe VRAM separado por pasada"]
+    },
+    {
+      "area": "GPU analysis and accumulation",
+      "files": ["src-tauri/src/gpu_analysis.rs", "src-tauri/src/gpu_stack.rs"],
+      "changes": ["readback u16 compacto", "productos opcionales", "epoch de fallo no destructivo", "presupuesto Metal de memoria unificada"]
+    },
+    {
+      "area": "CPU warp and AP mesh",
+      "files": ["src-tauri/src/liquid_warping.rs", "src-tauri/src/smart_ap_generator.rs", "src/main.js"],
+      "changes": ["paralelismo por filas", "NEON", "desempate IDW determinista", "malla sin SAT gigante", "dibujo UI con buckets espaciales", "cache persistente Smart AP"]
+    }
+  ],
+  "openFindings": [
+    {
+      "priority": "P0-acceptance",
+      "finding": "El arbol actual no compila en release por cambios concurrentes de cielo profundo.",
+      "implication": "No se puede certificar ni entregar una build hasta restaurar compilacion y repetir la matriz."
+    },
+    {
+      "priority": "P1-performance",
+      "finding": "La precarga SER crea hasta ocho grupos por lote y ejecuta VideoInput::open tambien para grupos vacios.",
+      "location": "src-tauri/src/commands_v2_v3.rs:6878",
+      "implication": "Con batch de un frame puede haber hasta ocho aperturas/remapeos por lote y por pasada; es un candidato principal para la lentitud SER observada."
+    },
+    {
+      "priority": "P1-performance",
+      "finding": "MOV puede recorrer el codec de nuevo para referencia y segunda pasada cuando la cache completa no cabe.",
+      "implication": "La seleccion exacta reduce conversion y stdout, pero no elimina el decode de GOP."
+    },
+    {
+      "priority": "P1-performance",
+      "finding": "FFmpeg, Rayon, refinamiento AP/LK y GPU no comparten un scheduler medido.",
+      "implication": "Aumentar hilos o batch sin perfil puede causar sobresuscripcion y reducir throughput."
+    },
+    {
+      "priority": "P2-scalability",
+      "finding": "El selector FFmpeg por expresion esta limitado a 2048 indices y aproximadamente 24 KiB.",
+      "implication": "Capturas con selecciones mayores requieren libav, filter script o seleccion segmentada."
+    }
+  ],
+  "decision": {
+    "engineeringDirection": "continue-with-gates",
+    "competitiveClaim": "not-authorized",
+    "rationale": "Las mejoras atacan cuellos de botella reales y tienen buenas invariantes de exactitud, pero no existe todavia una medicion end-to-end de los videos del usuario ni una matriz completa contra competidores y Windows."
+  },
+  "requiredNextGates": [
+    "Congelar un commit planetario aislado y restaurar compilacion release verde",
+    "Eliminar aperturas repetidas de lectores SER y mantener lectores persistentes durante cada pasada",
+    "Perfilar desde apertura hasta master lineal, por fase, en el MOV y SER del usuario",
+    "Ejecutar cold y warm cache, CPU-only, GPU-only e Hybrid sin swap ni thermal throttling",
+    "Validar los 14 escenarios planetarios de benchmarks/dataset-matrix.json",
+    "Ejecutar Windows fisico en NVIDIA, AMD e Intel iGPU",
+    "Comparar contra una version fijada de AutoStakkert!4 en el mismo Windows, hardware, SSD, crop, porcentaje y drizzle",
+    "Usar al menos cinco ejecuciones, mediana de velocidad y un intervalo de confianza",
+    "Exigir cero perdidas objetivas de calidad y al menos una mejora material por escenario contra referencia independiente",
+    "Publicar afirmaciones solo por competidor, version, escenario y plataforma cubiertos"
+  ]
+}

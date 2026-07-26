@@ -35,3 +35,10 @@ latest.json
 # Temporary local scripts and diagnostics
 *.tmp
 *.bak
+
+# Trazas del benchmark E2E planetario (perf_trace)
+benchmarks/telemetry/
+
+# Artefactos locales de QA visual e informes generados (no fuente)
+tmp/
+output/

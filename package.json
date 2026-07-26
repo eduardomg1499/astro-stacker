@@ -1,11 +1,12 @@
 {
   "name": "astro-stacker",
   "private": true,
-  "version": "0.2.8",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test": "node --test tests/*.test.mjs",
     "preview": "vite preview",
     "release:latest-json": "node scripts/release/generate-latest-json.mjs",
     "release:mac": "bash scripts/release/build-macos-release.sh",
@@ -14,8 +15,15 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "tauri:build:debug": "tauri build --debug",
+    "test:batch-output": "node --test scripts/batch-output.test.mjs",
+    "test:benchmark-report": "node --test scripts/benchmark/planetary-e2e-report.test.mjs",
+    "benchmark:deepsky-ab": "node scripts/benchmark/deepsky-ab-report.mjs",
+    "test:deepsky-ab": "node --test scripts/benchmark/deepsky-ab-report.test.mjs",
+    "test:settings-layout": "node --test scripts/settings-layout.test.mjs",
+    "test:planetary-contracts": "npm run test:batch-output && npm run test:benchmark-report && npm run test:settings-layout",
+    "test:deepsky-contracts": "node --test scripts/deepsky-contracts.test.mjs && npm run test:deepsky-ab",
     "rust:check": "cargo check --manifest-path src-tauri/Cargo.toml",
-    "check": "npm run build && npm run rust:check"
+    "check": "npm run test && npm run build && npm run rust:check"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
@@ -23,7 +31,9 @@
     "@tauri-apps/plugin-fs": "^2.4.4",
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-shell": "^2.3.4",
-    "@tauri-apps/plugin-updater": "^2.9.0"
+    "@tauri-apps/plugin-updater": "^2.9.0",
+    "chart.js": "^4.5.1",
+    "chartjs-plugin-annotation": "^3.1.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",

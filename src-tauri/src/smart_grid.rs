@@ -1,40 +1,15 @@
-use crate::AppState;
-// use rayon::prelude::*; // Unused
-use tauri::State;
-
 fn default_ap_size() -> usize {
     48
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+// PartialEq: el rewrite del cache de analisis solo se dispara si los puntos
+// AP realmente cambiaron (antes se reescribia el cache completo en cada clic).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct ApPoint {
     pub x: f32,
     pub y: f32,
     #[serde(default = "default_ap_size")]
     pub size: usize,
-}
-
-#[tauri::command]
-pub async fn cmd_generate_smart_ap_grid(
-    state: State<'_, AppState>,
-    grid_size: usize,
-    threshold: f32, // 0.0 - 1.0 (Variance threshold)
-    mode: String,   // "planetary" or "surface"
-) -> Result<Vec<ApPoint>, String> {
-    // 1. Get Master Reference (Stacked Image)
-    let stacked_img = {
-        let guard = state.stacked_image.lock().unwrap();
-        if let Some(res) = &*guard {
-            // Clone data to work without lock
-            (res.data.clone(), res.width, res.height)
-        } else {
-            return Err("No stacked image available for Smart APs".into());
-        }
-    };
-
-    let (data, width, height) = stacked_img;
-    let points = generate_smart_grid_internal(&data, width, height, grid_size, threshold, &mode);
-    Ok(points)
 }
 
 /// Public function to generate AP grid from any image buffer

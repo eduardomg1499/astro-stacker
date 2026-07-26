@@ -1,0 +1,7 @@
+{
+  "metrics_version": "pq1",
+  "scenario": "sintetico jupiter_like 256x256, 14 frames, sigmas 0.0..3.25, ruido 80 ADU",
+  "spearman_planet_scorer": -1.0,
+  "spearman_surface_scorer": 1.0,
+  "target_pr11": 0.95
+}

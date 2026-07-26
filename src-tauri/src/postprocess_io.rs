@@ -1,0 +1,2454 @@
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PostprocessHistogram {
+    bins: usize,
+    red: Vec<u64>,
+    green: Vec<u64>,
+    blue: Vec<u64>,
+    luminance: Vec<u64>,
+    minimum: u16,
+    maximum: u16,
+    median: u16,
+    percentile_low: u16,
+    percentile_high: u16,
+    shadow_clip: f32,
+    highlight_clip: f32,
+    is_mono: bool,
+    source: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PostprocessPixelSample {
+    x: usize,
+    y: usize,
+    red: u16,
+    green: u16,
+    blue: u16,
+    luminance: u16,
+    red_normalized: f32,
+    green_normalized: f32,
+    blue_normalized: f32,
+    is_mono: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RgbAlignmentEstimate {
+    red_x: f32,
+    red_y: f32,
+    blue_x: f32,
+    blue_y: f32,
+    confidence: f32,
+    applicable: bool,
+    reason: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactAnalysis {
+    sampled_pixels: usize,
+    chroma_sampled_pixels: usize,
+    hot_pixels: usize,
+    dead_pixels: usize,
+    clipped_shadows: usize,
+    clipped_highlights: usize,
+    mean_saturation: f32,
+    p95_saturation: f32,
+    chromatic_fraction: f32,
+    color_fringe_score: f32,
+    ringing_score: f32,
+    suggested_deringing_mode: i32,
+    suggested_deringing_radius: f32,
+    suggested_deringing_dark: f32,
+    suggested_deringing_light: f32,
+    suggested_denoise: f32,
+    summary: String,
+}
+
+fn postprocess_image_snapshot(
+    state: &AppState,
+    prefer_processed: bool,
+) -> Result<(StackResult, &'static str), String> {
+    if prefer_processed {
+        if let Some(image) = state.processed_image.lock().unwrap().clone() {
+            return Ok((image, "processed"));
+        }
+    }
+    state
+        .stacked_image
+        .lock()
+        .unwrap()
+        .clone()
+        .map(|image| (image, "source"))
+        .ok_or_else(|| "No hay un resultado activo para postprocesar.".to_string())
+}
+
+fn validate_rgb_stack(image: &StackResult) -> Result<(), String> {
+    let pixels = image
+        .width
+        .checked_mul(image.height)
+        .ok_or_else(|| "Dimensiones de imagen inválidas.".to_string())?;
+    if image.data.len() != pixels * 3 {
+        return Err(format!(
+            "Buffer 16-bit inválido: se esperaban {} muestras RGB y llegaron {}.",
+            pixels * 3,
+            image.data.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Classifies an RGB16 buffer by sampling the whole image instead of trusting a
+/// single centre pixel. Mosaic canvases commonly have black or neutral padding
+/// at the centre, which previously caused colour results to be marked as mono.
+fn rgb16_buffer_is_monochrome(data: &[u16]) -> bool {
+    let pixel_count = data.len() / 3;
+    if pixel_count == 0 {
+        return true;
+    }
+
+    const MAX_SAMPLES: usize = 262_144;
+    let stride = (pixel_count / MAX_SAMPLES).max(1);
+    let mut signal_samples = 0usize;
+    let mut chromatic_samples = 0usize;
+
+    for pixel in data.chunks_exact(3).step_by(stride) {
+        let minimum = pixel[0].min(pixel[1]).min(pixel[2]);
+        let maximum = pixel[0].max(pixel[1]).max(pixel[2]);
+        if maximum <= 64 {
+            continue;
+        }
+        signal_samples += 1;
+        // Ignore sub-LSB conversion noise, while retaining real low-saturation
+        // colour in linear astronomical data.
+        let tolerance = ((maximum as u32 / 2048).max(8)) as u16;
+        if maximum - minimum > tolerance {
+            chromatic_samples += 1;
+            if chromatic_samples >= 3 {
+                return false;
+            }
+        }
+    }
+
+    !(signal_samples < 128 && chromatic_samples > 0)
+}
+
+#[tauri::command]
+fn reset_postprocess_state(state: State<'_, AppState>) -> Result<usize, String> {
+    state.active_req_id.fetch_add(1, Ordering::SeqCst);
+    *state.processed_image.lock().unwrap() = None;
+    state.deconv_cache.lock().unwrap().clear();
+    state.wavelet_cache.lock().unwrap().clear();
+    state.filter_cache.lock().unwrap().clear();
+    clear_editor_previews();
+    Ok(state.result_generation.fetch_add(1, Ordering::SeqCst) + 1)
+}
+
+#[tauri::command]
+fn postprocess_histogram(
+    state: State<'_, AppState>,
+    prefer_processed: Option<bool>,
+) -> Result<PostprocessHistogram, String> {
+    state.license_manager.check_access()?;
+    let (image, source) = postprocess_image_snapshot(&state, prefer_processed.unwrap_or(true))?;
+    validate_rgb_stack(&image)?;
+    Ok(compute_postprocess_histogram(&image, source))
+}
+
+fn compute_postprocess_histogram(
+    image: &StackResult,
+    source: &'static str,
+) -> PostprocessHistogram {
+    const BINS: usize = 1024;
+    let mut red = vec![0u64; BINS];
+    let mut green = vec![0u64; BINS];
+    let mut blue = vec![0u64; BINS];
+    let mut luminance = vec![0u64; BINS];
+    let mut minimum = u16::MAX;
+    let mut maximum = u16::MIN;
+    let mut clipped_shadows = 0usize;
+    let mut clipped_highlights = 0usize;
+
+    for pixel in image.data.chunks_exact(3) {
+        let r = pixel[0];
+        let g = pixel[1];
+        let b = pixel[2];
+        let luma =
+            ((r as u32 * 2126 + g as u32 * 7152 + b as u32 * 722 + 5000) / 10000).min(65535) as u16;
+        red[r as usize * (BINS - 1) / 65535] += 1;
+        green[g as usize * (BINS - 1) / 65535] += 1;
+        blue[b as usize * (BINS - 1) / 65535] += 1;
+        luminance[luma as usize * (BINS - 1) / 65535] += 1;
+        minimum = minimum.min(luma);
+        maximum = maximum.max(luma);
+        if luma <= 16 {
+            clipped_shadows += 1;
+        }
+        if luma >= 65519 {
+            clipped_highlights += 1;
+        }
+    }
+
+    let pixel_count = image.width.saturating_mul(image.height).max(1);
+    let percentile_bin = |quantile: f64| -> usize {
+        let target = ((pixel_count as f64 * quantile).ceil() as u64).max(1);
+        let mut cumulative = 0u64;
+        for (index, count) in luminance.iter().enumerate() {
+            cumulative += count;
+            if cumulative >= target {
+                return index;
+            }
+        }
+        BINS - 1
+    };
+    let bin_to_u16 = |bin: usize| -> u16 {
+        ((bin as u32 * 65535 + (BINS as u32 - 1) / 2) / (BINS as u32 - 1)) as u16
+    };
+    let median_bin = percentile_bin(0.5);
+    let percentile_low_bin = percentile_bin(0.001);
+    let percentile_high_bin = percentile_bin(0.999);
+
+    PostprocessHistogram {
+        bins: BINS,
+        red,
+        green,
+        blue,
+        luminance,
+        minimum,
+        maximum,
+        median: bin_to_u16(median_bin).clamp(minimum, maximum),
+        percentile_low: bin_to_u16(percentile_low_bin).clamp(minimum, maximum),
+        percentile_high: bin_to_u16(percentile_high_bin).clamp(minimum, maximum),
+        shadow_clip: clipped_shadows as f32 / pixel_count as f32,
+        highlight_clip: clipped_highlights as f32 / pixel_count as f32,
+        is_mono: image.is_mono,
+        source,
+    }
+}
+
+#[tauri::command]
+fn sample_postprocess_pixel(
+    state: State<'_, AppState>,
+    x: usize,
+    y: usize,
+    prefer_processed: Option<bool>,
+) -> Result<PostprocessPixelSample, String> {
+    state.license_manager.check_access()?;
+    let (image, _) = postprocess_image_snapshot(&state, prefer_processed.unwrap_or(true))?;
+    validate_rgb_stack(&image)?;
+    if x >= image.width || y >= image.height {
+        return Err("El cuentagotas quedó fuera de la imagen.".into());
+    }
+    let index = (y * image.width + x) * 3;
+    let red = image.data[index];
+    let green = image.data[index + 1];
+    let blue = image.data[index + 2];
+    let luminance =
+        ((red as u32 * 2126 + green as u32 * 7152 + blue as u32 * 722 + 5000) / 10000) as u16;
+    Ok(PostprocessPixelSample {
+        x,
+        y,
+        red,
+        green,
+        blue,
+        luminance,
+        red_normalized: red as f32 / 65535.0,
+        green_normalized: green as f32 / 65535.0,
+        blue_normalized: blue as f32 / 65535.0,
+        is_mono: image.is_mono,
+    })
+}
+
+#[tauri::command]
+fn estimate_postprocess_rgb_alignment(
+    state: State<'_, AppState>,
+) -> Result<RgbAlignmentEstimate, String> {
+    state.license_manager.check_access()?;
+    let (image, _) = postprocess_image_snapshot(&state, false)?;
+    validate_rgb_stack(&image)?;
+    if image.is_mono {
+        return Ok(RgbAlignmentEstimate {
+            red_x: 0.0,
+            red_y: 0.0,
+            blue_x: 0.0,
+            blue_y: 0.0,
+            confidence: 1.0,
+            applicable: false,
+            reason: "La alineación RGB no aplica a una fuente monocroma.".into(),
+        });
+    }
+    if image.width < 64 || image.height < 64 {
+        return Ok(RgbAlignmentEstimate {
+            red_x: 0.0,
+            red_y: 0.0,
+            blue_x: 0.0,
+            blue_y: 0.0,
+            confidence: 0.0,
+            applicable: false,
+            reason: "La imagen es demasiado pequeña para una medición RGB fiable.".into(),
+        });
+    }
+    let mut working: Vec<f32> = image.data.iter().map(|value| *value as f32).collect();
+    let (red_x, red_y, blue_x, blue_y) =
+        align_stack_rgb_channels(&mut working, image.width, image.height);
+    let maximum = red_x
+        .abs()
+        .max(red_y.abs())
+        .max(blue_x.abs())
+        .max(blue_y.abs());
+    let applicable = maximum >= 0.05;
+    let confidence = if applicable {
+        (1.0 - (maximum / 12.0)).clamp(0.35, 0.98)
+    } else {
+        0.75
+    };
+    // `align_stack_rgb_channels` samples ch(p + measured_shift), while the
+    // interactive pipeline's `shift_channel` samples ch(p - slider_shift).
+    // Expose the correction in slider coordinates so clicking Auto produces
+    // exactly the validated backend alignment.
+    Ok(RgbAlignmentEstimate {
+        red_x: -red_x,
+        red_y: -red_y,
+        blue_x: -blue_x,
+        blue_y: -blue_y,
+        confidence,
+        applicable,
+        reason: if applicable {
+            "Desplazamiento subpíxel medido contra el canal verde.".into()
+        } else {
+            "Los canales ya están alineados dentro de la tolerancia de 0.05 px.".into()
+        },
+    })
+}
+
+#[tauri::command]
+fn analyze_postprocess_artifacts(
+    state: State<'_, AppState>,
+    prefer_processed: Option<bool>,
+) -> Result<ArtifactAnalysis, String> {
+    state.license_manager.check_access()?;
+    let (image, _) = postprocess_image_snapshot(&state, prefer_processed.unwrap_or(true))?;
+    validate_rgb_stack(&image)?;
+    Ok(compute_artifact_analysis(&image))
+}
+
+fn compute_artifact_analysis(image: &StackResult) -> ArtifactAnalysis {
+    let w = image.width;
+    let h = image.height;
+    let total = w.saturating_mul(h).max(1);
+    let stride = (total / 250_000).max(1);
+    let mut hot_pixels = 0usize;
+    let mut dead_pixels = 0usize;
+    let mut clipped_shadows = 0usize;
+    let mut clipped_highlights = 0usize;
+    let mut fringe_sum = 0.0f64;
+    let mut ringing_sum = 0.0f64;
+    let mut sampled = 0usize;
+    let mut chroma_sampled = 0usize;
+    let mut saturation_sum = 0.0f64;
+    let mut chromatic_samples = 0usize;
+    let mut saturation_histogram = [0usize; 64];
+
+    if w > 2 && h > 2 {
+        for linear in (w + 1..total.saturating_sub(w + 1)).step_by(stride) {
+            let x = linear % w;
+            if x == 0 || x + 1 >= w {
+                continue;
+            }
+            let index = linear * 3;
+            let r = image.data[index] as f32;
+            let g = image.data[index + 1] as f32;
+            let b = image.data[index + 2] as f32;
+            let center = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let mut neighbours = [0.0f32; 8];
+            let mut n = 0usize;
+            for oy in -1isize..=1 {
+                for ox in -1isize..=1 {
+                    if ox == 0 && oy == 0 {
+                        continue;
+                    }
+                    let pos = ((linear as isize + oy * w as isize + ox) as usize) * 3;
+                    neighbours[n] = 0.2126 * image.data[pos] as f32
+                        + 0.7152 * image.data[pos + 1] as f32
+                        + 0.0722 * image.data[pos + 2] as f32;
+                    n += 1;
+                }
+            }
+            neighbours.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let local_median = (neighbours[3] + neighbours[4]) * 0.5;
+            let local_range = (neighbours[7] - neighbours[0]).max(256.0);
+            if center - local_median > 4096.0 && center > local_median * 1.6 {
+                hot_pixels += 1;
+            }
+            if local_median - center > 4096.0 && local_median > center * 1.6 {
+                dead_pixels += 1;
+            }
+            if center <= 16.0 {
+                clipped_shadows += 1;
+            }
+            if center >= 65519.0 {
+                clipped_highlights += 1;
+            }
+            if !image.is_mono {
+                fringe_sum += ((r - g).abs() + (b - g).abs()) as f64 / 131070.0;
+                let maximum = r.max(g).max(b);
+                let minimum = r.min(g).min(b);
+                // Exclude black canvas/sky padding: its read noise is not
+                // evidence that a lunar master contains useful mineral colour.
+                if maximum >= 1024.0 && center >= 512.0 {
+                    let saturation = ((maximum - minimum) / maximum.max(1.0))
+                        .clamp(0.0, 1.0);
+                    saturation_sum += saturation as f64;
+                    chroma_sampled += 1;
+                    if saturation >= 0.02 {
+                        chromatic_samples += 1;
+                    }
+                    let bin = (saturation * (saturation_histogram.len() - 1) as f32)
+                        .round() as usize;
+                    saturation_histogram[bin.min(saturation_histogram.len() - 1)] += 1;
+                }
+            }
+            let overshoot = (center - local_median).abs() / local_range;
+            if overshoot > 1.0 {
+                ringing_sum += (overshoot - 1.0).min(4.0) as f64;
+            }
+            sampled += 1;
+        }
+    }
+
+    let divisor = sampled.max(1) as f64;
+    let ringing_score = (ringing_sum / divisor * 100.0).min(100.0) as f32;
+    let color_fringe_score = (fringe_sum / divisor * 100.0).min(100.0) as f32;
+    let mean_saturation = (saturation_sum / chroma_sampled.max(1) as f64) as f32;
+    let saturation_target = ((chroma_sampled as f64 * 0.95).ceil() as usize).max(1);
+    let mut saturation_cumulative = 0usize;
+    let mut p95_bin = 0usize;
+    for (bin, count) in saturation_histogram.iter().enumerate() {
+        saturation_cumulative += count;
+        if saturation_cumulative >= saturation_target {
+            p95_bin = bin;
+            break;
+        }
+    }
+    let p95_saturation = p95_bin as f32 / (saturation_histogram.len() - 1) as f32;
+    let chromatic_fraction = chromatic_samples as f32 / chroma_sampled.max(1) as f32;
+    let defect_rate = (hot_pixels + dead_pixels) as f32 / sampled.max(1) as f32;
+    let suggested_denoise = (defect_rate * 5000.0).clamp(0.0, 35.0);
+    let severity = (ringing_score / 100.0).clamp(0.0, 1.0);
+    let suggested_mode = if severity > 0.02 { 2 } else { 1 };
+    let summary = if ringing_score > 8.0 {
+        "Se detectaron halos u overshoot relevantes; conviene una corrección moderada y revisar en A/B."
+    } else if hot_pixels + dead_pixels > sampled / 500 {
+        "Predominan defectos puntuales; usa reducción de ruido conservadora antes de aumentar nitidez."
+    } else {
+        "No se detectaron artefactos severos en la muestra; conserva ajustes suaves."
+    };
+
+    ArtifactAnalysis {
+        sampled_pixels: sampled,
+        chroma_sampled_pixels: chroma_sampled,
+        hot_pixels,
+        dead_pixels,
+        clipped_shadows,
+        clipped_highlights,
+        mean_saturation,
+        p95_saturation,
+        chromatic_fraction,
+        color_fringe_score,
+        ringing_score,
+        suggested_deringing_mode: suggested_mode,
+        suggested_deringing_radius: (1.0 + severity * 2.0).clamp(1.0, 3.0),
+        suggested_deringing_dark: (severity * 0.55).clamp(0.05, 0.55),
+        suggested_deringing_light: (severity * 0.4).clamp(0.04, 0.4),
+        suggested_denoise,
+        summary: summary.into(),
+    }
+}
+
+#[inline]
+fn post_smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let t = ((value - edge0) / (edge1 - edge0).max(1e-6)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[inline]
+fn rgb_hue(r: f32, g: f32, b: f32) -> f32 {
+    let maximum = r.max(g).max(b);
+    let minimum = r.min(g).min(b);
+    let delta = maximum - minimum;
+    if delta <= 1e-6 {
+        return 0.0;
+    }
+    let hue = if maximum == r {
+        ((g - b) / delta).rem_euclid(6.0)
+    } else if maximum == g {
+        (b - r) / delta + 2.0
+    } else {
+        (r - g) / delta + 4.0
+    };
+    hue / 6.0
+}
+
+#[inline]
+fn interpolate_hue_control(values: &[f32; 8], hue: f32) -> f32 {
+    const CENTRES: [f32; 8] = [0.0, 1.0 / 12.0, 1.0 / 6.0, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75, 5.0 / 6.0];
+    let mut weighted = 0.0f32;
+    let mut total = 0.0f32;
+    for (index, centre) in CENTRES.iter().enumerate() {
+        let distance = (hue - centre).abs().min(1.0 - (hue - centre).abs());
+        let weight = (1.0 - distance / (1.0 / 6.0)).max(0.0).powi(2);
+        weighted += values[index].clamp(-1.0, 1.0) * weight;
+        total += weight;
+    }
+    if total > 1e-6 { weighted / total } else { 0.0 }
+}
+
+#[inline]
+fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let maximum = r.max(g).max(b);
+    let minimum = r.min(g).min(b);
+    let delta = maximum - minimum;
+    let lightness = (maximum + minimum) * 0.5;
+    let saturation = if delta <= 1e-6 {
+        0.0
+    } else {
+        delta / (1.0 - (2.0 * lightness - 1.0).abs()).max(1e-6)
+    };
+    (rgb_hue(r, g, b), saturation.clamp(0.0, 1.0), lightness.clamp(0.0, 1.0))
+}
+
+#[inline]
+fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> (f32, f32, f32) {
+    let h = hue.rem_euclid(1.0);
+    let s = saturation.clamp(0.0, 1.0);
+    let l = lightness.clamp(0.0, 1.0);
+    let chroma = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let sector = h * 6.0;
+    let x = chroma * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match sector.floor() as i32 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    let match_value = l - chroma * 0.5;
+    (r1 + match_value, g1 + match_value, b1 + match_value)
+}
+
+fn build_local_contrast_delta(
+    data: &[u16],
+    width: usize,
+    height: usize,
+    texture: f32,
+    clarity: f32,
+) -> Option<Vec<f32>> {
+    if width == 0 || height == 0 || data.len() != width * height * 3 {
+        return None;
+    }
+    let texture = texture.clamp(-1.0, 1.0);
+    let clarity = clarity.clamp(-1.0, 1.0);
+    if texture.abs() <= 1e-6 && clarity.abs() <= 1e-6 {
+        return None;
+    }
+    let luma: Vec<f32> = data
+        .par_chunks_exact(3)
+        .map(|pixel| {
+            (0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32)
+                / 65535.0
+        })
+        .collect();
+    let fine = if texture.abs() > 1e-6 {
+        Some(apply_gaussian_blur(&luma, width, height, 1.15))
+    } else {
+        None
+    };
+    let broad = if clarity.abs() > 1e-6 {
+        Some(apply_gaussian_blur(&luma, width, height, 4.5))
+    } else {
+        None
+    };
+    Some(
+        luma.par_iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                let fine_detail = fine.as_ref().map(|blur| value - blur[index]).unwrap_or(0.0);
+                let broad_detail = broad.as_ref().map(|blur| value - blur[index]).unwrap_or(0.0);
+                let structure = fine_detail.abs() + broad_detail.abs() * 0.55;
+                let confidence = post_smoothstep(0.0012, 0.012, structure);
+                let signal_gate = post_smoothstep(0.006, 0.065, value)
+                    * (1.0 - post_smoothstep(0.88, 0.995, value));
+                let positive_gate = if texture > 0.0 || clarity > 0.0 {
+                    0.12 + confidence * 0.88
+                } else {
+                    1.0
+                };
+                (fine_detail * texture * 1.15 + broad_detail * clarity * 0.82)
+                    * signal_gate
+                    * positive_gate
+            })
+            .collect(),
+    )
+}
+
+fn normalized_solar_curve(points: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    let mut normalized: Vec<[f32; 2]> = points
+        .iter()
+        .filter(|point| point[0].is_finite() && point[1].is_finite())
+        .map(|point| [point[0].clamp(0.0, 1.0), point[1].clamp(0.0, 1.0)])
+        .collect();
+    normalized.sort_by(|left, right| left[0].total_cmp(&right[0]));
+    normalized.dedup_by(|left, right| (left[0] - right[0]).abs() < 0.000_1);
+    if normalized.first().map(|point| point[0]).unwrap_or(1.0) > 0.000_1 {
+        normalized.insert(0, [0.0, 0.0]);
+    }
+    if normalized.last().map(|point| point[0]).unwrap_or(0.0) < 0.999_9 {
+        normalized.push([1.0, 1.0]);
+    }
+    if normalized.len() < 2 {
+        return vec![[0.0, 0.0], [1.0, 1.0]];
+    }
+    normalized
+}
+
+fn solar_curve_tangents(points: &[[f32; 2]]) -> Vec<f32> {
+    if points.len() < 2 {
+        return vec![1.0; points.len()];
+    }
+    let intervals: Vec<f32> = points
+        .windows(2)
+        .map(|pair| (pair[1][0] - pair[0][0]).max(1e-6))
+        .collect();
+    let secants: Vec<f32> = points
+        .windows(2)
+        .zip(intervals.iter())
+        .map(|(pair, &interval)| (pair[1][1] - pair[0][1]) / interval)
+        .collect();
+    let mut tangents = vec![0.0; points.len()];
+    tangents[0] = secants[0];
+    tangents[points.len() - 1] = secants[secants.len() - 1];
+    for index in 1..points.len() - 1 {
+        let previous = secants[index - 1];
+        let next = secants[index];
+        tangents[index] = if previous * next <= 0.0 {
+            0.0
+        } else {
+            // Weighted harmonic mean (PCHIP). It preserves a genuinely
+            // linear curve, keeps monotone segments monotone and still lets
+            // the user create a controlled local maximum or minimum.
+            let previous_interval = intervals[index - 1];
+            let next_interval = intervals[index];
+            let weight_previous = 2.0 * next_interval + previous_interval;
+            let weight_next = next_interval + 2.0 * previous_interval;
+            (weight_previous + weight_next)
+                / (weight_previous / previous + weight_next / next)
+        };
+    }
+    tangents
+}
+
+#[inline]
+fn evaluate_solar_curve(points: &[[f32; 2]], tangents: &[f32], value: f32) -> f32 {
+    let x = value.clamp(0.0, 1.0);
+    for (index, pair) in points.windows(2).enumerate() {
+        let left = pair[0];
+        let right = pair[1];
+        if x <= right[0] {
+            let span = (right[0] - left[0]).max(1e-6);
+            let t = ((x - left[0]) / span).clamp(0.0, 1.0);
+            let t2 = t * t;
+            let t3 = t2 * t;
+            let output = (2.0 * t3 - 3.0 * t2 + 1.0) * left[1]
+                + (t3 - 2.0 * t2 + t) * span * tangents[index]
+                + (-2.0 * t3 + 3.0 * t2) * right[1]
+                + (t3 - t2) * span * tangents[index + 1];
+            return output
+                .clamp(left[1].min(right[1]), left[1].max(right[1]))
+                .clamp(0.0, 1.0);
+        }
+    }
+    points.last().map(|point| point[1]).unwrap_or(x)
+}
+
+fn build_solar_filament_delta(
+    data: &[u16],
+    width: usize,
+    height: usize,
+    params: &SolarMonoParams,
+) -> Option<Vec<f32>> {
+    if !params.enabled
+        || params.filament_amount <= 1e-6
+        || width == 0
+        || height == 0
+        || data.len() != width * height * 3
+    {
+        return None;
+    }
+    let luma: Vec<f32> = data
+        .par_chunks_exact(3)
+        .map(|pixel| {
+            (0.2126 * pixel[0] as f32
+                + 0.7152 * pixel[1] as f32
+                + 0.0722 * pixel[2] as f32)
+                / 65535.0
+        })
+        .collect();
+    let radius = params.filament_radius.clamp(0.55, 4.0);
+    let blurred = apply_gaussian_blur(&luma, width, height, radius);
+    let details: Vec<f32> = luma
+        .par_iter()
+        .zip(blurred.par_iter())
+        .map(|(&source, &low_pass)| source - low_pass)
+        .collect();
+    if details
+        .par_iter()
+        .map(|detail| detail.abs())
+        .reduce(|| 0.0, f32::max)
+        <= 1e-7
+    {
+        return None;
+    }
+
+    // Robust global noise floor from a deterministic sample of the high-pass
+    // residual. It does not invent texture in a flat field and makes the
+    // "Protección de ruido" control meaningful for high-resolution stacks.
+    let stride = (details.len() / 32_768).max(1);
+    let mut absolute_sample: Vec<f32> = details
+        .iter()
+        .step_by(stride)
+        .map(|value| value.abs())
+        .collect();
+    absolute_sample.sort_by(|left, right| left.total_cmp(right));
+    // Cuantil BAJO, no la mediana. En un fotograma solar el disco llena el
+    // encuadre, así que la mediana de |paso-alto| ES la granulación: estimar el
+    // ruido con ella daba un umbral ~5× la estructura real y la puerta de
+    // confianza anulaba TODOS los filamentos. El percentil 25 se apoya en las
+    // zonas planas. Para ruido gaussiano puro ambos estimadores coinciden
+    // (|N(0,σ)|: P50 = 0.6745σ ⇒ ×1.4826; P25 = 0.3186σ ⇒ ×3.1382), así que un
+    // campo plano se comporta igual que antes y sólo cambia el caso con señal.
+    let last = absolute_sample.len().saturating_sub(1);
+    let quantile_at = |q: f32| -> f32 {
+        let index = ((last as f32) * q).round() as usize;
+        absolute_sample.get(index.min(last)).copied().unwrap_or(0.0)
+    };
+    let noise_sigma = (quantile_at(0.25) * 3.1382).max(0.000_35);
+    let guard = params.noise_guard.clamp(0.0, 1.0);
+    let noise_threshold = noise_sigma * (0.7 + guard * 2.6);
+    // Segundo anclaje, en un cuantil ALTO. Si la estructura llena el encuadre
+    // —un disco solar granulado— cualquier cuantil bajo sigue escalando con ella
+    // y el umbral acaba por encima de la señal: eso dejaba el resultado liso.
+    // Atarlo también a la parte fuerte del detalle garantiza que la estructura
+    // más marcada SIEMPRE pase, sea cual sea la escala absoluta, mientras que en
+    // un campo de puro ruido este anclaje queda por encima del piso y no abre la
+    // puerta (|N(0,σ)|: P25 = 0.3186σ, P90 = 1.6449σ).
+    let structure = quantile_at(0.90);
+    let threshold = noise_threshold.min(structure * (0.55 + guard * 0.35));
+    let upper = threshold * (2.4 + guard * 2.8);
+    let amount = params.filament_amount.clamp(0.0, 1.5);
+
+    Some(
+        luma.par_iter()
+            .zip(details.par_iter())
+            .map(|(&value, &detail)| {
+                let confidence = post_smoothstep(threshold, upper, detail.abs());
+                let signal_gate = post_smoothstep(0.004, 0.055, value)
+                    * (1.0 - post_smoothstep(0.9, 0.998, value));
+                // Dark H-alpha fibrils benefit from a slightly stronger
+                // response, while the confidence gate prevents noise worms.
+                let polarity = if detail < 0.0 { 1.16 } else { 1.0 };
+                detail * amount * 2.15 * confidence * signal_gate * polarity
+            })
+            .collect(),
+    )
+}
+
+/// Detecta si la imagen solar contiene un cielo/fondo oscuro real. En una
+/// superficie solar que llena todo el encuadre no devuelve máscara: así el
+/// control no confunde textura tenue del disco con cielo.
+fn estimate_solar_background(data: &[u16]) -> Option<(f32, f32)> {
+    if data.len() < 48 {
+        return None;
+    }
+    let pixels = data.len() / 3;
+    let stride = (pixels / 32_768).max(1);
+    let mut sample: Vec<f32> = (0..pixels)
+        .step_by(stride)
+        .map(|index| {
+            let offset = index * 3;
+            (0.2126 * data[offset] as f32
+                + 0.7152 * data[offset + 1] as f32
+                + 0.0722 * data[offset + 2] as f32)
+                / 65535.0
+        })
+        .collect();
+    if sample.len() < 16 {
+        return None;
+    }
+    sample.sort_by(|left, right| left.total_cmp(right));
+    let percentile = |fraction: f32| {
+        let index = ((sample.len() - 1) as f32 * fraction).round() as usize;
+        sample[index.min(sample.len() - 1)]
+    };
+    let p05 = percentile(0.05);
+    let p25 = percentile(0.25);
+    let p80 = percentile(0.80);
+    if p05 > 0.14 || p80 - p05 < 0.10 {
+        return None;
+    }
+    let ceiling = (p05 + (p25 - p05).max(0.002) * 1.65 + 0.003)
+        .clamp(p05 + 0.004, (p05 + 0.12).min(p80 - 0.015));
+    Some((p05, ceiling))
+}
+
+/// Confianza de protuberancia consciente del CUERPO de la estructura, no solo
+/// de sus bordes. La versión anterior era un paso-alto σ2.2 con puerta de
+/// intensidad: una protuberancia real es ancha y suave, así que su interior
+/// daba detalle ≈ 0, la confianza quedaba en cero y la protección de fondo
+/// borraba el cuerpo entero dejando, como mucho, un contorno — exactamente la
+/// "pérdida de protuberancias" y el corte duro sobre el limbo que se veía al
+/// activar cualquier receta. Además exigía `source ≤ techo+0.09`, con lo que
+/// los núcleos brillantes quedaban fuera del rescate por definición.
+///
+/// El detector actual compara cada píxel del cielo con un MODELO RADIAL del
+/// halo: cuantil bajo de la luminancia por anillos de distancia al limbo
+/// (transformada de distancia sobre la máscara espacial de cielo). Un
+/// halo/resplandor azimutalmente uniforme ES su propio anillo, su exceso es
+/// ≈ 0 y no se rescata (el preset invertido sigue sin volverlo blanco); una
+/// protuberancia es azimutalmente local, sobresale del cuantil de su anillo y
+/// conserva TODO su cuerpo, núcleo brillante incluido. La coherencia espacial
+/// (blur del veredicto) impide rescatar ruido suelto, y `noise_guard` sigue
+/// mandando sobre el umbral. Sigue siendo independiente del deslizador de
+/// filamentos y del de protuberancias: detección ≠ realce.
+fn build_solar_prominence_confidence(
+    data: &[u16],
+    width: usize,
+    height: usize,
+    background_ceiling: f32,
+    noise_guard: f32,
+    disk_mask: Option<&[f32]>,
+) -> Option<Vec<f32>> {
+    if width == 0 || height == 0 || data.len() != width * height * 3 {
+        return None;
+    }
+    let pixel_count = width * height;
+    let luma: Vec<f32> = data
+        .par_chunks_exact(3)
+        .map(|pixel| {
+            (0.2126 * pixel[0] as f32
+                + 0.7152 * pixel[1] as f32
+                + 0.0722 * pixel[2] as f32)
+                / 65535.0
+        })
+        .collect();
+    // σ pequeño: suprime ruido de píxel sin recortar el cuerpo de la señal.
+    let smooth = apply_gaussian_blur(&luma, width, height, 1.4);
+    drop(luma);
+
+    const BIN_WIDTH: f32 = 2.0;
+    const MAX_LIMB_DISTANCE: f32 = 512.0;
+    // Índices de cielo (submuestreados) para perfil y ruido; con máscara solo
+    // cielo inundado real (mask < 0.05) para no contaminar los primeros
+    // anillos con el pie del feather del disco.
+    let sample_stride = (pixel_count / 2_000_000).max(1);
+    let (halo_model, sky_samples): (Vec<f32>, Vec<usize>) = if let Some(mask) = disk_mask {
+        let inverted: Vec<f32> = mask.iter().map(|&value| 1.0 - value).collect();
+        let distance = crate::planetary_quality::distance_transform_truncated(
+            &inverted,
+            width,
+            height,
+            MAX_LIMB_DISTANCE,
+        );
+        if distance.len() != pixel_count {
+            return None;
+        }
+        let bin_count = (MAX_LIMB_DISTANCE / BIN_WIDTH) as usize + 1;
+        let mut bins: Vec<Vec<f32>> = vec![Vec::new(); bin_count];
+        let mut sky_samples = Vec::new();
+        for index in (0..pixel_count).step_by(sample_stride) {
+            if mask[index] < 0.05 {
+                let bin = ((distance[index] / BIN_WIDTH) as usize).min(bin_count - 1);
+                bins[bin].push(smooth[index]);
+                sky_samples.push(index);
+            }
+        }
+        // Cuantil BAJO por anillo: robusto hasta con protuberancias que ocupen
+        // ~2/3 del anillo; para un halo uniforme coincide con el propio halo.
+        let mut profile: Vec<Option<f32>> = bins
+            .into_iter()
+            .map(|mut samples| {
+                if samples.len() < 24 {
+                    return None;
+                }
+                samples.sort_by(|left, right| left.total_cmp(right));
+                let index = ((samples.len() - 1) as f32 * 0.35).round() as usize;
+                samples.get(index).copied()
+            })
+            .collect();
+        // Rellena huecos arrastrando el último anillo válido hacia fuera y el
+        // primero válido hacia dentro; sin ningún anillo válido no hay perfil.
+        let mut carried: Option<f32> = None;
+        for slot in profile.iter_mut() {
+            match slot {
+                Some(value) => carried = Some(*value),
+                None => *slot = carried,
+            }
+        }
+        let first_valid = profile.iter().flatten().next().copied();
+        let mut filled: Vec<f32> = match first_valid {
+            Some(first) => profile
+                .into_iter()
+                .map(|slot| slot.unwrap_or(first))
+                .collect(),
+            None => vec![background_ceiling; bin_count],
+        };
+        // Suavizado 1-2-1 entre anillos: el modelo no debe escalonar un halo
+        // con gradiente real solo porque el histograma cambie de bin.
+        if filled.len() >= 3 {
+            let raw_profile = filled.clone();
+            for index in 1..raw_profile.len() - 1 {
+                filled[index] = 0.25 * raw_profile[index - 1]
+                    + 0.5 * raw_profile[index]
+                    + 0.25 * raw_profile[index + 1];
+            }
+        }
+        let last_bin = filled.len() - 1;
+        let model: Vec<f32> = (0..pixel_count)
+            .into_par_iter()
+            .map(|index| {
+                let position = (distance[index] / BIN_WIDTH - 0.5).max(0.0);
+                let low = (position as usize).min(last_bin);
+                let high = (low + 1).min(last_bin);
+                let t = (position - low as f32).clamp(0.0, 1.0);
+                filled[low] * (1.0 - t) + filled[high] * t
+            })
+            .collect();
+        (model, sky_samples)
+    } else {
+        let sky_threshold = background_ceiling * 1.35 + 0.002;
+        let sky_samples: Vec<usize> = (0..pixel_count)
+            .step_by(sample_stride)
+            .filter(|&index| smooth[index] <= sky_threshold)
+            .collect();
+        (vec![background_ceiling; pixel_count], sky_samples)
+    };
+    if sky_samples.len() < 16 {
+        return None;
+    }
+
+    // Ruido robusto del residuo cielo − modelo (MAD): las protuberancias son
+    // cola positiva minoritaria y no lo sesgan.
+    let mut residuals: Vec<f32> = sky_samples
+        .iter()
+        .map(|&index| (smooth[index] - halo_model[index]).abs())
+        .collect();
+    residuals.sort_by(|left, right| left.total_cmp(right));
+    let noise = (residuals[residuals.len() / 2] * 1.4826).max(0.000_12);
+    let guard = noise_guard.clamp(0.0, 1.0);
+    let threshold = (noise * (1.7 + guard * 2.6)).max(0.001_2);
+    let upper = threshold * 2.4 + 0.006;
+
+    let raw: Vec<f32> = (0..pixel_count)
+        .into_par_iter()
+        .map(|index| {
+            let excess = smooth[index] - halo_model[index].max(background_ceiling);
+            let off_disk = match disk_mask {
+                Some(mask) => (1.0 - mask[index]).clamp(0.0, 1.0),
+                // Sin máscara espacial la única evidencia de "disco" es la
+                // intensidad: por encima de ~0.5 el realce no debe entrar.
+                None => 1.0 - post_smoothstep(0.30, 0.52, smooth[index]),
+            };
+            post_smoothstep(threshold, upper, excess) * off_disk
+        })
+        .collect();
+    // Coherencia: un píxel de ruido no sobrevive al blur; un cuerpo sí.
+    let coherence = apply_gaussian_blur(&raw, width, height, 2.6);
+    Some(
+        raw.par_iter()
+            .zip(coherence.par_iter())
+            .map(|(&value, &support)| value * post_smoothstep(0.10, 0.38, support))
+            .collect(),
+    )
+}
+
+#[inline]
+fn interpolate_solar_color(
+    value: f32,
+    shadow: [f32; 3],
+    midtone: [f32; 3],
+    highlight: [f32; 3],
+) -> [f32; 3] {
+    let value = value.clamp(0.0, 1.0);
+    let (left, right, linear_t) = if value <= 0.5 {
+        (shadow, midtone, value * 2.0)
+    } else {
+        (midtone, highlight, (value - 0.5) * 2.0)
+    };
+    let t = linear_t * linear_t * (3.0 - 2.0 * linear_t);
+    let chroma = [
+        left[0] + (right[0] - left[0]) * t,
+        left[1] + (right[1] - left[1]) * t,
+        left[2] + (right[2] - left[2]) * t,
+    ];
+    let chroma_luma = (0.2126 * chroma[0] + 0.7152 * chroma[1] + 0.0722 * chroma[2])
+        .max(0.015);
+    let scale = value / chroma_luma;
+    let scaled = [chroma[0] * scale, chroma[1] * scale, chroma[2] * scale];
+    // Las paletas solares son rojo-dominantes: `scaled[0]` supera 1.0 desde
+    // luminancia ~0.5 hacia arriba, y recortar POR CANAL dejaba la derivada del
+    // rojo en CERO sobre el disco entero — la granulación sobrevivía en
+    // luminancia pero desaparecía del canal que domina la imagen, que es
+    // exactamente el "disco naranja plano" que se ve al aplicar un preset.
+    // En vez de recortar se desatura hacia el gris de la MISMA luminancia sólo
+    // lo justo para caber en gama: como la luma es lineal, la mezcla conserva
+    // `value` exacto y ningún canal pierde su gradiente.
+    let mut fit = 1.0f32;
+    for channel in scaled {
+        if channel > 1.0 {
+            fit = fit.min((1.0 - value) / (channel - value));
+        } else if channel < 0.0 {
+            fit = fit.min(value / (value - channel));
+        }
+    }
+    let fit = fit.clamp(0.0, 1.0);
+    [
+        (value + (scaled[0] - value) * fit).clamp(0.0, 1.0),
+        (value + (scaled[1] - value) * fit).clamp(0.0, 1.0),
+        (value + (scaled[2] - value) * fit).clamp(0.0, 1.0),
+    ]
+}
+
+#[inline]
+fn compress_solar_highlights(value: f32, amount: f32) -> f32 {
+    let amount = amount.clamp(0.0, 1.0);
+    let value = value.clamp(0.0, 1.0);
+    if amount <= 1e-6 {
+        return value;
+    }
+    // A continuous, monotonic shoulder. The protected headroom is deliberately
+    // small enough to retain a bright solar limb, but large enough that colour
+    // mapping cannot collapse multiple 16-bit highlight values to pure white.
+    // La rodilla en 0.62 caía en mitad del disco estirado (0.55–0.85): cada
+    // preset aplanaba la granulación de casi todo el disco — el "velo" que se
+    // veía al activar el módulo. En 0.82 el hombro protege limbo y picos sin
+    // tocar los tonos medios.
+    let knee = 0.82;
+    if value <= knee {
+        return value;
+    }
+    let t = (value - knee) / (1.0 - knee);
+    let cap = 1.0 - amount * 0.08;
+    let shaped = t / (1.0 + amount * 0.9 * (1.0 - t));
+    knee + (cap - knee) * shaped
+}
+
+fn apply_advanced_postprocess(
+    data: &mut [u16],
+    width: usize,
+    height: usize,
+    is_mono: bool,
+    params: &AdvancedColorParams,
+) {
+    let black = params.levels_black.clamp(0.0, 0.98);
+    let white = params.levels_white.clamp(black + 0.005, 1.0);
+    let mid = params.levels_mid.clamp(0.1, 4.0);
+    let exposure = params.exposure.clamp(-4.0, 4.0).exp2();
+    let shadows = params.shadows.clamp(-1.0, 1.0);
+    let highlights = params.highlights.clamp(-1.0, 1.0);
+    let whites = params.whites.clamp(-1.0, 1.0);
+    let blacks = params.blacks.clamp(-1.0, 1.0);
+    let vibrance = params.vibrance.clamp(-1.0, 1.0);
+    let temperature = params.temperature.clamp(-1.0, 1.0);
+    let tint = params.tint.clamp(-1.0, 1.0);
+    let scnr_green = params.scnr_green.clamp(0.0, 1.0);
+    let tone_curve = normalized_solar_curve(&params.tone_curve_points);
+    let tone_curve_tangents = solar_curve_tangents(&tone_curve);
+    let solar_enabled = is_mono && params.solar.enabled;
+    let solar_curve = normalized_solar_curve(&params.solar.curve_points);
+    let solar_curve_tangents = solar_curve_tangents(&solar_curve);
+    let solar_filament_delta =
+        build_solar_filament_delta(data, width, height, &params.solar);
+    let solar_background = if solar_enabled {
+        estimate_solar_background(data)
+    } else {
+        None
+    };
+    // A brightness threshold alone is not enough after an inverted solar
+    // curve: smooth glare around the limb may sit above the measured black
+    // floor and would therefore turn white. Reuse the stacker's
+    // border-connected sky classifier so dark filaments/sunspots remain part
+    // of the disk while the true exterior sky receives a spatial mask.
+    let solar_signal_mask = if solar_enabled && solar_background.is_some() {
+        let source_luma: Vec<f32> = data
+            .par_chunks_exact(3)
+            .map(|pixel| {
+                (0.2126 * pixel[0] as f32
+                    + 0.7152 * pixel[1] as f32
+                    + 0.0722 * pixel[2] as f32)
+                    / 65535.0
+            })
+            .collect();
+        let mask = compute_border_connected_sky_mask(&source_luma, width, height, 10);
+        let stride = (source_luma.len() / 32_768).max(1);
+        let mut signal_sample: Vec<f32> =
+            source_luma.iter().step_by(stride).copied().collect();
+        signal_sample.sort_by(|left, right| left.total_cmp(right));
+        let high_signal_floor = signal_sample
+            .get(signal_sample.len() * 3 / 4)
+            .copied()
+            .unwrap_or(1.0);
+        let mut high_signal_count = 0usize;
+        let mut retained_signal = 0.0f32;
+        for index in (0..source_luma.len()).step_by(stride) {
+            if source_luma[index] >= high_signal_floor {
+                high_signal_count += 1;
+                retained_signal += mask[index];
+            }
+        }
+        let retained_signal_ratio =
+            retained_signal / high_signal_count.max(1) as f32;
+        if mask.iter().all(|&value| value >= 0.999)
+            || retained_signal_ratio < 0.8
+        {
+            None
+        } else {
+            Some(mask)
+        }
+    } else {
+        None
+    };
+    // La confianza también se necesita con el deslizador de protuberancias a
+    // CERO: es lo que impide que la protección de fondo borre una protuberancia
+    // detectada. Calcularla solo con el slider activo hacía que la posición
+    // "conservadora" del control fuese la más destructiva. Con inversión activa
+    // se necesita siempre: decide qué píxeles conservan su tono directo.
+    let solar_prominence_confidence = if solar_enabled
+        && (params.solar.prominence_amount > 1e-6
+            || params.solar.background_protect > 1e-6
+            || params.solar.invert)
+    {
+        solar_background.and_then(|(_, background_ceiling)| {
+            build_solar_prominence_confidence(
+                data,
+                width,
+                height,
+                background_ceiling,
+                params.solar.noise_guard,
+                solar_signal_mask.as_deref(),
+            )
+        })
+    } else {
+        None
+    };
+    let hsl_active = params.hsl_hue.iter().any(|value| value.abs() > 1e-6)
+        || params.hsl_saturation.iter().any(|value| value.abs() > 1e-6)
+        || params.hsl_luminance.iter().any(|value| value.abs() > 1e-6);
+    let local_delta = build_local_contrast_delta(data, width, height, params.texture, params.clarity);
+
+    data.par_chunks_exact_mut(3).enumerate().for_each(|(pixel_index, pixel)| {
+        let source_r = pixel[0] as f32 / 65535.0;
+        let source_g = pixel[1] as f32 / 65535.0;
+        let source_b = pixel[2] as f32 / 65535.0;
+        let source_mono = 0.2126 * source_r + 0.7152 * source_g + 0.0722 * source_b;
+        let source_maximum = source_r.max(source_g).max(source_b);
+        let source_minimum = source_r.min(source_g).min(source_b);
+        let source_saturation = if source_maximum > 1e-6 {
+            (source_maximum - source_minimum) / source_maximum
+        } else {
+            0.0
+        };
+        let source_chroma_evidence =
+            post_smoothstep(0.003, 0.08, source_saturation);
+        let source_tonal_gate = post_smoothstep(0.025, 0.16, source_mono)
+            * (1.0 - post_smoothstep(0.9, 1.0, source_mono) * 0.75);
+        let chroma_confidence =
+            (source_chroma_evidence * source_tonal_gate).clamp(0.0, 1.0);
+        let mut r = (source_r - black) / (white - black);
+        let mut g = (source_g - black) / (white - black);
+        let mut b = (source_b - black) / (white - black);
+        r = r.clamp(0.0, 1.0).powf(1.0 / mid) * exposure;
+        g = g.clamp(0.0, 1.0).powf(1.0 / mid) * exposure;
+        b = b.clamp(0.0, 1.0).powf(1.0 / mid) * exposure;
+
+        let luma = (0.2126 * r + 0.7152 * g + 0.0722 * b).max(0.0);
+        let shadow_weight = (1.0 - post_smoothstep(0.05, 0.62, luma)).powi(2);
+        let highlight_weight = post_smoothstep(0.38, 0.95, luma).powi(2);
+        let black_weight = 1.0 - post_smoothstep(0.0, 0.28, luma);
+        let white_weight = post_smoothstep(0.72, 1.0, luma);
+        let tone_delta = shadows * shadow_weight * 0.22
+            + highlights * highlight_weight * 0.22
+            + blacks * black_weight * 0.12
+            + whites * white_weight * 0.12;
+        let adjusted_luma = (luma
+            + tone_delta
+            + local_delta
+                .as_ref()
+                .map(|delta| delta[pixel_index])
+                .unwrap_or(0.0)
+            + solar_filament_delta
+                .as_ref()
+                .map(|delta| delta[pixel_index])
+                .unwrap_or(0.0))
+        .max(0.0);
+        let new_luma = evaluate_solar_curve(
+            &tone_curve,
+            &tone_curve_tangents,
+            adjusted_luma.clamp(0.0, 1.0),
+        );
+        if luma > 1e-6 {
+            let scale = new_luma / luma;
+            r *= scale;
+            g *= scale;
+            b *= scale;
+        } else {
+            r = new_luma;
+            g = new_luma;
+            b = new_luma;
+        }
+
+        if !is_mono {
+            let warm = temperature * 0.12;
+            let magenta = tint * 0.08;
+            r *= 1.0 + warm + magenta * 0.5;
+            g *= 1.0 - magenta;
+            b *= 1.0 - warm + magenta * 0.5;
+
+            let luma_after_wb = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let maximum = r.max(g).max(b);
+            let minimum = r.min(g).min(b);
+            let chroma = (maximum - minimum).max(0.0);
+            let current_saturation = if maximum > 1e-6 {
+                chroma / maximum
+            } else {
+                0.0
+            };
+            let vibrance_factor = if vibrance >= 0.0 {
+                1.0
+                    + vibrance
+                        * (1.0 - current_saturation)
+                        * 0.9
+                        * chroma_confidence.sqrt()
+            } else {
+                1.0 + vibrance
+            };
+            r = luma_after_wb + (r - luma_after_wb) * vibrance_factor;
+            g = luma_after_wb + (g - luma_after_wb) * vibrance_factor;
+            b = luma_after_wb + (b - luma_after_wb) * vibrance_factor;
+
+            if hsl_active && chroma > 1e-6 {
+                let (hue, saturation, lightness) = rgb_to_hsl(r, g, b);
+                let hue_adjustment = interpolate_hue_control(&params.hsl_hue, hue)
+                    / 12.0
+                    * chroma_confidence.sqrt();
+                let saturation_adjustment = interpolate_hue_control(&params.hsl_saturation, hue);
+                let luminance_adjustment = interpolate_hue_control(&params.hsl_luminance, hue);
+                let adjusted_saturation = if saturation_adjustment >= 0.0 {
+                    let evidence = chroma_confidence.sqrt()
+                        * (0.45 + 0.55 * post_smoothstep(0.03, 0.25, saturation));
+                    saturation + saturation_adjustment * evidence * (1.0 - saturation)
+                } else {
+                    saturation * (1.0 + saturation_adjustment)
+                };
+                let luminance_evidence = 0.25 + 0.75 * chroma_confidence.sqrt();
+                let adjusted_lightness = if luminance_adjustment >= 0.0 {
+                    lightness
+                        + luminance_adjustment
+                            * luminance_evidence
+                            * (1.0 - lightness)
+                            * 0.42
+                } else {
+                    lightness
+                        * (1.0 + luminance_adjustment * luminance_evidence * 0.42)
+                };
+                (r, g, b) = hsl_to_rgb(
+                    hue + hue_adjustment,
+                    adjusted_saturation,
+                    adjusted_lightness,
+                );
+            }
+
+            let grade_luma = (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0);
+            let grade_weights = [
+                (1.0 - post_smoothstep(0.0, 0.55, grade_luma)).powi(2),
+                (1.0 - ((grade_luma - 0.5).abs() * 2.0)).clamp(0.0, 1.0),
+                post_smoothstep(0.45, 1.0, grade_luma).powi(2),
+            ];
+            let grade_colors = [
+                params.grading_shadows,
+                params.grading_midtones,
+                params.grading_highlights,
+            ];
+            for grade_index in 0..3 {
+                let amount = params.grading_amounts[grade_index].clamp(0.0, 1.0)
+                    * grade_weights[grade_index]
+                    * 0.35;
+                if amount <= 1e-6 {
+                    continue;
+                }
+                let color = grade_colors[grade_index];
+                let color_luma = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
+                r += (color[0] - color_luma) * amount;
+                g += (color[1] - color_luma) * amount;
+                b += (color[2] - color_luma) * amount;
+            }
+
+            if scnr_green > 1e-6 {
+                let neutral_green = (r + b) * 0.5;
+                let green_excess = (g - neutral_green).max(0.0);
+                g -= green_excess * scnr_green;
+            }
+        } else {
+            let mono = (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0);
+            if solar_enabled {
+                let mut solar_luma =
+                    evaluate_solar_curve(&solar_curve, &solar_curve_tangents, mono);
+                let prominence_confidence = solar_prominence_confidence
+                    .as_ref()
+                    .map(|map| map[pixel_index])
+                    .unwrap_or(0.0);
+                if let Some((_background_floor, background_ceiling)) = solar_background {
+                    // "Recuperar protuberancias" = estirar la señal débil sobre
+                    // el cielo medido SOLO donde la confianza ve estructura
+                    // coherente. La puerta anterior era intensidad pura: subía
+                    // el halo y el anillo de oscurecimiento del limbo (el
+                    // "lavado" del disco) y se apagaba de 0.22 a 0.58, así que
+                    // los núcleos brillantes recibían CERO mientras su entorno
+                    // tenue subía — lo contrario de recuperar. El objetivo pasa
+                    // por la MISMA curva del usuario, conserva el orden tonal
+                    // (t → boosted es monótono) y con el slider a 0 es
+                    // identidad exacta.
+                    let prominence = params.solar.prominence_amount.clamp(0.0, 1.0);
+                    if prominence > 1e-6 && prominence_confidence > 1e-4 {
+                        let span = (0.60 - background_ceiling).max(0.08);
+                        let t = ((source_mono - background_ceiling) / span)
+                            .clamp(0.0, 1.0);
+                        // Estirado tipo Reinhard: pendiente acotada en el
+                        // origen (no amplifica el borde del cielo hasta el
+                        // infinito como una gamma) y saturación suave.
+                        let knee = 0.30;
+                        let stretched = t * (1.0 + knee) / (t + knee);
+                        let boosted = t + (stretched - t) * prominence;
+                        let target = (background_ceiling + boosted * span)
+                            .clamp(0.0, 1.0);
+                        let target_luma = evaluate_solar_curve(
+                            &solar_curve,
+                            &solar_curve_tangents,
+                            target,
+                        );
+                        if target_luma > solar_luma {
+                            solar_luma +=
+                                (target_luma - solar_luma) * prominence_confidence;
+                        }
+                    }
+                }
+                // La protección de luces reinyecta luminancia SIN curva. Arrancar
+                // en 0.48 metía en el reparto al disco entero (un máster solar
+                // estirado vive entre 0.5 y 0.85), así que devolvía ~50 % de la
+                // señal sin curva y el preset se veía plano y suavizado. Ahora
+                // empieza donde de verdad hay riesgo de quemar: el limbo.
+                let highlight_weight = post_smoothstep(0.80, 0.995, source_mono)
+                    * params.solar.highlight_protect.clamp(0.0, 1.0);
+                solar_luma += (mono - solar_luma) * highlight_weight * 0.78;
+                if params.solar.invert {
+                    // Compuesto clásico de H-alpha invertido: se invierte el
+                    // DISCO, no las protuberancias. Invertirlo todo empujaba la
+                    // protuberancia a la zona alta de la paleta (crema pálido):
+                    // "no agarraba color". Conservando su tono directo cae en
+                    // la zona roja profunda de la MISMA paleta y se separa del
+                    // cielo protegido, que sigue invirtiéndose y volviendo a su
+                    // negro medido.
+                    let inverted = 1.0 - solar_luma;
+                    solar_luma = inverted + (solar_luma - inverted) * prominence_confidence;
+                }
+                solar_luma = compress_solar_highlights(
+                    solar_luma,
+                    params.solar.highlight_compression,
+                );
+                if params.solar.colorize {
+                    let mapped = interpolate_solar_color(
+                        solar_luma,
+                        params.solar.shadow_color,
+                        params.solar.midtone_color,
+                        params.solar.highlight_color,
+                    );
+                    let strength = params.solar.color_strength.clamp(0.0, 1.0);
+                    let highlight_weight = post_smoothstep(0.72, 0.995, source_mono)
+                        * params.solar.highlight_protect.clamp(0.0, 1.0);
+                    // La estructura detectada fuera del disco recibe la paleta
+                    // con plena autoridad: es la única forma de que una
+                    // protuberancia tenue "agarre" el rojo en vez de quedarse
+                    // en gris translúcido.
+                    let effective_strength = (strength
+                        * (1.0 - highlight_weight * 0.82)
+                        * (1.0 + prominence_confidence * 0.35))
+                        .min(1.0);
+                    r = solar_luma + (mapped[0] - solar_luma) * effective_strength;
+                    g = solar_luma + (mapped[1] - solar_luma) * effective_strength;
+                    b = solar_luma + (mapped[2] - solar_luma) * effective_strength;
+                } else {
+                    r = solar_luma;
+                    g = solar_luma;
+                    b = solar_luma;
+                }
+
+                // Protect the measured sky *after* inversion and false colour.
+                // Doing this before inversion turned the preserved black sky
+                // into white, which is exactly the pale background seen in the
+                // H-alpha inverted preset.
+                if let Some((background_floor, background_ceiling)) = solar_background {
+                    let intensity_background =
+                        1.0 - post_smoothstep(background_floor, background_ceiling, source_mono);
+                    let spatial_background = solar_signal_mask
+                        .as_ref()
+                        .map(|mask| 1.0 - mask[pixel_index].clamp(0.0, 1.0))
+                        .unwrap_or(0.0);
+                    // Las protuberancias viven legítimamente dentro del cielo
+                    // conectado al borde. El rescate primario es la confianza
+                    // consciente del cuerpo (exceso sobre el modelo radial del
+                    // halo): rescata la protuberancia ENTERA, no solo sus
+                    // bordes, mientras el halo uniforme y el ruido de cielo no
+                    // puntúan. El detector de filamentos queda como refuerzo
+                    // para fibrillas finas fuera del limbo.
+                    let rescue_confidence = prominence_confidence.max(
+                        solar_filament_delta
+                            .as_ref()
+                            .map(|delta| {
+                                post_smoothstep(
+                                    0.000_25,
+                                    0.009,
+                                    delta[pixel_index].max(0.0),
+                                )
+                            })
+                            .unwrap_or(0.0),
+                    );
+                    // La confianza decide si el píxel ES estructura coherente;
+                    // `prominence_amount` decide cuánto se REALZA (en el lift de
+                    // arriba), no cuánto se le permite sobrevivir. Atar aquí el
+                    // techo del rescate a ese valor hacía que un preset
+                    // conservador (ha-natural, 0.12 → rescate máximo 0.43)
+                    // borrase ~80 % del estirado de una protuberancia aunque
+                    // estuviera detectada con confianza total.
+                    let prominence_rescue = rescue_confidence.clamp(0.0, 1.0);
+                    // El mask espacial (cielo conectado al borde) es
+                    // AUTORITATIVO cuando existe: combinarlo con `max` hacía que
+                    // una umbra o un filamento oscuro DENTRO del disco puntuara
+                    // como fondo por intensidad y se reseteara al valor sin
+                    // estirar, justo lo contrario de lo que el mask documenta.
+                    // Sin mask, la intensidad sigue siendo la única evidencia.
+                    let background_presence = if solar_signal_mask.is_some() {
+                        spatial_background
+                    } else {
+                        intensity_background
+                    };
+                    let background_weight =
+                        background_presence * (1.0 - prominence_rescue).clamp(0.0, 1.0);
+                    let protect = params.solar.background_protect.clamp(0.0, 1.0);
+                    let weighted_protect = (background_weight * protect).clamp(0.0, 1.0);
+                    let effective_protect =
+                        1.0 - (1.0 - weighted_protect) * (1.0 - weighted_protect);
+                    // El cielo vuelve a su valor MEDIDO, nunca por debajo de él.
+                    // Recortar a `min(source, techo)` dejaba cualquier señal mal
+                    // clasificada MÁS OSCURA que el propio máster (pérdida real
+                    // de datos 16-bit) y dibujaba el corte duro sobre el limbo.
+                    // Para el cielo auténtico `source_mono` ya es ese nivel
+                    // medido; para un falso positivo el peor caso ahora es
+                    // conservador: conservar la fuente.
+                    let measured_sky = source_mono;
+                    r += (measured_sky - r) * effective_protect;
+                    g += (measured_sky - g) * effective_protect;
+                    b += (measured_sky - b) * effective_protect;
+                }
+            } else {
+                r = mono;
+                g = mono;
+                b = mono;
+            }
+        }
+
+        pixel[0] = (r.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+        pixel[1] = (g.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+        pixel[2] = (b.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+    });
+}
+
+fn fits_card(keyword: &str, value: &str, comment: &str) -> [u8; 80] {
+    let text = if comment.is_empty() {
+        format!("{:<8}= {:>20}", keyword, value)
+    } else {
+        format!("{:<8}= {:>20} / {}", keyword, value, comment)
+    };
+    let mut card = [b' '; 80];
+    let bytes = text.as_bytes();
+    let length = bytes.len().min(80);
+    card[..length].copy_from_slice(&bytes[..length]);
+    card
+}
+
+fn fits_history_card(message: &str) -> [u8; 80] {
+    let text = format!("HISTORY {}", message);
+    let mut card = [b' '; 80];
+    let bytes = text.as_bytes();
+    let length = bytes.len().min(80);
+    card[..length].copy_from_slice(&bytes[..length]);
+    card
+}
+
+fn build_fits_bytes(image: &StackResult) -> Result<Vec<u8>, String> {
+    validate_rgb_stack(image)?;
+    let axes = if image.is_mono { 2 } else { 3 };
+    let mut header = Vec::<u8>::new();
+    for card in [
+        fits_card("SIMPLE", "T", "conforms to FITS standard"),
+        fits_card("BITPIX", "16", "signed 16-bit storage"),
+        fits_card("NAXIS", &axes.to_string(), "number of data axes"),
+        fits_card("NAXIS1", &image.width.to_string(), "image width"),
+        fits_card("NAXIS2", &image.height.to_string(), "image height"),
+    ] {
+        header.extend_from_slice(&card);
+    }
+    if !image.is_mono {
+        header.extend_from_slice(&fits_card("NAXIS3", "3", "RGB channel planes"));
+    }
+    header.extend_from_slice(&fits_card("BSCALE", "1", "physical scaling"));
+    header.extend_from_slice(&fits_card("BZERO", "32768", "unsigned 16-bit offset"));
+    header.extend_from_slice(&fits_card("EXTEND", "T", "extensions may be present"));
+    header.extend_from_slice(&fits_history_card(
+        "Zenith Astro Stacker processed derivative; RGB data is debayered.",
+    ));
+    let mut end = [b' '; 80];
+    end[..3].copy_from_slice(b"END");
+    header.extend_from_slice(&end);
+    let header_padding = (2880 - header.len() % 2880) % 2880;
+    header.resize(header.len() + header_padding, b' ');
+
+    let pixels = image.width * image.height;
+    let samples = if image.is_mono { pixels } else { pixels * 3 };
+    let mut output = Vec::with_capacity(header.len() + samples * 2 + 2880);
+    output.extend_from_slice(&header);
+    if image.is_mono {
+        for pixel in image.data.chunks_exact(3) {
+            let stored = (pixel[1] as i32 - 32768) as i16;
+            output.extend_from_slice(&stored.to_be_bytes());
+        }
+    } else {
+        for channel in 0..3 {
+            for pixel in image.data.chunks_exact(3) {
+                let stored = (pixel[channel] as i32 - 32768) as i16;
+                output.extend_from_slice(&stored.to_be_bytes());
+            }
+        }
+    }
+    let data_padding = (2880 - output.len() % 2880) % 2880;
+    output.resize(output.len() + data_padding, 0);
+    Ok(output)
+}
+
+fn write_fits_u16_atomic(path: &Path, image: &StackResult) -> Result<(), String> {
+    let bytes = build_fits_bytes(image)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("result.fits");
+    let temporary = parent.join(format!(".{}.{}.tmp", name, std::process::id()));
+    let write_result = (|| -> Result<(), String> {
+        let mut file = File::create(&temporary).map_err(|error| error.to_string())?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        std::fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn processed_export_path(source: &str, suffix: &str) -> PathBuf {
+    let source_path = Path::new(source);
+    let stem = source_path
+        .file_stem()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| std::ffi::OsStr::new("Zenith_Result"));
+    let mut file_name = stem.to_os_string();
+    file_name.push(suffix);
+    source_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(file_name)
+}
+
+#[cfg(test)]
+mod postprocess_io_tests {
+    use super::*;
+
+    fn color_image() -> StackResult {
+        StackResult {
+            data: vec![0, 32768, 65535, 1000, 2000, 3000],
+            width: 2,
+            height: 1,
+            is_mono: false,
+            is_surface: false,
+        }
+    }
+
+    #[test]
+    fn fits_is_block_aligned_and_uses_unsigned_16_bit_contract() {
+        let bytes = build_fits_bytes(&color_image()).unwrap();
+        assert_eq!(bytes.len() % 2880, 0);
+        let header = String::from_utf8_lossy(&bytes[..2880]);
+        assert!(header.contains("BITPIX  =                   16"));
+        assert!(header.contains("BZERO   =                32768"));
+        assert!(header.contains("NAXIS3  =                    3"));
+        assert!(!header.contains("BAYERPAT"));
+        assert_eq!(&bytes[2880..2882], &i16::MIN.to_be_bytes());
+    }
+
+    #[test]
+    fn processed_export_name_replaces_the_source_extension() {
+        assert_eq!(
+            processed_export_path("/tmp/Mosaic_Result.tiff", "_Final_16bit.fits"),
+            PathBuf::from("/tmp/Mosaic_Result_Final_16bit.fits")
+        );
+        assert_eq!(
+            processed_export_path("planetary-master", "_Final.png"),
+            PathBuf::from("planetary-master_Final.png")
+        );
+    }
+
+    #[test]
+    fn histogram_is_computed_from_16_bit_samples() {
+        let histogram = compute_postprocess_histogram(&color_image(), "source");
+        assert_eq!(histogram.bins, 1024);
+        assert_eq!(histogram.red.iter().sum::<u64>(), 2);
+        assert_eq!(histogram.luminance.iter().sum::<u64>(), 2);
+        assert!(histogram.maximum > histogram.minimum);
+        assert!(histogram.percentile_low >= histogram.minimum);
+        assert!(histogram.percentile_high <= histogram.maximum);
+        assert!(histogram.percentile_high >= histogram.percentile_low);
+    }
+
+    #[test]
+    fn artifact_analysis_measures_signal_chroma_without_black_canvas() {
+        let (width, height) = (32usize, 32usize);
+        let mut data = vec![0u16; width * height * 3];
+        for y in 4..28 {
+            for x in 4..28 {
+                let index = (y * width + x) * 3;
+                data[index..index + 3].copy_from_slice(&[32_000, 30_000, 27_000]);
+            }
+        }
+        let analysis = compute_artifact_analysis(&StackResult {
+            data,
+            width,
+            height,
+            is_mono: false,
+            is_surface: true,
+        });
+        assert!(analysis.chroma_sampled_pixels > 400);
+        assert!(analysis.mean_saturation > 0.1);
+        assert!(analysis.p95_saturation > 0.1);
+        assert!(analysis.chromatic_fraction > 0.9);
+    }
+
+    #[test]
+    fn monochrome_detection_samples_beyond_neutral_canvas_padding() {
+        let mut data = vec![0u16; 600 * 3];
+        data[15..18].copy_from_slice(&[8000, 16000, 32000]);
+        data[1500..1503].copy_from_slice(&[42000, 21000, 9000]);
+        assert!(!rgb16_buffer_is_monochrome(&data));
+    }
+
+    #[test]
+    fn monochrome_detection_accepts_replicated_rgb_signal() {
+        let data = vec![0, 0, 0, 1200, 1200, 1200, 64000, 64000, 64000];
+        assert!(rgb16_buffer_is_monochrome(&data));
+    }
+
+    #[test]
+    fn advanced_colour_controls_preserve_monochrome_equality() {
+        let mut data = vec![12000, 12000, 12000, 42000, 42000, 42000];
+        let mut params = AdvancedColorParams::default();
+        params.temperature = 1.0;
+        params.tint = -1.0;
+        params.hsl_saturation = [1.0; 8];
+        params.exposure = 0.25;
+        apply_advanced_postprocess(&mut data, 2, 1, true, &params);
+        for pixel in data.chunks_exact(3) {
+            assert_eq!(pixel[0], pixel[1]);
+            assert_eq!(pixel[1], pixel[2]);
+        }
+    }
+
+    #[test]
+    fn solar_mono_curve_can_invert_and_false_colour_without_mutating_the_contract() {
+        let mut data = vec![8_000u16, 8_000, 8_000, 48_000, 48_000, 48_000];
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.invert = true;
+        params.solar.colorize = true;
+        params.solar.color_strength = 1.0;
+        params.solar.curve_points = vec![[0.0, 0.0], [0.45, 0.32], [1.0, 1.0]];
+        apply_advanced_postprocess(&mut data, 2, 1, true, &params);
+        assert!(
+            data[0] > data[3],
+            "la inversión debe convertir la muestra oscura en la más luminosa"
+        );
+        assert!(
+            data[0] != data[1] || data[1] != data[2],
+            "el falso color solar debe producir canales distintos"
+        );
+    }
+
+    #[test]
+    fn solar_filament_recovery_ignores_flat_fields_and_responds_to_structure() {
+        let (width, height) = (24usize, 24usize);
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.colorize = false;
+        params.solar.filament_amount = 0.8;
+        params.solar.filament_radius = 1.0;
+        params.solar.noise_guard = 0.7;
+
+        let mut flat = vec![24_000u16; width * height * 3];
+        let flat_before = flat.clone();
+        apply_advanced_postprocess(&mut flat, width, height, true, &params);
+        assert_eq!(flat, flat_before, "un campo plano no debe generar filamentos");
+
+        let mut structured = vec![24_000u16; width * height * 3];
+        for y in 5..19 {
+            let x = 7 + (y % 3);
+            structured[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(15_000);
+        }
+        let before = structured.clone();
+        apply_advanced_postprocess(&mut structured, width, height, true, &params);
+        assert_ne!(
+            structured, before,
+            "una fibrilla coherente por encima del piso robusto debe responder"
+        );
+        for pixel in structured.chunks_exact(3) {
+            assert_eq!(pixel[0], pixel[1]);
+            assert_eq!(pixel[1], pixel[2]);
+        }
+    }
+
+    #[test]
+    fn solar_background_protection_keeps_sky_dark_and_recovers_prominence_signal() {
+        let (width, height) = (64usize, 32usize);
+        let mut source = vec![900u16; width * height * 3];
+        for y in 5..27 {
+            for x in 25..59 {
+                source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(38_000);
+            }
+        }
+        // Limbo casi saturado: ESTO es una luz, y es lo que la protección existe
+        // para conservar. El disco de 38 000 (luma 0.58) es tono medio.
+        for y in 8..24 {
+            for x in 54..59 {
+                source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(63_500);
+            }
+        }
+        for y in 10..22 {
+            let x = 21 + (y % 2);
+            source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(4_800);
+        }
+
+        let mut baseline = source.clone();
+        let mut protected = source.clone();
+        let mut base_params = AdvancedColorParams::default();
+        base_params.solar.enabled = true;
+        base_params.solar.colorize = false;
+        base_params.solar.curve_points =
+            vec![[0.0, 0.0], [0.04, 0.12], [0.18, 0.3], [1.0, 1.0]];
+        base_params.solar.background_protect = 0.0;
+        base_params.solar.prominence_amount = 0.0;
+        apply_advanced_postprocess(&mut baseline, width, height, true, &base_params);
+
+        let mut protected_params = base_params.clone();
+        protected_params.solar.background_protect = 1.0;
+        protected_params.solar.prominence_amount = 0.85;
+        protected_params.solar.highlight_protect = 0.9;
+        apply_advanced_postprocess(&mut protected, width, height, true, &protected_params);
+
+        let sky = (3 * width + 3) * 3;
+        assert!(
+            protected[sky] < baseline[sky],
+            "la protección debe evitar que la curva levante el cielo"
+        );
+        let prominence = (14 * width + 21) * 3;
+        assert!(
+            protected[prominence] > source[prominence],
+            "la señal coherente fuera del disco debe poder recuperarse"
+        );
+        // La protección de luces actúa sobre el LIMBO casi saturado, donde de
+        // verdad hay riesgo de quemar: subir `highlight_protect` tiene que
+        // moverlo respecto a la misma receta sin esa protección.
+        let limb = (16 * width + 56) * 3;
+        assert_ne!(
+            protected[limb], baseline[limb],
+            "la protección de luces debe seguir actuando sobre el limbo casi saturado"
+        );
+        // ...y NO sobre el disco de tono medio: reinyectar ahí luminancia sin
+        // curva era lo que dejaba el preset plano y suavizado. El disco debe
+        // conservar el estirado que pide la receta.
+        let disk = (16 * width + 42) * 3;
+        assert_eq!(
+            protected[disk], baseline[disk],
+            "el disco de tono medio no puede perder la curva por la protección de luces"
+        );
+        assert!(
+            protected[disk] > source[disk],
+            "el disco debe conservar el estirado de la curva ({} desde {})",
+            protected[disk],
+            source[disk]
+        );
+    }
+
+    #[test]
+    fn inverted_false_colour_protects_black_sky_after_inversion() {
+        let (width, height) = (64usize, 32usize);
+        let mut data = vec![750u16; width * height * 3];
+        for y in 5..27 {
+            for x in 23..59 {
+                data[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(40_000);
+            }
+        }
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.invert = true;
+        params.solar.colorize = true;
+        params.solar.color_strength = 1.0;
+        params.solar.background_protect = 0.98;
+        params.solar.highlight_compression = 0.72;
+        params.solar.curve_points =
+            vec![[0.0, 0.0], [0.16, 0.09], [0.48, 0.42], [1.0, 1.0]];
+
+        apply_advanced_postprocess(&mut data, width, height, true, &params);
+
+        let sky = (3 * width + 3) * 3;
+        let disk = (16 * width + 42) * 3;
+        let sky_luma = (data[sky] as u32 + data[sky + 1] as u32 + data[sky + 2] as u32) / 3;
+        let disk_luma =
+            (data[disk] as u32 + data[disk + 1] as u32 + data[disk + 2] as u32) / 3;
+        assert!(sky_luma < 3_000, "la inversión no puede convertir el cielo protegido en blanco");
+        assert!(disk_luma > sky_luma * 4, "el disco invertido debe seguir separado del cielo");
+        assert!(
+            data[disk] != data[disk + 1] || data[disk + 1] != data[disk + 2],
+            "el disco debe conservar el falso color"
+        );
+    }
+
+    #[test]
+    fn inverted_spatial_sky_mask_blocks_off_limb_glare() {
+        let (width, height) = (256usize, 160usize);
+        let (center_x, center_y) = (128.0f32, 165.0f32);
+        let mut data = vec![750u16; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let radius =
+                    ((x as f32 - center_x).powi(2) + (y as f32 - center_y).powi(2)).sqrt();
+                let value = if radius <= 120.0 {
+                    40_000
+                } else if radius <= 140.0 {
+                    7_000
+                } else {
+                    750
+                };
+                data[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(value);
+            }
+        }
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.invert = true;
+        params.solar.colorize = true;
+        params.solar.color_strength = 0.8;
+        params.solar.background_protect = 1.0;
+        params.solar.highlight_compression = 0.6;
+        params.solar.curve_points =
+            vec![[0.0, 0.0], [0.18, 0.14], [0.46, 0.4], [0.72, 0.74], [1.0, 0.97]];
+        apply_advanced_postprocess(&mut data, width, height, true, &params);
+
+        let sample_luma = |x: usize, y: usize| {
+            let index = (y * width + x) * 3;
+            (data[index] as u32 + data[index + 1] as u32 + data[index + 2] as u32) / 3
+        };
+        let sky_luma = sample_luma(16, 16);
+        let halo_luma = sample_luma(128, 35);
+        let disk_luma = sample_luma(128, 80);
+        assert!(sky_luma < 3_000);
+        assert!(
+            halo_luma < 10_000,
+            "un halo suave conectado al cielo no puede invertirse a blanco"
+        );
+        assert!(disk_luma > sky_luma * 4);
+    }
+
+    #[test]
+    fn solar_highlight_compression_retains_order_and_headroom() {
+        let low = compress_solar_highlights(0.72, 0.8);
+        let high = compress_solar_highlights(0.98, 0.8);
+        assert!(low < high, "la compresión debe ser monotónica");
+        assert!(high < 0.98, "debe reservar margen antes del recorte");
+        assert_eq!(compress_solar_highlights(0.58, 0.8), 0.58);
+        assert_eq!(compress_solar_highlights(0.98, 0.0), 0.98);
+        // El disco estirado vive en 0.55–0.85: la compresión es un hombro para
+        // las LUCES y no puede aplanar la granulación de los tonos medios.
+        assert_eq!(compress_solar_highlights(0.78, 0.9), 0.78);
+    }
+
+    #[test]
+    fn solar_filaments_survive_a_disk_that_fills_the_frame() {
+        // Regresión: el piso de ruido se estimaba con la MEDIANA de |paso-alto|
+        // sobre toda la imagen. En un disco solar que llena el encuadre esa
+        // mediana ES la granulación, así que el umbral quedaba muy por encima de
+        // la estructura real y la puerta de confianza anulaba TODOS los
+        // filamentos: el resultado salía liso. Con un cuantil bajo el piso vuelve
+        // a describir el ruido de las zonas planas.
+        let (width, height) = (64usize, 64usize);
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.colorize = false;
+        params.solar.filament_amount = 0.8;
+        params.solar.filament_radius = 1.0;
+        // Guard alto, como lo deja la adaptación sobre un máster real.
+        params.solar.noise_guard = 0.85;
+
+        // Granulación SUAVE por todo el encuadre (como la real: pasa por su
+        // media, así que su paso-alto tiene muchos valores pequeños) sobre un
+        // piso de ruido determinista mucho menor.
+        let mut disk = vec![0u16; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let granulation = 1_400.0
+                    * (x as f32 / 2.6).sin()
+                    * (y as f32 / 2.9).sin();
+                let noise = (((x * 7 + y * 13) % 11) as f32 - 5.0) * 12.0;
+                let value = (34_000.0 + granulation + noise).clamp(0.0, 65_535.0) as u16;
+                let index = (y * width + x) * 3;
+                disk[index..index + 3].fill(value);
+            }
+        }
+        for y in 12..52 {
+            let x = 26 + (y % 3);
+            let index = (y * width + x) * 3;
+            disk[index..index + 3].fill(21_000);
+        }
+
+        // Aísla EXACTAMENTE la recuperación de filamentos: misma receta con el
+        // control a cero y al valor pedido.
+        let mut without_filaments = params.clone();
+        without_filaments.solar.filament_amount = 0.0;
+        let mut off = disk.clone();
+        apply_advanced_postprocess(&mut off, width, height, true, &without_filaments);
+        let mut on = disk.clone();
+        apply_advanced_postprocess(&mut on, width, height, true, &params);
+
+        let fibril = (30 * width + 26 + (30 % 3)) * 3;
+        assert_ne!(
+            on[fibril], off[fibril],
+            "la fibrilla debe responder aunque el disco llene el encuadre"
+        );
+        let touched = off
+            .chunks_exact(3)
+            .zip(on.chunks_exact(3))
+            .filter(|(before, after)| before[0] != after[0])
+            .count();
+        assert!(
+            touched > width * height / 8,
+            "la textura del disco debe sobrevivir a la puerta de ruido ({touched} píxeles de {})",
+            width * height
+        );
+    }
+
+    #[test]
+    fn solar_filaments_do_not_invent_worms_on_a_noisy_flat_field() {
+        // Contrapeso del test anterior: bajar el piso de ruido no puede convertir
+        // el ruido en "filamentos". Un campo plano CON ruido (no el plano
+        // perfecto, que sale por el atajo de detalle nulo) debe quedar
+        // prácticamente intacto.
+        let (width, height) = (64usize, 64usize);
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.colorize = false;
+        params.solar.filament_amount = 0.8;
+        params.solar.filament_radius = 1.0;
+        params.solar.noise_guard = 0.85;
+
+        let mut noisy = vec![0u16; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let noise = (((x * 7 + y * 13) % 11) as f32 - 5.0) * 12.0;
+                let value = (34_000.0 + noise).clamp(0.0, 65_535.0) as u16;
+                let index = (y * width + x) * 3;
+                noisy[index..index + 3].fill(value);
+            }
+        }
+
+        let mut without_filaments = params.clone();
+        without_filaments.solar.filament_amount = 0.0;
+        let mut off = noisy.clone();
+        apply_advanced_postprocess(&mut off, width, height, true, &without_filaments);
+        let mut on = noisy.clone();
+        apply_advanced_postprocess(&mut on, width, height, true, &params);
+
+        let worst = off
+            .chunks_exact(3)
+            .zip(on.chunks_exact(3))
+            .map(|(before, after)| (after[0] as i32 - before[0] as i32).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            worst < 260,
+            "el ruido no puede convertirse en filamentos (desvío máximo {worst} ADU)"
+        );
+    }
+
+    #[test]
+    fn solar_false_colour_preserves_the_luminance_it_was_asked_for() {
+        // Regresión de detalle: el mapa de falso color escalaba la paleta a la
+        // luminancia pedida y recortaba POR CANAL. Con paletas rojo-dominantes
+        // el rojo se salía de gama desde luminancia ~0.5, el recorte se comía
+        // la parte del canal que faltaba y la luminancia resultante caía por
+        // debajo de la pedida: la granulación del disco se atenuaba justo en el
+        // tramo donde vive. Ahora se desatura hacia el gris de la misma
+        // luminancia, así que `luma(salida) == value` exacto en todo el rango.
+        let shadow = [0.070_6, 0.0, 0.0];
+        let midtone = [0.776_5, 0.352_9, 0.070_6]; // #c65a12 — H-alpha dorado
+        let highlight = [1.0, 0.913_7, 0.658_8]; // #ffe9a8
+        let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+
+        let mut previous = luma(interpolate_solar_color(0.0, shadow, midtone, highlight));
+        for step in 0..=200 {
+            let value = step as f32 / 200.0;
+            let mapped = interpolate_solar_color(value, shadow, midtone, highlight);
+            for (index, channel) in mapped.iter().enumerate() {
+                assert!(
+                    (0.0..=1.0).contains(channel),
+                    "el canal {index} debe quedar en gama (v={value}, {channel})"
+                );
+            }
+            let mapped_luma = luma(mapped);
+            assert!(
+                (mapped_luma - value).abs() < 1e-3,
+                "la luma mapeada debe ser la pedida (v={value}, luma={mapped_luma})"
+            );
+            assert!(
+                mapped_luma >= previous - 1e-4,
+                "la luma mapeada debe crecer con la señal (v={value})"
+            );
+            previous = mapped_luma;
+        }
+    }
+
+    #[test]
+    fn solar_background_protection_keeps_dark_disk_features_stretched() {
+        // Una umbra o un filamento oscuro DENTRO del disco puntúa como fondo por
+        // intensidad. Cuando existe el mask espacial de cielo, ese píxel es
+        // disco y su estirado debe sobrevivir; combinarlo con `max` lo reseteaba
+        // al valor sin estirar, que es lo contrario de lo que el mask documenta.
+        let (width, height) = (64usize, 32usize);
+        let mut source = vec![600u16; width * height * 3];
+        for y in 4..28 {
+            for x in 8..56 {
+                source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(36_000);
+            }
+        }
+        // Mancha oscura bien dentro del disco.
+        for y in 14..18 {
+            for x in 28..34 {
+                source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(3_200);
+            }
+        }
+
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.colorize = false;
+        params.solar.curve_points = vec![[0.0, 0.0], [0.05, 0.18], [0.2, 0.34], [1.0, 1.0]];
+        params.solar.background_protect = 1.0;
+        params.solar.prominence_amount = 0.12;
+        params.solar.highlight_protect = 0.9;
+
+        let mut stretched = source.clone();
+        apply_advanced_postprocess(&mut stretched, width, height, true, &params);
+
+        let umbra = (16 * width + 31) * 3;
+        assert!(
+            stretched[umbra] > source[umbra] + 1_500,
+            "la mancha del disco debe conservar el estirado de la curva (fue {} desde {})",
+            stretched[umbra],
+            source[umbra]
+        );
+        let sky = (1 * width + 2) * 3;
+        assert!(
+            stretched[sky] <= source[sky] + 400,
+            "el cielo debe seguir protegido (fue {} desde {})",
+            stretched[sky],
+            source[sky]
+        );
+    }
+
+    #[test]
+    fn prominence_bodies_survive_background_protection_and_scale_with_the_slider() {
+        // El defecto original: una protuberancia es ancha y suave, el detector
+        // por paso-alto daba 0 en su CUERPO y la protección de fondo la
+        // clavaba a `min(fuente, techo)` — borrada y más oscura que el máster.
+        // Además el realce por intensidad pura levantaba el borde del disco.
+        let (width, height) = (96usize, 64usize);
+        let mut source = vec![900u16; width * height * 3];
+        for y in 6..58 {
+            for x in 40..92 {
+                source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(39_000);
+            }
+        }
+        // Cuerpo ancho y LISO pegado al limbo: sin paso-alto interno.
+        for y in 22..40 {
+            for x in 26..40 {
+                source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(6_500);
+            }
+        }
+
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.colorize = false;
+        params.solar.curve_points =
+            vec![[0.0, 0.0], [0.05, 0.16], [0.2, 0.34], [1.0, 1.0]];
+        params.solar.background_protect = 1.0;
+        params.solar.prominence_amount = 0.0;
+
+        let run = |amount: f32| {
+            let mut data = source.clone();
+            let mut recipe = params.clone();
+            recipe.solar.prominence_amount = amount;
+            apply_advanced_postprocess(&mut data, width, height, true, &recipe);
+            data
+        };
+        let at_zero = run(0.0);
+        let at_half = run(0.5);
+        let at_full = run(1.0);
+
+        let body = (30 * width + 32) * 3;
+        let sky = (4 * width + 4) * 3;
+        let disk = (32 * width + 70) * 3;
+        // 1) El cuerpo sobrevive a la protección aunque el slider esté a cero:
+        //    el rescate es detección, no un premio por subir el realce.
+        assert!(
+            at_zero[body] > source[body] + 3_000,
+            "el cuerpo de la protuberancia debe conservar su estirado ({} desde {})",
+            at_zero[body],
+            source[body]
+        );
+        // 2) El cielo real sigue clavado a su valor medido.
+        assert!(
+            at_zero[sky] <= source[sky] + 200,
+            "el cielo debe volver a su nivel medido ({} desde {})",
+            at_zero[sky],
+            source[sky]
+        );
+        // 3) El deslizador REALZA la estructura detectada, monótonamente.
+        assert!(
+            at_full[body] >= at_half[body] && at_half[body] >= at_zero[body],
+            "el realce debe crecer con el control ({} / {} / {})",
+            at_zero[body],
+            at_half[body],
+            at_full[body]
+        );
+        assert!(
+            at_full[body] > at_zero[body] + 800,
+            "a tope el realce debe ser visible ({} frente a {})",
+            at_full[body],
+            at_zero[body]
+        );
+        // 4) Y el disco NO se lava al mover el control: el gate es estructura
+        //    fuera del disco, no intensidad.
+        assert_eq!(
+            at_full[disk], at_zero[disk],
+            "el deslizador de protuberancias no puede tocar el disco"
+        );
+    }
+
+    #[test]
+    fn inverted_preset_keeps_prominences_warm_and_separated_from_the_sky() {
+        // Compuesto clásico de H-alpha invertido: el DISCO se invierte, las
+        // protuberancias conservan su tono directo. Invertirlo todo las
+        // empujaba a la zona alta de la paleta (crema pálido): quedaban
+        // blanquecinas y sin separación cromática frente al cielo.
+        let (width, height) = (96usize, 64usize);
+        let mut data = vec![900u16; width * height * 3];
+        for y in 6..58 {
+            for x in 40..92 {
+                data[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(39_000);
+            }
+        }
+        for y in 22..40 {
+            for x in 26..40 {
+                data[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(6_500);
+            }
+        }
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.invert = true;
+        params.solar.colorize = true;
+        params.solar.color_strength = 0.72;
+        params.solar.background_protect = 1.0;
+        params.solar.prominence_amount = 0.4;
+        params.solar.highlight_compression = 0.55;
+        params.solar.shadow_color = [0.070_6, 0.0, 0.0];
+        params.solar.midtone_color = [0.769, 0.29, 0.047];
+        params.solar.highlight_color = [1.0, 0.894, 0.643];
+        params.solar.curve_points = vec![
+            [0.0, 0.0],
+            [0.18, 0.14],
+            [0.46, 0.4],
+            [0.72, 0.74],
+            [1.0, 0.97],
+        ];
+        apply_advanced_postprocess(&mut data, width, height, true, &params);
+
+        let body = (30 * width + 32) * 3;
+        let sky = (4 * width + 4) * 3;
+        let disk = (32 * width + 70) * 3;
+        // Cálida: el canal rojo debe dominar con claridad al azul.
+        assert!(
+            data[body] > data[body + 2].saturating_mul(2),
+            "la protuberancia debe agarrar el rojo de la paleta (r={}, b={})",
+            data[body],
+            data[body + 2]
+        );
+        let luma = |offset: usize| {
+            (data[offset] as u32 + data[offset + 1] as u32 + data[offset + 2] as u32) / 3
+        };
+        assert!(
+            luma(sky) < 3_000,
+            "el cielo invertido debe seguir protegido en negro ({})",
+            luma(sky)
+        );
+        assert!(
+            luma(body) > luma(sky) * 4,
+            "la protuberancia debe separarse del cielo ({} frente a {})",
+            luma(body),
+            luma(sky)
+        );
+        assert!(
+            data[disk] != data[disk + 1] || data[disk + 1] != data[disk + 2],
+            "el disco invertido debe conservar el falso color"
+        );
+    }
+
+    #[test]
+    fn background_protection_never_pushes_signal_below_its_measured_value() {
+        // El halo liso conectado al cielo se sigue conteniendo (no se rescata),
+        // pero contener significa devolverlo a su valor MEDIDO: recortarlo a
+        // `min(fuente, techo)` destruía datos reales del máster 16-bit y
+        // dibujaba un corte duro sobre el limbo.
+        let (width, height) = (256usize, 160usize);
+        let (center_x, center_y) = (128.0f32, 165.0f32);
+        let mut data = vec![750u16; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let radius =
+                    ((x as f32 - center_x).powi(2) + (y as f32 - center_y).powi(2)).sqrt();
+                let value = if radius <= 120.0 {
+                    40_000
+                } else if radius <= 140.0 {
+                    7_000
+                } else {
+                    750
+                };
+                data[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(value);
+            }
+        }
+        let source = data.clone();
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.colorize = false;
+        params.solar.background_protect = 1.0;
+        params.solar.prominence_amount = 0.0;
+        params.solar.curve_points =
+            vec![[0.0, 0.0], [0.04, 0.12], [0.18, 0.3], [1.0, 1.0]];
+        apply_advanced_postprocess(&mut data, width, height, true, &params);
+
+        let halo = ((35 * width + 128) * 3) as usize;
+        assert!(
+            data[halo] + 60 >= source[halo],
+            "contener el halo no puede dejarlo por debajo de su valor medido ({} desde {})",
+            data[halo],
+            source[halo]
+        );
+        let sky = ((16 * width + 16) * 3) as usize;
+        assert!(
+            data[sky] <= source[sky] + 200,
+            "el cielo profundo debe quedarse en su nivel medido ({} desde {})",
+            data[sky],
+            source[sky]
+        );
+    }
+
+    #[test]
+    fn neutral_advanced_recipe_is_identity() {
+        let mut data = color_image().data;
+        let original = data.clone();
+        apply_advanced_postprocess(&mut data, 2, 1, false, &AdvancedColorParams::default());
+        assert_eq!(data, original);
+    }
+
+    #[test]
+    fn free_tone_curve_is_bounded_and_preserves_mono_or_colour_ratios() {
+        let mut params = AdvancedColorParams::default();
+        params.tone_curve_points = vec![[0.0, 0.0], [0.5, 0.72], [1.0, 1.0]];
+
+        let mut mono = vec![24_000u16, 24_000, 24_000];
+        apply_advanced_postprocess(&mut mono, 1, 1, true, &params);
+        assert!(mono[0] > 24_000, "la curva debe elevar el medio tono");
+        assert_eq!(mono[0], mono[1]);
+        assert_eq!(mono[1], mono[2]);
+
+        let mut colour = vec![10_000u16, 20_000, 30_000];
+        let rg_before = colour[0] as f32 / colour[1] as f32;
+        let bg_before = colour[2] as f32 / colour[1] as f32;
+        apply_advanced_postprocess(&mut colour, 1, 1, false, &params);
+        let rg_after = colour[0] as f32 / colour[1] as f32;
+        let bg_after = colour[2] as f32 / colour[1] as f32;
+        assert!((rg_after - rg_before).abs() < 0.001);
+        assert!((bg_after - bg_before).abs() < 0.001);
+        assert!(
+            colour.iter().all(|value| *value >= 10_000),
+            "la curva monotónica no debe plegar ni vaciar los canales"
+        );
+    }
+
+    #[test]
+    fn local_detail_controls_preserve_mono_and_ignore_a_flat_field() {
+        let (width, height) = (16usize, 16usize);
+        let mut flat = vec![24000u16; width * height * 3];
+        let original = flat.clone();
+        let mut params = AdvancedColorParams::default();
+        params.texture = 0.8;
+        params.clarity = 0.65;
+        apply_advanced_postprocess(&mut flat, width, height, true, &params);
+        assert_eq!(flat, original, "un campo plano no debe inventar textura");
+
+        let mut structured = vec![12000u16; width * height * 3];
+        for y in 5..11 {
+            for x in 5..11 {
+                let index = (y * width + x) * 3;
+                structured[index..index + 3].fill(36000);
+            }
+        }
+        let before = structured.clone();
+        apply_advanced_postprocess(&mut structured, width, height, true, &params);
+        assert_ne!(structured, before, "la estructura real debe responder a textura/claridad");
+        for pixel in structured.chunks_exact(3) {
+            assert_eq!(pixel[0], pixel[1]);
+            assert_eq!(pixel[1], pixel[2]);
+        }
+    }
+
+    #[test]
+    fn hsl_hue_and_luminance_are_selective_and_scnr_only_reduces_green_excess() {
+        let mut red = vec![52000u16, 9000, 7000];
+        let mut hsl = AdvancedColorParams::default();
+        hsl.hsl_hue[0] = 1.0;
+        hsl.hsl_luminance[0] = 0.4;
+        apply_advanced_postprocess(&mut red, 1, 1, false, &hsl);
+        assert!(red[1] > 9000, "el matiz rojo positivo debe desplazarse hacia naranja");
+        assert!(red.iter().copied().max().unwrap() > 52000, "la luminancia selectiva debe elevar el sector rojo");
+
+        let mut green = vec![10000u16, 42000, 12000];
+        let mut scnr = AdvancedColorParams::default();
+        scnr.scnr_green = 1.0;
+        apply_advanced_postprocess(&mut green, 1, 1, false, &scnr);
+        assert!(green[1] <= 12000, "SCNR debe limitar el exceso verde a la referencia R/B");
+        assert_eq!(green[0], 10000);
+        assert_eq!(green[2], 12000);
+    }
+
+    #[test]
+    fn positive_colour_controls_do_not_colourize_neutral_lunar_noise() {
+        let mut neutral_noise = vec![30_000u16, 30_030, 29_970];
+        let before = neutral_noise.clone();
+        let mut params = AdvancedColorParams::default();
+        params.vibrance = 0.9;
+        params.hsl_saturation = [0.7; 8];
+        apply_advanced_postprocess(&mut neutral_noise, 1, 1, false, &params);
+        let range_before = before.iter().max().unwrap() - before.iter().min().unwrap();
+        let range_after =
+            neutral_noise.iter().max().unwrap() - neutral_noise.iter().min().unwrap();
+        assert!(
+            range_after <= range_before + 3,
+            "el ruido casi neutro no debe convertirse en bandas cromáticas"
+        );
+
+        let mut measured_colour = vec![36_000u16, 28_000, 20_000];
+        let colour_before = measured_colour.clone();
+        apply_advanced_postprocess(&mut measured_colour, 1, 1, false, &params);
+        let colour_range_before =
+            colour_before.iter().max().unwrap() - colour_before.iter().min().unwrap();
+        let colour_range_after =
+            measured_colour.iter().max().unwrap() - measured_colour.iter().min().unwrap();
+        assert!(
+            colour_range_after > colour_range_before,
+            "el color medido sí debe responder al preset mineral"
+        );
+    }
+
+    #[test]
+    fn contrast_preserves_the_luminance_pivot() {
+        let pivot = 18000.0f32;
+        let (mut r, mut g, mut b) = (pivot, pivot, pivot);
+        apply_advanced_color_magic(
+            &mut r, &mut g, &mut b, 1.0, 1.0, 1.8, 0.0, 0.0, 0.0, pivot, 65535.0, 0.0, 1.0, 1.0,
+        );
+        assert!((r - pivot).abs() < 0.5);
+        assert!((g - pivot).abs() < 0.5);
+        assert!((b - pivot).abs() < 0.5);
+    }
+
+    #[test]
+    fn contrast_changes_luminance_without_rotating_hue() {
+        let (mut r, mut g, mut b) = (9000.0f32, 18000.0f32, 27000.0f32);
+        let rg_before = r / g;
+        let bg_before = b / g;
+        apply_advanced_color_magic(
+            &mut r, &mut g, &mut b, 1.0, 1.0, 1.65, 0.0, 0.0, 0.0, 16000.0, 65535.0, 0.0, 1.0, 1.0,
+        );
+        assert!((r / g - rg_before).abs() < 1e-5);
+        assert!((b / g - bg_before).abs() < 1e-5);
+    }
+
+    #[test]
+    fn gamma_brightness_and_saturation_follow_their_independent_meanings() {
+        let apply = |gamma: f32, saturation: f32, brightness: f32| {
+            let (mut r, mut g, mut b) = (9000.0f32, 18000.0f32, 27000.0f32);
+            apply_advanced_color_magic(
+                &mut r,
+                &mut g,
+                &mut b,
+                gamma,
+                saturation,
+                1.0,
+                brightness,
+                0.0,
+                0.0,
+                16000.0,
+                65535.0,
+                0.0,
+                1.0,
+                1.0,
+            );
+            (r, g, b)
+        };
+
+        let neutral = apply(1.0, 1.0, 0.0);
+        let gamma_lift = apply(1.8, 1.0, 0.0);
+        let brighter = apply(1.0, 1.0, 0.4);
+        let saturated = apply(1.0, 1.8, 0.0);
+        assert!(gamma_lift.1 > neutral.1, "gamma > 1 debe elevar medios tonos");
+        assert!(brighter.1 > neutral.1, "brillo debe actuar como exposición positiva");
+        assert!(
+            saturated.2 - saturated.0 > neutral.2 - neutral.0,
+            "saturación debe ampliar la separación cromática"
+        );
+    }
+}
