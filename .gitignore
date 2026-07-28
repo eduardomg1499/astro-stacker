@@ -42,3 +42,9 @@ benchmarks/telemetry/
 # Artefactos locales de QA visual e informes generados (no fuente)
 tmp/
 output/
+
+# Config local del entorno de trabajo (no se comparte).
+.claude/
+
+# Salidas de auditoría y QA: se regeneran y pesan cientos de MB.
+artifacts/
