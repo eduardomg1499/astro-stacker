@@ -273,7 +273,17 @@ const DEFAULT_RULES = [
   {
     id: "dark-result",
     priority: 70,
-    when: (ctx) => ctx.hasResult && ctx.histogramAvailable && ctx.medianLevel < 0.035 && ctx.shadowClip <= 0.0001,
+    // `recommendedExposureEv` ya llega acotada por el tope anti-recorte (la
+    // señal brillante real no puede quemarse): si no queda margen útil, la
+    // tarjeta desaparece en vez de reaplicarse en bucle. En un planeta sobre
+    // cielo negro la mediana es el fondo, así que sin este gate la
+    // recomendación se re-disparaba tras cada aplicación hasta quemar el disco.
+    when: (ctx) => ctx.hasResult
+      && ctx.histogramAvailable
+      && ctx.medianLevel < 0.035
+      && ctx.shadowClip <= 0.0001
+      && ctx.highlightClip <= 0.0001
+      && Number(ctx.recommendedExposureEv || 0) >= 0.1,
     level: "next",
     title: "Medios tonos muy bajos",
     message: (ctx) => {

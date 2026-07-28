@@ -44,6 +44,7 @@ import {
     normalizeBatchEntryResult,
     normalizeBatchOutputSettings
 } from "./batch_output.js";
+import { computeSafeExposureEv } from "./adaptive_postprocess.js";
 
 let appWindow = null;
 // Persistencia de la categoría de objetivo: true mientras un cambio es
@@ -1693,7 +1694,6 @@ function applyZenithUltimateFlow() {
     const apBright = document.getElementById("ap-bright");
     const mpWrapper = document.getElementById("multipoint-wrapper");
     const warning = document.getElementById("liquid-warning");
-    const elitePanel = document.getElementById("panel-elite-settings");
 
     if (selTargetCategory && selTargetCategory.value !== flow.category) selTargetCategory.value = flow.category;
     if (selAnalysisMode) selAnalysisMode.value = flow.analysisMode;
@@ -1702,7 +1702,6 @@ function applyZenithUltimateFlow() {
     if (apBright) apBright.value = String(Math.round(flow.apThreshold * 100));
     if (mpWrapper) mpWrapper.style.display = flow.needsPoints ? "block" : "none";
     if (warning) warning.style.display = "none";
-    if (elitePanel) elitePanel.style.display = "none";
 
     currentAnalysisMode = flow.analysisMode;
     if (alignModeSelect) alignModeSelect.dispatchEvent(new Event("change"));
@@ -2151,6 +2150,29 @@ function getGpuMode() {
 }
 window.getGpuMode = getGpuMode;
 
+/// MODO PUREZA: fuerza de los frenos automáticos del post-procesado.
+///
+/// El pipeline lleva una decena de protecciones (altas luces, croma, frenos de
+/// deconvolución, suelo del denoise, rodillas de USM) que recortan el efecto real
+/// de los deslizadores. Son legítimas, pero estaban FIJAS y sin documentar: el
+/// usuario movía un control y obtenía una fracción de lo que pedía sin saber por
+/// qué.
+///
+/// Un valor desconocido o corrupto cae SIEMPRE en "protected": un ajuste roto
+/// nunca debe desactivar protecciones sin que nadie lo haya pedido.
+function getPurityMode() {
+    const v = localStorage.getItem("zas_purity_mode");
+    return (v === "pure" || v === "balanced" || v === "protected") ? v : "protected";
+}
+window.getPurityMode = getPurityMode;
+
+/// El mismo escalar que usa el backend (`ProtectionProfile`): 1 protegido,
+/// 0.5 equilibrado, 0 puro.
+function purityStrength(mode = getPurityMode()) {
+    return mode === "pure" ? 0 : mode === "balanced" ? 0.5 : 1;
+}
+window.purityStrength = purityStrength;
+
 function getComputePolicy() {
     return ({
         gpu: "gpu_only",
@@ -2430,41 +2452,6 @@ function enhanceRangeInputs() {
         sl.title = sl.title ? sl.title + " — " + hint : hint;
     });
 }
-
-// ============================================================
-// ESQUEMAS DE WAVELETS (presets estilo RegiStax, en localStorage)
-// Guardan la configuración COMPLETA del panel de post-procesado y la
-// re-aplican con un clic (los listeners num→slider hacen el resto y el
-// pipeline se re-lanza con su debounce normal).
-// ============================================================
-const WAVELET_PRESETS_KEY = "zas_wavelet_presets_v1";
-
-function waveletPresetsLoad() {
-    try { return JSON.parse(localStorage.getItem(WAVELET_PRESETS_KEY)) || {}; }
-    catch (_) { return {}; }
-}
-function waveletPresetsSave(all) {
-    try { localStorage.setItem(WAVELET_PRESETS_KEY, JSON.stringify(all)); } catch (_) { }
-}
-
-function refreshWaveletPresetList(selectName) {
-    const sel = document.getElementById("wavelet-preset-select");
-    if (!sel) return;
-    const all = waveletPresetsLoad();
-    sel.innerHTML = "";
-    const ph = document.createElement("option");
-    ph.value = "";
-    ph.textContent = tr("wavelets.presets.placeholder", "— Esquemas guardados —");
-    sel.appendChild(ph);
-    Object.keys(all).sort().forEach((name) => {
-        const opt = document.createElement("option");
-        opt.value = name;
-        opt.textContent = name;
-        sel.appendChild(opt);
-    });
-    if (selectName) sel.value = selectName;
-}
-
 function rgbUnitToHex(rgb) {
     return `#${(rgb || [1, 1, 1]).map((value) => Math.round(Math.max(0, Math.min(1, value)) * 255).toString(16).padStart(2, "0")).join("")}`;
 }
@@ -2620,10 +2607,16 @@ function applySolarParamsToUi(solar = {}, { presetName = "custom" } = {}) {
     updateSolarUiState();
 }
 
-async function measureAdaptiveRecipeInput() {
+// `preferProcessed: false` mide el máster original — correcto para las recetas
+// de acabado de objeto (wavelets/deconv actúan al INICIO del pipeline). La
+// etapa solar actúa al FINAL: su entrada real es el resultado con los pasos
+// previos aplicados (exposición del asistente incluida), así que ella pide
+// `preferProcessed: true`. Medir el máster la dejaba ciega a ese brillo
+// acumulado y su curva quemaba el disco.
+async function measureAdaptiveRecipeInput({ preferProcessed = false } = {}) {
     const [histogram, artifacts] = await Promise.all([
-        invoke("postprocess_histogram", { preferProcessed: false }).catch(() => lastPostHistogram),
-        invoke("analyze_postprocess_artifacts", { preferProcessed: false }).catch(() => null),
+        invoke("postprocess_histogram", { preferProcessed }).catch(() => lastPostHistogram),
+        invoke("analyze_postprocess_artifacts", { preferProcessed }).catch(() => null),
     ]);
     return {
         histogram: histogram || lastPostHistogram || {},
@@ -2648,6 +2641,8 @@ function adaptiveProtectionSummary(adaptation) {
         ringing: tr("wavelets.adaptive.ringing", "halos"),
         shadows: tr("wavelets.adaptive.shadows", "sombras"),
         balanced: tr("wavelets.adaptive.balanced", "señal equilibrada"),
+        exposure_guard: tr("wavelets.adaptive.exposure_guard", "brillo previo (curva frenada)"),
+        burn_guard: tr("wavelets.adaptive.burn_guard", "techo de blancos"),
     };
     return (adaptation.safeguards || ["balanced"]).map((key) => labels[key] || key).join(" + ");
 }
@@ -2677,7 +2672,7 @@ async function applySolarPreset(name) {
     let mutationStarted = false;
     if (adaptive) {
         if (status) {
-            status.textContent = tr("wavelets.adaptive.measuring", "Midiendo máster 16-bit, ruido y halos…");
+            status.textContent = tr("wavelets.adaptive.measuring_active", "Midiendo el resultado activo 16-bit, ruido y halos…");
             status.dataset.state = "processing";
         }
         buttons.forEach((button) => {
@@ -2686,10 +2681,12 @@ async function applySolarPreset(name) {
         });
     }
     try {
-        const measurement = adaptive ? await measureAdaptiveRecipeInput() : {};
+        const measurement = adaptive
+            ? await measureAdaptiveRecipeInput({ preferProcessed: true })
+            : {};
         if (token !== solarAdaptiveRequestId) return;
         const preset = adaptive
-            ? adaptSolarPreset(name, measurement)
+            ? adaptSolarPreset(name, { ...measurement, purity: purityStrength() })
             : cloneSolarPreset(name);
         preset.label = localizedSolarPresetLabel(name, preset.label);
         lastSolarAdaptiveState = preset;
@@ -2985,57 +2982,6 @@ function applyWaveletPreset(p, { trigger = true } = {}) {
     updateDeconvolutionStatus();
     drawPostprocessScopes();
     if (trigger) triggerUpdate();
-}
-
-function initWaveletPresets() {
-    const sel = document.getElementById("wavelet-preset-select");
-    const nameInput = document.getElementById("wavelet-preset-name");
-    const btnSave = document.getElementById("btn-wavelet-preset-save");
-    const btnDel = document.getElementById("btn-wavelet-preset-del");
-    if (!sel || !btnSave) return;
-
-    refreshWaveletPresetList();
-
-    btnSave.addEventListener("click", () => {
-        const name = (nameInput?.value || sel.value || "").trim();
-        if (!name) {
-            log("WARN", tr("wavelets.presets.need_name", "Escribe un nombre para guardar el esquema."));
-            return;
-        }
-        const all = waveletPresetsLoad();
-        all[name] = getPipelineParams();
-        waveletPresetsSave(all);
-        refreshWaveletPresetList(name);
-        if (nameInput) nameInput.value = "";
-        log("SUCCESS", tr("wavelets.presets.saved", "Esquema guardado: ") + name);
-    });
-
-    btnDel?.addEventListener("click", () => {
-        const name = sel.value;
-        if (!name) return;
-        const all = waveletPresetsLoad();
-        delete all[name];
-        waveletPresetsSave(all);
-        refreshWaveletPresetList();
-        log("INFO", tr("wavelets.presets.deleted", "Esquema borrado: ") + name);
-    });
-
-    sel.addEventListener("change", () => {
-        const name = sel.value;
-        if (!name) return;
-        const all = waveletPresetsLoad();
-        if (all[name]) {
-            suppressPostprocessEvents = true;
-            try {
-                applyWaveletPreset(all[name], { trigger: false });
-            } finally {
-                suppressPostprocessEvents = false;
-            }
-            triggerUpdate();
-            queuePostHistoryCommit(`Esquema: ${name}`);
-            log("INFO", tr("wavelets.presets.applied", "Esquema aplicado: ") + name);
-        }
-    });
 }
 
 // Arranque RESILIENTE: la secuencia se dispara con `load`, pero si un recurso
@@ -5855,6 +5801,12 @@ function getPipelineParams() {
         return Number.isFinite(value) ? value / 100 : fallback;
     };
     return {
+        // El Modo Pureza forma parte de la RECETA, no es un ajuste suelto. Si
+        // sólo viviera en localStorage, cambiarlo no invalidaría
+        // `lastProcessedParams` (el render no se refrescaría), el A/B compararía
+        // recetas que en realidad difieren, y un esquema guardado se
+        // reproduciría distinto según un ajuste oculto.
+        purity: getPurityMode(),
         u: [getVal("u1"), getVal("u2"), getVal("u3"), getVal("u4"), getVal("u5")],
         w: [getVal("w1"), getVal("w2"), getVal("w3"), getVal("w4"), getVal("w5"), getVal("w6")],
         d: [getVal("d1"), getVal("d2"), getVal("d3"), getVal("d4"), getVal("d5"), getVal("d6")],
@@ -6445,10 +6397,11 @@ function drawPostprocessScopes() {
     paintHealth("scope-highlight-health", "Luces", lastPostHistogram ? `${highlight.toFixed(2)}%` : "—", highlight > .01);
     const render = document.getElementById("scope-render-health");
     if (render) {
-        render.textContent = previewIsDownscaled
-            ? `Vista rápida 1:${previewDownscaleFactor}`
-            : "Final 1:1 exacta";
-        render.dataset.state = previewIsDownscaled ? "warning" : "good";
+        // El recuadro NO es una aproximación: es exacto dentro de su área, pero
+        // sólo cubre esa área. Por eso "parcial" y no "warning" como la antigua
+        // vista reducida, que sí mostraba contenido espacial equivocado.
+        render.textContent = previewIsDownscaled ? "Zona 1:1 · parcial" : "Final 1:1 exacta";
+        render.dataset.state = previewIsDownscaled ? "partial" : "good";
     }
 }
 
@@ -6560,15 +6513,71 @@ async function refreshPostHistogram(preferProcessed = true) {
     }
 }
 
+// Métricas del histograma ACTIVO para el asistente. La exposición recomendada
+// combina la necesidad (mediana → lectura útil) con el tope anti-recorte de
+// `computeSafeExposureEv`: nunca recomienda más EV del que la señal brillante
+// real puede absorber sin quemarse. Se usa tanto al pintar tarjetas como al
+// APLICARLAS, siempre releyendo `lastPostHistogram` (nada de instantáneas).
+function assistantHistogramContext() {
+    const histogram = lastPostHistogram;
+    if (!histogram) return {};
+    const medianLevel = Number(histogram.median || 0) / 65535;
+    const percentileLow = Number(histogram.percentileLow ?? histogram.minimum ?? 0) / 65535;
+    const percentileHigh = Number(histogram.percentileHigh ?? histogram.maximum ?? 65535) / 65535;
+    const safeEv = computeSafeExposureEv(histogram.luminance);
+    const neededEv = medianLevel > 0
+        ? Math.log2(0.18 / Math.max(0.002, medianLevel))
+        : 0;
+    return {
+        histogramAvailable: true,
+        isMono: !!histogram.isMono,
+        shadowClip: Number(histogram.shadowClip || 0),
+        highlightClip: Number(histogram.highlightClip || 0),
+        medianLevel,
+        percentileLow,
+        percentileHigh,
+        recommendedExposureEv: Math.max(0, Math.min(1.5, neededEv, safeEv)),
+        dynamicRange: Math.max(0, Number(histogram.maximum || 0) - Number(histogram.minimum || 0)) / 65535,
+        robustDynamicRange: Math.max(0, percentileHigh - percentileLow),
+    };
+}
+
+// Lleva la vista del panel izquierdo hasta un laboratorio con desplazamiento
+// suave y el mismo pulso visual que usa el asistente para revelar controles.
+function revealModulePanel(selector, title) {
+    const element = document.querySelector(selector);
+    if (!element) return;
+    let ancestor = element;
+    while (ancestor) {
+        if (ancestor.tagName === "DETAILS") ancestor.open = true;
+        ancestor = ancestor.parentElement;
+    }
+    requestAnimationFrame(() => {
+        element.scrollIntoView({ behavior: "smooth", block: "start", inline: "nearest" });
+        element.classList.add("assistant-target-pulse");
+        window.setTimeout(() => element.classList.remove("assistant-target-pulse"), 1450);
+    });
+    if (ui.statusText && title) {
+        ui.statusText.textContent = title;
+        ui.statusText.style.color = "#67e8f9";
+    }
+}
+
+function updateModuleShortcutBar() {
+    const bar = document.getElementById("module-shortcut-bar");
+    if (!bar) return;
+    const hasResult = !!postProcessSession.current();
+    bar.style.display = hasResult ? "flex" : "none";
+    const solarButton = document.getElementById("btn-goto-solar-module");
+    // El laboratorio solar sólo opera sobre másters mono; el botón sigue a esa
+    // misma regla para no enviar a un módulo bloqueado.
+    if (solarButton) solarButton.style.display = lastPostHistogram?.isMono === false ? "none" : "";
+}
+
 function updateZenithGuide(extra = {}) {
     if (!zenithGuide) return;
+    updateModuleShortcutBar();
     const history = postProcessSession.getState();
-    const medianLevel = Number(lastPostHistogram?.median || 0) / 65535;
-    const percentileLow = Number(lastPostHistogram?.percentileLow ?? lastPostHistogram?.minimum ?? 0) / 65535;
-    const percentileHigh = Number(lastPostHistogram?.percentileHigh ?? lastPostHistogram?.maximum ?? 65535) / 65535;
-    const recommendedExposureEv = medianLevel > 0
-        ? Math.max(0.1, Math.min(1.5, Math.log2(0.18 / Math.max(0.002, medianLevel))))
-        : 0.75;
     zenithGuide.update({
         ...assistantJourney,
         generation: history.generation || null,
@@ -6580,12 +6589,13 @@ function updateZenithGuide(extra = {}) {
         isMono: !!lastPostHistogram?.isMono,
         shadowClip: Number(lastPostHistogram?.shadowClip || 0),
         highlightClip: Number(lastPostHistogram?.highlightClip || 0),
-        medianLevel,
-        percentileLow,
-        percentileHigh,
-        recommendedExposureEv,
-        dynamicRange: Math.max(0, Number(lastPostHistogram?.maximum || 0) - Number(lastPostHistogram?.minimum || 0)) / 65535,
-        robustDynamicRange: Math.max(0, percentileHigh - percentileLow),
+        medianLevel: 0,
+        percentileLow: 0,
+        percentileHigh: 1,
+        recommendedExposureEv: 0,
+        dynamicRange: 0,
+        robustDynamicRange: 0,
+        ...assistantHistogramContext(),
         historyLength: history.length,
         canCompare: history.canCompare,
         compareActive: postCompareActive,
@@ -6840,7 +6850,12 @@ async function applyObjectFinishingPreset(name) {
     try {
         const measurement = await measureAdaptiveRecipeInput();
         if (token !== objectAdaptiveRequestId) return;
-        const preset = adaptObjectFinishingPreset(name, measurement);
+        // El Modo Pureza también gobierna los SUELOS que la receta impone por
+        // encima de lo que el usuario tenía puesto (auto-máscara, denoise).
+        const preset = adaptObjectFinishingPreset(name, {
+            ...measurement,
+            purity: purityStrength(),
+        });
         measuredMono = !!preset?.adaptation?.isMono;
         preset.label = localizedObjectPresetLabel(name, preset.label);
         const measuredApplicability = objectPresetApplicable(preset, { isMono: measuredMono });
@@ -7525,7 +7540,29 @@ function applyAssistantToneAdjustments(values, label, target = "#post-tone-modul
     if (!revealAssistantEdits(names, label)) navigateAssistantToControl(target, { title: label });
 }
 
+// Espera a que el render 1:1 pendiente termine (los cambios recién aplicados
+// aún no están medidos mientras el debounce/render corre). Sin esto, aplicar
+// dos tarjetas seguidas usaba métricas de ANTES del primer cambio y las
+// correcciones se acumulaban a ciegas (así se quemó Saturno con +1.50 EV × 2).
+async function waitForSettledPostPipeline(maxMs = 6000) {
+    const startedAt = performance.now();
+    while (performance.now() - startedAt < maxMs) {
+        const settled = JSON.stringify(getPipelineParams()) === lastProcessedParams
+            && !previewIsDownscaled;
+        if (settled) return true;
+        await new Promise((resolve) => setTimeout(resolve, 160));
+    }
+    return false;
+}
+
 async function applyAssistantRecommendation(action, suggestion, context) {
+    // Toda corrección se decide con el estado ACTIVO: pipeline asentado,
+    // histograma re-medido y métricas frescas fusionadas sobre la instantánea
+    // de la tarjeta. Tras aplicarse, el render 1:1 re-mide y el asistente
+    // re-sugiere solo (refreshPostHistogram → updateZenithGuide).
+    await waitForSettledPostPipeline();
+    await refreshPostHistogram(true);
+    context = { ...context, ...assistantHistogramContext() };
     const advanced = getAdvancedPostprocessParams();
     if (action === "solar-auto") {
         const preset = cloneSolarPreset("ha-gold");
@@ -7662,7 +7699,17 @@ async function applyAssistantRecommendation(action, suggestion, context) {
     }
 
     if (action === "lift-midtones") {
-        const addition = Math.max(0.1, Math.min(1.5, Number(context.recommendedExposureEv || 0.5)));
+        // Recalculada AHORA con el tope anti-recorte: si ya no queda margen
+        // seguro, no se aplica nada (y no se ensucia el historial con no-ops).
+        const addition = Math.min(1.5, Number(context.recommendedExposureEv || 0));
+        if (addition < 0.05) {
+            log("INFO", tr(
+                "assistant.exposure_settled",
+                "Asistente: la señal brillante ya no admite más exposición sin recortar; no se aplicó nada.",
+            ));
+            updateZenithGuide();
+            return;
+        }
         applyAssistantToneAdjustments({
             exposure: Math.min(4, advanced.exposure + addition),
         }, `Asistente · medios +${addition.toFixed(2)} EV`);
@@ -7695,6 +7742,12 @@ function initZenithGuideUi() {
     document.getElementById("btn-toggle-guide")?.addEventListener("click", () => setZenithGuideOpen(!panel?.classList.contains("open")));
     document.getElementById("btn-close-guide")?.addEventListener("click", () => setZenithGuideOpen(false));
     document.getElementById("btn-assistant-analyze")?.addEventListener("click", runAssistantPrimaryAction);
+    document.getElementById("btn-goto-solar-module")?.addEventListener("click", () => {
+        revealModulePanel("#solar-mono-module", tr("viewer.module_solar", "Laboratorio solar"));
+    });
+    document.getElementById("btn-goto-object-module")?.addEventListener("click", () => {
+        revealModulePanel("#object-finishing-module", tr("viewer.module_object", "Laboratorio de planetas"));
+    });
     updateZenithGuide();
     paintAssistantPrimaryAction();
 }
@@ -7718,11 +7771,388 @@ function initPostprocessHelpUi() {
     });
 }
 
+// =========================================================================
+// RECUADRO DE TRABAJO 1:1
+//
+// Sustituye a la antigua "vista rápida 1/4". Aquélla reducía la imagen y
+// aplicaba los MISMOS sigmas en píxeles, así que amplificaba detalle 4× más
+// grueso: el preview y el render final mostraban contenido espacial distinto
+// (correlación medida 0.009) y por eso el efecto de un slider "se minimizaba"
+// al soltar. El recuadro procesa a resolución nativa por el mismo backend CPU
+// que la exportación → lo que se ve dentro es el archivo final.
+//
+// Coordenadas SIEMPRE en píxeles del máster. `.zoom-content` aplica el zoom por
+// transform, así que el recuadro se posiciona con las mismas cifras que se
+// mandan al backend.
+// =========================================================================
+const POST_ROI_KEY = "zas_post_roi_v1";
+const POST_ROI_MIN = 64;
+let postRoiState = { enabled: false, x: 0, y: 0, w: 512, h: 512 };
+let postRoiDrag = null;
+
+function postRoiLoad() {
+    try {
+        const raw = JSON.parse(localStorage.getItem(POST_ROI_KEY) || "null");
+        if (raw && typeof raw === "object") {
+            const size = Number(raw.w);
+            postRoiState = {
+                enabled: !!raw.enabled,
+                x: Number.isFinite(Number(raw.x)) ? Math.max(0, Number(raw.x)) : 0,
+                y: Number.isFinite(Number(raw.y)) ? Math.max(0, Number(raw.y)) : 0,
+                w: Number.isFinite(size) && size >= POST_ROI_MIN ? size : 512,
+                h: Number.isFinite(Number(raw.h)) && Number(raw.h) >= POST_ROI_MIN ? Number(raw.h) : 512,
+            };
+        }
+    } catch { /* preferencia corrupta: se queda el valor por defecto */ }
+}
+
+function postRoiSave() {
+    try { localStorage.setItem(POST_ROI_KEY, JSON.stringify(postRoiState)); } catch { /* cuota llena */ }
+}
+
+function postRoiImageSize() {
+    const w = Number(ui.imgResult?.naturalWidth || currentFileMetadata?.width || 0);
+    const h = Number(ui.imgResult?.naturalHeight || currentFileMetadata?.height || 0);
+    return { w, h };
+}
+
+/// Encaja el recuadro dentro de la imagen sin cambiar su tamaño si cabe.
+///
+/// Sin imagen cargada aún no hay límite superior, pero el origen NUNCA puede ser
+/// negativo: si no, redimensionar antes de abrir un máster persistía un recuadro
+/// fuera de la imagen.
+function postRoiClamp() {
+    const { w: iw, h: ih } = postRoiImageSize();
+    postRoiState.w = Math.max(POST_ROI_MIN, iw ? Math.min(postRoiState.w, iw) : postRoiState.w);
+    postRoiState.h = Math.max(POST_ROI_MIN, ih ? Math.min(postRoiState.h, ih) : postRoiState.h);
+    postRoiState.x = Math.max(0, iw ? Math.min(postRoiState.x, iw - postRoiState.w) : postRoiState.x);
+    postRoiState.y = Math.max(0, ih ? Math.min(postRoiState.y, ih - postRoiState.h) : postRoiState.y);
+}
+
+/// El recuadro sólo tiene sentido si de verdad recorta algo: si cubre la imagen
+/// entera, el backend lo ignora y hace el render completo.
+function postRoiIsActive() {
+    if (!postRoiState.enabled) return false;
+    const { w: iw, h: ih } = postRoiImageSize();
+    if (!iw || !ih) return false;
+    return postRoiState.w < iw || postRoiState.h < ih;
+}
+
+/// Payload para `apply_wavelets`. `null` = render completo.
+function postRoiPayload() {
+    if (!postRoiIsActive()) return null;
+    postRoiClamp();
+    return [
+        Math.round(postRoiState.x),
+        Math.round(postRoiState.y),
+        Math.round(postRoiState.w),
+        Math.round(postRoiState.h),
+    ];
+}
+
+function postRoiRenderBox() {
+    const box = $("#post-roi-box");
+    if (!box) return;
+    if (!postRoiIsActive()) {
+        box.hidden = true;
+        const overlay = $("#img-result-roi");
+        if (overlay) overlay.hidden = true;
+        return;
+    }
+    postRoiClamp();
+    const img = ui.imgResult;
+    const offX = img ? img.offsetLeft : 0;
+    const offY = img ? img.offsetTop : 0;
+    box.hidden = false;
+    box.style.left = `${offX + postRoiState.x}px`;
+    box.style.top = `${offY + postRoiState.y}px`;
+    box.style.width = `${postRoiState.w}px`;
+    box.style.height = `${postRoiState.h}px`;
+}
+
+/// Coloca el render del recuadro encima de la vista base, alineado al píxel.
+function postRoiShowOverlay(src) {
+    const overlay = $("#img-result-roi");
+    if (!overlay) return;
+    const img = ui.imgResult;
+    const offX = img ? img.offsetLeft : 0;
+    const offY = img ? img.offsetTop : 0;
+    overlay.style.left = `${offX + Math.round(postRoiState.x)}px`;
+    overlay.style.top = `${offY + Math.round(postRoiState.y)}px`;
+    overlay.hidden = false;
+    overlay.src = src;
+}
+
+/// El overlay caduca en cuanto llega un render completo: si no, quedaría un
+/// parche de una receta anterior pegado sobre la imagen nueva.
+function postRoiClearOverlay() {
+    const overlay = $("#img-result-roi");
+    if (!overlay) return;
+    overlay.hidden = true;
+    overlay.removeAttribute("src");
+}
+
+function postRoiSyncControls() {
+    const chk = $("#chk-post-roi");
+    const sel = $("#sel-post-roi-size");
+    const centre = $("#btn-post-roi-center");
+    const hint = $("#post-roi-hint");
+    if (chk) chk.checked = postRoiState.enabled;
+    if (sel) {
+        sel.disabled = !postRoiState.enabled;
+        const size = String(Math.round(postRoiState.w));
+        if ([...sel.options].some((o) => o.value === size)) sel.value = size;
+    }
+    if (centre) centre.disabled = !postRoiState.enabled;
+    if (hint) {
+        // El módulo solar mide cuantiles globales (piso de ruido y techo de
+        // cielo); en un recorte del disco no hay cielo, así que el backend
+        // renderiza la imagen entera en vez de prometer una exactitud falsa.
+        let solar = null;
+        // Se llama durante el arranque del módulo: si el panel aún no existe,
+        // no debe tumbar la inicialización entera.
+        try { solar = getPipelineParams()?.advanced?.solar || null; } catch { solar = null; }
+        const solarBlocks = !!(solar?.enabled
+            && (Math.abs(solar.filamentAmount || 0) > 0
+                || Math.abs(solar.prominenceAmount || 0) > 0));
+        if (postRoiState.enabled && solarBlocks) {
+            hint.dataset.state = "inactive";
+            hint.textContent = tr(
+                "wavelets.roi.solar_full",
+                "El módulo solar necesita la escena completa (mide el cielo): se renderiza la imagen entera.",
+            );
+        } else {
+            delete hint.dataset.state;
+            hint.textContent = tr(
+                "wavelets.roi.hint",
+                "Lo que se ve dentro del recuadro es idéntico al archivo exportado.",
+            );
+        }
+    }
+}
+
+function postRoiSetSize(size) {
+    const { w: iw, h: ih } = postRoiImageSize();
+    const next = Math.max(POST_ROI_MIN, Number(size) || 512);
+    // Mantener el centro al cambiar de tamaño: el usuario está mirando una zona.
+    const cx = postRoiState.x + postRoiState.w / 2;
+    const cy = postRoiState.y + postRoiState.h / 2;
+    postRoiState.w = iw ? Math.min(next, iw) : next;
+    postRoiState.h = ih ? Math.min(next, ih) : next;
+    postRoiState.x = cx - postRoiState.w / 2;
+    postRoiState.y = cy - postRoiState.h / 2;
+    postRoiClamp();
+}
+
+/// Centra el recuadro en el objeto usando el centroide ponderado por brillo del
+/// render actual — el mismo criterio que usa la detección de disco.
+function postRoiCentreOnObject() {
+    const img = ui.imgResult;
+    const { w: iw, h: ih } = postRoiImageSize();
+    if (!img || !iw || !ih) return;
+    let cx = iw / 2;
+    let cy = ih / 2;
+    try {
+        const probe = 128;
+        const canvas = document.createElement("canvas");
+        canvas.width = probe;
+        canvas.height = probe;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0, probe, probe);
+        const { data } = ctx.getImageData(0, 0, probe, probe);
+        // Umbral en la mitad del rango presente: separa el cuerpo del fondo sin
+        // depender del brillo absoluto.
+        let peak = 0;
+        for (let i = 0; i < data.length; i += 4) {
+            const l = 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+            if (l > peak) peak = l;
+        }
+        const cut = peak * 0.45;
+        let sum = 0;
+        let sx = 0;
+        let sy = 0;
+        for (let py = 0; py < probe; py++) {
+            for (let px = 0; px < probe; px++) {
+                const i = (py * probe + px) * 4;
+                const l = 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+                if (l < cut) continue;
+                sum += l;
+                sx += px * l;
+                sy += py * l;
+            }
+        }
+        if (sum > 0) {
+            cx = (sx / sum) * (iw / probe);
+            cy = (sy / sum) * (ih / probe);
+        }
+    } catch { /* imagen no legible (CORS/aún sin cargar): queda el centro geométrico */ }
+    postRoiState.x = cx - postRoiState.w / 2;
+    postRoiState.y = cy - postRoiState.h / 2;
+    postRoiClamp();
+}
+
+function initPostRoiUi() {
+    postRoiLoad();
+    postRoiSyncControls();
+
+    $("#chk-post-roi")?.addEventListener("change", (e) => {
+        postRoiState.enabled = !!e.target.checked;
+        if (postRoiState.enabled) {
+            const { w: iw, h: ih } = postRoiImageSize();
+            // Primera activación: centrar en el objeto en vez de dejarlo en (0,0).
+            if (iw && ih && postRoiState.x === 0 && postRoiState.y === 0) postRoiCentreOnObject();
+            postRoiClamp();
+        } else {
+            postRoiClearOverlay();
+        }
+        postRoiSave();
+        postRoiSyncControls();
+        postRoiRenderBox();
+        triggerUpdate();
+    });
+
+    $("#sel-post-roi-size")?.addEventListener("change", (e) => {
+        postRoiSetSize(e.target.value);
+        postRoiSave();
+        postRoiRenderBox();
+        triggerUpdate();
+    });
+
+    $("#btn-post-roi-center")?.addEventListener("click", () => {
+        postRoiCentreOnObject();
+        postRoiSave();
+        postRoiRenderBox();
+        triggerUpdate();
+    });
+
+    const container = ui.viewResult?.querySelector(".zoom-target-container");
+    if (!container) return;
+
+    // El arrastre del recuadro no debe mover el pan del visor: se corta la
+    // propagación en cuanto el gesto empieza dentro de la caja.
+    container.addEventListener("mousedown", (e) => {
+        if (e.button !== 0 || !postRoiIsActive()) return;
+        const handle = e.target.closest("#post-roi-box .crop-handle");
+        const box = e.target.closest("#post-roi-box");
+        if (!handle && !box) return;
+        const coords = getLocalCoordinates(e, container);
+        postRoiDrag = handle
+            ? { mode: "resize", dir: handle.dataset.dir, origin: { ...postRoiState } }
+            : { mode: "move", dx: coords.x - postRoiState.x, dy: coords.y - postRoiState.y };
+        e.stopPropagation();
+        e.preventDefault();
+    });
+
+    window.addEventListener("mousemove", (e) => {
+        if (!postRoiDrag) return;
+        const coords = getLocalCoordinates(e, container);
+        if (postRoiDrag.mode === "move") {
+            postRoiState.x = coords.x - postRoiDrag.dx;
+            postRoiState.y = coords.y - postRoiDrag.dy;
+        } else {
+            const o = postRoiDrag.origin;
+            const right = o.x + o.w;
+            const bottom = o.y + o.h;
+            const dir = postRoiDrag.dir;
+            let x = o.x;
+            let y = o.y;
+            let w = o.w;
+            let h = o.h;
+            if (dir.includes("w")) {
+                x = Math.min(coords.x, right - POST_ROI_MIN);
+                w = right - x;
+            }
+            if (dir.includes("e")) w = Math.max(POST_ROI_MIN, coords.x - o.x);
+            if (dir.includes("n")) {
+                y = Math.min(coords.y, bottom - POST_ROI_MIN);
+                h = bottom - y;
+            }
+            if (dir.includes("s")) h = Math.max(POST_ROI_MIN, coords.y - o.y);
+            postRoiState = { ...postRoiState, x, y, w, h };
+        }
+        postRoiClamp();
+        postRoiRenderBox();
+    });
+
+    window.addEventListener("mouseup", () => {
+        if (!postRoiDrag) return;
+        postRoiDrag = null;
+        postRoiSave();
+        postRoiSyncControls();
+        // Sólo al SOLTAR se pide el render: durante el arrastre del recuadro
+        // sería un render por frame.
+        triggerUpdate();
+    });
+}
+
+/// Intensidad del sharpening pre-apilado, en el 0..1 que valida el backend
+/// (`validate_planetary_stack_parameters` RECHAZA fuera de ese rango).
+///
+/// El control es un deslizador 0-100. Antes era un `<select>` de cuatro valores,
+/// un tope artificial heredado de cuando la respuesta era muy poco lineal: ahora
+/// que el umbral de coring no depende de la intensidad, cualquier punto
+/// intermedio significa lo que dice.
+function getSharpenIntensity() {
+    const raw = Number(ui.selSharpenIntensity?.value);
+    if (!Number.isFinite(raw)) return 0.5;
+    return Math.min(1, Math.max(0, raw / 100));
+}
+
+function initPurityModeUi() {
+    const sel = $("#sel-purity-mode");
+    const warn = $("#purity-mode-warning");
+    if (!sel) return;
+    sel.value = getPurityMode();
+
+    const paint = () => {
+        if (!warn) return;
+        const mode = sel.value;
+        if (mode === "protected") {
+            warn.hidden = true;
+            warn.textContent = "";
+            return;
+        }
+        warn.hidden = false;
+        // El usuario debe saber QUÉ artefacto puede reaparecer, no sólo que
+        // "hay menos protección".
+        warn.textContent = mode === "pure"
+            ? tr(
+                "settings.general.purity_pure_warning",
+                "Sin frenos: pueden reaparecer anillos oscuros en el limbo, gusanos en el fondo y luces reventadas en Luna llena o disco solar.",
+            )
+            : tr(
+                "settings.general.purity_balanced_warning",
+                "Frenos al 50 %: más efectividad por deslizador, con riesgo moderado de halos en bordes de alto contraste.",
+            );
+    };
+
+    sel.addEventListener("change", () => {
+        const mode = sel.value;
+        try { localStorage.setItem("zas_purity_mode", mode); } catch { /* cuota llena */ }
+        paint();
+        // Forma parte de la receta: el render debe rehacerse.
+        triggerUpdate();
+    });
+    paint();
+}
+
+function initSharpenIntensityUi() {
+    const slider = ui.selSharpenIntensity;
+    const out = $("#out-sharpen-intensity");
+    if (!slider || !out) return;
+    const paint = () => { out.textContent = `${Math.round(Number(slider.value) || 0)}%`; };
+    slider.addEventListener("input", paint);
+    paint();
+}
+
 initAtmosphericCorrectionUi();
 initPostEyedropper();
 initArtifactRepairUi();
 initZenithGuideUi();
 initPostprocessHelpUi();
+initPostRoiUi();
+initSharpenIntensityUi();
+initPurityModeUi();
 
 function triggerUpdate(options = {}) {
     if (suppressPostprocessEvents) return;
@@ -7736,20 +8166,21 @@ function triggerUpdate(options = {}) {
         || (pipelineParams.advanced?.solar?.enabled
             && pipelineParams.advanced.solar.filamentAmount > 0);
 
-    // PREVIEW RÁPIDO EN VIVO: durante el arrastre (inputs rápidos) render a 1/4
-    // de resolución como máximo cada ~110 ms → feedback casi instantáneo; el
-    // render final exacto (resolución completa) lo hace el debounce de abajo al
-    // soltar. Solo para configuraciones PESADAS (deconv/lce/edge-aware/auto-máscara/
-    // PSF), donde el render completo tarda; en ligeras el debounce ya es rápido y
-    // así evitamos parpadeo.
+    // RECUADRO DE TRABAJO EN VIVO: durante el arrastre se procesa SOLO la zona
+    // elegida, a resolución nativa y por el mismo backend CPU que la exportación
+    // → lo que se ve dentro es exactamente el archivo final. Coste proporcional
+    // al área del recuadro, que elige el usuario.
+    //
+    // Antes esto era un render a 1/4 con los mismos sigmas en píxeles: mostraba
+    // detalle 4× más grueso y por eso el efecto "cambiaba" al soltar.
     if (currentFilePath) {
         const nowT = performance.now();
-        if ((heavy || forceFastPreview) && nowT - lastFastPreview >= FAST_PREVIEW_MS) {
+        if ((heavy || forceFastPreview)
+            && postRoiIsActive()
+            && nowT - lastFastPreview >= FAST_PREVIEW_MS) {
             lastFastPreview = nowT;
             pipelineRequestId++;
-            // RGB sub-pixel alignment needs a little more spatial fidelity than
-            // the heavy-filter preview; 1/2 keeps the drag smooth and visible.
-            processPipeline(pipelineRequestId, currentParams, forceFastPreview ? 2 : 4);
+            processPipeline(pipelineRequestId, currentParams, postRoiPayload());
         }
     }
 
@@ -7777,7 +8208,10 @@ function triggerUpdate(options = {}) {
     }, heavy || forceFastPreview ? 760 : 300);
 }
 
-async function processPipeline(requestId, paramsString, downscale = 1) {
+/// `roi` = [x, y, w, h] en píxeles del máster para el render del recuadro, o
+/// `null` para el render completo (el único que publica el búfer 16-bit, fija el
+/// memo de parámetros y alimenta historial/histograma).
+async function processPipeline(requestId, paramsString, roi = null) {
     if (!currentFilePath && !postProcessSession.current()) { hideImgLoader(); hideLocalProcessing(); return; }
     const renderStartedAt = performance.now();
     const p = JSON.parse(paramsString);
@@ -7816,8 +8250,9 @@ async function processPipeline(requestId, paramsString, downscale = 1) {
             edgeAwareStrength: p.edgeAwareStrength,
             autoMask: p.autoMask,
             adaptiveUsm: p.adaptiveUsm,
-            previewDownscale: downscale,
+            previewRoi: roi,
             gpuMode: getGpuMode(),
+            purityMode: p.purity,
             levelsBlack: p.levels.black,
             levelsWhite: p.levels.white,
             levelsGamma: p.levels.gamma,
@@ -7826,40 +8261,47 @@ async function processPipeline(requestId, paramsString, downscale = 1) {
         });
 
         if (requestId !== pipelineRequestId) { console.log("Descartado."); return; }
-        // Solo el render a resolución COMPLETA fija el memo; el preview rápido
-        // (downscale) marca la vista como baja-res para forzar luego el full.
-        if (downscale === 1) lastProcessedParams = paramsString;
-        const previewWidth = Number(ui.imgResult?.naturalWidth || currentFileMetadata?.width || 0);
-        const previewHeight = Number(ui.imgResult?.naturalHeight || currentFileMetadata?.height || 0);
-        previewDownscaleFactor = downscale > 1
-            && previewWidth >= 256 * downscale
-            && previewHeight >= 256 * downscale
-            ? downscale
-            : 1;
-        previewIsDownscaled = previewDownscaleFactor !== 1;
+        const isRoiRender = Array.isArray(roi);
+        // Sólo el render COMPLETO fija el memo; el del recuadro deja la vista
+        // marcada como parcial para que el debounce pida luego el completo.
+        if (!isRoiRender) lastProcessedParams = paramsString;
+        previewIsDownscaled = isRoiRender;
+        previewDownscaleFactor = 1;
         drawPostprocessScopes();
-        if (downscale === 1) postProcessSession.setPreview(b64);
+        if (!isRoiRender) postProcessSession.setPreview(b64);
 
-        if (ui.imgResult) {
+        if (isRoiRender) {
+            // El recuadro se superpone: la imagen base se queda con el último
+            // render completo y no salta ni parpadea al arrastrar.
+            postRoiShowOverlay(b64);
+            if (ui.statusText) {
+                const elapsed = Math.max(0, performance.now() - renderStartedAt);
+                const [, , rw, rh] = roi;
+                ui.statusText.textContent = `Zona 1:1 exacta · ${rw}×${rh} px · ${(elapsed / 1000).toFixed(1)} s · CPU`;
+                ui.statusText.style.color = "#67e8f9";
+            }
+        } else if (ui.imgResult) {
             if (msg) msg.textContent = "Renderizando...";
             const viewportBeforeRender = captureViewportState();
             await setImageAndWait(ui.imgResult, b64, false);
             restoreViewportState(viewportBeforeRender);
+            // El render completo ya incorpora la receta: el parche del recuadro
+            // sobraría y mostraría una versión anterior pegada encima.
+            postRoiClearOverlay();
+            postRoiRenderBox();
 
             if (ui.statusText) {
                 const elapsed = Math.max(0, performance.now() - renderStartedAt);
                 const finalEngine = getGpuMode() === "cpu"
                     ? "CPU exacta"
                     : "GPU validada · respaldo CPU";
-                ui.statusText.textContent = !previewIsDownscaled
-                    ? `Vista 1:1 actualizada · ${(elapsed / 1000).toFixed(1)} s · ${finalEngine}`
-                    : `Vista rápida 1/${previewDownscaleFactor} · ${(elapsed / 1000).toFixed(1)} s · GPU si es apta`;
-                ui.statusText.style.color = !previewIsDownscaled ? "#94a3b8" : "#67e8f9";
+                ui.statusText.textContent = `Vista 1:1 actualizada · ${(elapsed / 1000).toFixed(1)} s · ${finalEngine}`;
+                ui.statusText.style.color = "#94a3b8";
             }
         }
-        // El historial y el histograma científico sólo aceptan el render 1:1;
-        // el preview rápido durante el arrastre es deliberadamente transitorio.
-        if (downscale === 1) {
+        // El historial y el histograma científico sólo aceptan el render completo;
+        // el del recuadro durante el arrastre es deliberadamente transitorio.
+        if (!isRoiRender) {
             if (historyPlaybackRequestId === requestId) {
                 postProcessSession.updateCurrentPreview(b64);
                 historyPlaybackRequestId = 0;
@@ -9184,7 +9626,7 @@ if (ui.btnBatchRun) {
                 bayerOverrides: batchFiles.map(file => getBayerOverrideValue(file)),
                 anchorOverride: getManualAnchorOverrideValue(),
                 sharpened: document.getElementById("chk-sharpened").checked,
-                sharpenIntensity: parseFloat(ui.selSharpenIntensity?.value || "0.5"),
+                sharpenIntensity: getSharpenIntensity(),
                 doublePass: document.getElementById("chk-double-pass").checked,
                 normalizeColors: document.getElementById("chk-normalize-colors")?.checked || false,
                 alignRgb: document.getElementById("chk-rgb-align")
@@ -9335,6 +9777,7 @@ if (ui.btnBatchRun) {
                         levelsBlack: p.levels.black,
                         levelsWhite: p.levels.white,
                         levelsGamma: p.levels.gamma,
+                        purityMode: p.purity,
                         batchMode: actualBatchMode,
                         targetType: batchFlow.category,
                         bayerOverride: bOverride,
@@ -10254,7 +10697,7 @@ if (ui.btnStack) {
     ui.btnStack.addEventListener("click", async () => {
         if (!currentFilePath) return;
         const drizzleFactor = parseFloat(ui.drizzleScale.value) || 1.0;
-        const sharpenIntensity = parseFloat(ui.selSharpenIntensity?.value || "0.5");
+        const sharpenIntensity = getSharpenIntensity();
 
         // CHECK FRONTEND DE LICENCIA (Permitir en TRIAL)
         if (drizzleFactor > 1.0 && !isProVersion) {
@@ -10623,7 +11066,10 @@ async function fn_save(format_idx) {
                 levelsBlack: p.levels.black,
                 levelsWhite: p.levels.white,
                 levelsGamma: p.levels.gamma,
-                advanced: p.advanced
+                advanced: p.advanced,
+                // El archivo exportado debe salir con el MISMO modo con el que se
+                // juzgó en pantalla; si no, el WYSIWYG se rompe justo al final.
+                purityMode: p.purity,
             });
             log("SUCCESS", normalizeBackendText(msg)); showCustomAlert(tr("general.saved", "Guardado"), normalizeBackendText(msg));
         } catch (e) { log("ERROR", "Save: " + e); showCustomAlert("Error", "Error guardando: " + e); }
@@ -12873,6 +13319,14 @@ let dsInspectionDiagnostics = null;
 const dsDiscardedPaths = new Set();
 let dsInspectionFingerprint = "";
 let dsInspectionSerial = 0;
+// Preferencias del visor de tomas (solo vista, persistentes entre sesiones):
+// estirado STF 0..100 y balance por canal (quita el verde del OSC lineal).
+let dsFrameViewerStretch = (() => {
+    const stored = parseInt(localStorage.getItem("zas_ds_frame_stretch") ?? "50", 10);
+    return Number.isFinite(stored) ? Math.max(0, Math.min(100, stored)) : 50;
+})();
+let dsFrameViewerBalance = localStorage.getItem("zas_ds_frame_balance") !== "0";
+let dsFrameViewerRenderSerial = 0;
 const DS_PRESETS = {
     fast:     { interp: "bilinear", drizzle: "1", rejection: "sigma", kappaLow: 3.0, kappaHigh: 3.0, clipIters: "1",    norm: "additive", autocrop: true, cosmetic: true, darkopt: true, gradient: false, pedestal: "0", localw: false },
     // El backend resuelve Balanced con Winsorized (pipeline resolved_profile);
@@ -13910,7 +14364,16 @@ async function dsOpenFramePreview(row, allRows) {
             <button id="ds-viewer-next" class="secondary" style="font-size:.62rem;padding:4px 10px;border-radius:8px;" ${rowIndex >= 0 && rowIndex < rows.length - 1 ? "" : "disabled"} title="${tr("deepsky.next_frame", "Toma siguiente (flecha derecha)")}">›</button>
             <b style="color:#e2e8f0;font-size:.72rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(row.path)}">${escapeHtml(row.name)}</b>
             <span style="color:#64748b;font-size:.6rem;">${rowIndex + 1}/${rows.length}</span>
-            <span style="margin-left:auto;"></span>
+            <span style="margin-left:auto;display:flex;align-items:center;gap:12px;">
+                <label style="display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:.6rem;white-space:nowrap;cursor:pointer;" title="${tr("deepsky.viewer_stretch_hint", "Estirado de la vista (STF). No modifica los datos del apilado.")}">
+                    ${tr("deepsky.stf_intensity", "Intensidad")}
+                    <input id="ds-viewer-stretch" type="range" min="0" max="100" step="1" value="${dsFrameViewerStretch}" style="width:110px;">
+                </label>
+                <label style="display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:.6rem;white-space:nowrap;cursor:pointer;" title="${tr("deepsky.viewer_balance_hint", "Neutraliza el fondo por canal (quita el verde del OSC lineal) solo en la vista.")}">
+                    <input id="ds-viewer-balance" type="checkbox" ${dsFrameViewerBalance ? "checked" : ""} style="accent-color:#7c3aed;">
+                    ${tr("deepsky.viewer_balance", "Balance color")}
+                </label>
+            </span>
             <button id="ds-viewer-discard" class="secondary" style="font-size:.62rem;padding:4px 12px;border-radius:8px;">${isDiscarded() ? tr("deepsky.frame_restore", "Restaurar") : tr("deepsky.discard_from_stack", "Descartar del apilado")}</button>
             <button id="ds-viewer-close" class="secondary" style="font-size:.62rem;padding:4px 12px;border-radius:8px;">${tr("deepsky.close", "Cerrar")}</button>
         </div>
@@ -13952,20 +14415,47 @@ async function dsOpenFramePreview(row, allRows) {
         dsSchedulePreflight(true);
     });
     document.body.appendChild(overlay);
-    try {
-        const dataUrl = await invoke("deepsky_frame_preview", { path: row.path });
-        const body = overlay.querySelector("#ds-viewer-body");
-        if (body) body.innerHTML = `<img src="${dataUrl}" style="max-width:100%;max-height:100%;object-fit:contain;" alt="">`;
-    } catch (error) {
-        const body = overlay.querySelector("#ds-viewer-body");
-        if (body) {
-            body.textContent = trFormat(
-                "deepsky.preview_failed",
-                { error },
-                `No se pudo generar el preview: ${error}`,
-            );
+    // Render de la vista con estirado/balance elegibles. El backend cachea el
+    // último frame decodificado, así que mover los controles no relee el
+    // archivo; el serial descarta respuestas fuera de orden al arrastrar.
+    const renderPreview = async () => {
+        const serial = ++dsFrameViewerRenderSerial;
+        try {
+            const dataUrl = await invoke("deepsky_frame_preview", {
+                path: row.path,
+                strength: dsFrameViewerStretch / 100,
+                balanced: dsFrameViewerBalance,
+            });
+            if (serial !== dsFrameViewerRenderSerial) return;
+            const body = overlay.querySelector("#ds-viewer-body");
+            if (!body) return;
+            const img = body.querySelector("#ds-viewer-img");
+            if (img) img.src = dataUrl;
+            else body.innerHTML = `<img id="ds-viewer-img" src="${dataUrl}" style="max-width:100%;max-height:100%;object-fit:contain;" alt="">`;
+        } catch (error) {
+            if (serial !== dsFrameViewerRenderSerial) return;
+            const body = overlay.querySelector("#ds-viewer-body");
+            if (body) {
+                body.textContent = trFormat(
+                    "deepsky.preview_failed",
+                    { error },
+                    `No se pudo generar el preview: ${error}`,
+                );
+            }
         }
-    }
+    };
+    overlay.querySelector("#ds-viewer-stretch")?.addEventListener("input", (e) => {
+        const value = parseInt(e.target.value, 10);
+        dsFrameViewerStretch = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 50;
+        localStorage.setItem("zas_ds_frame_stretch", String(dsFrameViewerStretch));
+        renderPreview();
+    });
+    overlay.querySelector("#ds-viewer-balance")?.addEventListener("change", (e) => {
+        dsFrameViewerBalance = !!e.target.checked;
+        localStorage.setItem("zas_ds_frame_balance", dsFrameViewerBalance ? "1" : "0");
+        renderPreview();
+    });
+    await renderPreview();
 }
 
 async function dsInspectFrames(force = false) {
@@ -16968,13 +17458,6 @@ setupManualAnchorInteractions();
             // Sync warning or other internal states
             alignModeSelect.dispatchEvent(new Event('change'));
         };
-
-        alignModeSelect.addEventListener('change', () => {
-            const panel = document.getElementById('panel-elite-settings');
-            if (panel) {
-                panel.style.display = (alignModeSelect.value === 'elite_v4') ? 'block' : 'none';
-            }
-        });
 
         // Initial sync on load or after analysis reset
         setTimeout(updateVisibility, 500);

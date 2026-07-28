@@ -2736,6 +2736,30 @@
                             </details>
                         </div>
 
+                        <!-- MODO PUREZA. El pipeline lleva una decena de frenos
+                             automáticos (altas luces, croma, deconvolución, suelo de
+                             denoise, rodillas de USM) que recortan el efecto real de
+                             los deslizadores para evitar artefactos. Estaban fijos y
+                             sin documentar. Aquí se hacen explícitos y graduables.
+                             "Protegido" es bit-idéntico al comportamiento histórico. -->
+                        <div class="planetary-settings-section">
+                            <label class="planetary-settings-title"
+                                data-i18n="settings.general.purity_title">Protecciones de post-procesado</label>
+                            <p class="planetary-settings-intro" data-i18n="settings.general.purity_hint">
+                                Regula los frenos automáticos que limitan el efecto de los deslizadores. Protegido evita halos, ringing en el limbo y luces reventadas. Puro hace que el deslizador mande, a costa de que esos artefactos puedan reaparecer.
+                            </p>
+                            <div class="planetary-settings-row">
+                                <span class="planetary-settings-label"
+                                    data-i18n="settings.general.purity_mode">Modo</span>
+                                <select id="sel-purity-mode" class="planetary-settings-select">
+                                    <option value="protected" selected data-i18n="settings.general.purity_protected">Protegido (recomendado)</option>
+                                    <option value="balanced" data-i18n="settings.general.purity_balanced">Equilibrado</option>
+                                    <option value="pure" data-i18n="settings.general.purity_pure">Puro (sin frenos)</option>
+                                </select>
+                            </div>
+                            <p id="purity-mode-warning" class="planetary-settings-intro" hidden></p>
+                        </div>
+
                         <!-- Tutorial Settings -->
                         <div
                             style="margin-top:15px; margin-bottom:15px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px;">
@@ -2819,6 +2843,15 @@
 
 
     <div class="main-layout" style="flex:1; overflow:hidden;">
+
+        <!-- Accesos rápidos a los laboratorios del panel izquierdo. Viven en la
+             primera fila del grid (85px que ya estaban reservados y vacíos),
+             sobre la columna del visor, para no tapar la vista previa. -->
+        <div id="module-shortcut-bar" class="module-shortcut-bar" style="display:none;" role="toolbar"
+            aria-label="Accesos a módulos" data-i18n-aria-label="viewer.modules_aria">
+            <button id="btn-goto-solar-module" type="button" data-i18n="viewer.module_solar">Laboratorio solar</button>
+            <button id="btn-goto-object-module" type="button" data-i18n="viewer.module_object">Laboratorio de planetas</button>
+        </div>
 
         <div class="sidebar">
 
@@ -3417,47 +3450,6 @@
                         </div>
                     </div>
 
-                    <!-- ZENITH ELITE V4 SETTINGS PANEL -->
-                    <div id="panel-elite-settings" style="display:none; background: rgba(244, 114, 182, 0.05); border: 1px solid rgba(244, 114, 182, 0.2); border-radius: 8px; padding: 10px; margin-top: 10px; margin-bottom: 10px;">
-                        <h3 style="color:#f472b6; font-size:0.85rem; margin-top:0; margin-bottom:10px; display:flex; align-items:center; gap:6px;">
-                            <span style="font-size:1.2rem;">🧬</span> Zenith Elite V4 Config
-                        </h3>
-
-                        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
-                            <div class="elite-ctrl">
-                                <label style="font-size:0.7rem; color:#aaa; display:block;">PSF Radius</label>
-                                <input type="number" id="elite-psf-radius" value="15" min="5" max="50" style="width:100%; background:#1e293b; color:white; border:1px solid #334155; padding:3px; border-radius:4px;">
-                            </div>
-                            <div class="elite-ctrl">
-                                <label style="font-size:0.7rem; color:#aaa; display:block;">FWHM Pixels</label>
-                                <input type="number" id="elite-fwhm" value="2.5" step="0.1" style="width:100%; background:#1e293b; color:white; border:1px solid #334155; padding:3px; border-radius:4px;">
-                            </div>
-                            <div class="elite-ctrl">
-                                <label style="font-size:0.7rem; color:#aaa; display:block;">Airy Weight</label>
-                                <input type="number" id="elite-airy" value="0.3" step="0.1" style="width:100%; background:#1e293b; color:white; border:1px solid #334155; padding:3px; border-radius:4px;">
-                            </div>
-                            <div class="elite-ctrl" style="display:flex; align-items:center; gap:5px;">
-                                <input type="checkbox" id="elite-auto-psf" checked>
-                                <label style="font-size:0.7rem; color:#aaa;">Auto PSF (Limb)</label>
-                            </div>
-                            <div class="elite-ctrl">
-                                <label style="font-size:0.7rem; color:#aaa; display:block;">Iterations</label>
-                                <input type="number" id="elite-iter" value="15" min="1" max="50" style="width:100%; background:#1e293b; color:white; border:1px solid #334155; padding:3px; border-radius:4px;">
-                            </div>
-                            <div class="elite-ctrl">
-                                <label style="font-size:0.7rem; color:#aaa; display:block;">TV Lambda</label>
-                                <input type="number" id="elite-lambda" value="0.01" step="0.001" style="width:100%; background:#1e293b; color:white; border:1px solid #334155; padding:3px; border-radius:4px;">
-                            </div>
-                            <div class="elite-ctrl">
-                                <label style="font-size:0.7rem; color:#aaa; display:block;">SNR Floor</label>
-                                <input type="number" id="elite-snr" value="5.0" step="0.5" style="width:100%; background:#1e293b; color:white; border:1px solid #334155; padding:3px; border-radius:4px;">
-                            </div>
-                            <div class="elite-ctrl">
-                                <label style="font-size:0.7rem; color:#aaa; display:block;">Post-Sharpen</label>
-                                <input type="number" id="elite-sharpen" value="0.5" step="0.1" style="width:100%; background:#1e293b; color:white; border:1px solid #334155; padding:3px; border-radius:4px;">
-                            </div>
-                        </div>
-                    </div>
 
                     <div id="stacking-quality-options">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
@@ -3542,17 +3534,22 @@
                             <span style="font-size:0.6rem; color:#64748b; font-style:italic;"
                                 data-i18n="analysis.sharpen_multi_band">3-Band Engine</span>
                         </div>
-                        <select id="sel-sharpen-intensity"
-                            style="width:100%; background:#0f172a; color:#10b981; border:1px solid #334155; padding:6px; border-radius:4px; font-size:0.8rem; cursor:pointer;">
-                            <option value="0.25" data-i18n="analysis.intensity_options.low">25% (Sutil / Conservador)
-                            </option>
-                            <option value="0.50" selected data-i18n="analysis.intensity_options.suggested">50%
-                                (Equilibrado / Sugerido)</option>
-                            <option value="0.75" data-i18n="analysis.intensity_options.high">75% (Agresivo / Detallado)
-                            </option>
-                            <option value="1.00" data-i18n="analysis.intensity_options.extreme">100% (Extremo /
-                                Procesado)</option>
-                        </select>
+                        <!-- Deslizador continuo. Antes era un select de 4 valores, un
+                             tope artificial: la respuesta ya es lineal, así que
+                             cualquier punto intermedio es válido. Las marcas conservan
+                             los cuatro anclajes conocidos. -->
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <input type="range" id="sel-sharpen-intensity" min="0" max="100" step="1" value="50"
+                                list="sharpen-intensity-marks" style="flex:1; min-width:0;">
+                            <output id="out-sharpen-intensity"
+                                style="min-width:38px; color:#10b981; font-size:0.72rem; font-variant-numeric:tabular-nums; text-align:right;">50%</output>
+                        </div>
+                        <datalist id="sharpen-intensity-marks">
+                            <option value="25"></option>
+                            <option value="50"></option>
+                            <option value="75"></option>
+                            <option value="100"></option>
+                        </datalist>
                         <p style="font-size: 0.6rem; color: #64748b; margin-top: 5px;"
                             data-i18n="analysis.sharpen_hint">Controla el peso de las bandas fina, media y estructura.
                         </p>
@@ -4087,7 +4084,7 @@
                                 <svg class="zas-icon" aria-hidden="true"><use href="#icon-lightbulb"></use></svg>
                                 <div>
                                     <p data-i18n="wavelets.solar.contract"><strong>Derivado solar reversible.</strong> El máster apilado permanece monocromo; la curva y el color se guardan como una etapa del historial.</p>
-                                    <small class="adaptive-recipe-note" data-i18n="wavelets.adaptive.contract">Cada receta mide el máster 16-bit antes de ajustar detalle, ruido, halos y margen de luces.</small>
+                                    <small class="adaptive-recipe-note" data-i18n="wavelets.adaptive.solar_contract">Cada receta mide el resultado activo 16-bit (tus pasos previos incluidos) y frena curva y luces para no quemar el disco.</small>
                                 </div>
                             </div>
                             <div class="solar-preset-row" role="group" aria-label="Presets solares">
@@ -4489,6 +4486,17 @@
                 <div class="zoom-target-container">
                     <div class="zoom-content">
                         <img id="img-result" alt="">
+                        <!-- Recuadro de trabajo: render 1:1 de la zona elegida, superpuesto
+                             sobre la vista base. Lo que se ve aqui es bit-identico a lo que
+                             exporta, porque sale del mismo backend CPU. -->
+                        <img id="img-result-roi" alt="" hidden aria-hidden="true">
+                        <div id="post-roi-box" hidden>
+                            <span class="roi-tag" id="post-roi-tag" data-i18n="wavelets.roi.tag">Zona 1:1 · exacta</span>
+                            <div class="crop-handle nw" data-dir="nw"></div>
+                            <div class="crop-handle ne" data-dir="ne"></div>
+                            <div class="crop-handle sw" data-dir="sw"></div>
+                            <div class="crop-handle se" data-dir="se"></div>
+                        </div>
                         <div id="post-compare-layer" class="post-compare-layer" hidden aria-hidden="true">
                             <img id="img-result-before" alt="Referencia A">
                             <span id="post-compare-label-a" class="compare-label compare-label-a" data-i18n="wavelets.history.label_previous">A · Anterior</span>
@@ -4566,6 +4574,26 @@
             <span id="scope-highlight-health" data-i18n="assistant.highlights_empty">Luces —</span>
             <span id="scope-render-health" data-i18n="assistant.final_1to1">Final 1:1</span>
         </div>
+        <!-- RECUADRO DE TRABAJO. Durante el arrastre de sliders se procesa solo esta
+             zona, a resolucion nativa. Sustituye a la antigua "vista rapida 1:4", que
+             reducia la imagen y aplicaba los mismos sigmas en pixeles: amplificaba
+             detalle 4x mas grueso y por eso el efecto "cambiaba" al soltar. -->
+        <section class="roi-control-strip">
+            <label class="roi-toggle">
+                <input type="checkbox" id="chk-post-roi">
+                <span data-i18n="wavelets.roi.enable">Recuadro de trabajo 1:1</span>
+            </label>
+            <div class="roi-control-row">
+                <select id="sel-post-roi-size" class="planetary-settings-select" aria-label="Tamaño del recuadro">
+                    <option value="256">256 px</option>
+                    <option value="512" selected>512 px</option>
+                    <option value="720">720 px</option>
+                    <option value="1024">1024 px</option>
+                </select>
+                <button type="button" id="btn-post-roi-center" class="btn-mini" data-i18n="wavelets.roi.center">Centrar en el objeto</button>
+            </div>
+            <p class="roi-hint" id="post-roi-hint" data-i18n="wavelets.roi.hint">Lo que se ve dentro del recuadro es idéntico al archivo exportado.</p>
+        </section>
     </aside>
 
     <div id="console-panel" aria-hidden="true">

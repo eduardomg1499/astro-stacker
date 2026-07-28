@@ -1108,6 +1108,8 @@ pub fn rl_parity_rmse() -> Result<f64, String> {
         &|img| crate::apply_gaussian_blur(img, w, h, sigma),
         &|| false,
         &|_| {},
+        // El gate de paridad GPU↔CPU compara el nucleo historico.
+        crate::ProtectionProfile::PROTECTED,
     )
     .ok_or("richardson_lucy_core devolvió None")?;
 

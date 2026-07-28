@@ -30,7 +30,7 @@ export const SOLAR_CURVE_PRESETS = Object.freeze({
     enabled: true,
     invert: false,
     colorize: true,
-    curvePoints: [[0, 0], [0.08, 0.035], [0.3, 0.23], [0.58, 0.57], [0.8, 0.84], [1, 0.97]],
+    curvePoints: [[0, 0], [0.08, 0.035], [0.3, 0.23], [0.58, 0.555], [0.8, 0.785], [1, 0.935]],
     shadowColor: "#100000",
     midtoneColor: "#a83d12",
     highlightColor: "#ffdba0",
@@ -48,7 +48,7 @@ export const SOLAR_CURVE_PRESETS = Object.freeze({
     enabled: true,
     invert: false,
     colorize: true,
-    curvePoints: [[0, 0], [0.1, 0.035], [0.32, 0.23], [0.58, 0.56], [0.78, 0.82], [1, 0.965]],
+    curvePoints: [[0, 0], [0.1, 0.035], [0.32, 0.23], [0.58, 0.545], [0.78, 0.765], [1, 0.93]],
     shadowColor: "#120000",
     midtoneColor: "#c65a12",
     highlightColor: "#ffe9a8",
@@ -66,7 +66,7 @@ export const SOLAR_CURVE_PRESETS = Object.freeze({
     enabled: true,
     invert: true,
     colorize: true,
-    curvePoints: [[0, 0], [0.18, 0.14], [0.46, 0.4], [0.72, 0.74], [1, 0.97]],
+    curvePoints: [[0, 0], [0.18, 0.14], [0.46, 0.39], [0.72, 0.705], [1, 0.935]],
     shadowColor: "#120000",
     midtoneColor: "#c44a0c",
     highlightColor: "#ffe4a4",
@@ -84,7 +84,7 @@ export const SOLAR_CURVE_PRESETS = Object.freeze({
     enabled: true,
     invert: false,
     colorize: true,
-    curvePoints: [[0, 0], [0.1, 0.03], [0.34, 0.23], [0.56, 0.53], [0.76, 0.83], [1, 0.965]],
+    curvePoints: [[0, 0], [0.1, 0.03], [0.34, 0.23], [0.56, 0.515], [0.76, 0.745], [1, 0.93]],
     shadowColor: "#110000",
     midtoneColor: "#bd480a",
     highlightColor: "#ffe39a",
@@ -102,7 +102,7 @@ export const SOLAR_CURVE_PRESETS = Object.freeze({
     enabled: true,
     invert: false,
     colorize: true,
-    curvePoints: [[0, 0], [0.03, 0.012], [0.1, 0.13], [0.35, 0.33], [0.65, 0.65], [0.86, 0.82], [1, 0.95]],
+    curvePoints: [[0, 0], [0.03, 0.012], [0.1, 0.13], [0.35, 0.33], [0.65, 0.635], [0.86, 0.80], [1, 0.92]],
     shadowColor: "#070000",
     midtoneColor: "#a43a0b",
     highlightColor: "#ffd995",
@@ -120,7 +120,7 @@ export const SOLAR_CURVE_PRESETS = Object.freeze({
     enabled: true,
     invert: false,
     colorize: true,
-    curvePoints: [[0, 0], [0.035, 0.014], [0.12, 0.14], [0.34, 0.3], [0.62, 0.62], [0.82, 0.85], [1, 0.95]],
+    curvePoints: [[0, 0], [0.035, 0.014], [0.12, 0.14], [0.34, 0.3], [0.62, 0.605], [0.82, 0.805], [1, 0.92]],
     shadowColor: "#080000",
     midtoneColor: "#ad410b",
     highlightColor: "#ffdfa0",
@@ -138,7 +138,7 @@ export const SOLAR_CURVE_PRESETS = Object.freeze({
     enabled: true,
     invert: false,
     colorize: false,
-    curvePoints: [[0, 0], [0.15, 0.085], [0.38, 0.29], [0.62, 0.66], [0.82, 0.88], [1, 0.97]],
+    curvePoints: [[0, 0], [0.15, 0.085], [0.38, 0.29], [0.62, 0.625], [0.82, 0.815], [1, 0.935]],
     shadowColor: "#000000",
     midtoneColor: "#808080",
     highlightColor: "#ffffff",
@@ -210,6 +210,23 @@ export function evaluateSolarCurve(points, value) {
 export const normalizeToneCurvePoints = normalizeSolarCurvePoints;
 export const evaluateToneCurve = evaluateSolarCurve;
 
+/// Luminancia a la que una paleta de falso color pierde su degradado.
+///
+/// `interpolate_solar_color` (Rust) escala el color hasta alcanzar la luminancia
+/// pedida: `scale = value / chroma_luma`. Por encima de `chroma_luma` del color de
+/// luces el canal dominante se sale de gama, `fit_to_gamut` desatura para caber y
+/// los valores altos convergen al mismo tono. Son 0.863 en Prominencias y 0.893 en
+/// Cromosfera — por eso el techo no puede ser un número único para todos.
+export function solarPaletteCeiling(hex) {
+  const text = String(hex || "").replace("#", "").trim();
+  if (text.length !== 6) return 1;
+  const r = Number.parseInt(text.slice(0, 2), 16) / 255;
+  const g = Number.parseInt(text.slice(2, 4), 16) / 255;
+  const b = Number.parseInt(text.slice(4, 6), 16) / 255;
+  if (![r, g, b].every(Number.isFinite)) return 1;
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
 function finiteCssNumber(value, fallback = 0) {
   const number = Number.parseFloat(value);
   return Number.isFinite(number) ? number : fallback;
@@ -277,9 +294,18 @@ export function cloneSolarPreset(name) {
  * never invents gain/exposure metadata; it responds to their observable
  * consequences in the stack and keeps all values visible in the module.
  */
+/// `input.purity` = fuerza de las protecciones (1 protegido, 0.5 equilibrado,
+/// 0 puro). Escala `tonePreservation`, que es el freno que tira la curva del
+/// usuario de vuelta hacia la diagonal: con `purity = 0` la curva se respeta.
 export function adaptSolarPreset(name, input = {}) {
   const preset = cloneSolarPreset(name);
   const analysis = normalizeAdaptivePostprocessAnalysis(input);
+  // `null` NO es "sin especificar" para `Number()`: da 0, es decir PUREZA TOTAL.
+  // Sin este descarte explicito, un `purity: null` desactivaria las protecciones
+  // en silencio. Cualquier valor no numerico cae en 1 (protegido).
+  const purity = typeof input.purity === "number" && Number.isFinite(input.purity)
+    ? Math.min(1, Math.max(0, input.purity))
+    : 1;
   if (name === "neutral" || !preset.enabled) {
     return { ...preset, adaptation: analysis };
   }
@@ -300,10 +326,10 @@ export function adaptSolarPreset(name, input = {}) {
   const narrowRange = clampAdaptive((0.5 - analysis.robustRange) / 0.38);
   const exposureOffset = clampAdaptive(Math.abs(analysis.median - 0.52) / 0.48);
   const tonePreservation = clampAdaptive(
-    narrowRange * 0.18
+    (narrowRange * 0.18
       + exposureOffset * 0.1
       + analysis.shadowStress * 0.06
-      + highlightStress * 0.07,
+      + highlightStress * 0.07) * purity,
     0,
     0.3,
   );
@@ -312,10 +338,46 @@ export function adaptSolarPreset(name, input = {}) {
     0,
     1,
   ), 3);
+  // COMPRESIÓN DE LUCES: SUELO ATADO A LA PALETA DEL PRESET.
+  //
+  // El problema era que la compresión sólo miraba la ENTRADA. `highlightStress`
+  // se activa si el máster ya clipea o si su p99.8 pasa de 0.985; en un máster
+  // bien expuesto vale 0 y el factor quedaba en 0.68, o sea que la adaptación
+  // RECORTABA un 32 % la protección justo cuando el dato estaba limpio. Luego la
+  // curva subía la zona alta y se quemaba igual.
+  //
+  // Lo que de verdad marca el límite no es el histograma de entrada sino la
+  // PALETA: `interpolate_solar_color` escala el color por `value / chroma_luma`,
+  // así que por encima de la luminancia del color de luces el canal dominante se
+  // sale de gama, `fit_to_gamut` desatura para caber y los valores altos
+  // convergen al mismo tono. Ese punto es 0.863 en Prominencias y 0.914 en
+  // H-alpha dorado: no puede haber un número único para todos.
+  // Compresión que hace falta para que el techo (`1 - amount*0.16` en
+  // `compress_solar_highlights`) quede bajo el punto de aplanado de la paleta.
+  // Sin falso color no hay paleta que proteger.
+  //
+  // Se aplica como SUELO y nada más. El pico de la curva (x=1 → ~0.95-0.97)
+  // siempre supera la paleta, así que el requisito no depende de cuánto empuje el
+  // p99.8 — y añadir además un término proporcional a esa presión comprimía de
+  // más sin ganar nada, porque el suelo ya garantiza el invariante. El estrés
+  // medido sí puede subir la compresión por encima del suelo, nunca por debajo.
+  //
+  // Margen de 0.005: basta con quedar JUSTO bajo el punto de aplanado. Ahí el
+  // valor más alto toca el borde de gama pero todo lo de debajo conserva
+  // gradiente — el quemado es que colapse un RANGO, no que el pico llegue al
+  // límite. Un margen mayor sólo apagaría el limbo sin ganar nada.
+  const paletteCeiling = preset.colorize ? solarPaletteCeiling(preset.highlightColor) : 1;
+  const neededCompression = clampAdaptive((1 - (paletteCeiling - 0.005)) / 0.16, 0, 0.92);
+  // El mínimo y el estrés medido se COMPONEN, no compiten. Si se dejaba el
+  // reactivo como una alternativa (`max(adaptado, mínimo)`), el suelo se lo
+  // tragaba: un máster ya recortado recibía exactamente la misma compresión que
+  // uno impecable. Aquí el estrés escala sobre el mínimo, así que siempre añade.
+  const compressionFloor = Math.max(
+    preset.highlightCompression * 0.68,
+    neededCompression,
+  );
   preset.highlightCompression = roundAdaptive(clampAdaptive(
-    preset.highlightCompression
-      * (0.68 + highlightStress * 0.48)
-      + analysis.ringing * 0.04,
+    compressionFloor * (1 + highlightStress * 0.42) + analysis.ringing * 0.04,
     0.18,
     0.92,
   ), 3);
@@ -375,11 +437,102 @@ export function adaptSolarPreset(name, input = {}) {
         roundAdaptive(protectedY, 4),
       ];
     });
+
+  // Freno iterativo hacia la identidad: reduce la subida de la curva en un
+  // anclaje MEDIDO hasta que su salida quede bajo el objetivo. PCHIP no es
+  // afín entre puntos de control, así que una sola pasada deja residuo; tres
+  // pasadas convergen por debajo del objetivo con margen de milésimas. Solo
+  // toca puntos que SUBEN (y > x): los tramos que oscurecen (filamentos) y el
+  // pie de la curva (cielo/protuberancias) quedan intactos.
+  const restrainCurveAt = (points, anchor, targetMax, rampLow, rampHigh, fullBeyondAnchor) => {
+    let working = points.map((point) => [...point]);
+    let applied = 0;
+    for (let pass = 0; pass < 3; pass += 1) {
+      const mapped = evaluateSolarCurve(working, anchor);
+      if (mapped <= targetMax + 0.001 || mapped <= anchor) break;
+      const step = clampAdaptive(
+        (mapped - targetMax) / Math.max(0.000001, mapped - anchor),
+        0,
+        1,
+      );
+      if (step <= 0.001) break;
+      working = working.map(([x, y]) => {
+        if (y <= x) return [x, y];
+        const t = clampAdaptive((x - rampLow) / Math.max(0.000001, rampHigh - rampLow));
+        const weight = fullBeyondAnchor && x >= anchor ? 1 : t * t * (3 - 2 * t);
+        return [x, roundAdaptive(y + (x - y) * step * weight, 4)];
+      });
+      applied = applied + step * (1 - applied);
+    }
+    return { points: working, guard: applied };
+  };
+
+  // GARANTÍA ANTI-QUEMADO 1 — deriva de los medios. Las curvas de receta están
+  // escritas para un máster canónico (mediana ~0.5): sobre un resultado que ya
+  // llega brillante (exposición previa, curvas del asistente…) su subida de
+  // medios re-ilumina un disco que no lo necesita y se percibe como velo o
+  // quemado. El margen de subida permitido decae con la mediana MEDIDA.
+  const midAnchor = clampAdaptive(analysis.median, 0.12, 0.9);
+  // El margen permitido se ensancha al bajar la protección: en Puro la curva que
+  // el usuario dibujó manda sobre el criterio de "este disco ya venía brillante".
+  const allowedMidLift =
+    (clampAdaptive((0.58 - midAnchor) * 0.55, 0, 0.22) + 0.015) * purity
+    + (1 - purity) * 1.0;
+  const midResult = restrainCurveAt(
+    preset.curvePoints,
+    midAnchor,
+    midAnchor + allowedMidLift,
+    midAnchor * 0.45,
+    Math.max(midAnchor * 0.45 + 0.08, midAnchor * 0.95),
+    false,
+  );
+  preset.curvePoints = midResult.points;
+  const exposureGuard = midResult.guard;
+
+  // GARANTÍA ANTI-QUEMADO 2 — techo del blanco robusto. El p99.8 MEDIDO no
+  // puede quedar mapeado contra el hombro de compresión: conserva pendiente
+  // (estructura) y margen 16-bit en el limbo pase lo que pase con la receta.
+  const brightAnchor = clampAdaptive(
+    Math.max(analysis.percentileHigh, analysis.median + 0.05),
+    0.15,
+    0.99,
+  );
+  // Este techo NO se suelta del todo ni en Puro, y es deliberado: no protege un
+  // criterio estético sino el margen 16-bit del limbo. Mapear el blanco medido
+  // contra 1.0 recorta de verdad la estructura más brillante, y eso es pérdida de
+  // dato irreversible, no una cuestión de gusto. En Puro sube hasta 0.985 —
+  // visualmente indistinguible de saturar, pero sin destruir el limbo.
+  const burnCeiling = Math.min(
+    0.952 * purity + 0.985 * (1 - purity),
+    brightAnchor + (1 - brightAnchor) * (0.5 * purity + 1.0 * (1 - purity)),
+  );
+  const brightResult = restrainCurveAt(
+    preset.curvePoints,
+    brightAnchor,
+    burnCeiling,
+    clampAdaptive(midAnchor * 0.75, 0.02, Math.max(0.05, brightAnchor - 0.12)),
+    brightAnchor,
+    true,
+  );
+  preset.curvePoints = brightResult.points;
+  const burnGuard = brightResult.guard;
+
+  // Los frenos que actúan se anuncian en el estado del módulo: ningún ajuste
+  // invisible. La curva ya los muestra; esto los NOMBRA.
+  const guardSafeguards = [];
+  if (exposureGuard > 0.05) guardSafeguards.push("exposure_guard");
+  if (burnGuard > 0.05) guardSafeguards.push("burn_guard");
+  const safeguards = guardSafeguards.length
+    ? [...analysis.safeguards.filter((key) => key !== "balanced"), ...guardSafeguards]
+    : [...analysis.safeguards];
   preset.adaptation = {
     ...analysis,
+    safeguards,
     detailScale: roundAdaptive(detailScale, 2),
     narrowRange: roundAdaptive(narrowRange, 2),
     tonePreservation: roundAdaptive(tonePreservation, 2),
+    exposureGuard: roundAdaptive(exposureGuard, 2),
+    burnGuard: roundAdaptive(burnGuard, 2),
   };
   return preset;
 }

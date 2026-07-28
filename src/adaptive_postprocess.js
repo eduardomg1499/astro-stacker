@@ -153,3 +153,39 @@ export function roundAdaptive(value, digits = 2) {
   const scale = 10 ** digits;
   return Math.round(Number(value || 0) * scale) / scale;
 }
+
+/**
+ * Máxima subida de exposición (EV) que NO empuja la señal brillante real al
+ * recorte. El tope se mide con el histograma de luminancia del resultado
+ * activo: el nivel p99.98 (la señal más alta con población real, inmune a
+ * píxeles calientes sueltos) debe quedar por debajo de `headroomTarget` tras
+ * la ganancia. En un planeta sobre cielo negro la mediana es el FONDO: la
+ * recomendación clásica "lleva la mediana al 18 %" multiplicaba también el
+ * planeta y lo quemaba; este tope es lo que la hace segura para astro.
+ */
+export function computeSafeExposureEv(bins, {
+  headroomTarget = 0.92,
+  tailFraction = 0.0001,
+  maxEv = 4,
+} = {}) {
+  if (!Array.isArray(bins) || !bins.length) return 0;
+  let total = 0;
+  for (const bin of bins) total += Math.max(0, Number(bin) || 0);
+  if (total <= 0) return 0;
+  // Suelo absoluto de 24 píxeles: un planeta diminuto en un sensor grande no
+  // puede quedar por debajo del presupuesto de cola, pero un puñado de píxeles
+  // calientes sueltos tampoco puede secuestrar el tope.
+  const budget = Math.max(total * clampAdaptive(tailFraction, 0.000001, 0.05), 24);
+  let running = 0;
+  let topBin = 0;
+  for (let index = bins.length - 1; index >= 0; index -= 1) {
+    running += Math.max(0, Number(bins[index]) || 0);
+    if (running > budget) {
+      topBin = index;
+      break;
+    }
+  }
+  const topLevel = Math.max(0.004, (topBin + 1) / bins.length);
+  const safe = Math.log2(clampAdaptive(headroomTarget, 0.5, 1) / topLevel);
+  return clampAdaptive(safe, 0, maxEv);
+}

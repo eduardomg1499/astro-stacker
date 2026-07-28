@@ -1217,6 +1217,38 @@ button:disabled {
     box-shadow: 0 6px 20px rgba(16, 185, 129, 0.5);
 }
 
+/* Cinta diagonal "BETA" en la esquina del botón de cielo profundo.
+   El flujo está completo pero aún no es versión final, así que el aviso
+   viaja con el propio botón. Se apoya en el position:relative y el
+   overflow:hidden de la regla base de `button`, de modo que los extremos
+   de la cinta quedan recortados por el radio de 12px de la esquina. */
+#btn-deepsky-mode::after {
+    content: "BETA";
+    position: absolute;
+    /* El centro de la cinta debe caer sobre la bisectriz de la esquina
+       (Cx = -Cy) o el texto se sale del recorte: con alto total 16px
+       (8 de fuente + 6 de padding + 2 de borde), top 5 y right -27 sobre
+       80 de ancho dejan la banda a 26px del vértice y "BETA" centrado. */
+    top: 5px;
+    right: -27px;
+    width: 80px;
+    padding: 3px 0;
+    transform: rotate(45deg);
+    background: linear-gradient(135deg, #fbbf24, #d97706);
+    border-top: 1px dashed rgba(255, 255, 255, 0.55);
+    border-bottom: 1px dashed rgba(255, 255, 255, 0.55);
+    color: #2a1500;
+    font-size: 0.5rem;
+    font-weight: 900;
+    line-height: 1;
+    letter-spacing: 0.1em;
+    text-align: center;
+    text-shadow: none;
+    text-transform: uppercase;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+    pointer-events: none;
+}
+
 #btn-auto-psf {
     flex: 2;
     width: auto;
@@ -6424,8 +6456,140 @@ button.adc-node:active { cursor: grabbing; }
     white-space: nowrap;
 }
 
+/* ===== RECUADRO DE TRABAJO 1:1 ===== */
+.roi-control-strip {
+    margin-top: 9px;
+    padding: 8px;
+    border: 1px solid rgba(148, 163, 184, .12);
+    border-radius: 8px;
+    background: rgba(15, 23, 42, .7);
+}
+
+.roi-toggle {
+    display: flex;
+    gap: 7px;
+    align-items: center;
+    color: #cbd5e1;
+    font-size: .58rem;
+    cursor: pointer;
+}
+
+.roi-toggle input {
+    flex: none;
+    accent-color: #38bdf8;
+    cursor: pointer;
+}
+
+.roi-control-row {
+    display: grid;
+    grid-template-columns: minmax(0, 88px) minmax(0, 1fr);
+    gap: 6px;
+    margin-top: 7px;
+}
+
+.roi-control-strip .btn-mini {
+    padding: 5px 7px;
+    overflow: hidden;
+    color: #94a3b8;
+    border: 1px solid rgba(148, 163, 184, .18);
+    border-radius: 6px;
+    background: rgba(30, 41, 59, .8);
+    font-size: .52rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.roi-control-strip .btn-mini:hover:not(:disabled) {
+    color: #e2e8f0;
+    border-color: rgba(56, 189, 248, .45);
+}
+
+.roi-control-strip .btn-mini:disabled,
+.roi-control-strip select:disabled {
+    opacity: .45;
+    cursor: not-allowed;
+}
+
+.roi-hint {
+    margin: 7px 0 0;
+    color: #64748b;
+    font-size: .5rem;
+    line-height: 1.45;
+}
+
+.roi-hint[data-state="inactive"] {
+    color: #f59e0b;
+}
+
+/* El recuadro vive dentro de .zoom-content, en el espacio de pixeles NATIVO de
+   la imagen: el transform del contenedor ya aplica el zoom, asi que las
+   coordenadas coinciden 1:1 con las que se mandan al backend. */
+#post-roi-box {
+    position: absolute;
+    z-index: 55;
+    border: 1px solid rgba(56, 189, 248, .85);
+    box-shadow:
+        0 0 0 1px rgba(8, 47, 73, .9),
+        0 0 18px rgba(56, 189, 248, .35);
+    box-sizing: border-box;
+    pointer-events: auto;
+    touch-action: none;
+    cursor: move;
+}
+
+#post-roi-box[hidden] {
+    display: none;
+}
+
+#post-roi-box .roi-tag {
+    position: absolute;
+    top: -19px;
+    left: -1px;
+    padding: 2px 6px;
+    color: #082f49;
+    border-radius: 4px 4px 0 0;
+    background: rgba(56, 189, 248, .92);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .02em;
+    white-space: nowrap;
+    pointer-events: none;
+}
+
+#post-roi-box .crop-handle {
+    position: absolute;
+    width: 11px;
+    height: 11px;
+    border: 1px solid rgba(8, 47, 73, .9);
+    border-radius: 2px;
+    background: #38bdf8;
+    pointer-events: auto;
+}
+
+#post-roi-box .crop-handle.nw { top: -6px; left: -6px; cursor: nwse-resize; }
+#post-roi-box .crop-handle.ne { top: -6px; right: -6px; cursor: nesw-resize; }
+#post-roi-box .crop-handle.sw { bottom: -6px; left: -6px; cursor: nesw-resize; }
+#post-roi-box .crop-handle.se { bottom: -6px; right: -6px; cursor: nwse-resize; }
+
+/* El render del recuadro se superpone a la vista base, alineado en el mismo
+   espacio de pixeles. Sin transicion: debe reemplazar al instante. */
+#img-result-roi {
+    position: absolute;
+    z-index: 54;
+    opacity: 1 !important;
+    animation: none !important;
+    pointer-events: none;
+}
+
+#img-result-roi[hidden] {
+    display: none;
+}
+
 .scope-health-strip span[data-state="warning"] { color: #fda4af; border-color: rgba(251, 113, 133, .25); }
 .scope-health-strip span[data-state="good"] { color: #6ee7b7; border-color: rgba(52, 211, 153, .2); }
+/* "parcial" no es un aviso: el recuadro es EXACTO, sólo que cubre una zona. */
+.scope-health-strip span[data-state="partial"] { color: #67e8f9; border-color: rgba(56, 189, 248, .28); }
 
 input[type="range"][data-bipolar="true"]::-webkit-slider-runnable-track {
     background:
@@ -6602,6 +6766,50 @@ input[type="range"][data-bipolar="true"]::-webkit-slider-runnable-track {
 .log-entry[data-level="WARN"] .log-level { color: #fbbf24; }
 .log-entry[data-level="ERROR"] .log-level { color: #fb7185; }
 .log-message { min-width: 0; color: #cbd5e1; overflow-wrap: anywhere; }
+
+/* Accesos rápidos a los laboratorios. Ocupan la fila 1 del grid principal,
+   85px que ya estaban reservados y vacíos desde que <header> salió del grid,
+   así que la barra no roba altura al visor ni tapa la vista previa. Se limita
+   a la columna del visor (2) y flota centrada dentro de esa banda. */
+.module-shortcut-bar {
+    grid-row: 1;
+    grid-column: 2;
+    justify-self: center;
+    align-self: center;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    z-index: 60;
+    padding: 5px 7px;
+    background: rgba(15, 23, 42, 0.82);
+    /* Contorno legible sobre el fondo casi negro de la banda, pero en gris
+       neutro: la barra debe encontrarse sin competir con los botones del
+       panel izquierdo ni con la vista previa. */
+    border: 1px solid rgba(148, 163, 184, 0.45);
+    border-radius: 999px;
+    backdrop-filter: blur(8px);
+    box-shadow: 0 8px 24px rgba(2, 6, 23, 0.35);
+}
+.module-shortcut-bar button {
+    width: auto;
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 5px 14px;
+    border-radius: 999px;
+    border: 1px solid rgba(148, 163, 184, 0.42);
+    background: rgba(30, 41, 59, 0.7);
+    color: #cbd5e1;
+    cursor: pointer;
+    transition: color .18s ease, border-color .18s ease, background .18s ease, transform .18s ease;
+}
+.module-shortcut-bar button:hover {
+    color: #f8fafc;
+    border-color: rgba(56, 189, 248, 0.55);
+    background: rgba(37, 99, 235, 0.28);
+    transform: translateY(-1px);
+}
 
 @media (max-width: 1250px) {
     .main-layout { grid-template-columns: 370px 1fr; }

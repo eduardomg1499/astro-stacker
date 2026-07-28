@@ -3988,6 +3988,10 @@ async fn process_batch_entry(
     ap_threshold: Option<f32>,  // R13: umbral de malla del flujo Zenith
     align_rgb: Option<bool>,    // switch de alineacion RGB automatica
     gpu_mode: Option<String>,   // GPU compute: "auto" | "gpu" | "cpu"
+    // Modo Pureza: "protected" (historico, por defecto) | "balanced" | "pure".
+    // Controla la fuerza de las protecciones automaticas (altas luces, croma,
+    // frenos de deconvolucion, suelo de denoise, rodillas de USM).
+    purity_mode: Option<String>,
     compute_policy: Option<String>, // contrato nuevo; gpu_mode queda legado
     decode_policy: Option<String>,  // FFmpeg: auto/software/hardware
     quality_policy: Option<String>, // rigor AP: adaptive/standard/maximum
@@ -4556,18 +4560,23 @@ async fn process_batch_entry(
         levels_black.unwrap_or(0.0),           // Niveles
         levels_white.unwrap_or(1.0),
         levels_gamma.unwrap_or(1.0),
+        // Lote: `original` YA es el master completo → medir aqui es correcto y
+        // mantiene el resultado bit-identico al historico.
+        None,
+        ProtectionProfile::from_mode(purity_mode.as_deref()),
     );
 
     if processed.is_empty() {
         return Err("Cancelado por el usuario".to_string());
     }
     if let Some(ref advanced_params) = advanced {
-        apply_advanced_postprocess(
+        apply_advanced_postprocess_with(
             &mut processed,
             temp_res.width,
             temp_res.height,
             temp_res.is_mono,
             advanced_params,
+            ProtectionProfile::from_mode(purity_mode.as_deref()),
         );
     }
     planetary_derotation_checkpoint(&batch_postprocess_token, "el postprocesado batch")?;
@@ -5978,10 +5987,21 @@ fn apply_autostakkert_sharpening(buffer: &mut [u16], width: usize, height: usize
     let mut abs_devs: Vec<f32> = noise_samples.iter().map(|v| (v - median_bg).abs()).collect();
     abs_devs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let noise_sigma = abs_devs.get(abs_devs.len() / 2).cloned().unwrap_or(100.0) * 1.4826;
-    // Dynamic soft coring: as intensity increases, we also increase the noise threshold
-    // to prevent amplification of tiny artifacts at high sharpening levels.
-    let base_threshold = (noise_sigma * (2.5 + intensity)).max(120.0 * intensity.sqrt());
+    // El umbral de coring sigue al RUIDO (propiedad del dato), nunca a la
+    // intensidad que pide el usuario.
+    //
+    // Antes era `noise_sigma * (2.5 + intensity)` con suelo `120·√intensity`: al
+    // subir el slider subia tambien el umbral que descarta detalle, y con el
+    // coring DURO de mas abajo el efecto no era solo sublineal, era una inversion.
+    // Con σ pequeña (regimen del suelo absoluto) y un coeficiente de banda 1 de
+    // 130 ADU: a intensidad 0.25 el umbral era 72 y aportaba (130−72)·3.0·0.25 =
+    // 43.5; a intensidad 1.00 el umbral era 144 y aportaba CERO. Subir el
+    // deslizador borraba el detalle que decia realzar.
+    let base_threshold = (noise_sigma * 2.5).max(60.0);
     let signal_threshold = median_bg + noise_sigma * 2.0;
+    // Ancho de la transicion SNR: el corte duro en `signal_threshold` producia un
+    // escalon visible justo donde el fondo se convierte en señal.
+    let snr_transition = (noise_sigma * 2.0).max(1.0);
 
     // 3. WAVELET DECOMPOSITION (luminance only)
     let b1_blur = apply_gaussian_blur_f32(&lum, width, height, 1.0);
@@ -6001,22 +6021,38 @@ fn apply_autostakkert_sharpening(buffer: &mut [u16], width: usize, height: usize
     sharp_lum.par_iter_mut().enumerate().for_each(|(i, sl)| {
         let orig_l = lum[i];
 
-        // SNR mask: don't sharpen background
-        let snr_weight = if orig_l < signal_threshold {
-            0.0
-        } else {
-            ((orig_l - signal_threshold) / (noise_sigma * 5.0 + 1.0)).clamp(0.0, 1.0)
-        };
+        // Mascara SNR: no realzar el fondo.
+        //
+        // La forma anterior (`if orig_l < signal_threshold { 0.0 } else {
+        // (orig_l - signal_threshold) / (sigma*5+1) }`) ya era CONTINUA: valia
+        // exactamente 0 en el umbral. El smoothstep no arregla un escalon — no lo
+        // habia — sino que ademas hace continua la DERIVADA, con lo que la
+        // transicion fondo→objeto no tiene el codo que dejaba la rampa lineal.
+        // Mejora marginal; el invariante que importa (nunca un salto) lo fija
+        // `test_prestack_snr_mask_has_no_discontinuity`.
+        let snr_weight = post_smoothstep(
+            signal_threshold - snr_transition,
+            signal_threshold + snr_transition,
+            orig_l,
+        );
 
-        if snr_weight < 0.01 {
+        if snr_weight < 0.001 {
             *sl = orig_l;
             return;
         }
 
-        // Soft coring: only amplify coefficients above noise floor
+        // Contraccion suave: `c · c²/(c²+t²)`. Continua y monotona — atenua el
+        // ruido por debajo del umbral sin BORRAR de golpe los coeficientes justo
+        // por encima, que es lo que hacia el coring duro `(|c|−t)·signo(c)`.
+        // Preserva la propiedad esencial (|c| ≫ t pasa casi intacto) y elimina la
+        // discontinuidad que hacia desaparecer detalle al subir la intensidad.
         let core = |coeff: f32, thresh: f32| -> f32 {
-            let ac = coeff.abs();
-            if ac < thresh { 0.0 } else { (ac - thresh) * coeff.signum() }
+            let t2 = thresh * thresh;
+            if t2 <= f32::EPSILON {
+                return coeff;
+            }
+            let c2 = coeff * coeff;
+            coeff * (c2 / (c2 + t2))
         };
 
         let d1 = core(band1[i], base_threshold * 1.2) * s1_amp;
@@ -6180,59 +6216,6 @@ async fn stack_video(
     .await;
 }
 
-/// Downsample de un buffer RGB16 entrelazado por un factor entero (2/4) con
-/// promedio de bloque (area). Para el preview rapido en vivo: procesar a 1/N de
-/// resolucion abarata la deconvolucion/wavelets ~N². Devuelve (data, w', h').
-fn downsample_rgb_u16(data: &[u16], w: usize, h: usize, factor: usize) -> (Vec<u16>, usize, usize) {
-    let sw = w / factor;
-    let sh = h / factor;
-    let mut out = vec![0u16; sw * sh * 3];
-    let n = (factor * factor) as u32;
-    out.par_chunks_exact_mut(sw * 3)
-        .enumerate()
-        .for_each(|(ty, row)| {
-            for tx in 0..sw {
-                let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
-                for dy in 0..factor {
-                    let sy = ty * factor + dy;
-                    let base = (sy * w + tx * factor) * 3;
-                    for dx in 0..factor {
-                        let p = base + dx * 3;
-                        r += data[p] as u32;
-                        g += data[p + 1] as u32;
-                        b += data[p + 2] as u32;
-                    }
-                }
-                let o = tx * 3;
-                row[o] = (r / n) as u16;
-                row[o + 1] = (g / n) as u16;
-                row[o + 2] = (b / n) as u16;
-            }
-        });
-    (out, sw, sh)
-}
-
-/// Re-escala (nearest) un buffer RGB8 al tamaño destino. Se usa para devolver el
-/// preview downscaled a dimensiones COMPLETAS → el pan/zoom del visor no salta
-/// entre el preview rapido (arrastre) y el render final (al soltar).
-fn upscale_rgb8_nearest(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
-    let mut out = vec![0u8; dw * dh * 3];
-    out.par_chunks_exact_mut(dw * 3)
-        .enumerate()
-        .for_each(|(y, row)| {
-            let sy = (y * sh / dh).min(sh.saturating_sub(1));
-            for x in 0..dw {
-                let sx = (x * sw / dw).min(sw.saturating_sub(1));
-                let sp = (sy * sw + sx) * 3;
-                let o = x * 3;
-                row[o] = src[sp];
-                row[o + 1] = src[sp + 1];
-                row[o + 2] = src[sp + 2];
-            }
-        });
-    out
-}
-
 #[tauri::command]
 async fn apply_wavelets(
     app: tauri::AppHandle,
@@ -6288,8 +6271,17 @@ async fn apply_wavelets(
     edge_aware_strength: Option<f32>,  // B+: intensidad edge-aware (0..100)
     auto_mask: Option<f32>,            // Calidad: sharpening adaptativo por SNR
     adaptive_usm: Option<AdaptiveUsmParams>, // USM adaptativo por luminancia de entrada
-    preview_downscale: Option<u32>,    // Interactividad: 2/4 = preview rapido en arrastre
+    // Interactividad: recuadro de trabajo [x, y, w, h] en pixeles del master. Se
+    // procesa a resolucion NATIVA (mas una guarda que se descarta), asi que lo que
+    // se ve dentro es bit-identico al render completo y a la exportacion. Sustituye
+    // al antiguo `preview_downscale`, que procesaba a 1/N con los mismos sigmas en
+    // pixeles y por tanto amplificaba contenido espacial distinto.
+    preview_roi: Option<[u32; 4]>,
     gpu_mode: Option<String>,          // Velocidad: "auto"|"gpu"|"cpu" (descomposicion GPU)
+    // Modo Pureza: "protected" (historico, por defecto) | "balanced" | "pure".
+    // Controla la fuerza de las protecciones automaticas (altas luces, croma,
+    // frenos de deconvolucion, suelo de denoise, rodillas de USM).
+    purity_mode: Option<String>,
     levels_black: Option<f32>,         // Niveles: punto negro (0..1)
     levels_white: Option<f32>,         // Niveles: punto blanco (0..1)
     levels_gamma: Option<f32>,         // Niveles: gamma medios (0.1..5)
@@ -6321,34 +6313,127 @@ async fn apply_wavelets(
         b_bal,
     );
 
-    // PREVIEW EN VIVO (interactividad): durante el arrastre de sliders el front
-    // pide un downscale (2/4). Procesamos a 1/N de resolucion (deconv/wavelets
-    // ~N² mas rapidos) y luego re-escalamos el resultado a dimensiones COMPLETAS
-    // (abajo) para que el visor (pan/zoom) no salte. Stats globales/limbo/norma-
-    // lizacion siguen coherentes → el render final al soltar (downscale=1) es exacto.
-    let ds = preview_downscale.unwrap_or(1).max(1) as usize;
-    let use_ds = ds > 1 && original.width >= 256 * ds && original.height >= 256 * ds;
-    let ds_holder;
-    let (proc_ref, pw, ph): (&StackResult, usize, usize) = if use_ds {
-        let (small, sw, sh) =
-            downsample_rgb_u16(&original.data, original.width, original.height, ds);
-        ds_holder = StackResult {
-            data: small,
-            width: sw,
-            height: sh,
-            is_mono: original.is_mono,
-            is_surface: original.is_surface,
-        };
-        (&ds_holder, sw, sh)
-    } else {
-        (&original, original.width, original.height)
+    // ESTADISTICAS DEL MASTER COMPLETO. Se miden sobre `original` (imagen entera)
+    // ANTES de cualquier recorte/reduccion y se cachean por `result_generation`.
+    // Dos motivos:
+    //   - Correccion: el recuadro interactivo procesa un recorte; medir p99, el
+    //     pivote tonal o la PSF del limbo de el haria que mover el recuadro
+    //     cambiase el resultado.
+    //   - Velocidad: p99 ordena el master entero y la PSF recorre mascaras de
+    //     disco/limbo. Recalcularlo en cada arrastre de slider era puro gasto.
+    let wants_psf = psf_from_limb.unwrap_or(false);
+    let global_stats = {
+        let generation = state.result_generation.load(Ordering::SeqCst);
+        let mut guard = state
+            .global_stats_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let usable = guard.as_ref().is_some_and(|(gen, stats)| {
+            *gen == generation && stats.matches_psf_request(wants_psf, deconv_sigma)
+        });
+        if !usable {
+            let (stats, note) = GlobalStats::measure(
+                &original.data,
+                original.width,
+                original.height,
+                wants_psf,
+                deconv_sigma,
+            );
+            if let Some(note) = note {
+                log_to_front(&app, "INFO", note);
+            }
+            *guard = Some((generation, stats));
+        }
+        guard.as_ref().map(|(_, stats)| stats.clone()).unwrap()
     };
 
-    // El preview rápido downscaled puede usar GPU; el render completo usa el
-    // mismo backend CPU que exportación/lote para que el WYSIWYG sea exacto.
-    let gpu_allowed = use_ds
-        && gpu_mode.as_deref().map(|m| m != "cpu").unwrap_or(true)
-        && crate::gpu_stack::gpu_runtime().is_some();
+    // RECUADRO DE TRABAJO (interactividad). Durante el arrastre el front manda un
+    // rectangulo; se procesa a resolucion NATIVA mas una guarda que luego se
+    // descarta. Coste proporcional a los pixeles del recuadro, no a la resolucion
+    // del master — igual que el antiguo downscale, pero con cada sigma en su
+    // escala real, asi que lo que se ve dentro ES lo que exporta.
+    //
+    // La guarda es adaptativa: 3σ de la banda mas gruesa activa (ver `roi_guard_px`).
+    // El modulo solar avanzado mide cuantiles GLOBALES que describen la escena
+    // entera: el piso de ruido del paso-alto (`quantile_at(0.25)`/`(0.90)`) y el
+    // techo de fondo del cielo (`p05/p25/p80`). En un recuadro sobre el interior
+    // del disco no hay cielo, asi que esas medidas saldrian invalidas y el
+    // recuadro NO podria ser exacto. Antes que prometer un WYSIWYG que no se
+    // cumple, ahi se renderiza la imagen completa.
+    let solar_needs_full_frame = advanced
+        .as_ref()
+        .map(|a| {
+            a.solar.enabled
+                && (a.solar.filament_amount.abs() > 1e-6
+                    || a.solar.prominence_amount.abs() > 1e-6
+                    || a.solar.background_protect.abs() > 1e-6)
+        })
+        .unwrap_or(false);
+
+    let roi = preview_roi.filter(|_| !solar_needs_full_frame).and_then(|[rx, ry, rw, rh]| {
+        let x = (rx as usize).min(original.width.saturating_sub(1));
+        let y = (ry as usize).min(original.height.saturating_sub(1));
+        let w = (rw as usize).min(original.width - x);
+        let h = (rh as usize).min(original.height - y);
+        // Por debajo de 64 px el recuadro no compensa el coste fijo del recorte.
+        (w >= 64 && h >= 64 && (w < original.width || h < original.height))
+            .then_some((x, y, w, h))
+    });
+
+    let roi_holder;
+    // `visible` = offset del recuadro DENTRO del buffer procesado, para recortar
+    // la guarda al final.
+    let (proc_ref, pw, ph, visible): (&StackResult, usize, usize, Option<(usize, usize, usize, usize)>) =
+        match roi {
+            Some((vx, vy, vw, vh)) => {
+                let guard = roi_guard_px(
+                    &[u1, u2, u3, u4, u5],
+                    &[w1, w2, w3, w4, w5, w6],
+                    &[d1, d2, d3, d4, d5, d6],
+                    resolved_post.lce_amount,
+                    original.width,
+                    original.height,
+                    deconv_sigma,
+                    deconv_iter,
+                    vc_sigma,
+                    vc_iter,
+                    resolved_post.usm_radius,
+                    resolved_post.usm_amount,
+                    crisp,
+                    deringing_radius,
+                    deringing_mode,
+                );
+                // Expandir por la guarda, recortando contra los bordes del master.
+                let cx = vx.saturating_sub(guard);
+                let cy = vy.saturating_sub(guard);
+                let cw = (vx + vw + guard).min(original.width) - cx;
+                let ch = (vy + vh + guard).min(original.height) - cy;
+                let mut crop = vec![0u16; cw * ch * 3];
+                for row in 0..ch {
+                    let src = ((cy + row) * original.width + cx) * 3;
+                    let dst = row * cw * 3;
+                    crop[dst..dst + cw * 3]
+                        .copy_from_slice(&original.data[src..src + cw * 3]);
+                }
+                roi_holder = StackResult {
+                    data: crop,
+                    width: cw,
+                    height: ch,
+                    is_mono: original.is_mono,
+                    is_surface: original.is_surface,
+                };
+                (&roi_holder, cw, ch, Some((vx - cx, vy - cy, vw, vh)))
+            }
+            None => (&original, original.width, original.height, None),
+        };
+    let use_roi = visible.is_some();
+
+    // WYSIWYG: el recuadro usa el MISMO backend CPU que exportacion y lote
+    // (`gpu_allowed = false` en ambas). Reservar la GPU al preview hacia que la
+    // vista interactiva y el archivo exportado salieran de rutas distintas.
+    let _ = &gpu_mode;
+    let gpu_allowed = false;
+    let protection = ProtectionProfile::from_mode(purity_mode.as_deref());
 
     let mut final_u16 = run_processing_pipeline(
         &app,
@@ -6397,6 +6482,8 @@ async fn apply_wavelets(
         levels_black.unwrap_or(0.0),           // Niveles
         levels_white.unwrap_or(1.0),
         levels_gamma.unwrap_or(1.0),
+        Some(&global_stats),
+        protection,
     );
 
     if final_u16.is_empty() {
@@ -6407,12 +6494,13 @@ async fn apply_wavelets(
     }
 
     if let Some(ref advanced_params) = advanced {
-        apply_advanced_postprocess(
+        apply_advanced_postprocess_with(
             &mut final_u16,
             pw,
             ph,
             original.is_mono,
             advanced_params,
+            protection,
         );
     }
 
@@ -6423,10 +6511,10 @@ async fn apply_wavelets(
         }
     }
 
-    // El preview de arrastre puede estar reducido; no debe sustituir el búfer
+    // El render del recuadro cubre solo una zona; no debe sustituir el búfer
     // 16-bit de tamaño completo que consumen histograma, cuentagotas y export.
-    // Al soltar el control llega el render 1:1 y entonces sí se publica.
-    if !use_ds {
+    // Al soltar el control llega el render completo y entonces sí se publica.
+    if !use_roi {
         let mut processed = state.processed_image.lock().unwrap();
         *processed = Some(StackResult {
             data: final_u16.clone(),
@@ -6438,21 +6526,23 @@ async fn apply_wavelets(
     }
 
     emit_progress(&app, "Generando vista...", 97.0, None);
-    let vis_small = to_8bit_visual(&final_u16, 1.0);
-    // Re-escalar el preview downscaled a dimensiones completas (visor estable).
-    let vis = if use_ds {
-        upscale_rgb8_nearest(&vis_small, pw, ph, original.width, original.height)
-    } else {
-        vis_small
+    // Descartar la guarda: se proceso solo para que las colas de las Gaussianas
+    // entraran correctas dentro de la zona visible.
+    let (vis, out_w, out_h) = match visible {
+        Some((ox, oy, vw, vh)) => {
+            let mut cropped = vec![0u16; vw * vh * 3];
+            for row in 0..vh {
+                let src = ((oy + row) * pw + ox) * 3;
+                let dst = row * vw * 3;
+                cropped[dst..dst + vw * 3].copy_from_slice(&final_u16[src..src + vw * 3]);
+            }
+            (to_8bit_visual(&cropped, 1.0), vw, vh)
+        }
+        None => (to_8bit_visual(&final_u16, 1.0), original.width, original.height),
     };
     let mut png = Vec::new();
     image::png::PngEncoder::new(&mut Cursor::new(&mut png))
-        .encode(
-            &vis,
-            original.width as u32,
-            original.height as u32,
-            image::ColorType::Rgb8,
-        )
+        .encode(&vis, out_w as u32, out_h as u32, image::ColorType::Rgb8)
         .map_err(|e| e.to_string())?;
     if check_cancel(&state, backend_request_id) {
         return Err("Cancelled".into());
@@ -6465,7 +6555,7 @@ async fn apply_wavelets(
     // único por render (el WebView cachea por URL). Los previews 1:1 se
     // conservan para deshacer/A-B; los reducidos de arrastre son transitorios.
     // Fallback a base64 si el temp falla.
-    let preview_tag = if use_ds { "editor_fast" } else { "editor" };
+    let preview_tag = if use_roi { "editor_fast" } else { "editor" };
     let preview = save_preview_png_to_temp(&png, preview_tag).unwrap_or_else(|| {
         format!(
             "data:image/png;base64,{}",
@@ -6606,6 +6696,10 @@ async fn save_final_image(
     levels_white: Option<f32>,         // Niveles: punto blanco (0..1)
     levels_gamma: Option<f32>,         // Niveles: gamma medios (0.1..5)
     advanced: Option<AdvancedColorParams>,
+    // Modo Pureza: "protected" (historico, por defecto) | "balanced" | "pure".
+    // Controla la fuerza de las protecciones automaticas (altas luces, croma,
+    // frenos de deconvolucion, suelo de denoise, rodillas de USM).
+    purity_mode: Option<String>,
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
     let export_request_id = begin_planetary_user_job(&state);
@@ -6690,6 +6784,10 @@ async fn save_final_image(
         levels_black.unwrap_or(0.0),           // Niveles
         levels_white.unwrap_or(1.0),
         levels_gamma.unwrap_or(1.0),
+        // Exportacion: `original` YA es el master completo → medir aqui es
+        // correcto y mantiene el resultado bit-identico al historico.
+        None,
+        ProtectionProfile::from_mode(purity_mode.as_deref()),
     );
 
     if final_u16.is_empty() {
@@ -6700,12 +6798,13 @@ async fn save_final_image(
     }
 
     if let Some(ref advanced_params) = advanced {
-        apply_advanced_postprocess(
+        apply_advanced_postprocess_with(
             &mut final_u16,
             original.width,
             original.height,
             original.is_mono,
             advanced_params,
+            ProtectionProfile::from_mode(purity_mode.as_deref()),
         );
     }
 
@@ -11593,17 +11692,22 @@ fn apply_high_pass(
     sigma: f32,
     amt: f32,
     img_scale: f32,
+    protection: ProtectionProfile,
 ) -> Vec<f32> {
     let blurred = apply_gaussian_blur_safe(chan, w, h, sigma);
     let mut out = vec![0.0; chan.len()];
     for i in 0..chan.len() {
         let hp = chan[i] - blurred[i];
         let mut added = hp * amt;
-        let limit = img_scale * 8000.0;
+        // Rodilla: pasado `limit` el exceso se comprime. En Protegido con raiz
+        // cuadrada (duplicar el deslizador casi no cambia nada mas alla del
+        // codo); en Puro es lineal y el control manda.
+        let knee_exp = protection.sharpen_knee_exponent();
+        let limit = protection.sharpen_limit(img_scale * 8000.0);
         if added > limit {
-            added = limit + (added - limit).powf(0.5) * 10.0 * img_scale;
+            added = limit + (added - limit).powf(knee_exp) * 10.0 * img_scale;
         } else if added < -limit {
-            added = -(limit + (-added - limit).powf(0.5) * 10.0 * img_scale);
+            added = -(limit + (-added - limit).powf(knee_exp) * 10.0 * img_scale);
         }
         out[i] = chan[i] + added;
     }
@@ -11620,17 +11724,22 @@ fn apply_smart_sharpen_bilateral(
     auto_mask: f32,
     adaptive: &AdaptiveUsmParams,
     input_luminance: Option<&[f32]>,
+    protection: ProtectionProfile,
 ) -> Vec<f32> {
     // FIX: If radius is 0 (default slider pos), use an intelligent default (1.5)
     // allowing "One Slider" operation as requested.
     let effective_radius = if radius < 0.1 { 1.5 } else { radius };
+    let knee_exp = protection.sharpen_knee_exponent();
 
     // SAFE CALL: Use local safe implementation
     let blurred = apply_gaussian_blur_safe(chan, w, h, effective_radius);
 
     // FIX: Initialize with input to ensure we don't return black if loop fails or logic errors
     let mut out = chan.clone();
-    let threshold = 50.0;
+    // Bajo este umbral el USM atenua el detalle CUADRATICAMENTE. En Puro pasa a
+    // 0, con lo que el detalle fino entra entero (a cambio de amplificar tambien
+    // el grano en zonas planas).
+    let threshold = protection.usm_fine_threshold(50.0);
     let mask_strength = auto_mask.clamp(0.0, 1.0);
     let confidence = if mask_strength > 0.001 {
         let detail: Vec<f32> = chan
@@ -11661,9 +11770,13 @@ fn apply_smart_sharpen_bilateral(
         } else {
             1.0
         };
-        let mut added = if diff.abs() > threshold {
+        let mut added = if threshold <= f32::EPSILON || diff.abs() > threshold {
+            // Con `threshold` a 0 (modo Puro) hay que cortocircuitar: la rama de
+            // abajo haria 0/0 = NaN cuando `diff` es exactamente cero, y el NaN
+            // se propagaria a todo el pixel.
             diff * amt
         } else {
+            // Atenuacion cuadratica del detalle fino.
             let factor = (diff.abs() / threshold).powf(2.0);
             diff * amt * factor
         } * adaptive_scale;
@@ -11671,11 +11784,11 @@ fn apply_smart_sharpen_bilateral(
             added *= 1.0 - mask_strength * (1.0 - map[i]);
         }
 
-        let limit = img_scale * 8000.0;
+        let limit = protection.sharpen_limit(img_scale * 8000.0);
         if added > limit {
-            added = limit + (added - limit).powf(0.5) * 10.0 * img_scale;
+            added = limit + (added - limit).powf(knee_exp) * 10.0 * img_scale;
         } else if added < -limit {
-            added = -(limit + (-added - limit).powf(0.5) * 10.0 * img_scale);
+            added = -(limit + (-added - limit).powf(knee_exp) * 10.0 * img_scale);
         }
 
         out[i] = chan[i] + added;
@@ -11683,16 +11796,28 @@ fn apply_smart_sharpen_bilateral(
     out
 }
 
-fn apply_clahe_improved(chan: &Vec<f32>, w: usize, h: usize, amt: f32) -> Vec<f32> {
+/// `scale_w`/`scale_h` son las dimensiones que fijan el RADIO del realce local:
+/// siempre las del MASTER, aunque `chan` sea un recorte. El sigma se deriva del
+/// tamaño de la imagen, asi que medirlo del recorte daria un radio distinto
+/// (4K → 30; recorte de 512 → 10.2) y el recuadro mentiria sobre el LCE.
+fn apply_clahe_improved(
+    chan: &Vec<f32>,
+    w: usize,
+    h: usize,
+    scale_w: usize,
+    scale_h: usize,
+    amt: f32,
+    protection: ProtectionProfile,
+) -> Vec<f32> {
     // Robust Local Contrast (LCE) with Limiting
     // FIX: Cap sigma to 30.0 to prevent freezing on large images (convolution explode)
-    let dynamic_sigma = (w.max(h) as f32 * 0.02).min(30.0).max(5.0);
+    let dynamic_sigma = (scale_w.max(scale_h) as f32 * 0.02).min(30.0).max(5.0);
 
     // SAFE CALL: Use local safe implementation
     let blurred = apply_gaussian_blur_safe(chan, w, h, dynamic_sigma);
 
     let mut out = chan.clone();
-    let limit = 8000.0;
+    let limit = protection.lce_limit(8000.0);
     let amount_scaled = amt / 100.0;
 
     if amount_scaled <= 0.001 {
@@ -11740,12 +11865,13 @@ fn estimate_channel_noise(chan: &[f32], width: usize, height: usize) -> f32 {
     (residuals[residuals.len() / 2] * 1.4826).clamp(8.0, 4096.0)
 }
 
-fn apply_luma_preserving_denoise(
+fn apply_luma_preserving_denoise_with(
     chan: &[f32],
     width: usize,
     height: usize,
     amount: f32,
     detail_protect: f32,
+    protection: ProtectionProfile,
 ) -> Vec<f32> {
     // Edge-preserving luminance denoise: a true bilateral filter. It smooths
     // flat/noisy regions hard while leaving edges and fine structure intact.
@@ -11800,7 +11926,10 @@ fn apply_luma_preserving_denoise(
     let inv_step = lut_n as f32 / lut_max;
 
     // Global blend so the slider scales the visible strength smoothly.
-    let blend = (0.30 + amount_n * 0.70).clamp(0.0, 1.0);
+    // Suelo del 30 %: en Protegido el deslizador NUNCA baja de ese filtrado. Es
+    // sobre-suavizado forzado, asi que relajarlo recupera detalle sin introducir
+    // ningun artefacto a cambio.
+    let blend = protection.denoise_blend(amount_n);
 
     let w = width as i32;
     let h = height as i32;
@@ -11895,6 +12024,7 @@ fn apply_master_denoise_channels(
     detail_protect: f32,
     chroma_amount: f32,
     rgb_mode: bool,
+    protection: ProtectionProfile,
 ) {
     if amount <= 0.001 || channels.is_empty() {
         return;
@@ -11913,7 +12043,8 @@ fn apply_master_denoise_channels(
             v[i] = cv;
         }
 
-        let y_clean = apply_luma_preserving_denoise(&y, width, height, amount, detail_protect);
+        let y_clean =
+            apply_luma_preserving_denoise_with(&y, width, height, amount, detail_protect, protection);
         let (u_clean, v_clean) =
             apply_chroma_denoise_planes(&u, &v, width, height, amount, chroma_amount);
 
@@ -11924,12 +12055,13 @@ fn apply_master_denoise_channels(
             channels[2][i] = b;
         }
     } else {
-        channels[0] = apply_luma_preserving_denoise(
+        channels[0] = apply_luma_preserving_denoise_with(
             &channels[0],
             width,
             height,
             amount,
             detail_protect,
+            protection,
         );
     }
 }
@@ -12172,6 +12304,7 @@ fn main() {
                 deconv_cache: Mutex::new(Vec::new()),
                 wavelet_cache: Mutex::new(Vec::new()),
                 filter_cache: Mutex::new(Vec::new()),
+                global_stats_cache: Mutex::new(None),
                 batch_anchor: Mutex::new(None),
                 batch_anchor_dims: Mutex::new((0, 0)),
                 planetary_generation_gate: Mutex::new(()),

@@ -6096,42 +6096,69 @@ fn deepsky_restretch(
 }
 
 /// Preview estirado de UNA toma individual (inspección PSF): lee el archivo,
-/// hace debayer si aplica, reduce a ~1200 px de lado mayor y aplica el mismo
-/// estirado STF del resultado. Devuelve data-URL PNG — para revisar POR QUÉ
+/// hace debayer si aplica, reduce a ~1200 px de lado mayor y aplica el estirado
+/// STF elegible desde el visor. Devuelve data-URL PNG — para revisar POR QUÉ
 /// la inspección marcó una toma antes de decidir descartarla.
+/// `strength` 0..1 mueve el midtone (misma semántica que `deepsky_restretch`);
+/// `balanced` usa STF por canal (neutraliza el fondo verde de un OSC lineal)
+/// frente al estirado ligado fiel al color crudo. Solo afecta a la VISTA: los
+/// datos del apilado no se tocan.
 #[tauri::command]
-fn deepsky_frame_preview(path: String) -> Result<String, String> {
-    let mut img = ds_read_image(&path)?;
-    if let Some(cid) = img.bayer {
-        img = ds_debayer_image(img, cid);
-    }
-    let factor = ((img.w.max(img.h) + 1199) / 1200).max(1);
-    let (w, h) = ((img.w / factor).max(1), (img.h / factor).max(1));
-    let ch = img.ch.min(3);
-    let mut rgb16 = vec![0u16; w * h * 3];
-    rgb16.par_chunks_mut(3).enumerate().for_each(|(index, px)| {
-        let ox = index % w;
-        let oy = index / w;
-        let x0 = ox * factor;
-        let y0 = oy * factor;
-        let x1 = (x0 + factor).min(img.w);
-        let y1 = (y0 + factor).min(img.h);
-        let mut sums = [0.0f64; 3];
-        let mut count = 0usize;
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let base = (y * img.w + x) * img.ch;
-                for c in 0..3 {
-                    sums[c] += img.data[base + c.min(ch - 1)] as f64;
+fn deepsky_frame_preview(
+    path: String,
+    strength: Option<f32>,
+    balanced: Option<bool>,
+) -> Result<String, String> {
+    // Caché del último frame decodificado: mover estirado/balance en el visor
+    // no debe releer ni re-debayerizar un light de decenas de MB.
+    static PREVIEW_CACHE: std::sync::Mutex<Option<(String, Vec<u16>, usize, usize)>> =
+        std::sync::Mutex::new(None);
+    let cached = PREVIEW_CACHE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|(cached_path, data, w, h)| {
+            (cached_path == &path).then(|| (data.clone(), *w, *h))
+        });
+    let (rgb16, w, h) = if let Some(hit) = cached {
+        hit
+    } else {
+        let mut img = ds_read_image(&path)?;
+        if let Some(cid) = img.bayer {
+            img = ds_debayer_image(img, cid);
+        }
+        let factor = ((img.w.max(img.h) + 1199) / 1200).max(1);
+        let (w, h) = ((img.w / factor).max(1), (img.h / factor).max(1));
+        let ch = img.ch.min(3);
+        let mut rgb16 = vec![0u16; w * h * 3];
+        rgb16.par_chunks_mut(3).enumerate().for_each(|(index, px)| {
+            let ox = index % w;
+            let oy = index / w;
+            let x0 = ox * factor;
+            let y0 = oy * factor;
+            let x1 = (x0 + factor).min(img.w);
+            let y1 = (y0 + factor).min(img.h);
+            let mut sums = [0.0f64; 3];
+            let mut count = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let base = (y * img.w + x) * img.ch;
+                    for c in 0..3 {
+                        sums[c] += img.data[base + c.min(ch - 1)] as f64;
+                    }
+                    count += 1;
                 }
-                count += 1;
             }
-        }
-        for c in 0..3 {
-            px[c] = (sums[c] / count.max(1) as f64).clamp(0.0, 65535.0) as u16;
-        }
-    });
-    let preview8 = ds_render_stretch(&rgb16, w, h, false, 2.8, 0.25);
+            for c in 0..3 {
+                px[c] = (sums[c] / count.max(1) as f64).clamp(0.0, 65535.0) as u16;
+            }
+        });
+        *PREVIEW_CACHE.lock().unwrap() = Some((path.clone(), rgb16.clone(), w, h));
+        (rgb16, w, h)
+    };
+    let s = strength.unwrap_or(0.5).clamp(0.0, 1.0);
+    let target = (0.45 - 0.35 * s).clamp(0.08, 0.45);
+    let preview8 = ds_render_stretch(&rgb16, w, h, balanced.unwrap_or(true), 2.8, target);
     let mut rgba = Vec::with_capacity(w * h * 4);
     for i in 0..(w * h) {
         rgba.push(preview8[i * 3]);
@@ -21920,8 +21947,10 @@ mod ds_tests {
     #[test]
     #[ignore = "requires ZAS_M16_DIR real dataset"]
     fn validate_m16_channel_balance_on_real_data() {
-        let root = std::env::var("ZAS_M16_DIR")
-            .expect("ZAS_M16_DIR must point to the real M16 calibration corpus");
+        let Ok(root) = std::env::var("ZAS_M16_DIR") else {
+            eprintln!("SKIP validate_m16_channel_balance_on_real_data: define ZAS_M16_DIR for the manual real-data validation");
+            return;
+        };
         let list_fits = |dir: &str, max: usize| -> Vec<String> {
             let mut v: Vec<String> = std::fs::read_dir(dir)
                 .map(|rd| {

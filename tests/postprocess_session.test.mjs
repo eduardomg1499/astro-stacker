@@ -296,7 +296,16 @@ test("solar recipes adapt to the measured master without losing bounded headroom
   assert.ok(adapted.highlightCompression >= baseline.highlightCompression);
   assert.ok(adapted.filamentAmount < baseline.filamentAmount);
   assert.ok(adapted.noiseGuard >= baseline.noiseGuard);
-  assert.ok(adapted.curvePoints.at(-1)[1] < baseline.curvePoints.at(-1)[1]);
+  // CONTRATO ACTUALIZADO. Antes se exigía `adapted.at(-1)[1] < baseline.at(-1)[1]`,
+  // es decir que el `endpointCap` RECORTARA el extremo. Al bajar los últimos
+  // puntos de las curvas de preset (el penúltimo levantaba hasta +0.070 sobre la
+  // diagonal y quemaba la superficie), el extremo ya nace por debajo del cap: no
+  // hay nada que recortar. Lo que importaba era el MARGEN reservado, y eso se
+  // comprueba directamente.
+  assert.ok(
+    adapted.curvePoints.at(-1)[1] <= 0.94,
+    `el extremo debe reservar margen 16-bit (${adapted.curvePoints.at(-1)[1]})`,
+  );
   assert.ok(adapted.curvePoints.every(([, y]) => y >= 0 && y <= 1));
 });
 
@@ -749,4 +758,69 @@ test("the 16-bit white-level range can represent the exact neutral endpoint", as
   assert.equal(max, 65535);
   assert.equal(value, max);
   assert.equal((max - min) % step, 0);
+});
+
+// ===========================================================================
+// EL MODO PUREZA FORMA PARTE DE LA RECETA, no es un ajuste suelto.
+//
+// Si sólo viviera en localStorage, cambiarlo no invalidaría el memo de
+// parámetros (el render no se refrescaría), el A/B compararía dos estados que en
+// realidad difieren, y el historial reproduciría un paso con una protección
+// distinta de la que tenía cuando se creó.
+// ===========================================================================
+
+test("purity distingue dos recetas por lo demás idénticas", () => {
+  const base = { gamma: 1.2, u: [1, 0, 0, 0, 0], purity: "protected" };
+  const puro = { ...base, purity: "pure" };
+  assert.ok(recipesEqual(base, { ...base }), "la misma receta debe seguir siendo igual");
+  assert.ok(
+    !recipesEqual(base, puro),
+    "cambiar el modo de protección tiene que producir una receta distinta",
+  );
+});
+
+test("el historial conserva la protección con la que se creó cada paso", () => {
+  const session = new PostProcessSession();
+  session.beginResult({
+    generation: 1,
+    source: "stack",
+    recipe: { gamma: 1, purity: "protected" },
+    preview: "base",
+  });
+  session.commit({ gamma: 1, purity: "pure" }, { preview: "puro" });
+  session.commit({ gamma: 1.4, purity: "pure" }, { preview: "puro-mas-gamma" });
+
+  // Deshacer devuelve el paso con SU protección, no con la activa ahora.
+  const undone = session.undo();
+  assert.equal(undone.recipe.purity, "pure");
+  assert.equal(undone.recipe.gamma, 1);
+
+  const backToOrigin = session.undo();
+  assert.equal(
+    backToOrigin.recipe.purity,
+    "protected",
+    "el original debe recuperarse con la protección que tenía",
+  );
+
+  const redone = session.redo();
+  assert.equal(redone.recipe.purity, "pure");
+});
+
+test("el A/B compara estados con protecciones distintas sin romperse", () => {
+  const session = new PostProcessSession();
+  session.beginResult({
+    generation: 1,
+    source: "stack",
+    recipe: { gamma: 1, purity: "protected" },
+    preview: "a",
+  });
+  session.commit({ gamma: 1, purity: "pure" }, { preview: "b" });
+
+  assert.ok(session.getState().canCompare, "con historial debe haber A/B disponible");
+  // El lado A conserva su propia protección: comparar Protegido contra Puro es
+  // justo el uso para el que sirve el A/B aquí.
+  const ladoA = session.getCompareEntry("previous");
+  assert.equal(unwrapPreviewReference(ladoA.preview), "a");
+  assert.equal(ladoA.recipe.purity, "protected");
+  assert.equal(unwrapPreviewReference(session.getCompareEntry("source").preview), "a");
 });

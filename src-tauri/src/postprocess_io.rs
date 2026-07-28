@@ -545,6 +545,24 @@ fn build_local_contrast_delta(
     texture: f32,
     clarity: f32,
 ) -> Option<Vec<f32>> {
+    build_local_contrast_delta_with(
+        data,
+        width,
+        height,
+        texture,
+        clarity,
+        ProtectionProfile::PROTECTED,
+    )
+}
+
+fn build_local_contrast_delta_with(
+    data: &[u16],
+    width: usize,
+    height: usize,
+    texture: f32,
+    clarity: f32,
+    protection: ProtectionProfile,
+) -> Option<Vec<f32>> {
     if width == 0 || height == 0 || data.len() != width * height * 3 {
         return None;
     }
@@ -578,10 +596,14 @@ fn build_local_contrast_delta(
                 let broad_detail = broad.as_ref().map(|blur| value - blur[index]).unwrap_or(0.0);
                 let structure = fine_detail.abs() + broad_detail.abs() * 0.55;
                 let confidence = post_smoothstep(0.0012, 0.012, structure);
+                // La puerta de altas luces apaga Textura/Claridad sobre el
+                // objeto brillante, que es justo donde se quieren usar.
+                let (gate_lo, gate_hi) = protection.local_contrast_highlight_gate();
                 let signal_gate = post_smoothstep(0.006, 0.065, value)
-                    * (1.0 - post_smoothstep(0.88, 0.995, value));
+                    * (1.0 - post_smoothstep(gate_lo, gate_hi, value));
                 let positive_gate = if texture > 0.0 || clarity > 0.0 {
-                    0.12 + confidence * 0.88
+                    let floor = protection.local_contrast_flat_floor();
+                    floor + confidence * (1.0 - floor)
                 } else {
                     1.0
                 };
@@ -802,20 +824,37 @@ fn estimate_solar_background(data: &[u16]) -> Option<(f32, f32)> {
     Some((p05, ceiling))
 }
 
-/// Finds thin, coherent positive off-limb signal without treating a smooth
-/// atmospheric/optical halo as a prominence. This confidence is independent
-/// from the filament amount so the dedicated "Recuperar protuberancias"
-/// control remains effective even when filament sharpening is disabled.
+/// Confianza de protuberancia consciente del CUERPO de la estructura, no solo
+/// de sus bordes. La versión anterior era un paso-alto σ2.2 con puerta de
+/// intensidad: una protuberancia real es ancha y suave, así que su interior
+/// daba detalle ≈ 0, la confianza quedaba en cero y la protección de fondo
+/// borraba el cuerpo entero dejando, como mucho, un contorno — exactamente la
+/// "pérdida de protuberancias" y el corte duro sobre el limbo que se veía al
+/// activar cualquier receta. Además exigía `source ≤ techo+0.09`, con lo que
+/// los núcleos brillantes quedaban fuera del rescate por definición.
+///
+/// El detector actual compara cada píxel del cielo con un MODELO RADIAL del
+/// halo: cuantil bajo de la luminancia por anillos de distancia al limbo
+/// (transformada de distancia sobre la máscara espacial de cielo). Un
+/// halo/resplandor azimutalmente uniforme ES su propio anillo, su exceso es
+/// ≈ 0 y no se rescata (el preset invertido sigue sin volverlo blanco); una
+/// protuberancia es azimutalmente local, sobresale del cuantil de su anillo y
+/// conserva TODO su cuerpo, núcleo brillante incluido. La coherencia espacial
+/// (blur del veredicto) impide rescatar ruido suelto, y `noise_guard` sigue
+/// mandando sobre el umbral. Sigue siendo independiente del deslizador de
+/// filamentos y del de protuberancias: detección ≠ realce.
 fn build_solar_prominence_confidence(
     data: &[u16],
     width: usize,
     height: usize,
     background_ceiling: f32,
     noise_guard: f32,
+    disk_mask: Option<&[f32]>,
 ) -> Option<Vec<f32>> {
     if width == 0 || height == 0 || data.len() != width * height * 3 {
         return None;
     }
+    let pixel_count = width * height;
     let luma: Vec<f32> = data
         .par_chunks_exact(3)
         .map(|pixel| {
@@ -825,39 +864,153 @@ fn build_solar_prominence_confidence(
                 / 65535.0
         })
         .collect();
-    let blurred = apply_gaussian_blur(&luma, width, height, 2.2);
-    let positive_detail: Vec<f32> = luma
-        .par_iter()
-        .zip(blurred.par_iter())
-        .map(|(&source, &low_pass)| (source - low_pass).max(0.0))
-        .collect();
+    // σ pequeño: suprime ruido de píxel sin recortar el cuerpo de la señal.
+    let smooth = apply_gaussian_blur(&luma, width, height, 1.4);
+    drop(luma);
 
-    let stride = (luma.len() / 32_768).max(1);
-    let mut sky_sample: Vec<f32> = luma
-        .iter()
-        .zip(positive_detail.iter())
-        .step_by(stride)
-        .filter_map(|(&source, &detail)| {
-            (source <= background_ceiling * 1.35 + 0.002).then_some(detail)
-        })
-        .collect();
-    if sky_sample.len() < 16 {
+    const BIN_WIDTH: f32 = 2.0;
+    const MAX_LIMB_DISTANCE: f32 = 512.0;
+    // Índices de cielo (submuestreados) para perfil y ruido; con máscara solo
+    // cielo inundado real (mask < 0.05) para no contaminar los primeros
+    // anillos con el pie del feather del disco.
+    let sample_stride = (pixel_count / 2_000_000).max(1);
+    let (halo_model, sky_samples): (Vec<f32>, Vec<usize>) = if let Some(mask) = disk_mask {
+        let inverted: Vec<f32> = mask.iter().map(|&value| 1.0 - value).collect();
+        let distance = crate::planetary_quality::distance_transform_truncated(
+            &inverted,
+            width,
+            height,
+            MAX_LIMB_DISTANCE,
+        );
+        if distance.len() != pixel_count {
+            return None;
+        }
+        let bin_count = (MAX_LIMB_DISTANCE / BIN_WIDTH) as usize + 1;
+        let mut bins: Vec<Vec<f32>> = vec![Vec::new(); bin_count];
+        let mut sky_samples = Vec::new();
+        for index in (0..pixel_count).step_by(sample_stride) {
+            if mask[index] < 0.05 {
+                let bin = ((distance[index] / BIN_WIDTH) as usize).min(bin_count - 1);
+                bins[bin].push(smooth[index]);
+                sky_samples.push(index);
+            }
+        }
+        // Cuantil BAJO por anillo: robusto hasta con protuberancias que ocupen
+        // ~2/3 del anillo; para un halo uniforme coincide con el propio halo.
+        let mut profile: Vec<Option<f32>> = bins
+            .into_iter()
+            .map(|mut samples| {
+                if samples.len() < 24 {
+                    return None;
+                }
+                samples.sort_by(|left, right| left.total_cmp(right));
+                let index = ((samples.len() - 1) as f32 * 0.35).round() as usize;
+                samples.get(index).copied()
+            })
+            .collect();
+        // Rellena huecos arrastrando el último anillo válido hacia fuera y el
+        // primero válido hacia dentro; sin ningún anillo válido no hay perfil.
+        let mut carried: Option<f32> = None;
+        for slot in profile.iter_mut() {
+            match slot {
+                Some(value) => carried = Some(*value),
+                None => *slot = carried,
+            }
+        }
+        let first_valid = profile.iter().flatten().next().copied();
+        let mut filled: Vec<f32> = match first_valid {
+            Some(first) => profile
+                .into_iter()
+                .map(|slot| slot.unwrap_or(first))
+                .collect(),
+            None => vec![background_ceiling; bin_count],
+        };
+        // Suavizado 1-2-1 entre anillos: el modelo no debe escalonar un halo
+        // con gradiente real solo porque el histograma cambie de bin.
+        if filled.len() >= 3 {
+            let raw_profile = filled.clone();
+            for index in 1..raw_profile.len() - 1 {
+                filled[index] = 0.25 * raw_profile[index - 1]
+                    + 0.5 * raw_profile[index]
+                    + 0.25 * raw_profile[index + 1];
+            }
+        }
+        let last_bin = filled.len() - 1;
+        let model: Vec<f32> = (0..pixel_count)
+            .into_par_iter()
+            .map(|index| {
+                let position = (distance[index] / BIN_WIDTH - 0.5).max(0.0);
+                let low = (position as usize).min(last_bin);
+                let high = (low + 1).min(last_bin);
+                let t = (position - low as f32).clamp(0.0, 1.0);
+                filled[low] * (1.0 - t) + filled[high] * t
+            })
+            .collect();
+        (model, sky_samples)
+    } else {
+        let sky_threshold = background_ceiling * 1.35 + 0.002;
+        let sky_samples: Vec<usize> = (0..pixel_count)
+            .step_by(sample_stride)
+            .filter(|&index| smooth[index] <= sky_threshold)
+            .collect();
+        (vec![background_ceiling; pixel_count], sky_samples)
+    };
+    if sky_samples.len() < 16 {
         return None;
     }
-    sky_sample.sort_by(|left, right| left.total_cmp(right));
-    let noise = (sky_sample[sky_sample.len() / 2] * 1.4826).max(0.000_12);
-    let guard = noise_guard.clamp(0.0, 1.0);
-    let threshold = (noise * (2.2 + guard * 2.8)).max(0.000_28);
-    let upper = threshold * (3.2 + guard * 1.4);
-    let signal_end = (background_ceiling + 0.09).min(0.32);
 
+    // Ruido robusto del residuo cielo − modelo (MAD): las protuberancias son
+    // cola positiva minoritaria y no lo sesgan.
+    let mut residuals: Vec<f32> = sky_samples
+        .iter()
+        .map(|&index| (smooth[index] - halo_model[index]).abs())
+        .collect();
+    residuals.sort_by(|left, right| left.total_cmp(right));
+    let noise = (residuals[residuals.len() / 2] * 1.4826).max(0.000_12);
+    let guard = noise_guard.clamp(0.0, 1.0);
+    let threshold = (noise * (1.7 + guard * 2.6)).max(0.001_2);
+    let upper = threshold * 2.4 + 0.006;
+
+    // SEGUNDA EVIDENCIA: ESTRUCTURA LOCAL.
+    //
+    // Hasta aquí la única prueba de "esto es una protuberancia" era el BRILLO por
+    // encima del halo. Con `noise_guard` alto (los presets traen 0.86-0.9) el
+    // listón queda en ~4σ, así que una protuberancia tenue no llega y se trata
+    // como cielo: la protección de fondo la devuelve al máster y desaparece.
+    //
+    // Pero cielo y protuberancia se distinguen por algo más que el brillo: el halo
+    // es SUAVE y monótono en radio, mientras que un cuerpo tiene estructura
+    // interna a su propia escala. Se mide como desviación respecto a la media
+    // local (σ 5.0, la escala de una protuberancia) y sirve para BAJAR el listón
+    // donde hay forma — nunca para subirlo. Así el cielo liso conserva exactamente
+    // el mismo rechazo de ruido que antes y sólo cambia el caso ambiguo.
+    let broad = apply_gaussian_blur(&smooth, width, height, 5.0);
+    let raw: Vec<f32> = (0..pixel_count)
+        .into_par_iter()
+        .map(|index| {
+            let excess = smooth[index] - halo_model[index].max(background_ceiling);
+            let off_disk = match disk_mask {
+                Some(mask) => (1.0 - mask[index]).clamp(0.0, 1.0),
+                // Sin máscara espacial la única evidencia de "disco" es la
+                // intensidad: por encima de ~0.5 el realce no debe entrar.
+                None => 1.0 - post_smoothstep(0.30, 0.52, smooth[index]),
+            };
+            // Sólo cuenta la estructura POSITIVA: un cuerpo emite sobre el fondo.
+            // Restar también las depresiones dejaría que el ruido puntuara.
+            let structure = (smooth[index] - broad[index]).max(0.0);
+            let structure_relief = post_smoothstep(noise * 1.5, noise * 5.0, structure);
+            let eased_threshold = threshold * (1.0 - 0.55 * structure_relief);
+            let eased_upper = upper * (1.0 - 0.45 * structure_relief);
+            post_smoothstep(eased_threshold, eased_upper.max(eased_threshold + 1e-6), excess)
+                * off_disk
+        })
+        .collect();
+    // Coherencia: un píxel de ruido no sobrevive al blur; un cuerpo sí.
+    let coherence = apply_gaussian_blur(&raw, width, height, 2.6);
     Some(
-        luma.par_iter()
-            .zip(positive_detail.par_iter())
-            .map(|(&source, &detail)| {
-                post_smoothstep(threshold, upper, detail)
-                    * post_smoothstep(background_ceiling, signal_end, source)
-            })
+        raw.par_iter()
+            .zip(coherence.par_iter())
+            .map(|(&value, &support)| value * post_smoothstep(0.10, 0.38, support))
             .collect(),
     )
 }
@@ -919,12 +1072,30 @@ fn compress_solar_highlights(value: f32, amount: f32) -> f32 {
     // A continuous, monotonic shoulder. The protected headroom is deliberately
     // small enough to retain a bright solar limb, but large enough that colour
     // mapping cannot collapse multiple 16-bit highlight values to pure white.
-    let knee = 0.62;
+    // La rodilla en 0.62 caía en mitad del disco estirado (0.55–0.85): cada
+    // preset aplanaba la granulación de casi todo el disco — el "velo" que se
+    // veía al activar el módulo. En 0.82 el hombro protege limbo y picos sin
+    // tocar los tonos medios.
+    let knee = 0.82;
     if value <= knee {
         return value;
     }
     let t = (value - knee) / (1.0 - knee);
-    let cap = 1.0 - amount * 0.08;
+    // El techo reserva el DOBLE de margen que antes (0.16 en vez de 0.08).
+    //
+    // Motivo medido: el quemado solar no ocurre en la luminancia sino en el canal
+    // ROJO del falso color. Las paletas son rojo-dominantes (`highlightColor` con
+    // R=255), asi que `interpolate_solar_color` escala por `value / chroma_luma` y
+    // el rojo alcanza 1.0 en cuanto la luminancia supera `chroma_luma` — 0.893
+    // para #ffe39a (Cromosfera), 0.872 para #ffdba0. A partir de ahi
+    // `fit_to_gamut` desatura para caber en gama y el DEGRADADO desaparece: eso es
+    // lo que se ve como "luces quemadas".
+    //
+    // Con el 0.08 anterior el techo era 0.92 ni con el control al maximo, siempre
+    // por encima del punto de saturacion de la paleta: el deslizador no podia
+    // evitar el problema aunque se subiera a tope. Con 0.16, un valor de ~0.8
+    // deja el techo en 0.872 y el degradado sobrevive.
+    let cap = 1.0 - amount * 0.16;
     let shaped = t / (1.0 + amount * 0.9 * (1.0 - t));
     knee + (cap - knee) * shaped
 }
@@ -935,6 +1106,24 @@ fn apply_advanced_postprocess(
     height: usize,
     is_mono: bool,
     params: &AdvancedColorParams,
+) {
+    apply_advanced_postprocess_with(
+        data,
+        width,
+        height,
+        is_mono,
+        params,
+        ProtectionProfile::PROTECTED,
+    )
+}
+
+fn apply_advanced_postprocess_with(
+    data: &mut [u16],
+    width: usize,
+    height: usize,
+    is_mono: bool,
+    params: &AdvancedColorParams,
+    protection: ProtectionProfile,
 ) {
     let black = params.levels_black.clamp(0.0, 0.98);
     let white = params.levels_white.clamp(black + 0.005, 1.0);
@@ -1004,8 +1193,15 @@ fn apply_advanced_postprocess(
     } else {
         None
     };
+    // La confianza también se necesita con el deslizador de protuberancias a
+    // CERO: es lo que impide que la protección de fondo borre una protuberancia
+    // detectada. Calcularla solo con el slider activo hacía que la posición
+    // "conservadora" del control fuese la más destructiva. Con inversión activa
+    // se necesita siempre: decide qué píxeles conservan su tono directo.
     let solar_prominence_confidence = if solar_enabled
-        && params.solar.prominence_amount > 1e-6
+        && (params.solar.prominence_amount > 1e-6
+            || params.solar.background_protect > 1e-6
+            || params.solar.invert)
     {
         solar_background.and_then(|(_, background_ceiling)| {
             build_solar_prominence_confidence(
@@ -1014,6 +1210,7 @@ fn apply_advanced_postprocess(
                 height,
                 background_ceiling,
                 params.solar.noise_guard,
+                solar_signal_mask.as_deref(),
             )
         })
     } else {
@@ -1022,7 +1219,14 @@ fn apply_advanced_postprocess(
     let hsl_active = params.hsl_hue.iter().any(|value| value.abs() > 1e-6)
         || params.hsl_saturation.iter().any(|value| value.abs() > 1e-6)
         || params.hsl_luminance.iter().any(|value| value.abs() > 1e-6);
-    let local_delta = build_local_contrast_delta(data, width, height, params.texture, params.clarity);
+    let local_delta = build_local_contrast_delta_with(
+        data,
+        width,
+        height,
+        params.texture,
+        params.clarity,
+        protection,
+    );
 
     data.par_chunks_exact_mut(3).enumerate().for_each(|(pixel_index, pixel)| {
         let source_r = pixel[0] as f32 / 65535.0;
@@ -1040,8 +1244,12 @@ fn apply_advanced_postprocess(
             post_smoothstep(0.003, 0.08, source_saturation);
         let source_tonal_gate = post_smoothstep(0.025, 0.16, source_mono)
             * (1.0 - post_smoothstep(0.9, 1.0, source_mono) * 0.75);
-        let chroma_confidence =
-            (source_chroma_evidence * source_tonal_gate).clamp(0.0, 1.0);
+        // Vibrance, tono/saturacion/luminancia HSL se multiplican por esto: sobre
+        // datos casi neutros vale ~0 y esos controles no hacen nada. El Modo
+        // Pureza permite que el deslizador mande.
+        let chroma_confidence = protection.effective_chroma_confidence(
+            (source_chroma_evidence * source_tonal_gate).clamp(0.0, 1.0),
+        );
         let mut r = (source_r - black) / (white - black);
         let mut g = (source_g - black) / (white - black);
         let mut b = (source_b - black) / (white - black);
@@ -1181,34 +1389,133 @@ fn apply_advanced_postprocess(
             if solar_enabled {
                 let mut solar_luma =
                     evaluate_solar_curve(&solar_curve, &solar_curve_tangents, mono);
+                let prominence_confidence = solar_prominence_confidence
+                    .as_ref()
+                    .map(|map| map[pixel_index])
+                    .unwrap_or(0.0);
                 if let Some((_background_floor, background_ceiling)) = solar_background {
+                    // "Recuperar protuberancias" = estirar la señal débil sobre
+                    // el cielo medido SOLO donde la confianza ve estructura
+                    // coherente. La puerta anterior era intensidad pura: subía
+                    // el halo y el anillo de oscurecimiento del limbo (el
+                    // "lavado" del disco) y se apagaba de 0.22 a 0.58, así que
+                    // los núcleos brillantes recibían CERO mientras su entorno
+                    // tenue subía — lo contrario de recuperar. El objetivo pasa
+                    // por la MISMA curva del usuario, conserva el orden tonal
+                    // (t → boosted es monótono) y con el slider a 0 es
+                    // identidad exacta.
                     let prominence = params.solar.prominence_amount.clamp(0.0, 1.0);
-                    if prominence > 1e-6 {
-                        let signal_start = background_ceiling;
-                        let signal_end = (background_ceiling + 0.055).min(0.28);
-                        let low_signal = post_smoothstep(signal_start, signal_end, source_mono)
-                            * (1.0 - post_smoothstep(0.22, 0.58, source_mono));
-                        let separation = ((source_mono - background_ceiling)
-                            / (signal_end - background_ceiling).max(0.008))
+                    if prominence > 1e-6 && prominence_confidence > 1e-4 {
+                        let span = (0.60 - background_ceiling).max(0.08);
+                        let t = ((source_mono - background_ceiling) / span)
                             .clamp(0.0, 1.0);
-                        solar_luma += prominence
-                            * low_signal
-                            * separation.sqrt()
-                            * (1.0 - solar_luma)
-                            * 0.28;
+                        // Estirado tipo Reinhard: pendiente acotada en el
+                        // origen (no amplifica el borde del cielo hasta el
+                        // infinito como una gamma) y saturación suave.
+                        let knee = 0.30;
+                        let stretched = t * (1.0 + knee) / (t + knee);
+                        let boosted = t + (stretched - t) * prominence;
+                        let target = (background_ceiling + boosted * span)
+                            .clamp(0.0, 1.0);
+                        let target_luma = evaluate_solar_curve(
+                            &solar_curve,
+                            &solar_curve_tangents,
+                            target,
+                        );
+                        if target_luma > solar_luma {
+                            solar_luma +=
+                                (target_luma - solar_luma) * prominence_confidence;
+                        }
                     }
                 }
-                // La protección de luces reinyecta luminancia SIN curva. Arrancar
-                // en 0.48 metía en el reparto al disco entero (un máster solar
-                // estirado vive entre 0.5 y 0.85), así que devolvía ~50 % de la
-                // señal sin curva y el preset se veía plano y suavizado. Ahora
-                // empieza donde de verdad hay riesgo de quemar: el limbo.
+                // La protección de luces solo FRENA la curva cuando esta
+                // sobrepasa al máster en el limbo (fuente ≥ 0.80): tira hacia
+                // abajo, nunca re-ilumina. La versión simétrica devolvía el
+                // limbo caliente a su valor crudo aunque la receta lo hubiera
+                // oscurecido a propósito: sobre másters ya brillantes eso ERA
+                // el quemado que ningún deslizador podía frenar.
                 let highlight_weight = post_smoothstep(0.80, 0.995, source_mono)
                     * params.solar.highlight_protect.clamp(0.0, 1.0);
-                solar_luma += (mono - solar_luma) * highlight_weight * 0.78;
-                if params.solar.invert {
-                    solar_luma = 1.0 - solar_luma;
+                if solar_luma > mono {
+                    solar_luma += (mono - solar_luma) * highlight_weight * 0.78;
                 }
+                if params.solar.invert {
+                    // Compuesto clásico de H-alpha invertido: se invierte el
+                    // DISCO, no las protuberancias. Invertirlo todo empujaba la
+                    // protuberancia a la zona alta de la paleta (crema pálido):
+                    // "no agarraba color". Conservando su tono directo cae en
+                    // la zona roja profunda de la MISMA paleta y se separa del
+                    // cielo protegido, que sigue invirtiéndose y volviendo a su
+                    // negro medido.
+                    let inverted = 1.0 - solar_luma;
+                    solar_luma = inverted + (solar_luma - inverted) * prominence_confidence;
+                }
+
+                // Protección de fondo EN LUMINANCIA y ANTES del falso color.
+                // Mezclar el RGB ya coloreado hacia el gris escalar de la
+                // fuente ponía un velo gris encima de cualquier píxel con
+                // confianza parcial (bordes del cuerpo, base en el limbo,
+                // fibras tenues): las protuberancias "no agarraban color" y
+                // ningún deslizador podía desbloquearlas, porque el velo se
+                // aplicaba DESPUÉS de todos los controles. Contenido el fondo
+                // en luminancia, TODO pasa después por la paleta: la afinidad
+                // de color es total incluso donde el rescate es parcial. Sigue
+                // ocurriendo tras la inversión (proteger antes de invertir
+                // volvía blanco el cielo).
+                if let Some((background_floor, background_ceiling)) = solar_background {
+                    let intensity_background =
+                        1.0 - post_smoothstep(background_floor, background_ceiling, source_mono);
+                    let spatial_background = solar_signal_mask
+                        .as_ref()
+                        .map(|mask| 1.0 - mask[pixel_index].clamp(0.0, 1.0))
+                        .unwrap_or(0.0);
+                    // Las protuberancias viven legítimamente dentro del cielo
+                    // conectado al borde. El rescate primario es la confianza
+                    // consciente del cuerpo (exceso sobre el modelo radial del
+                    // halo); el detector de filamentos refuerza las fibrillas
+                    // finas fuera del limbo. La confianza decide si el píxel ES
+                    // estructura; `prominence_amount` decide cuánto se realza.
+                    let rescue_confidence = prominence_confidence.max(
+                        solar_filament_delta
+                            .as_ref()
+                            .map(|delta| {
+                                post_smoothstep(
+                                    0.000_25,
+                                    0.009,
+                                    delta[pixel_index].max(0.0),
+                                )
+                            })
+                            .unwrap_or(0.0),
+                    );
+                    let prominence_rescue = rescue_confidence.clamp(0.0, 1.0);
+                    // El mask espacial (cielo conectado al borde) es
+                    // AUTORITATIVO cuando existe: una umbra o un filamento
+                    // oscuro DENTRO del disco no puede puntuar como fondo por
+                    // intensidad. Sin mask, la intensidad es la única evidencia.
+                    let background_presence = if solar_signal_mask.is_some() {
+                        spatial_background
+                    } else {
+                        intensity_background
+                    };
+                    let protect = params.solar.background_protect.clamp(0.0, 1.0);
+                    // Dos papeles separados. "Conservar cielo" mantiene su
+                    // autoridad dura sobre el cielo AUTÉNTICO (easing cóncavo),
+                    // mientras la confianza parcial del rescate solo suaviza de
+                    // forma CUADRÁTICA. El easing único anterior amplificaba la
+                    // mezcla justo en la zona parcial: con confianza 0.5 el
+                    // píxel quedaba bloqueado al 75 % — el "gris que no se deja
+                    // pintar" de los bordes de protuberancia.
+                    let sky_authority = (background_presence * protect).clamp(0.0, 1.0);
+                    let sky_hold =
+                        1.0 - (1.0 - sky_authority) * (1.0 - sky_authority);
+                    let rescue_soft =
+                        (1.0 - prominence_rescue) * (1.0 - prominence_rescue);
+                    let effective_protect = (sky_hold * rescue_soft).clamp(0.0, 1.0);
+                    // El cielo vuelve a su valor MEDIDO, nunca por debajo de él
+                    // (recortar a `min(source, techo)` destruía datos 16-bit).
+                    solar_luma += (source_mono - solar_luma) * effective_protect;
+                }
+
                 solar_luma = compress_solar_highlights(
                     solar_luma,
                     params.solar.highlight_compression,
@@ -1221,9 +1528,21 @@ fn apply_advanced_postprocess(
                         params.solar.highlight_color,
                     );
                     let strength = params.solar.color_strength.clamp(0.0, 1.0);
-                    let highlight_weight = post_smoothstep(0.72, 0.995, source_mono)
-                        * params.solar.highlight_protect.clamp(0.0, 1.0);
-                    let effective_strength = strength * (1.0 - highlight_weight * 0.82);
+                    // El guarda de blancos mira la SALIDA, no la fuente. Atado
+                    // a la intensidad de la fuente (desde 0.72) despintaba el
+                    // limbo entero — el anillo blanco que se leía como
+                    // "quemado". La paleta ya se auto-desatura al encajar en
+                    // gama cerca del blanco; esto solo evita chroma duro en el
+                    // último tramo.
+                    let white_guard = post_smoothstep(0.93, 0.995, solar_luma) * 0.5;
+                    // La estructura detectada fuera del disco recibe la paleta
+                    // con plena autoridad: es la única forma de que una
+                    // protuberancia tenue "agarre" el rojo en vez de quedarse
+                    // en gris translúcido.
+                    let effective_strength = (strength
+                        * (1.0 - white_guard)
+                        * (1.0 + prominence_confidence * 0.35))
+                        .min(1.0);
                     r = solar_luma + (mapped[0] - solar_luma) * effective_strength;
                     g = solar_luma + (mapped[1] - solar_luma) * effective_strength;
                     b = solar_luma + (mapped[2] - solar_luma) * effective_strength;
@@ -1231,69 +1550,6 @@ fn apply_advanced_postprocess(
                     r = solar_luma;
                     g = solar_luma;
                     b = solar_luma;
-                }
-
-                // Protect the measured sky *after* inversion and false colour.
-                // Doing this before inversion turned the preserved black sky
-                // into white, which is exactly the pale background seen in the
-                // H-alpha inverted preset.
-                if let Some((background_floor, background_ceiling)) = solar_background {
-                    let intensity_background =
-                        1.0 - post_smoothstep(background_floor, background_ceiling, source_mono);
-                    let spatial_background = solar_signal_mask
-                        .as_ref()
-                        .map(|mask| 1.0 - mask[pixel_index].clamp(0.0, 1.0))
-                        .unwrap_or(0.0);
-                    // Thin positive structures outside the disk (prominences)
-                    // may legitimately live inside the border-connected sky.
-                    // Rescue only coherent high-pass signal already accepted
-                    // by the noise-aware filament detector; smooth glare and
-                    // sky noise do not pass this gate.
-                    let prominence_confidence = solar_prominence_confidence
-                        .as_ref()
-                        .map(|confidence| confidence[pixel_index])
-                        .unwrap_or(0.0)
-                        .max(
-                            solar_filament_delta
-                                .as_ref()
-                                .map(|delta| {
-                                    post_smoothstep(
-                                        0.000_25,
-                                        0.009,
-                                        delta[pixel_index].max(0.0),
-                                    )
-                                })
-                                .unwrap_or(0.0),
-                        );
-                    // La confianza decide si el píxel ES estructura coherente;
-                    // `prominence_amount` decide cuánto se REALZA (en el lift de
-                    // arriba), no cuánto se le permite sobrevivir. Atar aquí el
-                    // techo del rescate a ese valor hacía que un preset
-                    // conservador (ha-natural, 0.12 → rescate máximo 0.43)
-                    // borrase ~80 % del estirado de una protuberancia aunque
-                    // estuviera detectada con confianza total.
-                    let prominence_rescue = prominence_confidence.clamp(0.0, 1.0);
-                    // El mask espacial (cielo conectado al borde) es
-                    // AUTORITATIVO cuando existe: combinarlo con `max` hacía que
-                    // una umbra o un filamento oscuro DENTRO del disco puntuara
-                    // como fondo por intensidad y se reseteara al valor sin
-                    // estirar, justo lo contrario de lo que el mask documenta.
-                    // Sin mask, la intensidad sigue siendo la única evidencia.
-                    let background_presence = if solar_signal_mask.is_some() {
-                        spatial_background
-                    } else {
-                        intensity_background
-                    };
-                    let background_weight =
-                        background_presence * (1.0 - prominence_rescue).clamp(0.0, 1.0);
-                    let protect = params.solar.background_protect.clamp(0.0, 1.0);
-                    let weighted_protect = (background_weight * protect).clamp(0.0, 1.0);
-                    let effective_protect =
-                        1.0 - (1.0 - weighted_protect) * (1.0 - weighted_protect);
-                    let measured_sky = source_mono.min(background_ceiling);
-                    r += (measured_sky - r) * effective_protect;
-                    g += (measured_sky - g) * effective_protect;
-                    b += (measured_sky - b) * effective_protect;
                 }
             } else {
                 r = mono;
@@ -1418,6 +1674,187 @@ fn processed_export_path(source: &str, suffix: &str) -> PathBuf {
 
 #[cfg(test)]
 mod postprocess_io_tests {
+
+    /// CIELO vs PROTUBERANCIA: la estructura es la segunda evidencia.
+    ///
+    /// Antes la unica prueba era el BRILLO sobre el halo. Con `noise_guard` alto
+    /// (los presets traen 0.86-0.9) el liston queda en ~4σ, asi que una
+    /// protuberancia tenue no llegaba, se tomaba por cielo y la proteccion de
+    /// fondo la devolvia al master: desaparecia.
+    ///
+    /// Ahora un cuerpo con FORMA baja su propio liston. La escena tiene tres
+    /// zonas: cielo liso con ruido, una protuberancia tenue (poco brillo pero con
+    /// cuerpo) y una brillante de control.
+    #[test]
+    fn faint_prominences_are_not_mistaken_for_sky() {
+        let (w, h) = (160usize, 120usize);
+        let sky = 0.020f32;
+        // Ruido determinista y reproducible (LCG), del orden de 0.0012.
+        let mut seed = 0x2545_F491u32;
+        let mut noise_at = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((seed >> 8) as f32 / 16_777_216.0 - 0.5) * 0.0024
+        };
+
+        let mut luma = vec![0.0f32; w * h];
+        for index in 0..w * h {
+            luma[index] = sky + noise_at();
+        }
+        // Protuberancia TENUE: +0.0035 sobre el cielo (≈3σ), cuerpo de 18x14.
+        for y in 30..44 {
+            for x in 24..42 {
+                luma[y * w + x] += 0.0035;
+            }
+        }
+        // Protuberancia BRILLANTE de control: +0.020 (≈17σ).
+        for y in 70..84 {
+            for x in 24..42 {
+                luma[y * w + x] += 0.020;
+            }
+        }
+
+        let mut data = vec![0u16; w * h * 3];
+        for index in 0..w * h {
+            let value = (luma[index].clamp(0.0, 1.0) * 65535.0) as u16;
+            data[index * 3] = value;
+            data[index * 3 + 1] = value;
+            data[index * 3 + 2] = value;
+        }
+
+        // Sin mascara de disco: toda la escena es cielo + cuerpos.
+        let confidence =
+            build_solar_prominence_confidence(&data, w, h, sky, 0.9, None)
+                .expect("la confianza debe calcularse");
+
+        let mean_over = |x0: usize, x1: usize, y0: usize, y1: usize| -> f32 {
+            let mut acc = 0.0f32;
+            let mut n = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    acc += confidence[y * w + x];
+                    n += 1;
+                }
+            }
+            acc / n.max(1) as f32
+        };
+
+        let tenue = mean_over(28, 38, 33, 41);
+        let brillante = mean_over(28, 38, 73, 81);
+        // Cielo limpio, lejos de ambos cuerpos.
+        let cielo = mean_over(100, 150, 20, 100);
+
+        eprintln!(
+            "confianza -> protuberancia tenue {tenue:.3} · brillante {brillante:.3} · cielo {cielo:.3}"
+        );
+
+        assert!(
+            brillante > 0.75,
+            "una protuberancia marcada debe puntuar alto: {brillante:.3}"
+        );
+        assert!(
+            tenue > 0.20,
+            "una protuberancia tenue con cuerpo no puede confundirse con cielo: {tenue:.3}"
+        );
+        // Lo que NO puede pasar: que el cielo empiece a puntuar. El termino de
+        // estructura solo BAJA el liston donde hay forma, nunca lo sube.
+        assert!(
+            cielo < 0.05,
+            "el cielo liso debe seguir rechazado: {cielo:.3}"
+        );
+        assert!(
+            tenue > cielo * 4.0,
+            "la separacion cielo/protuberancia debe ser clara ({cielo:.3} vs {tenue:.3})"
+        );
+    }
+
+
+    /// QUE SIGNIFICA "QUEMAR" AQUI, medido.
+    ///
+    /// No es que el canal rojo llegue a 1.0: eso pasa YA en los medios porque las
+    /// paletas solares son naranjas saturados de baja luminancia, y `fit_to_gamut`
+    /// lo resuelve desaturando sin perder informacion. Quemar es que dejen de
+    /// distinguirse valores DISTINTOS de entrada — que el decil superior del
+    /// histograma colapse a un mismo tono.
+    ///
+    /// Se mide como el recorrido de salida que conserva la entrada [0.90, 1.0] y
+    /// la pendiente en el extremo.
+    #[test]
+    fn solar_highlight_compression_keeps_the_top_decile_separable() {
+        for amount in [0.3f32, 0.6, 0.8, 0.92] {
+            let low = compress_solar_highlights(0.90, amount);
+            let high = compress_solar_highlights(1.0, amount);
+            let span = high - low;
+            // Pendiente en el propio extremo (ultimo 1 % de la entrada).
+            let slope = (compress_solar_highlights(1.0, amount)
+                - compress_solar_highlights(0.99, amount))
+                / 0.01;
+            eprintln!(
+                "amount={amount:.2} -> techo {high:.4} · recorrido del decil alto {span:.4} · pendiente en el extremo {slope:.3}"
+            );
+            // El decil superior no puede colapsar: tiene que seguir habiendo
+            // gradacion entre 0.90 y 1.0.
+            assert!(
+                span > 0.012,
+                "amount={amount}: el decil alto colapsa a {span:.4} de recorrido"
+            );
+            // Y la pendiente en el extremo no debe EXPANDIR. Con el techo anterior
+            // (1 - amount*0.08) valia >1 justo arriba: los picos se estiraban
+            // contra la pared de gama en vez de comprimirse.
+            assert!(
+                slope < 1.0,
+                "amount={amount}: la pendiente en el extremo es {slope:.3}, sigue estirando las luces"
+            );
+        }
+    }
+
+    /// El techo alcanzable tiene que poder bajar del punto en que la paleta pierde
+    /// su degradado (~0.87-0.89 segun el color de luces), o el deslizador no puede
+    /// evitar el problema por mucho que se suba.
+    #[test]
+    fn solar_highlight_ceiling_can_reach_below_palette_saturation() {
+        let palettes: [(&str, [f32; 3]); 3] = [
+            ("chromosphere #ffe39a", [1.0, 0.890, 0.604]),
+            ("ha-natural #ffdba0", [1.0, 0.859, 0.627]),
+            ("prominence #ffd995", [1.0, 0.851, 0.584]),
+        ];
+        let max_cap = compress_solar_highlights(1.0, 1.0);
+        for (name, highlight) in palettes {
+            let chroma_luma = 0.2126 * highlight[0]
+                + 0.7152 * highlight[1]
+                + 0.0722 * highlight[2];
+            eprintln!("{name}: pierde degradado sobre {chroma_luma:.4} · techo maximo alcanzable {max_cap:.4}");
+            assert!(
+                max_cap < chroma_luma,
+                "{name}: el techo maximo {max_cap:.4} no baja de {chroma_luma:.4}"
+            );
+        }
+    }
+
+    /// La compresion sigue siendo MONOTONA y no aplana los medios: proteger el
+    /// limbo no puede costar la granulacion del disco.
+    #[test]
+    fn solar_highlight_compression_stays_monotonic_and_spares_midtones() {
+        for amount in [0.0f32, 0.3, 0.6, 0.92, 1.0] {
+            let mut previous = -1.0f32;
+            for step in 0..=400 {
+                let raw = step as f32 / 400.0;
+                let out = compress_solar_highlights(raw, amount);
+                assert!(
+                    out >= previous - 1e-6,
+                    "amount={amount}: la compresion debe ser monotona ({previous} -> {out})"
+                );
+                previous = out;
+                // Por debajo de la rodilla no toca NADA.
+                if raw <= 0.82 {
+                    assert!(
+                        (out - raw).abs() < 1e-6,
+                        "amount={amount}: el hombro no debe tocar los medios (raw={raw}, out={out})"
+                    );
+                }
+            }
+        }
+    }
+
     use super::*;
 
     fn color_image() -> StackResult {
@@ -1729,6 +2166,9 @@ mod postprocess_io_tests {
         assert!(high < 0.98, "debe reservar margen antes del recorte");
         assert_eq!(compress_solar_highlights(0.58, 0.8), 0.58);
         assert_eq!(compress_solar_highlights(0.98, 0.0), 0.98);
+        // El disco estirado vive en 0.55–0.85: la compresión es un hombro para
+        // las LUCES y no puede aplanar la granulación de los tonos medios.
+        assert_eq!(compress_solar_highlights(0.78, 0.9), 0.78);
     }
 
     #[test]
@@ -1918,6 +2358,325 @@ mod postprocess_io_tests {
             stretched[sky] <= source[sky] + 400,
             "el cielo debe seguir protegido (fue {} desde {})",
             stretched[sky],
+            source[sky]
+        );
+    }
+
+    #[test]
+    fn prominence_bodies_survive_background_protection_and_scale_with_the_slider() {
+        // El defecto original: una protuberancia es ancha y suave, el detector
+        // por paso-alto daba 0 en su CUERPO y la protección de fondo la
+        // clavaba a `min(fuente, techo)` — borrada y más oscura que el máster.
+        // Además el realce por intensidad pura levantaba el borde del disco.
+        let (width, height) = (96usize, 64usize);
+        let mut source = vec![900u16; width * height * 3];
+        for y in 6..58 {
+            for x in 40..92 {
+                source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(39_000);
+            }
+        }
+        // Cuerpo ancho y LISO pegado al limbo: sin paso-alto interno.
+        for y in 22..40 {
+            for x in 26..40 {
+                source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(6_500);
+            }
+        }
+
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.colorize = false;
+        params.solar.curve_points =
+            vec![[0.0, 0.0], [0.05, 0.16], [0.2, 0.34], [1.0, 1.0]];
+        params.solar.background_protect = 1.0;
+        params.solar.prominence_amount = 0.0;
+
+        let run = |amount: f32| {
+            let mut data = source.clone();
+            let mut recipe = params.clone();
+            recipe.solar.prominence_amount = amount;
+            apply_advanced_postprocess(&mut data, width, height, true, &recipe);
+            data
+        };
+        let at_zero = run(0.0);
+        let at_half = run(0.5);
+        let at_full = run(1.0);
+
+        let body = (30 * width + 32) * 3;
+        let sky = (4 * width + 4) * 3;
+        let disk = (32 * width + 70) * 3;
+        // 1) El cuerpo sobrevive a la protección aunque el slider esté a cero:
+        //    el rescate es detección, no un premio por subir el realce.
+        assert!(
+            at_zero[body] > source[body] + 3_000,
+            "el cuerpo de la protuberancia debe conservar su estirado ({} desde {})",
+            at_zero[body],
+            source[body]
+        );
+        // 2) El cielo real sigue clavado a su valor medido.
+        assert!(
+            at_zero[sky] <= source[sky] + 200,
+            "el cielo debe volver a su nivel medido ({} desde {})",
+            at_zero[sky],
+            source[sky]
+        );
+        // 3) El deslizador REALZA la estructura detectada, monótonamente.
+        assert!(
+            at_full[body] >= at_half[body] && at_half[body] >= at_zero[body],
+            "el realce debe crecer con el control ({} / {} / {})",
+            at_zero[body],
+            at_half[body],
+            at_full[body]
+        );
+        assert!(
+            at_full[body] > at_zero[body] + 800,
+            "a tope el realce debe ser visible ({} frente a {})",
+            at_full[body],
+            at_zero[body]
+        );
+        // 4) Y el disco NO se lava al mover el control: el gate es estructura
+        //    fuera del disco, no intensidad.
+        assert_eq!(
+            at_full[disk], at_zero[disk],
+            "el deslizador de protuberancias no puede tocar el disco"
+        );
+    }
+
+    #[test]
+    fn inverted_preset_keeps_prominences_warm_and_separated_from_the_sky() {
+        // Compuesto clásico de H-alpha invertido: el DISCO se invierte, las
+        // protuberancias conservan su tono directo. Invertirlo todo las
+        // empujaba a la zona alta de la paleta (crema pálido): quedaban
+        // blanquecinas y sin separación cromática frente al cielo.
+        let (width, height) = (96usize, 64usize);
+        let mut data = vec![900u16; width * height * 3];
+        for y in 6..58 {
+            for x in 40..92 {
+                data[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(39_000);
+            }
+        }
+        for y in 22..40 {
+            for x in 26..40 {
+                data[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(6_500);
+            }
+        }
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.invert = true;
+        params.solar.colorize = true;
+        params.solar.color_strength = 0.72;
+        params.solar.background_protect = 1.0;
+        params.solar.prominence_amount = 0.4;
+        params.solar.highlight_compression = 0.55;
+        params.solar.shadow_color = [0.070_6, 0.0, 0.0];
+        params.solar.midtone_color = [0.769, 0.29, 0.047];
+        params.solar.highlight_color = [1.0, 0.894, 0.643];
+        params.solar.curve_points = vec![
+            [0.0, 0.0],
+            [0.18, 0.14],
+            [0.46, 0.4],
+            [0.72, 0.74],
+            [1.0, 0.97],
+        ];
+        apply_advanced_postprocess(&mut data, width, height, true, &params);
+
+        let body = (30 * width + 32) * 3;
+        let sky = (4 * width + 4) * 3;
+        let disk = (32 * width + 70) * 3;
+        // Cálida: el canal rojo debe dominar con claridad al azul.
+        assert!(
+            data[body] > data[body + 2].saturating_mul(2),
+            "la protuberancia debe agarrar el rojo de la paleta (r={}, b={})",
+            data[body],
+            data[body + 2]
+        );
+        let luma = |offset: usize| {
+            (data[offset] as u32 + data[offset + 1] as u32 + data[offset + 2] as u32) / 3
+        };
+        assert!(
+            luma(sky) < 3_000,
+            "el cielo invertido debe seguir protegido en negro ({})",
+            luma(sky)
+        );
+        assert!(
+            luma(body) > luma(sky) * 4,
+            "la protuberancia debe separarse del cielo ({} frente a {})",
+            luma(body),
+            luma(sky)
+        );
+        assert!(
+            data[disk] != data[disk + 1] || data[disk + 1] != data[disk + 2],
+            "el disco invertido debe conservar el falso color"
+        );
+    }
+
+    #[test]
+    fn colorized_prominences_take_the_palette_without_grey_veil() {
+        // El velo gris: la protección de fondo mezclaba el RGB YA coloreado
+        // hacia el gris escalar de la fuente, después de todos los controles.
+        // Cualquier confianza parcial (bordes, base del limbo) dejaba la
+        // protuberancia gris translúcida y ningún deslizador podía pintarla.
+        // Ahora el fondo se contiene en luminancia ANTES de la paleta: todo
+        // píxel visible sale coloreado y conserva su estirado.
+        let (width, height) = (96usize, 64usize);
+        let mut source = vec![900u16; width * height * 3];
+        for y in 6..58 {
+            for x in 40..92 {
+                source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(39_000);
+            }
+        }
+        for y in 22..40 {
+            for x in 26..40 {
+                source[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(6_500);
+            }
+        }
+
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.colorize = true;
+        params.solar.invert = false;
+        params.solar.shadow_color = [0.03, 0.0, 0.0];
+        params.solar.midtone_color = [0.64, 0.23, 0.04];
+        params.solar.highlight_color = [1.0, 0.85, 0.58];
+        params.solar.color_strength = 0.75;
+        params.solar.curve_points =
+            vec![[0.0, 0.0], [0.05, 0.16], [0.2, 0.34], [1.0, 1.0]];
+        params.solar.prominence_amount = 0.5;
+        params.solar.highlight_protect = 0.9;
+
+        let run = |protect: f32| {
+            let mut data = source.clone();
+            let mut recipe = params.clone();
+            recipe.solar.background_protect = protect;
+            apply_advanced_postprocess(&mut data, width, height, true, &recipe);
+            data
+        };
+        let protected = run(1.0);
+        let free = run(0.0);
+
+        let luma_of = |data: &[u16], index: usize| {
+            0.2126 * data[index] as f32
+                + 0.7152 * data[index + 1] as f32
+                + 0.0722 * data[index + 2] as f32
+        };
+        // Todo píxel del cuerpo con señal visible sale ROJO dominante y
+        // conserva al menos el 62 % del estirado sin proteger: sin velo gris
+        // y sin bloqueo, también en los bordes de confianza parcial.
+        let mut checked = 0usize;
+        for y in 23..39 {
+            for x in 27..39 {
+                let index = (y * width + x) * 3;
+                let luma_protected = luma_of(&protected, index);
+                if luma_protected <= 2_700.0 {
+                    continue;
+                }
+                checked += 1;
+                let (r, g, b) = (protected[index], protected[index + 1], protected[index + 2]);
+                assert!(
+                    r > g && g >= b,
+                    "la paleta debe dominar en rojo también con rescate parcial ({r}/{g}/{b} en {x},{y})"
+                );
+                assert!(
+                    f32::from(r) - f32::from(b) >= f32::from(r) * 0.18,
+                    "el cuerpo no puede quedar gris translúcido ({r}/{g}/{b} en {x},{y})"
+                );
+                let luma_free = luma_of(&free, index).max(1.0);
+                assert!(
+                    luma_protected >= luma_free * 0.62,
+                    "la protección no puede bloquear el estirado ({luma_protected} vs {luma_free} en {x},{y})"
+                );
+            }
+        }
+        assert!(checked > 60, "el cuerpo debe tener señal medible ({checked} píxeles)");
+        let sky = (4 * width + 4) * 3;
+        let sky_mean = (u32::from(protected[sky])
+            + u32::from(protected[sky + 1])
+            + u32::from(protected[sky + 2]))
+            / 3;
+        assert!(sky_mean < 2_000, "el cielo protegido debe seguir oscuro ({sky_mean})");
+    }
+
+    #[test]
+    fn highlight_protection_never_relifts_a_hot_limb() {
+        // La reinyección simétrica devolvía el limbo caliente a su valor crudo
+        // aunque la receta lo oscureciera a propósito: ese era el quemado que
+        // ningún deslizador podía frenar. Ahora solo actúa hacia abajo.
+        let (width, height) = (96usize, 64usize);
+        let mut data = vec![900u16; width * height * 3];
+        for y in 6..58 {
+            for x in 30..92 {
+                data[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(38_000);
+            }
+        }
+        for y in 6..58 {
+            for x in 86..92 {
+                data[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(62_000);
+            }
+        }
+        let source = data.clone();
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.colorize = false;
+        params.solar.background_protect = 0.0;
+        params.solar.prominence_amount = 0.0;
+        params.solar.highlight_protect = 1.0;
+        params.solar.highlight_compression = 0.0;
+        params.solar.curve_points = vec![[0.0, 0.0], [0.5, 0.5], [1.0, 0.9]];
+        apply_advanced_postprocess(&mut data, width, height, true, &params);
+
+        let limb = (30 * width + 89) * 3;
+        assert!(
+            data[limb] + 3_000 < source[limb],
+            "una curva que oscurece el limbo caliente debe respetarse ({} desde {})",
+            data[limb],
+            source[limb]
+        );
+    }
+
+    #[test]
+    fn background_protection_never_pushes_signal_below_its_measured_value() {
+        // El halo liso conectado al cielo se sigue conteniendo (no se rescata),
+        // pero contener significa devolverlo a su valor MEDIDO: recortarlo a
+        // `min(fuente, techo)` destruía datos reales del máster 16-bit y
+        // dibujaba un corte duro sobre el limbo.
+        let (width, height) = (256usize, 160usize);
+        let (center_x, center_y) = (128.0f32, 165.0f32);
+        let mut data = vec![750u16; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let radius =
+                    ((x as f32 - center_x).powi(2) + (y as f32 - center_y).powi(2)).sqrt();
+                let value = if radius <= 120.0 {
+                    40_000
+                } else if radius <= 140.0 {
+                    7_000
+                } else {
+                    750
+                };
+                data[(y * width + x) * 3..(y * width + x) * 3 + 3].fill(value);
+            }
+        }
+        let source = data.clone();
+        let mut params = AdvancedColorParams::default();
+        params.solar.enabled = true;
+        params.solar.colorize = false;
+        params.solar.background_protect = 1.0;
+        params.solar.prominence_amount = 0.0;
+        params.solar.curve_points =
+            vec![[0.0, 0.0], [0.04, 0.12], [0.18, 0.3], [1.0, 1.0]];
+        apply_advanced_postprocess(&mut data, width, height, true, &params);
+
+        let halo = ((35 * width + 128) * 3) as usize;
+        assert!(
+            data[halo] + 60 >= source[halo],
+            "contener el halo no puede dejarlo por debajo de su valor medido ({} desde {})",
+            data[halo],
+            source[halo]
+        );
+        let sky = ((16 * width + 16) * 3) as usize;
+        assert!(
+            data[sky] <= source[sky] + 200,
+            "el cielo profundo debe quedarse en su nivel medido ({} desde {})",
+            data[sky],
             source[sky]
         );
     }

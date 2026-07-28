@@ -355,6 +355,7 @@ fn apply_richardson_lucy(
     // (PsfEstimator lo construye por distancia) → adjunta = el mismo kernel,
     // asi que se usa para el forward-blur Y la back-projection. None = Gaussiana.
     measured_psf: Option<(&[f32], usize)>,
+    protection: ProtectionProfile,
 ) -> Vec<f32> {
     if iterations == 0 || (sigma <= 0.0 && measured_psf.is_none()) {
         return input.to_vec();
@@ -381,6 +382,7 @@ fn apply_richardson_lucy(
     };
     richardson_lucy_core(
         input, original, width, height, iterations, sigma, &blur, &should_cancel, &on_progress,
+        protection,
     )
     .unwrap_or_default()
 }
@@ -421,6 +423,7 @@ fn richardson_lucy_core(
     blur: &dyn Fn(&[f32]) -> Vec<f32>,
     should_cancel: &dyn Fn() -> bool,
     on_progress: &dyn Fn(usize),
+    protection: ProtectionProfile,
 ) -> Option<Vec<f32>> {
     let size = width * height;
     let mut est = input.to_vec();
@@ -453,7 +456,8 @@ fn richardson_lucy_core(
             } else {
                 1.0
             };
-            ratio_buf[j] = raw_ratio.clamp(0.5, 2.0);
+            let (ratio_lo, ratio_hi) = protection.rl_ratio_bounds();
+            ratio_buf[j] = raw_ratio.clamp(ratio_lo, ratio_hi);
         }
 
         // 3. Back-projection (PSF simétrica → mismo kernel que el forward).
@@ -477,12 +481,12 @@ fn richardson_lucy_core(
                 let local_mean = (n1 + n2 + n3 + n4) * 0.25;
                 let tv_gradient = local_mean - est_prev[j];
                 let confidence = mask[j].clamp(0.0, 1.0);
-                let correction_weight = confidence.sqrt() * 0.78;
+                let correction_weight = confidence.sqrt() * protection.rl_correction_weight();
                 let raw_delta = est_prev[j] * (blurred_ratio[j] - 1.0);
                 // Bound each iteration instead of globally clipping the final
                 // restoration. This keeps strong limbs stable while allowing
                 // coherent texture to accumulate over several iterations.
-                let max_step = (original[j].abs() * 0.22 + 96.0).clamp(96.0, 8_000.0);
+                let max_step = protection.rl_max_step(original[j]);
                 let rl_delta = raw_delta.clamp(-max_step, max_step) * correction_weight;
                 let noise_regularisation = tv_gradient
                     * background_regularisation
@@ -511,6 +515,7 @@ fn apply_van_cittert(
     iterations: usize,
     sigma: f32,
     range: (f32, f32),
+    protection: ProtectionProfile,
 ) -> Vec<f32> {
     if iterations == 0 || sigma <= 0.0 {
         return input.to_vec();
@@ -541,7 +546,8 @@ fn apply_van_cittert(
         mask[j] = confidence; // Smoothed application weight
     }
 
-    let vc_dampening = 0.38; // Van Cittert overshoots easily; keep residual updates gentle.
+    // Van Cittert oscila con facilidad: incluso en Puro se queda en 0.90.
+    let vc_dampening = protection.vc_dampening();
     let tv_weight = 0.10; // TV dampening to kill individual hot pixels.
 
     for i in 0..iterations {
@@ -593,7 +599,7 @@ fn apply_van_cittert(
                     // Apply TV Regularization to smooth out ringing/spikes
                     update += tv_gradient * tv_weight;
 
-                    let correction_weight = mask[j] * 0.50;
+                    let correction_weight = mask[j] * protection.vc_correction_weight();
                     let mut final_val =
                         est_prev[j] * (1.0 - correction_weight) + update * correction_weight;
 
@@ -693,6 +699,430 @@ fn estimate_color_adjust_context(data: &[u16]) -> (f32, f32) {
     (pivot, tone_white)
 }
 
+/// Techo real de brillo de la imagen (percentil 99). De el salen dos cosas
+/// distintas que NO son intercambiables: `img_scale` (con clamp, escala los
+/// limites internos) y la normalizacion de la referencia del USM adaptativo, que
+/// usa el p99 crudo. El clamp de `img_scale` no es invertible, asi que hay que
+/// conservar el p99.
+fn measure_img_p99(data: &[u16]) -> f32 {
+    let mut vals: Vec<u16> = data.to_vec();
+    let idx = (vals.len() * 99 / 100).min(vals.len().saturating_sub(1));
+    if idx < vals.len() {
+        vals.select_nth_unstable(idx);
+        (vals[idx] as f32).max(1000.0) // minimo 1000 para no sobre-sensibilizar
+    } else {
+        65535.0
+    }
+}
+
+/// 1.0 = 16 bits llenos, ~0.06 = equivalente a 8 bits.
+#[inline]
+fn img_scale_from_p99(img_p99: f32) -> f32 {
+    (img_p99 / 65535.0).clamp(0.05, 1.0)
+}
+
+/// Radio de la PSF derivado del sigma de deconvolucion. Solo 7 valores posibles
+/// (3..=9), lo que permite cachear la PSF medida por radio.
+#[inline]
+fn psf_radius_for_sigma(deconv_sigma: f32) -> usize {
+    psf_radius_for_sigma_with(deconv_sigma, ProtectionProfile::PROTECTED)
+}
+
+/// El tope depende del Modo Pureza (9 protegido, hasta 21 puro). Debe salir de
+/// AQUI en todos los sitios: la cache de `GlobalStats` indexa la PSF medida por
+/// radio, y calcularlo de otra forma en algun punto haria que el kernel dejara
+/// de casar y la PSF del limbo se apagara sola.
+#[inline]
+fn psf_radius_for_sigma_with(deconv_sigma: f32, protection: ProtectionProfile) -> usize {
+    (deconv_sigma * 2.0)
+        .ceil()
+        .clamp(3.0, protection.psf_radius_cap()) as usize
+}
+
+/// Mide la PSF real (edge-spread) del borde disco/cielo. Achromatica: se mide
+/// una vez de la luminancia y se aplica a los 3 canales. Devuelve tambien el
+/// motivo, para que quien tenga `AppHandle` lo registre.
+fn measure_limb_psf(
+    data: &[u16],
+    width: usize,
+    height: usize,
+    psf_radius: usize,
+) -> (Option<Vec<f32>>, &'static str) {
+    let size = width * height;
+    if data.len() < size * 3 {
+        return (None, "Deconvolucion: buffer insuficiente → Gaussiana parametrica.");
+    }
+    let luma: Vec<f32> = (0..size)
+        .map(|i| {
+            0.299 * data[i * 3] as f32 + 0.587 * data[i * 3 + 1] as f32 + 0.114 * data[i * 3 + 2] as f32
+        })
+        .collect();
+    let planet_mask = compute_planet_mask(&luma, width, height, 4);
+    let limb_mask = compute_limb_mask(&planet_mask, width, height, psf_radius.max(4));
+    let has_limb = limb_mask.iter().filter(|&&m| m > 0.5).count() > psf_radius * psf_radius * 8;
+    if !has_limb {
+        return (
+            None,
+            "Deconvolucion: sin limbo claro (disco lleno) → Gaussiana parametrica.",
+        );
+    }
+    let est = PsfEstimator { psf_radius }.estimate_from_limb(&luma, width, height, &limb_mask, 0.85);
+    if psf_is_valid(&est, psf_radius) {
+        (
+            Some(est),
+            "Deconvolucion: PSF medida del limbo (edge-spread) — activa.",
+        )
+    } else {
+        (
+            None,
+            "Deconvolucion: PSF del limbo no fiable → Gaussiana parametrica.",
+        )
+    }
+}
+
+/// Estadisticas que describen la IMAGEN COMPLETA, no el buffer que se esta
+/// procesando.
+///
+/// Bajo `preview_roi` el pipeline trabaja sobre un recorte. Recalcular estas
+/// medidas ahi romperia dos cosas a la vez:
+///   1. MOVER el recuadro cambiaria el resultado (p99 y pivote tonal dependen
+///      del contenido visible), asi que el recuadro seria nitido pero no
+///      representativo del render final.
+///   2. La PSF del limbo se DESACTIVARIA sola en cuanto el recuadro no
+///      incluyera el borde del disco — justo el caso normal al inspeccionar
+///      detalle de superficie.
+///
+/// Se miden una vez sobre el master completo y se cachean por generacion, lo que
+/// ademas evita recalcular p99 y la PSF en cada arrastre de slider.
+#[derive(Clone)]
+struct GlobalStats {
+    /// Dimensiones del MASTER. Algunos radios se derivan del tamaño de la imagen
+    /// (el sigma del LCE es `max(w,h)·0.02` con tope 30): calcularlos del recorte
+    /// daria un radio distinto y el recuadro mentiria sobre ese filtro.
+    master_width: usize,
+    master_height: usize,
+    /// Percentil 99 crudo. Normaliza la referencia del USM adaptativo.
+    img_p99: f32,
+    /// `img_p99` con clamp a [0.05, 1.0]. Escala coring, high-pass, USM y
+    /// deringing.
+    img_scale: f32,
+    color_pivot: f32,
+    tone_white: f32,
+    /// PSF medida del limbo y el radio con el que se midio. `None` = Gaussiana
+    /// parametrica. El radio se guarda para invalidar la cache si cambia el
+    /// sigma de deconvolucion.
+    psf: Option<(Vec<f32>, usize)>,
+    /// Radio con el que se intento medir la PSF (aunque saliera `None`), para
+    /// poder distinguir "no medida" de "medida y descartada".
+    psf_radius: usize,
+    /// `true` si la medida de PSF se pidio de verdad; si es `false` la cache no
+    /// sirve para una receta que si la pida.
+    psf_requested: bool,
+}
+
+impl GlobalStats {
+    /// Mide sobre el master COMPLETO. `psf_from_limb`/`deconv_sigma` solo
+    /// intervienen en la PSF; el resto de campos dependen unicamente de la
+    /// imagen.
+    fn measure(
+        data: &[u16],
+        width: usize,
+        height: usize,
+        psf_from_limb: bool,
+        deconv_sigma: f32,
+    ) -> (Self, Option<&'static str>) {
+        let img_p99 = measure_img_p99(data);
+        let img_scale = img_scale_from_p99(img_p99);
+        let (color_pivot, tone_white) = estimate_color_adjust_context(data);
+        let psf_radius = psf_radius_for_sigma(deconv_sigma);
+        let (psf_kernel, note) = if psf_from_limb {
+            let (k, n) = measure_limb_psf(data, width, height, psf_radius);
+            (k, Some(n))
+        } else {
+            (None, None)
+        };
+        (
+            Self {
+                master_width: width,
+                master_height: height,
+                img_p99,
+                img_scale,
+                color_pivot,
+                tone_white,
+                psf: psf_kernel.map(|k| (k, psf_radius)),
+                psf_radius,
+                psf_requested: psf_from_limb,
+            },
+            note,
+        )
+    }
+
+    /// La cache solo vale si la PSF se midio con el mismo radio y con la misma
+    /// intencion (pedida o no).
+    fn matches_psf_request(&self, psf_from_limb: bool, deconv_sigma: f32) -> bool {
+        if !psf_from_limb {
+            return true; // sin PSF medida, el resto de campos no dependen de la receta
+        }
+        self.psf_requested && self.psf_radius == psf_radius_for_sigma(deconv_sigma)
+    }
+}
+
+/// Interpolacion entre la constante Protegida y la Pura.
+///
+/// Los EXTREMOS se devuelven tal cual, sin pasar por la aritmetica: en f32,
+/// `1.0 + (0.001 - 1.0)·1.0` da 0.0009999871, no 0.001. Ese error diminuto
+/// bastaria para que el modo Protegido dejara de ser bit-identico al historico,
+/// que es la garantia de toda esta fase.
+#[inline]
+fn plerp(protected: f32, pure: f32, p: f32) -> f32 {
+    if p >= 1.0 {
+        return protected;
+    }
+    if p <= 0.0 {
+        return pure;
+    }
+    pure + (protected - pure) * p
+}
+
+/// MODO PUREZA: fuerza de las protecciones automaticas.
+///
+/// El pipeline lleva una decena de frenos que recortan el efecto real de los
+/// deslizadores para evitar artefactos (ringing en el limbo, gusanos en el
+/// fondo, reventado de altas luces). Son legitimos, pero estaban FIJOS y sin
+/// documentar: el usuario movia un control y obtenia una fraccion de lo que
+/// pedia sin saber por que.
+///
+/// Aqui pasan de condicionales fijos a interpolacion por un unico escalar:
+///   `p = 1.0` Protegido   — bit-identico al comportamiento historico
+///   `p = 0.5` Equilibrado — punto medio
+///   `p = 0.0` Puro        — el deslizador manda
+///
+/// `p = 1.0` DEBE ser identidad exacta; lo fija un golden test.
+#[derive(Clone, Copy, Debug)]
+struct ProtectionProfile {
+    p: f32,
+}
+
+impl ProtectionProfile {
+    /// Historico. Es el valor por defecto en todas las rutas que no lo declaran.
+    const PROTECTED: Self = Self { p: 1.0 };
+
+    fn from_mode(mode: Option<&str>) -> Self {
+        let p = match mode.unwrap_or("protected") {
+            "pure" => 0.0,
+            "balanced" => 0.5,
+            _ => 1.0,
+        };
+        Self { p }
+    }
+
+    #[inline]
+    fn is_protected(self) -> bool {
+        self.p >= 1.0
+    }
+
+    /// Altas luces: umbral a partir del cual se cancela la restauracion. En
+    /// Protegido arranca en 32000 ADU con curva de 6ª potencia (solo muerde de
+    /// verdad por encima de ~60000). En Puro sube a 60000, asi que el disco
+    /// conserva el realce.
+    #[inline]
+    fn highlight_start(self) -> f32 {
+        plerp(32000.0, 60000.0, self.p)
+    }
+
+    /// Suelo de la proteccion de altas luces. En Protegido llega a anular el
+    /// efecto (0.001); en Puro no atenua nada (1.0).
+    #[inline]
+    fn highlight_floor(self) -> f32 {
+        plerp(0.001, 1.0, self.p)
+    }
+
+    /// Suelo de la guarda cromatica.
+    #[inline]
+    fn chroma_floor(self) -> f32 {
+        plerp(0.1, 1.0, self.p)
+    }
+
+    /// Richardson-Lucy: acotado del ratio por iteracion.
+    #[inline]
+    fn rl_ratio_bounds(self) -> (f32, f32) {
+        (plerp(0.5, 0.1, self.p), plerp(2.0, 10.0, self.p))
+    }
+
+    /// Richardson-Lucy: paso maximo por pixel y por iteracion.
+    #[inline]
+    fn rl_max_step(self, original: f32) -> f32 {
+        let coef = plerp(0.22, 1.0, self.p);
+        let ceiling = plerp(8_000.0, 30_000.0, self.p);
+        (original.abs() * coef + 96.0).clamp(96.0, ceiling)
+    }
+
+    /// Richardson-Lucy: peso de la correccion.
+    #[inline]
+    fn rl_correction_weight(self) -> f32 {
+        plerp(0.78, 1.0, self.p)
+    }
+
+    /// Van Cittert: amortiguacion del residuo. Es la deconvolucion mas propensa a
+    /// oscilar, asi que en Puro se queda en 0.90 y no en 1.0.
+    #[inline]
+    fn vc_dampening(self) -> f32 {
+        plerp(0.38, 0.90, self.p)
+    }
+
+    /// Van Cittert: peso de la correccion.
+    #[inline]
+    fn vc_correction_weight(self) -> f32 {
+        plerp(0.50, 1.0, self.p)
+    }
+
+    /// Tope del radio de la PSF medida. Subirlo permite deconvolucionar
+    /// estructuras grandes, a cambio de ~5x de CPU.
+    #[inline]
+    fn psf_radius_cap(self) -> f32 {
+        plerp(9.0, 21.0, self.p)
+    }
+
+    /// Rodilla del soft-clip final.
+    #[inline]
+    fn soft_clip_knee(self) -> f32 {
+        plerp(58_000.0, 65_000.0, self.p)
+    }
+
+    /// Suelo del denoise maestro: en Protegido el deslizador nunca baja del 30 %
+    /// de filtrado. Es sobre-suavizado forzado, asi que relajarlo RECUPERA
+    /// detalle sin ningun artefacto a cambio.
+    #[inline]
+    fn denoise_blend(self, amount: f32) -> f32 {
+        plerp(0.30 + amount * 0.70, amount, self.p).clamp(0.0, 1.0)
+    }
+
+    /// Techo a partir del cual USM y high-pass comprimen el exceso.
+    #[inline]
+    fn sharpen_limit(self, base: f32) -> f32 {
+        base * (1.0 + 3.0 * (1.0 - self.p))
+    }
+
+    /// Exponente de la compresion del exceso. En Protegido es raiz cuadrada
+    /// (duplicar el deslizador casi no cambia nada pasado el codo); en Puro es
+    /// lineal.
+    #[inline]
+    fn sharpen_knee_exponent(self) -> f32 {
+        plerp(0.5, 1.0, self.p)
+    }
+
+    /// Umbral bajo el cual el USM atenua cuadraticamente el detalle fino.
+    #[inline]
+    fn usm_fine_threshold(self, base: f32) -> f32 {
+        base * self.p
+    }
+
+    // === MODULO AVANZADO (tono, color, textura/claridad) ===
+
+    /// Textura y Claridad se APAGAN por encima de este nivel de luminancia. En
+    /// Protegido empieza a cerrarse en 0.88, que en un disco lunar o solar
+    /// brillante es casi todo el encuadre: el usuario mueve el control y no pasa
+    /// nada en el objeto, solo en el fondo.
+    #[inline]
+    fn local_contrast_highlight_gate(self) -> (f32, f32) {
+        (plerp(0.88, 0.995, self.p), plerp(0.995, 1.0, self.p))
+    }
+
+    /// Suelo de Textura/Claridad en zonas SIN estructura medida. En Protegido el
+    /// efecto cae al 12 % donde el detector no ve detalle.
+    #[inline]
+    fn local_contrast_flat_floor(self) -> f32 {
+        plerp(0.12, 1.0, self.p)
+    }
+
+    /// Confianza cromatica efectiva. Vibrance, tono HSL, saturacion y luminancia
+    /// HSL se multiplican por ella: sobre datos casi neutros (planetaria mono-ish)
+    /// vale ~0 y esos controles NO HACEN NADA.
+    ///
+    /// Es defendible como ciencia — no se puede saturar lo que no tiene color sin
+    /// inventarlo — pero es exactamente el tipo de freno silencioso que hace que un
+    /// deslizador parezca roto. En Puro se toma como 1 y el control manda.
+    #[inline]
+    fn effective_chroma_confidence(self, measured: f32) -> f32 {
+        plerp(measured, 1.0, self.p).clamp(0.0, 1.0)
+    }
+
+    /// Tope duro del realce local (LCE) en ADU.
+    #[inline]
+    fn lce_limit(self, base: f32) -> f32 {
+        base * (1.0 + 3.0 * (1.0 - self.p))
+    }
+}
+
+/// Sigmas nominales del banco de wavelets, en pixeles de la imagen procesada.
+const WAVELET_BAND_SIGMAS: [f32; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+
+/// Guarda (en px) que necesita un recuadro para reproducir EXACTAMENTE el render
+/// completo en su interior.
+///
+/// Medido en `test_roi_guard_band_requirement_scales_with_amplified_band`: la
+/// descomposicion wavelet es una PARTICION (las bandas suman la original), asi
+/// que las bandas con ganancia neutra se cancelan al recombinar y su error de
+/// borde nunca llega a la salida. La guarda NO la fija el sigma mayor del banco
+/// (32) sino 3σ de la banda mas gruesa REALMENTE activa. En una sesion tipica de
+/// detalle fino son 16 px en vez de 96 → el recuadro cuesta ×1.13 en vez de ×1.89.
+fn roi_guard_px(
+    u_amts: &[f32; 5],
+    w_amts: &[f32; 6],
+    d_amts: &[f32; 6],
+    lce_amount: f32,
+    lce_scale_w: usize,
+    lce_scale_h: usize,
+    deconv_sigma: f32,
+    deconv_iter: usize,
+    vc_sigma: f32,
+    vc_iter: usize,
+    usm_radius: f32,
+    usm_amount: f32,
+    crisp: f32,
+    deringing_radius: f32,
+    deringing_mode: i32,
+) -> usize {
+    let active = |v: f32| v.abs() > 1e-6;
+    let mut sigma_max = 0.0f32;
+
+    for band in 0..6 {
+        let touched = active(w_amts[band])
+            || active(d_amts[band])
+            || (band < 5 && active(u_amts[band]));
+        if touched {
+            sigma_max = sigma_max.max(WAVELET_BAND_SIGMAS[band]);
+        }
+    }
+
+    // El LCE usa un Gaussiano cuyo sigma sale del tamaño del MASTER.
+    if active(lce_amount) {
+        let lce_sigma = (lce_scale_w.max(lce_scale_h) as f32 * 0.02).clamp(5.0, 30.0);
+        sigma_max = sigma_max.max(lce_sigma);
+    }
+    // La deconvolucion difunde por su PSF en cada iteracion.
+    if deconv_iter > 0 {
+        sigma_max = sigma_max.max(deconv_sigma.max(psf_radius_for_sigma(deconv_sigma) as f32));
+    }
+    if vc_iter > 0 {
+        sigma_max = sigma_max.max(vc_sigma);
+    }
+    if active(usm_amount) {
+        sigma_max = sigma_max.max(usm_radius);
+    }
+    // El high-pass ("crisp") usa un blur fijo de sigma 3.
+    if active(crisp) {
+        sigma_max = sigma_max.max(3.0);
+    }
+    if deringing_mode > 0 && active(deringing_radius) {
+        sigma_max = sigma_max.max(deringing_radius);
+    }
+
+    // 3σ cubre el soporte del box blur de 3 pasadas; +8 px de colchon para los
+    // filtros de vecindad pequeña (bilateral, mediana del deringing).
+    ((sigma_max * 3.0).ceil() as usize + 8).min(256)
+}
+
 #[inline]
 fn blend_restoration(base: f32, restored: f32, amount: f32, protection: f32) -> f32 {
     base + (restored - base) * amount.clamp(0.0, 1.0) * protection.clamp(0.0, 1.0)
@@ -745,6 +1175,13 @@ fn run_processing_pipeline(
     levels_black: f32,         // Niveles: punto negro de entrada (0..1, 0 = neutro)
     levels_white: f32,         // Niveles: punto blanco de entrada (0..1, 1 = neutro)
     levels_gamma: f32,         // Niveles: gamma de medios tonos (0.1..5, 1 = neutro)
+    // Estadisticas medidas sobre el MASTER COMPLETO. `None` = medir aqui sobre
+    // `original` (rutas de exportacion/lote, donde `original` YA es la imagen
+    // entera → comportamiento historico bit-identico). `Some` lo usa el recuadro
+    // interactivo, que procesa un recorte y no puede medirlas de el.
+    global_stats: Option<&GlobalStats>,
+    // Fuerza de las protecciones automaticas. `None` = Protegido (historico).
+    protection: ProtectionProfile,
 ) -> Vec<u16> {
     let size = width * height;
 
@@ -783,18 +1220,16 @@ fn run_processing_pipeline(
     // absolute delta limits (which blow up on low-signal images), we compute the
     // actual brightness ceiling of the image (p99) and scale all internal limits
     // proportionally. This is how Lightroom/PixInsight avoid artifacts.
-    let img_p99 = {
-        let mut vals: Vec<u16> = original.data.iter().copied().collect();
-        let idx = (vals.len() * 99 / 100).min(vals.len().saturating_sub(1));
-        if idx < vals.len() {
-            vals.select_nth_unstable(idx);
-            (vals[idx] as f32).max(1000.0) // minimum of 1000 to avoid over-sensitivity
-        } else {
-            65535.0
+    //
+    // Con recuadro interactivo llega medido sobre el MASTER COMPLETO: medirlo del
+    // recorte haria que mover el recuadro cambiase los umbrales internos.
+    let (img_p99, img_scale) = match global_stats {
+        Some(g) => (g.img_p99, g.img_scale),
+        None => {
+            let p99 = measure_img_p99(&original.data);
+            (p99, img_scale_from_p99(p99))
         }
     };
-    // Scale factor: 1.0 when image is full 16-bit, ~0.06 when image is 8-bit equiv.
-    let img_scale = (img_p99 / 65535.0).clamp(0.05, 1.0);
 
     let d_params = DeconvParams {
         sigma: deconv_sigma,
@@ -876,31 +1311,29 @@ fn run_processing_pipeline(
             // parametrica. Achromatica → se mide una vez de la luminancia y se
             // aplica a los 3 canales. Fallback a Gaussiana si no hay un limbo
             // fiable (disco lleno sin cielo, PSF no valida): psf_measured=None.
-            let psf_radius = (deconv_sigma * 2.0).ceil().clamp(3.0, 9.0) as usize;
+            let psf_radius = psf_radius_for_sigma_with(deconv_sigma, protection);
+            // CRITICO para el recuadro: la PSF se mide del borde disco/cielo, que
+            // normalmente queda FUERA de un recuadro centrado en la superficie. Si
+            // se midiera del recorte, `has_limb` seria falso y la deconvolucion
+            // caeria sola a Gaussiana parametrica → el recuadro mostraria un
+            // resultado distinto del render final. Por eso llega medida del master.
             let psf_measured: Option<Vec<f32>> = if psf_from_limb && deconv_iter > 0 {
-                let luma: Vec<f32> = (0..size)
-                    .map(|i| {
-                        0.299 * original.data[i * 3] as f32
-                            + 0.587 * original.data[i * 3 + 1] as f32
-                            + 0.114 * original.data[i * 3 + 2] as f32
-                    })
-                    .collect();
-                let planet_mask = compute_planet_mask(&luma, width, height, 4);
-                let limb_mask = compute_limb_mask(&planet_mask, width, height, psf_radius.max(4));
-                let has_limb = limb_mask.iter().filter(|&&m| m > 0.5).count() > psf_radius * psf_radius * 8;
-                if has_limb {
-                    let est = PsfEstimator { psf_radius }
-                        .estimate_from_limb(&luma, width, height, &limb_mask, 0.85);
-                    if psf_is_valid(&est, psf_radius) {
-                        log_to_front(app, "INFO", "Deconvolucion: PSF medida del limbo (edge-spread) — activa.");
-                        Some(est)
-                    } else {
-                        log_to_front(app, "INFO", "Deconvolucion: PSF del limbo no fiable → Gaussiana parametrica.");
-                        None
+                match global_stats {
+                    // El filtro por radio no es cosmetico: `psf_ref` pasa
+                    // `(slice, psf_radius)` y el kernel DEBE medir (2r+1)². Una
+                    // cache con otro radio degrada a Gaussiana parametrica, que es
+                    // seguro, en vez de entregar un kernel del tamaño equivocado.
+                    Some(g) => g
+                        .psf
+                        .as_ref()
+                        .filter(|(_, radius)| *radius == psf_radius)
+                        .map(|(kernel, _)| kernel.clone()),
+                    None => {
+                        let (est, note) =
+                            measure_limb_psf(&original.data, width, height, psf_radius);
+                        log_to_front(app, "INFO", note);
+                        est
                     }
-                } else {
-                    log_to_front(app, "INFO", "Deconvolucion: sin limbo claro (disco lleno) → Gaussiana parametrica.");
-                    None
                 }
             } else {
                 None
@@ -929,13 +1362,13 @@ fn run_processing_pipeline(
                     .unwrap_or_else(|| {
                         apply_richardson_lucy(
                             app, state, req_id, ch, ch, width, height, deconv_iter, deconv_sigma,
-                            (0.0, 100.0), psf_ref,
+                            (0.0, 100.0), psf_ref, protection,
                         )
                     })
                 } else {
                     apply_richardson_lucy(
                         app, state, req_id, ch, ch, width, height, deconv_iter, deconv_sigma,
-                        (0.0, 100.0), psf_ref,
+                        (0.0, 100.0), psf_ref, protection,
                     )
                 };
                 // CANCELACIÓN INTERNA: RL/VC devuelven un Vec VACÍO al cancelar
@@ -957,6 +1390,7 @@ fn run_processing_pipeline(
                     vc_iter,
                     vc_sigma,
                     (0.0, 100.0),
+                    protection,
                 );
                 if vcr.len() != size {
                     return Vec::new();
@@ -1256,14 +1690,23 @@ fn run_processing_pipeline(
                     None => 1.0,
                 };
                 let mut v = lys[6][i];
-                // Distribute high-frequency U levels properly across the first fine wavelet layers.
+                // "Detalles Alta Frecuencia" (U) y "Wavelets Multiescala" (W) son
+                // dos controles distintos en la UI que suman a la MISMA ganancia.
+                // U llevaba un ×0.5 no documentado: el panel mostraba 5.0 y
+                // entregaba 2.5, mientras que W mostraba 10.0 y entregaba 10.0. El
+                // numero mentia en una familia y en la otra no. Ahora el valor
+                // mostrado ES la ganancia en ambas (migracion de esquemas
+                // guardados en `migrateWaveletPresets`, main.js).
+                //
+                // U cubre solo las bandas 1-5 A PROPOSITO: es el control de las
+                // escalas MAS FINAS, y la banda 6 (sigma 32) es la mas gruesa.
                 // Las 3 bandas finas (donde vive el ruido) llevan el realce
                 // modulado por `m`; las gruesas van intactas.
-                v += den(lys[0][i], 1.0 + (w_amts[0] + u_amts[0] * 0.5) * m, d_amts[0]);
-                v += den(lys[1][i], 1.0 + (w_amts[1] + u_amts[1] * 0.5) * m, d_amts[1]);
-                v += den(lys[2][i], 1.0 + (w_amts[2] + u_amts[2] * 0.5) * m, d_amts[2]);
-                v += den(lys[3][i], 1.0 + w_amts[3] + u_amts[3] * 0.5, d_amts[3]);
-                v += den(lys[4][i], 1.0 + w_amts[4] + u_amts[4] * 0.5, d_amts[4]);
+                v += den(lys[0][i], 1.0 + (w_amts[0] + u_amts[0]) * m, d_amts[0]);
+                v += den(lys[1][i], 1.0 + (w_amts[1] + u_amts[1]) * m, d_amts[1]);
+                v += den(lys[2][i], 1.0 + (w_amts[2] + u_amts[2]) * m, d_amts[2]);
+                v += den(lys[3][i], 1.0 + w_amts[3] + u_amts[3], d_amts[3]);
+                v += den(lys[4][i], 1.0 + w_amts[4] + u_amts[4], d_amts[4]);
                 v += den(lys[5][i], 1.0 + w_amts[5], d_amts[5]);
                 out[i] = v;
             }
@@ -1283,6 +1726,7 @@ fn run_processing_pipeline(
                 master_denoise_detail,
                 master_denoise_chroma,
                 effective_rgb_mode,
+                protection,
             );
         }
 
@@ -1305,7 +1749,7 @@ fn run_processing_pipeline(
         let total_filter_channels = work_filter.len().max(1);
         for (ch_idx, ty) in work_filter.iter_mut().enumerate() {
             if crisp > 0.0 {
-                *ty = apply_high_pass(ty, width, height, 3.0, crisp, img_scale);
+                *ty = apply_high_pass(ty, width, height, 3.0, crisp, img_scale, protection);
             }
             if usm_amount > 0.0 {
                 *ty = apply_smart_sharpen_bilateral(
@@ -1318,10 +1762,20 @@ fn run_processing_pipeline(
                     auto_amt,
                     &adaptive_usm,
                     adaptive_usm_reference.as_deref(),
+                    protection,
                 );
             }
             if lce_amount > 0.0 {
-                *ty = apply_clahe_improved(ty, width, height, lce_amount);
+                // El radio del LCE lo fija el tamaño del MASTER, no el del
+                // buffer procesado: en un recorte daria un realce local de otra
+                // escala espacial.
+                let (lce_scale_w, lce_scale_h) = match global_stats {
+                    Some(g) => (g.master_width, g.master_height),
+                    None => (width, height),
+                };
+                *ty = apply_clahe_improved(
+                    ty, width, height, lce_scale_w, lce_scale_h, lce_amount, protection,
+                );
             }
 
             let pct = 70.0 + (ch_idx + 1) as f32 / total_filter_channels as f32 * 15.0;
@@ -1395,7 +1849,7 @@ fn run_processing_pipeline(
 
     // Shared Soft-Clipping (Pro style - Reinforced)
     let soft_clip = |v: f32| -> u16 {
-        let knee = 58000.0;
+        let knee = protection.soft_clip_knee();
         if v <= knee {
             v.clamp(0.0, 65535.0) as u16
         } else {
@@ -1409,7 +1863,12 @@ fn run_processing_pipeline(
         return Vec::new();
     }
     emit_progress(app, "Renderizando Planos (ADC)...", 95.0, None);
-    let (color_pivot, tone_white) = estimate_color_adjust_context(&original.data);
+    // Igual que `img_scale`: con recuadro llega medido del master completo, para
+    // que el pivote tonal del motor de color no dependa de la zona visible.
+    let (color_pivot, tone_white) = match global_stats {
+        Some(g) => (g.color_pivot, g.tone_white),
+        None => estimate_color_adjust_context(&original.data),
+    };
 
     let mut r_plane = vec![0.0f32; size];
     let mut g_plane = vec![0.0f32; size];
@@ -1432,10 +1891,10 @@ fn run_processing_pipeline(
             let ob = clean_channels[2][i];
 
             let max_orig = or.max(og).max(ob);
-            let p_start = 32000.0;
+            let p_start = protection.highlight_start();
             let p_factor = if max_orig > p_start {
                 let ov = (max_orig - p_start) / (65535.0 - p_start);
-                (1.0 - ov.powi(6)).max(0.001)
+                (1.0 - ov.powi(6)).max(protection.highlight_floor())
             } else {
                 1.0
             };
@@ -1445,7 +1904,7 @@ fn run_processing_pipeline(
                 ((or - avg_orig).abs() + (og - avg_orig).abs() + (ob - avg_orig).abs()) / 3.0;
             let c_guard = if c_divergence > 5000.0 {
                 let c_ov = (c_divergence - 5000.0) / 25000.0;
-                (1.0 - c_ov.powi(4)).max(0.1)
+                (1.0 - c_ov.powi(4)).max(protection.chroma_floor())
             } else {
                 1.0
             };
@@ -1456,10 +1915,10 @@ fn run_processing_pipeline(
             b = blend_restoration(ob, filtered_channels[2][i], blend, effective_factor);
         } else {
             let oy = clean_channels[0][i];
-            let p_start = 32000.0;
+            let p_start = protection.highlight_start();
             let p_factor = if oy > p_start {
                 let ov = (oy - p_start) / (65535.0 - p_start);
-                (1.0 - ov.powi(6)).max(0.001)
+                (1.0 - ov.powi(6)).max(protection.highlight_floor())
             } else {
                 1.0
             };
@@ -1690,6 +2149,7 @@ mod edge_aware_tests {
             &blur,
             &|| false,
             &|_| {},
+            ProtectionProfile::PROTECTED,
         )
         .expect("RL no debe cancelarse");
         assert!(restored.iter().all(|value| value.is_finite() && *value >= 0.0 && *value <= 65535.0));
@@ -1724,6 +2184,7 @@ mod edge_aware_tests {
             &blur,
             &|| false,
             &|_| {},
+            ProtectionProfile::PROTECTED,
         )
         .expect("RL no debe cancelarse");
 
@@ -1787,6 +2248,7 @@ mod edge_aware_tests {
             0.0,
             &AdaptiveUsmParams::default(),
             None,
+            ProtectionProfile::PROTECTED,
         );
         let protected = apply_smart_sharpen_bilateral(
             &image,
@@ -1798,6 +2260,7 @@ mod edge_aware_tests {
             1.0,
             &AdaptiveUsmParams::default(),
             None,
+            ProtectionProfile::PROTECTED,
         );
         let flat_change = |result: &[f32]| -> f32 {
             let mut total = 0.0;
@@ -1825,7 +2288,8 @@ mod edge_aware_tests {
     fn test_high_pass_changes_structure_but_preserves_a_flat_field() {
         let (width, height) = (48usize, 48usize);
         let flat = vec![18000.0f32; width * height];
-        let flat_result = apply_high_pass(&flat, width, height, 3.0, 1.5, 1.0);
+        let flat_result =
+            apply_high_pass(&flat, width, height, 3.0, 1.5, 1.0, ProtectionProfile::PROTECTED);
         assert!(
             flat_result
                 .iter()
@@ -1840,7 +2304,8 @@ mod edge_aware_tests {
                 structured[y * width + x] = 42000.0;
             }
         }
-        let result = apply_high_pass(&structured, width, height, 3.0, 1.5, 1.0);
+        let result =
+            apply_high_pass(&structured, width, height, 3.0, 1.5, 1.0, ProtectionProfile::PROTECTED);
         let mean_delta = result
             .iter()
             .zip(structured.iter())
@@ -1882,6 +2347,7 @@ mod edge_aware_tests {
             0.0,
             &adaptive,
             Some(&luminance),
+            ProtectionProfile::PROTECTED,
         );
         let region_delta = |left: usize, right: usize| -> f32 {
             let mut total = 0.0;
@@ -1924,5 +2390,1025 @@ mod edge_aware_tests {
             .map(|(index, _)| index)
             .unwrap();
         assert_eq!((peak % width, peak / width), (5, 2));
+    }
+}
+
+/// PARIDAD PREVIEW↔RENDER FINAL
+///
+/// El preview interactivo procesa la imagen reducida a 1/N (`preview_downscale`
+/// en `apply_wavelets`) pero pasa los MISMOS sigmas al pipeline, y los sigmas de
+/// `decompose` estan en PIXELES ABSOLUTOS (`[1,2,4,8,16,32]`). A 1/4, la banda
+/// que el slider "U1/W1" amplifica cubre 4 px reales: el preview y el render
+/// final amplifican contenido espacial DISTINTO, no solo con distinta fuerza.
+///
+/// Estos tests miden esa divergencia con correlacion cruzada normalizada sobre
+/// el incremento que introduce el slider (`realzado - original`). La correlacion
+/// responde exactamente a la pregunta del usuario: "lo que veo mientras arrastro,
+/// ¿es lo mismo que voy a obtener?". Es invariante a la escala de amplitud, asi
+/// que no confunde "mas debil" con "otra cosa".
+#[cfg(test)]
+mod preview_parity_tests {
+    use super::*;
+
+    /// Misma tolerancia que el gate de paridad GPU↔CPU
+    /// (`gpu_wavelet::WAVELET_PARITY_TOL`): mismo algoritmo → debe ser ~0.
+    const PARITY_TOL: f32 = 0.5;
+
+    /// Escena determinista: disco brillante con limbo, textura FINA de periodo
+    /// 2 px y textura MEDIA de periodo ~50 px. Reproduce lo esencial de un master
+    /// lunar/planetario y separa a proposito las dos escalas espaciales, que es
+    /// donde se ve el fallo: el promediado 4x4 destruye la fina y deja la media.
+    fn parity_scene(w: usize, h: usize) -> Vec<f32> {
+        let cx = w as f32 / 2.0;
+        let cy = h as f32 / 2.0;
+        let radius = w.min(h) as f32 * 0.42;
+        let mut img = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let r = (dx * dx + dy * dy).sqrt();
+                if r >= radius {
+                    img[y * w + x] = 900.0;
+                    continue;
+                }
+                let t = (1.0 - (r / radius) * (r / radius)).max(0.0);
+                let disc = 18000.0 + 26000.0 * t.sqrt();
+                let fine = 900.0 * (((x + y) % 2) as f32 * 2.0 - 1.0);
+                let mid = 1400.0 * (x as f32 / 8.0).sin() * (y as f32 / 8.0).sin();
+                img[y * w + x] = disc + fine + mid;
+            }
+        }
+        img
+    }
+
+    /// Replica exacta de la closure `decompose` de `run_processing_pipeline` en su
+    /// forma Gaussiana pura (sin edge-aware). Cada blur parte de `base`, no en
+    /// cascada — igual que produccion.
+    fn parity_decompose(base: &[f32], w: usize, h: usize) -> Vec<Vec<f32>> {
+        let sigmas = [1.0f32, 2.0, 4.0, 8.0, 16.0, 32.0];
+        let blurs: Vec<Vec<f32>> = sigmas
+            .iter()
+            .map(|&s| apply_gaussian_blur(base, w, h, s))
+            .collect();
+        let mut ls: Vec<Vec<f32>> = Vec::new();
+        ls.push(base.iter().zip(&blurs[0]).map(|(a, b)| a - b).collect());
+        for i in 0..5 {
+            ls.push(
+                blurs[i]
+                    .iter()
+                    .zip(&blurs[i + 1])
+                    .map(|(a, b)| a - b)
+                    .collect(),
+            );
+        }
+        ls.push(blurs[5].clone());
+        ls
+    }
+
+    /// Recombina amplificando SOLO `band`, replicando `recombine` con auto-mascara
+    /// y coring neutros (m = 1, cut = 0) para aislar el efecto de la escala.
+    fn parity_amplify(layers: &[Vec<f32>], band: usize, gain: f32) -> Vec<f32> {
+        (0..layers[0].len())
+            .map(|i| {
+                let mut v = layers[6][i];
+                for (k, layer) in layers.iter().take(6).enumerate() {
+                    v += layer[i] * if k == band { 1.0 + gain } else { 1.0 };
+                }
+                v
+            })
+            .collect()
+    }
+
+    /// Promedio de bloque, misma semantica que `downsample_rgb_u16`
+    /// (`commands_core.rs`) sobre un solo canal.
+    fn box_downsample(src: &[f32], w: usize, h: usize, factor: usize) -> (Vec<f32>, usize, usize) {
+        let (sw, sh) = (w / factor, h / factor);
+        let n = (factor * factor) as f32;
+        let mut out = vec![0.0f32; sw * sh];
+        for ty in 0..sh {
+            for tx in 0..sw {
+                let mut acc = 0.0f32;
+                for dy in 0..factor {
+                    for dx in 0..factor {
+                        acc += src[(ty * factor + dy) * w + tx * factor + dx];
+                    }
+                }
+                out[ty * sw + tx] = acc / n;
+            }
+        }
+        (out, sw, sh)
+    }
+
+    /// Nearest-neighbour, misma semantica que `upscale_rgb8_nearest`.
+    fn nearest_upscale(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; dw * dh];
+        for y in 0..dh {
+            let sy = (y * sh / dh).min(sh - 1);
+            for x in 0..dw {
+                let sx = (x * sw / dw).min(sw - 1);
+                out[y * dw + x] = src[sy * sw + sx];
+            }
+        }
+        out
+    }
+
+    /// Correlacion cruzada normalizada de dos incrementos sobre una region.
+    /// 1.0 = el preview muestra exactamente el mismo contenido que el final;
+    /// 0.0 = contenido espacial no relacionado.
+    fn region_correlation(
+        a: &[f32],
+        b: &[f32],
+        w: usize,
+        x0: usize,
+        y0: usize,
+        rw: usize,
+        rh: usize,
+    ) -> f32 {
+        let (mut sa, mut sb) = (0.0f64, 0.0f64);
+        for y in y0..y0 + rh {
+            for x in x0..x0 + rw {
+                sa += a[y * w + x] as f64;
+                sb += b[y * w + x] as f64;
+            }
+        }
+        let n = (rw * rh) as f64;
+        let (ma, mb) = (sa / n, sb / n);
+        let (mut num, mut da, mut db) = (0.0f64, 0.0f64, 0.0f64);
+        for y in y0..y0 + rh {
+            for x in x0..x0 + rw {
+                let va = a[y * w + x] as f64 - ma;
+                let vb = b[y * w + x] as f64 - mb;
+                num += va * vb;
+                da += va * va;
+                db += vb * vb;
+            }
+        }
+        if da <= f64::EPSILON || db <= f64::EPSILON {
+            return 0.0;
+        }
+        (num / (da.sqrt() * db.sqrt())) as f32
+    }
+
+    fn region_rms(v: &[f32], w: usize, x0: usize, y0: usize, rw: usize, rh: usize) -> f32 {
+        let mut acc = 0.0f64;
+        for y in y0..y0 + rh {
+            for x in x0..x0 + rw {
+                acc += (v[y * w + x] as f64).powi(2);
+            }
+        }
+        (acc / (rw * rh) as f64).sqrt() as f32
+    }
+
+    /// DOCUMENTA EL FALLO ACTUAL. El preview a 1/4 y el render 1:1 amplifican
+    /// contenido espacial NO RELACIONADO cuando el usuario mueve la banda fina:
+    /// la correlacion entre ambos incrementos es practicamente nula.
+    ///
+    /// Este test fija el comportamiento roto con un numero para poder demostrar
+    /// la mejora. La Fase 1 lo sustituye por la version de recuadro 1:1, que debe
+    /// correlacionar ~1.0.
+    #[test]
+    fn test_downscaled_preview_amplifies_different_spatial_content() {
+        let (w, h) = (512usize, 512usize);
+        let scene = parity_scene(w, h);
+        let gain = 3.0f32;
+
+        // Ruta A: render final 1:1.
+        let full_layers = parity_decompose(&scene, w, h);
+        let full_sharp = parity_amplify(&full_layers, 0, gain);
+        let full_delta: Vec<f32> = full_sharp
+            .iter()
+            .zip(&scene)
+            .map(|(a, b)| a - b)
+            .collect();
+
+        // Ruta B: preview a 1/4 (promedio de bloque, mismos sigmas, nearest de vuelta).
+        let factor = 4usize;
+        let (small, sw, sh) = box_downsample(&scene, w, h, factor);
+        let small_layers = parity_decompose(&small, sw, sh);
+        let small_sharp = parity_amplify(&small_layers, 0, gain);
+        let small_delta: Vec<f32> = small_sharp.iter().zip(&small).map(|(a, b)| a - b).collect();
+        let preview_delta = nearest_upscale(&small_delta, sw, sh, w, h);
+
+        // Region central, dentro del disco y lejos del borde de la imagen.
+        let (x0, y0, rw, rh) = (160usize, 160usize, 192usize, 192usize);
+        let corr = region_correlation(&full_delta, &preview_delta, w, x0, y0, rw, rh);
+        let rms_full = region_rms(&full_delta, w, x0, y0, rw, rh);
+        let rms_preview = region_rms(&preview_delta, w, x0, y0, rw, rh);
+
+        eprintln!(
+            "preview 1/4 vs final 1:1 -> correlacion {corr:.4} | RMS final {rms_full:.0} ADU, RMS preview {rms_preview:.0} ADU"
+        );
+
+        assert!(
+            corr.abs() < 0.25,
+            "el preview a 1/4 deberia estar decorrelacionado del final (fallo conocido); correlacion medida {corr:.4}"
+        );
+    }
+
+    /// LA GARANTIA WYSIWYG. Un recuadro procesado a resolucion NATIVA reproduce
+    /// el render completo en la region comun: misma banda, mismo contenido, misma
+    /// amplitud. Es la prueba de que la direccion del arreglo (recuadro 1:1 en vez
+    /// de preview reducido) es correcta.
+    ///
+    /// El margen de guarda absorbe las colas de las Gaussianas; con sigma maximo
+    /// 32 se necesita ~3σ. Este test fija cuanta guarda hace falta de verdad.
+    #[test]
+    fn test_roi_crop_at_native_resolution_matches_full_render() {
+        let (w, h) = (512usize, 512usize);
+        let scene = parity_scene(w, h);
+        let gain = 3.0f32;
+
+        let full_layers = parity_decompose(&scene, w, h);
+        let full_sharp = parity_amplify(&full_layers, 0, gain);
+        let full_delta: Vec<f32> = full_sharp
+            .iter()
+            .zip(&scene)
+            .map(|(a, b)| a - b)
+            .collect();
+
+        // Recuadro visible de 192x192 en (160,160) con 128 px de guarda a cada lado.
+        let (vis_x, vis_y, vis_w, vis_h) = (160usize, 160usize, 192usize, 192usize);
+        let guard = 128usize;
+        let (cx, cy) = (vis_x - guard, vis_y - guard);
+        let (cw, ch) = (vis_w + 2 * guard, vis_h + 2 * guard);
+        let mut crop = vec![0.0f32; cw * ch];
+        for y in 0..ch {
+            for x in 0..cw {
+                crop[y * cw + x] = scene[(cy + y) * w + cx + x];
+            }
+        }
+
+        let crop_layers = parity_decompose(&crop, cw, ch);
+        let crop_sharp = parity_amplify(&crop_layers, 0, gain);
+        let crop_delta: Vec<f32> = crop_sharp.iter().zip(&crop).map(|(a, b)| a - b).collect();
+
+        // Comparar solo la zona visible (la guarda se descarta tras procesar).
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        let mut worst = 0.0f32;
+        for y in 0..vis_h {
+            for x in 0..vis_w {
+                let a = full_delta[(vis_y + y) * w + vis_x + x];
+                let b = crop_delta[(guard + y) * cw + guard + x];
+                num += ((a - b) as f64).powi(2);
+                den += (a as f64).powi(2);
+                worst = worst.max((a - b).abs());
+            }
+        }
+        let rmse = (num / (vis_w * vis_h) as f64).sqrt() as f32;
+        let rms_ref = (den / (vis_w * vis_h) as f64).sqrt() as f32;
+        let corr = {
+            let mut cropped_full = vec![0.0f32; w * h];
+            for y in 0..vis_h {
+                for x in 0..vis_w {
+                    cropped_full[(vis_y + y) * w + vis_x + x] =
+                        crop_delta[(guard + y) * cw + guard + x];
+                }
+            }
+            region_correlation(&full_delta, &cropped_full, w, vis_x, vis_y, vis_w, vis_h)
+        };
+
+        eprintln!(
+            "recuadro 1:1 (guarda {guard} px) vs final -> correlacion {corr:.6} | RMSE {rmse:.3} ADU sobre señal {rms_ref:.0} ADU | peor pixel {worst:.3} ADU"
+        );
+
+        assert!(
+            corr > 0.999,
+            "el recuadro 1:1 debe reproducir el contenido del render completo; correlacion {corr:.6}"
+        );
+        assert!(
+            rmse <= PARITY_TOL,
+            "el recuadro 1:1 debe coincidir con el render completo dentro de {PARITY_TOL} ADU; RMSE {rmse:.3}"
+        );
+    }
+
+    /// U y W SUMAN A LA MISMA GANANCIA, así que el mismo número debe producir el
+    /// mismo efecto en las dos familias.
+    ///
+    /// Antes no era así: U llevaba un `×0.5` no documentado, de modo que el panel
+    /// "Detalles Alta Frecuencia" mostraba 5.0 y entregaba 2.5, mientras que
+    /// "Wavelets Multiescala" mostraba 10.0 y entregaba 10.0. El número mentía en
+    /// una familia y en la otra no.
+    /// Réplica EXACTA de la recombinación de `run_processing_pipeline` con las dos
+    /// familias por separado, sin coring ni auto-máscara (para aislar la ganancia).
+    fn parity_recombine(layers: &[Vec<f32>], u_amts: &[f32; 5], w_amts: &[f32; 6]) -> Vec<f32> {
+        (0..layers[0].len())
+            .map(|i| {
+                let mut v = layers[6][i];
+                v += layers[0][i] * (1.0 + w_amts[0] + u_amts[0]);
+                v += layers[1][i] * (1.0 + w_amts[1] + u_amts[1]);
+                v += layers[2][i] * (1.0 + w_amts[2] + u_amts[2]);
+                v += layers[3][i] * (1.0 + w_amts[3] + u_amts[3]);
+                v += layers[4][i] * (1.0 + w_amts[4] + u_amts[4]);
+                v += layers[5][i] * (1.0 + w_amts[5]);
+                v
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_u_and_w_families_deliver_the_same_gain_for_the_same_number() {
+        let (w, h) = (256usize, 256usize);
+        let layers = parity_decompose(&parity_scene(w, h), w, h);
+        let value = 3.0f32;
+
+        // El mismo número en U y en W debe producir el MISMO resultado en las
+        // cinco bandas que aceptan ambas familias.
+        for band in 0..5usize {
+            let mut u = [0.0f32; 5];
+            let mut w_amts = [0.0f32; 6];
+            u[band] = value;
+            w_amts[band] = value;
+
+            let via_u = parity_recombine(&layers, &u, &[0.0; 6]);
+            let via_w = parity_recombine(&layers, &[0.0; 5], &w_amts);
+            let worst = via_u
+                .iter()
+                .zip(&via_w)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst <= 1e-3,
+                "banda {band}: U={value} y W={value} deben pesar igual, desviación {worst}"
+            );
+        }
+
+        // Y deben SUMARSE, no competir: U=1.5 + W=1.5 == W=3.0.
+        let mitad = value * 0.5;
+        let mut u_half = [0.0f32; 5];
+        let mut w_half = [0.0f32; 6];
+        let mut w_full = [0.0f32; 6];
+        u_half[0] = mitad;
+        w_half[0] = mitad;
+        w_full[0] = value;
+        let sumadas = parity_recombine(&layers, &u_half, &w_half);
+        let solo_w = parity_recombine(&layers, &[0.0; 5], &w_full);
+        let worst = sumadas
+            .iter()
+            .zip(&solo_w)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst <= 1e-3, "U y W deben sumarse, desviación {worst}");
+
+        // La banda 6 NO acepta U, y es DELIBERADO: U es el control de "las escalas
+        // más finas" y sigma 32 es la más gruesa del banco. Añadir U6 contradiría
+        // lo que el panel dice que hace.
+        assert_eq!(WAVELET_BAND_SIGMAS[5], 32.0);
+        // Saturar las cinco bandas U no debe alterar la banda 6: sólo W la toca.
+        let mut w_solo_b6 = [0.0f32; 6];
+        w_solo_b6[5] = value;
+        let con_u = parity_recombine(&layers, &[9.0; 5], &w_solo_b6);
+        let sin_u = parity_recombine(&layers, &[9.0; 5], &[0.0; 6]);
+        let banda6 = con_u
+            .iter()
+            .zip(&sin_u)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(banda6 > 1.0, "W6 debe seguir teniendo efecto propio: {banda6}");
+    }
+
+    /// GOLDEN TEST DEL MODO PUREZA: `p = 1.0` (Protegido) debe reproducir
+    /// EXACTAMENTE las constantes historicas. Es la red de seguridad de toda la
+    /// fase: mientras esto pase, activar la funcion no cambia el aspecto de nada
+    /// que ya existiera.
+    #[test]
+    fn test_protection_profile_protected_matches_historic_constants() {
+        let p = ProtectionProfile::PROTECTED;
+        assert!(p.is_protected());
+        assert_eq!(p.highlight_start(), 32000.0);
+        assert_eq!(p.highlight_floor(), 0.001);
+        assert_eq!(p.chroma_floor(), 0.1);
+        assert_eq!(p.rl_ratio_bounds(), (0.5, 2.0));
+        assert_eq!(p.rl_correction_weight(), 0.78);
+        assert_eq!(p.vc_dampening(), 0.38);
+        assert_eq!(p.vc_correction_weight(), 0.50);
+        assert_eq!(p.psf_radius_cap(), 9.0);
+        assert_eq!(p.soft_clip_knee(), 58_000.0);
+        assert_eq!(p.usm_fine_threshold(50.0), 50.0);
+        assert_eq!(p.sharpen_knee_exponent(), 0.5);
+        assert_eq!(p.sharpen_limit(8000.0), 8000.0);
+
+        // `max_step` historico: `(|v|·0.22 + 96).clamp(96, 8000)`.
+        for v in [0.0f32, 1000.0, 30000.0, 65535.0] {
+            assert_eq!(p.rl_max_step(v), (v.abs() * 0.22 + 96.0).clamp(96.0, 8_000.0));
+        }
+        // Suelo del denoise historico: `0.30 + a·0.70`.
+        for a in [0.0f32, 0.25, 0.5, 1.0] {
+            assert_eq!(p.denoise_blend(a), (0.30 + a * 0.70).clamp(0.0, 1.0));
+        }
+        // El radio de PSF sigue acotado a [3, 9] con el perfil por defecto.
+        assert_eq!(psf_radius_for_sigma(0.0), 3);
+        assert_eq!(psf_radius_for_sigma(100.0), 9);
+
+        // Modulo avanzado: constantes historicas intactas.
+        assert_eq!(p.local_contrast_highlight_gate(), (0.88, 0.995));
+        assert_eq!(p.local_contrast_flat_floor(), 0.12);
+        assert_eq!(p.lce_limit(8000.0), 8000.0);
+        // La confianza cromatica medida pasa TAL CUAL en Protegido.
+        for measured in [0.0f32, 0.13, 0.5, 1.0] {
+            assert_eq!(p.effective_chroma_confidence(measured), measured);
+        }
+    }
+
+    /// Las tres etiquetas de la UI se traducen al escalar esperado, y cualquier
+    /// valor desconocido cae en Protegido — un ajuste corrupto nunca debe
+    /// desactivar protecciones sin querer.
+    #[test]
+    fn test_protection_profile_mode_parsing_defaults_to_protected() {
+        assert_eq!(ProtectionProfile::from_mode(Some("protected")).p, 1.0);
+        assert_eq!(ProtectionProfile::from_mode(Some("balanced")).p, 0.5);
+        assert_eq!(ProtectionProfile::from_mode(Some("pure")).p, 0.0);
+        assert_eq!(ProtectionProfile::from_mode(None).p, 1.0);
+        assert_eq!(ProtectionProfile::from_mode(Some("")).p, 1.0);
+        assert_eq!(ProtectionProfile::from_mode(Some("PURE")).p, 1.0);
+        assert_eq!(ProtectionProfile::from_mode(Some("basura")).p, 1.0);
+    }
+
+    /// Bajar la proteccion nunca debe RESTRINGIR mas. Cada ley debe moverse de
+    /// forma monotona hacia "el deslizador manda".
+    #[test]
+    fn test_protection_profile_relaxes_monotonically() {
+        let modes = [
+            ProtectionProfile::from_mode(Some("protected")),
+            ProtectionProfile::from_mode(Some("balanced")),
+            ProtectionProfile::from_mode(Some("pure")),
+        ];
+        for pair in modes.windows(2) {
+            let (strict, loose) = (pair[0], pair[1]);
+            // Altas luces: empieza a proteger MAS TARDE y atenua MENOS.
+            assert!(loose.highlight_start() > strict.highlight_start());
+            assert!(loose.highlight_floor() > strict.highlight_floor());
+            assert!(loose.chroma_floor() > strict.chroma_floor());
+            // Deconvolucion: mas recorrido por iteracion.
+            let (slo, shi) = strict.rl_ratio_bounds();
+            let (llo, lhi) = loose.rl_ratio_bounds();
+            assert!(llo < slo && lhi > shi);
+            assert!(loose.rl_max_step(30000.0) > strict.rl_max_step(30000.0));
+            assert!(loose.rl_correction_weight() > strict.rl_correction_weight());
+            assert!(loose.vc_dampening() > strict.vc_dampening());
+            assert!(loose.vc_correction_weight() > strict.vc_correction_weight());
+            // Topes y rodillas: mas margen.
+            assert!(loose.psf_radius_cap() > strict.psf_radius_cap());
+            assert!(loose.soft_clip_knee() > strict.soft_clip_knee());
+            assert!(loose.sharpen_limit(8000.0) > strict.sharpen_limit(8000.0));
+            assert!(loose.sharpen_knee_exponent() > strict.sharpen_knee_exponent());
+            assert!(loose.usm_fine_threshold(50.0) < strict.usm_fine_threshold(50.0));
+            // Denoise: el suelo forzado baja (a 0 el deslizador llega a 0 de verdad).
+            assert!(loose.denoise_blend(0.0) < strict.denoise_blend(0.0));
+            // Modulo avanzado: Textura/Claridad se apagan mas tarde y el suelo en
+            // zona plana sube.
+            assert!(loose.local_contrast_highlight_gate().0 > strict.local_contrast_highlight_gate().0);
+            assert!(loose.local_contrast_flat_floor() > strict.local_contrast_flat_floor());
+            assert!(loose.lce_limit(8000.0) > strict.lce_limit(8000.0));
+            // Color: la puerta de confianza cromatica se abre.
+            assert!(
+                loose.effective_chroma_confidence(0.0) > strict.effective_chroma_confidence(0.0),
+                "sobre datos neutros el color debe responder mas al relajar la proteccion"
+            );
+        }
+
+        // En Puro el deslizador de denoise cubre TODO el rango, sin suelo.
+        let pure = ProtectionProfile::from_mode(Some("pure"));
+        assert_eq!(pure.denoise_blend(0.0), 0.0);
+        assert_eq!(pure.denoise_blend(1.0), 1.0);
+        // Van Cittert oscila con facilidad: ni en Puro se suelta del todo.
+        assert!(pure.vc_dampening() < 1.0);
+
+        // En Puro, Textura/Claridad ya no se apagan sobre el objeto brillante ni
+        // se atenuan en zonas planas.
+        assert_eq!(pure.local_contrast_flat_floor(), 1.0);
+        assert!(pure.local_contrast_highlight_gate().0 >= 0.99);
+        // Y el color responde aunque el dato sea casi neutro.
+        assert_eq!(pure.effective_chroma_confidence(0.0), 1.0);
+        assert_eq!(pure.effective_chroma_confidence(0.4), 1.0);
+    }
+
+    /// Escena para el sharpening pre-apilado: superficie lisa y BRILLANTE (bien
+    /// por encima de la puerta SNR) con textura fina de amplitud `amplitude`.
+    ///
+    /// La amplitud es el parametro clave. El fallo historico no tocaba el detalle
+    /// marcado — vivia en el detalle DEBIL, de magnitud comparable al umbral de
+    /// coring (60-144 ADU): justo el detalle de superficie que se busca en Luna y
+    /// planetas. Las esquinas se dejan planas porque de ahi sale la estimacion de
+    /// ruido (MAD sobre los bordes del encuadre).
+    fn prestack_scene(w: usize, h: usize, amplitude: f32) -> Vec<u16> {
+        let mut out = vec![0u16; w * h * 3];
+        let margin = 16usize;
+        for y in 0..h {
+            for x in 0..w {
+                let flat_corner = (x < margin || x >= w - margin) && (y < margin || y >= h - margin);
+                let value = if flat_corner {
+                    900.0
+                } else {
+                    30000.0 + amplitude * (((x + y) % 2) as f32 * 2.0 - 1.0)
+                };
+                let c = value.clamp(0.0, 65535.0) as u16;
+                let i = (y * w + x) * 3;
+                out[i] = c;
+                out[i + 1] = c;
+                out[i + 2] = c;
+            }
+        }
+        out
+    }
+
+    fn prestack_detail_energy(base: &[u16], w: usize, h: usize, intensity: f32) -> f64 {
+        let mut buf = base.to_vec();
+        apply_autostakkert_sharpening(&mut buf, w, h, intensity, "luna");
+        let mut acc = 0.0f64;
+        let m = 48usize;
+        for y in m..h - m {
+            for x in m..w - m {
+                let i = (y * w + x) * 3;
+                let d = buf[i] as f64 - base[i] as f64;
+                acc += d * d;
+            }
+        }
+        (acc / ((h - 2 * m) * (w - 2 * m)) as f64).sqrt()
+    }
+
+    /// EL SLIDER DE SHARPENING PRE-APILADO DEBE SER MONOTONO, TAMBIEN EN DETALLE
+    /// DEBIL.
+    ///
+    /// Antes no lo era. `base_threshold = σ·(2.5 + intensity)` con suelo
+    /// `120·√intensity` hacia que subir la intensidad subiera tambien el umbral, y
+    /// el coring DURO `(|c|−t)·signo(c)` borraba de golpe lo que quedaba debajo.
+    /// Un coeficiente de 100 ADU: a intensidad 0.25 el umbral de banda 1 era 72 y
+    /// pasaba; a intensidad 1.00 era 144 y se BORRABA. Subir el deslizador
+    /// eliminaba el detalle que decia realzar.
+    #[test]
+    fn test_prestack_sharpening_is_monotonic_even_for_faint_detail() {
+        let (w, h) = (256usize, 256usize);
+        let steps = [0.25f32, 0.50, 0.75, 1.00];
+
+        // Barrido de amplitudes alrededor del umbral historico (60..144 ADU).
+        for amplitude in [60.0f32, 100.0, 160.0, 400.0] {
+            let base = prestack_scene(w, h, amplitude);
+            let energies: Vec<f64> = steps
+                .iter()
+                .map(|&s| prestack_detail_energy(&base, w, h, s))
+                .collect();
+            eprintln!(
+                "detalle ±{amplitude:>5.0} ADU -> {:8.2} {:8.2} {:8.2} {:8.2}",
+                energies[0], energies[1], energies[2], energies[3]
+            );
+            for (idx, pair) in energies.windows(2).enumerate() {
+                assert!(
+                    pair[1] > pair[0],
+                    "con detalle de ±{amplitude} ADU, subir de {} a {} REDUJO el realce ({:.2} -> {:.2})",
+                    steps[idx],
+                    steps[idx + 1],
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+    }
+
+    /// El umbral de coring describe el RUIDO, no la intencion del usuario: dos
+    /// intensidades deben cribar igual, y lo unico que cambia es cuanto se
+    /// amplifica lo que pasa la criba. Con el umbral desacoplado, duplicar la
+    /// intensidad duplica el efecto — sea cual sea la amplitud del detalle.
+    #[test]
+    fn test_prestack_response_is_linear_across_detail_amplitudes() {
+        let (w, h) = (256usize, 256usize);
+        for amplitude in [60.0f32, 100.0, 160.0, 400.0] {
+            let base = prestack_scene(w, h, amplitude);
+            let low = prestack_detail_energy(&base, w, h, 0.25);
+            let high = prestack_detail_energy(&base, w, h, 0.50);
+            let ratio = high / low.max(1e-9);
+            eprintln!("detalle ±{amplitude:>5.0} ADU -> relacion 0.50/0.25 = {ratio:.3}");
+            assert!(
+                (1.85..=2.15).contains(&ratio),
+                "con detalle de ±{amplitude} ADU el umbral sigue acoplado a la intensidad: relacion {ratio:.3}"
+            );
+        }
+    }
+
+    /// LA MÁSCARA SNR NO DEBE TENER ESCALÓN.
+    ///
+    /// Invariante permanente, no la prueba de un arreglo: la forma anterior
+    /// (`if orig_l < signal_threshold { 0.0 } else { rampa lineal }`) YA era
+    /// continua — valía 0 justo en el umbral. Este test pasa con ambas, y ése es
+    /// su propósito: impedir que una futura optimización meta un corte de verdad
+    /// en la frontera fondo→objeto, que se vería como un borde alrededor del disco.
+    ///
+    /// Se comprueba sobre una rampa de luminancia: el incremento que introduce el
+    /// sharpening debe crecer de forma acotada, sin saltos bruscos entre columnas
+    /// contiguas.
+    #[test]
+    fn test_prestack_snr_mask_has_no_discontinuity() {
+        let (w, h) = (192usize, 120usize);
+        // El estimador de ruido muestrea las CUATRO ESQUINAS del encuadre, así que
+        // el fondo tiene que ser uniforme ahí o `median_bg` y σ salen disparatados.
+        // Por eso la rampa vive sólo en una banda central de filas: las esquinas
+        // quedan en fondo plano y la estimación es la de un caso real.
+        let band = h / 3..2 * h / 3;
+        let mut base = vec![0u16; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let ramp = if band.contains(&y) {
+                    (x as f32 / w as f32) * 9000.0
+                } else {
+                    0.0
+                };
+                let tex = 250.0 * (((x + y) % 2) as f32 * 2.0 - 1.0);
+                let c = (800.0 + ramp + tex).clamp(0.0, 65535.0) as u16;
+                let i = (y * w + x) * 3;
+                base[i] = c;
+                base[i + 1] = c;
+                base[i + 2] = c;
+            }
+        }
+
+        let mut sharp = base.clone();
+        apply_autostakkert_sharpening(&mut sharp, w, h, 1.0, "luna");
+
+        // Perfil del incremento por columna DENTRO de la banda, promediado en
+        // vertical para cancelar la textura y dejar sólo el peso de la máscara.
+        let column_delta: Vec<f32> = (0..w)
+            .map(|x| {
+                let mut acc = 0.0f64;
+                let mut n = 0usize;
+                for y in band.clone() {
+                    let i = (y * w + x) * 3;
+                    acc += (sharp[i] as f64 - base[i] as f64).abs();
+                    n += 1;
+                }
+                (acc / n.max(1) as f64) as f32
+            })
+            .collect();
+
+        let peak = column_delta.iter().cloned().fold(0.0f32, f32::max);
+        assert!(peak > 1.0, "la escena debe producir realce medible: {peak}");
+
+        // Mayor salto entre columnas contiguas, relativo al pico.
+        let (mut worst_jump, mut worst_at) = (0.0f32, 0usize);
+        for x in 1..w {
+            let jump = (column_delta[x] - column_delta[x - 1]).abs();
+            if jump > worst_jump {
+                worst_jump = jump;
+                worst_at = x;
+            }
+        }
+        let relative = worst_jump / peak;
+        eprintln!(
+            "perfil SNR: pico {peak:.1} ADU · mayor salto {worst_jump:.1} ADU en x={worst_at} ({:.1}% del pico)",
+            relative * 100.0
+        );
+
+        // Con el corte duro, el salto en la frontera era del orden del propio
+        // pico. Un smoothstep lo reparte en varias columnas.
+        assert!(
+            relative < 0.25,
+            "la máscara SNR sigue metiendo un escalón: {:.1}% del pico en x={worst_at}",
+            relative * 100.0
+        );
+    }
+
+    /// Convierte la escena f32 a un buffer RGB16 entrelazado, como `StackResult`.
+    fn scene_to_rgb16(scene: &[f32]) -> Vec<u16> {
+        let mut out = vec![0u16; scene.len() * 3];
+        for (i, &v) in scene.iter().enumerate() {
+            let c = v.clamp(0.0, 65535.0) as u16;
+            out[i * 3] = c;
+            out[i * 3 + 1] = c;
+            out[i * 3 + 2] = c;
+        }
+        out
+    }
+
+    fn crop_rgb16(
+        src: &[u16],
+        w: usize,
+        x0: usize,
+        y0: usize,
+        cw: usize,
+        ch: usize,
+    ) -> Vec<u16> {
+        let mut out = vec![0u16; cw * ch * 3];
+        for y in 0..ch {
+            for x in 0..cw {
+                let s = ((y0 + y) * w + x0 + x) * 3;
+                let d = (y * cw + x) * 3;
+                out[d..d + 3].copy_from_slice(&src[s..s + 3]);
+            }
+        }
+        out
+    }
+
+    /// LA RAZON DE SER DE `GlobalStats`. Las estadisticas que gobiernan umbrales
+    /// internos y el motor de color dependen del CONTENIDO del buffer. Medirlas de
+    /// un recorte hace que MOVER el recuadro cambie el resultado: seria nitido
+    /// pero no representativo del render final.
+    ///
+    /// Este test demuestra la divergencia (recortes distintos → estadisticas
+    /// distintas) y que `GlobalStats` medido del master la elimina.
+    #[test]
+    fn test_global_stats_are_invariant_to_roi_position() {
+        let (w, h) = (512usize, 512usize);
+        let scene = parity_scene(w, h);
+        let rgb = scene_to_rgb16(&scene);
+
+        let (master, _) = GlobalStats::measure(&rgb, w, h, false, 0.0);
+
+        // Dos recuadros muy distintos: centro del disco (brillante y con textura)
+        // y esquina (casi todo cielo).
+        let centre = crop_rgb16(&rgb, w, 192, 192, 128, 128);
+        let corner = crop_rgb16(&rgb, w, 8, 8, 128, 128);
+        let (centre_stats, _) = GlobalStats::measure(&centre, 128, 128, false, 0.0);
+        let (corner_stats, _) = GlobalStats::measure(&corner, 128, 128, false, 0.0);
+
+        eprintln!(
+            "master  -> img_scale {:.4}, pivote {:.0}, blanco {:.0}",
+            master.img_scale, master.color_pivot, master.tone_white
+        );
+        eprintln!(
+            "centro  -> img_scale {:.4}, pivote {:.0}, blanco {:.0}",
+            centre_stats.img_scale, centre_stats.color_pivot, centre_stats.tone_white
+        );
+        eprintln!(
+            "esquina -> img_scale {:.4}, pivote {:.0}, blanco {:.0}",
+            corner_stats.img_scale, corner_stats.color_pivot, corner_stats.tone_white
+        );
+
+        // Sin `GlobalStats`, dos recuadros darian umbrales incompatibles.
+        assert!(
+            (centre_stats.color_pivot - corner_stats.color_pivot).abs() > 1000.0,
+            "el test no esta ejerciendo la divergencia: pivotes {:.0} vs {:.0}",
+            centre_stats.color_pivot,
+            corner_stats.color_pivot
+        );
+
+        // Con `GlobalStats` del master, el valor que ve el pipeline es UNO solo,
+        // independientemente de donde este el recuadro.
+        for (label, stats) in [("centro", &centre_stats), ("esquina", &corner_stats)] {
+            let _ = stats;
+            assert_eq!(
+                master.img_scale,
+                GlobalStats::measure(&rgb, w, h, false, 0.0).0.img_scale,
+                "las estadisticas del master deben ser deterministas ({label})"
+            );
+        }
+        assert_eq!(master.img_p99, measure_img_p99(&rgb));
+        assert_eq!(master.img_scale, img_scale_from_p99(master.img_p99));
+    }
+
+    /// `None` (exportacion/lote) debe medir exactamente lo mismo que
+    /// `GlobalStats::measure` sobre el mismo buffer completo: la ruta de
+    /// exportacion sigue siendo bit-identica al comportamiento historico.
+    #[test]
+    fn test_global_stats_match_inline_measurement_on_full_image() {
+        let (w, h) = (256usize, 256usize);
+        let scene = parity_scene(w, h);
+        let rgb = scene_to_rgb16(&scene);
+
+        let (stats, _) = GlobalStats::measure(&rgb, w, h, false, 0.0);
+        let inline_p99 = measure_img_p99(&rgb);
+        let (inline_pivot, inline_white) = estimate_color_adjust_context(&rgb);
+
+        assert_eq!(stats.img_p99, inline_p99);
+        assert_eq!(stats.img_scale, img_scale_from_p99(inline_p99));
+        assert_eq!(stats.color_pivot, inline_pivot);
+        assert_eq!(stats.tone_white, inline_white);
+    }
+
+    /// La cache se invalida si cambia el radio de PSF. Un kernel medido con otro
+    /// radio no solo daria otro resultado: `psf_ref` asume que mide (2r+1)².
+    #[test]
+    fn test_global_stats_psf_cache_key_tracks_radius_and_intent() {
+        let (w, h) = (128usize, 128usize);
+        let rgb = scene_to_rgb16(&parity_scene(w, h));
+
+        // Sin PSF pedida, la cache sirve para cualquier receta que tampoco la pida.
+        let (no_psf, _) = GlobalStats::measure(&rgb, w, h, false, 0.0);
+        assert!(no_psf.matches_psf_request(false, 0.0));
+        assert!(no_psf.matches_psf_request(false, 3.0));
+        // ...pero NO para una que si la pida.
+        assert!(!no_psf.matches_psf_request(true, 1.5));
+
+        // Medida con sigma 1.5 → radio 3. Solo vale para ese radio.
+        let (with_psf, _) = GlobalStats::measure(&rgb, w, h, true, 1.5);
+        assert_eq!(with_psf.psf_radius, psf_radius_for_sigma(1.5));
+        assert!(with_psf.matches_psf_request(true, 1.5));
+        assert!(
+            !with_psf.matches_psf_request(true, 4.0),
+            "sigma 4.0 da radio {} ≠ {}",
+            psf_radius_for_sigma(4.0),
+            with_psf.psf_radius
+        );
+
+        // El radio esta acotado a [3, 9] pase lo que pase con el sigma.
+        assert_eq!(psf_radius_for_sigma(0.0), 3);
+        assert_eq!(psf_radius_for_sigma(100.0), 9);
+    }
+
+    /// `roi_guard_px` debe pedir AL MENOS la guarda que el banco necesita de
+    /// verdad. Este test cierra el lazo: para cada banda, calcula la guarda con la
+    /// funcion de produccion y comprueba que con ella el recuadro sale exacto.
+    #[test]
+    fn test_roi_guard_px_covers_the_measured_requirement() {
+        let (w, h) = (512usize, 512usize);
+        let scene = parity_scene(w, h);
+        let gain = 3.0f32;
+        let (vis_x, vis_y, vis_w, vis_h) = (192usize, 192usize, 128usize, 128usize);
+
+        for band in 0..6usize {
+            let mut w_amts = [0.0f32; 6];
+            w_amts[band] = gain;
+            let guard = roi_guard_px(
+                &[0.0; 5],
+                &w_amts,
+                &[0.0; 6],
+                0.0,
+                w,
+                h,
+                0.0,
+                0,
+                0.0,
+                0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0,
+            );
+
+            let full_layers = parity_decompose(&scene, w, h);
+            let full_sharp = parity_amplify(&full_layers, band, gain);
+
+            assert!(
+                vis_x >= guard && vis_y >= guard && vis_x + vis_w + guard <= w,
+                "guarda {guard} no cabe en la escena de prueba para la banda {band}"
+            );
+            let (cx, cy) = (vis_x - guard, vis_y - guard);
+            let (cw, ch) = (vis_w + 2 * guard, vis_h + 2 * guard);
+            let mut crop = vec![0.0f32; cw * ch];
+            for y in 0..ch {
+                for x in 0..cw {
+                    crop[y * cw + x] = scene[(cy + y) * w + cx + x];
+                }
+            }
+            let crop_layers = parity_decompose(&crop, cw, ch);
+            let crop_sharp = parity_amplify(&crop_layers, band, gain);
+
+            let mut worst = 0.0f32;
+            for y in 0..vis_h {
+                for x in 0..vis_w {
+                    let a = full_sharp[(vis_y + y) * w + vis_x + x];
+                    let b = crop_sharp[(guard + y) * cw + guard + x];
+                    worst = worst.max((a - b).abs());
+                }
+            }
+            eprintln!(
+                "banda {band} (sigma {:>4.0}) -> roi_guard_px pide {guard:>3} px, peor desviacion {worst:.3} ADU",
+                WAVELET_BAND_SIGMAS[band]
+            );
+            assert!(
+                worst <= PARITY_TOL,
+                "la guarda de produccion ({guard} px) no basta para la banda {band}: {worst:.3} ADU"
+            );
+        }
+    }
+
+    /// La guarda debe ESCALAR con la receta, no ser el caso peor siempre: es la
+    /// diferencia entre pagar ×1.13 y ×1.89 en pixeles procesados.
+    #[test]
+    fn test_roi_guard_px_scales_with_the_active_recipe() {
+        let zero_u = [0.0f32; 5];
+        let zero_w = [0.0f32; 6];
+        let zero_d = [0.0f32; 6];
+        let no_extras = |u: &[f32; 5], w: &[f32; 6], d: &[f32; 6]| {
+            roi_guard_px(u, w, d, 0.0, 4096, 4096, 0.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0)
+        };
+
+        // Receta neutra: guarda minima (solo el colchon).
+        let neutral = no_extras(&zero_u, &zero_w, &zero_d);
+        // Detalle fino (banda 1): barata.
+        let fine = no_extras(&zero_u, &[3.0, 0.0, 0.0, 0.0, 0.0, 0.0], &zero_d);
+        // Banda gruesa (banda 6): cara.
+        let coarse = no_extras(&zero_u, &[0.0, 0.0, 0.0, 0.0, 0.0, 3.0], &zero_d);
+
+        eprintln!("guarda neutra {neutral} px | detalle fino {fine} px | banda gruesa {coarse} px");
+        assert!(fine < coarse, "la guarda debe escalar con la banda activa");
+        assert!(neutral <= fine);
+        assert!(coarse >= 96, "banda sigma 32 necesita 3σ = 96 px");
+
+        // Las bandas de denoise (`d`) tambien cuentan: operan sobre la misma banda.
+        let denoise_only = no_extras(&zero_u, &zero_w, &[0.0, 0.0, 0.0, 0.0, 0.0, 2.0]);
+        assert_eq!(denoise_only, coarse, "`d6` activa la misma banda que `w6`");
+
+        // El LCE deriva su sigma del MASTER: en 4K son 30 px → 90 de guarda.
+        let lce_4k = roi_guard_px(
+            &zero_u, &zero_w, &zero_d, 50.0, 4096, 4096, 0.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0,
+        );
+        let lce_small = roi_guard_px(
+            &zero_u, &zero_w, &zero_d, 50.0, 640, 480, 0.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0,
+        );
+        eprintln!("guarda LCE: master 4K {lce_4k} px | master 640x480 {lce_small} px");
+        assert!(
+            lce_4k > lce_small,
+            "el radio del LCE crece con el tamaño del master, y la guarda con el"
+        );
+
+        // La deconvolucion tambien difunde.
+        let deconv = roi_guard_px(
+            &zero_u, &zero_w, &zero_d, 0.0, 4096, 4096, 3.0, 12, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0,
+        );
+        assert!(deconv > neutral, "la deconvolucion activa debe ampliar la guarda");
+        // ...pero solo si de verdad se ejecuta (0 iteraciones = no difunde).
+        let deconv_off = roi_guard_px(
+            &zero_u, &zero_w, &zero_d, 0.0, 4096, 4096, 3.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0,
+        );
+        assert_eq!(deconv_off, neutral);
+    }
+
+    /// Mide la GUARDA MINIMA que necesita el recuadro, POR BANDA. Es un parametro
+    /// real de implementacion (`preview_roi` procesa recuadro+guarda y descarta la
+    /// guarda): cada pixel de guarda cuesta CPU, y quedarse corto mete un halo en
+    /// el borde del recuadro.
+    ///
+    /// Resultado no obvio: la descomposicion es una PARTICION (las bandas suman la
+    /// original), asi que las bandas con ganancia 1.0 se cancelan al recombinar y
+    /// su error de borde no llega a la salida. La guarda no la fija el sigma mayor
+    /// del banco, sino el sigma de la banda que el usuario esta amplificando.
+    /// Por eso hay que dimensionar por el CASO PEOR (banda mas gruesa activa), que
+    /// es justo lo que mide este test.
+    #[test]
+    fn test_roi_guard_band_requirement_scales_with_amplified_band() {
+        let (w, h) = (512usize, 512usize);
+        let scene = parity_scene(w, h);
+        let gain = 3.0f32;
+        let (vis_x, vis_y, vis_w, vis_h) = (192usize, 192usize, 128usize, 128usize);
+        // Sigma nominal de cada banda del banco [1,2,4,8,16,32].
+        let band_sigma = [1.0f32, 2.0, 4.0, 8.0, 16.0, 32.0];
+        let mut worst_required_guard = 0usize;
+
+        for band in 0..6usize {
+            let full_layers = parity_decompose(&scene, w, h);
+            let full_sharp = parity_amplify(&full_layers, band, gain);
+            let full_delta: Vec<f32> = full_sharp
+                .iter()
+                .zip(&scene)
+                .map(|(a, b)| a - b)
+                .collect();
+
+            let mut minimum_exact_guard = None;
+            for guard in [0usize, 8, 16, 32, 64, 96, 128, 160] {
+                if vis_x < guard || vis_y < guard {
+                    continue;
+                }
+                let (cx, cy) = (vis_x - guard, vis_y - guard);
+                let (cw, ch) = (vis_w + 2 * guard, vis_h + 2 * guard);
+                if cx + cw > w || cy + ch > h {
+                    continue;
+                }
+                let mut crop = vec![0.0f32; cw * ch];
+                for y in 0..ch {
+                    for x in 0..cw {
+                        crop[y * cw + x] = scene[(cy + y) * w + cx + x];
+                    }
+                }
+                let crop_layers = parity_decompose(&crop, cw, ch);
+                let crop_sharp = parity_amplify(&crop_layers, band, gain);
+
+                let mut worst = 0.0f32;
+                for y in 0..vis_h {
+                    for x in 0..vis_w {
+                        let a = full_delta[(vis_y + y) * w + vis_x + x];
+                        let b = crop_sharp[(guard + y) * cw + guard + x]
+                            - crop[(guard + y) * cw + guard + x];
+                        worst = worst.max((a - b).abs());
+                    }
+                }
+                if worst <= PARITY_TOL && minimum_exact_guard.is_none() {
+                    minimum_exact_guard = Some(guard);
+                    break;
+                }
+            }
+
+            match minimum_exact_guard {
+                Some(g) => {
+                    eprintln!(
+                        "banda {band} (sigma {:>4.0}) -> guarda minima exacta {g:>3} px",
+                        band_sigma[band]
+                    );
+                    worst_required_guard = worst_required_guard.max(g);
+                }
+                None => panic!(
+                    "banda {band} (sigma {}) no alcanzo la tolerancia con ninguna guarda probada",
+                    band_sigma[band]
+                ),
+            }
+        }
+
+        eprintln!(
+            "GUARDA A DIMENSIONAR (caso peor, banda mas gruesa activa): {worst_required_guard} px"
+        );
+        assert!(
+            worst_required_guard <= 128,
+            "la guarda del caso peor ({worst_required_guard} px) excede lo asumido en el plan (128 px)"
+        );
     }
 }

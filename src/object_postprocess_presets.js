@@ -266,10 +266,22 @@ function scaledBands(values = [], amount = 1) {
  * detail/color and raises protection when the source has clipping, noise or
  * ringing. This keeps the result predictable and fully editable.
  */
+/// `input.purity` = fuerza de las protecciones (1 protegido, 0.5 equilibrado,
+/// 0 puro). Modula los SUELOS forzados de abajo: valores que la receta impone por
+/// encima de lo que el usuario tenía puesto. Con `purity = 0` gana siempre el
+/// usuario.
 export function adaptObjectFinishingPreset(name, input = {}) {
   const preset = cloneObjectFinishingPreset(name);
   if (!preset) return null;
   const analysis = normalizeAdaptivePostprocessAnalysis(input);
+  // `null` NO es "sin especificar" para `Number()`: da 0, es decir PUREZA TOTAL.
+  // Sin este descarte explicito, un `purity: null` desactivaria las protecciones
+  // en silencio. Cualquier valor no numerico cae en 1 (protegido).
+  const purity = typeof input.purity === "number" && Number.isFinite(input.purity)
+    ? Math.min(1, Math.max(0, input.purity))
+    : 1;
+  // Suelo ponderado: a purity 1 se impone entero (histórico), a 0 desaparece.
+  const guardedFloor = (userValue, floor) => Math.max(userValue, floor * purity);
   const pipeline = preset.pipeline;
   const creativePenalty = preset.intent === "creative" ? 0.05 : 0;
   const detailScale = clampAdaptive(
@@ -321,8 +333,10 @@ export function adaptObjectFinishingPreset(name, input = {}) {
     0,
     100,
   ));
+  // La auto-máscara forzada a >=46 es lo que más "lava" el realce sin que el
+  // usuario lo pida: modula las tres bandas finas de wavelets.
   pipeline.autoMask = Math.round(clampAdaptive(
-    Math.max(
+    guardedFloor(
       Number(pipeline.autoMask || 0),
       46 + analysis.noiseStress * 34 + analysis.ringing * 18,
     ),
@@ -330,7 +344,7 @@ export function adaptObjectFinishingPreset(name, input = {}) {
     100,
   ));
   pipeline.masterDenoise = roundAdaptive(clampAdaptive(
-    Math.max(
+    guardedFloor(
       Number(pipeline.masterDenoise || 0),
       analysis.noiseStress * 16,
     ),

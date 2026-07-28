@@ -3038,6 +3038,11 @@ struct AppState {
     deconv_cache: Mutex<Vec<DeconvCache>>,
     wavelet_cache: Mutex<Vec<WaveletLayers>>,
     filter_cache: Mutex<Vec<FilterCache>>,
+    /// Estadisticas del MASTER COMPLETO (p99, pivote tonal, PSF del limbo) con la
+    /// `result_generation` que las valida. El recuadro interactivo procesa un
+    /// recorte y no puede medirlas de el; ademas evita recalcular p99 y la PSF en
+    /// cada arrastre de slider.
+    global_stats_cache: Mutex<Option<(usize, GlobalStats)>>,
     batch_anchor: Mutex<Option<Vec<u16>>>,
     batch_anchor_dims: Mutex<(usize, usize)>,
     /// Serializa cambios de generación con la publicación/consumo del

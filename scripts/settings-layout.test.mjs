@@ -18,6 +18,9 @@ test("planetary settings keep labels and selects in the scoped responsive layout
         "sel-gpu-mode",
         "sel-planetary-quality-policy",
         "sel-decode-policy",
+        // Modo Pureza: comparte la rejilla de ajustes, así que debe llevar la
+        // misma clase o cae al layout global de width:100%.
+        "sel-purity-mode",
     ]) {
         assert.match(
             planetarySection,
