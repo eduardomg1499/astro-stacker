@@ -26,7 +26,13 @@ function Invoke-GateCommand {
     Write-Host ""
     Write-Host ("== " + $Name + " ==") -ForegroundColor Cyan
     $logPath = Join-Path $EvidenceDir $LogName
-    & $FilePath @Arguments 2>&1 | Tee-Object -FilePath $logPath
+    $oldEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $FilePath @Arguments 2>&1 | Tee-Object -FilePath $logPath
+    } finally {
+        $ErrorActionPreference = $oldEAP
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "$Name fallo con codigo $LASTEXITCODE. Log: $logPath"
     }

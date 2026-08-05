@@ -720,10 +720,14 @@ mod tests {
                 data.extend_from_slice(&((frame * 1000 + pixel) as u16).to_le_bytes());
             }
         }
+        let safe_thread_name = std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .replace(':', "_");
         let path = std::env::temp_dir().join(format!(
             "zas_frame_source_{}_{}.ser",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            safe_thread_name
         ));
         std::fs::write(&path, data).unwrap();
         path

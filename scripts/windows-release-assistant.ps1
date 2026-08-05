@@ -45,7 +45,13 @@ function Invoke-NativeCapture {
         [string[]]$Arguments = @(),
         [string]$ErrorMessage = "El comando externo fallo."
     )
-    $output = & $FilePath @Arguments 2>&1
+    $oldEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $FilePath @Arguments 2>&1
+    } finally {
+        $ErrorActionPreference = $oldEAP
+    }
     if ($LASTEXITCODE -ne 0) {
         $detail = ($output | Out-String).Trim()
         Stop-Assistant "$ErrorMessage $detail"

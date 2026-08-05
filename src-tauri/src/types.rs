@@ -3473,8 +3473,8 @@ mod frame_stream_tests {
         }
         #[cfg(windows)]
         {
-            let mut command = std::process::Command::new("cmd");
-            command.args(["/C", "ping 127.0.0.1 -n 6 >NUL"]);
+            let mut command = std::process::Command::new("powershell");
+            command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 5"]);
             command
         }
     }

@@ -355,12 +355,14 @@ fn write_store_atomically(path: &Path, store: &CalibrationStore) -> Result<(), S
     let payload = serde_json::to_vec_pretty(store)
         .map_err(|e| format!("No se pudo serializar la calibracion: {e}"))?;
     let write_result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        file.write_all(&payload)?;
-        file.sync_all()?;
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)?;
+            file.write_all(&payload)?;
+            file.sync_all()?;
+        }
         publish_store_atomically(path, &temporary)?;
         #[cfg(not(target_os = "windows"))]
         std::fs::File::open(parent)?.sync_all()?;

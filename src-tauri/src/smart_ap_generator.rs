@@ -1311,10 +1311,14 @@ mod smart_ap_perf_tests {
 
     #[test]
     fn smart_ap_reference_survives_ram_cache_reset_without_reopening_source() {
+        let safe_thread_name = std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .replace(':', "_");
         let source = std::env::temp_dir().join(format!(
             "zas_smart_ap_source_{}_{}.mov",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            safe_thread_name
         ));
         std::fs::write(&source, b"fingerprint-only fixture").unwrap();
         let path = source.to_string_lossy();

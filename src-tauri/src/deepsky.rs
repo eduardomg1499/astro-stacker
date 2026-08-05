@@ -28913,10 +28913,14 @@ mod ds_tests {
     fn test_ds_float32_tiff_input_preserves_negative_values_and_headroom() {
         use tiff::encoder::{colortype, TiffEncoder};
 
+        let safe_thread_name = std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .replace(':', "_");
         let path = std::env::temp_dir().join(format!(
             "zas-f32-linear-{}-{}.tiff",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            safe_thread_name
         ));
         let source = vec![-0.25f32, 0.0, 1.0, 1.5];
         {
@@ -28943,10 +28947,14 @@ mod ds_tests {
 
     #[test]
     fn test_ds_source_fingerprint_detects_in_place_content_change() {
+        let safe_thread_name = std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .replace(':', "_");
         let path = std::env::temp_dir().join(format!(
             "zas-ds-fingerprint-{}-{}.fits",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            safe_thread_name
         ));
         std::fs::write(&path, vec![0x11u8; 20_000]).unwrap();
         let paths = vec![path.to_string_lossy().to_string()];

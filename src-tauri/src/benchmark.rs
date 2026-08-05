@@ -4162,10 +4162,14 @@ mod tests {
 
     #[test]
     fn deepsky_recipe_with_abe_scnr_cannot_authorize_benchmark() {
+        let safe_thread_name = std::thread::current()
+            .name()
+            .unwrap_or("thread")
+            .replace(':', "_");
         let dir = std::env::temp_dir().join(format!(
             "zas-benchmark-recipe-test-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("thread")
+            safe_thread_name
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("recipe.json");
