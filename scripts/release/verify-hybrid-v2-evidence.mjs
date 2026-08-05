@@ -28,7 +28,7 @@ const gpuLog = read(gpuLogPath);
 const cpu = summaries(cpuLog)[0];
 const gpu = summaries(gpuLog).sort((a, b) => b.passed - a.passed)[0];
 const adapter = gpuLog
-  .match(/GPU disponible:\s*true\s+(?:—|-)\s+([^\r\n]+)/)?.[1]
+  .match(/GPU disponible:\s*true\s+[^\r\n\w]*\s*([A-Za-z0-9][^\r\n·┬À]+?)(?:\s*[·┬À\.]|\s*presupuesto|\s*paridad|\r|\n|$)/i)?.[1]
   ?.replace(/\s*·\s*paridad\s+pending\s*$/i, "")
   .trim();
 const errors = [];
