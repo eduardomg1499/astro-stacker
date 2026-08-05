@@ -1683,8 +1683,7 @@ static ENHANCE_ENGINE: std::sync::OnceLock<std::sync::Mutex<Option<EnhanceEngine
 // El staging de readback también consume VRAM. Serializar la llamada completa
 // mantiene un único staging vivo y evita que la concurrencia de frames exceda
 // silenciosamente el presupuesto aunque el engine persistente sea compartido.
-static ENHANCE_CALL_GATE: std::sync::OnceLock<std::sync::Mutex<()>> =
-    std::sync::OnceLock::new();
+static ENHANCE_CALL_GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
 /// Libera caches planetarios únicamente cuando cada motor está ocioso. Se usa
 /// antes de un acumulador grande para que buffers de una etapa ya terminada no
@@ -2934,10 +2933,7 @@ mod tests {
         assert_eq!(allocation.result_bytes, 7 * 16);
         assert_eq!(
             allocation.reserved_bytes,
-            allocation.image_bytes * 2
-                + allocation.point_bytes
-                + allocation.result_bytes
-                + 4096
+            allocation.image_bytes * 2 + allocation.point_bytes + allocation.result_bytes + 4096
         );
         assert_eq!(super::sad_engine_pool_budget(8 * 1024), 2 * 1024);
         assert_eq!(

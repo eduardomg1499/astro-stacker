@@ -15,18 +15,81 @@ pub(crate) type NormalizedHeaderMap = BTreeMap<String, String>;
 /// Lista acotada que el adapter fitrs debe consultar. Mantenerla aquí evita
 /// que la extracción de firma y el lector concreto diverjan en sus aliases.
 pub(crate) const CALIBRATION_HEADER_KEYS: &[&str] = &[
-    "INSTRUME", "CAMERA", "CAMMODEL", "CAMERAMOD", "SENSOR", "DETECTOR",
-    "SENSORMOD", "READMODE", "READOUTM", "READOUT", "CAMMODE", "GAIN", "EGAIN",
-    "CAM-GAIN", "ISOSPEED", "ISO", "ISO_SPEED", "OFFSET", "BLKLEVEL", "BLACKLEV",
-    "CAM-OFFS", "CCD-TEMP", "CCDTEMP", "SENSOR_TEMP", "SET-TEMP", "EXPTIME",
-    "EXPOSURE", "EXP_TIME", "XBINNING", "BINX", "XBIN", "YBINNING", "BINY",
-    "YBIN", "BINNING", "CCDBIN", "XORGSUBF", "XORIGIN", "ROI_X", "STARTX",
-    "YORGSUBF", "YORIGIN", "ROI_Y", "STARTY", "BAYERPAT", "BAYERPATN", "CFAPAT",
-    "CFA", "XBAYROFF", "BAYOFFX", "CFAOFFX", "YBAYROFF", "BAYOFFY", "CFAOFFY",
-    "FILTER", "FILTERID", "FILTNAME", "DATE-OBS", "DATE-LOC", "DATE", "TELESCOP",
-    "TELESCOPE", "LENS", "FOCALLEN", "FOCLEN", "FOCAL_LENGTH", "FOCRATIO",
-    "F_RATIO", "APTDIA", "BITDEPTH", "ADC_BITS", "SATURATE", "SATLEVEL",
-    "WHITELEV", "WHITE_LEVEL",
+    "INSTRUME",
+    "CAMERA",
+    "CAMMODEL",
+    "CAMERAMOD",
+    "SENSOR",
+    "DETECTOR",
+    "SENSORMOD",
+    "READMODE",
+    "READOUTM",
+    "READOUT",
+    "CAMMODE",
+    "GAIN",
+    "EGAIN",
+    "CAM-GAIN",
+    "ISOSPEED",
+    "ISO",
+    "ISO_SPEED",
+    "OFFSET",
+    "BLKLEVEL",
+    "BLACKLEV",
+    "CAM-OFFS",
+    "CCD-TEMP",
+    "CCDTEMP",
+    "SENSOR_TEMP",
+    "SET-TEMP",
+    "EXPTIME",
+    "EXPOSURE",
+    "EXP_TIME",
+    "XBINNING",
+    "BINX",
+    "XBIN",
+    "YBINNING",
+    "BINY",
+    "YBIN",
+    "BINNING",
+    "CCDBIN",
+    "XORGSUBF",
+    "XORIGIN",
+    "ROI_X",
+    "STARTX",
+    "YORGSUBF",
+    "YORIGIN",
+    "ROI_Y",
+    "STARTY",
+    "BAYERPAT",
+    "BAYERPATN",
+    "CFAPAT",
+    "CFA",
+    "XBAYROFF",
+    "BAYOFFX",
+    "CFAOFFX",
+    "YBAYROFF",
+    "BAYOFFY",
+    "CFAOFFY",
+    "FILTER",
+    "FILTERID",
+    "FILTNAME",
+    "DATE-OBS",
+    "DATE-LOC",
+    "DATE",
+    "TELESCOP",
+    "TELESCOPE",
+    "LENS",
+    "FOCALLEN",
+    "FOCLEN",
+    "FOCAL_LENGTH",
+    "FOCRATIO",
+    "F_RATIO",
+    "APTDIA",
+    "BITDEPTH",
+    "ADC_BITS",
+    "SATURATE",
+    "SATLEVEL",
+    "WHITELEV",
+    "WHITE_LEVEL",
 ];
 
 #[derive(Clone, Debug)]
@@ -84,9 +147,7 @@ fn clean_header_value(value: &str) -> String {
     }
     let without_comment = value.split(" / ").next().unwrap_or(value).trim();
     without_comment
-        .trim_matches(|character| {
-            matches!(character, '\'' | '"' | '(' | ')' | '[' | ']')
-        })
+        .trim_matches(|character| matches!(character, '\'' | '"' | '(' | ')' | '[' | ']'))
         .trim()
         .to_string()
 }
@@ -108,11 +169,12 @@ fn numeric_prefix(value: &str) -> Option<f64> {
         .trim()
         .chars()
         .take_while(|character| {
-            character.is_ascii_digit()
-                || matches!(character, '.' | '-' | '+' | 'e' | 'E')
+            character.is_ascii_digit() || matches!(character, '.' | '-' | '+' | 'e' | 'E')
         })
         .collect();
-    (!token.is_empty()).then(|| token.parse::<f64>().ok()).flatten()
+    (!token.is_empty())
+        .then(|| token.parse::<f64>().ok())
+        .flatten()
 }
 
 fn first_number(headers: &NormalizedHeaderMap, aliases: &[&str]) -> Option<f64> {
@@ -121,8 +183,7 @@ fn first_number(headers: &NormalizedHeaderMap, aliases: &[&str]) -> Option<f64> 
 
 fn first_u32(headers: &NormalizedHeaderMap, aliases: &[&str]) -> Option<u32> {
     let value = first_number(headers, aliases)?;
-    (value.is_finite() && value >= 0.0 && value <= u32::MAX as f64)
-        .then_some(value.round() as u32)
+    (value.is_finite() && value >= 0.0 && value <= u32::MAX as f64).then_some(value.round() as u32)
 }
 
 fn parse_binning_pair(value: &str) -> Option<(u32, u32)> {
@@ -219,36 +280,23 @@ pub(crate) fn signature_from_headers(
     context: SignatureContext,
 ) -> SignatureExtraction {
     let mut warnings = Vec::new();
-    let camera = first_string(
-        headers,
-        &["INSTRUME", "CAMERA", "CAMMODEL", "CAMERAMOD"],
-    );
+    let camera = first_string(headers, &["INSTRUME", "CAMERA", "CAMMODEL", "CAMERAMOD"]);
     let sensor = first_string(headers, &["SENSOR", "DETECTOR", "SENSORMOD"]);
-    let read_mode = first_string(
-        headers,
-        &["READMODE", "READOUTM", "READOUT", "CAMMODE"],
-    );
+    let read_mode = first_string(headers, &["READMODE", "READOUTM", "READOUT", "CAMMODE"]);
     // EGAIN is normally the detector conversion gain in e-/ADU.  It is not
     // the user-selected camera gain and therefore cannot be used to decide
     // whether two calibration frames share a capture setting.
     let gain = first_number(headers, &["GAIN", "CAM-GAIN"]).map(|v| v as f32);
     if gain.is_none() && headers.contains_key("EGAIN") {
         warnings.push(
-            "EGAIN describe e-/ADU y no sustituye el gain de captura; falta GAIN/CAM-GAIN"
-                .into(),
+            "EGAIN describe e-/ADU y no sustituye el gain de captura; falta GAIN/CAM-GAIN".into(),
         );
     }
     let iso = first_u32(headers, &["ISOSPEED", "ISO", "ISO_SPEED"]);
-    let offset = first_number(
-        headers,
-        &["OFFSET", "BLKLEVEL", "BLACKLEV", "CAM-OFFS"],
-    )
-    .map(|v| v as f32);
-    let temperature_c = first_number(
-        headers,
-        &["CCD-TEMP", "CCDTEMP", "SENSOR_TEMP", "SET-TEMP"],
-    )
-    .map(|v| v as f32);
+    let offset =
+        first_number(headers, &["OFFSET", "BLKLEVEL", "BLACKLEV", "CAM-OFFS"]).map(|v| v as f32);
+    let temperature_c = first_number(headers, &["CCD-TEMP", "CCDTEMP", "SENSOR_TEMP", "SET-TEMP"])
+        .map(|v| v as f32);
     let exposure_seconds = first_number(headers, &["EXPTIME", "EXPOSURE", "EXP_TIME"]);
 
     let pair = first(headers, &["BINNING", "CCDBIN"]).and_then(parse_binning_pair);
@@ -268,8 +316,8 @@ pub(crate) fn signature_from_headers(
         }
     };
 
-    let cfa_pattern = first(headers, &["BAYERPAT", "BAYERPATN", "CFAPAT", "CFA"])
-        .and_then(normalize_cfa_pattern);
+    let cfa_pattern =
+        first(headers, &["BAYERPAT", "BAYERPATN", "CFAPAT", "CFA"]).and_then(normalize_cfa_pattern);
     let cfa_header_present = first(headers, &["BAYERPAT", "BAYERPATN", "CFAPAT", "CFA"]).is_some();
     if cfa_header_present && cfa_pattern.is_none() {
         warnings.push("patrón CFA no reconocido; sólo RGGB/GRBG/GBRG/BGGR son válidos".into());
@@ -371,7 +419,10 @@ pub(crate) fn missing_required_signature_fields(
             missing.push(label);
         }
     };
-    required(signature.gain.is_some() || signature.iso.is_some(), "gainOrIso");
+    required(
+        signature.gain.is_some() || signature.iso.is_some(),
+        "gainOrIso",
+    );
     required(signature.offset.is_some(), "offset");
     required(signature.binning_x.is_some(), "binningX");
     required(signature.binning_y.is_some(), "binningY");
@@ -457,11 +508,9 @@ mod tests {
         // ds_session_night_id, que agrupa los flats por noche).
         assert_eq!(out.signature.session.as_deref(), Some("2026-07-18"));
         assert!(matches!(out.layout, Some(StoreLayout::Mono)));
-        assert!(missing_required_signature_fields(
-            &out.signature,
-            CalibrationRole::Dark
-        )
-        .is_empty());
+        assert!(
+            missing_required_signature_fields(&out.signature, CalibrationRole::Dark).is_empty()
+        );
     }
 
     #[test]
@@ -594,15 +643,11 @@ mod tests {
         assert_eq!(out.signature.roi, Some([20, 10, 2000, 1500]));
         assert_eq!(out.signature.white_level_adu, Some(60000.0));
         assert_eq!(out.signature.gain, None);
-        assert!(out
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("EGAIN")));
-        assert!(missing_required_signature_fields(
-            &out.signature,
-            CalibrationRole::Dark
-        )
-        .contains(&"gainOrIso"));
+        assert!(out.warnings.iter().any(|warning| warning.contains("EGAIN")));
+        assert!(
+            missing_required_signature_fields(&out.signature, CalibrationRole::Dark)
+                .contains(&"gainOrIso")
+        );
     }
 
     #[test]

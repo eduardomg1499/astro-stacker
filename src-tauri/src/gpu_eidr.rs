@@ -240,7 +240,12 @@ struct EidrParams {
     mode: [u32; 4],
 }
 
-fn make_buffer(dev: &wgpu::Device, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
+fn make_buffer(
+    dev: &wgpu::Device,
+    label: &str,
+    bytes: &[u8],
+    usage: wgpu::BufferUsages,
+) -> wgpu::Buffer {
     use wgpu::util::DeviceExt;
     dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(label),
@@ -271,7 +276,13 @@ fn parity_mask(cfa: Option<i32>, c: usize) -> u32 {
 /// (canal + subconjunto de frames fijos). Buffers estáticos por frame (LUT,
 /// máscara, pesos, uniforms de apply/adjoint) + z/tmp/out reutilizados.
 pub(crate) struct EidrGpuMatvec {
-    frames: Vec<(EidrParams, EidrParams, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)>,
+    frames: Vec<(
+        EidrParams,
+        EidrParams,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+    )>,
     z_buf: wgpu::Buffer,
     tmp_buf: wgpu::Buffer,
     out_buf: wgpu::Buffer,
@@ -286,10 +297,11 @@ impl EidrGpuMatvec {
     /// científicamente distinto del CPU, por lo que el caller debe hacer
     /// fallback explícito a CPU hasta implementar ese buffer en GPU.
     pub(crate) fn new(op: &EidrOperator, idxs: &[usize], c: usize) -> Option<Self> {
-        if idxs
-            .iter()
-            .any(|&fi| op.frames.get(fi).map_or(true, |frame| frame.has_spatial_inv_var()))
-        {
+        if idxs.iter().any(|&fi| {
+            op.frames
+                .get(fi)
+                .map_or(true, |frame| frame.has_spatial_inv_var())
+        }) {
             return None;
         }
         let rt = gpu_runtime()?;
@@ -313,9 +325,24 @@ impl EidrGpuMatvec {
             let (lut_data, lut_n, lut_radius, lut_inv_step) = f.lut.raw();
             let lut_center = (lut_n as f32 - 1.0) * 0.5;
             let base = EidrParams {
-                fa: [g.f0[0] as f32, g.f0[1] as f32, g.fx[0] as f32, g.fx[1] as f32],
-                fb: [g.fy[0] as f32, g.fy[1] as f32, g.g0[0] as f32, g.g0[1] as f32],
-                fc: [g.gx[0] as f32, g.gx[1] as f32, g.gy[0] as f32, g.gy[1] as f32],
+                fa: [
+                    g.f0[0] as f32,
+                    g.f0[1] as f32,
+                    g.fx[0] as f32,
+                    g.fx[1] as f32,
+                ],
+                fb: [
+                    g.fy[0] as f32,
+                    g.fy[1] as f32,
+                    g.g0[0] as f32,
+                    g.g0[1] as f32,
+                ],
+                fc: [
+                    g.gx[0] as f32,
+                    g.gx[1] as f32,
+                    g.gy[0] as f32,
+                    g.gy[1] as f32,
+                ],
                 dims: [f.w as u32, f.h as u32, op.w_out as u32, op.h_out as u32],
                 lutp: [
                     lut_center,
@@ -371,7 +398,9 @@ impl EidrGpuMatvec {
         let out_buf = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("zas-eidr-out"),
             size: out_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let read_buf = dev.create_buffer(&wgpu::BufferDescriptor {
@@ -421,12 +450,30 @@ impl EidrGpuMatvec {
                         label: Some("zas-eidr-bind"),
                         layout: &pipe.layout,
                         entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: lut_buf.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 2, resource: input.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 3, resource: output.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 4, resource: mask_buf.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 5, resource: rw_buf.as_entire_binding() },
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: params.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: lut_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: input.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: output.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: mask_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: rw_buf.as_entire_binding(),
+                            },
                         ],
                     })
                 };
@@ -484,7 +531,12 @@ impl EidrGpuMatvec {
 fn parity_op() -> EidrOperator {
     use crate::deepsky_psf::MoffatPsf;
     use crate::eidr::*;
-    let gamma = MoffatPsf { fwhm_x: 2.2, fwhm_y: 2.2, theta: 0.0, beta: 2.5 };
+    let gamma = MoffatPsf {
+        fwhm_x: 2.2,
+        fwhm_y: 2.2,
+        theta: 0.0,
+        beta: 2.5,
+    };
     let frames = [
         (0.0f32, (0.0f32, 0.0f32)),
         (0.12, (0.4, -0.7)),
@@ -496,7 +548,12 @@ fn parity_op() -> EidrOperator {
         let t = crate::DsTransform::from_similarity((cs, sn, dx, dy));
         let geom = eidr_geom(&t, 2.0).expect("similitud");
         let lut = eidr_build_lut(
-            Some(MoffatPsf { fwhm_x: 2.0, fwhm_y: 1.9, theta: 0.2, beta: 2.4 }),
+            Some(MoffatPsf {
+                fwhm_x: 2.0,
+                fwhm_y: 1.9,
+                theta: 0.2,
+                beta: 2.4,
+            }),
             gamma,
             &geom,
         );
@@ -512,7 +569,13 @@ fn parity_op() -> EidrOperator {
         }
     })
     .collect();
-    EidrOperator { frames, w_out: 96, h_out: 80, cfa: None, ch: 1 }
+    EidrOperator {
+        frames,
+        w_out: 96,
+        h_out: 80,
+        cfa: None,
+        ch: 1,
+    }
 }
 
 /// Paridad CPU/GPU del matvec sobre un caso sintético pequeño, cacheada: el
@@ -531,7 +594,9 @@ pub(crate) fn ensure_eidr_parity() -> bool {
         let mut state = 0x1234_5678u64;
         let p_in: Vec<f32> = (0..n)
             .map(|_| {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((state >> 33) as f64 / (u32::MAX as f64) * 2000.0 - 1000.0) as f32
             })
             .collect();
@@ -565,7 +630,12 @@ mod tests {
     use crate::eidr::*;
 
     fn tiny_op() -> EidrOperator {
-        let gamma = MoffatPsf { fwhm_x: 2.2, fwhm_y: 2.2, theta: 0.0, beta: 2.5 };
+        let gamma = MoffatPsf {
+            fwhm_x: 2.2,
+            fwhm_y: 2.2,
+            theta: 0.0,
+            beta: 2.5,
+        };
         let frames = [
             (0.0f32, (0.0f32, 0.0f32)),
             (0.12, (0.4, -0.7)),
@@ -577,7 +647,12 @@ mod tests {
             let t = crate::DsTransform::from_similarity((c, s, dx, dy));
             let geom = eidr_geom(&t, 2.0).unwrap();
             let lut = eidr_build_lut(
-                Some(MoffatPsf { fwhm_x: 2.0, fwhm_y: 1.9, theta: 0.2, beta: 2.4 }),
+                Some(MoffatPsf {
+                    fwhm_x: 2.0,
+                    fwhm_y: 1.9,
+                    theta: 0.2,
+                    beta: 2.4,
+                }),
                 gamma,
                 &geom,
             );
@@ -593,23 +668,22 @@ mod tests {
             }
         })
         .collect();
-        EidrOperator { frames, w_out: 96, h_out: 80, cfa: None, ch: 1 }
+        EidrOperator {
+            frames,
+            w_out: 96,
+            h_out: 80,
+            cfa: None,
+            ch: 1,
+        }
     }
 
     #[test]
     fn gpu_matvec_rejects_spatial_inverse_variance_before_runtime_probe() {
         let mut op = tiny_op();
         let (w, h) = (op.frames[0].w, op.frames[0].h);
-        let spatial = EidrSpatialInvVar::new(
-            EidrInvVarLayout::Mono,
-            vec![1.0; w * h],
-            w,
-            h,
-        )
-        .unwrap();
-        op.frames[0]
-            .set_spatial_inv_var(Some(spatial))
-            .unwrap();
+        let spatial =
+            EidrSpatialInvVar::new(EidrInvVarLayout::Mono, vec![1.0; w * h], w, h).unwrap();
+        op.frames[0].set_spatial_inv_var(Some(spatial)).unwrap();
         assert!(
             EidrGpuMatvec::new(&op, &(0..op.frames.len()).collect::<Vec<_>>(), 0).is_none(),
             "GPU no debe aceptar un operador cuya Sigma^-1 espacial no puede representar"

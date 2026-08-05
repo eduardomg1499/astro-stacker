@@ -273,9 +273,7 @@ fn atrous_smooth_tiled(
             for x in 0..w {
                 let mut acc = 0.0f32;
                 for (tap, &kernel) in B3.iter().enumerate() {
-                    let scratch_y = (centre as isize
-                        + (tap as isize - 2) * step as isize)
-                        as usize;
+                    let scratch_y = (centre as isize + (tap as isize - 2) * step as isize) as usize;
                     acc += kernel * horizontal[scratch_y * w + x];
                 }
                 out[output_y * w + x] = acc;
@@ -405,7 +403,7 @@ fn bh_fdr_pcut(pvals: &mut [f64], q: f64) -> f64 {
     if pvals.is_empty() {
         return 0.0;
     }
-    pvals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    pvals.sort_by(|a, b| a.total_cmp(b));
     let m = pvals.len() as f64;
     let mut cut = 0.0f64;
     for (i, &p) in pvals.iter().enumerate() {
@@ -425,7 +423,7 @@ fn bh_fdr_zcut(z_abs: &mut [f32], q: f64) -> f32 {
     if z_abs.is_empty() {
         return f32::INFINITY;
     }
-    z_abs.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    z_abs.sort_by(|a, b| b.total_cmp(a));
     let m = z_abs.len() as f64;
     let mut cut = f32::INFINITY;
     for (i, &z) in z_abs.iter().enumerate() {
@@ -727,8 +725,7 @@ mod tests {
             .collect();
         let expected =
             build_struct_pyramid_reference(&full, &half_a, &half_b, w, h, 1.0, 1.0, 0.01, 2.5);
-        let actual =
-            build_struct(&full, &half_a, &half_b, w, h, 1.0, 1.0, 0.01, 2.5).unwrap();
+        let actual = build_struct(&full, &half_a, &half_b, w, h, 1.0, 1.0, 0.01, 2.5).unwrap();
         assert_eq!(actual.levels, expected.levels);
         assert_eq!(actual.accepted_per_level, expected.accepted_per_level);
         for p in 0..npx {
@@ -893,10 +890,7 @@ mod tests {
         assert!(streaming_bytes < 2_200 * 1_048_576);
         {
             let _budget = override_test_memory_budget(2_200 * 1_048_576);
-            assert_eq!(
-                validate_build_memory_budget(w, h).unwrap(),
-                streaming_bytes
-            );
+            assert_eq!(validate_build_memory_budget(w, h).unwrap(), streaming_bytes);
         }
         // Limitación cuantificada: las sumas split-half RGB de NebulaFusion
         // siguen dominando el preflight completo aunque el build STRUCT ya quepa.

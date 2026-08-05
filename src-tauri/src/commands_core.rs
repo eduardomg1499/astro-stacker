@@ -144,6 +144,12 @@ fn is_planetary_batch_output_dir(path: &Path) -> bool {
     path.join(PLANETARY_BATCH_OUTPUT_MARKER).is_file()
 }
 
+fn is_macos_appledouble_sidecar(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| name.to_string_lossy().starts_with("._"))
+        .unwrap_or(false)
+}
+
 fn scan_video_directory(root: &Path, recursive: bool) -> std::io::Result<Vec<String>> {
     fn visit_dirs(dir: &Path, files: &mut Vec<String>, recursive: bool) -> std::io::Result<()> {
         if !dir.is_dir() || is_planetary_batch_output_dir(dir) {
@@ -152,6 +158,12 @@ fn scan_video_directory(root: &Path, recursive: bool) -> std::io::Result<Vec<Str
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
+            // External drives commonly materialize macOS extended attributes as
+            // AppleDouble files (for example `._capture.ser`). Their extension
+            // matches the real video, but their contents are metadata, not frames.
+            if is_macos_appledouble_sidecar(&path) {
+                continue;
+            }
             if path.is_dir() {
                 if recursive && !is_planetary_batch_output_dir(&path) {
                     visit_dirs(&path, files, recursive)?;
@@ -1279,6 +1291,21 @@ mod batch_output_tests {
 
         let root_only = scan_video_directory(root.path(), false).expect("scan raíz");
         assert_eq!(root_only, vec![root.path().join("capture.ser").display().to_string()]);
+    }
+
+    #[test]
+    fn scan_ignores_macos_appledouble_video_sidecars() {
+        let root = TestRoot::new("scan-appledouble");
+        let source = write_source(&root.path().join("capture.ser"));
+        let nested_source = write_source(&root.path().join("inputs").join("capture.avi"));
+        write_source(&root.path().join("._capture.ser"));
+        write_source(&root.path().join("inputs").join("._capture.avi"));
+
+        let root_only = scan_video_directory(root.path(), false).expect("scan raíz");
+        assert_eq!(root_only, vec![source.clone()]);
+
+        let recursive = scan_video_directory(root.path(), true).expect("scan recursivo");
+        assert_eq!(recursive, vec![source, nested_source]);
     }
 
     #[test]
@@ -7620,6 +7647,149 @@ fn derot_load_rgb16_image(path: &str) -> Result<(Vec<u16>, usize, usize), String
     Ok((rgb.into_raw(), w as usize, h as usize))
 }
 
+fn load_fits_rgb16_image(path_str: &str) -> Result<(Vec<u16>, usize, usize), String> {
+    let fits = fitrs::Fits::open(path_str).map_err(|e| format!("Error abriendo FITS: {:?}", e))?;
+    let hdu = fits.iter().next().ok_or("FITS sin HDU primario".to_string())?;
+
+    let (shape, floats): (Vec<usize>, Vec<f32>) = match hdu.read_data() {
+        fitrs::FitsData::FloatingPoint32(arr) => (arr.shape, arr.data),
+        fitrs::FitsData::FloatingPoint64(arr) => (arr.shape, arr.data.iter().map(|&v| v as f32).collect()),
+        fitrs::FitsData::IntegersI32(arr) => (arr.shape, arr.data.iter().map(|v| v.map_or(0.0, |val| val as f32)).collect()),
+        fitrs::FitsData::IntegersU32(arr) => (arr.shape, arr.data.iter().map(|v| v.map_or(0.0, |val| val as f32)).collect()),
+        _ => return Err("Formato de datos FITS no numérico".into()),
+    };
+
+    if shape.len() < 2 {
+        return Err("Geometría de FITS no válida".into());
+    }
+
+    let (w, h, channels) = if shape.len() == 2 {
+        (shape[1], shape[0], 1)
+    } else if shape.len() == 3 {
+        if shape[0] == 3 || shape[0] == 1 {
+            (shape[2], shape[1], shape[0])
+        } else {
+            (shape[1], shape[0], shape[2])
+        }
+    } else {
+        return Err("FITS dimensión > 3 no soportada".into());
+    };
+
+    if w == 0 || h == 0 || floats.is_empty() {
+        return Err("FITS sin píxeles válidos".into());
+    }
+
+    let (min_val, max_val) = floats.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &val| {
+        if val.is_finite() { (lo.min(val), hi.max(val)) } else { (lo, hi) }
+    });
+
+    let scale = if (max_val - min_val) > 1e-6 {
+        65535.0 / (max_val - min_val)
+    } else {
+        1.0
+    };
+
+    let u16_samples: Vec<u16> = floats.iter().map(|&v| {
+        if !v.is_finite() { 0 }
+        else if max_val > 65535.0 || max_val <= 1.0 {
+            ((v - min_val) * scale).clamp(0.0, 65535.0) as u16
+        } else {
+            v.clamp(0.0, 65535.0) as u16
+        }
+    }).collect();
+
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    if channels == 1 {
+        for &sample in &u16_samples {
+            rgb.push(sample);
+            rgb.push(sample);
+            rgb.push(sample);
+        }
+    } else if channels >= 3 {
+        let plane_size = w * h;
+        if u16_samples.len() >= plane_size * 3 {
+            for i in 0..plane_size {
+                rgb.push(u16_samples[i]);
+                rgb.push(u16_samples[plane_size + i]);
+                rgb.push(u16_samples[plane_size * 2 + i]);
+            }
+        } else {
+            return Err("Buffer de canal FITS incompleto".into());
+        }
+    } else {
+        return Err("Canales FITS no soportados".into());
+    }
+
+    Ok((rgb, w, h))
+}
+
+fn load_any_rgb16_image(path_str: &str) -> Result<(Vec<u16>, usize, usize), String> {
+    let path = Path::new(path_str);
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if matches!(ext.as_str(), "fits" | "fit" | "fts") {
+        if let Ok((data, w, h)) = load_fits_rgb16_image(path_str) {
+            return Ok((data, w, h));
+        }
+    }
+
+    match image::open(path_str) {
+        Ok(img) => {
+            let rgb = img.to_rgb16();
+            let (w, h) = rgb.dimensions();
+            Ok((rgb.into_raw(), w as usize, h as usize))
+        }
+        Err(e) => {
+            if matches!(ext.as_str(), "fits" | "fit" | "fts") {
+                load_fits_rgb16_image(path_str)
+            } else {
+                Err(format!("No se pudo abrir la imagen ({}): {}", path_str, e))
+            }
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadStackedImageResponse {
+    width: usize,
+    height: usize,
+    is_mono: bool,
+    path: String,
+}
+
+#[tauri::command]
+async fn load_stacked_image(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<LoadStackedImageResponse, String> {
+    let (rgb_data, width, height) = load_any_rgb16_image(&path)?;
+    let is_mono = rgb16_buffer_is_monochrome(&rgb_data);
+
+    let stack_result = StackResult {
+        data: rgb_data,
+        width,
+        height,
+        is_mono,
+        is_surface: false,
+    };
+
+    let _generation = state.result_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    *state.stacked_image.lock().unwrap_or_else(|e| e.into_inner()) = Some(stack_result);
+    *state.processed_image.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+    Ok(LoadStackedImageResponse {
+        width,
+        height,
+        is_mono,
+        path,
+    })
+}
+
 fn derot_rgb_to_mono(rgb: &[u16]) -> Vec<u16> {
     rgb.chunks_exact(3)
         .map(|px| {
@@ -12166,6 +12336,16 @@ fn clear_app_memory(state: tauri::State<'_, AppState>) {
             *state.batch_anchor_dims.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0);
         },
     );
+    *state.deep_sky_result.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    state
+        .deep_sky_products
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    *state
+        .deep_sky_active_product
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// R13: limpieza ligera POR ARCHIVO dentro de un lote. A diferencia de
@@ -12196,6 +12376,15 @@ fn clear_stack_memory(state: tauri::State<'_, AppState>) {
         },
     );
     *state.deep_sky_result.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    state
+        .deep_sky_products
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    *state
+        .deep_sky_active_product
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 #[tauri::command]
@@ -12280,6 +12469,7 @@ fn main() {
                 let default_hook = std::panic::take_hook();
                 std::panic::set_hook(Box::new(move |info| {
                     let msg = info.to_string();
+                    let backtrace = std::backtrace::Backtrace::force_capture();
                     if let Some(parent) = crash_log.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
@@ -12289,7 +12479,13 @@ fn main() {
                         .open(&crash_log)
                     {
                         use std::io::Write;
-                        let _ = writeln!(f, "[{}] {}", chrono::Utc::now().to_rfc3339(), msg);
+                        let _ = writeln!(
+                            f,
+                            "[{}] {}\n{}",
+                            chrono::Utc::now().to_rfc3339(),
+                            msg,
+                            backtrace
+                        );
                     }
                     let _ = handle.emit("backend_panic", msg.clone());
                     default_hook(info);
@@ -12300,6 +12496,8 @@ fn main() {
             app.manage(AppState {
                 stacked_image: Mutex::new(None),
                 deep_sky_result: Mutex::new(None),
+                deep_sky_products: Mutex::new(std::collections::BTreeMap::new()),
+                deep_sky_active_product: Mutex::new(None),
                 processed_image: Mutex::new(None),
                 deconv_cache: Mutex::new(Vec::new()),
                 wavelet_cache: Mutex::new(Vec::new()),
@@ -12368,14 +12566,26 @@ fn main() {
             prepare_deepsky_stack,
             run_deepsky_stack,
             deepsky_cancel_job,
+            milky_way::detect_milky_way_sky_mask,
+            milky_way::analyze_milky_way_registration,
+            milky_way::prepare_milky_way_stack,
+            milky_way::run_milky_way_stack,
+            milky_way::cancel_milky_way_stack,
+            milky_way::crop_milky_way_products,
             deepsky_plan_dither,
             prepare_deepsky_session,
             run_deepsky_session,
             stack_deepsky,
             deepsky_probe,
+            detect_deepsky_comet,
+            fit_deepsky_comet_trajectory,
             inspect_deepsky_frames,
+            deepsky_browse_directories,
+            deepsky_create_directory,
+            deepsky_rename_directory,
             deepsky_scan_classify,
             deepsky_restretch,
+            deepsky_select_product,
             deepsky_frame_preview,
             deepsky_result_view,
             deepsky_export,
@@ -12384,6 +12594,34 @@ fn main() {
             deepsky_combine_channels,
             deepsky_split_channels,
             deepsky_dualband_hoo,
+            deepsky_studio_palette_gallery,
+            deepsky_studio_active_dualband_gallery,
+            deepsky_studio_apply_palette,
+            deepsky_annotations_preview,
+            deepsky_annotations_export,
+            deepsky_poststack_apply_crop,
+            deepsky_poststack_apply_gradient,
+            deepsky_poststack_analyze,
+            deepsky_poststack_analyze_psf,
+            deepsky_poststack_apply_deconvolution,
+            deepsky_poststack_separate_stars,
+            deepsky_poststack_adjust_stars,
+            deepsky_poststack_recombine,
+            deepsky_poststack_layer_preview,
+            deepsky_poststack_apply_dualband,
+            deepsky_poststack_apply_denoise,
+            deepsky_poststack_apply_stretch,
+            deepsky_poststack_apply_curves,
+            deepsky_poststack_apply_detail,
+            deepsky_poststack_apply_finish,
+            deepsky_poststack_load_master,
+            deepsky_poststack_state,
+            deepsky_poststack_undo,
+            deepsky_poststack_redo,
+            deepsky_poststack_reset,
+            deepsky_poststack_source_preview,
+            solve_deepsky_astrometry,
+            pcc_gaia_calibrate,
             spcc_calibrate,
             check_license_status,
             activate_pro_license,
@@ -12404,6 +12642,7 @@ fn main() {
             zas_stack_video_elite,          // Zenith Elite V4
             clear_app_memory,
             clear_stack_memory,
+            load_stacked_image,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

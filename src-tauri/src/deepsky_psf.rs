@@ -665,9 +665,10 @@ pub(crate) fn fit_frame_psf(
             continue;
         }
         // Aislamiento: sin vecina a < 10 px en TODA la lista de entrada.
-        let aislada = stars.iter().enumerate().all(|(k, &(x2, y2, _))| {
-            k == i || (x - x2) * (x - x2) + (y - y2) * (y - y2) >= 100.0
-        });
+        let aislada = stars
+            .iter()
+            .enumerate()
+            .all(|(k, &(x2, y2, _))| k == i || (x - x2) * (x - x2) + (y - y2) * (y - y2) >= 100.0);
         if !aislada {
             continue;
         }
@@ -696,7 +697,11 @@ pub(crate) fn fit_frame_psf(
         .filter_map(|&(x, y, _)| ajusta_estrella(luma, w, h, x, y, None).map(|e| e.beta))
         .collect();
     // 2.5 de reserva si ninguna converge con beta libre (valor típico de seeing).
-    let beta_frame = if betas.is_empty() { 2.5 } else { mediana(&mut betas) };
+    let beta_frame = if betas.is_empty() {
+        2.5
+    } else {
+        mediana(&mut betas)
+    };
 
     // 3. Etapa B: todas las candidatas con beta fijo.
     let ajustadas: Vec<EstrellaAjustada> = candidatas
@@ -768,7 +773,10 @@ pub(crate) fn fit_frame_psf(
 /// beta <= 1.05 se satura a 1.05 (mantiene la integral finita y evita alas
 /// patológicas); FWHM <= 0 se satura a 0.1 px.
 pub(crate) fn rasterize_psf(psf: &MoffatPsf, size: usize) -> Vec<f32> {
-    assert!(size % 2 == 1 && size > 0, "rasterize_psf: size debe ser impar");
+    assert!(
+        size % 2 == 1 && size > 0,
+        "rasterize_psf: size debe ser impar"
+    );
     const SS: usize = 4;
     let beta = (psf.beta as f64).max(1.05);
     let ax = alfa_de_fwhm((psf.fwhm_x as f64).max(0.1), beta);
@@ -869,7 +877,12 @@ mod tests {
             color: [1.0, 1.0, 1.0],
             stars,
         };
-        let exp = SimExposure { exposure_s: 60.0, dx: 0.0, dy: 0.0, seed };
+        let exp = SimExposure {
+            exposure_s: 60.0,
+            dx: 0.0,
+            dy: 0.0,
+            seed,
+        };
         render_light(&scene, &sensor_base(), &exp).0
     }
 
@@ -911,8 +924,7 @@ mod tests {
             "detector: solo {} estrellas de 40",
             detectadas.len()
         );
-        let (fp, rep) =
-            fit_frame_psf(&luma, w, h, &detectadas, 0.2).expect("ajuste PSF del frame");
+        let (fp, rep) = fit_frame_psf(&luma, w, h, &detectadas, 0.2).expect("ajuste PSF del frame");
         let fwhm = fp.base.fwhm_mean();
         let err = ((fwhm - 3.2) / 3.2).abs();
         assert!(
@@ -927,7 +939,11 @@ mod tests {
             fp.base.fwhm_x,
             fp.base.fwhm_y
         );
-        assert!(rep.stars_used >= 20, "censo usado {} demasiado bajo", rep.stars_used);
+        assert!(
+            rep.stars_used >= 20,
+            "censo usado {} demasiado bajo",
+            rep.stars_used
+        );
     }
 
     /// 2. Campo espacial: FWHM crece linealmente 2.6 -> 3.8 px de izquierda a
@@ -954,8 +970,7 @@ mod tests {
             "detector: solo {} estrellas de 50",
             detectadas.len()
         );
-        let (fp, rep) =
-            fit_frame_psf(&luma, w, h, &detectadas, 0.2).expect("ajuste PSF del frame");
+        let (fp, rep) = fit_frame_psf(&luma, w, h, &detectadas, 0.2).expect("ajuste PSF del frame");
         assert!(
             rep.spatial_order >= 1,
             "con ~50 estrellas el campo debe ser al menos Linear (orden {})",
@@ -979,7 +994,11 @@ mod tests {
         let detectadas = crate::ds_detect_stars(&luma, w, h, 120);
         let (_fp, rep) =
             fit_frame_psf(&luma, w, h, &detectadas, 0.2).expect("ajuste PSF del frame");
-        assert!(rep.stars_holdout >= 4, "holdout de {} estrellas", rep.stars_holdout);
+        assert!(
+            rep.stars_holdout >= 4,
+            "holdout de {} estrellas",
+            rep.stars_holdout
+        );
         assert!(
             rep.holdout_fwhm_bias.abs() < 0.03,
             "sesgo de FWHM en holdout {:.4}",
@@ -1017,8 +1036,18 @@ mod tests {
     #[test]
     fn test_rasterize_psf_normalized() {
         for psf in [
-            MoffatPsf { fwhm_x: 3.0, fwhm_y: 3.0, theta: 0.0, beta: 2.5 },
-            MoffatPsf { fwhm_x: 4.0, fwhm_y: 2.2, theta: 0.0, beta: 3.0 },
+            MoffatPsf {
+                fwhm_x: 3.0,
+                fwhm_y: 3.0,
+                theta: 0.0,
+                beta: 2.5,
+            },
+            MoffatPsf {
+                fwhm_x: 4.0,
+                fwhm_y: 2.2,
+                theta: 0.0,
+                beta: 3.0,
+            },
         ] {
             let size = 21usize;
             let g = rasterize_psf(&psf, size);
@@ -1031,7 +1060,11 @@ mod tests {
                 .enumerate()
                 .max_by(|a, b| a.1.total_cmp(b.1))
                 .unwrap();
-            assert_eq!(imax, centro * size + centro, "el pico debe estar en el centro");
+            assert_eq!(
+                imax,
+                centro * size + centro,
+                "el pico debe estar en el centro"
+            );
             // Simetría especular en x y en y (theta = 0).
             for py in 0..size {
                 for px in 0..size {
@@ -1053,7 +1086,12 @@ mod tests {
             assert!((fwhm_de_alfa(a, beta) - 3.2).abs() < 1e-12);
         }
         // beta por debajo del tope: no debe producir NaN y sigue normalizado.
-        let psf = MoffatPsf { fwhm_x: 3.0, fwhm_y: 3.0, theta: 0.0, beta: 0.8 };
+        let psf = MoffatPsf {
+            fwhm_x: 3.0,
+            fwhm_y: 3.0,
+            theta: 0.0,
+            beta: 0.8,
+        };
         let g = rasterize_psf(&psf, 15);
         assert!(g.iter().all(|v| v.is_finite()));
         let suma: f64 = g.iter().map(|&v| v as f64).sum();

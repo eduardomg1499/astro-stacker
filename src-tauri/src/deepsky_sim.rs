@@ -142,11 +142,24 @@ impl Psf {
             // Radio que encierra >= 99.9 % del flujo:
             // fracción fuera de r = (1 + (r/alpha)^2)^(1-beta) = 1e-3.
             let r_max = alpha * ((1e-3f64).powf(-1.0 / (beta - 1.0)) - 1.0).sqrt();
-            (Psf::Moffat { amp, inv_a2: 1.0 / (alpha * alpha), beta }, r_max)
+            (
+                Psf::Moffat {
+                    amp,
+                    inv_a2: 1.0 / (alpha * alpha),
+                    beta,
+                },
+                r_max,
+            )
         } else {
             let sigma = fwhm / FWHM_A_SIGMA;
             let amp = star.flux_adu / (2.0 * std::f64::consts::PI * sigma * sigma);
-            (Psf::Gauss { amp, inv2s2: 1.0 / (2.0 * sigma * sigma) }, 5.0 * sigma)
+            (
+                Psf::Gauss {
+                    amp,
+                    inv2s2: 1.0 / (2.0 * sigma * sigma),
+                },
+                5.0 * sigma,
+            )
         }
     }
 
@@ -220,7 +233,9 @@ fn muestra_poisson(rng: &mut StdRng, lambda: f64) -> f64 {
             k += 1;
         }
     }
-    (lambda + muestra_normal(rng) * lambda.sqrt()).round().max(0.0)
+    (lambda + muestra_normal(rng) * lambda.sqrt())
+        .round()
+        .max(0.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -391,13 +406,11 @@ pub(crate) fn render_dark_with_pattern(
         let x = (i % w) as f64;
         let y = (i / w) as f64;
         let spatial = spatial_dark_adu_per_s.map_or(0.0, |pattern| pattern(x, y));
-        let lambda_e = (sensor.dark_adu_per_s + hot[i] + spatial).max(0.0)
-            * exposure_s
-            * gain;
+        let lambda_e = (sensor.dark_adu_per_s + hot[i] + spatial).max(0.0) * exposure_s * gain;
         let shot_e = muestra_poisson(&mut rng, lambda_e);
         let lectura_e = muestra_normal(&mut rng) * sensor.read_noise_e;
-        out[i] = ((shot_e + lectura_e) / gain + sensor.bias_adu)
-            .clamp(0.0, sensor.full_well_adu) as f32;
+        out[i] =
+            ((shot_e + lectura_e) / gain + sensor.bias_adu).clamp(0.0, sensor.full_well_adu) as f32;
     }
     out
 }
@@ -445,10 +458,9 @@ pub(crate) fn render_flat_exposure(
                 nivel *= vg(px as f64, py as f64);
             }
             let i = py * w + px;
-            let spatial = spatial_dark_adu_per_s
-                .map_or(0.0, |pattern| pattern(px as f64, py as f64));
-            let thermal_adu =
-                (sensor.dark_adu_per_s + hot[i] + spatial).max(0.0) * exposure_s;
+            let spatial =
+                spatial_dark_adu_per_s.map_or(0.0, |pattern| pattern(px as f64, py as f64));
+            let thermal_adu = (sensor.dark_adu_per_s + hot[i] + spatial).max(0.0) * exposure_s;
             let lambda_e = (nivel.max(0.0) + thermal_adu) * gain;
             let shot_e = muestra_poisson(&mut rng, lambda_e);
             let lectura_e = muestra_normal(&mut rng) * sensor.read_noise_e;
@@ -493,7 +505,12 @@ mod tests {
     }
 
     fn exposicion(seed: u64, dx: f64, dy: f64) -> SimExposure {
-        SimExposure { exposure_s: 60.0, dx, dy, seed }
+        SimExposure {
+            exposure_s: 60.0,
+            dx,
+            dy,
+            seed,
+        }
     }
 
     /// 1. Fotometría de apertura sobre el render ideal (sin ruido): el flujo
@@ -546,7 +563,8 @@ mod tests {
         let mut suma2 = vec![0.0f64; w * h];
         let mut var_verdadera = vec![0.0f64; w * h];
         for s in 0..n {
-            let (frame, var) = render_light(&scene, &sensor, &exposicion(1000 + s as u64, 0.0, 0.0));
+            let (frame, var) =
+                render_light(&scene, &sensor, &exposicion(1000 + s as u64, 0.0, 0.0));
             if s == 0 {
                 var_verdadera = var;
             }
@@ -582,8 +600,7 @@ mod tests {
     fn sim_cfa_pattern_matches_ds_cfa_channel() {
         // Mapeo esperado, copiado (no llamado) de ds_cfa_channel:
         // cid -> (rx, ry) de la celda R en la matriz 2x2.
-        let esperado: [(i32, usize, usize); 4] =
-            [(8, 0, 0), (9, 1, 0), (10, 0, 1), (11, 1, 1)];
+        let esperado: [(i32, usize, usize); 4] = [(8, 0, 0), (9, 1, 0), (10, 0, 1), (11, 1, 1)];
         let (w, h) = (8usize, 8usize);
         for &(cid, rx, ry) in &esperado {
             let mut scene = escena_plana(w, h, 100.0);
@@ -647,7 +664,10 @@ mod tests {
         assert!(a != c, "semillas distintas deben dar frames distintos");
 
         // Tambien los frames de calibracion.
-        assert_eq!(render_bias(&sensor, 24, 24, 5), render_bias(&sensor, 24, 24, 5));
+        assert_eq!(
+            render_bias(&sensor, 24, 24, 5),
+            render_bias(&sensor, 24, 24, 5)
+        );
         assert_eq!(
             render_dark(&sensor, 24, 24, 60.0, 6),
             render_dark(&sensor, 24, 24, 60.0, 6)
@@ -802,8 +822,7 @@ mod tests {
             .zip(&dark_flat_mean)
             .map(|(flat, dark_flat)| flat - dark_flat)
             .collect();
-        let calibrated_delta =
-            column_mean(&calibrated, w - 1) - column_mean(&calibrated, 0);
+        let calibrated_delta = column_mean(&calibrated, w - 1) - column_mean(&calibrated, 0);
 
         assert!(
             bias_only_delta > 250.0,

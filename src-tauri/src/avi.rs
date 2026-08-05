@@ -809,6 +809,7 @@ mod tests {
         compression: [u8; 4],
         frame_chunk: [u8; 4],
         frame: &[u8],
+        identity_gray_palette: bool,
         wrap_in_rec: bool,
     ) -> Vec<u8> {
         let mut avih = vec![0u8; 56];
@@ -833,6 +834,13 @@ mod tests {
         strf[14..16].copy_from_slice(&bit_count.to_le_bytes());
         strf[16..20].copy_from_slice(&compression);
         strf[20..24].copy_from_slice(&(frame.len() as u32).to_le_bytes());
+        if identity_gray_palette {
+            assert_eq!(bit_count, 8, "la paleta de prueba requiere AVI de 8 bits");
+            strf[32..36].copy_from_slice(&256u32.to_le_bytes());
+            for value in 0..=255u8 {
+                strf.extend_from_slice(&[value, value, value, 0]);
+            }
+        }
 
         let mut stream_children = Vec::new();
         push_chunk(&mut stream_children, b"strh", &strh);
@@ -889,7 +897,17 @@ mod tests {
         let bottom = [10, 11, 12, 13, 14, 15, 0, 0];
         let top = [20, 21, 22, 23, 24, 25, 0, 0];
         let frame: Vec<u8> = bottom.into_iter().chain(top).collect();
-        let avi = make_avi(2, 2, 24, *b"DIB ", [0, 0, 0, 0], *b"00db", &frame, false);
+        let avi = make_avi(
+            2,
+            2,
+            24,
+            *b"DIB ",
+            [0, 0, 0, 0],
+            *b"00db",
+            &frame,
+            false,
+            false,
+        );
         let reader = open_bytes("bgr24", &avi).expect("raw BGR24 debe abrir");
 
         assert_eq!(reader.info.width, 2);
@@ -906,7 +924,9 @@ mod tests {
     #[test]
     fn accepts_verified_raw_bayer16() {
         let frame = [1, 0, 2, 0, 3, 0, 4, 0];
-        let avi = make_avi(2, -2, 16, *b"RGGB", *b"RGGB", *b"00db", &frame, false);
+        let avi = make_avi(
+            2, -2, 16, *b"RGGB", *b"RGGB", *b"00db", &frame, false, false,
+        );
         let reader = open_bytes("bayer16", &avi).expect("Bayer16 raw debe abrir");
 
         assert_eq!(reader.info.bytes_per_pixel, 2);
@@ -916,9 +936,34 @@ mod tests {
     }
 
     #[test]
+    fn accepts_verified_identity_gray_palette_as_manual_cfa_candidate() {
+        // SharpCap puede envolver RAW8 en un DIB de 8 bits cuya paleta es una
+        // rampa gris identidad. Los índices siguen siendo el mosaico original;
+        // clasificarlos como RGB impediría que el usuario indique RGGB.
+        let frame = [12, 34, 56, 78, 90, 123, 167, 201];
+        let avi = make_avi(
+            4,
+            -2,
+            8,
+            *b"raw ",
+            [0, 0, 0, 0],
+            *b"00db",
+            &frame,
+            true,
+            false,
+        );
+        let reader = open_bytes("gray-palette", &avi).expect("DIB gris RAW8 debe abrir");
+
+        assert_eq!(reader.info.bytes_per_pixel, 1);
+        assert_eq!(reader.info.sample_bits, 8);
+        assert_eq!(reader.info.color_id, 0);
+        assert_eq!(reader.get_frame(0, 8).as_ref(), frame);
+    }
+
+    #[test]
     fn rejects_compressed_or_unknown_fourcc_instead_of_treating_it_as_pixels() {
         for codec in [*b"H264", *b"MJPG", *b"XVID", *b"ZZZZ"] {
-            let avi = make_avi(2, 2, 24, codec, codec, *b"00dc", &[0u8; 16], false);
+            let avi = make_avi(2, 2, 24, codec, codec, *b"00dc", &[0u8; 16], false, false);
             let error = open_bytes("compressed", &avi).expect_err("codec debe rechazarse");
             assert!(
                 error.contains("no soportado") || error.contains("comprimido"),
@@ -940,6 +985,7 @@ mod tests {
             *b"00dc",
             &[0u8; 16],
             false,
+            false,
         );
         let error = open_bytes("dc", &avi).expect_err("##dc nunca debe pasar como raw");
         assert!(
@@ -959,6 +1005,7 @@ mod tests {
             *b"00db",
             &[0u8; 12],
             false,
+            false,
         );
         let error = open_bytes("bad-size", &avi).expect_err("stride invalido debe rechazarse");
         assert!(
@@ -969,7 +1016,17 @@ mod tests {
 
     #[test]
     fn rejects_list_rec_and_open_dml_avix() {
-        let rec = make_avi(2, 2, 24, *b"DIB ", [0, 0, 0, 0], *b"00db", &[0u8; 16], true);
+        let rec = make_avi(
+            2,
+            2,
+            24,
+            *b"DIB ",
+            [0, 0, 0, 0],
+            *b"00db",
+            &[0u8; 16],
+            false,
+            true,
+        );
         let error = open_bytes("rec", &rec).expect_err("LIST rec debe delegarse");
         assert!(
             error.contains("LIST rec") && error.contains("FFmpeg"),
@@ -984,6 +1041,7 @@ mod tests {
             [0, 0, 0, 0],
             *b"00db",
             &[0u8; 16],
+            false,
             false,
         );
         avix.extend_from_slice(b"RIFF\x04\x00\x00\x00AVIX");

@@ -509,9 +509,7 @@ pub fn capture_resource_snapshot(
     // CPU only no debe inicializar wgpu ni tocar un driver inestable. El
     // snapshot conserva CPU/RAM/FFmpeg y declara GPU no sondeada.
     let gpu = probe_gpu.then(crate::gpu_stack::gpu_info);
-    let runtime = probe_gpu
-        .then(crate::gpu_stack::gpu_runtime)
-        .flatten();
+    let runtime = probe_gpu.then(crate::gpu_stack::gpu_runtime).flatten();
     let (ram_total_mb, ram_available_mb) = resolved_available_ram_mb(&system);
     ResourceSnapshot {
         os: sysinfo::System::long_os_version().unwrap_or_else(|| std::env::consts::OS.into()),
@@ -1978,21 +1976,81 @@ mod tests {
 
         let base_key = calibration_key(&base, &resources(), PlanetaryStage::Decode);
         let mutations: Vec<(&str, WorkloadSignature)> = vec![
-            ("reader", { let mut v = base.clone(); v.reader = Some("other".into()); v }),
-            ("codec", { let mut v = base.clone(); v.codec = Some("prores".into()); v }),
-            ("pixelFormat", { let mut v = base.clone(); v.pixel_format = Some("p010le".into()); v }),
-            ("sampleBits", { let mut v = base.clone(); v.sample_bits = 14; v }),
-            ("CFA", { let mut v = base.clone(); v.cfa_pattern = Some("BGGR".into()); v }),
-            ("endian", { let mut v = base.clone(); v.byte_order = SampleByteOrder::BigEndian; v }),
-            ("resolution", { let mut v = base.clone(); v.width += 1; v }),
-            ("ROI", { let mut v = base.clone(); v.roi = Some([13, 14, 1_600, 900]); v }),
-            ("category", { let mut v = base.clone(); v.target_type = "surface".into(); v }),
-            ("frames", { let mut v = base.clone(); v.selected_frames += 1; v }),
-            ("AP", { let mut v = base.clone(); v.ap_count += 1; v }),
-            ("drizzle", { let mut v = base.clone(); v.drizzle = 3.0; v }),
-            ("doublePass", { let mut v = base.clone(); v.double_pass = false; v }),
-            ("colorRange", { let mut v = base.clone(); v.color_range = Some("full".into()); v }),
-            ("colorMatrix", { let mut v = base.clone(); v.color_matrix = Some("bt709".into()); v }),
+            ("reader", {
+                let mut v = base.clone();
+                v.reader = Some("other".into());
+                v
+            }),
+            ("codec", {
+                let mut v = base.clone();
+                v.codec = Some("prores".into());
+                v
+            }),
+            ("pixelFormat", {
+                let mut v = base.clone();
+                v.pixel_format = Some("p010le".into());
+                v
+            }),
+            ("sampleBits", {
+                let mut v = base.clone();
+                v.sample_bits = 14;
+                v
+            }),
+            ("CFA", {
+                let mut v = base.clone();
+                v.cfa_pattern = Some("BGGR".into());
+                v
+            }),
+            ("endian", {
+                let mut v = base.clone();
+                v.byte_order = SampleByteOrder::BigEndian;
+                v
+            }),
+            ("resolution", {
+                let mut v = base.clone();
+                v.width += 1;
+                v
+            }),
+            ("ROI", {
+                let mut v = base.clone();
+                v.roi = Some([13, 14, 1_600, 900]);
+                v
+            }),
+            ("category", {
+                let mut v = base.clone();
+                v.target_type = "surface".into();
+                v
+            }),
+            ("frames", {
+                let mut v = base.clone();
+                v.selected_frames += 1;
+                v
+            }),
+            ("AP", {
+                let mut v = base.clone();
+                v.ap_count += 1;
+                v
+            }),
+            ("drizzle", {
+                let mut v = base.clone();
+                v.drizzle = 3.0;
+                v
+            }),
+            ("doublePass", {
+                let mut v = base.clone();
+                v.double_pass = false;
+                v
+            }),
+            ("colorRange", {
+                let mut v = base.clone();
+                v.color_range = Some("full".into());
+                v
+            }),
+            ("colorMatrix", {
+                let mut v = base.clone();
+                v.color_matrix = Some("bt709".into());
+                v
+            }),
         ];
         for (label, changed) in mutations {
             assert_ne!(

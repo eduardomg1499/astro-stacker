@@ -8,8 +8,9 @@
 //      maxima with hot-pixel rejection, ajuste PSF y ranking por flujo.
 //   3. REGISTRATION  — RANSAC y selección automática similitud/afín/
 //      proyectiva/distorsión local, refinada y validada por RMS/inliers.
-//   4. INTEGRATION   — media ponderada, sigma iterativo, Winsorized y
-//      linear-fit GPU/CPU tiled; drizzle mono/RGB/CFA conserva cobertura.
+//   4. INTEGRATION   — media ponderada GPU/CPU cuando conserva paridad;
+//      sigma iterativo, Winsorized/linear-fit y drizzle permanecen CPU hasta
+//      publicar cobertura por canal y Σw² equivalentes.
 //   5. RESULTADO     — el máster científico queda LINEAL float32; STF/TIFF/PNG
 //      son vistas/exportaciones separadas.
 //
@@ -113,10 +114,7 @@ fn ds_bayer_id(hdu: &fitrs::Hdu) -> Option<i32> {
     let width = ds_hdr_num(hdu, "NAXIS1").unwrap_or(0.0).max(0.0) as usize;
     let height = ds_hdr_num(hdu, "NAXIS2").unwrap_or(0.0).max(0.0) as usize;
     let extraction = ds_signature_extraction_for_hdu(hdu, width, height, 1);
-    extraction
-        .layout
-        .as_ref()
-        .and_then(ds_bayer_id_from_layout)
+    extraction.layout.as_ref().and_then(ds_bayer_id_from_layout)
 }
 
 /// Convert a raw FITS integer to physical ADU applying the standard
@@ -295,7 +293,7 @@ fn ds_nonfinite_sample_count(data: &[f32]) -> usize {
 
 fn ds_read_image(path: &str) -> Result<DsImage, String> {
     let lower = path.to_lowercase();
-    if lower.ends_with(".fits") || lower.ends_with(".fit") {
+    if lower.ends_with(".fits") || lower.ends_with(".fit") || lower.ends_with(".fts") {
         let fits = fitrs::Fits::open(path).map_err(|e| format!("FITS open: {:?}", e))?;
         let hdu = fits.iter().next().ok_or("FITS sin HDU primario")?;
         // OSC cameras store a CFA mono plane + BAYERPAT — read it BEFORE the
@@ -320,7 +318,9 @@ fn ds_read_image(path: &str) -> Result<DsImage, String> {
                     arr.shape.clone(),
                     arr.data
                         .par_iter()
-                        .map(|value| ds_int_to_adu(value.expect("BLANK validado") as f64, bscale, bzero))
+                        .map(|value| {
+                            ds_int_to_adu(value.expect("BLANK validado") as f64, bscale, bzero)
+                        })
                         .collect(),
                 )
             }
@@ -335,7 +335,9 @@ fn ds_read_image(path: &str) -> Result<DsImage, String> {
                     arr.shape.clone(),
                     arr.data
                         .par_iter()
-                        .map(|value| ds_int_to_adu(value.expect("BLANK validado") as f64, bscale, bzero))
+                        .map(|value| {
+                            ds_int_to_adu(value.expect("BLANK validado") as f64, bscale, bzero)
+                        })
                         .collect(),
                 )
             }
@@ -533,6 +535,30 @@ fn ds_debayer_image(img: DsImage, cid: i32) -> DsImage {
                 [0.5 * (u + d), v, 0.5 * (l + r)]
             };
             rgb[o..o + 3].copy_from_slice(&px);
+        }
+    }
+    // Borde de 1 px: el pase interior (1..h−1 × 1..w−1) no tiene vecindario
+    // CFA completo en el marco. Dejarlo a 0.0 exacto inyectaba un "cielo
+    // negro perfecto" falso que el registro estelar y el modelo de fondo
+    // consumían como dato medido. Replicamos el píxel interior más cercano
+    // (clamp de coordenadas): sesgo local mínimo y nunca un valor fuera del
+    // rango real de la imagen. (w,h ≥ 4 garantizado por el early-return.)
+    for x in 0..img.w {
+        let xc = x.clamp(1, img.w - 2);
+        let top_src = (img.w + xc) * 3; // fila interior y=1
+        let bot_src = ((img.h - 2) * img.w + xc) * 3; // fila interior y=h−2
+        let top_dst = x * 3;
+        let bot_dst = ((img.h - 1) * img.w + x) * 3;
+        for k in 0..3 {
+            rgb[top_dst + k] = rgb[top_src + k];
+            rgb[bot_dst + k] = rgb[bot_src + k];
+        }
+    }
+    for y in 1..img.h - 1 {
+        let row = y * img.w * 3;
+        for k in 0..3 {
+            rgb[row + k] = rgb[row + 3 + k]; // x=0 ← x=1
+            rgb[row + (img.w - 1) * 3 + k] = rgb[row + (img.w - 2) * 3 + k]; // x=w−1 ← x=w−2
         }
     }
     DsImage {
@@ -785,9 +811,7 @@ fn ds_build_master_preprocessed(
     // exception. Work in bounded pixel tiles and keep mean only for very small
     // sample counts where a median has poor statistical efficiency.
     let use_robust_mean = n >= 5;
-    let robust = crate::deepsky_variance::combine_master_store_robust(
-        &store, n, npx, cancel,
-    )?;
+    let robust = crate::deepsky_variance::combine_master_store_robust(&store, n, npx, cancel)?;
 
     log_to_front(
         app,
@@ -1000,6 +1024,8 @@ struct DsFlatLinearityReport {
     /// Same interleaved sample layout as DsCalibrationMaster::dq.
     dq: Vec<u32>,
     white_level_adu: f32,
+    white_level_source: String,
+    white_level_inferred: bool,
     nonlinear_level_adu: f32,
     saturated_samples: usize,
     nonlinear_samples: usize,
@@ -1019,12 +1045,13 @@ impl DsFlatLinearityReport {
         let nonlinear_fraction = self.nonlinear_samples as f64 / total as f64;
         if saturated_fraction > 0.0001 || nonlinear_fraction > 0.001 {
             return Some(format!(
-                "flat saturado/no lineal: {} muestra(s) SATURATED ({:.4}%) y {} NONLINEAR ({:.4}%), white={:.3} ADU, inicio no lineal={:.3} ADU",
+                "flat saturado/no lineal: {} muestra(s) SATURATED ({:.4}%) y {} NONLINEAR ({:.4}%), white={:.3} ADU ({}), inicio no lineal={:.3} ADU",
                 self.saturated_samples,
                 saturated_fraction * 100.0,
                 self.nonlinear_samples,
                 nonlinear_fraction * 100.0,
                 self.white_level_adu,
+                self.white_level_source,
                 self.nonlinear_level_adu,
             ));
         }
@@ -1032,22 +1059,105 @@ impl DsFlatLinearityReport {
     }
 }
 
+fn ds_gcd_u32(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+/// Algunos drivers guardan un ADC de 12/14 bits desplazado a la izquierda en
+/// el contenedor FITS unsigned de 16 bits, pero N.I.N.A. no siempre escribe
+/// ADC_BITS/WHITELEV. El retículo entero demuestra ese caso sin adivinar por
+/// modelo de cámara: códigos múltiplos de 2^shift y valores por encima del
+/// máximo nativo prueban que el rango fue escalado al contenedor.
+fn ds_infer_shifted_flat_white_level(flat: &DsImage) -> Option<(f32, String)> {
+    if flat.data.len() < 512 {
+        return None;
+    }
+    let stride = (flat.data.len() / 250_000).max(1);
+    let mut quantum = 0u32;
+    let mut maximum = 0u32;
+    let mut sampled = 0usize;
+    for value in flat.data.iter().step_by(stride).copied() {
+        if !value.is_finite() || !(0.0..=65_535.0).contains(&value) {
+            return None;
+        }
+        let rounded = value.round();
+        if (value - rounded).abs() > 1.0e-3 {
+            return None;
+        }
+        let code = rounded as u32;
+        quantum = ds_gcd_u32(quantum, code);
+        maximum = maximum.max(code);
+        sampled += 1;
+        if quantum == 1 {
+            return None;
+        }
+    }
+    if sampled < 512 || quantum < 2 || quantum > 256 || !quantum.is_power_of_two() {
+        return None;
+    }
+    let shift = quantum.trailing_zeros();
+    let adc_bits = 16u32.checked_sub(shift)?;
+    if !(8..16).contains(&adc_bits) {
+        return None;
+    }
+    let native_white = (1u32 << adc_bits) - 1;
+    // Sin códigos por encima del rango nativo, los píxeles no demuestran si
+    // el ADC está alineado a la izquierda o simplemente subexpuesto.
+    if maximum <= native_white {
+        return None;
+    }
+    let stored_white = native_white.checked_mul(quantum)?;
+    if maximum > stored_white {
+        return None;
+    }
+    Some((
+        stored_white as f32,
+        format!("cuantización medida: ADC {adc_bits}-bit << {shift}"),
+    ))
+}
+
 fn ds_effective_white_level_adu(
+    flat: &DsImage,
     signature: &pipeline::CalibrationSignature,
-) -> Result<f32, String> {
+) -> Result<(f32, String, bool), String> {
     if let Some(value) = signature.white_level_adu {
         if value.is_finite() && value > 1.0 {
-            return Ok(value);
+            return Ok((value, "cabecera whiteLevelAdu".into(), false));
         }
         return Err("whiteLevelAdu inválido para validar el flat".into());
     }
-    let bits = signature
-        .adc_bits
-        .ok_or("faltan whiteLevelAdu y adcBits para validar saturación del flat")?;
-    if bits == 0 || bits > 31 {
-        return Err(format!("adcBits={bits} fuera de rango para validar el flat"));
+    let shifted = ds_infer_shifted_flat_white_level(flat);
+    if let Some(bits) = signature.adc_bits {
+        if bits == 0 || bits > 31 {
+            return Err(format!(
+                "adcBits={bits} fuera de rango para validar el flat"
+            ));
+        }
+        if let Some((white, source)) = shifted {
+            // La etiqueta contiene la evidencia legible; si ADC_BITS fue
+            // declarado, aceptar el rango almacenado sólo cuando coincide.
+            if source.contains(&format!("ADC {bits}-bit")) {
+                return Ok((white, source, true));
+            }
+        }
+        return Ok((
+            ((1u64 << bits) - 1) as f32,
+            format!("cabecera adcBits={bits}"),
+            false,
+        ));
     }
-    Ok(((1u64 << bits) - 1) as f32)
+    if let Some((white, source)) = shifted {
+        return Ok((white, source, true));
+    }
+    Err(
+        "faltan whiteLevelAdu y adcBits; la cuantización de los píxeles tampoco demuestra un ADC desplazado para validar saturación del flat"
+            .into(),
+    )
 }
 
 /// Marks detector samples that cannot define a linear multiplicative flat.
@@ -1057,7 +1167,8 @@ fn ds_flat_linearity_report(
     flat: &DsImage,
     signature: &pipeline::CalibrationSignature,
 ) -> Result<DsFlatLinearityReport, String> {
-    let white = ds_effective_white_level_adu(signature)?;
+    let (white, white_level_source, white_level_inferred) =
+        ds_effective_white_level_adu(flat, signature)?;
     let nonlinear = white * 0.90;
     let saturation_floor = (white - 0.5).max(nonlinear);
     let mut dq = vec![0u32; flat.data.len()];
@@ -1077,6 +1188,8 @@ fn ds_flat_linearity_report(
     Ok(DsFlatLinearityReport {
         dq,
         white_level_adu: white,
+        white_level_source,
+        white_level_inferred,
         nonlinear_level_adu: nonlinear,
         saturated_samples,
         nonlinear_samples,
@@ -1172,9 +1285,7 @@ fn ds_validate_flat_pedestal_policy(
     }
     match crate::deepsky_calibration_contract::validate_flat_pedestal(inputs) {
         Ok(_) => Ok(()),
-        Err(reason) if matches!(policy, pipeline::DeepSkyCalibrationPolicy::Strict) => {
-            Err(reason)
-        }
+        Err(reason) if matches!(policy, pipeline::DeepSkyCalibrationPolicy::Strict) => Err(reason),
         Err(reason) => {
             log_to_front(
                 app,
@@ -1380,6 +1491,7 @@ fn ds_build_calibrated_flat_master(
     // evolve back to parallel acceptance).  A mutex keeps the accumulated
     // input quality plane deterministic without weakening the callback API.
     let flat_input_dq = std::sync::Mutex::new(None::<Vec<u32>>);
+    let inferred_white_level_logged = std::sync::atomic::AtomicBool::new(false);
     let preprocess = |path: &str, flat: &mut DsImage| {
         let flat_probe = flat_probes.get(path);
         let report = flat_probe
@@ -1387,10 +1499,23 @@ fn ds_build_calibrated_flat_master(
             .and_then(|probe| ds_flat_linearity_report(flat, &probe.signature));
         match report {
             Ok(report) => {
+                if report.white_level_inferred
+                    && !inferred_white_level_logged.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    log_to_front(
+                        app,
+                        "INFO",
+                        &format!(
+                            "{label}: nivel blanco almacenado validado por {} ({:.0} ADU).",
+                            report.white_level_source, report.white_level_adu
+                        ),
+                    );
+                }
                 if let Some(reason) = report.invalid_frame_reason() {
                     if matches!(policy, pipeline::DeepSkyCalibrationPolicy::Strict) {
                         return Err(reason);
                     }
+                    data_degraded.store(true, std::sync::atomic::Ordering::Relaxed);
                     log_to_front(
                         app,
                         "WARN",
@@ -1425,17 +1550,20 @@ fn ds_build_calibrated_flat_master(
             Err(reason) if matches!(policy, pipeline::DeepSkyCalibrationPolicy::Strict) => {
                 return Err(reason);
             }
-            Err(reason) => log_to_front(
-                app,
-                "WARN",
-                &format!(
-                    "AllowDegraded: no se pudo validar saturación/linealidad de '{}': {reason}",
-                    std::path::Path::new(path)
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                ),
-            ),
+            Err(reason) => {
+                data_degraded.store(true, std::sync::atomic::Ordering::Relaxed);
+                log_to_front(
+                    app,
+                    "WARN",
+                    &format!(
+                        "AllowDegraded: no se pudo validar saturación/linealidad de '{}': {reason}",
+                        std::path::Path::new(path)
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                    ),
+                )
+            }
         }
         ds_precalibrate_flat(
             app,
@@ -1484,30 +1612,28 @@ fn ds_build_calibrated_flat_master(
                     ds_dark_flat_master_matches_flat(flat_probe, &flat.image, candidate)
                 })
             });
-            let source = selected
-                .map(|candidate| &candidate.master)
-                .or_else(|| {
-                    bias.zip(bias_probe).and_then(|(candidate, bias_probe)| {
-                        flat_probes.get(path).and_then(|flat_probe| {
-                            (ds_compare_probe_calibration(
-                                flat_probe,
-                                bias_probe,
-                                crate::deepsky_calibration_contract::CalibrationRole::Bias,
-                                pipeline::DeepSkyCalibrationPolicy::Strict,
-                            )
-                            .compatible
-                                && ds_master_is_compatible(&flat.image, &candidate.image))
-                            .then_some(candidate)
-                        })
+            let source = selected.map(|candidate| &candidate.master).or_else(|| {
+                bias.zip(bias_probe).and_then(|(candidate, bias_probe)| {
+                    flat_probes.get(path).and_then(|flat_probe| {
+                        (ds_compare_probe_calibration(
+                            flat_probe,
+                            bias_probe,
+                            crate::deepsky_calibration_contract::CalibrationRole::Bias,
+                            pipeline::DeepSkyCalibrationPolicy::Strict,
+                        )
+                        .compatible
+                            && ds_master_is_compatible(&flat.image, &candidate.image))
+                        .then_some(candidate)
                     })
-                });
+                })
+            });
             if let Some(source) = source {
                 pedestal_found = true;
                 for index in 0..pedestal_variance.len() {
                     let value = source.variance[index];
                     if value.is_finite() && value >= 0.0 {
-                        pedestal_variance[index] = pedestal_variance[index]
-                            .max(value * flat.max_input_scale_sq);
+                        pedestal_variance[index] =
+                            pedestal_variance[index].max(value * flat.max_input_scale_sq);
                     } else {
                         pedestal_variance[index] = f32::NAN;
                     }
@@ -1517,9 +1643,7 @@ fn ds_build_calibrated_flat_master(
         }
         if pedestal_found {
             for index in 0..flat.variance.len() {
-                if flat.variance[index].is_finite()
-                    && pedestal_variance[index].is_finite()
-                {
+                if flat.variance[index].is_finite() && pedestal_variance[index].is_finite() {
                     flat.variance[index] += pedestal_variance[index];
                 } else {
                     flat.variance[index] = f32::NAN;
@@ -1537,7 +1661,7 @@ fn ds_build_calibrated_flat_master(
 /// Header-only exposure probe (EXPTIME/EXPOSURE). None for non-FITS files.
 fn ds_probe_exptime(path: &str) -> Option<f32> {
     let lower = path.to_lowercase();
-    if !(lower.ends_with(".fits") || lower.ends_with(".fit")) {
+    if !(lower.ends_with(".fits") || lower.ends_with(".fit") || lower.ends_with(".fts")) {
         return None;
     }
     let fits = fitrs::Fits::open(path).ok()?;
@@ -1651,7 +1775,7 @@ fn ds_cluster_exposures(mut items: Vec<(f32, String)>) -> Vec<(f32, Vec<String>)
     if items.is_empty() {
         return Vec::new();
     }
-    items.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    items.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut groups: Vec<(Vec<f32>, Vec<String>)> = Vec::new();
     for (exp, path) in items {
         match groups.last_mut() {
@@ -1774,7 +1898,7 @@ fn ds_filter_of_path(path: &str) -> Option<&'static str> {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
     let filename_filter = ds_filter_token(&fname).or_else(|| ds_filter_token(path));
-    if lower.ends_with(".fits") || lower.ends_with(".fit") {
+    if lower.ends_with(".fits") || lower.ends_with(".fit") || lower.ends_with(".fts") {
         if let Ok(fits) = fitrs::Fits::open(path) {
             if let Some(hdu) = fits.iter().next() {
                 if let Some(name) = ds_hdr_str(&hdu, "FILTER") {
@@ -1799,17 +1923,65 @@ fn ds_filter_of_path(path: &str) -> Option<&'static str> {
 /// pixel in every frame after registration only if the mount never moved —
 /// with dithering/drift they become spurious stars). A pixel far above its
 /// 8-neighbour median is replaced by that median.
+/// Para un frame CFA devuelve 4 pares (mediana, MAD·1.4826) indexados por fase
+/// Bayer `((y&1)<<1)|(x&1)`; para mono/RGB devuelve un par por canal.
 fn ds_cosmetic_stats(img: &DsImage) -> (Vec<f32>, Vec<f32>) {
+    // CFA: estadísticas POR FASE Bayer. Una única mediana/MAD del mosaico
+    // entrelazado mezcla poblaciones con niveles distintos (bajo cielo típico
+    // G recoge ~el doble de señal que R/B): el "MAD" resultante no mide el
+    // ruido sino el OFFSET entre canales, el umbral 6·MAD se infla un orden de
+    // magnitud y los píxeles calientes moderados sobreviven — y al ser
+    // defectos FIJOS del sensor apilan coherentes tras el registro, dejando
+    // falsas estrellas. La mediana/MAD de la sub-retícula de la PROPIA fase
+    // recupera el umbral físicamente correcto (el vecindario de comparación ya
+    // usaba stride 2, es decir, la misma fase).
+    if img.ch == 1 && img.bayer.is_some() {
+        let (w, h) = (img.w, img.h);
+        let mut medians = vec![0.0f32; 4];
+        let mut noises = vec![2.0f32; 4];
+        for phase in 0..4usize {
+            let (dy, dx) = (phase >> 1, phase & 1);
+            if dy >= h || dx >= w {
+                continue;
+            }
+            let cols = (w - dx).div_ceil(2);
+            let rows = (h - dy).div_ceil(2);
+            let sites = cols.saturating_mul(rows);
+            if sites == 0 {
+                continue;
+            }
+            // ~150k muestras totales como antes ⇒ ~37.5k por fase.
+            let step = (sites / 37_500).max(1);
+            let mut sample: Vec<f32> = Vec::with_capacity(sites.div_ceil(step));
+            let mut site = 0usize;
+            while site < sites {
+                let x = dx + (site % cols) * 2;
+                let y = dy + (site / cols) * 2;
+                sample.push(img.data[y * w + x]);
+                site += step;
+            }
+            if sample.is_empty() {
+                continue;
+            }
+            sample.sort_by(|a, b| a.total_cmp(b));
+            let med = sample[sample.len() / 2];
+            let mut dev: Vec<f32> = sample.iter().map(|v| (v - med).abs()).collect();
+            dev.sort_by(|a, b| a.total_cmp(b));
+            medians[phase] = med;
+            noises[phase] = (dev[dev.len() / 2] * 1.4826).max(2.0);
+        }
+        return (medians, noises);
+    }
     let mut medians = Vec::with_capacity(img.ch);
     let mut noises = Vec::with_capacity(img.ch);
     for c in 0..img.ch {
         let plane: Vec<f32> = img.data.iter().skip(c).step_by(img.ch).copied().collect();
         let step = (plane.len() / 150_000).max(1);
         let mut sample: Vec<f32> = plane.iter().step_by(step).copied().collect();
-        sample.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sample.sort_by(|a, b| a.total_cmp(b));
         let med = sample.get(sample.len() / 2).copied().unwrap_or(0.0);
         let mut dev: Vec<f32> = sample.iter().map(|v| (v - med).abs()).collect();
-        dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        dev.sort_by(|a, b| a.total_cmp(b));
         medians.push(med);
         noises.push((dev.get(dev.len() / 2).copied().unwrap_or(0.0) * 1.4826).max(2.0));
     }
@@ -1818,7 +1990,10 @@ fn ds_cosmetic_stats(img: &DsImage) -> (Vec<f32>, Vec<f32>) {
 
 fn ds_cosmetic_hot_pixels_with_stats(img: &mut DsImage, medians: &[f32], noises: &[f32]) {
     let (w, h, ch) = (img.w, img.h, img.ch);
-    if w < 8 || h < 8 || medians.len() < ch || noises.len() < ch {
+    // CFA: las stats llegan POR FASE Bayer (4 pares), no por canal.
+    let cfa = img.bayer.is_some() && ch == 1;
+    let expected_stats = if cfa { 4 } else { ch };
+    if w < 8 || h < 8 || medians.len() < expected_stats || noises.len() < expected_stats {
         return;
     }
     // CFA-aware neighbourhood: on a raw Bayer frame the 8 immediate neighbours
@@ -1829,8 +2004,6 @@ fn ds_cosmetic_hot_pixels_with_stats(img: &mut DsImage, medians: &[f32], noises:
     let pad = d;
     for c in 0..ch {
         let plane: Vec<f32> = img.data.iter().skip(c).step_by(ch).copied().collect();
-        let med = medians[c];
-        let noise = noises[c];
 
         let data_ptr = img.data.as_mut_ptr() as usize;
         (pad..h - pad).into_par_iter().for_each(|y| {
@@ -1838,6 +2011,12 @@ fn ds_cosmetic_hot_pixels_with_stats(img: &mut DsImage, medians: &[f32], noises:
                 std::slice::from_raw_parts_mut((data_ptr as *mut f32).add(y * w * ch), w * ch)
             };
             for x in pad..w - pad {
+                // Cada píxel se umbraliza contra la mediana/MAD de SU fase
+                // Bayer: la comparación mono contra el mosaico mezclado dejaba
+                // pasar calientes moderados (el offset G↔R/B inflaba el MAD).
+                let stat = if cfa { ((y & 1) << 1) | (x & 1) } else { c };
+                let med = medians[stat];
+                let noise = noises[stat];
                 let v = plane[y * w + x];
                 let mut nb = [
                     plane[(y - d) * w + x - d],
@@ -1849,7 +2028,7 @@ fn ds_cosmetic_hot_pixels_with_stats(img: &mut DsImage, medians: &[f32], noises:
                     plane[(y + d) * w + x],
                     plane[(y + d) * w + x + d],
                 ];
-                nb.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                nb.sort_by(|a, b| a.total_cmp(b));
                 let m8 = (nb[3] + nb[4]) * 0.5;
                 // Hot pixel: far ABOVE its same-colour neighbours.
                 if v > m8 + 6.0 * noise && v > m8 * 1.5 {
@@ -1954,7 +2133,7 @@ fn ds_extract_background_gradient(data: &mut [f32], w: usize, h: usize, ch: usiz
                 if cell.len() < 8 {
                     continue;
                 }
-                cell.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                cell.sort_by(|a, b| a.total_cmp(b));
                 xs.push((x0 + x1) as f64 / 2.0 / w as f64);
                 ys.push((y0 + y1) as f64 / 2.0 / h as f64);
                 vs.push(cell[cell.len() * 3 / 20] as f64); // 15th pct
@@ -2006,7 +2185,7 @@ fn ds_extract_background_gradient(data: &mut [f32], w: usize, h: usize, ch: usiz
                 }
             }
             let mut ares: Vec<f64> = res.iter().map(|r| r.abs()).collect();
-            ares.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            ares.sort_by(|a, b| a.total_cmp(b));
             let sigma = ares[ares.len() / 2] * 1.4826 + 1e-6;
             for i in 0..vs.len() {
                 if keep[i] {
@@ -2036,7 +2215,7 @@ fn ds_extract_background_gradient(data: &mut [f32], w: usize, h: usize, ch: usiz
                     .sum()
             })
             .collect();
-        fitted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        fitted.sort_by(|a, b| a.total_cmp(b));
         let level = fitted[fitted.len() / 2];
 
         let coef_ref = &coef;
@@ -2138,7 +2317,7 @@ fn ds_measure_dark_scaling(
     amp_glow_detected: bool,
     bias_subtracted: bool,
 ) -> Result<DsDarkScalingMeasurement, String> {
-    use crate::deepsky_calibration_contract::{DarkScalingEvidence, validate_dark_scaling};
+    use crate::deepsky_calibration_contract::{validate_dark_scaling, DarkScalingEvidence};
 
     let pedestal_state = if bias_subtracted {
         pipeline::PedestalState::BiasSubtracted
@@ -2353,10 +2532,7 @@ fn ds_uncertainty_is_publishable(
     let Some(pixels) = w.checked_mul(h) else {
         return false;
     };
-    if !matches!(ch, 1 | 3)
-        || dq.len() != pixels
-        || variance.len() != pixels.saturating_mul(ch)
-    {
+    if !matches!(ch, 1 | 3) || dq.len() != pixels || variance.len() != pixels.saturating_mul(ch) {
         return false;
     }
     let fatal = ds_uncertainty_fatal_dq();
@@ -2481,12 +2657,7 @@ fn ds_calibrate_scientific(
         }
         let bias_value = bias_used
             .map(|master| {
-                ds_master_sample_f32(
-                    &master.image.data,
-                    master.image.ch,
-                    light.ch,
-                    sample,
-                )
+                ds_master_sample_f32(&master.image.data, master.image.ch, light.ch, sample)
             })
             .unwrap_or(0.0);
         let dark_value = dark
@@ -2507,18 +2678,8 @@ fn ds_calibrate_scientific(
             .unwrap_or(f32::NAN);
         let bias_variance = bias_used
             .map(|master| {
-                dq[pixel] |= ds_master_sample_u32(
-                    &master.dq,
-                    master.image.ch,
-                    light.ch,
-                    sample,
-                );
-                ds_master_sample_f32(
-                    &master.variance,
-                    master.image.ch,
-                    light.ch,
-                    sample,
-                )
+                dq[pixel] |= ds_master_sample_u32(&master.dq, master.image.ch, light.ch, sample);
+                ds_master_sample_f32(&master.variance, master.image.ch, light.ch, sample)
             })
             .unwrap_or(0.0);
         let dark_variance = dark
@@ -2563,12 +2724,7 @@ fn ds_calibrate_scientific(
     if let Some(flat) = flat {
         for sample in 0..samples {
             let pixel = sample / light.ch;
-            dq[pixel] |= ds_master_sample_u32(
-                &flat.dq,
-                flat.image.ch,
-                light.ch,
-                sample,
-            );
+            dq[pixel] |= ds_master_sample_u32(&flat.dq, flat.image.ch, light.ch, sample);
         }
         if !missing_variance && flat.variance_publishable() {
             let divided = crate::deepsky_variance::divide_by_flat_scientific(
@@ -2667,10 +2823,8 @@ fn ds_debayer_scientific(
     let source_dq = uncertainty.dq;
     let rgb = ds_debayer_image(img, cid);
     let mut variance = vec![f32::NAN; w * h * 3];
-    let mut dq = vec![
-        crate::deepsky_variance::dq::EDGE | crate::deepsky_variance::dq::NO_COVERAGE;
-        w * h
-    ];
+    let mut dq =
+        vec![crate::deepsky_variance::dq::EDGE | crate::deepsky_variance::dq::NO_COVERAGE; w * h];
     let combine = |indices: &[usize], coefficient: f32| -> f32 {
         let mut sum = 0.0f32;
         for &index in indices {
@@ -2728,8 +2882,8 @@ fn ds_debayer_scientific(
             dq[i] = flags;
         }
     }
-    let publishable = uncertainty.publishable
-        && ds_uncertainty_is_publishable(&variance, &dq, w, h, 3);
+    let publishable =
+        uncertainty.publishable && ds_uncertainty_is_publishable(&variance, &dq, w, h, 3);
     (
         rgb,
         DsCalibratedUncertainty {
@@ -2749,41 +2903,75 @@ fn ds_uncertainty_sigmas(
     bayer: Option<i32>,
 ) -> [f32; 3] {
     let mut populations = [Vec::<f32>::new(), Vec::<f32>::new(), Vec::<f32>::new()];
-    let step = (w.saturating_mul(h) / 200_000).max(1);
-    for pixel in (0..w.saturating_mul(h)).step_by(step) {
-        if ch == 3 {
-            for channel in 0..3 {
-                let value = variance[pixel * 3 + channel];
-                if value.is_finite() && value >= 0.0 {
-                    populations[channel].push(value);
+    let cfa_origin = bayer.and_then(|cid| match cid {
+        // (rx, ry) = fase del fotosito ROJO dentro del mosaico 2×2.
+        8 => Some((0usize, 0usize)),
+        9 => Some((1, 0)),
+        10 => Some((0, 1)),
+        11 => Some((1, 1)),
+        _ => None,
+    });
+    if ch == 1 && cfa_origin.is_some() {
+        // CFA: muestreo POR FASE Bayer. El barrido antiguo (0..w·h).step_by(step)
+        // era estadísticamente inválido sobre un mosaico entrelazado: con `step`
+        // par y `w` par el índice plano sólo visita píxeles de x par (2 de las
+        // 4 fases), la población de algún canal quedaba VACÍA y su sigma salía
+        // NaN — que fluía a frame_calibration_sigmas y envenenaba el modelo de
+        // ruido de EIDR. Cada fase (dy,dx)∈{0,1}² es una sub-retícula de stride
+        // 2 con paso PROPIO (impar respecto a la retícula ⇒ irrelevante aquí,
+        // porque el paso avanza en índice de sub-retícula, no en índice plano):
+        // así las 4 fases quedan representadas SIEMPRE, sea cual sea la paridad
+        // de w y h, con ~50k muestras por fase (~200k totales, como antes).
+        let (rx, ry) = cfa_origin.unwrap_or((0, 0));
+        for dy in 0..2usize {
+            for dx in 0..2usize {
+                if dy >= h || dx >= w {
+                    continue;
+                }
+                let cols = (w - dx).div_ceil(2);
+                let rows = (h - dy).div_ceil(2);
+                let sites = cols.saturating_mul(rows);
+                if sites == 0 {
+                    continue;
+                }
+                let step = (sites / 50_000).max(1);
+                // Canal físico de la fase: coincide con (rx,ry) ⇒ R; fase
+                // opuesta en ambos ejes ⇒ B; las dos restantes ⇒ G.
+                let channel = if (dx & 1) == rx && (dy & 1) == ry {
+                    0
+                } else if (dx & 1) != rx && (dy & 1) != ry {
+                    2
+                } else {
+                    1
+                };
+                let mut site = 0usize;
+                while site < sites {
+                    let x = dx + (site % cols) * 2;
+                    let y = dy + (site / cols) * 2;
+                    let value = variance[y * w + x];
+                    if value.is_finite() && value >= 0.0 {
+                        populations[channel].push(value);
+                    }
+                    site += step;
                 }
             }
-        } else {
-            let value = variance[pixel];
-            if !value.is_finite() || value < 0.0 {
-                continue;
+        }
+    } else {
+        let step = (w.saturating_mul(h) / 200_000).max(1);
+        for pixel in (0..w.saturating_mul(h)).step_by(step) {
+            if ch == 3 {
+                for channel in 0..3 {
+                    let value = variance[pixel * 3 + channel];
+                    if value.is_finite() && value >= 0.0 {
+                        populations[channel].push(value);
+                    }
+                }
+            } else {
+                let value = variance[pixel];
+                if value.is_finite() && value >= 0.0 {
+                    populations[0].push(value);
+                }
             }
-            let channel = bayer
-                .and_then(|cid| {
-                    let x = pixel % w;
-                    let y = pixel / w;
-                    let (rx, ry) = match cid {
-                        8 => (0usize, 0usize),
-                        9 => (1, 0),
-                        10 => (0, 1),
-                        11 => (1, 1),
-                        _ => return None,
-                    };
-                    Some(if (x & 1) == rx && (y & 1) == ry {
-                        0
-                    } else if (x & 1) != rx && (y & 1) != ry {
-                        2
-                    } else {
-                        1
-                    })
-                })
-                .unwrap_or(0);
-            populations[channel].push(value);
         }
     }
     let mut out = [f32::NAN; 3];
@@ -2793,9 +2981,28 @@ fn ds_uncertainty_sigmas(
             out[channel] = value.sqrt();
         }
     }
-    if ch == 1 && bayer.is_none() {
+    if ch == 1 && cfa_origin.is_none() {
         out[1] = out[0];
         out[2] = out[0];
+    }
+    // Red de seguridad: si alguna población quedó vacía (imagen minúscula, VAR
+    // no finita en toda una fase, o patrón Bayer desconocido) se usa la sigma
+    // AGRUPADA de todas las fases/canales como estimador conservador. JAMÁS se
+    // devuelve NaN: aguas abajo un NaN se propaga a los pesos de EIDR y
+    // corrompe todo el modelo de incertidumbre del apilado.
+    if out.iter().any(|sigma| !sigma.is_finite()) {
+        let mut pooled: Vec<f32> = populations.iter().flatten().copied().collect();
+        let pooled_sigma = if pooled.is_empty() {
+            0.0
+        } else {
+            pooled.sort_by(|a, b| a.total_cmp(b));
+            pooled[pooled.len() / 2].sqrt()
+        };
+        for sigma in out.iter_mut() {
+            if !sigma.is_finite() {
+                *sigma = pooled_sigma;
+            }
+        }
     }
     out
 }
@@ -2834,10 +3041,10 @@ fn ds_bg_noise(luma: &[f32]) -> (f32, f32) {
     if s.is_empty() {
         return (0.0, 1.0);
     }
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s.sort_by(|a, b| a.total_cmp(b));
     let bg = s[s.len() / 2];
     let mut d: Vec<f32> = s.iter().map(|v| (v - bg).abs()).collect();
-    d.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    d.sort_by(|a, b| a.total_cmp(b));
     (bg, (d[d.len() / 2] * 1.4826).max(1.0))
 }
 
@@ -2858,7 +3065,7 @@ fn ds_channel_backgrounds(img: &DsImage) -> [f32; 3] {
         if s.is_empty() {
             continue;
         }
-        s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        s.sort_by(|a, b| a.total_cmp(b));
         out[c] = s[s.len() / 4];
     }
     if ch == 1 {
@@ -2921,7 +3128,7 @@ fn ds_mrs_noise(luma: &[f32], w: usize, h: usize) -> f32 {
     if d.is_empty() {
         return 1.0;
     }
-    d.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    d.sort_by(|a, b| a.total_cmp(b));
     let mad = d[d.len() / 2];
     // σ_image ≈ MAD·1.4826 / 0.889 (0.889 = σ of the first B3 à-trous layer for
     // unit-variance white noise).
@@ -2943,7 +3150,12 @@ fn ds_local_bg_grid(luma: &[f32], w: usize, h: usize, gw: usize, gh: usize) -> V
             for y in y0..y1 {
                 for x in x0..x1 {
                     let v = luma[y * w + x];
-                    if v > 0.0 {
+                    // Sin pedestal (default del pipeline) el cielo calibrado
+                    // es ruido simétrico alrededor de su nivel real, que puede
+                    // ser ≈0 o negativo: filtrar `v > 0` descartaba la mitad
+                    // negativa y sesgaba el fondo ~+0.7σ. Solo se excluyen los
+                    // no finitos (píxeles sin dato).
+                    if v.is_finite() {
                         cell.push(v);
                     }
                 }
@@ -2952,7 +3164,7 @@ fn ds_local_bg_grid(luma: &[f32], w: usize, h: usize, gw: usize, gh: usize) -> V
                 grid[gy * gw + gx] = 0.0;
                 continue;
             }
-            cell.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            cell.sort_by(|a, b| a.total_cmp(b));
             grid[gy * gw + gx] = cell[cell.len() / 4]; // 25th percentile ≈ sky
         }
     }
@@ -2960,13 +3172,25 @@ fn ds_local_bg_grid(luma: &[f32], w: usize, h: usize, gw: usize, gh: usize) -> V
 }
 
 /// Bilinearly sample a `gw`×`gh` grid at normalized coords (u,v) ∈ [0,1].
+///
+/// CONVENCIÓN CENTRO-DE-CELDA: todos los constructores de estas rejillas
+/// (ds_local_bg_grid, rejillas bg/nz de detección estelar, campos LN de
+/// deepsky_background, rejillas WQ del Rescate de detalle) agregan la celda j
+/// por binning `floor(u·G)`, así que su valor representa el centro de celda
+/// (j+0.5)/G. El nodo j debe colocarse ahí — no en j/(G-1): esa convención de
+/// nodos-en-bordes desplazaba el campo media celda y lo estiraba G/(G-1),
+/// sesgo sistemático ~1/(2G) máximo en los bordes. Coordenada continua
+/// g = clamp(u·G − 0.5, 0, G−1); fuera de los centros extremos se extrapola
+/// constante (clamp), error acotado a media celda. Los kernels WGSL de
+/// gpu_deepsky.rs replican EXACTAMENTE esta fórmula: cambiarla exige cambiar
+/// ambos lados a la vez o los gates de paridad GPU fallarán en runtime.
 #[inline]
 fn ds_sample_grid(grid: &[f32], gw: usize, gh: usize, u: f32, v: f32) -> f32 {
     if grid.is_empty() {
         return 0.0;
     }
-    let fx = (u.clamp(0.0, 1.0) * (gw as f32 - 1.0)).max(0.0);
-    let fy = (v.clamp(0.0, 1.0) * (gh as f32 - 1.0)).max(0.0);
+    let fx = (u.clamp(0.0, 1.0) * gw as f32 - 0.5).clamp(0.0, gw as f32 - 1.0);
+    let fy = (v.clamp(0.0, 1.0) * gh as f32 - 0.5).clamp(0.0, gh as f32 - 1.0);
     let x0 = (fx.floor() as usize).min(gw - 1);
     let y0 = (fy.floor() as usize).min(gh - 1);
     let x1 = (x0 + 1).min(gw - 1);
@@ -2996,7 +3220,9 @@ fn ds_sample_local_field(
 ) -> f32 {
     let cells = gw.saturating_mul(gh);
     let grid = if cells > 0 && field.len() >= cells.saturating_mul(channels) {
-        let start = channel.min(channels.saturating_sub(1)).saturating_mul(cells);
+        let start = channel
+            .min(channels.saturating_sub(1))
+            .saturating_mul(cells);
         &field[start..start + cells]
     } else {
         field
@@ -3212,10 +3438,10 @@ fn ds_detect_stars_impl(
             if cell.is_empty() {
                 continue;
             }
-            cell.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            cell.sort_by(|a, b| a.total_cmp(b));
             let med = cell[cell.len() / 2];
             let mut dev: Vec<f32> = cell.iter().map(|v| (v - med).abs()).collect();
-            dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            dev.sort_by(|a, b| a.total_cmp(b));
             bg_grid[gy * gw + gx] = med;
             nz_grid[gy * gw + gx] = (dev[dev.len() / 2] * 1.4826).max(1.0);
         }
@@ -3274,7 +3500,7 @@ fn ds_detect_stars_impl(
             }
         }
     }
-    cands.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    cands.sort_by(|a, b| b.2.total_cmp(&a.2));
 
     // Centroid + minimum separation dedupe.
     let mut stars: Vec<(f32, f32, f32)> = Vec::new();
@@ -3343,7 +3569,7 @@ fn ds_frame_fwhm_proxy(luma: &[f32], w: usize, h: usize, stars: &[(f32, f32, f32
     // Local background from the global median (cheap and stable enough here).
     let step = (luma.len() / 100_000).max(1);
     let mut s: Vec<f32> = luma.iter().step_by(step).copied().collect();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s.sort_by(|a, b| a.total_cmp(b));
     let bg = s[s.len() / 2];
 
     for &(sx, sy, _) in stars.iter().take(20) {
@@ -3374,7 +3600,7 @@ fn ds_frame_fwhm_proxy(luma: &[f32], w: usize, h: usize, stars: &[(f32, f32, f32
     if fwhms.is_empty() {
         return 0.0;
     }
-    fwhms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    fwhms.sort_by(|a, b| a.total_cmp(b));
     fwhms[fwhms.len() / 2]
 }
 
@@ -3390,7 +3616,7 @@ fn ds_star_fwhms(
 ) -> Vec<(f32, f32, f32)> {
     let step = (luma.len() / 100_000).max(1);
     let mut s: Vec<f32> = luma.iter().step_by(step).copied().collect();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s.sort_by(|a, b| a.total_cmp(b));
     let bg = s[s.len() / 2];
     let mut out = Vec::with_capacity(stars.len().min(80));
     for &(sx, sy, _) in stars.iter().take(80) {
@@ -3427,7 +3653,7 @@ fn ds_star_fwhms(
 fn ds_frame_roundness(luma: &[f32], w: usize, h: usize, stars: &[(f32, f32, f32)]) -> f32 {
     let step = (luma.len() / 100_000).max(1);
     let mut s: Vec<f32> = luma.iter().step_by(step).copied().collect();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s.sort_by(|a, b| a.total_cmp(b));
     let bg = s[s.len() / 2];
 
     let mut eccs: Vec<f32> = Vec::new();
@@ -3466,7 +3692,7 @@ fn ds_frame_roundness(luma: &[f32], w: usize, h: usize, stars: &[(f32, f32, f32)
     if eccs.is_empty() {
         return 0.0;
     }
-    eccs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    eccs.sort_by(|a, b| a.total_cmp(b));
     eccs[eccs.len() / 2]
 }
 
@@ -3559,6 +3785,24 @@ impl DsTransform {
             poly: [0.0; 12],
             norm: [0.0, 0.0, 1.0],
         }
+    }
+
+    /// Compone una traslación en la cuadrícula de salida. Así el registro
+    /// cometario conserva una sola interpolación por rama.
+    fn translated_output(mut self, dx: f32, dy: f32) -> Self {
+        let (dx, dy) = (dx as f64, dy as f64);
+        if self.model == DsRegistrationModel::LocalDistortion {
+            self.poly[2] += dx;
+            self.poly[8] += dy;
+        } else {
+            self.h[0] += dx * self.h[6];
+            self.h[1] += dx * self.h[7];
+            self.h[2] += dx * self.h[8];
+            self.h[3] += dy * self.h[6];
+            self.h[4] += dy * self.h[7];
+            self.h[5] += dy * self.h[8];
+        }
+        self
     }
 
     fn to_gpu(self) -> Option<crate::gpu_deepsky::WarpTransform> {
@@ -3781,19 +4025,107 @@ fn ds_fit_projective(pairs: &[((f32, f32), (f32, f32))]) -> Option<DsTransform> 
     if pairs.len() < 4 {
         return None;
     }
+    // Normalización de Hartley ("In Defence of the Eight-Point Algorithm",
+    // PAMI 1997): centroide al origen y distancia media √2 en AMBOS conjuntos
+    // antes del ajuste DLT. Sin ella, con coordenadas de sensor ~6000 px los
+    // términos cruzados u·x ~ 3.6e7 llevan AtA a magnitudes ~1e15: el pivote
+    // ABSOLUTO 1e-12 de ds_solve_normal deja de detectar deficiencia de rango
+    // (una configuración colineal "se resuelve" con una H espuria) y el
+    // condicionamiento ~cuadrado de las ecuaciones normales destruye la
+    // precisión del ajuste. En el espacio normalizado AtA es O(1), el mismo
+    // umbral vuelve a ser significativo y el resultado es invariante al origen
+    // y la escala del sensor. ds_fit_local_distortion ya normaliza igual.
+    let n = pairs.len() as f64;
+    let (mut src_cx, mut src_cy, mut dst_cx, mut dst_cy) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for &((x, y), (u, v)) in pairs {
+        src_cx += x as f64;
+        src_cy += y as f64;
+        dst_cx += u as f64;
+        dst_cy += v as f64;
+    }
+    src_cx /= n;
+    src_cy /= n;
+    dst_cx /= n;
+    dst_cy /= n;
+    let (mut src_dist, mut dst_dist) = (0.0f64, 0.0f64);
+    for &((x, y), (u, v)) in pairs {
+        src_dist += ((x as f64 - src_cx).powi(2) + (y as f64 - src_cy).powi(2)).sqrt();
+        dst_dist += ((u as f64 - dst_cx).powi(2) + (v as f64 - dst_cy).powi(2)).sqrt();
+    }
+    src_dist /= n;
+    dst_dist /= n;
+    if !(src_dist > 1e-9 && dst_dist > 1e-9) {
+        // Nube degenerada a un punto: no hay geometría que ajustar.
+        return None;
+    }
+    let src_s = std::f64::consts::SQRT_2 / src_dist;
+    let dst_s = std::f64::consts::SQRT_2 / dst_dist;
+    // DLT de 8 parámetros (h22_norm ≡ 1) en el espacio normalizado.
     let mut rows = Vec::with_capacity(pairs.len() * 2);
     let mut rhs = Vec::with_capacity(pairs.len() * 2);
     for &((x, y), (u, v)) in pairs {
-        let (x, y, u, v) = (x as f64, y as f64, u as f64, v as f64);
-        rows.push(vec![x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y]);
-        rhs.push(u);
-        rows.push(vec![0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y]);
-        rhs.push(v);
+        let xn = (x as f64 - src_cx) * src_s;
+        let yn = (y as f64 - src_cy) * src_s;
+        let un = (u as f64 - dst_cx) * dst_s;
+        let vn = (v as f64 - dst_cy) * dst_s;
+        rows.push(vec![xn, yn, 1.0, 0.0, 0.0, 0.0, -un * xn, -un * yn]);
+        rhs.push(un);
+        rows.push(vec![0.0, 0.0, 0.0, xn, yn, 1.0, -vn * xn, -vn * yn]);
+        rhs.push(vn);
     }
     let c = ds_least_squares(&rows, &rhs, 8)?;
+    let h_norm = [
+        [c[0], c[1], c[2]],
+        [c[3], c[4], c[5]],
+        [c[6], c[7], 1.0],
+    ];
+    // Desnormalización: H = T_dst⁻¹ · H_norm · T_src, con
+    //   T_src   = [[s, 0, -s·cx], [0, s, -s·cy], [0, 0, 1]]  (px → normalizado)
+    //   T_dst⁻¹ = [[1/s', 0, cx'], [0, 1/s', cy'], [0, 0, 1]] (normalizado → px)
+    let t_src = [
+        [src_s, 0.0, -src_s * src_cx],
+        [0.0, src_s, -src_s * src_cy],
+        [0.0, 0.0, 1.0],
+    ];
+    let t_dst_inv = [
+        [1.0 / dst_s, 0.0, dst_cx],
+        [0.0, 1.0 / dst_s, dst_cy],
+        [0.0, 0.0, 1.0],
+    ];
+    let mat_mul = |a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]| -> [[f64; 3]; 3] {
+        let mut out = [[0.0f64; 3]; 3];
+        for (row, out_row) in out.iter_mut().enumerate() {
+            for (col, out_val) in out_row.iter_mut().enumerate() {
+                *out_val = (0..3).map(|k| a[row][k] * b[k][col]).sum();
+            }
+        }
+        out
+    };
+    let h_px = mat_mul(&t_dst_inv, &mat_mul(&h_norm, &t_src));
+    // Renormaliza h22 = 1 (la convención del resto del pipeline). h22 ≈ 0
+    // significaría que el origen del sensor cae sobre la línea del horizonte
+    // proyectivo — imposible en un registro real entre tomas del mismo campo.
+    let h22 = h_px[2][2];
+    if !h22.is_finite() || h22.abs() < 1e-12 {
+        return None;
+    }
+    let h = [
+        h_px[0][0] / h22,
+        h_px[0][1] / h22,
+        h_px[0][2] / h22,
+        h_px[1][0] / h22,
+        h_px[1][1] / h22,
+        h_px[1][2] / h22,
+        h_px[2][0] / h22,
+        h_px[2][1] / h22,
+        1.0,
+    ];
+    if h.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
     Some(DsTransform {
         model: DsRegistrationModel::Projective,
-        h: [c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], 1.0],
+        h,
         poly: [0.0; 12],
         norm: [0.0, 0.0, 1.0],
     })
@@ -3924,9 +4256,7 @@ fn ds_pairs_from_indices(
 ) -> Vec<((f32, f32), (f32, f32))> {
     indices
         .iter()
-        .map(|&(target_index, reference_index)| {
-            (target[target_index], reference[reference_index])
-        })
+        .map(|&(target_index, reference_index)| (target[target_index], reference[reference_index]))
         .collect()
 }
 
@@ -3980,10 +4310,7 @@ fn ds_stable_vote_winner(
 /// round-robin from every occupied 4×4 cell before a cell contributes twice.
 fn ds_registration_train_holdout(
     pairs: &[((f32, f32), (f32, f32))],
-) -> (
-    Vec<((f32, f32), (f32, f32))>,
-    Vec<((f32, f32), (f32, f32))>,
-) {
+) -> (Vec<((f32, f32), (f32, f32))>, Vec<((f32, f32), (f32, f32))>) {
     if pairs.len() < 8 {
         return (pairs.to_vec(), Vec::new());
     }
@@ -4139,6 +4466,38 @@ fn ds_count_dither_positions(
     bins.len()
 }
 
+/// CFA Drizzle deposita cada fotodiodo únicamente en su canal físico. Con una
+/// cuadrícula 2× y una huella menor que el píxel nativo, una secuencia corta o
+/// que no cubre las 16 fases subpíxel puede dejar agujeros reales entre
+/// depósitos. En ese caso se conserva Drizzle 2×, pero la huella efectiva pasa
+/// a 1.0 (área física completa del píxel) en vez de publicar NaN dispersos.
+fn ds_safe_drizzle_pixfrac(
+    requested: f32,
+    drizzle: f32,
+    cfa: bool,
+    frames: usize,
+    dither_positions: usize,
+) -> (f32, Option<String>) {
+    let requested = requested.clamp(0.4, 1.0);
+    if drizzle > 1.01 && cfa && requested < 1.0 && (frames < 32 || dither_positions < 16) {
+        let reason = format!(
+            "CFA Drizzle {:.0}× con {frames} tomas y {dither_positions}/16 fases: pixfrac {:.2} → 1.00 para evitar huecos de cobertura",
+            drizzle, requested
+        );
+        (1.0, Some(reason))
+    } else {
+        (requested, None)
+    }
+}
+
+/// Un mosaico Bayer necesita cubrir las 16 fases CFA y suficientes muestras
+/// por fase para que el depósito directo no imprima una retícula periódica.
+/// Si no se cumple, Drizzle conserva su escala pero consume RGB float32
+/// calibrado/demosaiced y la receta registra la sustitución.
+fn ds_cfa_drizzle_needs_rgb_fallback(drizzle: f32, frames: usize, dither_positions: usize) -> bool {
+    drizzle > 1.01 && (frames < 32 || dither_positions < 16)
+}
+
 fn ds_registration_residual_map(
     reference: &[(f32, f32, f32)],
     catalogs: &[Vec<(f32, f32, f32)>],
@@ -4171,8 +4530,13 @@ fn ds_registration_residual_map(
                 best = best.min(((p.0 - rx).powi(2) + (p.1 - ry).powi(2)).sqrt());
             }
             if best <= 5.0 {
-                let gx = ((p.0 / w.max(1) as f32) * (G - 1) as f32).round() as usize;
-                let gy = ((p.1 / h.max(1) as f32) * (G - 1) as f32).round() as usize;
+                // Binning centro-de-celda `floor(u·G)`: misma convención que el
+                // resto de constructores de rejilla y que ds_sample_grid (que
+                // coloca el nodo j en (j+0.5)/G). El antiguo round(u·(G−1))
+                // asignaba a nodos-en-bordes y el remuestreo posterior quedaba
+                // desplazado media celda respecto a lo construido.
+                let gx = ((p.0 / w.max(1) as f32) * G as f32).floor() as usize;
+                let gy = ((p.1 / h.max(1) as f32) * G as f32).floor() as usize;
                 let gi = gy.min(G - 1) * G + gx.min(G - 1);
                 sum[gi] += best as f64;
                 count[gi] += 1.0;
@@ -4731,15 +5095,21 @@ fn ds_warp_accumulate(
 /// Warp a SINGLE image onto the reference grid (inverse similarity, bilinear),
 /// same convention as `ds_warp_accumulate` but producing a plain buffer — used
 /// to co-register per-filter channel masters before LRGB/narrowband combine.
-/// Out-of-bounds samples become 0.
-fn ds_warp_single(img: &DsImage, t: DsTransform, w: usize, h: usize) -> Vec<f32> {
+/// Out-of-bounds samples stay NaN and receive zero coverage so a black border
+/// can never masquerade as measured sky.
+fn ds_warp_single(img: &DsImage, t: DsTransform, w: usize, h: usize) -> (Vec<f32>, Vec<f32>) {
     let ch = img.ch;
-    let mut out = vec![0.0f32; w * h * ch];
+    let lut = ds_l3_lut();
+    let mut out = vec![f32::NAN; w * h * ch];
+    let mut coverage = vec![0.0f32; w * h];
     let out_ptr = out.as_mut_ptr() as usize;
+    let coverage_ptr = coverage.as_mut_ptr() as usize;
     (0..h).into_par_iter().for_each(|y| {
         let row = unsafe {
             std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(y * w * ch), w * ch)
         };
+        let coverage_row =
+            unsafe { std::slice::from_raw_parts_mut((coverage_ptr as *mut f32).add(y * w), w) };
         for x in 0..w {
             let Some((sxf, syf)) = t.inverse(x as f32, y as f32) else {
                 continue;
@@ -4751,17 +5121,37 @@ fn ds_warp_single(img: &DsImage, t: DsTransform, w: usize, h: usize) -> Vec<f32>
             let y0 = syf as usize;
             let fx = sxf - x0 as f32;
             let fy = syf - y0 as f32;
-            for c in 0..ch {
-                let i00 = (y0 * img.w + x0) * ch + c;
-                let i01 = i00 + img.w * ch;
-                row[x * ch + c] = img.data[i00] * (1.0 - fx) * (1.0 - fy)
-                    + img.data[i00 + ch] * fx * (1.0 - fy)
-                    + img.data[i01] * (1.0 - fx) * fy
-                    + img.data[i01 + ch] * fx * fy;
+            if img.w >= 7
+                && img.h >= 7
+                && sxf >= 3.0
+                && syf >= 3.0
+                && sxf < (img.w - 4) as f32
+                && syf < (img.h - 4) as f32
+            {
+                let mut values = [0.0f32; 3];
+                ds_sample_lanczos3(img, lut, sxf, syf, &mut values);
+                row[x * ch..x * ch + ch].copy_from_slice(&values[..ch]);
+            } else {
+                // Lanczos-3 needs a complete 6×6 support. At the outer border,
+                // fall back to bilinear instead of inventing reflected pixels.
+                for c in 0..ch {
+                    let i00 = (y0 * img.w + x0) * ch + c;
+                    let i01 = i00 + img.w * ch;
+                    row[x * ch + c] = img.data[i00] * (1.0 - fx) * (1.0 - fy)
+                        + img.data[i00 + ch] * fx * (1.0 - fy)
+                        + img.data[i01] * (1.0 - fx) * fy
+                        + img.data[i01 + ch] * fx * fy;
+                }
+            }
+            if row[x * ch..x * ch + ch]
+                .iter()
+                .all(|value| value.is_finite())
+            {
+                coverage_row[x] = 1.0;
             }
         }
     });
-    out
+    (out, coverage)
 }
 
 /// Memory-bounded registered proxy used only to solve the smooth local
@@ -4823,13 +5213,90 @@ fn ds_registered_background_proxy(
     Ok((data, coverage))
 }
 
+/// B12 — Bbox de ENTRADA que puede aportar gotas a la banda de salida
+/// `[oy0, oy1)`. COMPARTIDO por los kernels drizzle RGB y CFA para que ambos
+/// apliquen la MISMA geometría y el MISMO margen (+1 px de salida: la
+/// convención centro desplaza la gota +0.5 px, y ensanchar el conjunto
+/// candidato sólo añade trabajo — un píxel de entrada cuya gota no solapa la
+/// banda aporta área 0 — nunca sesgo).
+///
+/// Por qué las esquinas no bastan: para Similarity/Affine la inversa es afín,
+/// los bordes rectos del rectángulo de banda siguen rectos en la entrada y los
+/// extremos del bbox caen en los vértices (esquinas EXACTAS). Para Projective
+/// la inversa es una homografía: si su horizonte (d≈0) cruza el rectángulo,
+/// una esquina se invierte "al otro lado" con el signo cambiado. Para
+/// LocalDistortion la inversa es no lineal y sus bordes pueden curvarse con un
+/// extremo entre muestras. Un muestreo finito de aristas NO prueba una cota
+/// conservadora en ninguno de esos dos modelos. La solución científica segura
+/// es usar el frame de entrada completo como conjunto candidato: el test exacto
+/// de solape dentro del kernel descarta gotas ajenas, de modo que sólo aumenta
+/// trabajo y nunca pierde cobertura ni depende del particionado en hilos.
+fn ds_drizzle_band_input_bbox(
+    t: DsTransform,
+    w: usize,
+    oy0: usize,
+    oy1: usize,
+    half: f32,
+    scale: f32,
+    img_w: usize,
+    img_h: usize,
+) -> Option<(i32, i32, i32, i32)> {
+    if img_w == 0 || img_h == 0 {
+        return None;
+    }
+    if matches!(
+        t.model,
+        DsRegistrationModel::Projective | DsRegistrationModel::LocalDistortion
+    ) {
+        return Some((0, img_w as i32 - 1, 0, img_h as i32 - 1));
+    }
+    // Rectángulo de banda en píxeles de SALIDA, expandido por la media gota y
+    // el margen +1 de la convención centro (idéntico en RGB y CFA).
+    let x0 = -half - 1.0;
+    let x1 = w as f32 + half + 1.0;
+    let y0 = oy0 as f32 - half - 1.0;
+    let y1 = oy1 as f32 + half + 1.0;
+    let points: [(f32, f32); 5] = [
+        (x0, y0),
+        (x1, y0),
+        (x0, y1),
+        (x1, y1),
+        // El centro es redundante para una afín, pero conserva un fallback
+        // estable ante redondeos extremos sin ensanchar incorrectamente.
+        (0.5 * (x0 + x1), 0.5 * (y0 + y1)),
+    ];
+    let mut ixmin = i32::MAX;
+    let mut ixmax = i32::MIN;
+    let mut iymin = i32::MAX;
+    let mut iymax = i32::MIN;
+    for (ox, oy) in points {
+        let Some((sx, sy)) = t.inverse(ox / scale, oy / scale) else {
+            continue;
+        };
+        if !sx.is_finite() || !sy.is_finite() {
+            continue;
+        }
+        // El cast float→int satura en Rust: las muestras cuasi-horizonte
+        // (coordenadas enormes) sólo pueden AGRANDAR el bbox hasta el clamp.
+        ixmin = ixmin.min(sx.floor() as i32);
+        ixmax = ixmax.max(sx.ceil() as i32);
+        iymin = iymin.min(sy.floor() as i32);
+        iymax = iymax.max(sy.ceil() as i32);
+    }
+    let ixmin = ixmin.max(0);
+    let iymin = iymin.max(0);
+    let ixmax = ixmax.min(img_w as i32 - 1);
+    let iymax = iymax.min(img_h as i32 - 1);
+    (ixmin <= ixmax && iymin <= iymax).then_some((ixmin, ixmax, iymin, iymax))
+}
+
 /// TRUE DROP-KERNEL DRIZZLE (Fruchter & Hook) — used instead of inverse-bilinear
 /// when the user enables real drizzle. Each input pixel is a "drop" shrunk by
 /// `pixfrac`; its flux is scattered onto the finer output grid by geometric
 /// overlap area, so dithered subframes recover resolution WITHOUT interpolation
 /// blur. Same sum/sumsq/wgt/bounds interface as `ds_warp_accumulate` (both κσ
 /// passes work). Parallelised over disjoint output row-bands; each band derives
-/// its contributing input bbox by inverse-mapping the band corners.
+/// its contributing input bbox via `ds_drizzle_band_input_bbox`.
 #[allow(clippy::too_many_arguments)]
 fn ds_drizzle_accumulate(
     img: &DsImage,
@@ -4849,12 +5316,16 @@ fn ds_drizzle_accumulate(
     loc: Option<(&[f32], usize, usize)>, // local-norm offset grid (output space)
     // Rescate de detalle: rejilla de calidad local (multiplica frame_w).
     wq: Option<(&[f32], usize, usize)>,
+    // B10: Σw² por píxel/canal para la varianza ponderada no sesgada de
+    // la siguiente ventana κσ. El peso incluye área de la gota y calidad local.
+    weight_sq: Option<&mut Vec<f64>>,
 ) {
     let half = 0.5 * pixfrac.clamp(0.2, 1.0) * scale; // drop half-size (output px)
 
     let sum_ptr = sum.as_mut_ptr() as usize;
     let wgt_ptr = wgt.as_mut_ptr() as usize;
     let sq_ptr: Option<usize> = sumsq.map(|v| v.as_mut_ptr() as usize);
+    let wsq_ptr: Option<usize> = weight_sq.map(|v| v.as_mut_ptr() as usize);
     let (low_ptr, high_ptr): (Option<usize>, Option<usize>) = rejection_maps
         .map(|(low, high)| {
             (
@@ -4886,6 +5357,9 @@ fn ds_drizzle_accumulate(
         let mut sq_band = sq_ptr.map(|p| unsafe {
             std::slice::from_raw_parts_mut((p as *mut f64).add(oy0 * w * ch), rows * w * ch)
         });
+        let mut wsq_band = wsq_ptr.map(|p| unsafe {
+            std::slice::from_raw_parts_mut((p as *mut f64).add(oy0 * w * ch), rows * w * ch)
+        });
         let mut low_band = low_ptr.map(|p| unsafe {
             std::slice::from_raw_parts_mut((p as *mut f64).add(oy0 * w), rows * w)
         });
@@ -4893,37 +5367,13 @@ fn ds_drizzle_accumulate(
             std::slice::from_raw_parts_mut((p as *mut f64).add(oy0 * w), rows * w)
         });
 
-        // Input bbox that can splat into this band: inverse-map the band corners
-        // (expanded by the drop half-size) output → ref → input.
-        let mut ixmin = i32::MAX;
-        let mut ixmax = i32::MIN;
-        let mut iymin = i32::MAX;
-        let mut iymax = i32::MIN;
-        // Margen +1: la convención centro desplaza la gota +0.5 px de salida;
-        // ensanchar el bbox solo agranda el conjunto candidato (seguro).
-        for &(ox, oy) in &[
-            (-half - 1.0, oy0 as f32 - half - 1.0),
-            (w as f32 + half + 1.0, oy0 as f32 - half - 1.0),
-            (-half - 1.0, oy1 as f32 + half + 1.0),
-            (w as f32 + half + 1.0, oy1 as f32 + half + 1.0),
-        ] {
-            let rx = ox / scale;
-            let ry = oy / scale;
-            let Some((sx, sy)) = t.inverse(rx, ry) else {
-                continue;
-            };
-            ixmin = ixmin.min(sx.floor() as i32);
-            ixmax = ixmax.max(sx.ceil() as i32);
-            iymin = iymin.min(sy.floor() as i32);
-            iymax = iymax.max(sy.ceil() as i32);
-        }
-        ixmin = ixmin.max(0);
-        iymin = iymin.max(0);
-        ixmax = ixmax.min(img.w as i32 - 1);
-        iymax = iymax.min(img.h as i32 - 1);
-        if ixmin > ixmax || iymin > iymax {
+        // B12: bbox de entrada por esquinas + aristas muestreadas (helper
+        // compartido con el kernel CFA — mismo margen, misma geometría).
+        let Some((ixmin, ixmax, iymin, iymax)) =
+            ds_drizzle_band_input_bbox(t, w, oy0, oy1, half, scale, img.w, img.h)
+        else {
             return;
-        }
+        };
 
         for iy in iymin..=iymax {
             for ix in ixmin..=ixmax {
@@ -4960,15 +5410,7 @@ fn ds_drizzle_accumulate(
                 for c in 0..ch {
                     let loc_off = loc
                         .map(|(g, gw, gh)| {
-                            ds_sample_local_field(
-                                g,
-                                gw,
-                                gh,
-                                ch,
-                                c,
-                                ox / w as f32,
-                                oy / h as f32,
-                            )
+                            ds_sample_local_field(g, gw, gh, ch, c, ox / w as f32, oy / h as f32)
                         })
                         .unwrap_or(0.0);
                     vals[c] = img.data[base + c] * norm.0[c] + norm.1[c] + loc_off;
@@ -5018,6 +5460,9 @@ fn ds_drizzle_accumulate(
                                 sum_band[lpix * ch + c] += vals[c] as f64 * wv;
                                 if let Some(sq) = sq_band.as_deref_mut() {
                                     sq[lpix * ch + c] += (vals[c] as f64) * (vals[c] as f64) * wv;
+                                }
+                                if let Some(wsq) = wsq_band.as_deref_mut() {
+                                    wsq[lpix * ch + c] += wv * wv;
                                 }
                                 wgt_band[lpix * ch + c] += wv;
                             }
@@ -5137,31 +5582,14 @@ fn ds_drizzle_cfa_accumulate(
             std::slice::from_raw_parts_mut((p as *mut f64).add(oy0 * w), rows * w)
         });
 
-        let mut ixmin = i32::MAX;
-        let mut ixmax = i32::MIN;
-        let mut iymin = i32::MAX;
-        let mut iymax = i32::MIN;
-        for &(ox, oy) in &[
-            (-half, oy0 as f32 - half),
-            (w as f32 + half, oy0 as f32 - half),
-            (-half, oy1 as f32 + half),
-            (w as f32 + half, oy1 as f32 + half),
-            (w as f32 * 0.5, (oy0 + oy1) as f32 * 0.5),
-        ] {
-            if let Some((sx, sy)) = t.inverse(ox / scale, oy / scale) {
-                ixmin = ixmin.min(sx.floor() as i32);
-                ixmax = ixmax.max(sx.ceil() as i32);
-                iymin = iymin.min(sy.floor() as i32);
-                iymax = iymax.max(sy.ceil() as i32);
-            }
-        }
-        ixmin = ixmin.max(0);
-        iymin = iymin.max(0);
-        ixmax = ixmax.min(img.w as i32 - 1);
-        iymax = iymax.min(img.h as i32 - 1);
-        if ixmin > ixmax || iymin > iymax {
+        // B12: bbox por el MISMO helper que el kernel RGB. Antes este kernel
+        // no aplicaba el margen +1 de la convención centro (+0.5): los dos
+        // masters (mono/RGB y CFA) deben compartir geometría exacta.
+        let Some((ixmin, ixmax, iymin, iymax)) =
+            ds_drizzle_band_input_bbox(t, w, oy0, oy1, half, scale, img.w, img.h)
+        else {
             return;
-        }
+        };
 
         for iy in iymin..=iymax {
             for ix in ixmin..=ixmax {
@@ -5181,15 +5609,7 @@ fn ds_drizzle_cfa_accumulate(
                 let py1 = (dy1.ceil() as i32 - 1).max(py0);
                 let loc_off = loc
                     .map(|(g, gw, gh)| {
-                        ds_sample_local_field(
-                            g,
-                            gw,
-                            gh,
-                            3,
-                            c,
-                            ox / w as f32,
-                            oy / h as f32,
-                        )
+                        ds_sample_local_field(g, gw, gh, 3, c, ox / w as f32, oy / h as f32)
                     })
                     .unwrap_or(0.0);
                 // Peso local del Rescate de detalle (1.0 exacto con wq=None).
@@ -5264,6 +5684,20 @@ fn ds_cfa_coverage(wgt_rgb: &[f64]) -> Vec<f64> {
         .collect()
 }
 
+/// Cobertura espacial completa para SCI interleaved. DQ tiene una palabra por
+/// píxel, no por canal; por ello un RGB sólo está cubierto si todos sus canales
+/// conservan peso. El mínimo hace visible un canal totalmente rechazado en vez
+/// de esconderlo detrás de la media de los restantes.
+fn ds_complete_channel_coverage(weights: &[f64], ch: usize) -> Vec<f64> {
+    if ch == 0 {
+        return Vec::new();
+    }
+    weights
+        .chunks_exact(ch)
+        .map(|channels| channels.iter().copied().fold(f64::INFINITY, f64::min))
+        .collect()
+}
+
 /// Preserve the scientific meaning of zero drizzle coverage. Interpolating a
 /// neighbour into SCI fabricates a measurement even if coverage remains zero;
 /// mark every channel NaN so FITS/DQ consumers cannot mistake it for signal.
@@ -5332,8 +5766,7 @@ fn ds_reconcile_scientific_planes_with_dq(
     for (pixel, &flags) in dq.iter().enumerate() {
         let no_coverage = flags & crate::deepsky_variance::dq::NO_COVERAGE != 0;
         let invalid_input = flags
-            & (crate::deepsky_variance::dq::NAN_INPUT
-                | crate::deepsky_variance::dq::FLAT_INVALID)
+            & (crate::deepsky_variance::dq::NAN_INPUT | crate::deepsky_variance::dq::FLAT_INVALID)
             != 0;
         let uncertainty_unavailable =
             flags & crate::deepsky_variance::dq::EIDR_UNCERTAINTY_UNAVAILABLE != 0;
@@ -5377,17 +5810,18 @@ fn ds_classic_products_from_moments(
     let mut neff = vec![0.0f32; len];
     let mut coverage = vec![0.0f64; npx];
     for p in 0..npx {
-        let mut pixel_coverage = 0.0f64;
+        let mut pixel_coverage = f64::INFINITY;
         for c in 0..ch {
             let i = p * ch + c;
             let w = weights[i];
             let w2 = weight_sq[i];
             if !w.is_finite() || !w2.is_finite() || w <= 0.0 || w2 <= 0.0 {
+                pixel_coverage = 0.0;
                 continue;
             }
             let effective_n = (w * w / w2).max(0.0);
             neff[i] = effective_n as f32;
-            pixel_coverage += w;
+            pixel_coverage = pixel_coverage.min(w);
             if effective_n > 1.0 + 1e-6 {
                 let weighted_m2 = (sumsq[i] - sum[i] * sum[i] / w).max(0.0);
                 let unbiased_denom = w - w2 / w;
@@ -5400,7 +5834,11 @@ fn ds_classic_products_from_moments(
                 }
             }
         }
-        coverage[p] = pixel_coverage / ch as f64;
+        coverage[p] = if pixel_coverage.is_finite() {
+            pixel_coverage
+        } else {
+            0.0
+        };
     }
     let mut dq = ds_dq_from_coverage(&coverage);
     for p in 0..npx {
@@ -5496,26 +5934,16 @@ fn ds_classic_products_from_calibration(
 
         (0..h).into_par_iter().for_each(|y| {
             let var_row = unsafe {
-                std::slice::from_raw_parts_mut(
-                    (var_ptr as *mut f64).add(y * w * ch),
-                    w * ch,
-                )
+                std::slice::from_raw_parts_mut((var_ptr as *mut f64).add(y * w * ch), w * ch)
             };
             let weight_row = unsafe {
-                std::slice::from_raw_parts_mut(
-                    (weight_ptr as *mut f64).add(y * w * ch),
-                    w * ch,
-                )
+                std::slice::from_raw_parts_mut((weight_ptr as *mut f64).add(y * w * ch), w * ch)
             };
             let weight_sq_row = unsafe {
-                std::slice::from_raw_parts_mut(
-                    (weight_sq_ptr as *mut f64).add(y * w * ch),
-                    w * ch,
-                )
+                std::slice::from_raw_parts_mut((weight_sq_ptr as *mut f64).add(y * w * ch), w * ch)
             };
-            let dq_row = unsafe {
-                std::slice::from_raw_parts_mut((dq_ptr as *mut u32).add(y * w), w)
-            };
+            let dq_row =
+                unsafe { std::slice::from_raw_parts_mut((dq_ptr as *mut u32).add(y * w), w) };
             for x in 0..w {
                 let Some((sx, sy)) = transform.inverse(x as f32, y as f32) else {
                     continue;
@@ -5530,13 +5958,8 @@ fn ds_classic_products_from_calibration(
                 let local_weight = wq
                     .map(|(grid, gw, gh)| {
                         frame_weight
-                            * ds_sample_grid(
-                                grid,
-                                gw,
-                                gh,
-                                x as f32 / w as f32,
-                                y as f32 / h as f32,
-                            ) as f64
+                            * ds_sample_grid(grid, gw, gh, x as f32 / w as f32, y as f32 / h as f32)
+                                as f64
                     })
                     .unwrap_or(frame_weight);
                 let mut sampled_science = [f32::NAN; 3];
@@ -5663,9 +6086,8 @@ fn ds_classic_products_from_calibration(
                             )
                         })
                         .unwrap_or(0.0);
-                    let normalized_science = sampled_science[channel] * norm.0[channel]
-                        + norm.1[channel]
-                        + loc_offset;
+                    let normalized_science =
+                        sampled_science[channel] * norm.0[channel] + norm.1[channel] + loc_offset;
                     let normalized_variance =
                         sampled_variance[channel] * norm.0[channel] * norm.0[channel];
                     if !normalized_science.is_finite()
@@ -5699,14 +6121,15 @@ fn ds_classic_products_from_calibration(
         return Ok(None);
     }
     for pixel in 0..w * h {
-        let mut covered = false;
+        let mut covered = true;
         for channel in 0..ch {
             let sample = pixel * ch + channel;
             if weight[sample] > 0.0 && weight_sq[sample] > 0.0 {
-                covered = true;
                 variance[sample] =
                     (variance_numerator[sample] / (weight[sample] * weight[sample])) as f32;
                 neff[sample] = (weight[sample] * weight[sample] / weight_sq[sample]) as f32;
+            } else {
+                covered = false;
             }
         }
         if covered {
@@ -5739,8 +6162,7 @@ fn ds_classic_products_from_calibration(
         neff,
         dq: dq_out,
         masked_samples: 0,
-        variance_origin:
-            crate::deepsky_variance::VarianceOrigin::HybridEmpiricalPropagated,
+        variance_origin: crate::deepsky_variance::VarianceOrigin::HybridEmpiricalPropagated,
         g1g2_offset_max: None,
     }))
 }
@@ -5761,7 +6183,7 @@ fn ds_neutralize_background(data: &mut [f32], w: usize, h: usize, ch: usize) -> 
     let mut bg = [0.0f32; 3];
     for c in 0..3 {
         let mut s: Vec<f32> = (0..n).step_by(step).map(|i| data[i * 3 + c]).collect();
-        s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        s.sort_by(|a, b| a.total_cmp(b));
         // 25th percentile ≈ background (object is a minority of pixels).
         bg[c] = s[s.len() / 4];
     }
@@ -5859,6 +6281,21 @@ fn ds_autocrop(
     (out, nw, nh)
 }
 
+fn ds_apply_autocrop(
+    enabled: bool,
+    data: &[f32],
+    cov: &[f64],
+    w: usize,
+    h: usize,
+    ch: usize,
+) -> (Vec<f32>, usize, usize, usize, usize) {
+    if enabled {
+        ds_autocrop_with_origin(data, cov, w, h, ch)
+    } else {
+        (data.to_vec(), w, h, 0, 0)
+    }
+}
+
 fn ds_crop_plane<T: Copy>(
     plane: &[T],
     w: usize,
@@ -5890,10 +6327,10 @@ fn ds_stf_params(mut sample: Vec<f32>, shadow_k: f32, target: f32) -> (f32, f32)
     if sample.is_empty() {
         return (0.0, 0.5);
     }
-    sample.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sample.sort_by(|a, b| a.total_cmp(b));
     let med = sample[sample.len() / 2];
     let mut dev: Vec<f32> = sample.iter().map(|v| (v - med).abs()).collect();
-    dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    dev.sort_by(|a, b| a.total_cmp(b));
     let mad = (dev[dev.len() / 2] * 1.4826).max(1.0 / 65535.0);
     let c = (med - shadow_k * mad).max(0.0);
     let m_in = ((med - c) / (1.0 - c)).clamp(1.0 / 65535.0, 0.99);
@@ -5989,7 +6426,7 @@ fn ds_stretch16(rgb: &[u16], w: usize, h: usize, mode: &str, strength: f32) -> V
             .step_by(step)
             .map(|i| (rgb[i * 3] as f32 + rgb[i * 3 + 1] as f32 + rgb[i * 3 + 2] as f32) / 3.0)
             .collect();
-        smp.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        smp.sort_by(|a, b| a.total_cmp(b));
         let lo = smp[smp.len() / 1000];
         let hi = (smp[smp.len() - 1 - smp.len() / 1000]).max(lo + 1.0);
         let mut out = vec![0u16; n * 3];
@@ -6037,11 +6474,22 @@ fn deepsky_restretch(
     strength: Option<f32>,
 ) -> Result<String, String> {
     let (rgb16, w, h) = {
-        let guard = state.stacked_image.lock().unwrap();
-        let img = guard
+        let guard = state.deep_sky_result.lock().unwrap();
+        let result = guard
             .as_ref()
-            .ok_or("No hay resultado apilado en memoria.")?;
-        (img.data.clone(), img.width, img.height)
+            .ok_or("No hay resultado lineal de cielo profundo en memoria.")?;
+        // El STF es una vista, no el producto cientifico. Materializarlo a la
+        // resolucion completa (y despues RGB8 + RGBA + PNG) duplicaba cientos
+        // de MiB justo despues de restaurar un checkpoint Drizzle x2. El
+        // promedio de area acotado conserva el encuadre y la fotometria visual
+        // mientras el master float32 permanece intacto y a resolucion completa.
+        ds_poststack_preview_rgb16(
+            &result.data,
+            result.width,
+            result.height,
+            result.channels,
+            None,
+        )
     };
     if rgb16.len() < w * h * 3 {
         return Err("Resultado no compatible con re-estirado RGB.".into());
@@ -6061,7 +6509,7 @@ fn deepsky_restretch(
                     (rgb16[i * 3] as f32 + rgb16[i * 3 + 1] as f32 + rgb16[i * 3 + 2] as f32) / 3.0
                 })
                 .collect();
-            s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            s.sort_by(|a, b| a.total_cmp(b));
             let lo = s[s.len() / 1000] as f32;
             let hi = (s[s.len() - 1 - s.len() / 1000] as f32).max(lo + 1.0);
             let mut out = vec![0u8; n * 3];
@@ -6177,118 +6625,1301 @@ fn deepsky_frame_preview(
     ))
 }
 
+const DS_PRODUCT_CACHE_MAGIC: &[u8; 8] = b"ZDSPv2\0\0";
+const DS_PRODUCT_CACHE_DIGEST_BYTES: usize = 32;
+const DS_PRODUCT_RESUME_SCHEMA: &str = "zenith-deepsky-product-resume-v2";
+const DS_PRODUCT_RESUME_DIR: &str = "Productos_Completados";
+
+struct DsSha256Writer<W> {
+    inner: W,
+    hasher: sha2::Sha256,
+}
+
+impl<W> DsSha256Writer<W> {
+    fn new(inner: W) -> Self {
+        use sha2::Digest as _;
+
+        Self {
+            inner,
+            hasher: sha2::Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> [u8; DS_PRODUCT_CACHE_DIGEST_BYTES] {
+        use sha2::Digest as _;
+
+        self.hasher.finalize().into()
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for DsSha256Writer<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest as _;
+
+        let written = self.inner.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct DsSha256Reader<R> {
+    inner: R,
+    hasher: sha2::Sha256,
+}
+
+impl<R> DsSha256Reader<R> {
+    fn new(inner: R) -> Self {
+        use sha2::Digest as _;
+
+        Self {
+            inner,
+            hasher: sha2::Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> (R, [u8; DS_PRODUCT_CACHE_DIGEST_BYTES]) {
+        use sha2::Digest as _;
+
+        (self.inner, self.hasher.finalize().into())
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for DsSha256Reader<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        use sha2::Digest as _;
+
+        let read = self.inner.read(bytes)?;
+        self.hasher.update(&bytes[..read]);
+        Ok(read)
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DsProductCacheWrite<'a> {
+    id: &'a str,
+    data: &'a [f32],
+    width: usize,
+    height: usize,
+    channels: usize,
+    coverage: &'a [f32],
+    weight: &'a [f32],
+    rejection_low: &'a [f32],
+    rejection_high: &'a [f32],
+    registration_residuals: &'a [f32],
+    engine: &'a str,
+    method: &'a str,
+    frames_used: usize,
+    frames_rejected: usize,
+    elapsed_seconds: f32,
+    recipe_json: &'a str,
+    variance: Option<&'a [f32]>,
+    neff: Option<&'a [f32]>,
+    dq: Option<&'a [u32]>,
+    struct_map: Option<&'a [f32]>,
+    struct_residual: Option<&'a [f32]>,
+    recoverability: Option<&'a [f32]>,
+    source_data: Option<&'a [f32]>,
+    source_variance: Option<&'a [f32]>,
+    source_layout: Option<&'a PostStackSourceLayout>,
+    post_stack_recipe: &'a PostStackRecipe,
+    astrometry_solution: Option<&'a AstrometrySolution>,
+}
+
+#[derive(serde::Deserialize)]
+struct DsProductCacheRead {
+    id: String,
+    data: Vec<f32>,
+    width: usize,
+    height: usize,
+    channels: usize,
+    coverage: Vec<f32>,
+    weight: Vec<f32>,
+    rejection_low: Vec<f32>,
+    rejection_high: Vec<f32>,
+    registration_residuals: Vec<f32>,
+    engine: String,
+    method: String,
+    frames_used: usize,
+    frames_rejected: usize,
+    elapsed_seconds: f32,
+    recipe_json: String,
+    variance: Option<Vec<f32>>,
+    neff: Option<Vec<f32>>,
+    dq: Option<Vec<u32>>,
+    struct_map: Option<Vec<f32>>,
+    struct_residual: Option<Vec<f32>>,
+    recoverability: Option<Vec<f32>>,
+    source_data: Option<Vec<f32>>,
+    source_variance: Option<Vec<f32>>,
+    source_layout: Option<PostStackSourceLayout>,
+    post_stack_recipe: PostStackRecipe,
+    astrometry_solution: Option<AstrometrySolution>,
+}
+
+impl DsProductCacheRead {
+    fn into_result(self) -> Result<DeepSkyResult, String> {
+        let recipe = serde_json::from_str(&self.recipe_json)
+            .map_err(|error| format!("Receta del caché de producto inválida: {error}"))?;
+        Ok(DeepSkyResult {
+            id: self.id,
+            data: self.data,
+            width: self.width,
+            height: self.height,
+            channels: self.channels,
+            coverage: self.coverage,
+            weight: self.weight,
+            rejection_low: self.rejection_low,
+            rejection_high: self.rejection_high,
+            registration_residuals: self.registration_residuals,
+            engine: self.engine,
+            method: self.method,
+            frames_used: self.frames_used,
+            frames_rejected: self.frames_rejected,
+            elapsed_seconds: self.elapsed_seconds,
+            recipe,
+            variance: self.variance,
+            neff: self.neff,
+            dq: self.dq,
+            struct_map: self.struct_map,
+            struct_residual: self.struct_residual,
+            recoverability: self.recoverability,
+            source_data: self.source_data,
+            source_variance: self.source_variance,
+            source_layout: self.source_layout,
+            post_stack_recipe: self.post_stack_recipe,
+            astrometry_solution: self.astrometry_solution,
+        })
+    }
+}
+
+fn ds_result_resident_bytes(result: &DeepSkyResult) -> u64 {
+    let f32_bytes = std::mem::size_of::<f32>() as u64;
+    let u32_bytes = std::mem::size_of::<u32>() as u64;
+    let mut bytes = 0u64;
+    for plane in [
+        Some(&result.data),
+        Some(&result.coverage),
+        Some(&result.weight),
+        Some(&result.rejection_low),
+        Some(&result.rejection_high),
+        Some(&result.registration_residuals),
+        result.variance.as_ref(),
+        result.neff.as_ref(),
+        result.struct_map.as_ref(),
+        result.struct_residual.as_ref(),
+        result.recoverability.as_ref(),
+        result.source_data.as_ref(),
+        result.source_variance.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        bytes = bytes.saturating_add((plane.len() as u64).saturating_mul(f32_bytes));
+    }
+    if let Some(dq) = &result.dq {
+        bytes = bytes.saturating_add((dq.len() as u64).saturating_mul(u32_bytes));
+    }
+    bytes
+}
+
+fn ds_validate_cached_result(result: &DeepSkyResult) -> Result<(), String> {
+    let npx = result
+        .width
+        .checked_mul(result.height)
+        .filter(|count| *count > 0)
+        .ok_or("Caché de producto con geometría vacía o fuera de rango")?;
+    if !matches!(result.channels, 1 | 3) {
+        return Err(format!(
+            "Caché de producto con {} canales; se esperaban 1 o 3",
+            result.channels
+        ));
+    }
+    let samples = npx
+        .checked_mul(result.channels)
+        .ok_or("Caché de producto con demasiadas muestras")?;
+    if result.data.len() != samples {
+        return Err(format!(
+            "Caché SCI truncado: {} muestras; se esperaban {samples}",
+            result.data.len()
+        ));
+    }
+    for (name, plane) in [
+        ("coverage", &result.coverage),
+        ("weight", &result.weight),
+        ("rejection_low", &result.rejection_low),
+        ("rejection_high", &result.rejection_high),
+        ("registration_residuals", &result.registration_residuals),
+    ] {
+        if plane.len() != npx {
+            return Err(format!(
+                "Caché {name} truncado: {} muestras; se esperaban {npx}",
+                plane.len()
+            ));
+        }
+    }
+    for (name, plane) in [
+        ("variance", result.variance.as_ref()),
+        ("neff", result.neff.as_ref()),
+    ] {
+        if let Some(plane) = plane {
+            if plane.len() != samples {
+                return Err(format!(
+                    "Caché {name} truncado: {} muestras; se esperaban {samples}",
+                    plane.len()
+                ));
+            }
+        }
+    }
+    for (name, plane) in [
+        ("struct", result.struct_map.as_ref()),
+        ("struct_residual", result.struct_residual.as_ref()),
+        ("recoverability", result.recoverability.as_ref()),
+    ] {
+        if let Some(plane) = plane {
+            if plane.len() != npx {
+                return Err(format!(
+                    "Caché {name} truncado: {} muestras; se esperaban {npx}",
+                    plane.len()
+                ));
+            }
+        }
+    }
+    if let Some(dq) = &result.dq {
+        if dq.len() != npx {
+            return Err(format!(
+                "Caché DQ truncado: {} muestras; se esperaban {npx}",
+                dq.len()
+            ));
+        }
+    }
+    match (&result.source_data, &result.source_variance, &result.source_layout) {
+        (None, None, None) => {}
+        (None, _, _) => {
+            return Err(
+                "Caché de producto con mapas fuente pero sin source_data original".into(),
+            )
+        }
+        (Some(_), _, None) => {
+            return Err("Caché de producto con source_data pero sin source_layout".into())
+        }
+        (Some(source_data), source_variance, Some(layout)) => {
+            let source_npx = layout
+                .width
+                .checked_mul(layout.height)
+                .filter(|count| *count > 0)
+                .ok_or("Caché de producto con geometría fuente vacía o fuera de rango")?;
+            let source_samples = source_npx
+                .checked_mul(result.channels)
+                .ok_or("Caché de producto con demasiadas muestras fuente")?;
+            if source_data.len() != source_samples {
+                return Err(format!(
+                    "Caché source_data truncado: {} muestras; se esperaban {source_samples}",
+                    source_data.len()
+                ));
+            }
+            if let Some(source_variance) = source_variance {
+                if source_variance.len() != source_samples {
+                    return Err(format!(
+                        "Caché source_variance truncado: {} muestras; se esperaban {source_samples}",
+                        source_variance.len()
+                    ));
+                }
+            }
+            for (name, plane) in [
+                ("source.coverage", &layout.coverage),
+                ("source.weight", &layout.weight),
+                ("source.rejection_low", &layout.rejection_low),
+                ("source.rejection_high", &layout.rejection_high),
+                (
+                    "source.registration_residuals",
+                    &layout.registration_residuals,
+                ),
+            ] {
+                if plane.len() != source_npx {
+                    return Err(format!(
+                        "Caché {name} truncado: {} muestras; se esperaban {source_npx}",
+                        plane.len()
+                    ));
+                }
+            }
+            if let Some(neff) = &layout.neff {
+                if neff.len() != source_samples {
+                    return Err(format!(
+                        "Caché source.neff truncado: {} muestras; se esperaban {source_samples}",
+                        neff.len()
+                    ));
+                }
+            }
+            if let Some(dq) = &layout.dq {
+                if dq.len() != source_npx {
+                    return Err(format!(
+                        "Caché source.dq truncado: {} muestras; se esperaban {source_npx}",
+                        dq.len()
+                    ));
+                }
+            }
+            for (name, plane) in [
+                ("source.struct", layout.struct_map.as_ref()),
+                ("source.struct_residual", layout.struct_residual.as_ref()),
+                ("source.recoverability", layout.recoverability.as_ref()),
+            ] {
+                if let Some(plane) = plane {
+                    if plane.len() != source_npx {
+                        return Err(format!(
+                            "Caché {name} truncado: {} muestras; se esperaban {source_npx}",
+                            plane.len()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Identidad conservadora de un trabajo reanudable. Incluye el request ya
+/// resuelto (perfil/Auto incluidos), la huella de contenido de todos los
+/// orígenes y una versión explícita del contrato. Cualquier cambio de tomas,
+/// asignación, rechazo, drizzle, método, producto o política invalida el hit.
+fn ds_product_resume_engine_identity() -> String {
+    format!(
+        "package={};commit={};worktree={}",
+        env!("CARGO_PKG_VERSION"),
+        env!("ZAS_GIT_COMMIT"),
+        env!("ZAS_WORKTREE_FINGERPRINT")
+    )
+}
+
+fn ds_product_resume_fingerprint_for_product_with_engine_identity(
+    request: &pipeline::DeepSkyStackRequest,
+    product: &pipeline::DeepSkyIntegrationProductRequest,
+    engine_identity: &str,
+) -> Result<String, String> {
+    use sha2::{Digest as _, Sha256};
+
+    // La huella pertenece a la rama, no al conjunto de tarjetas de la UI.
+    // Cambiar el producto principal o retirar EIDR/STRUCT tras una cancelacion
+    // no altera los pixeles Classic ya publicados. Normalizar esos campos
+    // permite reutilizarlo sin relajar ningun parametro cientifico propio.
+    let mut branch_request = request.clone();
+    let mut branch_product = product.clone();
+    branch_product.id = "resume-branch".into();
+    branch_product.primary = true;
+    branch_request.integration_method = None;
+    branch_request.integration_products = vec![branch_product];
+    branch_request.work_dir = None;
+    let request_json = serde_json::to_vec(&branch_request)
+        .map_err(|error| format!("No se pudo identificar la receta reanudable: {error}"))?;
+    let source_fingerprint = ds_source_fingerprint(&[
+        &request.lights,
+        &request.darks,
+        &request.flats,
+        &request.dark_flats,
+        &request.bias,
+    ]);
+    let mut hasher = Sha256::new();
+    hasher.update(DS_PRODUCT_RESUME_SCHEMA.as_bytes());
+    hasher.update(engine_identity.as_bytes());
+    hasher.update(source_fingerprint.as_bytes());
+    hasher.update(&request_json);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn ds_product_resume_fingerprint_for_product(
+    request: &pipeline::DeepSkyStackRequest,
+    product: &pipeline::DeepSkyIntegrationProductRequest,
+) -> Result<String, String> {
+    ds_product_resume_fingerprint_for_product_with_engine_identity(
+        request,
+        product,
+        &ds_product_resume_engine_identity(),
+    )
+}
+
+/// Amplía la identidad reanudable de una rama con el significado científico
+/// del grupo multibanda. `filter_profile` vive fuera de `DeepSkyStackRequest`:
+/// sin este namespace dos grupos con las mismas tomas/receta pero etiquetados
+/// como bandas distintas podrían compartir por accidente el mismo producto.
+/// La huella interna sigue normalizando hermanos, id visible y `primary`, por
+/// lo que cambiar únicamente la selección de productos no invalida una rama
+/// ya publicada.
+fn ds_session_product_resume_fingerprint_with_engine_identity(
+    group_id: &str,
+    filter_profile: &str,
+    request: &pipeline::DeepSkyStackRequest,
+    product: &pipeline::DeepSkyIntegrationProductRequest,
+    engine_identity: &str,
+) -> Result<String, String> {
+    use sha2::{Digest as _, Sha256};
+
+    let branch_fingerprint = ds_product_resume_fingerprint_for_product_with_engine_identity(
+        request,
+        product,
+        engine_identity,
+    )?;
+    let mut hasher = Sha256::new();
+    hasher.update(DS_PRODUCT_RESUME_SCHEMA.as_bytes());
+    hasher.update(b"multiband-scientific-group-v1");
+    hasher.update(group_id.trim().as_bytes());
+    hasher.update([0]);
+    hasher.update(filter_profile.trim().to_ascii_uppercase().as_bytes());
+    hasher.update([0]);
+    hasher.update(branch_fingerprint.as_bytes());
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn ds_session_product_resume_fingerprint(
+    group_id: &str,
+    filter_profile: &str,
+    request: &pipeline::DeepSkyStackRequest,
+    product: &pipeline::DeepSkyIntegrationProductRequest,
+) -> Result<String, String> {
+    ds_session_product_resume_fingerprint_with_engine_identity(
+        group_id,
+        filter_profile,
+        request,
+        product,
+        &ds_product_resume_engine_identity(),
+    )
+}
+
+#[cfg(test)]
+fn ds_product_resume_fingerprint(request: &pipeline::DeepSkyStackRequest) -> Result<String, String> {
+    let product = request
+        .resolved_integration_products()
+        .into_iter()
+        .next()
+        .ok_or("No hay un producto para identificar")?;
+    ds_product_resume_fingerprint_for_product(request, &product)
+}
+
+fn ds_product_resume_root(base: &std::path::Path, fingerprint: &str) -> std::path::PathBuf {
+    base.join(".zenith-cache")
+        .join("Cielo_Profundo")
+        .join(DS_PRODUCT_RESUME_DIR)
+        .join(fingerprint)
+}
+
+fn ds_product_resume_path(
+    base: &std::path::Path,
+    fingerprint: &str,
+    product_id: &str,
+) -> std::path::PathBuf {
+    ds_product_resume_root(base, fingerprint).join(format!(
+        "{}.zds-cache",
+        ds_session_safe_name(product_id)
+    ))
+}
+
+fn ds_mark_product_resume_recipe(
+    result: &mut DeepSkyResult,
+    fingerprint: &str,
+    product_id: &str,
+) {
+    if let Some(recipe) = result.recipe.as_object_mut() {
+        recipe.insert(
+            "resumeCheckpoint".into(),
+            serde_json::json!({
+                "schema": DS_PRODUCT_RESUME_SCHEMA,
+                "fingerprint": fingerprint,
+                "productId": product_id,
+                "complete": true,
+            }),
+        );
+    }
+}
+
+fn ds_mark_session_product_resume_recipe(
+    result: &mut DeepSkyResult,
+    fingerprint: &str,
+    product_id: &str,
+    group_id: &str,
+    filter_profile: &str,
+) {
+    ds_mark_product_resume_recipe(result, fingerprint, product_id);
+    if let Some(checkpoint) = result
+        .recipe
+        .get_mut("resumeCheckpoint")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        checkpoint.insert("scope".into(), serde_json::json!("multibandGroup"));
+        checkpoint.insert("groupId".into(), serde_json::json!(group_id));
+        checkpoint.insert(
+            "filterProfile".into(),
+            serde_json::json!(filter_profile),
+        );
+    }
+}
+
+fn ds_validate_product_resume_recipe(
+    result: &DeepSkyResult,
+    fingerprint: &str,
+    product_id: &str,
+) -> Result<(), String> {
+    let checkpoint = result
+        .recipe
+        .get("resumeCheckpoint")
+        .ok_or("El caché no contiene un contrato de reanudación")?;
+    let schema = checkpoint
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let stored_fingerprint = checkpoint
+        .get("fingerprint")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let stored_product = checkpoint
+        .get("productId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let complete = checkpoint
+        .get("complete")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if schema != DS_PRODUCT_RESUME_SCHEMA
+        || stored_fingerprint != fingerprint
+        || stored_product != product_id
+        || !complete
+    {
+        return Err(format!(
+            "Checkpoint incompatible para '{product_id}' (receta, entradas o configuración diferentes)"
+        ));
+    }
+    Ok(())
+}
+
+fn ds_spill_product_to_disk(
+    cache_root: &std::path::Path,
+    product_id: &str,
+    result: &DeepSkyResult,
+) -> Result<DeepSkyProductCacheEntry, String> {
+    ds_spill_product_to_disk_with_space_probe(cache_root, product_id, result, available_disk_bytes)
+}
+
+fn ds_spill_product_to_disk_with_space_probe<F>(
+    cache_root: &std::path::Path,
+    product_id: &str,
+    result: &DeepSkyResult,
+    space_probe: F,
+) -> Result<DeepSkyProductCacheEntry, String>
+where
+    F: FnOnce(&std::path::Path) -> Option<u64>,
+{
+    let cache_dir = cache_root.join(".zenith-runtime-products");
+    let safe_id = ds_session_safe_name(product_id);
+    let cache_path = cache_dir.join(format!(
+        "{}_{}.zds-cache",
+        safe_id,
+        ds_session_safe_name(&new_job_id("product"))
+    ));
+    ds_write_product_cache_to_path_with_space_probe(
+        &cache_path,
+        product_id,
+        result,
+        true,
+        space_probe,
+    )
+}
+
+fn ds_spill_product_checkpoint(
+    cache_base: &std::path::Path,
+    fingerprint: &str,
+    product_id: &str,
+    result: &DeepSkyResult,
+) -> Result<DeepSkyProductCacheEntry, String> {
+    ds_spill_product_checkpoint_with_space_probe(
+        cache_base,
+        fingerprint,
+        product_id,
+        result,
+        available_disk_bytes,
+    )
+}
+
+fn ds_spill_product_checkpoint_with_space_probe<F>(
+    cache_base: &std::path::Path,
+    fingerprint: &str,
+    product_id: &str,
+    result: &DeepSkyResult,
+    space_probe: F,
+) -> Result<DeepSkyProductCacheEntry, String>
+where
+    F: FnOnce(&std::path::Path) -> Option<u64>,
+{
+    let cache_path = ds_product_resume_path(cache_base, fingerprint, product_id);
+    ds_write_product_cache_to_path_with_space_probe(
+        &cache_path,
+        product_id,
+        result,
+        false,
+        space_probe,
+    )
+}
+
+fn ds_write_product_cache_to_path_with_space_probe<F>(
+    cache_path: &std::path::Path,
+    product_id: &str,
+    result: &DeepSkyResult,
+    remove_on_drop: bool,
+    space_probe: F,
+) -> Result<DeepSkyProductCacheEntry, String>
+where
+    F: FnOnce(&std::path::Path) -> Option<u64>,
+{
+    use bincode::Options as _;
+
+    ds_validate_cached_result(result)?;
+    let cache_dir = cache_path
+        .parent()
+        .ok_or("La ruta del caché de producto no tiene carpeta padre")?;
+    std::fs::create_dir_all(cache_dir)
+        .map_err(|error| format!("No se pudo crear el caché de productos: {error}"))?;
+    let estimated = ds_result_resident_bytes(result)
+        .saturating_add(DS_PRODUCT_CACHE_MAGIC.len() as u64)
+        .saturating_add(DS_PRODUCT_CACHE_DIGEST_BYTES as u64)
+        .saturating_add(64 * 1024 * 1024);
+    if let Some(available) = space_probe(cache_dir) {
+        let reserve = (available / 20).max(2 * 1024 * 1024 * 1024);
+        if estimated.saturating_add(reserve) > available {
+            return Err(format!(
+                "No hay espacio seguro para conservar '{}' fuera de RAM: se requieren ≈{:.1} GB más una reserva de {:.1} GB y quedan {:.1} GB",
+                product_id,
+                estimated as f64 / 1_073_741_824.0,
+                reserve as f64 / 1_073_741_824.0,
+                available as f64 / 1_073_741_824.0
+            ));
+        }
+    }
+    let temp_path = cache_dir.join(format!(
+        ".{}.{}.part",
+        cache_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("producto.zds-cache"),
+        ds_session_safe_name(&new_job_id("publish"))
+    ));
+    let recipe_json = serde_json::to_string(&result.recipe)
+        .map_err(|error| format!("No se pudo serializar la receta de '{product_id}': {error}"))?;
+    let payload = DsProductCacheWrite {
+        id: &result.id,
+        data: &result.data,
+        width: result.width,
+        height: result.height,
+        channels: result.channels,
+        coverage: &result.coverage,
+        weight: &result.weight,
+        rejection_low: &result.rejection_low,
+        rejection_high: &result.rejection_high,
+        registration_residuals: &result.registration_residuals,
+        engine: &result.engine,
+        method: &result.method,
+        frames_used: result.frames_used,
+        frames_rejected: result.frames_rejected,
+        elapsed_seconds: result.elapsed_seconds,
+        recipe_json: &recipe_json,
+        variance: result.variance.as_deref(),
+        neff: result.neff.as_deref(),
+        dq: result.dq.as_deref(),
+        struct_map: result.struct_map.as_deref(),
+        struct_residual: result.struct_residual.as_deref(),
+        recoverability: result.recoverability.as_deref(),
+        source_data: result.source_data.as_deref(),
+        source_variance: result.source_variance.as_deref(),
+        source_layout: result.source_layout.as_ref(),
+        post_stack_recipe: &result.post_stack_recipe,
+        astrometry_solution: result.astrometry_solution.as_ref(),
+    };
+    let write_result = (|| -> Result<(), String> {
+        use std::io::Seek as _;
+
+        let file = std::fs::File::create(&temp_path)
+            .map_err(|error| format!("No se pudo crear el caché de '{product_id}': {error}"))?;
+        let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
+        writer
+            .write_all(DS_PRODUCT_CACHE_MAGIC)
+            .map_err(|error| format!("No se pudo iniciar el caché de '{product_id}': {error}"))?;
+        writer
+            .write_all(&[0u8; DS_PRODUCT_CACHE_DIGEST_BYTES])
+            .map_err(|error| {
+                format!("No se pudo reservar la firma de '{product_id}': {error}")
+            })?;
+        let digest = {
+            let mut hashing_writer = DsSha256Writer::new(&mut writer);
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .serialize_into(&mut hashing_writer, &payload)
+                .map_err(|error| format!("No se pudo serializar '{product_id}': {error}"))?;
+            hashing_writer
+                .flush()
+                .map_err(|error| format!("No se pudo vaciar '{product_id}': {error}"))?;
+            hashing_writer.finish()
+        };
+        writer
+            .flush()
+            .map_err(|error| format!("No se pudo vaciar el caché de '{product_id}': {error}"))?;
+        writer
+            .seek(std::io::SeekFrom::Start(DS_PRODUCT_CACHE_MAGIC.len() as u64))
+            .map_err(|error| format!("No se pudo firmar el caché de '{product_id}': {error}"))?;
+        writer.write_all(&digest).map_err(|error| {
+            format!("No se pudo publicar la firma de '{product_id}': {error}")
+        })?;
+        writer
+            .flush()
+            .map_err(|error| format!("No se pudo vaciar la firma de '{product_id}': {error}"))?;
+        writer
+            .get_ref()
+            .sync_data()
+            .map_err(|error| format!("No se pudo sincronizar el caché de '{product_id}': {error}"))
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    // El destino nunca contiene bytes parciales: se publica sólo después de
+    // flush+fsync. Si había un checkpoint corrupto de la misma huella se
+    // aparta primero; un corte en esta ventana produce un miss seguro, nunca
+    // un falso hit.
+    if cache_path.exists() {
+        let stale_path = cache_dir.join(format!(
+            ".{}.stale-{}",
+            cache_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("producto.zds-cache"),
+            ds_session_safe_name(&new_job_id("old"))
+        ));
+        std::fs::rename(cache_path, &stale_path).map_err(|error| {
+            format!("No se pudo apartar el caché previo de '{product_id}': {error}")
+        })?;
+        let _ = std::fs::remove_file(stale_path);
+    }
+    std::fs::rename(&temp_path, cache_path)
+        .map_err(|error| format!("No se pudo publicar el caché de '{product_id}': {error}"))?;
+    #[cfg(unix)]
+    {
+        // Persistir la entrada de directorio además del contenido del archivo
+        // permite recuperar un producto completo tras una terminación abrupta.
+        std::fs::File::open(cache_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                format!("No se pudo confirmar el checkpoint de '{product_id}': {error}")
+            })?;
+    }
+    let stored_bytes = std::fs::metadata(cache_path)
+        .map_err(|error| format!("No se pudo medir el caché de '{product_id}': {error}"))?
+        .len();
+    Ok(if remove_on_drop {
+        DeepSkyProductCacheEntry::transient(cache_path.to_path_buf(), stored_bytes)
+    } else {
+        DeepSkyProductCacheEntry::durable(cache_path.to_path_buf(), stored_bytes)
+    })
+}
+
+const DS_PRODUCT_RESTORE_PREVIEW_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn ds_product_cache_safe_load_budget(available_bytes: u64) -> u64 {
+    // El archivo serializado aproxima el residente float32. Al restaurarlo se
+    // añade un espejo RGB16 de como máximo 25% de ese tamaño (por los cinco
+    // planos escalares obligatorios) y una vista <=1600 px. Limitar el pico
+    // completo a 85% deja reserva real para SO/GPU/runtime, en vez de validar
+    // únicamente los bytes del checkpoint y fallar al construir la vista.
+    available_bytes
+        .saturating_mul(85)
+        .checked_div(100)
+        .unwrap_or(0)
+        .saturating_sub(DS_PRODUCT_RESTORE_PREVIEW_RESERVE_BYTES)
+        .saturating_mul(4)
+        / 5
+}
+
+fn ds_product_cache_fits_load_budget(stored_bytes: u64, available_bytes: u64) -> bool {
+    stored_bytes <= ds_product_cache_safe_load_budget(available_bytes)
+}
+
+fn ds_product_cache_load_budget_error(
+    product_id: &str,
+    stored_bytes: u64,
+    available_bytes: u64,
+) -> String {
+    format!(
+        "El producto '{}' necesita ≈{:.1} GB para abrirse y el presupuesto seguro actual es {:.1} GB; cierra otras aplicaciones o elige una salida 1×",
+        product_id,
+        stored_bytes as f64 / 1_073_741_824.0,
+        ds_product_cache_safe_load_budget(available_bytes) as f64 / 1_073_741_824.0
+    )
+}
+
+fn ds_load_product_from_disk(
+    product_id: &str,
+    entry: &DeepSkyProductCacheEntry,
+) -> Result<DeepSkyResult, String> {
+    ds_load_product_from_disk_with_available(product_id, entry, None)
+}
+
+fn ds_load_product_from_disk_with_available(
+    product_id: &str,
+    entry: &DeepSkyProductCacheEntry,
+    available_override: Option<u64>,
+) -> Result<DeepSkyResult, String> {
+    use bincode::Options as _;
+    use std::io::Seek as _;
+
+    let mut system = sysinfo::System::new_all();
+    system.refresh_memory();
+    let available = available_override
+        .map(|known_reclaimable| system.available_memory().max(known_reclaimable))
+        .unwrap_or_else(|| system.available_memory());
+    // La deserialización materializa el producto y después crea el espejo u16
+    // activo. El presupuesto común ya incluye ese pico, la vista acotada y la
+    // reserva del SO/GPU/runtime; no se aplica aquí un piso artificial que
+    // pudiera autorizar la carga precisamente cuando queda poca memoria.
+    if !ds_product_cache_fits_load_budget(entry.stored_bytes, available) {
+        return Err(ds_product_cache_load_budget_error(
+            product_id,
+            entry.stored_bytes,
+            available,
+        ));
+    }
+    let file = std::fs::File::open(&entry.path)
+        .map_err(|error| format!("No se pudo abrir el caché de '{product_id}': {error}"))?;
+    let mut reader = std::io::BufReader::with_capacity(1024 * 1024, file);
+    let mut magic = [0u8; 8];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|error| format!("Caché de '{product_id}' truncado: {error}"))?;
+    if &magic != DS_PRODUCT_CACHE_MAGIC {
+        return Err(format!(
+            "El caché temporal de '{product_id}' pertenece a otra versión"
+        ));
+    }
+    let mut expected_digest = [0u8; DS_PRODUCT_CACHE_DIGEST_BYTES];
+    reader
+        .read_exact(&mut expected_digest)
+        .map_err(|error| format!("Firma de '{product_id}' truncada: {error}"))?;
+    let payload_bytes = entry.stored_bytes.saturating_sub(
+        (DS_PRODUCT_CACHE_MAGIC.len() + DS_PRODUCT_CACHE_DIGEST_BYTES) as u64,
+    );
+    // Verificar antes de deserializar evita que un length prefix corrupto
+    // provoque una reserva descontrolada y garantiza que ningún píxel llega al
+    // editor antes de validar todos los bytes del payload.
+    let mut hashing_reader = DsSha256Reader::new(reader);
+    std::io::copy(&mut hashing_reader, &mut std::io::sink())
+        .map_err(|error| format!("No se pudo verificar '{product_id}': {error}"))?;
+    let (mut reader, actual_digest) = hashing_reader.finish();
+    if actual_digest != expected_digest {
+        return Err(format!(
+            "La integridad SHA-256 del checkpoint de '{product_id}' no coincide"
+        ));
+    }
+    reader
+        .seek(std::io::SeekFrom::Start(
+            (DS_PRODUCT_CACHE_MAGIC.len() + DS_PRODUCT_CACHE_DIGEST_BYTES) as u64,
+        ))
+        .map_err(|error| format!("No se pudo releer '{product_id}': {error}"))?;
+    let cached: DsProductCacheRead = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(payload_bytes.saturating_add(1))
+        .deserialize_from(&mut reader)
+        .map_err(|error| format!("No se pudo restaurar '{product_id}': {error}"))?;
+    let result = cached.into_result()?;
+    ds_validate_cached_result(&result)?;
+    Ok(result)
+}
+
+fn ds_try_restore_product_checkpoint(
+    cache_base: &std::path::Path,
+    fingerprint: &str,
+    product_id: &str,
+) -> Result<Option<(DeepSkyResult, DeepSkyProductCacheEntry)>, String> {
+    let path = ds_product_resume_path(cache_base, fingerprint, product_id);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "No se pudo inspeccionar el checkpoint de '{product_id}': {error}"
+            ))
+        }
+    };
+    let entry = DeepSkyProductCacheEntry::durable(path.clone(), metadata.len());
+    let restored = match ds_load_product_from_disk(product_id, &entry) {
+        Err(error) if error.contains("presupuesto seguro actual") => return Err(error),
+        other => other,
+    }
+        .and_then(|result| {
+            ds_validate_product_resume_recipe(&result, fingerprint, product_id)?;
+            Ok(result)
+        })
+        .map_err(|error| {
+            // Un archivo truncado/incompatible no puede bloquear la receta.
+            // Se elimina de forma cerrada y el llamador recalcula la rama.
+            let _ = std::fs::remove_file(&path);
+            format!("Se descartó el checkpoint inválido de '{product_id}': {error}")
+        })?;
+    Ok(Some((restored, entry)))
+}
+
+/// Cambia el producto lineal activo de una receta v5 sin recalcular. El
+/// anterior se vuelca de forma lossless al NVMe y se libera antes de cargar el
+/// siguiente, evitando que dos másteres científicos gigantes coexistan en RAM.
+fn ds_select_product_transaction<FSpill, FLoad, FPreview>(
+    requested: &str,
+    active: &mut Option<String>,
+    products: &mut std::collections::BTreeMap<String, DeepSkyProductCacheEntry>,
+    current_result: &mut Option<DeepSkyResult>,
+    current_preview: &mut Option<StackResult>,
+    available_before_switch: u64,
+    mut spill: FSpill,
+    mut load: FLoad,
+    mut build_preview: FPreview,
+) -> Result<String, String>
+where
+    FSpill: FnMut(
+        &std::path::Path,
+        &str,
+        &DeepSkyResult,
+    ) -> Result<DeepSkyProductCacheEntry, String>,
+    FLoad: FnMut(
+        &str,
+        &DeepSkyProductCacheEntry,
+        Option<u64>,
+    ) -> Result<DeepSkyResult, String>,
+    FPreview: FnMut(&DeepSkyResult) -> Result<StackResult, String>,
+{
+    if active.as_deref() == Some(requested) {
+        return Ok(requested.to_string());
+    }
+    let previous_id = active
+        .as_ref()
+        .cloned()
+        .ok_or("No hay un identificador de producto activo")?;
+    if previous_id == requested {
+        return Ok(requested.to_string());
+    }
+    if products.contains_key(&previous_id) {
+        return Err(format!(
+            "El producto activo '{previous_id}' ya existe en el almacén; se bloqueó el cambio para no sobrescribirlo"
+        ));
+    }
+    let next_entry = products
+        .get(requested)
+        .ok_or_else(|| format!("El producto '{requested}' no está disponible"))?;
+    let previous_result = current_result
+        .as_ref()
+        .ok_or("No hay un producto lineal activo")?;
+    let cache_root = next_entry
+        .path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    // El allocator puede conservar páginas después de liberar el producto
+    // anterior. Recordar de antemano la RAM que la transacción va a recuperar
+    // evita un falso "sin presupuesto" al cargar el siguiente, sin relajar el
+    // límite por encima de la memoria que ya estaba ocupada por datos válidos.
+    let switch_available = available_before_switch
+        .saturating_add(ds_result_resident_bytes(previous_result));
+    if !ds_product_cache_fits_load_budget(next_entry.stored_bytes, switch_available) {
+        return Err(ds_product_cache_load_budget_error(
+            requested,
+            next_entry.stored_bytes,
+            switch_available,
+        ));
+    }
+
+    // Hasta aquí todo son lecturas. En particular, un fallo de espacio al
+    // publicar el spill deja intactos resultado, preview, active y el mapa.
+    let previous_entry = spill(&cache_root, &previous_id, previous_result)?;
+    let previous_result = current_result
+        .take()
+        .expect("el resultado se validó bajo el mismo lock");
+    drop(previous_result);
+
+    let next_result = match load(
+        requested,
+        products
+            .get(requested)
+            .expect("la entrada solicitada sigue protegida por el mismo lock"),
+        Some(switch_available),
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            // El spill acaba de validarse, escribirse y sincronizarse. Para el
+            // rollback no se aplica de nuevo el presupuesto conservador: se
+            // repone exactamente la memoria que este mismo producto ocupaba
+            // antes de iniciar la transacción. La preview anterior nunca se
+            // retiró, de modo que tampoco puede fallar su reconstrucción.
+            let restored = load(&previous_id, &previous_entry, Some(u64::MAX)).map_err(
+                |restore_error| {
+                    format!(
+                        "{error}. Además falló la restauración transaccional de '{previous_id}': {restore_error}"
+                    )
+                },
+            )?;
+            *current_result = Some(restored);
+            return Err(error);
+        }
+    };
+    let next_preview = match build_preview(&next_result) {
+        Ok(preview) => preview,
+        Err(error) => {
+            drop(next_result);
+            let restored = load(&previous_id, &previous_entry, Some(u64::MAX)).map_err(
+                |restore_error| {
+                    format!(
+                        "{error}. Además falló la restauración transaccional de '{previous_id}': {restore_error}"
+                    )
+                },
+            )?;
+            *current_result = Some(restored);
+            return Err(error);
+        }
+    };
+
+    // Commit: sólo ahora se consume la entrada solicitada y se publican de
+    // forma conjunta id, datos y preview. No queda ningún punto de fallo tras
+    // la primera mutación del mapa.
+    let consumed_next = products
+        .remove(requested)
+        .expect("la entrada solicitada se validó bajo el mismo lock");
+    products.insert(previous_id, previous_entry);
+    *active = Some(requested.to_string());
+    *current_result = Some(next_result);
+    *current_preview = Some(next_preview);
+    drop(consumed_next);
+    Ok(requested.to_string())
+}
+
+#[tauri::command]
+fn deepsky_select_product(
+    state: State<'_, AppState>,
+    product_id: String,
+) -> Result<String, String> {
+    let requested = product_id.trim();
+    if requested.is_empty() {
+        return Err("El identificador del producto está vacío".into());
+    }
+    let mut active = state
+        .deep_sky_active_product
+        .lock()
+        .map_err(|_| "No se pudo bloquear el producto activo")?;
+    let mut products = state
+        .deep_sky_products
+        .lock()
+        .map_err(|_| "No se pudo bloquear el almacén de productos")?;
+    let mut current_result = state
+        .deep_sky_result
+        .lock()
+        .map_err(|_| "No se pudo bloquear el resultado lineal")?;
+    let mut current_preview = state
+        .stacked_image
+        .lock()
+        .map_err(|_| "No se pudo bloquear la vista previa")?;
+    let mut system = sysinfo::System::new_all();
+    system.refresh_memory();
+    ds_select_product_transaction(
+        requested,
+        &mut active,
+        &mut products,
+        &mut current_result,
+        &mut current_preview,
+        system.available_memory(),
+        ds_spill_product_to_disk,
+        ds_load_product_from_disk_with_available,
+        ds_stack_result_for_linear,
+    )
+}
+
 /// Vista diagnóstica de los planos científicos conservados con el máster.
 /// La normalización es sólo visual (percentil 99); los arrays float32 no se
 /// modifican y se exportan con su escala física por `deepsky_export_float32`.
-#[tauri::command]
-fn deepsky_result_view(state: State<'_, AppState>, kind: String) -> Result<String, String> {
-    let guard = state.deep_sky_result.lock().unwrap();
-    let result = guard
-        .as_ref()
-        .ok_or("No hay resultado lineal de cielo profundo")?;
-    let bg_owned: Vec<f32>;
-    let plane: &[f32] = match kind.as_str() {
-        "coverage" => &result.coverage,
-        "weight" => &result.weight,
-        "rejection_low" => &result.rejection_low,
-        "rejection_high" => &result.rejection_high,
-        "registration_residuals" => &result.registration_residuals,
-        // Productos científicos NF (F3): luma media de canales; VAR con NaN
-        // (huecos) a 0 para el colormap; DQ como bits en float exacto.
-        "variance" | "neff" => {
-            let planes = if kind == "variance" {
-                result.variance.as_ref()
-            } else {
-                result.neff.as_ref()
-            };
-            let plane_data = planes.ok_or(
-                "La ruta efectiva no conservó momentos/Σw² para este mapa; revisa scientificProducts en la receta",
-            )?;
-            let (w, h, chn) = (result.width, result.height, result.channels);
-            let npx = w * h;
-            let mut luma = vec![0.0f32; npx];
-            for p in 0..npx {
-                let mut s = 0.0f32;
-                let mut cnt = 0.0f32;
-                for c in 0..chn {
-                    let v = plane_data[p * chn + c];
-                    if v.is_finite() {
-                        s += v;
-                        cnt += 1.0;
+#[derive(Clone, Copy)]
+enum DsScalarPreviewAggregation {
+    Mean,
+    Max,
+}
+
+fn ds_scalar_preview_bounded<F>(
+    width: usize,
+    height: usize,
+    aggregation: DsScalarPreviewAggregation,
+    sample: F,
+) -> (Vec<f32>, usize, usize)
+where
+    F: Fn(usize) -> Option<f32> + Sync,
+{
+    let (factor, preview_width, preview_height) =
+        ds_poststack_preview_geometry(width, height);
+    let mut preview = vec![0.0f32; preview_width * preview_height];
+    preview
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(preview_pixel, output)| {
+            let px = preview_pixel % preview_width;
+            let py = preview_pixel / preview_width;
+            let x0 = px * factor;
+            let y0 = py * factor;
+            let x1 = (x0 + factor).min(width);
+            let y1 = (y0 + factor).min(height);
+            let mut sum = 0.0f64;
+            let mut maximum = f32::NEG_INFINITY;
+            let mut count = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    if let Some(value) = sample(y * width + x).filter(|value| value.is_finite()) {
+                        sum += value as f64;
+                        maximum = maximum.max(value);
+                        count += 1;
                     }
                 }
-                luma[p] = if cnt > 0.0 { s / cnt } else { 0.0 };
             }
-            bg_owned = luma;
-            &bg_owned
-        }
-        "dq" => {
-            let dq = result
-                .dq
-                .as_ref()
-                .ok_or("La ruta efectiva no produjo DQ")?;
-            bg_owned = dq.iter().map(|&b| b as f32).collect();
-            &bg_owned
-        }
-        // STRUCT/RESIDUAL (F7): desplazados al rango positivo para el colormap.
-        "struct" | "struct_residual" => {
-            let plane_src = if kind == "struct" {
-                result.struct_map.as_ref()
+            *output = if count == 0 {
+                0.0
             } else {
-                result.struct_residual.as_ref()
-            }
-            .ok_or("STRUCT requiere el modo NebulaFusion Full + STRUCT")?;
-            let mut shifted = plane_src.clone();
-            let minv = shifted.iter().copied().fold(f32::INFINITY, f32::min);
-            if minv.is_finite() && minv < 0.0 {
-                for v in shifted.iter_mut() {
-                    *v -= minv;
+                match aggregation {
+                    DsScalarPreviewAggregation::Mean => (sum / count as f64) as f32,
+                    // Rechazo usa max-pooling: un hit aislado no desaparece al
+                    // reducir una salida Drizzle grande para la pantalla.
+                    DsScalarPreviewAggregation::Max => maximum,
+                }
+            };
+        });
+    (preview, preview_width, preview_height)
+}
+
+fn ds_dq_preview_bounded(
+    dq: &[u32],
+    width: usize,
+    height: usize,
+) -> (Vec<f32>, usize, usize) {
+    let (factor, preview_width, preview_height) =
+        ds_poststack_preview_geometry(width, height);
+    let mut preview = vec![0.0f32; preview_width * preview_height];
+    preview
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(preview_pixel, output)| {
+            let px = preview_pixel % preview_width;
+            let py = preview_pixel / preview_width;
+            let x0 = px * factor;
+            let y0 = py * factor;
+            let x1 = (x0 + factor).min(width);
+            let y1 = (y0 + factor).min(height);
+            let mut bits = 0u32;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    bits |= dq[y * width + x];
                 }
             }
-            bg_owned = shifted;
-            &bg_owned
-        }
-        // Modelo de fondo/contaminación lumínica (F2): se ajusta bajo demanda
-        // sobre el máster (grado 2 robusto, no destructivo) y se muestra como
-        // luma desplazada al rango positivo.
-        // Mapa de recuperabilidad EIDR (F9): R por tile, 0..1.
-        "recoverability" => {
-            let plane_src = result
-                .recoverability
-                .as_ref()
-                .ok_or("El mapa de recuperabilidad requiere el motor EIDR")?;
-            bg_owned = plane_src.clone();
-            &bg_owned
-        }
-        "background_model" => {
-            let (w, h, ch) = (result.width, result.height, result.channels);
-            let model = crate::deepsky_background::fit_background_model(&result.data, w, h, ch)
-                .ok_or("El máster es demasiado pequeño para modelar el fondo")?;
-            let corr = model.render_correction();
-            let npx = w * h;
-            let mut luma = vec![0.0f32; npx];
-            for p in 0..npx {
-                let mut s = 0.0f32;
-                for c in 0..ch {
-                    s += corr[p * ch + c];
-                }
-                luma[p] = s / ch as f32;
+            *output = bits as f32;
+        });
+    (preview, preview_width, preview_height)
+}
+
+#[tauri::command]
+fn deepsky_result_view(state: State<'_, AppState>, kind: String) -> Result<String, String> {
+    let (mut plane, width, height) = {
+        let guard = state.deep_sky_result.lock().unwrap();
+        let result = guard
+            .as_ref()
+            .ok_or("No hay resultado lineal de cielo profundo")?;
+        let (w, h, channels) = (result.width, result.height, result.channels);
+        let direct = |values: &[f32], aggregation| {
+            if values.len() != w * h {
+                return Err("El mapa no coincide con la geometría del máster".to_string());
             }
-            let minv = luma.iter().copied().fold(f32::INFINITY, f32::min);
-            if minv.is_finite() && minv < 0.0 {
-                for v in luma.iter_mut() {
-                    *v -= minv;
-                }
+            Ok(ds_scalar_preview_bounded(w, h, aggregation, |pixel| {
+                Some(values[pixel])
+            }))
+        };
+        match kind.as_str() {
+            "coverage" => direct(&result.coverage, DsScalarPreviewAggregation::Mean)?,
+            "weight" => direct(&result.weight, DsScalarPreviewAggregation::Mean)?,
+            "rejection_low" => {
+                direct(&result.rejection_low, DsScalarPreviewAggregation::Max)?
             }
-            bg_owned = luma;
-            &bg_owned
+            "rejection_high" => {
+                direct(&result.rejection_high, DsScalarPreviewAggregation::Max)?
+            }
+            "registration_residuals" => direct(
+                &result.registration_residuals,
+                DsScalarPreviewAggregation::Mean,
+            )?,
+            // VAR/NEFF se reducen directamente desde su layout interleaved;
+            // nunca se crea antes una luma full-res auxiliar.
+            "variance" | "neff" => {
+                let values = if kind == "variance" {
+                    result.variance.as_ref()
+                } else {
+                    result.neff.as_ref()
+                }
+                .ok_or(
+                    "La ruta efectiva no conservó momentos/Σw² para este mapa; revisa scientificProducts en la receta",
+                )?;
+                ds_scalar_preview_bounded(w, h, DsScalarPreviewAggregation::Mean, |pixel| {
+                    let mut sum = 0.0f32;
+                    let mut count = 0usize;
+                    for channel in 0..channels {
+                        let value = values[pixel * channels + channel];
+                        if value.is_finite() {
+                            sum += value;
+                            count += 1;
+                        }
+                    }
+                    (count > 0).then_some(sum / count.max(1) as f32)
+                })
+            }
+            "dq" => {
+                let dq = result.dq.as_ref().ok_or("La ruta efectiva no produjo DQ")?;
+                if dq.len() != w * h {
+                    return Err("El mapa DQ no coincide con la geometría del máster".into());
+                }
+                ds_dq_preview_bounded(dq, w, h)
+            }
+            "struct" | "struct_residual" => {
+                let values = if kind == "struct" {
+                    result.struct_map.as_ref()
+                } else {
+                    result.struct_residual.as_ref()
+                }
+                .ok_or("STRUCT requiere el modo NebulaFusion Full + STRUCT")?;
+                direct(values, DsScalarPreviewAggregation::Mean)?
+            }
+            "recoverability" => {
+                let values = result
+                    .recoverability
+                    .as_ref()
+                    .ok_or("El mapa de recuperabilidad requiere el motor EIDR")?;
+                direct(values, DsScalarPreviewAggregation::Mean)?
+            }
+            "background_model" => {
+                let model =
+                    crate::deepsky_background::fit_background_model(&result.data, w, h, channels)
+                        .ok_or("El máster es demasiado pequeño para modelar el fondo")?;
+                let correction = model.render_correction();
+                ds_scalar_preview_bounded(w, h, DsScalarPreviewAggregation::Mean, |pixel| {
+                    let mut sum = 0.0f32;
+                    for channel in 0..channels {
+                        sum += correction[pixel * channels + channel];
+                    }
+                    Some(sum / channels.max(1) as f32)
+                })
+            }
+            _ => return Err(format!("Vista diagnóstica desconocida: {kind}")),
         }
-        _ => return Err(format!("Vista diagnóstica desconocida: {kind}")),
     };
-    let n = result.width * result.height;
-    if plane.len() != n {
-        return Err("El mapa no coincide con la geometría del máster".into());
+    // STRUCT/residuales y el modelo de fondo pueden ser firmados. El
+    // desplazamiento ocurre sólo sobre la vista acotada.
+    let minimum = plane.iter().copied().fold(f32::INFINITY, f32::min);
+    if minimum.is_finite() && minimum < 0.0 {
+        plane.par_iter_mut().for_each(|value| *value -= minimum);
     }
+    let n = width * height;
     let mut sample: Vec<f32> = plane
         .iter()
         .step_by((n / 200_000).max(1))
@@ -6302,7 +7933,7 @@ fn deepsky_result_view(state: State<'_, AppState>, kind: String) -> Result<Strin
         .unwrap_or(1.0)
         .max(1e-6);
     let mut rgba = Vec::with_capacity(n * 4);
-    for &v in plane {
+    for &v in &plane {
         let x = (v / hi).clamp(0.0, 1.0).sqrt();
         let (r, g, b) = match kind.as_str() {
             "coverage" | "weight" => {
@@ -6322,16 +7953,18 @@ fn deepsky_result_view(state: State<'_, AppState>, kind: String) -> Result<Strin
         };
         rgba.extend_from_slice(&[r, g, b, 255]);
     }
-    let img = RgbaImage::from_raw(result.width as u32, result.height as u32, rgba)
+    let img = RgbaImage::from_raw(width as u32, height as u32, rgba)
         .ok_or("Mapa inválido")?;
     let mut png = Vec::new();
     DynamicImage::ImageRgba8(img)
         .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
         .map_err(|e| e.to_string())?;
-    Ok(format!(
-        "data:image/png;base64,{}",
-        general_purpose::STANDARD.encode(png)
-    ))
+    Ok(save_preview_png_to_temp(&png, "deepsky_scientific_view").unwrap_or_else(|| {
+        format!(
+            "data:image/png;base64,{}",
+            general_purpose::STANDARD.encode(png)
+        )
+    }))
 }
 
 /// EXPORT the deep-sky result to disk next to the reference light. Saves the
@@ -6472,9 +8105,7 @@ impl DsFitsUnit {
 
 fn ds_map_fits_unit(name: &str) -> DsFitsUnit {
     match name {
-        "coverage" | "weight" | "neff" | "recoverability" | "recov" => {
-            DsFitsUnit::Dimensionless
-        }
+        "coverage" | "weight" | "neff" | "recoverability" | "recov" => DsFitsUnit::Dimensionless,
         "variance" => DsFitsUnit::AduSquared,
         "dq" => DsFitsUnit::Bitmask,
         "rejection_low" | "rejection_high" => DsFitsUnit::Count,
@@ -6748,6 +8379,102 @@ struct DeepSkyFloatExport {
     diagnostic_fits: Vec<String>,
 }
 
+/// Cabecera WCS única para SCI y para cada mapa/producto que comparte
+/// exactamente su geometría. Centralizarla evita que el máster sea anotable
+/// pero VAR/NEFF/DQ/coverage pierdan la proyección al abrirse por separado.
+fn ds_wcs_fits_metadata(
+    recipe: &serde_json::Value,
+    width: usize,
+    height: usize,
+) -> Vec<(&'static str, String)> {
+    let Some(wcs) = recipe.get("wcs").or_else(|| recipe.pointer("/recipe/wcs")) else {
+        return Vec::new();
+    };
+    let geometry_matches = match (
+        wcs.get("pixelWidth").and_then(serde_json::Value::as_u64),
+        wcs.get("pixelHeight").and_then(serde_json::Value::as_u64),
+    ) {
+        (Some(wcs_width), Some(wcs_height)) => {
+            wcs_width as usize == width && wcs_height as usize == height
+        }
+        // Recetas previas al fingerprint no se rompen, pero toda solución nueva
+        // queda ligada a dimensiones por `spcc_stamp_wcs_geometry`.
+        (None, None) => true,
+        _ => false,
+    };
+    if !geometry_matches {
+        let mut invalid = vec![("ZASWCSIV", "'GEOMETRY_MISMATCH'".to_string())];
+        if let Some(fingerprint) = wcs
+            .get("geometryFingerprint")
+            .and_then(serde_json::Value::as_str)
+        {
+            invalid.push(("ZASWCSFP", format!("'{}'", fingerprint.replace('\'', ""))));
+        }
+        return invalid;
+    }
+    let num = |key: &str| {
+        wcs.get(key)
+            .and_then(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite())
+    };
+    let (
+        Some(crval1),
+        Some(crval2),
+        Some(crpix1),
+        Some(crpix2),
+        Some(cd11),
+        Some(cd12),
+        Some(cd21),
+        Some(cd22),
+    ) = (
+        num("crval1"),
+        num("crval2"),
+        num("crpix1"),
+        num("crpix2"),
+        num("cd11"),
+        num("cd12"),
+        num("cd21"),
+        num("cd22"),
+    )
+    else {
+        return vec![("ZASWCSIV", "'MALFORMED_WCS'".to_string())];
+    };
+    if (cd11 * cd22 - cd12 * cd21).abs() <= 1.0e-18 {
+        return vec![("ZASWCSIV", "'SINGULAR_WCS'".to_string())];
+    }
+    let mut metadata = vec![
+        ("WCSAXES", format!("{:>20}", 2)),
+        ("CTYPE1", "'RA---TAN'".to_string()),
+        ("CTYPE2", "'DEC--TAN'".to_string()),
+        ("CUNIT1", "'deg'".to_string()),
+        ("CUNIT2", "'deg'".to_string()),
+        ("CRVAL1", format!("{crval1:>20.10}")),
+        ("CRVAL2", format!("{crval2:>20.10}")),
+        ("CRPIX1", format!("{crpix1:>20.4}")),
+        ("CRPIX2", format!("{crpix2:>20.4}")),
+        ("CD1_1", format!("{cd11:>20.10E}")),
+        ("CD1_2", format!("{cd12:>20.10E}")),
+        ("CD2_1", format!("{cd21:>20.10E}")),
+        ("CD2_2", format!("{cd22:>20.10E}")),
+        ("RADESYS", "'ICRS'".to_string()),
+    ];
+    if let Some(fingerprint) = wcs
+        .get("geometryFingerprint")
+        .and_then(serde_json::Value::as_str)
+    {
+        metadata.push(("ZASWCSFP", format!("'{}'", fingerprint.replace('\'', ""))));
+    }
+    metadata
+}
+
+fn ds_metadata_with_wcs(
+    mut metadata: Vec<(&'static str, String)>,
+    wcs: &[(&'static str, String)],
+) -> Vec<(&'static str, String)> {
+    metadata.extend(wcs.iter().cloned());
+    metadata
+}
+
 // (async): trabajo de segundos-minutos fuera del hilo principal — la UI
 // sigue viva y Cancelar/checkpoints funcionan (auditoría 2026-07-20).
 #[tauri::command(async)]
@@ -6793,6 +8520,7 @@ fn deepsky_export_float32(
     let stem = format!("ZenithDeepSky_{}", result.id);
     let master = parent.join(format!("{stem}_linear_float32.fits"));
     let recipe = parent.join(format!("{stem}_recipe.json"));
+    let wcs_metadata = ds_wcs_fits_metadata(&result.recipe, result.width, result.height);
     let mut master_metadata = vec![
         ("ZASVER", "'hybrid-v2-2026.07'".to_string()),
         ("ZASJOB", format!("'{}'", result.id)),
@@ -6809,29 +8537,7 @@ fn deepsky_export_float32(
             ),
         ),
     ];
-    // WCS resuelta por SPCC (TAN por similitud contra Gaia): keywords estándar
-    // para que PixInsight/Siril/astropy puedan anotar y reproyectar el máster.
-    if let Some(wcs) = result.recipe.get("wcs") {
-        let num = |key: &str| wcs.get(key).and_then(|v| v.as_f64());
-        if let (Some(crval1), Some(crval2), Some(crpix1), Some(crpix2), Some(cd11), Some(cd12), Some(cd21), Some(cd22)) = (
-            num("crval1"), num("crval2"), num("crpix1"), num("crpix2"),
-            num("cd11"), num("cd12"), num("cd21"), num("cd22"),
-        ) {
-            master_metadata.push(("CTYPE1", "'RA---TAN'".to_string()));
-            master_metadata.push(("CTYPE2", "'DEC--TAN'".to_string()));
-            master_metadata.push(("CUNIT1", "'deg'".to_string()));
-            master_metadata.push(("CUNIT2", "'deg'".to_string()));
-            master_metadata.push(("CRVAL1", format!("{crval1:>20.10}")));
-            master_metadata.push(("CRVAL2", format!("{crval2:>20.10}")));
-            master_metadata.push(("CRPIX1", format!("{crpix1:>20.4}")));
-            master_metadata.push(("CRPIX2", format!("{crpix2:>20.4}")));
-            master_metadata.push(("CD1_1", format!("{cd11:>20.10E}")));
-            master_metadata.push(("CD1_2", format!("{cd12:>20.10E}")));
-            master_metadata.push(("CD2_1", format!("{cd21:>20.10E}")));
-            master_metadata.push(("CD2_2", format!("{cd22:>20.10E}")));
-            master_metadata.push(("RADESYS", "'ICRS'".to_string()));
-        }
-    }
+    master_metadata.extend(wcs_metadata.iter().cloned());
     cancellation_checkpoint(cancel.as_ref(), "exportación FITS float32")?;
     ds_save_float32_fits_cancellable(
         &master,
@@ -6855,17 +8561,21 @@ fn deepsky_export_float32(
             cancellation_checkpoint(cancel.as_ref(), "exportación de mapas diagnósticos")?;
             if map.len() == result.width * result.height {
                 let path = parent.join(format!("{stem}_{name}.fits"));
+                let metadata = ds_metadata_with_wcs(
+                    vec![
+                        ("EXTNAME", format!("'{}'", name)),
+                        ("ZASJOB", format!("'{}'", result.id)),
+                        ("BUNIT", ds_map_fits_unit(name).header_value().into()),
+                    ],
+                    &wcs_metadata,
+                );
                 ds_save_float32_fits_cancellable(
                     &path,
                     map,
                     result.width,
                     result.height,
                     1,
-                    &[
-                        ("EXTNAME", format!("'{}'", name)),
-                        ("ZASJOB", format!("'{}'", result.id)),
-                        ("BUNIT", ds_map_fits_unit(name).header_value().into()),
-                    ],
+                    &metadata,
                     Some(cancel.as_ref()),
                 )?;
                 diagnostics.push(path.display().to_string());
@@ -6880,17 +8590,21 @@ fn deepsky_export_float32(
             if let Some(plane) = plane {
                 cancellation_checkpoint(cancel.as_ref(), "exportación de productos científicos")?;
                 let path = parent.join(format!("{stem}_{name}.fits"));
+                let metadata = ds_metadata_with_wcs(
+                    vec![
+                        ("EXTNAME", format!("'{}'", name.to_uppercase())),
+                        ("ZASJOB", format!("'{}'", result.id)),
+                        ("BUNIT", ds_map_fits_unit(name).header_value().into()),
+                    ],
+                    &wcs_metadata,
+                );
                 ds_save_float32_fits_cancellable(
                     &path,
                     plane,
                     result.width,
                     result.height,
                     chn,
-                    &[
-                        ("EXTNAME", format!("'{}'", name.to_uppercase())),
-                        ("ZASJOB", format!("'{}'", result.id)),
-                        ("BUNIT", ds_map_fits_unit(name).header_value().into()),
-                    ],
+                    &metadata,
                     Some(cancel.as_ref()),
                 )?;
                 diagnostics.push(path.display().to_string());
@@ -6905,17 +8619,21 @@ fn deepsky_export_float32(
             if let Some(plane) = plane {
                 cancellation_checkpoint(cancel.as_ref(), "exportación de STRUCT")?;
                 let path = parent.join(format!("{stem}_{name}.fits"));
+                let metadata = ds_metadata_with_wcs(
+                    vec![
+                        ("EXTNAME", format!("'{}'", name.to_uppercase())),
+                        ("ZASJOB", format!("'{}'", result.id)),
+                        ("ZASEVID", "T".to_string()),
+                    ],
+                    &wcs_metadata,
+                );
                 ds_save_float32_fits_cancellable(
                     &path,
                     plane,
                     result.width,
                     result.height,
                     1,
-                    &[
-                        ("EXTNAME", format!("'{}'", name.to_uppercase())),
-                        ("ZASJOB", format!("'{}'", result.id)),
-                        ("ZASEVID", "T".to_string()),
-                    ],
+                    &metadata,
                     Some(cancel.as_ref()),
                 )?;
                 diagnostics.push(path.display().to_string());
@@ -6926,13 +8644,8 @@ fn deepsky_export_float32(
         if let Some(plane) = result.recoverability.as_deref() {
             cancellation_checkpoint(cancel.as_ref(), "exportación de RECOV")?;
             let path = parent.join(format!("{stem}_recov.fits"));
-            ds_save_float32_fits_cancellable(
-                &path,
-                plane,
-                result.width,
-                result.height,
-                1,
-                &[
+            let metadata = ds_metadata_with_wcs(
+                vec![
                     ("EXTNAME", "'RECOV'".to_string()),
                     ("ZASJOB", format!("'{}'", result.id)),
                     ("ZASEVID", "T".to_string()),
@@ -6941,6 +8654,15 @@ fn deepsky_export_float32(
                         DsFitsUnit::Dimensionless.header_value().to_string(),
                     ),
                 ],
+                &wcs_metadata,
+            );
+            ds_save_float32_fits_cancellable(
+                &path,
+                plane,
+                result.width,
+                result.height,
+                1,
+                &metadata,
                 Some(cancel.as_ref()),
             )?;
             diagnostics.push(path.display().to_string());
@@ -6979,18 +8701,22 @@ fn deepsky_export_float32(
                         stretched.iter().map(|&v| v as f32).collect()
                     };
                     let path = parent.join(format!("{stem}_contrast_NONLINEAR.fits"));
+                    let metadata = ds_metadata_with_wcs(
+                        vec![
+                            ("EXTNAME", "'CONTRAST'".to_string()),
+                            ("ZASJOB", format!("'{}'", result.id)),
+                            ("ZASNONLI", "T".to_string()),
+                            ("ZASBOOST", format!("{CONTRAST_BOOST:.2}")),
+                        ],
+                        &wcs_metadata,
+                    );
                     ds_save_float32_fits_cancellable(
                         &path,
                         &contrast_f32,
                         w,
                         h,
                         out_ch,
-                        &[
-                            ("EXTNAME", "'CONTRAST'".to_string()),
-                            ("ZASJOB", format!("'{}'", result.id)),
-                            ("ZASNONLI", "T".to_string()),
-                            ("ZASBOOST", format!("{CONTRAST_BOOST:.2}")),
-                        ],
+                        &metadata,
                         Some(cancel.as_ref()),
                     )?;
                     diagnostics.push(path.display().to_string());
@@ -7010,17 +8736,21 @@ fn deepsky_export_float32(
             cancellation_checkpoint(cancel.as_ref(), "exportación de DQ")?;
             let dq_f32: Vec<f32> = dq.iter().map(|&b| b as f32).collect();
             let path = parent.join(format!("{stem}_dq.fits"));
+            let metadata = ds_metadata_with_wcs(
+                vec![
+                    ("EXTNAME", "'DQ'".to_string()),
+                    ("ZASJOB", format!("'{}'", result.id)),
+                    ("BUNIT", DsFitsUnit::Bitmask.header_value().to_string()),
+                ],
+                &wcs_metadata,
+            );
             ds_save_float32_fits_cancellable(
                 &path,
                 &dq_f32,
                 result.width,
                 result.height,
                 1,
-                &[
-                    ("EXTNAME", "'DQ'".to_string()),
-                    ("ZASJOB", format!("'{}'", result.id)),
-                    ("BUNIT", DsFitsUnit::Bitmask.header_value().to_string()),
-                ],
+                &metadata,
                 Some(cancel.as_ref()),
             )?;
             diagnostics.push(path.display().to_string());
@@ -7038,18 +8768,22 @@ fn deepsky_export_float32(
         ) {
             let corr = model.render_correction();
             let path = parent.join(format!("{stem}_background_model.fits"));
+            let metadata = ds_metadata_with_wcs(
+                vec![
+                    ("EXTNAME", "'BG'".to_string()),
+                    ("ZASJOB", format!("'{}'", result.id)),
+                    ("ZASBGDEG", model.degree.to_string()),
+                    ("ZASBGREV", "T".to_string()),
+                ],
+                &wcs_metadata,
+            );
             ds_save_float32_fits_cancellable(
                 &path,
                 &corr,
                 result.width,
                 result.height,
                 result.channels,
-                &[
-                    ("EXTNAME", "'BG'".to_string()),
-                    ("ZASJOB", format!("'{}'", result.id)),
-                    ("ZASBGDEG", model.degree.to_string()),
-                    ("ZASBGREV", "T".to_string()),
-                ],
+                &metadata,
                 Some(cancel.as_ref()),
             )?;
             diagnostics.push(path.display().to_string());
@@ -7275,13 +9009,97 @@ fn deepsky_split_channels(
     ))
 }
 
-/// LRGB / NARROWBAND CHANNEL COMBINATION (PixInsight ChannelCombination +
-/// LRGBCombination parity). Each argument is a pre-stacked MONO master already
+fn ds_require_mono_channel_master(image: DsImage, path: &str) -> Result<DsImage, String> {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    if image.bayer.is_some() {
+        return Err(format!(
+            "'{name}' es CFA/Bayer sin demosaicar. Combinar canales sólo acepta másteres MONO lineales ya apilados."
+        ));
+    }
+    if image.ch != 1 {
+        return Err(format!(
+            "'{name}' tiene {} canales. No se convertirá RGB a luminancia silenciosamente; asigna un máster MONO lineal.",
+            image.ch
+        ));
+    }
+    if image.data.len() != image.w.saturating_mul(image.h) {
+        return Err(format!(
+            "'{name}' no cumple la geometría MONO declarada {}×{}.",
+            image.w, image.h
+        ));
+    }
+    Ok(image)
+}
+
+/// Umbral τ para la inyección LRGB: 1e-4 de la mediana de |L| sobre los
+/// valores finitos del máster L. Escalar con la mediana hace el umbral
+/// adimensional respecto al nivel de exposición (ADU crudos o normalizados)
+/// y 1e-4 lo sitúa muy por debajo de cualquier señal real: solo el fondo al
+/// nivel del ruido cae al régimen aditivo.
+fn ds_lrgb_tau(ld: &[f32]) -> f64 {
+    let mut abs_l: Vec<f32> = ld
+        .iter()
+        .filter(|v| v.is_finite())
+        .map(|v| v.abs())
+        .collect();
+    if abs_l.is_empty() {
+        return 0.0;
+    }
+    let mid = abs_l.len() / 2;
+    abs_l.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    1e-4 * abs_l[mid] as f64
+}
+
+/// Inyección de luminancia LRGB por píxel. La forma aditiva pura RGB+(L−Y)
+/// colapsa la saturación: suma el MISMO delta a los tres canales, así que una
+/// estrella roja (1000,100,100) con L=2900 acababa casi gris (el ratio 10:1:1
+/// se diluye hacia 1:1:1). La forma multiplicativa RGB·(L/Y) conserva el
+/// ratio de color exactamente, pero explota cuando Y→0 (fondo sin
+/// crominancia). Blend convexo entre ambas:
+///   m = clamp((Y−τ)/τ, 0, 1) → multiplicativo donde hay señal cromática,
+///   aditivo puro bajo τ (el fondo no tiene ratio de color que conservar).
+/// Propiedad clave (verificada en tests): la luma Rec.709 de la salida es
+/// EXACTAMENTE L en ambos regímenes — el multiplicativo escala Y hasta L, el
+/// aditivo desplaza Y hasta L, y el blend convexo de dos soluciones con la
+/// misma luma conserva esa luma. Aritmética interna en f64 para no degradar
+/// la garantía al redondear.
+fn ds_lrgb_inject_pixel(rgb: [f32; 3], l: f32, tau: f64) -> [f32; 3] {
+    let c = [rgb[0] as f64, rgb[1] as f64, rgb[2] as f64];
+    let l = l as f64;
+    let y = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let mut out = [0.0f32; 3];
+    if y > tau {
+        // Con τ=0 la división (Y−τ)/τ da +inf y el clamp lo lleva a m=1
+        // (multiplicativo puro): correcto, porque Y>τ≥0 garantiza que L/Y
+        // está bien definida.
+        let m = ((y - tau) / tau).clamp(0.0, 1.0);
+        let scale = l / y;
+        for k in 0..3 {
+            out[k] = (m * (c[k] * scale) + (1.0 - m) * (c[k] + (l - y))) as f32;
+        }
+    } else {
+        // Fondo (Y≤τ, incluida Y no positiva): aditivo puro. Aquí no hay
+        // ratio de color que conservar y dividir por Y≈0 amplificaría el
+        // ruido sin cota.
+        for k in 0..3 {
+            out[k] = (c[k] + (l - y)) as f32;
+        }
+    }
+    out
+}
+
+/// LRGB / NARROWBAND CHANNEL COMBINATION. Each argument is a pre-stacked MONO master already
 /// assigned to an output channel (for SHO the frontend maps SII→R, Ha→G,
 /// OIII→B). Channels are star-registered to R, combined into RGB, and — when an
-/// L master is given — the luminance is replaced via the chroma-preserving ratio
-/// method. Post: optional ABE, SCNR and background neutralization (off for
-/// narrowband palettes so the mapped colours are preserved).
+/// L master is given — luminance is injected multiplicatively, RGB·(L/Y), with
+/// an additive reserve RGB + (L − Y) below the noise threshold τ (see
+/// `ds_lrgb_inject_pixel`): the ratio-preserving form keeps star/nebula color,
+/// the additive form keeps the near-zero background finite and signed. ABE,
+/// SCNR and background neutralization remain explicit compatibility options
+/// and default OFF; the guided post-stack editor owns those derived operations.
 #[tauri::command]
 async fn deepsky_combine_channels(
     app: tauri::AppHandle,
@@ -7294,33 +9112,30 @@ async fn deepsky_combine_channels(
     neutralize: Option<bool>,
     scnr: Option<bool>,
     gradient: Option<bool>,
+    combination_mode: Option<String>,
 ) -> Result<String, String> {
     state.license_manager.check_access()?;
+    let started = std::time::Instant::now();
     let do_reg = register.unwrap_or(true);
-    let do_neut = neutralize.unwrap_or(true);
-    let do_scnr = scnr.unwrap_or(do_neut);
-    let do_grad = gradient.unwrap_or(true);
+    let do_neut = neutralize.unwrap_or(false);
+    let do_scnr = scnr.unwrap_or(false);
+    let do_grad = gradient.unwrap_or(false);
+    let combination_mode = combination_mode
+        .as_deref()
+        .unwrap_or("rgb")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(combination_mode.as_str(), "rgb" | "sho" | "hoo") {
+        return Err(format!(
+            "Modo de combinación desconocido '{combination_mode}'. Usa RGB/LRGB, SHO o HOO."
+        ));
+    }
+    let l_path = l_path.filter(|path| !path.is_empty());
 
-    // Load any path as a single mono plane (debayer→luma for CFA, luma for RGB).
+    // Fail closed: a science picker may still receive a mislabeled RGB/CFA
+    // FITS. Never transform it into a plausible-looking MONO master silently.
     let load_mono = |p: &str| -> Result<DsImage, String> {
-        let img = ds_read_image(p)?;
-        let img = if let Some(cid) = img.bayer {
-            ds_debayer_image(img, cid)
-        } else {
-            img
-        };
-        if img.ch == 1 {
-            Ok(img)
-        } else {
-            let luma = ds_luma(&img);
-            Ok(DsImage {
-                data: luma,
-                w: img.w,
-                h: img.h,
-                ch: 1,
-                bayer: None,
-            })
-        }
+        ds_require_mono_channel_master(ds_read_image(p)?, p)
     };
 
     emit_progress(&app, "Combinar canales: cargando masters...", 6.0, None);
@@ -7337,7 +9152,7 @@ async fn deepsky_combine_channels(
         None,
     );
     let ref_stars = ds_detect_stars(&rimg.data, w, h, 120);
-    let align = |img: &DsImage, name: &str| -> Result<Vec<f32>, String> {
+    let align = |img: &DsImage, name: &str| -> Result<(Vec<f32>, Vec<f32>), String> {
         if img.w != w || img.h != h {
             return Err(format!(
                 "El canal {} es {}×{} pero R es {}×{} — todos los canales deben coincidir.",
@@ -7345,7 +9160,12 @@ async fn deepsky_combine_channels(
             ));
         }
         if !do_reg {
-            return Ok(img.data.clone());
+            let coverage = img
+                .data
+                .iter()
+                .map(|value| if value.is_finite() { 1.0 } else { 0.0 })
+                .collect();
+            return Ok((img.data.clone(), coverage));
         }
         let st = ds_detect_stars(&img.data, w, h, 120);
         match ds_match_triangles_in_field(&ref_stars, &st, w, h) {
@@ -7371,20 +9191,29 @@ async fn deepsky_combine_channels(
         }
     };
 
-    let gd = align(&gimg, "G")?;
-    let bd = align(&bimg, "B")?;
+    let (gd, gcov) = align(&gimg, "G")?;
+    let (bd, bcov) = align(&bimg, "B")?;
 
     let n = w * h;
+    let mut coverage = vec![0.0f32; n];
     let mut final_data = vec![0.0f32; n * 3];
     for i in 0..n {
-        final_data[i * 3] = rimg.data[i];
-        final_data[i * 3 + 1] = gd[i];
-        final_data[i * 3 + 2] = bd[i];
+        if rimg.data[i].is_finite() && gcov[i] > 0.0 && bcov[i] > 0.0 {
+            coverage[i] = 1.0;
+            final_data[i * 3] = rimg.data[i];
+            final_data[i * 3 + 1] = gd[i];
+            final_data[i * 3 + 2] = bd[i];
+        } else {
+            final_data[i * 3..i * 3 + 3].fill(f32::NAN);
+        }
     }
 
-    // Optional luminance (LRGB): replace the RGB luma with L, preserving chroma
-    // via the ratio method (R'=R·L/Y). L carries the detail/SNR, RGB the colour.
-    if let Some(lp) = l_path.filter(|s| !s.is_empty()) {
+    // Optional luminance (LRGB): multiplicative injection RGB·(L/Y), which
+    // preserves the color ratio (the additive form washed saturated stars to
+    // gray), with an additive reserve RGB + (L − Y) below τ so the near-zero
+    // background stays finite and signed. Output luma equals L in both
+    // regimes (see ds_lrgb_inject_pixel).
+    if let Some(lp) = l_path.as_deref() {
         emit_progress(
             &app,
             "Combinar canales: aplicando luminancia (LRGB)...",
@@ -7392,22 +9221,25 @@ async fn deepsky_combine_channels(
             None,
         );
         let limg = load_mono(&lp)?;
-        let ld = align(&limg, "L")?;
+        let (ld, lcov) = align(&limg, "L")?;
+        // τ una sola vez sobre el máster L registrado (mediana de |L| finitos).
+        let tau = ds_lrgb_tau(&ld);
         for i in 0..n {
-            let y = 0.2126 * final_data[i * 3]
-                + 0.7152 * final_data[i * 3 + 1]
-                + 0.0722 * final_data[i * 3 + 2];
-            let l = ld[i];
-            if y > 1.0 {
-                let k = (l / y).clamp(0.0, 8.0);
-                final_data[i * 3] = (final_data[i * 3] * k).min(65535.0);
-                final_data[i * 3 + 1] = (final_data[i * 3 + 1] * k).min(65535.0);
-                final_data[i * 3 + 2] = (final_data[i * 3 + 2] * k).min(65535.0);
-            } else {
-                final_data[i * 3] = l;
-                final_data[i * 3 + 1] = l;
-                final_data[i * 3 + 2] = l;
+            if coverage[i] <= 0.0 || lcov[i] <= 0.0 || !ld[i].is_finite() {
+                coverage[i] = 0.0;
+                final_data[i * 3..i * 3 + 3].fill(f32::NAN);
+                continue;
             }
+            let out = ds_lrgb_inject_pixel(
+                [
+                    final_data[i * 3],
+                    final_data[i * 3 + 1],
+                    final_data[i * 3 + 2],
+                ],
+                ld[i],
+                tau,
+            );
+            final_data[i * 3..i * 3 + 3].copy_from_slice(&out);
         }
     }
 
@@ -7457,7 +9289,11 @@ async fn deepsky_combine_channels(
     );
     let mut rgb16 = vec![0u16; n * 3];
     for i in 0..n * 3 {
-        rgb16[i] = final_data[i].clamp(0.0, 65535.0) as u16;
+        rgb16[i] = if final_data[i].is_finite() {
+            final_data[i].clamp(0.0, 65535.0) as u16
+        } else {
+            0
+        };
     }
     let preview8 = ds_render_stretch(&rgb16, w, h, false, 2.8, 0.25);
     let mut rgba = Vec::with_capacity(n * 4);
@@ -7481,18 +9317,119 @@ async fn deepsky_combine_channels(
             is_mono: false,
             is_surface: false,
         });
-        state.deconv_cache.lock().unwrap().clear();
-        state.wavelet_cache.lock().unwrap().clear();
-        state.filter_cache.lock().unwrap().clear();
+        state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
+    let mut input_paths = vec![r_path.clone(), g_path.clone(), b_path.clone()];
+    if let Some(path) = &l_path {
+        input_paths.push(path.clone());
+    }
+    let input_names = input_paths
+        .iter()
+        .map(|path| {
+            std::path::Path::new(path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    let dq = coverage
+        .iter()
+        .map(|value| {
+            if *value > 0.0 {
+                if do_reg {
+                    crate::deepsky_variance::dq::INTERPOLATED
+                } else {
+                    0
+                }
+            } else {
+                crate::deepsky_variance::dq::NO_COVERAGE | crate::deepsky_variance::dq::EDGE
+            }
+        })
+        .collect::<Vec<_>>();
+    let result_id = new_job_id("ds-channel-combine");
+    let recipe = serde_json::json!({
+        "schemaVersion": pipeline::DEEP_SKY_RECIPE_SCHEMA_VERSION,
+        "operation": "linearChannelCombination",
+        "combinationMode": combination_mode,
+        "sourceFingerprint": ds_source_fingerprint(&[input_paths.as_slice()]),
+        "inputs": input_names,
+        "channels": {
+            "r": std::path::Path::new(&r_path).file_name().unwrap_or_default().to_string_lossy(),
+            "g": std::path::Path::new(&g_path).file_name().unwrap_or_default().to_string_lossy(),
+            "b": std::path::Path::new(&b_path).file_name().unwrap_or_default().to_string_lossy(),
+            "l": l_path.as_ref().map(|path| std::path::Path::new(path).file_name().unwrap_or_default().to_string_lossy().to_string()),
+        },
+        "registration": {
+            "enabled": do_reg,
+            "reference": "R",
+            "interpolation": if do_reg { "lanczos3_with_bilinear_border" } else { "none" },
+            "coverageTracked": true,
+        },
+        "luminance": {
+            "enabled": l_path.is_some(),
+            "transform": "RGB*(L/Y) con reserva aditiva bajo tau",
+            "linear": true,
+        },
+        "derivedCorrections": {
+            "gradient": do_grad,
+            "scnr": do_scnr,
+            "backgroundNeutralization": do_neut,
+        },
+        "scientificProducts": {
+            "coverage": true,
+            "dq": true,
+            "variance": false,
+            "neff": false,
+            "reason": "Los másteres importados no aportan VAR/NEFF ni covarianza entre canales",
+        },
+        "linear": true,
+    });
+    {
+        let mut linear = state.deep_sky_result.lock().unwrap();
+        *linear = Some(DeepSkyResult {
+            id: result_id,
+            data: final_data,
+            width: w,
+            height: h,
+            channels: 3,
+            coverage: coverage.clone(),
+            weight: coverage,
+            rejection_low: vec![0.0; n],
+            rejection_high: vec![0.0; n],
+            registration_residuals: Vec::new(),
+            engine: "cpu_channel_combine".into(),
+            method: "linear_channel_combination".into(),
+            frames_used: input_paths.len(),
+            frames_rejected: 0,
+            elapsed_seconds: started.elapsed().as_secs_f32(),
+            recipe,
+            variance: None,
+            neff: None,
+            dq: Some(dq),
+            struct_map: None,
+            struct_residual: None,
+            recoverability: None,
+            source_data: None,
+            source_variance: None,
+            source_layout: None,
+            post_stack_recipe: PostStackRecipe::default(),
+            astrometry_solution: None,
+        });
+    }
+    state.deep_sky_products.lock().unwrap().clear();
+    *state.deep_sky_active_product.lock().unwrap() = None;
     log_to_front(
         &app,
         "SUCCESS",
         &format!(
-            "Canales combinados {}×{} · registro {} · SCNR {} · neutralización {}.",
+            "Canales combinados {}×{} · registro {} · gradiente {} · SCNR {} · neutralización {} · máster lineal conservado.",
             w,
             h,
             if do_reg { "ON" } else { "OFF" },
+            if do_grad { "ON" } else { "OFF" },
             if do_scnr { "ON" } else { "OFF" },
             if do_neut { "ON" } else { "OFF" }
         ),
@@ -7524,7 +9461,7 @@ struct DsProbe {
     date_obs: Option<String>, // DATE-OBS (inicio de exposición) — sesiones/noches
     #[serde(rename = "frameType")]
     frame_type: Option<String>, // IMAGETYP / OBSTYPE / FRAME
-    object: Option<String>,    // OBJECT (p. ej. FlatWizard de N.I.N.A.)
+    object: Option<String>,   // OBJECT (p. ej. FlatWizard de N.I.N.A.)
     signature: pipeline::CalibrationSignature,
     #[serde(rename = "storeLayout")]
     store_layout: Option<pipeline::StoreLayout>,
@@ -7536,9 +9473,7 @@ struct DsProbe {
     error: Option<String>,
 }
 
-fn ds_missing_light_signature_fields(
-    signature: &pipeline::CalibrationSignature,
-) -> Vec<String> {
+fn ds_missing_light_signature_fields(signature: &pipeline::CalibrationSignature) -> Vec<String> {
     let mut missing = crate::deepsky_signature::missing_required_signature_fields(
         signature,
         crate::deepsky_calibration_contract::CalibrationRole::Bias,
@@ -7592,10 +9527,43 @@ fn ds_signature_extraction_without_headers(
     )
 }
 
-// v7 retains the v6 bijective-registration evidence and also invalidates
-// calibrated frames produced before the exact signature/pedestal/dark-scaling
-// gates. Reusing those pixels would make a warm cache contradict the recipe.
-const DS_PREP_CACHE_VERSION: u32 = 8;
+/// Probe radiométrico compartido por flujos científicos adyacentes. Lee sólo
+/// cabecera/geometría y devuelve exactamente la misma CalibrationSignature
+/// normalizada que usa el selector deep-sky; nunca infiere exposición, gain o
+/// temperatura desde el nombre del archivo.
+pub(crate) fn ds_probe_calibration_signature(
+    path: &str,
+) -> Result<pipeline::CalibrationSignature, String> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".fits") || lower.ends_with(".fit") || lower.ends_with(".fts") {
+        let fits = fitrs::Fits::open(path)
+            .map_err(|error| format!("FITS probe '{}': {error:?}", path))?;
+        let hdu = fits
+            .iter()
+            .next()
+            .ok_or_else(|| format!("FITS sin HDU primario: {path}"))?;
+        let width = ds_hdr_num(&hdu, "NAXIS1").unwrap_or(0.0) as usize;
+        let height = ds_hdr_num(&hdu, "NAXIS2").unwrap_or(0.0) as usize;
+        let channels = ds_hdr_num(&hdu, "NAXIS3").unwrap_or(1.0).max(1.0) as usize;
+        if width == 0 || height == 0 {
+            return Err(format!("FITS sin geometría válida: {path}"));
+        }
+        return Ok(ds_signature_extraction_for_hdu(&hdu, width, height, channels).signature);
+    }
+    let (width, height) = image::image_dimensions(path)
+        .map_err(|error| format!("No se pudo sondear '{path}': {error}"))?;
+    Ok(ds_signature_extraction_without_headers(
+        width as usize,
+        height as usize,
+        ds_probe_nonfits_channels(path),
+    )
+    .signature)
+}
+
+// v9 retains the exact signature/pedestal/dark-scaling gates, persists
+// calibration/analysis/registration across products and re-stacks, and binds
+// manual assignments so a changed calibration link cannot reuse stale pixels.
+const DS_PREP_CACHE_VERSION: u32 = 9;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct DsCachedFrameAnalysis {
@@ -7690,57 +9658,171 @@ fn ds_walk_images(root: &std::path::Path, out: &mut Vec<String>, depth: usize) {
     }
 }
 
-fn ds_source_fingerprint(groups: &[&[String]]) -> String {
-    use std::hash::{Hash, Hasher};
-    use std::io::{Read, Seek};
+fn ds_hash_path_identity(hasher: &mut sha2::Sha256, path: &std::path::Path) {
+    use sha2::Digest as _;
 
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    // Version change intentionally invalidates metadata-only caches. File size
-    // and mtime are insufficient when capture software rewrites a calibrated
-    // frame in place or a restored backup preserves timestamps.
-    "hybrid-v2-2026.07.10-content-edges-v2".hash(&mut h);
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let bytes = path.as_os_str().as_bytes();
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let words = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        hasher.update((words.len() as u64).to_le_bytes());
+        for word in words {
+            hasher.update(word.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let rendered = path.to_string_lossy();
+        hasher.update((rendered.len() as u64).to_le_bytes());
+        hasher.update(rendered.as_bytes());
+    }
+}
+
+fn ds_hash_platform_file_identity(hasher: &mut sha2::Sha256, meta: &std::fs::Metadata) {
+    use sha2::Digest as _;
+
+    hasher.update(meta.len().to_le_bytes());
+    if let Ok(modified) = meta.modified() {
+        if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+            hasher.update(duration.as_nanos().to_le_bytes());
+        }
+    }
+    if let Ok(created) = meta.created() {
+        if let Ok(duration) = created.duration_since(std::time::UNIX_EPOCH) {
+            hasher.update(duration.as_nanos().to_le_bytes());
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        // ctime cannot normally be restored by a userspace rewrite. dev+ino
+        // also distinguish a replacement file that preserved path/mtime/size.
+        hasher.update(meta.dev().to_le_bytes());
+        hasher.update(meta.ino().to_le_bytes());
+        hasher.update(meta.ctime().to_le_bytes());
+        hasher.update(meta.ctime_nsec().to_le_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        hasher.update(meta.file_attributes().to_le_bytes());
+        hasher.update(meta.creation_time().to_le_bytes());
+        hasher.update(meta.last_write_time().to_le_bytes());
+        hasher.update(meta.file_size().to_le_bytes());
+    }
+}
+
+/// Digest acotado pero distribuido de un RAW. Los ficheros pequeños se leen
+/// completos; para los FITS grandes se muestrean 17 bloques equidistantes,
+/// incluido exactamente el centro. ctime/identidad de archivo cubren además
+/// reescrituras entre muestras en los sistemas soportados sin releer cientos
+/// de GiB al preparar 5.000 tomas.
+fn ds_sampled_file_content_digest(
+    path: &std::path::Path,
+    length: u64,
+) -> std::io::Result<[u8; 32]> {
+    use sha2::Digest as _;
+    use std::io::{Read as _, Seek as _};
+
+    const FULL_HASH_LIMIT: u64 = 1024 * 1024;
+    const SAMPLE_BYTES: usize = 8 * 1024;
+    const SAMPLE_POINTS: u64 = 17;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"zenith-source-content-distributed-v3");
+    hasher.update(length.to_le_bytes());
+    if length <= FULL_HASH_LIMIT {
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        return Ok(hasher.finalize().into());
+    }
+
+    let block_len = length.min(SAMPLE_BYTES as u64) as usize;
+    let last_offset = length.saturating_sub(block_len as u64);
+    let mut buffer = vec![0u8; block_len];
+    let mut previous_offset = None;
+    for point in 0..SAMPLE_POINTS {
+        let offset = ((last_offset as u128 * point as u128) / (SAMPLE_POINTS - 1) as u128) as u64;
+        if previous_offset == Some(offset) {
+            continue;
+        }
+        previous_offset = Some(offset);
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        file.read_exact(&mut buffer)?;
+        hasher.update(offset.to_le_bytes());
+        hasher.update((block_len as u64).to_le_bytes());
+        hasher.update(&buffer);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn ds_source_fingerprint(groups: &[&[String]]) -> String {
+    use sha2::Digest as _;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"hybrid-v2-2026.08.03-distributed-content-v3");
     for paths in groups {
+        hasher.update((paths.len() as u64).to_le_bytes());
         for path in *paths {
-            std::fs::canonicalize(path)
-                .unwrap_or_else(|_| std::path::PathBuf::from(path))
-                .hash(&mut h);
-            if let Ok(meta) = std::fs::metadata(path) {
-                meta.len().hash(&mut h);
-                meta.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos())
-                    .hash(&mut h);
-                // Hash bounded content samples so fingerprinting remains cheap
-                // for thousands of high-resolution lights while detecting the
-                // common in-place rewrite/corruption cases.
-                const EDGE: usize = 8 * 1024;
-                if let Ok(mut file) = std::fs::File::open(path) {
-                    let head_len = (meta.len() as usize).min(EDGE);
-                    let mut head = vec![0u8; head_len];
-                    match file.read_exact(&mut head) {
-                        Ok(()) => head.hash(&mut h),
-                        Err(e) => e.kind().hash(&mut h),
-                    }
-                    if meta.len() as usize > EDGE {
-                        let tail_len = (meta.len() as usize).min(EDGE);
-                        let mut tail = vec![0u8; tail_len];
-                        match file
-                            .seek(std::io::SeekFrom::End(-(tail_len as i64)))
-                            .and_then(|_| file.read_exact(&mut tail))
-                        {
-                            Ok(()) => tail.hash(&mut h),
-                            Err(e) => e.kind().hash(&mut h),
+            let canonical = std::fs::canonicalize(path)
+                .unwrap_or_else(|_| std::path::PathBuf::from(path));
+            ds_hash_path_identity(&mut hasher, &canonical);
+            match std::fs::metadata(path) {
+                Ok(meta) => {
+                    hasher.update(b"file");
+                    ds_hash_platform_file_identity(&mut hasher, &meta);
+                    match ds_sampled_file_content_digest(std::path::Path::new(path), meta.len()) {
+                        Ok(digest) => hasher.update(digest),
+                        Err(error) => {
+                            hasher.update(b"unreadable");
+                            hasher.update(format!("{:?}", error.kind()).as_bytes());
                         }
                     }
-                } else {
-                    "unreadable".hash(&mut h);
                 }
-            } else {
-                "missing".hash(&mut h);
+                Err(error) => {
+                    hasher.update(b"missing");
+                    hasher.update(format!("{:?}", error.kind()).as_bytes());
+                }
             }
         }
-        0xD5u8.hash(&mut h);
+        hasher.update(b"group-end");
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn ds_calibration_overrides_fingerprint(
+    overrides: &[pipeline::DeepSkyCalibrationOverride],
+) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    "deepsky-calibration-overrides-v1".hash(&mut h);
+    match serde_json::to_vec(overrides) {
+        Ok(serialized) => serialized.hash(&mut h),
+        Err(error) => {
+            // Serialization cannot currently fail for this DTO. Hashing the
+            // error still fails closed instead of silently sharing a cache
+            // across two assignment states.
+            error.to_string().hash(&mut h);
+        }
     }
     format!("{:016x}", h.finish())
 }
@@ -7921,6 +10003,201 @@ struct DsClassified {
     #[serde(rename = "darkFlats")]
     dark_flats: Vec<DsProbe>,
     bias: Vec<DsProbe>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DsDirectoryEntry {
+    name: String,
+    path: String,
+    hidden: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DsDirectoryShortcut {
+    kind: String,
+    label: String,
+    path: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DsDirectoryListing {
+    current: String,
+    parent: Option<String>,
+    entries: Vec<DsDirectoryEntry>,
+    shortcuts: Vec<DsDirectoryShortcut>,
+}
+
+fn ds_directory_shortcuts() -> Vec<DsDirectoryShortcut> {
+    let mut shortcuts = Vec::new();
+    let mut add = |kind: &str, label: String, path: std::path::PathBuf| {
+        let path_string = path.to_string_lossy().to_string();
+        if !path.is_dir()
+            || shortcuts
+                .iter()
+                .any(|item: &DsDirectoryShortcut| item.path == path_string)
+        {
+            return;
+        }
+        shortcuts.push(DsDirectoryShortcut {
+            kind: kind.to_string(),
+            label,
+            path: path_string,
+        });
+    };
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        add("home", "Inicio".into(), home);
+    }
+    #[cfg(target_os = "macos")]
+    add(
+        "volumes",
+        "Discos y volúmenes".into(),
+        std::path::PathBuf::from("/Volumes"),
+    );
+    #[cfg(unix)]
+    add("root", "Sistema".into(), std::path::PathBuf::from("/"));
+    #[cfg(target_os = "windows")]
+    for letter in b'A'..=b'Z' {
+        let path = std::path::PathBuf::from(format!("{}:\\", letter as char));
+        add("drive", format!("Unidad {}:", letter as char), path);
+    }
+    shortcuts
+}
+
+fn ds_list_directories(path: Option<&str>) -> Result<DsDirectoryListing, String> {
+    let requested = path
+        .filter(|value| !value.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| "No se pudo determinar una carpeta inicial".to_string())?;
+    let current = requested
+        .canonicalize()
+        .map_err(|error| format!("No se puede abrir '{}': {error}", requested.display()))?;
+    if !current.is_dir() {
+        return Err(format!("'{}' no es una carpeta", current.display()));
+    }
+    let mut entries = std::fs::read_dir(&current)
+        .map_err(|error| format!("No se puede leer '{}': {error}", current.display()))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            Some(DsDirectoryEntry {
+                hidden: name.starts_with('.'),
+                name,
+                path: path.to_string_lossy().to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(DsDirectoryListing {
+        current: current.to_string_lossy().to_string(),
+        parent: current
+            .parent()
+            .map(|parent| parent.to_string_lossy().to_string()),
+        entries,
+        shortcuts: ds_directory_shortcuts(),
+    })
+}
+
+fn ds_validate_directory_name(name: &str) -> Result<&str, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Escribe un nombre para la carpeta".into());
+    }
+    if matches!(name, "." | "..")
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err("El nombre contiene caracteres no permitidos".into());
+    }
+    Ok(name)
+}
+
+fn ds_create_directory(parent: &str, name: &str) -> Result<DsDirectoryListing, String> {
+    let parent = std::path::PathBuf::from(parent)
+        .canonicalize()
+        .map_err(|error| format!("No se puede abrir la carpeta superior: {error}"))?;
+    if !parent.is_dir() {
+        return Err(format!("'{}' no es una carpeta", parent.display()));
+    }
+    let name = ds_validate_directory_name(name)?;
+    let target = parent.join(name);
+    if target.exists() {
+        return Err(format!("Ya existe una carpeta llamada '{name}'"));
+    }
+    std::fs::create_dir(&target)
+        .map_err(|error| format!("No se pudo crear '{}': {error}", target.display()))?;
+    ds_list_directories(Some(target.to_string_lossy().as_ref()))
+}
+
+fn ds_rename_directory(path: &str, name: &str) -> Result<DsDirectoryListing, String> {
+    let source = std::path::PathBuf::from(path)
+        .canonicalize()
+        .map_err(|error| format!("No se puede abrir la carpeta: {error}"))?;
+    if !source.is_dir() {
+        return Err(format!("'{}' no es una carpeta", source.display()));
+    }
+    let parent = source
+        .parent()
+        .ok_or_else(|| "No se puede renombrar la raíz del sistema".to_string())?;
+    if std::env::var_os("HOME")
+        .and_then(|home| std::path::PathBuf::from(home).canonicalize().ok())
+        .as_ref()
+        == Some(&source)
+    {
+        return Err("No se puede renombrar la carpeta de inicio desde aquí".into());
+    }
+    #[cfg(target_os = "macos")]
+    if parent == std::path::Path::new("/Volumes") {
+        return Err("No se puede renombrar un volumen montado desde aquí".into());
+    }
+    let name = ds_validate_directory_name(name)?;
+    if source.file_name().and_then(|value| value.to_str()) == Some(name) {
+        return ds_list_directories(Some(parent.to_string_lossy().as_ref()));
+    }
+    let target = parent.join(name);
+    if target.exists() {
+        return Err(format!("Ya existe una carpeta llamada '{name}'"));
+    }
+    std::fs::rename(&source, &target).map_err(|error| {
+        format!(
+            "No se pudo renombrar '{}' como '{}': {error}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    ds_list_directories(Some(parent.to_string_lossy().as_ref()))
+}
+
+/// Navegación explícita por carpetas para el flujo deep-sky. A diferencia de
+/// NSOpenPanel en modo `pick_folder`, entrar en una subcarpeta y confirmar la
+/// selección son acciones separadas en la UI.
+#[tauri::command]
+fn deepsky_browse_directories(path: Option<String>) -> Result<DsDirectoryListing, String> {
+    ds_list_directories(path.as_deref())
+}
+
+#[tauri::command]
+fn deepsky_create_directory(parent: String, name: String) -> Result<DsDirectoryListing, String> {
+    ds_create_directory(&parent, &name)
+}
+
+#[tauri::command]
+fn deepsky_rename_directory(path: String, name: String) -> Result<DsDirectoryListing, String> {
+    ds_rename_directory(&path, &name)
 }
 
 /// Scan a folder recursively, auto-classify every image into lights/darks/
@@ -8126,7 +10403,7 @@ fn deepsky_probe(paths: Vec<String>) -> Vec<DsProbe> {
                 ok: false,
                 error: None,
             };
-            if lower.ends_with(".fits") || lower.ends_with(".fit") {
+            if lower.ends_with(".fits") || lower.ends_with(".fit") || lower.ends_with(".fts") {
                 match fitrs::Fits::open(p) {
                     Ok(fits) => match fits.iter().next() {
                         Some(hdu) => {
@@ -8161,8 +10438,7 @@ fn deepsky_probe(paths: Vec<String>) -> Vec<DsProbe> {
                                 .or_else(|| ds_hdr_str(&hdu, "OBSTYPE"))
                                 .or_else(|| ds_hdr_str(&hdu, "FRAME"));
                             let object = ds_hdr_str(&hdu, "OBJECT");
-                            let extraction =
-                                ds_signature_extraction_for_hdu(&hdu, w, h, ch.min(3));
+                            let extraction = ds_signature_extraction_for_hdu(&hdu, w, h, ch.min(3));
                             let signature_missing =
                                 ds_missing_light_signature_fields(&extraction.signature);
                             let mut signature = extraction.signature;
@@ -8231,6 +10507,511 @@ fn deepsky_probe(paths: Vec<String>) -> Vec<DsProbe> {
             }
         })
         .collect()
+}
+
+fn ds_parse_observation_timestamp(raw: &str) -> Option<f64> {
+    let value = raw.trim();
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(parsed.timestamp_micros() as f64 / 1_000_000.0);
+    }
+    for format in [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ] {
+        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(value, format) {
+            return Some(parsed.and_utc().timestamp_micros() as f64 / 1_000_000.0);
+        }
+    }
+    None
+}
+
+/// B11a — Umbral robusto de rechazo para los residuos del ajuste de
+/// trayectoria cometaria: `med + 3·MAD` con MAD REAL,
+/// `mad = 1.4826·mediana(|r − med|)`. El factor 1.4826 hace del MAD un
+/// estimador consistente de σ bajo ruido gaussiano, así que el corte equivale
+/// a "mediana + 3σ robustos". La versión anterior usaba `3·mediana(r)`, que
+/// NO es un MAD: escala con el NIVEL base de los residuos (no con su
+/// dispersión), y con residuos base ~2 px el corte subía a ~6-7 px dejando
+/// pasar blunders de identificación del núcleo. Se conserva el suelo de
+/// 1.5 px — `(med + 3·mad).max(1.5)` — para no sobre-rechazar cuando los
+/// residuos son diminutos: la incertidumbre del centroide manual del núcleo
+/// es del orden del píxel y un corte sub-píxel vaciaría el ajuste.
+fn ds_comet_residual_cutoff(residuals: &[f32]) -> f32 {
+    let mut sorted: Vec<f32> = residuals
+        .iter()
+        .copied()
+        .filter(|residual| residual.is_finite())
+        .collect();
+    if sorted.is_empty() {
+        return 1.5;
+    }
+    sorted.sort_by(f32::total_cmp);
+    let median = sorted[sorted.len() / 2];
+    let mut deviations: Vec<f32> = sorted
+        .iter()
+        .map(|residual| (residual - median).abs())
+        .collect();
+    deviations.sort_by(f32::total_cmp);
+    let mad = 1.4826 * deviations[deviations.len() / 2];
+    (median + 3.0 * mad).max(1.5)
+}
+
+fn ds_fit_comet_observations(
+    observations: &[pipeline::CometObservation],
+) -> Result<pipeline::CometTrajectory, String> {
+    let mut points: Vec<&pipeline::CometObservation> = observations
+        .iter()
+        .filter(|observation| {
+            observation.confirmed
+                && observation.timestamp_unix.is_finite()
+                && observation.registered_x.is_finite()
+                && observation.registered_y.is_finite()
+        })
+        .collect();
+    if points.len() < 3 {
+        return Err("Confirma al menos tres posiciones del núcleo".into());
+    }
+    points.sort_by(|a, b| a.timestamp_unix.total_cmp(&b.timestamp_unix));
+    let epoch = points[points.len() / 2].timestamp_unix;
+    let fit = |points: &[&pipeline::CometObservation]| -> Option<(f32, f32, f32, f32)> {
+        let n = points.len() as f64;
+        let mean_dt = points
+            .iter()
+            .map(|point| point.timestamp_unix - epoch)
+            .sum::<f64>()
+            / n;
+        let mean_x = points
+            .iter()
+            .map(|point| point.registered_x as f64)
+            .sum::<f64>()
+            / n;
+        let mean_y = points
+            .iter()
+            .map(|point| point.registered_y as f64)
+            .sum::<f64>()
+            / n;
+        let denominator = points
+            .iter()
+            .map(|point| {
+                let centered = point.timestamp_unix - epoch - mean_dt;
+                centered * centered
+            })
+            .sum::<f64>();
+        if denominator <= 1e-9 {
+            return None;
+        }
+        let vx = points
+            .iter()
+            .map(|point| {
+                (point.timestamp_unix - epoch - mean_dt) * (point.registered_x as f64 - mean_x)
+            })
+            .sum::<f64>()
+            / denominator;
+        let vy = points
+            .iter()
+            .map(|point| {
+                (point.timestamp_unix - epoch - mean_dt) * (point.registered_y as f64 - mean_y)
+            })
+            .sum::<f64>()
+            / denominator;
+        Some((
+            (mean_x - vx * mean_dt) as f32,
+            (mean_y - vy * mean_dt) as f32,
+            vx as f32,
+            vy as f32,
+        ))
+    };
+    let (mut x0, mut y0, mut vx, mut vy) =
+        fit(&points).ok_or("Los timestamps confirmados no abarcan un intervalo")?;
+    // Segunda pasada robusta: sólo elimina un punto si hay más de tres y su
+    // residuo supera mediana + 3×MAD (MAD real — ver ds_comet_residual_cutoff).
+    // Con tres puntos el usuario sigue siendo la autoridad y el RMS hace
+    // visible la inconsistencia.
+    if points.len() > 3 {
+        let mut residuals: Vec<f32> = points
+            .iter()
+            .map(|point| {
+                let dt = (point.timestamp_unix - epoch) as f32;
+                ((point.registered_x - (x0 + vx * dt)).powi(2)
+                    + (point.registered_y - (y0 + vy * dt)).powi(2))
+                .sqrt()
+            })
+            .collect();
+        let cutoff = ds_comet_residual_cutoff(&residuals);
+        let kept: Vec<&pipeline::CometObservation> = points
+            .iter()
+            .zip(residuals.drain(..))
+            .filter_map(|(point, residual)| (residual <= cutoff).then_some(*point))
+            .collect();
+        if kept.len() >= 3 {
+            points = kept;
+            (x0, y0, vx, vy) = fit(&points).ok_or("No se pudo reajustar la trayectoria robusta")?;
+        }
+    }
+    let rms = (points
+        .iter()
+        .map(|point| {
+            let dt = (point.timestamp_unix - epoch) as f32;
+            (point.registered_x - (x0 + vx * dt)).powi(2)
+                + (point.registered_y - (y0 + vy * dt)).powi(2)
+        })
+        .sum::<f32>()
+        / points.len() as f32)
+        .sqrt();
+    let span = points.last().unwrap().timestamp_unix - points[0].timestamp_unix;
+    let motion = ((vx * span as f32).powi(2) + (vy * span as f32).powi(2)).sqrt();
+    let confidence = ((points.len() as f32 / 3.0).min(1.0)
+        * (-rms / 3.0).exp()
+        * (motion / 4.0).clamp(0.35, 1.0))
+    .clamp(0.0, 1.0);
+    Ok(pipeline::CometTrajectory {
+        epoch_unix: epoch,
+        x_at_epoch: x0,
+        y_at_epoch: y0,
+        velocity_x_px_s: vx,
+        velocity_y_px_s: vy,
+        rms_px: rms,
+        confidence,
+    })
+}
+
+/// `detect_deepsky_comet` expresa la trayectoria en la cuadrícula de su primer
+/// light cronológico. El apilador puede elegir otra referencia por PSF; por
+/// eso tanto el ancla como cada observación deben atravesar la transformación
+/// detector→referencia efectiva antes de calcular la traslación de salida.
+fn ds_comet_translation_in_stack_grid(
+    detector_to_stack: DsTransform,
+    anchor_x: f32,
+    anchor_y: f32,
+    observation_x: f32,
+    observation_y: f32,
+) -> Result<(f32, f32), String> {
+    let (anchor_x, anchor_y) = detector_to_stack.forward(anchor_x, anchor_y);
+    let (observation_x, observation_y) = detector_to_stack.forward(observation_x, observation_y);
+    let dx = anchor_x - observation_x;
+    let dy = anchor_y - observation_y;
+    if !dx.is_finite() || !dy.is_finite() {
+        return Err("La proyección cometaria a la referencia efectiva no es finita".into());
+    }
+    Ok((dx, dy))
+}
+
+#[tauri::command]
+fn fit_deepsky_comet_trajectory(
+    observations: Vec<pipeline::CometObservation>,
+) -> Result<pipeline::CometTrajectory, String> {
+    ds_fit_comet_observations(&observations)
+}
+
+/// Detección automática acotada: registra un máximo de nueve tomas por
+/// estrellas, busca residuos puntuales con movimiento aproximadamente lineal
+/// y predice el núcleo para toda la secuencia. La trayectoria usa el instante
+/// medio DATE-OBS + EXPTIME/2, no el inicio de exposiciones largas. Siempre
+/// exige confirmar primero/centro/último antes de apilar.
+#[tauri::command(async)]
+fn detect_deepsky_comet(lights: Vec<String>) -> Result<pipeline::CometDetectionResult, String> {
+    if lights.len() < 3 {
+        return Ok(pipeline::CometDetectionResult {
+            reasons: vec!["Se requieren al menos tres lights para una trayectoria".into()],
+            requires_confirmation: true,
+            ..Default::default()
+        });
+    }
+    let probes = deepsky_probe(lights);
+    let mut reasons = Vec::new();
+    let mut timed = Vec::new();
+    for probe in probes {
+        if !probe.ok {
+            reasons.push(format!("No se pudo leer {}", probe.name));
+            continue;
+        }
+        let timestamp = probe
+            .date_obs
+            .as_deref()
+            .and_then(ds_parse_observation_timestamp);
+        match (
+            timestamp,
+            probe
+                .exptime
+                .filter(|value| value.is_finite() && *value > 0.0),
+        ) {
+            (Some(timestamp), Some(exptime)) => timed.push((
+                probe.path,
+                timestamp + exptime as f64 * 0.5,
+                probe.w,
+                probe.h,
+            )),
+            (None, _) => reasons.push(format!(
+                "{} no tiene DATE-OBS/DATE-LOC interpretable",
+                probe.name
+            )),
+            (Some(_), None) => reasons.push(format!(
+                "{} no tiene EXPTIME válido; no se puede calcular el instante medio",
+                probe.name
+            )),
+        }
+    }
+    if !reasons.is_empty() || timed.len() < 3 {
+        return Ok(pipeline::CometDetectionResult {
+            reasons,
+            requires_confirmation: true,
+            ..Default::default()
+        });
+    }
+    timed.sort_by(|a, b| a.1.total_cmp(&b.1));
+    if timed
+        .windows(2)
+        .any(|pair| (pair[1].1 - pair[0].1).abs() < 1e-6)
+    {
+        return Ok(pipeline::CometDetectionResult {
+            reasons: vec!["Los timestamps de los lights no son únicos".into()],
+            requires_confirmation: true,
+            ..Default::default()
+        });
+    }
+    let geometry = (timed[0].2, timed[0].3);
+    if timed.iter().any(|item| (item.2, item.3) != geometry) {
+        return Ok(pipeline::CometDetectionResult {
+            reasons: vec!["Los lights del cometa no comparten geometría".into()],
+            requires_confirmation: true,
+            ..Default::default()
+        });
+    }
+    let sample_count = timed.len().min(9);
+    let mut sample_indices = Vec::new();
+    for slot in 0..sample_count {
+        let index = if sample_count == 1 {
+            0
+        } else {
+            ((slot as f64 * (timed.len() - 1) as f64 / (sample_count - 1) as f64).round()) as usize
+        };
+        if sample_indices.last().copied() != Some(index) {
+            sample_indices.push(index);
+        }
+    }
+    #[derive(Clone)]
+    struct Sample {
+        time: f64,
+        factor: usize,
+        stars: Vec<(f32, f32, f32)>,
+        mapped: Vec<(f32, f32, f32)>,
+    }
+    let mut samples = Vec::new();
+    for &index in &sample_indices {
+        let image = ds_read_image(&timed[index].0)?;
+        let (luma, width, height, factor) = ds_inspection_luma(&image);
+        let stars = ds_detect_stars(&luma, width, height, 180);
+        if stars.len() < 12 {
+            return Ok(pipeline::CometDetectionResult {
+                reasons: vec![format!(
+                    "{} sólo contiene {} fuentes; se requieren 12 para separar el movimiento",
+                    std::path::Path::new(&timed[index].0)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                    stars.len()
+                )],
+                requires_confirmation: true,
+                ..Default::default()
+            });
+        }
+        samples.push(Sample {
+            time: timed[index].1,
+            factor,
+            stars,
+            mapped: Vec::new(),
+        });
+    }
+    let factor = samples[0].factor;
+    if samples.iter().any(|sample| sample.factor != factor) {
+        return Err("El detector usó escalas de inspección incompatibles".into());
+    }
+    let reference = samples[0].stars.clone();
+    let width = (geometry.0 / factor).max(1);
+    let height = (geometry.1 / factor).max(1);
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let transform = if index == 0 {
+            DsTransform::identity()
+        } else {
+            let Some(registration) =
+                ds_match_triangles_in_field(&reference, &sample.stars, width, height)
+            else {
+                return Ok(pipeline::CometDetectionResult {
+                    reasons: vec![format!(
+                        "El registro estelar falló en la muestra {} de {}",
+                        index + 1,
+                        samples.len()
+                    )],
+                    requires_confirmation: true,
+                    ..Default::default()
+                });
+            };
+            registration.transform
+        };
+        sample.mapped = sample
+            .stars
+            .iter()
+            .map(|&(x, y, flux)| {
+                let (x, y) = transform.forward(x, y);
+                (x, y, flux)
+            })
+            .filter(|(x, y, _)| x.is_finite() && y.is_finite())
+            .collect();
+    }
+    let residual_catalog = |sample: &Sample| -> Vec<(f32, f32, f32)> {
+        sample
+            .mapped
+            .iter()
+            .copied()
+            .filter(|&(x, y, _)| {
+                !reference
+                    .iter()
+                    .any(|&(rx, ry, _)| (x - rx).powi(2) + (y - ry).powi(2) <= 36.0)
+            })
+            .take(48)
+            .collect()
+    };
+    let residuals: Vec<Vec<(f32, f32, f32)>> = samples
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| {
+            if index == 0 {
+                reference.iter().copied().take(48).collect()
+            } else {
+                residual_catalog(sample)
+            }
+        })
+        .collect();
+    let first_moving = (1..samples.len()).find(|&index| !residuals[index].is_empty());
+    let last_moving = (1..samples.len())
+        .rev()
+        .find(|&index| !residuals[index].is_empty());
+    let (Some(first_moving), Some(last_moving)) = (first_moving, last_moving) else {
+        return Ok(pipeline::CometDetectionResult {
+            reasons: vec!["No se encontró un residuo móvil separado del campo estelar".into()],
+            requires_confirmation: true,
+            ..Default::default()
+        });
+    };
+    if first_moving == last_moving {
+        return Ok(pipeline::CometDetectionResult {
+            reasons: vec!["Sólo una muestra contiene candidato móvil".into()],
+            requires_confirmation: true,
+            ..Default::default()
+        });
+    }
+    let t0 = samples[first_moving].time;
+    let t1 = samples[last_moving].time;
+    let mut candidates: Vec<(f32, Vec<(f64, f32, f32)>)> = Vec::new();
+    for &(ax, ay, _) in &residuals[first_moving] {
+        for &(bx, by, _) in &residuals[last_moving] {
+            let motion = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
+            if motion < 2.0 {
+                continue;
+            }
+            let mut matched = Vec::new();
+            let mut residual_sum = 0.0f32;
+            for (sample_index, sample) in samples.iter().enumerate() {
+                let alpha = ((sample.time - t0) / (t1 - t0)).clamp(-1.0, 2.0) as f32;
+                let px = ax + (bx - ax) * alpha;
+                let py = ay + (by - ay) * alpha;
+                let nearest = residuals[sample_index]
+                    .iter()
+                    .map(|&(x, y, _)| {
+                        let distance = ((x - px).powi(2) + (y - py).powi(2)).sqrt();
+                        (distance, x, y)
+                    })
+                    .min_by(|a, b| a.0.total_cmp(&b.0));
+                if let Some((distance, x, y)) = nearest.filter(|nearest| nearest.0 <= 6.0) {
+                    matched.push((sample.time, x, y));
+                    residual_sum += distance * distance;
+                }
+            }
+            if matched.len() >= 3 {
+                let rms = (residual_sum / matched.len() as f32).sqrt();
+                let coverage = matched.len() as f32 / samples.len() as f32;
+                let score = coverage * (-rms / 3.0).exp();
+                candidates.push((score, matched));
+            }
+        }
+    }
+    candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let Some((best_score, matched)) = candidates.first().cloned() else {
+        return Ok(pipeline::CometDetectionResult {
+            reasons: vec![
+                "No se encontró una trayectoria lineal coherente; marca el núcleo manualmente"
+                    .into(),
+            ],
+            requires_confirmation: true,
+            ..Default::default()
+        });
+    };
+    let epoch = timed[timed.len() / 2].1;
+    let mut fit_points: Vec<pipeline::CometObservation> = matched
+        .into_iter()
+        .map(
+            |(timestamp_unix, registered_x, registered_y)| pipeline::CometObservation {
+                frame_path: String::new(),
+                timestamp_unix,
+                registered_x: registered_x * factor as f32,
+                registered_y: registered_y * factor as f32,
+                confirmed: true,
+            },
+        )
+        .collect();
+    let mut trajectory = ds_fit_comet_observations(&fit_points)?;
+    let second_score = candidates
+        .get(1)
+        .map(|candidate| candidate.0)
+        .unwrap_or(0.0);
+    let uniqueness = if best_score > 0.0 {
+        ((best_score - second_score) / best_score).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    trajectory.confidence = (best_score * (0.55 + 0.45 * uniqueness)).clamp(0.0, 1.0);
+    trajectory.epoch_unix = epoch;
+    let epoch_dt = (epoch - fit_points[fit_points.len() / 2].timestamp_unix) as f32;
+    trajectory.x_at_epoch += trajectory.velocity_x_px_s * epoch_dt;
+    trajectory.y_at_epoch += trajectory.velocity_y_px_s * epoch_dt;
+    let observations = timed
+        .iter()
+        .map(|(path, timestamp, _, _)| {
+            let dt = (*timestamp - trajectory.epoch_unix) as f32;
+            pipeline::CometObservation {
+                frame_path: path.clone(),
+                timestamp_unix: *timestamp,
+                registered_x: trajectory.x_at_epoch + trajectory.velocity_x_px_s * dt,
+                registered_y: trajectory.y_at_epoch + trajectory.velocity_y_px_s * dt,
+                confirmed: false,
+            }
+        })
+        .collect::<Vec<_>>();
+    fit_points.clear();
+    let confidence_threshold = 0.72;
+    let mut result_reasons = Vec::new();
+    if trajectory.confidence < confidence_threshold {
+        result_reasons.push(format!(
+            "Confianza automática {:.0}%: confirma o corrige los tres puntos",
+            trajectory.confidence * 100.0
+        ));
+    }
+    if uniqueness < 0.18 {
+        result_reasons.push(
+            "Hay varios candidatos de movimiento parecido; la confirmación es obligatoria".into(),
+        );
+    }
+    Ok(pipeline::CometDetectionResult {
+        valid: trajectory.confidence >= confidence_threshold,
+        requires_confirmation: true,
+        key_observation_indices: vec![0, observations.len() / 2, observations.len() - 1],
+        observations,
+        trajectory: Some(trajectory),
+        reasons: result_reasons,
+        used_wcs: false,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -8542,8 +11323,8 @@ fn inspect_deepsky_frames(
             }
         }
     }
-    let dither = (positions.len() >= 2)
-        .then(|| crate::deepsky_noise::analyze_dither_positions(&positions));
+    let dither =
+        (positions.len() >= 2).then(|| crate::deepsky_noise::analyze_dither_positions(&positions));
 
     // Patrón de detector: mediana por banding de las muestras medidas (hasta
     // tres primeras tomas), robusta a una toma atípica.
@@ -8600,7 +11381,9 @@ fn ds_compare_probe_calibration(
         policy,
     );
     let layout_reason = match (&reference.store_layout, &candidate.store_layout) {
-        (Some(reference_layout), Some(candidate_layout)) if reference_layout == candidate_layout => {
+        (Some(reference_layout), Some(candidate_layout))
+            if reference_layout == candidate_layout =>
+        {
             None
         }
         (Some(reference_layout), Some(candidate_layout)) => Some(format!(
@@ -8618,18 +11401,9 @@ fn ds_compare_probe_calibration(
             {
                 None
             }
-            (Some(reference_session), Some(candidate_session)) => {
-                // Práctica real: los flats se disparan al atardecer siguiente o
-                // al amanecer — la noche ADYACENTE (Δ1 día) es la misma sesión
-                // óptica (el tren no cambia). Más lejos sí es otra sesión.
-                if ds_night_distance(Some(reference_session), Some(candidate_session)) <= 1 {
-                    None
-                } else {
-                    Some(format!(
-                        "session: {reference_session:?} != {candidate_session:?}"
-                    ))
-                }
-            }
+            (Some(reference_session), Some(candidate_session)) => Some(format!(
+                "session: {reference_session:?} != {candidate_session:?}; requiere reutilización explícita validada"
+            )),
             _ => Some("metadata obligatoria ausente: session".into()),
         }
     } else {
@@ -8747,7 +11521,9 @@ fn ds_select_calibration_group(
             warnings: if required
                 && matches!(policy, pipeline::DeepSkyCalibrationPolicy::AllowDegraded)
             {
-                vec![format!("AllowDegraded: {reason}; sólo Classic no científico")]
+                vec![format!(
+                    "AllowDegraded: {reason}; sólo Classic no científico"
+                )]
             } else {
                 Vec::new()
             },
@@ -8806,15 +11582,18 @@ fn ds_select_calibration_group(
     let mut mismatch_groups: std::collections::BTreeMap<(String, bool), (usize, String)> =
         std::collections::BTreeMap::new();
     for probe in probes.iter().filter(|probe| probe.ok) {
-        let exact = references.iter().filter(|reference| reference.ok).any(|reference| {
-            ds_compare_probe_calibration(
-                reference,
-                probe,
-                role,
-                pipeline::DeepSkyCalibrationPolicy::Strict,
-            )
-            .compatible
-        });
+        let exact = references
+            .iter()
+            .filter(|reference| reference.ok)
+            .any(|reference| {
+                ds_compare_probe_calibration(
+                    reference,
+                    probe,
+                    role,
+                    pipeline::DeepSkyCalibrationPolicy::Strict,
+                )
+                .compatible
+            });
         if exact {
             selected.push(probe);
             continue;
@@ -8840,9 +11619,7 @@ fn ds_select_calibration_group(
             })
             .min_by_key(Vec::len)
             .unwrap_or_else(|| vec!["sin firma de referencia".into()]);
-        if scalable_dark
-            && matches!(policy, pipeline::DeepSkyCalibrationPolicy::AllowDegraded)
-        {
+        if scalable_dark && matches!(policy, pipeline::DeepSkyCalibrationPolicy::AllowDegraded) {
             selected.push(probe);
         }
         let entry = mismatch_groups
@@ -8977,7 +11754,11 @@ fn ds_select_calibration_group(
         if !uncovered_nights.is_empty() {
             let reason = format!(
                 "flats: el máster por sesión no cubre todas las firmas de light en {}",
-                uncovered_nights.iter().cloned().collect::<Vec<_>>().join(", ")
+                uncovered_nights
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             if matches!(policy, pipeline::DeepSkyCalibrationPolicy::Strict) {
                 blocking_reasons.push(reason);
@@ -9052,10 +11833,7 @@ fn ds_virtual_master_path(kind: &str, paths: &[String]) -> Option<String> {
     })
 }
 
-fn ds_selected_probes(
-    probes: &[DsProbe],
-    selection: &DsCalibrationSelection,
-) -> Vec<DsProbe> {
+fn ds_selected_probes(probes: &[DsProbe], selection: &DsCalibrationSelection) -> Vec<DsProbe> {
     let selected = selection
         .paths
         .iter()
@@ -9257,6 +12035,10 @@ fn ds_prepare_calibration_decisions(
                 },
                 compatible: !degraded,
                 degraded,
+                scientific_eligible: !degraded
+                    && !selected_dark.is_empty()
+                    && !selected_flat.is_empty(),
+                assignment_tier: pipeline::CalibrationAssignmentTier::AutomaticExact,
                 fallback,
                 reasons,
                 ..pipeline::PreparedCalibrationDecision::default()
@@ -9300,6 +12082,7 @@ fn ds_is_linear_science_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.ends_with(".fits")
         || lower.ends_with(".fit")
+        || lower.ends_with(".fts")
         || lower.ends_with(".tif")
         || lower.ends_with(".tiff")
 }
@@ -9460,9 +12243,8 @@ fn ds_measure_auto_signals(probes: &[&DsProbe]) -> DsAutoSignals {
     signals.stars_per_mpx = median(samples.iter().map(|s| s.stars_per_mpx).collect());
     signals.fwhm_px = median(samples.iter().map(|s| s.fwhm_px).collect());
     let flat_fraction = median(samples.iter().map(|s| s.low_flat_fraction).collect());
-    signals.dark_nebula = signals.background_over_noise < 2.0
-        && signals.stars_per_mpx < 40.0
-        && flat_fraction > 0.90;
+    signals.dark_nebula =
+        signals.background_over_noise < 2.0 && signals.stars_per_mpx < 40.0 && flat_fraction > 0.90;
 
     // Dithering: offsets estelares de cada muestra contra la primera. Con tan
     // pocas muestras, una deriva lineal pura es colineal en XY: el RMS de la
@@ -9508,7 +12290,11 @@ fn ds_auto_preliminary_pressure(probes: &[&DsProbe]) -> (u64, bool) {
         let px = probe.w as u64 * probe.h as u64;
         if px > in_px {
             in_px = px;
-            ch = if probe.bayer.is_some() { 3 } else { probe.ch as u64 };
+            ch = if probe.bayer.is_some() {
+                3
+            } else {
+                probe.ch as u64
+            };
         }
     }
     let estimate_mb = |out_px: u64| -> u64 {
@@ -9518,8 +12304,8 @@ fn ds_auto_preliminary_pressure(probes: &[&DsProbe]) -> (u64, bool) {
             / (1024 * 1024)
     };
     let pressure = estimate_mb(in_px).saturating_mul(100) / host_memory_mb;
-    let ram_2x_fits = estimate_mb(in_px.saturating_mul(4)).saturating_mul(100) / host_memory_mb
-        < 60;
+    let ram_2x_fits =
+        estimate_mb(in_px.saturating_mul(4)).saturating_mul(100) / host_memory_mb < 60;
     (pressure, ram_2x_fits)
 }
 
@@ -9661,7 +12447,10 @@ fn ds_resolve_auto_recipe(
                 blockers.push(format!("{n} lights (<30)"));
             }
             if !fwhm_ok {
-                blockers.push(format!("FWHM {:.1} px (≥2.5: sin submuestreo)", signals.fwhm_px));
+                blockers.push(format!(
+                    "FWHM {:.1} px (≥2.5: sin submuestreo)",
+                    signals.fwhm_px
+                ));
             }
             if !ram_2x_fits {
                 blockers.push("RAM insuficiente para lienzo 2×".into());
@@ -9752,60 +12541,1021 @@ fn ds_apply_auto_profile(
     ds_resolve_auto_recipe(request, &signals, pressure, ram_2x_fits)
 }
 
-/// Aplica las asignaciones manuales a la matriz de decisiones: la elección
-/// explícita del usuario sustituye al emparejamiento automático de darks y
-/// flats para los lights afectados y NUNCA cuenta como error de contrato.
+#[derive(Clone, Debug)]
+struct DsManualRoleAssessment {
+    safe: bool,
+    tier: pipeline::CalibrationAssignmentTier,
+    reuse_evidence: Option<pipeline::CalibrationReuseEvidence>,
+    user_verified: bool,
+    verification_reasons: Vec<String>,
+    reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DsFlatReuseSignatureIssues {
+    blocking: Vec<String>,
+    attestable: Vec<String>,
+}
+
+/// Separa mismatches/ausencias físicas que nunca pueden forzarse de identidad
+/// extendida ausente que el usuario sí puede certificar. Un valor PRESENTE y
+/// distinto siempre es bloqueante, incluso en un campo attestable.
+fn ds_flat_reuse_signature_issues(
+    reference: &DsProbe,
+    candidate: &DsProbe,
+) -> DsFlatReuseSignatureIssues {
+    let mut issues = DsFlatReuseSignatureIssues::default();
+    if (reference.w, reference.h, reference.ch) != (candidate.w, candidate.h, candidate.ch) {
+        issues.blocking.push(format!(
+            "geometría: {}×{}×{} != {}×{}×{}",
+            reference.w, reference.h, reference.ch, candidate.w, candidate.h, candidate.ch
+        ));
+    }
+    if reference.store_layout.is_none()
+        || candidate.store_layout.is_none()
+        || reference.store_layout != candidate.store_layout
+    {
+        issues
+            .blocking
+            .push("storeLayout/CFA phase ausente o distinto".into());
+    }
+    let a = &reference.signature;
+    let b = &candidate.signature;
+    macro_rules! require_physical_equal {
+        ($field:ident, $label:literal) => {
+            match (&a.$field, &b.$field) {
+                (Some(left), Some(right)) if left == right => {}
+                (Some(left), Some(right)) => issues
+                    .blocking
+                    .push(format!("{}: {:?} != {:?}", $label, left, right)),
+                _ => issues
+                    .blocking
+                    .push(format!("metadata física ausente: {}", $label)),
+            }
+        };
+    }
+    macro_rules! require_identity_or_attest {
+        ($field:ident, $label:literal) => {
+            match (&a.$field, &b.$field) {
+                (Some(left), Some(right)) if left == right => {}
+                (Some(left), Some(right)) => issues
+                    .blocking
+                    .push(format!("{}: {:?} != {:?}", $label, left, right)),
+                _ => issues
+                    .attestable
+                    .push(format!("metadata de identidad ausente: {}", $label)),
+            }
+        };
+    }
+    require_identity_or_attest!(camera, "camera");
+    require_identity_or_attest!(sensor, "sensor");
+    require_identity_or_attest!(read_mode, "readMode");
+    require_physical_equal!(binning_x, "binningX");
+    require_physical_equal!(binning_y, "binningY");
+    require_identity_or_attest!(roi, "roi");
+    require_physical_equal!(filter, "filter");
+    require_identity_or_attest!(optical_train, "opticalTrain");
+    require_identity_or_attest!(adc_bits, "adcBits");
+    if a.gain.is_some() || b.gain.is_some() {
+        match (a.gain, b.gain) {
+            (Some(left), Some(right)) if (left - right).abs() <= 1.0e-3 => {}
+            (Some(left), Some(right)) => issues
+                .blocking
+                .push(format!("gain: {left:.4} != {right:.4}")),
+            _ => issues.blocking.push("metadata física ausente: gain".into()),
+        }
+    } else {
+        require_physical_equal!(iso, "iso");
+    }
+    match (a.offset, b.offset) {
+        (Some(left), Some(right)) if (left - right).abs() <= 1.0e-3 => {}
+        (Some(left), Some(right)) => issues
+            .blocking
+            .push(format!("offset: {left:.4} != {right:.4}")),
+        _ => issues
+            .blocking
+            .push("metadata física ausente: offset".into()),
+    }
+    match (a.white_level_adu, b.white_level_adu) {
+        (Some(left), Some(right)) if (left - right).abs() <= 1.0 => {}
+        (Some(left), Some(right)) => issues
+            .blocking
+            .push(format!("whiteLevelAdu: {left:.1} != {right:.1}")),
+        _ => issues
+            .attestable
+            .push("metadata de identidad ausente: whiteLevelAdu".into()),
+    }
+    if a.cfa_pattern.is_some() || b.cfa_pattern.is_some() {
+        require_physical_equal!(cfa_pattern, "cfaPattern");
+        require_physical_equal!(cfa_phase, "cfaPhase");
+    }
+    issues.blocking.sort();
+    issues.blocking.dedup();
+    issues.attestable.sort();
+    issues.attestable.dedup();
+    issues
+}
+
+fn ds_flat_normalized_profile(path: &str) -> Result<Vec<f32>, String> {
+    const GRID_X: usize = 32;
+    const GRID_Y: usize = 24;
+    let image = ds_read_image(path)?;
+    if image.w < GRID_X || image.h < GRID_Y || image.ch == 0 {
+        return Err("flat demasiado pequeño para calcular fingerprint 32×24".into());
+    }
+    let mut profile = vec![0.0f64; GRID_X * GRID_Y];
+    let mut counts = vec![0usize; GRID_X * GRID_Y];
+    for y in 0..image.h {
+        let gy = (y * GRID_Y / image.h).min(GRID_Y - 1);
+        for x in 0..image.w {
+            let gx = (x * GRID_X / image.w).min(GRID_X - 1);
+            let cell = gy * GRID_X + gx;
+            let offset = (y * image.w + x) * image.ch;
+            let mut value = 0.0f64;
+            let mut finite = 0usize;
+            for channel in 0..image.ch {
+                let sample = image.data[offset + channel];
+                if sample.is_finite() {
+                    value += sample as f64;
+                    finite += 1;
+                }
+            }
+            if finite > 0 {
+                profile[cell] += value / finite as f64;
+                counts[cell] += 1;
+            }
+        }
+    }
+    let mut normalized = profile
+        .into_iter()
+        .zip(counts)
+        .map(|(sum, count)| {
+            if count == 0 {
+                f32::NAN
+            } else {
+                (sum / count as f64) as f32
+            }
+        })
+        .collect::<Vec<_>>();
+    let finite = normalized
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<_>>();
+    if finite.len() != normalized.len() {
+        return Err("fingerprint contiene celdas sin señal lineal".into());
+    }
+    let mean = finite.iter().map(|value| *value as f64).sum::<f64>() / finite.len() as f64;
+    if !mean.is_finite() || mean <= 0.0 {
+        return Err("nivel medio inválido al calcular fingerprint".into());
+    }
+    for value in &mut normalized {
+        *value /= mean as f32;
+    }
+    Ok(normalized)
+}
+
+fn ds_measure_flat_reuse_evidence(paths: &[String]) -> pipeline::CalibrationReuseEvidence {
+    use sha2::{Digest as _, Sha256};
+
+    let cache_key = ds_source_fingerprint(&[paths]);
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, pipeline::CalibrationReuseEvidence>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(evidence) = guard.get(&cache_key) {
+            return evidence.clone();
+        }
+    }
+
+    let sample_count = paths.len().min(7);
+    let sample_indices = if sample_count == 0 {
+        Vec::new()
+    } else if sample_count == 1 {
+        vec![0]
+    } else {
+        (0..sample_count)
+            .map(|index| index * (paths.len() - 1) / (sample_count - 1))
+            .collect::<Vec<_>>()
+    };
+    let mut reasons = Vec::new();
+    let mut profiles = Vec::new();
+    for index in sample_indices {
+        match ds_flat_normalized_profile(&paths[index]) {
+            Ok(profile) => profiles.push(profile),
+            Err(reason) => reasons.push(format!(
+                "{}: {reason}",
+                std::path::Path::new(&paths[index])
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            )),
+        }
+    }
+    if profiles.len() < 3 {
+        reasons.push(format!(
+            "se requieren al menos 3 flats legibles para validar estabilidad; disponibles {}",
+            profiles.len()
+        ));
+    }
+    let cells = profiles.first().map(Vec::len).unwrap_or(0);
+    let mut reference = vec![0.0f32; cells];
+    if cells > 0 && profiles.iter().all(|profile| profile.len() == cells) {
+        let mut values = Vec::with_capacity(profiles.len());
+        for cell in 0..cells {
+            values.clear();
+            values.extend(profiles.iter().map(|profile| profile[cell]));
+            values.sort_by(|left, right| left.total_cmp(right));
+            reference[cell] = values[values.len() / 2];
+        }
+    } else if !profiles.is_empty() {
+        reasons.push("los fingerprints del lote tienen geometrías distintas".into());
+    }
+    let mut maximum_profile_rms = 0.0f32;
+    let mut maximum_profile_delta = 0.0f32;
+    if cells > 0 {
+        for profile in &profiles {
+            let mut squared = 0.0f64;
+            for (value, expected) in profile.iter().zip(&reference) {
+                let delta = (*value - *expected).abs();
+                maximum_profile_delta = maximum_profile_delta.max(delta);
+                squared += (delta as f64).powi(2);
+            }
+            maximum_profile_rms = maximum_profile_rms.max((squared / cells as f64).sqrt() as f32);
+        }
+    }
+    if maximum_profile_rms > 0.015 {
+        reasons.push(format!(
+            "inestabilidad de iluminación RMS {:.3}% > 1.500%",
+            maximum_profile_rms * 100.0
+        ));
+    }
+    if maximum_profile_delta > 0.08 {
+        reasons.push(format!(
+            "cambio local máximo {:.3}% > 8.000%",
+            maximum_profile_delta * 100.0
+        ));
+    }
+    let mut hasher = Sha256::new();
+    for value in &reference {
+        hasher.update(((value * 10_000.0).round() as i32).to_le_bytes());
+    }
+    let evidence = pipeline::CalibrationReuseEvidence {
+        fingerprint_sha256: hex::encode(hasher.finalize()),
+        sampled_frames: profiles.len(),
+        profile_cells: cells,
+        maximum_profile_rms,
+        maximum_profile_delta,
+        stable: reasons.is_empty(),
+        reasons,
+        ..Default::default()
+    };
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= 32 {
+            guard.clear();
+        }
+        guard.insert(cache_key, evidence.clone());
+    }
+    evidence
+}
+
+fn ds_assess_manual_calibration_role(
+    over: &pipeline::DeepSkyCalibrationOverride,
+    selected_paths: &[String],
+    references: &[DsProbe],
+    candidates: &[DsProbe],
+    role: crate::deepsky_calibration_contract::CalibrationRole,
+    scope_by_override_lights: bool,
+) -> Option<DsManualRoleAssessment> {
+    if selected_paths.is_empty() {
+        return None;
+    }
+    let affected_lights = references
+        .iter()
+        .filter(|light| {
+            light.ok
+                && (!scope_by_override_lights
+                    || over.lights.is_empty()
+                    || over.lights.iter().any(|path| path == &light.path))
+        })
+        .collect::<Vec<_>>();
+    let selected = selected_paths
+        .iter()
+        .map(|path| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.ok && candidate.path == *path)
+                .ok_or_else(|| format!("no se pudo sondear el candidato '{path}'"))
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let selected = match selected {
+        Ok(selected) if !affected_lights.is_empty() => selected,
+        Ok(_) => {
+            return Some(DsManualRoleAssessment {
+                safe: false,
+                tier: pipeline::CalibrationAssignmentTier::ForcedUnsafe,
+                reuse_evidence: None,
+                user_verified: false,
+                verification_reasons: Vec::new(),
+                reasons: vec!["la regla manual no afecta ningún light cargado".into()],
+            });
+        }
+        Err(reason) => {
+            return Some(DsManualRoleAssessment {
+                safe: false,
+                tier: pipeline::CalibrationAssignmentTier::ForcedUnsafe,
+                reuse_evidence: None,
+                user_verified: false,
+                verification_reasons: Vec::new(),
+                reasons: vec![reason],
+            });
+        }
+    };
+
+    let mut reasons = Vec::new();
+    let mut verification_reasons = Vec::new();
+    let mut reused_session = false;
+    for light in affected_lights {
+        if matches!(
+            role,
+            crate::deepsky_calibration_contract::CalibrationRole::DarkFlat
+        ) {
+            // El desplegable presenta un lote dark-flat por sesión. Ese lote
+            // puede contener submásters para exposiciones distintas (p. ej.
+            // un flat Ha y otro OIII). No exigimos que cada candidato calibre
+            // cada flat: exigimos que CADA flat tenga al menos un subgrupo
+            // estricto y científico. El runtime vuelve a agrupar por firma y
+            // selecciona el submáster exacto, por lo que nunca mezcla píxeles
+            // de exposiciones/temperaturas incompatibles.
+            let reports = selected
+                .iter()
+                .map(|candidate| {
+                    (
+                        *candidate,
+                        ds_compare_probe_calibration(
+                            light,
+                            candidate,
+                            role,
+                            pipeline::DeepSkyCalibrationPolicy::Strict,
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !reports
+                .iter()
+                .any(|(_, report)| report.compatible && report.scientific_eligible)
+            {
+                let detail = reports
+                    .iter()
+                    .min_by_key(|(_, report)| report.reasons.len())
+                    .map(|(candidate, report)| {
+                        format!(
+                            "{}: {}",
+                            candidate.name,
+                            if report.reasons.is_empty() {
+                                "la firma no es científico-elegible".into()
+                            } else {
+                                report.reasons.join(", ")
+                            }
+                        )
+                    })
+                    .unwrap_or_else(|| "el lote no contiene candidatos legibles".into());
+                reasons.push(format!(
+                    "{}: ningún dark-flat compatible en el lote ({detail})",
+                    light.name
+                ));
+            }
+            continue;
+        }
+        for candidate in &selected {
+            let cross_session_flat = matches!(
+                role,
+                crate::deepsky_calibration_contract::CalibrationRole::Flat
+            ) && light.signature.session != candidate.signature.session;
+            let report = if cross_session_flat {
+                // La fecha es pista, no contrato físico. Para una asignación
+                // explícita se neutraliza sólo `session`; el comparador sigue
+                // validando todos los demás campos y el lote deberá superar
+                // además el fingerprint de estabilidad calculado abajo.
+                let mut reusable_candidate = (*candidate).clone();
+                reusable_candidate.signature.session = light.signature.session.clone();
+                ds_compare_probe_calibration(
+                    light,
+                    &reusable_candidate,
+                    role,
+                    pipeline::DeepSkyCalibrationPolicy::Strict,
+                )
+            } else {
+                ds_compare_probe_calibration(
+                    light,
+                    candidate,
+                    role,
+                    pipeline::DeepSkyCalibrationPolicy::Strict,
+                )
+            };
+            let reuse_issues =
+                cross_session_flat.then(|| ds_flat_reuse_signature_issues(light, candidate));
+            // Para un flat de otra noche, el comparador Strict marca como
+            // incompatible cualquier metadata obligatoria ausente. Ese es
+            // precisamente el único hueco que la certificación limitada
+            // puede completar; los mismatches conocidos y campos físicos
+            // siguen llegando por `blocking`.
+            if (!report.compatible || !report.scientific_eligible)
+                && reuse_issues
+                    .as_ref()
+                    .map_or(true, |issues| !issues.blocking.is_empty())
+            {
+                reasons.push(format!(
+                    "{} ↔ {}: {}",
+                    light.name,
+                    candidate.name,
+                    if report.reasons.is_empty() {
+                        "la firma no es científico-elegible".into()
+                    } else {
+                        report.reasons.join(", ")
+                    }
+                ));
+            }
+            if cross_session_flat {
+                reused_session = true;
+                let issues = reuse_issues.expect("cross-session flat has reuse issues");
+                reasons.extend(issues.blocking);
+                verification_reasons.extend(issues.attestable);
+            }
+        }
+    }
+    let reuse_evidence = reused_session.then(|| ds_measure_flat_reuse_evidence(selected_paths));
+    if let Some(evidence) = &reuse_evidence {
+        if !evidence.stable {
+            reasons.extend(
+                evidence
+                    .reasons
+                    .iter()
+                    .map(|reason| format!("estabilidad del flat: {reason}")),
+            );
+        }
+    }
+    reasons.sort();
+    reasons.dedup();
+    verification_reasons.sort();
+    verification_reasons.dedup();
+    let verification_reason_present = over
+        .user_verification_reason
+        .as_deref()
+        .is_some_and(|reason| !reason.trim().is_empty());
+    let user_verified = reused_session
+        && !verification_reasons.is_empty()
+        && reasons.is_empty()
+        && over.user_verified_scientific
+        && verification_reason_present;
+    if reused_session && !verification_reasons.is_empty() && !user_verified {
+        reasons.push(format!(
+            "requiere confirmación explícita del usuario: {}",
+            verification_reasons.join(", ")
+        ));
+    }
+    let safe = reasons.is_empty();
+    Some(DsManualRoleAssessment {
+        safe,
+        tier: if safe && user_verified {
+            pipeline::CalibrationAssignmentTier::UserVerified
+        } else if safe && reused_session {
+            pipeline::CalibrationAssignmentTier::ValidatedReuse
+        } else if safe {
+            pipeline::CalibrationAssignmentTier::AutomaticExact
+        } else {
+            pipeline::CalibrationAssignmentTier::ForcedUnsafe
+        },
+        reuse_evidence,
+        user_verified,
+        verification_reasons,
+        reasons,
+    })
+}
+
+fn ds_merge_assignment_tier(
+    current: pipeline::CalibrationAssignmentTier,
+    next: pipeline::CalibrationAssignmentTier,
+) -> pipeline::CalibrationAssignmentTier {
+    use pipeline::CalibrationAssignmentTier::*;
+    match (current, next) {
+        (ForcedUnsafe, _) | (_, ForcedUnsafe) => ForcedUnsafe,
+        (Skipped, _) | (_, Skipped) => Skipped,
+        (UserVerified, _) | (_, UserVerified) => UserVerified,
+        (ValidatedReuse, _) | (_, ValidatedReuse) => ValidatedReuse,
+        _ => AutomaticExact,
+    }
+}
+
+fn ds_calibration_requires_classic(decisions: &[pipeline::PreparedCalibrationDecision]) -> bool {
+    decisions
+        .iter()
+        .any(|decision| decision.degraded || !decision.scientific_eligible)
+}
+
+/// Aplica las asignaciones manuales a la matriz de decisiones después de
+/// volver a validar sus rutas contra las firmas reales. Una selección segura
+/// puede sustituir al automático; una incompatible queda registrada pero
+/// nunca se transforma en `compatible=true`.
+fn ds_manual_flat_references(
+    over: &pipeline::DeepSkyCalibrationOverride,
+    light_probes: &[DsProbe],
+    flat_probes: &[DsProbe],
+) -> Vec<DsProbe> {
+    if !over.flats.is_empty() {
+        return flat_probes
+            .iter()
+            .filter(|probe| probe.ok && over.flats.iter().any(|path| path == &probe.path))
+            .cloned()
+            .collect();
+    }
+    let mut selected = Vec::new();
+    for light in light_probes.iter().filter(|light| {
+        light.ok && (over.lights.is_empty() || over.lights.iter().any(|path| path == &light.path))
+    }) {
+        selected.extend(
+            ds_exact_calibrations(
+                light,
+                flat_probes,
+                crate::deepsky_calibration_contract::CalibrationRole::Flat,
+            )
+            .into_iter()
+            .cloned(),
+        );
+    }
+    selected.sort_by(|left, right| left.path.cmp(&right.path));
+    selected.dedup_by(|left, right| left.path == right.path);
+    selected
+}
+
 fn ds_apply_manual_overrides_to_decisions(
     decisions: &mut [pipeline::PreparedCalibrationDecision],
     overrides: &[pipeline::DeepSkyCalibrationOverride],
+    light_probes: &[DsProbe],
+    bias_probes: &[DsProbe],
+    dark_probes: &[DsProbe],
+    flat_probes: &[DsProbe],
+    dark_flat_probes: &[DsProbe],
 ) {
     for over in overrides {
-        if over.darks.is_empty() && over.flats.is_empty() && !over.skip_flats && !over.skip_darks
+        if over.darks.is_empty()
+            && over.flats.is_empty()
+            && over.dark_flats.is_empty()
+            && over.bias.is_empty()
+            && !over.skip_flats
+            && !over.skip_darks
+            && !over.skip_dark_flats
+            && !over.skip_bias
         {
             continue;
         }
-        let applies =
-            |path: &str| over.lights.is_empty() || over.lights.iter().any(|l| l == path);
+        let bias_assessment = ds_assess_manual_calibration_role(
+            over,
+            &over.bias,
+            light_probes,
+            bias_probes,
+            crate::deepsky_calibration_contract::CalibrationRole::Bias,
+            true,
+        );
+        let dark_assessment = ds_assess_manual_calibration_role(
+            over,
+            &over.darks,
+            light_probes,
+            dark_probes,
+            crate::deepsky_calibration_contract::CalibrationRole::Dark,
+            true,
+        );
+        let flat_assessment = ds_assess_manual_calibration_role(
+            over,
+            &over.flats,
+            light_probes,
+            flat_probes,
+            crate::deepsky_calibration_contract::CalibrationRole::Flat,
+            true,
+        );
+        let flat_references = ds_manual_flat_references(over, light_probes, flat_probes);
+        let dark_flat_assessment = ds_assess_manual_calibration_role(
+            over,
+            &over.dark_flats,
+            &flat_references,
+            dark_flat_probes,
+            crate::deepsky_calibration_contract::CalibrationRole::DarkFlat,
+            false,
+        );
+        let applies = |path: &str| over.lights.is_empty() || over.lights.iter().any(|l| l == path);
         for decision in decisions.iter_mut() {
             if !applies(&decision.frame_path) {
                 continue;
             }
             decision.manual = true;
+            let mut unsafe_assignment = false;
+            let mut skipped = false;
+            if over.skip_bias {
+                decision
+                    .reasons
+                    .retain(|reason| !reason.starts_with("bias:"));
+                decision.bias_master_path = None;
+                decision
+                    .reasons
+                    .push("bias omitido por decisión del usuario".into());
+            } else if let Some(assessment) = &bias_assessment {
+                decision.assignment_tier =
+                    ds_merge_assignment_tier(decision.assignment_tier, assessment.tier);
+                if assessment.safe {
+                    decision
+                        .reasons
+                        .retain(|reason| !reason.starts_with("bias:"));
+                    decision.bias_master_path = Some(format!("manual://{} bias", over.bias.len()));
+                    decision
+                        .reasons
+                        .push("bias manual validado contra la firma completa".into());
+                } else {
+                    unsafe_assignment = true;
+                    decision.reasons.push(format!(
+                        "bias forzado no seguro: {}",
+                        assessment.reasons.join("; ")
+                    ));
+                }
+            }
             if over.skip_darks {
-                decision.reasons.retain(|reason| !reason.starts_with("dark:"));
+                decision
+                    .reasons
+                    .retain(|reason| !reason.starts_with("dark:"));
                 decision.dark_master_path = None;
                 decision.dark_scale = None;
                 decision
                     .reasons
                     .push("dark omitido por decisión del usuario".into());
-            } else if !over.darks.is_empty() {
-                decision.reasons.retain(|reason| !reason.starts_with("dark:"));
-                decision.dark_master_path =
-                    Some(format!("manual://{} darks", over.darks.len()));
-                decision.dark_scale = Some(1.0);
+                skipped = true;
+            } else if let Some(assessment) = &dark_assessment {
+                decision.assignment_tier =
+                    ds_merge_assignment_tier(decision.assignment_tier, assessment.tier);
+                if assessment.safe {
+                    decision
+                        .reasons
+                        .retain(|reason| !reason.starts_with("dark:"));
+                    decision.dark_master_path =
+                        Some(format!("manual://{} darks", over.darks.len()));
+                    decision.dark_scale = Some(1.0);
+                    decision
+                        .reasons
+                        .push("darks manuales validados contra la firma completa; k=1".into());
+                } else {
+                    unsafe_assignment = true;
+                    decision.reasons.push(format!(
+                        "darks forzados no seguros: {}",
+                        assessment.reasons.join("; ")
+                    ));
+                }
             }
             if over.skip_flats {
-                decision.reasons.retain(|reason| !reason.starts_with("flat:"));
+                decision
+                    .reasons
+                    .retain(|reason| !reason.starts_with("flat:"));
                 decision.flat_master_path = None;
                 decision
                     .reasons
                     .push("flat omitido por decisión del usuario".into());
-            } else if !over.flats.is_empty() {
-                decision.reasons.retain(|reason| !reason.starts_with("flat:"));
-                decision.flat_master_path =
-                    Some(format!("manual://{} flats", over.flats.len()));
+                skipped = true;
+            } else if let Some(assessment) = &flat_assessment {
+                decision.assignment_tier =
+                    ds_merge_assignment_tier(decision.assignment_tier, assessment.tier);
+                decision.reuse_evidence = assessment.reuse_evidence.clone();
+                decision.user_verified_scientific = assessment.user_verified;
+                decision.user_verification_reason = assessment.user_verified.then(|| {
+                    over.user_verification_reason
+                        .clone()
+                        .unwrap_or_else(|| "identidad extendida confirmada por el usuario".into())
+                });
+                if assessment.safe {
+                    decision
+                        .reasons
+                        .retain(|reason| !reason.starts_with("flat:"));
+                    decision.flat_master_path =
+                        Some(format!("manual://{} flats", over.flats.len()));
+                    decision.reasons.push(if assessment.user_verified {
+                        let evidence = assessment.reuse_evidence.as_ref();
+                        format!(
+                            "flat de otra noche comprobado por el usuario ({}); fingerprint estable ({} muestras, RMS máx {:.3}%)",
+                            assessment.verification_reasons.join(", "),
+                            evidence.map(|value| value.sampled_frames).unwrap_or(0),
+                            evidence
+                                .map(|value| value.maximum_profile_rms * 100.0)
+                                .unwrap_or(0.0)
+                        )
+                    } else if matches!(
+                        assessment.tier,
+                        pipeline::CalibrationAssignmentTier::ValidatedReuse
+                    ) {
+                        let evidence = assessment.reuse_evidence.as_ref();
+                        format!(
+                            "flats reutilizados entre noches con firma completa y fingerprint estable ({} muestras, RMS máx {:.3}%)",
+                            evidence.map(|value| value.sampled_frames).unwrap_or(0),
+                            evidence
+                                .map(|value| value.maximum_profile_rms * 100.0)
+                                .unwrap_or(0.0)
+                        )
+                    } else {
+                        "flats manuales validados contra la firma completa".into()
+                    });
+                } else {
+                    unsafe_assignment = true;
+                    decision.reasons.push(format!(
+                        "flats forzados no seguros: {}",
+                        assessment.reasons.join("; ")
+                    ));
+                }
             }
-            decision
+            if over.skip_dark_flats {
+                decision
+                    .reasons
+                    .retain(|reason| !reason.starts_with("dark-flat:"));
+                decision.dark_flat_master_path = None;
+                decision
+                    .reasons
+                    .push("dark-flat omitido por decisión del usuario".into());
+            } else if let Some(assessment) = &dark_flat_assessment {
+                decision.assignment_tier =
+                    ds_merge_assignment_tier(decision.assignment_tier, assessment.tier);
+                if assessment.safe {
+                    decision
+                        .reasons
+                        .retain(|reason| !reason.starts_with("dark-flat:"));
+                    decision.dark_flat_master_path =
+                        Some(format!("manual://{} dark-flats", over.dark_flats.len()));
+                    decision
+                        .reasons
+                        .push("dark-flats manuales validados contra los flats elegidos".into());
+                } else {
+                    unsafe_assignment = true;
+                    decision.reasons.push(format!(
+                        "dark-flats forzados no seguros: {}",
+                        assessment.reasons.join("; ")
+                    ));
+                }
+            }
+            if skipped {
+                decision.assignment_tier = ds_merge_assignment_tier(
+                    decision.assignment_tier,
+                    pipeline::CalibrationAssignmentTier::Skipped,
+                );
+            }
+            let unresolved_automatic_mismatch = decision
                 .reasons
-                .push("asignación manual del usuario".into());
-            // Sin motivos automáticos restantes, la decisión no bloquea; los
-            // problemas de bias/dark-flat (si quedan) conservan su degradación.
-            let blocking_left = decision.reasons.iter().any(|reason| {
-                reason.starts_with("bias") || reason.starts_with("dark-flat")
+                .iter()
+                .any(|reason| reason.starts_with("dark:") || reason.starts_with("flat:"));
+            decision.degraded = unsafe_assignment || unresolved_automatic_mismatch;
+            decision.compatible = !decision.degraded;
+            decision.scientific_eligible = decision.compatible
+                && !skipped
+                && decision.dark_master_path.is_some()
+                && decision.flat_master_path.is_some();
+            if unsafe_assignment {
+                decision.assignment_tier = pipeline::CalibrationAssignmentTier::ForcedUnsafe;
+                decision.fallback = Some(
+                    "La firma forzada no se aplicará; AllowDegraded continúa por Classic con calibraciones automáticas válidas"
+                        .into(),
+                );
+            }
+            decision.reasons.push(match over.reason.as_deref() {
+                Some(reason) if !reason.trim().is_empty() => {
+                    format!("asignación manual del usuario: {}", reason.trim())
+                }
+                _ => "asignación manual del usuario".into(),
             });
-            decision.compatible = true;
-            decision.degraded = decision.degraded && blocking_left;
         }
+    }
+}
+
+/// El ejecutor recibe únicamente las partes de una regla manual que el mismo
+/// contrato tipado volvió a validar. Los intentos inseguros siguen visibles en
+/// `PreparedCalibrationDecision`, pero no llegan a construir un máster.
+fn ds_sanitize_manual_overrides_for_runtime(
+    overrides: &[pipeline::DeepSkyCalibrationOverride],
+    light_probes: &[DsProbe],
+    bias_probes: &[DsProbe],
+    dark_probes: &[DsProbe],
+    flat_probes: &[DsProbe],
+    dark_flat_probes: &[DsProbe],
+) -> Vec<pipeline::DeepSkyCalibrationOverride> {
+    overrides
+        .iter()
+        .filter_map(|over| {
+            let mut safe = over.clone();
+            if ds_assess_manual_calibration_role(
+                over,
+                &over.bias,
+                light_probes,
+                bias_probes,
+                crate::deepsky_calibration_contract::CalibrationRole::Bias,
+                true,
+            )
+            .is_some_and(|assessment| !assessment.safe)
+            {
+                safe.bias.clear();
+            }
+            if ds_assess_manual_calibration_role(
+                over,
+                &over.darks,
+                light_probes,
+                dark_probes,
+                crate::deepsky_calibration_contract::CalibrationRole::Dark,
+                true,
+            )
+            .is_some_and(|assessment| !assessment.safe)
+            {
+                safe.darks.clear();
+            }
+            if ds_assess_manual_calibration_role(
+                over,
+                &over.flats,
+                light_probes,
+                flat_probes,
+                crate::deepsky_calibration_contract::CalibrationRole::Flat,
+                true,
+            )
+            .is_some_and(|assessment| !assessment.safe)
+            {
+                safe.flats.clear();
+            }
+            let flat_references = ds_manual_flat_references(over, light_probes, flat_probes);
+            // Dark-flat y bias calibran al flat. Si un consumidor del contrato
+            // elige/omite dark-flat dejando Flats=Auto, materializamos las
+            // referencias automáticas exactas para construir un máster plano
+            // específico de la regla (la UI también lo hace, pero el backend
+            // no puede depender de ese detalle).
+            if safe.flats.is_empty()
+                && !safe.skip_flats
+                && (safe.skip_bias
+                    || !safe.bias.is_empty()
+                    || safe.skip_dark_flats
+                    || !safe.dark_flats.is_empty())
+            {
+                safe.flats = flat_references
+                    .iter()
+                    .map(|probe| probe.path.clone())
+                    .collect();
+            }
+            if ds_assess_manual_calibration_role(
+                over,
+                &over.dark_flats,
+                &flat_references,
+                dark_flat_probes,
+                crate::deepsky_calibration_contract::CalibrationRole::DarkFlat,
+                false,
+            )
+            .is_some_and(|assessment| !assessment.safe)
+            {
+                safe.dark_flats.clear();
+            }
+            (!safe.darks.is_empty()
+                || !safe.flats.is_empty()
+                || !safe.dark_flats.is_empty()
+                || !safe.bias.is_empty()
+                || safe.skip_flats
+                || safe.skip_darks
+                || safe.skip_dark_flats
+                || safe.skip_bias)
+                .then_some(safe)
+        })
+        .collect()
+}
+
+fn ds_validate_comet_request(
+    comet: &pipeline::CometStackRequest,
+    lights: &[String],
+) -> (bool, bool, Vec<String>, usize, usize) {
+    use std::collections::BTreeSet;
+    if !comet.enabled {
+        return (true, false, Vec::new(), 0, 0);
+    }
+    let mut reasons = Vec::new();
+    if !(16.0..=2048.0).contains(&comet.coma_radius_px) || !comet.coma_radius_px.is_finite() {
+        reasons.push("el radio de coma debe estar entre 16 y 2048 px".into());
+    }
+    if !(0.5..=0.99).contains(&comet.minimum_confidence) || !comet.minimum_confidence.is_finite() {
+        reasons.push("la confianza mínima debe estar entre 0.50 y 0.99".into());
+    }
+    let mut paths = BTreeSet::new();
+    let mut timestamps = Vec::new();
+    for observation in &comet.observations {
+        if !lights.iter().any(|path| path == &observation.frame_path) {
+            reasons.push(format!(
+                "la observación no pertenece a los lights: {}",
+                observation.frame_path
+            ));
+        }
+        if !paths.insert(observation.frame_path.as_str()) {
+            reasons.push(format!(
+                "observación duplicada para {}",
+                observation.frame_path
+            ));
+        }
+        if !observation.timestamp_unix.is_finite()
+            || !observation.registered_x.is_finite()
+            || !observation.registered_y.is_finite()
+        {
+            reasons.push(format!("observación no finita: {}", observation.frame_path));
+        }
+        timestamps.push(observation.timestamp_unix);
+    }
+    if comet.observations.len() != lights.len() {
+        reasons.push(format!(
+            "la trayectoria debe predecir todos los lights ({} observaciones para {} lights)",
+            comet.observations.len(),
+            lights.len()
+        ));
+    }
+    timestamps.sort_by(f64::total_cmp);
+    timestamps.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+    if timestamps.len() < 3 {
+        reasons.push("se requieren al menos tres timestamps FITS distintos".into());
+    }
+    let mut chronological: Vec<&pipeline::CometObservation> = comet.observations.iter().collect();
+    chronological.sort_by(|a, b| a.timestamp_unix.total_cmp(&b.timestamp_unix));
+    let confirmed_count = chronological
+        .iter()
+        .filter(|observation| observation.confirmed)
+        .count();
+    let key_confirmed = chronological.len() >= 3
+        && chronological[0].confirmed
+        && chronological[chronological.len() / 2].confirmed
+        && chronological[chronological.len() - 1].confirmed;
+    if confirmed_count < 3 || !key_confirmed {
+        reasons.push("confirma/corrige el núcleo en el primer, central y último fotograma".into());
+    }
+    let trajectory = &comet.trajectory;
+    if !trajectory.epoch_unix.is_finite()
+        || !trajectory.x_at_epoch.is_finite()
+        || !trajectory.y_at_epoch.is_finite()
+        || !trajectory.velocity_x_px_s.is_finite()
+        || !trajectory.velocity_y_px_s.is_finite()
+        || !trajectory.rms_px.is_finite()
+        || !trajectory.confidence.is_finite()
+    {
+        reasons.push("la trayectoria contiene valores no finitos".into());
+    }
+    if trajectory.confidence < comet.minimum_confidence {
+        reasons.push(format!(
+            "confianza de trayectoria {:.0}% inferior al mínimo {:.0}%",
+            trajectory.confidence * 100.0,
+            comet.minimum_confidence * 100.0
+        ));
+    }
+    if trajectory.rms_px > 3.0 {
+        reasons.push(format!(
+            "RMS de trayectoria {:.2} px; corrige los puntos del núcleo",
+            trajectory.rms_px
+        ));
+    }
+    let requires_confirmation = confirmed_count < 3 || !key_confirmed;
+    (
+        reasons.is_empty(),
+        requires_confirmation,
+        reasons,
+        comet.observations.len(),
+        confirmed_count,
+    )
+}
+
+fn ds_effective_clip_iterations(
+    effective_rejection: &str,
+    requested: Option<u32>,
+    frame_count: usize,
+) -> u32 {
+    let tiled = matches!(
+        effective_rejection,
+        "median" | "winsorized" | "linearfit" | "percentile" | "minmax"
+    );
+    if effective_rejection == "average" || tiled || frame_count < 4 {
+        0
+    } else {
+        requested
+            .map(|value| value.clamp(1, 3))
+            .unwrap_or(if frame_count >= 6 { 2 } else { 1 })
+    }
+}
+
+fn ds_compute_workload_for_product(
+    product: pipeline::DeepSkyIntegrationProductKind,
+    effective_rejection: &str,
+    clip_iterations: u32,
+    effective_drizzle: f32,
+) -> pipeline::DeepSkyComputeWorkload {
+    pipeline::DeepSkyComputeWorkload {
+        product,
+        rejection: pipeline::DeepSkyRejectionMode::from_effective_label(effective_rejection)
+            .unwrap_or(pipeline::DeepSkyRejectionMode::Tiled),
+        clip_iterations,
+        drizzle_scale: effective_drizzle,
+        // La ruta científica actual construye VAR espacial por toma para EIDR.
+        // El matvec GPU publicado sólo admite una varianza escalar y no puede
+        // sustituirla sin cambiar el problema inverso.
+        eidr_spatial_inverse_variance: matches!(
+            product,
+            pipeline::DeepSkyIntegrationProductKind::Eidr
+        ),
     }
 }
 
@@ -9824,10 +13574,38 @@ fn prepare_deepsky_stack_impl(
     let (request, auto_reasons, auto_recipe) = ds_apply_auto_profile(request, &probes);
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
-    if request.schema_version != pipeline::DEEP_SKY_STACK_REQUEST_SCHEMA_VERSION {
+    let comet_assessment = request
+        .comet
+        .as_ref()
+        .filter(|comet| comet.enabled)
+        .map(|comet| ds_validate_comet_request(comet, &request.lights));
+    if let Some((eligible, _, reasons, _, _)) = &comet_assessment {
+        if !eligible {
+            errors.extend(reasons.iter().map(|reason| format!("Cometa: {reason}")));
+        }
+    }
+    if request.comet.as_ref().is_some_and(|comet| comet.enabled) {
+        if request.lights.len() < 5 {
+            errors.push(
+                "Cometa: se requieren al menos cinco lights para rechazar el objeto en la rama estelar y las estrellas en la rama cometaria"
+                    .into(),
+            );
+        }
+        if matches!(
+            ds_canonical_rejection(&request.rejection),
+            Some("average") | Some("minmax")
+        ) {
+            errors.push(
+                "Cometa: usa rechazo Winsorized, sigma o mediana; promedio/min-max no separa ambas trayectorias de forma fiable"
+                    .into(),
+            );
+        }
+    }
+    if !request.schema_is_readable() {
         errors.push(format!(
-            "Versión DeepSkyStackRequest {} no soportada; se requiere {}",
+            "Versión DeepSkyStackRequest {} no soportada; se admiten {}..={}",
             request.schema_version,
+            pipeline::DEEP_SKY_STACK_REQUEST_MIN_READABLE_VERSION,
             pipeline::DEEP_SKY_STACK_REQUEST_SCHEMA_VERSION
         ));
     }
@@ -9919,68 +13697,131 @@ fn prepare_deepsky_stack_impl(
     {
         errors.push("pedestal debe ser un número finito".into());
     }
-    // Métodos de integración versionados (receta v3). Sin fallback silencioso:
-    // las restricciones de fase son errores de plan, no degradaciones.
-    match request.resolved_integration_method() {
-        pipeline::DeepSkyIntegrationMethod::Classic(_) => {}
-        pipeline::DeepSkyIntegrationMethod::NebulaFusion(nf_cfg) => {
-            if matches!(nf_cfg.mode, pipeline::NebulaFusionMode::FullWithStruct)
-                && request.lights.len() < 16
-            {
-                errors.push(format!(
-                    "STRUCT requiere al menos 16 tomas (división 8/8 mínima para validar por mitades); hay {}",
-                    request.lights.len()
-                ));
+    // Productos de integración v5. Cada producto conserva su elegibilidad y
+    // sus razones; uno no elegible se corrige o se elimina en UI y nunca se
+    // sustituye silenciosamente por Classic.
+    let integration_requests = request.resolved_integration_products();
+    let classic_requested = integration_requests.iter().any(|product| {
+        matches!(
+            product.product,
+            pipeline::DeepSkyIntegrationProductKind::Classic
+        )
+    });
+    let independent_scientific_products = integration_requests
+        .iter()
+        .filter(|product| {
+            !matches!(
+                product.product,
+                pipeline::DeepSkyIntegrationProductKind::Classic
+            )
+        })
+        .map(|product| product.product.label())
+        .collect::<Vec<_>>();
+    if request.drizzle > 1.01 {
+        if !classic_requested {
+            errors.push(format!(
+                "Drizzle {:.0}× pertenece al producto Classic: selecciona Classic para generar ese máster o deja Drizzle en 1×",
+                request.drizzle
+            ));
+        } else if !independent_scientific_products.is_empty() {
+            warnings.push(format!(
+                "Flujos paralelos: Classic se integrará con Drizzle {:.0}× y {} se ejecutará{} en una rama independiente a 1× interno. Comparten calibración y registro, pero generan másters separados",
+                request.drizzle,
+                independent_scientific_products.join(" + "),
+                if independent_scientific_products.len() == 1 { "" } else { "n" },
+            ));
+        }
+    }
+    let primary_count = integration_requests
+        .iter()
+        .filter(|product| product.primary)
+        .count();
+    if primary_count > 1 {
+        errors.push("integrationProducts admite un solo producto primario".into());
+    }
+    let mut integration_ids = BTreeSet::new();
+    let mut integration_product_assessments: Vec<(
+        pipeline::DeepSkyIntegrationProductRequest,
+        Vec<String>,
+    )> = Vec::new();
+    for product in integration_requests {
+        let mut product_errors = Vec::new();
+        if product.id.trim().is_empty() {
+            product_errors.push("el id del producto no puede estar vacío".into());
+        } else if !integration_ids.insert(product.id.clone()) {
+            product_errors.push(format!("id de producto duplicado '{}'", product.id));
+        }
+        if !product.method_matches_product() {
+            product_errors.push(format!(
+                "el producto {} no coincide con el motor/configuración solicitado",
+                product.product.label()
+            ));
+        }
+        match &product.method {
+            pipeline::DeepSkyIntegrationMethod::Classic(_) => {}
+            pipeline::DeepSkyIntegrationMethod::NebulaFusion(nf_cfg) => {
+                if matches!(nf_cfg.mode, pipeline::NebulaFusionMode::FullWithStruct)
+                    && request.lights.len() < 16
+                {
+                    product_errors.push(format!(
+                        "STRUCT requiere al menos 16 tomas (división 8/8 mínima para validar por mitades); hay {}",
+                        request.lights.len()
+                    ));
+                }
+                if matches!(
+                    nf_cfg.mode,
+                    pipeline::NebulaFusionMode::Full | pipeline::NebulaFusionMode::FullWithStruct
+                ) && nf_cfg.cfa_direct
+                {
+                    product_errors.push(
+                        "NebulaFusion Full requiere la ruta demosaiced en esta fase: desactiva el modo CFA directo".into(),
+                    );
+                }
+                if matches!(request.compute_policy, ComputePolicy::GpuOnly) {
+                    product_errors
+                        .push("NebulaFusion ejecuta en CPU en esta fase; usa Auto o Hybrid".into());
+                }
             }
-            if matches!(
-                nf_cfg.mode,
-                pipeline::NebulaFusionMode::Full | pipeline::NebulaFusionMode::FullWithStruct
-            ) && nf_cfg.cfa_direct
-            {
-                errors.push(
-                    "NebulaFusion Full requiere la ruta demosaiced en esta fase: desactiva el modo CFA directo".into(),
-                );
-            }
-            if request.drizzle > 1.01 {
-                errors.push(
-                    "NebulaFusion Lite integra a escala nativa: desactiva drizzle (la reconstrucción de muestreo llega con EIDR)".into(),
-                );
-            }
-            if matches!(request.compute_policy, ComputePolicy::GpuOnly) {
-                errors.push(
-                    "NebulaFusion Lite ejecuta en CPU en esta fase; usa Auto o Hybrid".into(),
-                );
+            pipeline::DeepSkyIntegrationMethod::Eidr(eidr_cfg) => {
+                if matches!(
+                    eidr_cfg.solve_mode,
+                    pipeline::EidrSolveMode::ExperimentalDetail
+                ) {
+                    warnings.push(format!(
+                        "{}: EIDR Detalle experimental (Huber-IRLS): el cuadrático científico corre como baseline interno y si el holdout empeora se REVIERTE automáticamente (§7.9/§7.10). TGV queda fuera de esta versión",
+                        product.id
+                    ));
+                }
+                let n = request.lights.len();
+                let (min_n, label) = match eidr_cfg.scale {
+                    pipeline::EidrScalePolicy::X2 => {
+                        (if eidr_cfg.cfa_direct { 24 } else { 12 }, "2x")
+                    }
+                    pipeline::EidrScalePolicy::X1_5 => (8, "1.5x"),
+                    pipeline::EidrScalePolicy::X1 => (3, "1x"),
+                    pipeline::EidrScalePolicy::Auto => (6, "auto"),
+                };
+                if n < min_n {
+                    product_errors.push(format!(
+                        "EIDR a escala {label} requiere al menos {min_n} tomas (hay {n}); la puerta espectral valida además la diversidad de dithers"
+                    ));
+                }
             }
         }
-        pipeline::DeepSkyIntegrationMethod::Eidr(eidr_cfg) => {
-            if matches!(
-                eidr_cfg.solve_mode,
-                pipeline::EidrSolveMode::ExperimentalDetail
-            ) {
-                warnings.push(
-                    "EIDR Detalle experimental (Huber-IRLS): el cuadrático científico corre como baseline interno y si el holdout empeora se REVIERTE automáticamente (§7.9/§7.10). TGV queda fuera de esta versión".into(),
-                );
-            }
-            let n = request.lights.len();
-            let (min_n, label) = match eidr_cfg.scale {
-                pipeline::EidrScalePolicy::X2 => (if eidr_cfg.cfa_direct { 24 } else { 12 }, "2x"),
-                pipeline::EidrScalePolicy::X1_5 => (8, "1.5x"),
-                pipeline::EidrScalePolicy::X1 => (3, "1x"),
-                pipeline::EidrScalePolicy::Auto => (6, "auto"),
-            };
-            if n < min_n {
-                errors.push(format!(
-                    "EIDR a escala {label} requiere al menos {min_n} tomas (hay {n}); la puerta espectral valida además la diversidad de dithers"
-                ));
-            }
-            if request.drizzle > 1.01 {
-                errors.push(
-                    "EIDR sustituye a drizzle: deja drizzle en 1× (la escala 1x/1.5x/2x se elige en el método)".into(),
-                );
-            }
-            // GpuOnly se valida en ejecución (runtime + paridad física del
-            // matvec EIDR); Auto/Hybrid usan GPU cuando está disponible.
-        }
+        errors.extend(
+            product_errors
+                .iter()
+                .map(|reason| format!("Producto '{}': {reason}", product.id)),
+        );
+        integration_product_assessments.push((product, product_errors));
+    }
+    if integration_product_assessments.is_empty() {
+        errors.push("Selecciona al menos un producto de integración".into());
+    } else if primary_count == 0 && integration_product_assessments.len() > 1 {
+        warnings.push(
+            "Ningún producto fue marcado como primario; se usará el primero y quedará registrado"
+                .into(),
+        );
     }
     if probes.is_empty() {
         errors.push("Selecciona al menos un light".into());
@@ -10205,20 +14046,14 @@ fn prepare_deepsky_stack_impl(
                     .compatible
                 });
                 if !compatible {
-                    let message = format!(
-                        "Flat '{}' sin dark-flat de firma completa exacta (exposición/temperatura/geometría/CFA incluidas)",
+                    // Dark-flat es opcional y ahora puede ligarse a un bloque
+                    // concreto. El gate definitivo se resuelve por decisión
+                    // después de aplicar overrides; bloquear aquí dejaba el
+                    // error antiguo aun cuando el usuario ya lo había ligado.
+                    warnings.push(format!(
+                        "Flat '{}' sin dark-flat automático exacto; elige Dark-flats en la tabla o usa bias como fallback declarado",
                         flat.name
-                    );
-                    if matches!(
-                        request.calibration_policy,
-                        pipeline::DeepSkyCalibrationPolicy::Strict
-                    ) {
-                        errors.push(message);
-                    } else {
-                        warnings.push(format!(
-                            "{message}; se intentará bias como fallback declarado"
-                        ));
-                    }
+                    ));
                 }
             }
         }
@@ -10238,20 +14073,13 @@ fn prepare_deepsky_stack_impl(
                     .any(|&dark_exp| ds_exposures_match(light_exp, dark_exp))
             });
             if !exact {
-                let message = format!(
-                    "Light '{}' sin dark de exposición exacta (tolerancia 1 ms / 1e-6 relativa)",
+                // La matriz tipada decide después si existe un dark manual
+                // seguro. Mantener este error previo hacía inconsistente el
+                // resumen tras un ligado válido.
+                warnings.push(format!(
+                    "Light '{}' sin dark automático de exposición exacta; elige Darks en la tabla o deja que la decisión tipada declare el fallback",
                     light.name
-                );
-                if matches!(
-                    request.calibration_policy,
-                    pipeline::DeepSkyCalibrationPolicy::Strict
-                ) {
-                    errors.push(message);
-                } else {
-                    warnings.push(format!(
-                        "{message}; cualquier escalado/omisión quedará declarado"
-                    ));
-                }
+                ));
             }
         }
     }
@@ -10304,7 +14132,7 @@ fn prepare_deepsky_stack_impl(
             nonlinear_inputs.len()
         ));
     }
-    let mut scientific_eligible = nonlinear_inputs.is_empty();
+    let scientific_eligible;
     let _ = signature_degraded;
     if !nonlinear_inputs.is_empty() {
         let shown = nonlinear_inputs
@@ -10338,24 +14166,12 @@ fn prepare_deepsky_stack_impl(
     let preflight_dark_probes = deepsky_probe(request.darks.clone());
     let preflight_flat_probes = deepsky_probe(request.flats.clone());
     let preflight_dark_flat_probes = deepsky_probe(request.dark_flats.clone());
-    let preflight_bias_selection = ds_select_calibration_group(
-        &request.bias,
-        &probes,
-        "bias",
-        request.calibration_policy,
-    );
-    let preflight_dark_selection = ds_select_calibration_group(
-        &request.darks,
-        &probes,
-        "darks",
-        request.calibration_policy,
-    );
-    let preflight_flat_selection = ds_select_calibration_group(
-        &request.flats,
-        &probes,
-        "flats",
-        request.calibration_policy,
-    );
+    let preflight_bias_selection =
+        ds_select_calibration_group(&request.bias, &probes, "bias", request.calibration_policy);
+    let preflight_dark_selection =
+        ds_select_calibration_group(&request.darks, &probes, "darks", request.calibration_policy);
+    let preflight_flat_selection =
+        ds_select_calibration_group(&request.flats, &probes, "flats", request.calibration_policy);
     let preflight_dark_flat_selection = ds_select_calibration_group(
         &request.dark_flats,
         &preflight_flat_probes,
@@ -10367,21 +14183,24 @@ fn prepare_deepsky_stack_impl(
         &ds_selected_probes(&preflight_bias_probes, &preflight_bias_selection),
         &ds_selected_probes(&preflight_dark_probes, &preflight_dark_selection),
         &ds_selected_probes(&preflight_flat_probes, &preflight_flat_selection),
-        &ds_selected_probes(
-            &preflight_dark_flat_probes,
-            &preflight_dark_flat_selection,
-        ),
+        &ds_selected_probes(&preflight_dark_flat_probes, &preflight_dark_flat_selection),
         request.calibration_policy,
     );
     ds_apply_manual_overrides_to_decisions(
         &mut calibration_decisions,
         &request.calibration_overrides,
+        &probes,
+        &preflight_bias_probes,
+        &preflight_dark_probes,
+        &preflight_flat_probes,
+        &preflight_dark_flat_probes,
     );
-    if request
-        .calibration_overrides
-        .iter()
-        .any(|over| !over.darks.is_empty() || !over.flats.is_empty())
-    {
+    if request.calibration_overrides.iter().any(|over| {
+        !over.darks.is_empty()
+            || !over.flats.is_empty()
+            || !over.dark_flats.is_empty()
+            || !over.bias.is_empty()
+    }) {
         warnings.push(
             "Asignación manual de calibración activa: los lotes forzados sustituyen al emparejamiento automático y quedan registrados en decisiones y receta.".into(),
         );
@@ -10418,13 +14237,12 @@ fn prepare_deepsky_stack_impl(
     // el usuario no haya omitido a propósito) necesita SU flat y SU dark. Lo
     // demás — bias, dark-flats, metadata extendida — no condiciona.
     if request.flats.is_empty() {
-        scientific_eligibility_reasons.push(
-            "añade FLATS: NebulaFusion y EIDR requieren corrección de viñeteo/PRNU".into(),
-        );
+        scientific_eligibility_reasons
+            .push("añade FLATS: NebulaFusion y EIDR requieren corrección de viñeteo/PRNU".into());
     } else {
         let lights_missing_flat = calibration_decisions
             .iter()
-            .filter(|decision| !decision.manual && decision.flat_master_path.is_none())
+            .filter(|decision| decision.flat_master_path.is_none())
             .count();
         if lights_missing_flat > 0 {
             scientific_eligibility_reasons.push(format!(
@@ -10433,13 +14251,12 @@ fn prepare_deepsky_stack_impl(
         }
     }
     if request.darks.is_empty() {
-        scientific_eligibility_reasons.push(
-            "añade DARKS: NebulaFusion y EIDR requieren corrección térmica".into(),
-        );
+        scientific_eligibility_reasons
+            .push("añade DARKS: NebulaFusion y EIDR requieren corrección térmica".into());
     } else {
         let lights_missing_dark = calibration_decisions
             .iter()
-            .filter(|decision| !decision.manual && decision.dark_master_path.is_none())
+            .filter(|decision| decision.dark_master_path.is_none())
             .count();
         if lights_missing_dark > 0 {
             scientific_eligibility_reasons.push(format!(
@@ -10447,12 +14264,49 @@ fn prepare_deepsky_stack_impl(
             ));
         }
     }
-    scientific_eligible = scientific_eligibility_reasons.is_empty();
+    let unsafe_manual = calibration_decisions
+        .iter()
+        .filter(|decision| {
+            matches!(
+                decision.assignment_tier,
+                pipeline::CalibrationAssignmentTier::ForcedUnsafe
+                    | pipeline::CalibrationAssignmentTier::Skipped
+            )
+        })
+        .count();
+    if unsafe_manual > 0 {
+        scientific_eligibility_reasons.push(format!(
+            "{unsafe_manual} light(s) con calibración manual forzada u omitida: corrige la asignación para activar NebulaFusion/EIDR"
+        ));
+    }
+    scientific_eligible = scientific_eligibility_reasons.is_empty()
+        && calibration_decisions
+            .iter()
+            .all(|decision| decision.scientific_eligible);
+    if !scientific_eligible {
+        for (product, product_errors) in &mut integration_product_assessments {
+            if matches!(
+                product.method,
+                pipeline::DeepSkyIntegrationMethod::Classic(_)
+            ) {
+                continue;
+            }
+            let reason = format!(
+                "no elegible científicamente: {}",
+                scientific_eligibility_reasons.join(" · ")
+            );
+            if !product_errors.contains(&reason) {
+                product_errors.push(reason.clone());
+                errors.push(format!("Producto '{}': {reason}", product.id));
+            }
+        }
+    }
     if !scientific_eligible
         && !matches!(
             request.resolved_integration_method(),
             pipeline::DeepSkyIntegrationMethod::Classic(_)
         )
+        && request.integration_products.is_empty()
         && matches!(
             request.calibration_policy,
             pipeline::DeepSkyCalibrationPolicy::AllowDegraded
@@ -10525,15 +14379,17 @@ fn prepare_deepsky_stack_impl(
             ("flats", request.flats.clone()),
             ("bias", request.bias.clone()),
         ] {
-            let selection = ds_select_calibration_group(
-                &paths,
-                &probes,
-                kind,
-                request.calibration_policy,
+            let selection =
+                ds_select_calibration_group(&paths, &probes, kind, request.calibration_policy);
+            // Estos son hallazgos de la selección AUTOMÁTICA. La autoridad
+            // bloqueante es la matriz post-override: un lote manual seguro
+            // puede resolverlos y debe retirar el estado rojo anterior.
+            warnings.extend(
+                selection
+                    .blocking_reasons
+                    .iter()
+                    .map(|reason| format!("Auto {kind}: {reason}")),
             );
-            if !selection.blocking_reasons.is_empty() {
-                errors.extend(selection.blocking_reasons.iter().cloned());
-            }
             if kind == "flats" {
                 flat_sessions_for_map = selection
                     .sessions
@@ -10591,7 +14447,12 @@ fn prepare_deepsky_stack_impl(
             "dark-flats",
             request.calibration_policy,
         );
-        errors.extend(dark_flat_selection.blocking_reasons.iter().cloned());
+        warnings.extend(
+            dark_flat_selection
+                .blocking_reasons
+                .iter()
+                .map(|reason| format!("Auto dark-flats: {reason}")),
+        );
         warnings.extend(dark_flat_selection.warnings.iter().cloned());
         if !request.dark_flats.is_empty() {
             warnings.push(format!(
@@ -10601,31 +14462,163 @@ fn prepare_deepsky_stack_impl(
         }
     }
 
-    // MATRIZ lights↔flats por sesión exacta. Una sesión sin flat queda visible
-    // y nunca se sustituye por la noche cronológicamente más cercana.
+    // MATRIZ de calibración efectiva por sesión. Se construye DESPUÉS de
+    // aplicar los overrides para que un enlace manual seguro no siga
+    // apareciendo como "sin flats". La fecha del flat es informativa: una
+    // reutilización entre noches sólo aparece aquí cuando la decisión tipada
+    // la aceptó como ValidatedReuse/UserVerified.
     let session_map: Vec<crate::pipeline::SessionMapEntry> = light_sessions
         .iter()
         .map(|(night, count, total)| {
-            let flat = flat_sessions_for_map
+            let light_paths = valid_probes
+                .iter()
+                .filter(|probe| {
+                    ds_session_night_id(&probe.path, probe.date_obs.as_deref())
+                        .unwrap_or_else(|| "?".into())
+                        == *night
+                })
+                .map(|probe| probe.path.clone())
+                .collect::<Vec<_>>();
+            let session_path_set = light_paths
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::HashSet<_>>();
+            let session_decisions = calibration_decisions
+                .iter()
+                .filter(|decision| session_path_set.contains(decision.frame_path.as_str()))
+                .collect::<Vec<_>>();
+            let relevant_overrides = request
+                .calibration_overrides
+                .iter()
+                .filter(|over| {
+                    over.lights.is_empty()
+                        || over
+                            .lights
+                            .iter()
+                            .any(|path| session_path_set.contains(path.as_str()))
+                })
+                .collect::<Vec<_>>();
+            let decision_uses_manual = |role: &str| {
+                session_decisions.iter().any(|decision| match role {
+                    "bias" => decision
+                        .bias_master_path
+                        .as_deref()
+                        .is_some_and(|path| path.starts_with("manual://")),
+                    "dark" => decision
+                        .dark_master_path
+                        .as_deref()
+                        .is_some_and(|path| path.starts_with("manual://")),
+                    "dark-flat" => decision
+                        .dark_flat_master_path
+                        .as_deref()
+                        .is_some_and(|path| path.starts_with("manual://")),
+                    "flat" => decision
+                        .flat_master_path
+                        .as_deref()
+                        .is_some_and(|path| path.starts_with("manual://")),
+                    _ => false,
+                })
+            };
+            let unique_override_paths = |role: &str| {
+                let mut paths = Vec::new();
+                for over in &relevant_overrides {
+                    match role {
+                        "bias" => paths.extend(over.bias.iter().cloned()),
+                        "dark" => paths.extend(over.darks.iter().cloned()),
+                        "dark-flat" => paths.extend(over.dark_flats.iter().cloned()),
+                        "flat" => paths.extend(over.flats.iter().cloned()),
+                        _ => {}
+                    }
+                }
+                paths.sort();
+                paths.dedup();
+                paths
+            };
+            let automatic_flat = flat_sessions_for_map
                 .iter()
                 .find(|(flat_night, _)| flat_night == night)
-                .cloned()
-                .or_else(|| {
-                    // Noche adyacente (Δ1 día): misma sesión óptica.
-                    flat_sessions_for_map
+                .cloned();
+            let manual_flat_paths = decision_uses_manual("flat")
+                .then(|| unique_override_paths("flat"))
+                .unwrap_or_default();
+            let mut manual_flat_nights = manual_flat_paths
+                .iter()
+                .filter_map(|path| {
+                    preflight_flat_probes
                         .iter()
-                        .filter(|(flat_night, _)| {
-                            ds_night_distance(Some(night), Some(flat_night)) <= 1
+                        .find(|probe| probe.path == *path)
+                        .and_then(|probe| {
+                            ds_session_night_id(&probe.path, probe.date_obs.as_deref())
                         })
-                        .min_by_key(|(flat_night, _)| {
-                            ds_night_distance(Some(night), Some(flat_night))
-                        })
-                        .cloned()
-                });
+                })
+                .collect::<Vec<_>>();
+            manual_flat_nights.sort();
+            manual_flat_nights.dedup();
+            let flat = if manual_flat_paths.is_empty() {
+                automatic_flat
+            } else {
+                Some((
+                    if manual_flat_nights.is_empty() {
+                        "manual".into()
+                    } else {
+                        manual_flat_nights.join(", ")
+                    },
+                    manual_flat_paths.len(),
+                ))
+            };
             let flat_distance_days = flat
                 .as_ref()
                 .map(|(flat_night, _)| ds_night_distance(Some(night), Some(flat_night)))
                 .unwrap_or(i64::MAX / 2);
+            let role_description = |role: &str, automatic: &str| {
+                if decision_uses_manual(role) {
+                    format!(
+                        "{} toma(s) manuales verificadas",
+                        unique_override_paths(role).len()
+                    )
+                } else {
+                    automatic.to_string()
+                }
+            };
+            let calibration_state = if session_decisions.iter().any(|decision| {
+                matches!(
+                    decision.assignment_tier,
+                    pipeline::CalibrationAssignmentTier::ForcedUnsafe
+                )
+            }) {
+                "forcedUnsafe"
+            } else if session_decisions.iter().any(|decision| {
+                matches!(
+                    decision.assignment_tier,
+                    pipeline::CalibrationAssignmentTier::Skipped
+                )
+            }) {
+                "skipped"
+            } else if session_decisions.iter().any(|decision| {
+                matches!(
+                    decision.assignment_tier,
+                    pipeline::CalibrationAssignmentTier::UserVerified
+                )
+            }) {
+                "userVerified"
+            } else if session_decisions.iter().any(|decision| {
+                matches!(
+                    decision.assignment_tier,
+                    pipeline::CalibrationAssignmentTier::ValidatedReuse
+                )
+            }) {
+                "validatedReuse"
+            } else if !session_decisions.is_empty()
+                && session_decisions
+                    .iter()
+                    .all(|decision| decision.scientific_eligible)
+            {
+                "exact"
+            } else if session_decisions.iter().all(|decision| decision.compatible) {
+                "incomplete"
+            } else {
+                "blocked"
+            };
             crate::pipeline::SessionMapEntry {
                 night: night.clone(),
                 lights: *count,
@@ -10633,16 +14626,14 @@ fn prepare_deepsky_stack_impl(
                 flat_night: flat.as_ref().map(|(flat_night, _)| flat_night.clone()),
                 flat_count: flat.map(|(_, flat_count)| flat_count).unwrap_or(0),
                 flat_distance_days,
-                darks: darks_desc_for_map.clone(),
-                light_paths: valid_probes
-                    .iter()
-                    .filter(|p| {
-                        ds_session_night_id(&p.path, p.date_obs.as_deref())
-                            .unwrap_or_else(|| "?".into())
-                            == *night
-                    })
-                    .map(|p| p.path.clone())
-                    .collect(),
+                darks: role_description("dark", &darks_desc_for_map),
+                dark_flats: role_description(
+                    "dark-flat",
+                    &preflight_dark_flat_selection.description,
+                ),
+                bias: role_description("bias", &preflight_bias_selection.description),
+                calibration_state: calibration_state.into(),
+                light_paths,
                 filter: valid_probes
                     .iter()
                     .find(|p| {
@@ -10659,13 +14650,6 @@ fn prepare_deepsky_stack_impl(
             warnings.push(format!(
                 "Sesión {}: no existe flat exacto de la misma sesión; Strict bloquea y AllowDegraded lo omite",
                 entry.night
-            ));
-        } else if entry.flat_distance_days > 30 && entry.flat_distance_days < i64::MAX / 4 {
-            warnings.push(format!(
-                "Sesión {}: el flat más cercano es de {} (a {} días) — revisa fechas/flats de esa noche",
-                entry.night,
-                entry.flat_night.clone().unwrap_or_default(),
-                entry.flat_distance_days
             ));
         }
     }
@@ -10804,23 +14788,21 @@ fn prepare_deepsky_stack_impl(
         * if nf_requested { 2.0 } else { 1.0 }; // NF-Lite: ~6 pasadas de warp vs ~3
 
     let gpu = crate::gpu_stack::gpu_info();
-    // Prove every shader family that this recipe may execute. These gates are
-    // cached for the session; a planetary parity label is not evidence for the
-    // distinct deep-sky calibration, warp and rejection kernels.
+    // Prueba sólo las familias GPU que esta receta puede ejecutar realmente.
+    // Winsorized/linear-fit siguen en CPU científica, por lo que un gate del
+    // kernel tiled experimental no debe desactivar cosmética/mapa estelar ni
+    // una integración streaming que sí pasaron su propia paridad.
     let deep_gpu_parity_ok = if gpu.available && request.compute_policy.allows_gpu() {
         crate::gpu_deepsky::ensure_parity()
             && crate::gpu_deepsky::ensure_pixel_preprocess_parity()
             && crate::gpu_deepsky::ensure_advanced_warp_parity()
-            && (!matches!(effective_rejection.as_str(), "winsorized" | "linearfit")
-                || crate::gpu_deepsky::ensure_tiled_parity())
     } else {
         true
     };
     let host_memory_mb = benchmark::get_benchmark_environment().memory_mb.max(1);
     let calibrated = !request.darks.is_empty() && !request.flats.is_empty();
     let memory_pressure = estimated_ram_mb.saturating_mul(100) / host_memory_mb;
-    let (recommended_profile, recommendation_reasons) = if request.profile
-        == PipelineProfile::Auto
+    let (recommended_profile, recommendation_reasons) = if request.profile == PipelineProfile::Auto
     {
         // AUTO: las razones medidas de la receta resuelta sustituyen a la
         // heurística de 3 casos (que se conserva para los perfiles manuales).
@@ -10887,67 +14869,94 @@ fn prepare_deepsky_stack_impl(
     } else {
         full_vram_mb
     };
-    let compute_resolution = resolve_compute_policy(
-        request.compute_policy,
-        &ComputeCapability {
-            gpu_available: gpu.available,
-            parity_ok: deep_gpu_parity_ok,
-            required_vram_mb: estimated_vram_mb,
-            vram_budget_mb: gpu.vram_budget_mb,
-        },
-    );
+    let compute_capability = ComputeCapability {
+        gpu_available: gpu.available,
+        parity_ok: deep_gpu_parity_ok,
+        required_vram_mb: estimated_vram_mb,
+        vram_budget_mb: gpu.vram_budget_mb,
+    };
+    let compute_resolution = resolve_compute_policy(request.compute_policy, &compute_capability);
     let gpu_fits = compute_resolution.as_ref().is_ok_and(|r| r.use_gpu);
-    // NF/EIDR integran en CPU en esta fase: el plan no puede declarar una
-    // etapa GPU ni un motor "Hybrid CPU+GPU" que no se ejecutará (auditoría
-    // 2026-07-20). GPU sigue disponible para calibración/estrellas.
-    let classic_integration = matches!(
-        request.resolved_integration_method(),
-        pipeline::DeepSkyIntegrationMethod::Classic(_)
+    let effective_clip_iterations = ds_effective_clip_iterations(
+        &effective_rejection,
+        request.clip_iters,
+        valid_probes.len(),
     );
-    let gpu_streaming = gpu_fits
-        && classic_integration
-        && request.compute_policy.allows_gpu()
-        && request.drizzle <= 1.01
-        && matches!(effective_rejection.as_str(), "sigma" | "average");
-    let gpu_tiled_rejection = gpu_fits
-        && classic_integration
-        && request.compute_policy.allows_gpu()
-        && request.drizzle <= 1.01
-        && matches!(effective_rejection.as_str(), "winsorized" | "linearfit");
-    let gpu_integration = gpu_streaming || gpu_tiled_rejection;
-    if matches!(request.compute_policy, ComputePolicy::GpuOnly) && request.drizzle > 1.01 {
+    let mut integration_compute_disclosures: BTreeMap<String, (String, Option<String>)> =
+        BTreeMap::new();
+    let mut gpu_integrations = Vec::new();
+    for (product, _) in &integration_product_assessments {
+        let workload = ds_compute_workload_for_product(
+            product.product,
+            &effective_rejection,
+            effective_clip_iterations,
+            product.effective_drizzle(request.drizzle),
+        );
+        match pipeline::resolve_deep_sky_compute_eligibility(
+            request.compute_policy,
+            workload,
+            &compute_capability,
+        ) {
+            Ok(decision) => {
+                let reason = decision
+                    .required_cpu_reason
+                    .map(|value| value.message().to_string())
+                    .or(decision.fallback_reason);
+                let engine = match decision.effective_engine {
+                    pipeline::EffectiveEngine::GpuCompute => {
+                        gpu_integrations.push(product.id.clone());
+                        format!("GPU wgpu · {} ({})", gpu.name, gpu.backend)
+                    }
+                    pipeline::EffectiveEngine::RequiredCpu => "CPU científica".into(),
+                    _ => "CPU Rayon/SIMD".into(),
+                };
+                if let Some(reason) = &reason {
+                    if !matches!(request.compute_policy, ComputePolicy::CpuOnly) {
+                        warnings.push(format!(
+                            "Producto '{}': integración en CPU — {reason}",
+                            product.id
+                        ));
+                    }
+                }
+                integration_compute_disclosures.insert(product.id.clone(), (engine, reason));
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                errors.push(format!("Producto '{}': {reason}", product.id));
+                integration_compute_disclosures.insert(
+                    product.id.clone(),
+                    ("GPU estricta no elegible".into(), Some(reason)),
+                );
+            }
+        }
+    }
+    // Calibración radiométrica, propagación VAR/DQ, debayer científico y
+    // RANSAC siguen siendo CPU obligatoria. GPU-only es estricto: no se finge
+    // una ruta completa sólo porque cosmética/mapa estelar sí tengan kernel.
+    if matches!(request.compute_policy, ComputePolicy::GpuOnly) {
         errors.push(
-            "GPU only no admite todavía drizzle drop-kernel con paridad; usa Hybrid/Auto".into(),
+            "GPU only no puede ejecutar todavía el flujo científico completo de cielo profundo: calibración VAR/DQ, debayer y PSF/RANSAC requieren CPU. Usa Auto o Hybrid para combinar CPU+GPU sin perder el contrato científico"
+                .into(),
         );
     }
-    if matches!(request.compute_policy, ComputePolicy::GpuOnly)
-        && !matches!(
-            effective_rejection.as_str(),
-            "sigma" | "average" | "winsorized" | "linearfit"
-        )
-    {
-        errors.push(format!(
-            "GPU only no admite rechazo '{}' con paridad; usa sigma, average, Winsorized, linear-fit o Hybrid/Auto",
-            effective_rejection
-        ));
-    }
-    if gpu_fits
-        && request.compute_policy.allows_gpu()
-        && !gpu_integration
-        && !matches!(request.compute_policy, ComputePolicy::GpuOnly)
-    {
-        warnings.push(
-            "La calibración usará GPU, pero la integración seleccionada conservará CPU".into(),
-        );
-    }
+    let gpu_preprocessing = gpu_fits && request.compute_policy.allows_gpu();
     let effective_engine = match request.compute_policy {
         ComputePolicy::CpuOnly => "CPU (Rayon/SIMD)".to_string(),
         ComputePolicy::GpuOnly if !gpu_fits => {
             errors.push(compute_resolution.as_ref().unwrap_err().clone());
             "GPU no disponible".to_string()
         }
-        ComputePolicy::GpuOnly => format!("GPU only · {} ({})", gpu.name, gpu.backend),
-        _ if gpu_fits => format!("Hybrid CPU+GPU · {} ({})", gpu.name, gpu.backend),
+        ComputePolicy::GpuOnly => "GPU estricta no elegible para el flujo completo".into(),
+        _ if gpu_fits && !gpu_integrations.is_empty() => format!(
+            "CPU científica + GPU por etapas · {} ({}) · integración GPU: {}",
+            gpu.name,
+            gpu.backend,
+            gpu_integrations.join(", ")
+        ),
+        _ if gpu_fits => format!(
+            "CPU científica + GPU cosmética/mapa estelar · {} ({})",
+            gpu.name, gpu.backend
+        ),
         _ => {
             if let Ok(resolution) = &compute_resolution {
                 if let Some(reason) = &resolution.fallback_reason {
@@ -10960,22 +14969,17 @@ fn prepare_deepsky_stack_impl(
     let mut stages = BTreeMap::new();
     stages.insert(
         "read_calibrate".into(),
-        if gpu_fits && request.compute_policy.allows_gpu() {
-            "CPU I/O/estadística + GPU calibración/cosmética/debayer float32"
+        if gpu_preprocessing {
+            "CPU I/O + calibración científica VAR/DQ + debayer; GPU cosmética validada"
         } else {
-            "CPU Rayon"
+            "CPU I/O + calibración científica VAR/DQ + debayer"
         }
         .into(),
     );
-    stages.insert("register".into(), if gpu_fits && request.compute_policy.allows_gpu() { "GPU mapa estelar + CPU centroides PSF/RANSAC · similitud/afín/proyectivo/distorsión local" } else { "CPU PSF/RANSAC · similitud/afín/proyectivo/distorsión local automáticos" }.into());
+    stages.insert("register".into(), if gpu_preprocessing { "GPU mapa estelar + CPU centroides PSF/RANSAC · similitud/afín/proyectivo/distorsión local" } else { "CPU mapa estelar/PSF/RANSAC · similitud/afín/proyectivo/distorsión local automáticos" }.into());
     stages.insert(
         "normalize".into(),
-        if gpu_streaming {
-            "CPU modelo robusto + GPU aplicación"
-        } else {
-            "CPU modelo robusto"
-        }
-        .into(),
+        "CPU modelo robusto y pesos científicos".into(),
     );
     let has_cfa = valid_probes.first().is_some_and(|p| p.bayer.is_some());
     if let pipeline::DeepSkyIntegrationMethod::NebulaFusion(nf_cfg) =
@@ -10997,21 +15001,21 @@ fn prepare_deepsky_stack_impl(
             );
         }
     }
-    stages.insert(
-        "integrate".into(),
-        if gpu_streaming {
-            "GPU tiled wgpu + CPU coordinación"
-        } else if gpu_tiled_rejection {
-            "CPU warp/Lanczos + GPU rechazo tiled Winsorized/linear-fit"
-        } else if request.drizzle > 1.01 && has_cfa {
-            "CPU drizzle CFA calibrado, sin debayer previo"
-        } else if request.drizzle > 1.01 {
-            "CPU drop-kernel drizzle"
-        } else {
-            "CPU tiled/streaming"
-        }
-        .into(),
-    );
+    let integration_stage = integration_product_assessments
+        .iter()
+        .map(|(product, _)| {
+            let (engine, reason) = integration_compute_disclosures
+                .get(&product.id)
+                .cloned()
+                .unwrap_or_else(|| ("CPU".into(), None));
+            match reason {
+                Some(reason) => format!("{}: {} ({reason})", product.id, engine),
+                None => format!("{}: {}", product.id, engine),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    stages.insert("integrate".into(), integration_stage);
     stages.insert("export".into(), "CPU asynchronous I/O".into());
     let mut normalization_model = BTreeMap::new();
     normalization_model.insert("modo".into(), request.normalization.clone());
@@ -11113,6 +15117,82 @@ fn prepare_deepsky_stack_impl(
         }
     };
 
+    let implicit_primary_id = integration_product_assessments
+        .iter()
+        .find(|(product, _)| product.primary)
+        .or_else(|| integration_product_assessments.first())
+        .map(|(product, _)| product.id.clone())
+        .unwrap_or_default();
+    let integration_products = integration_product_assessments
+        .into_iter()
+        .map(|(product, reasons)| {
+            let (compute_engine, compute_reason) = integration_compute_disclosures
+                .get(&product.id)
+                .cloned()
+                .unwrap_or_else(|| ("CPU Rayon/SIMD".into(), None));
+            let (ram_factor, vram_factor, disk_factor, time_factor) = match product.product {
+                pipeline::DeepSkyIntegrationProductKind::Classic => (1.0, 1.0, 1.0, 1.0),
+                pipeline::DeepSkyIntegrationProductKind::NebulaFusionSci => (1.35, 1.0, 1.35, 1.8),
+                pipeline::DeepSkyIntegrationProductKind::Struct => (1.6, 1.0, 1.6, 2.2),
+                pipeline::DeepSkyIntegrationProductKind::Eidr => (2.2, 1.4, 1.8, 4.0),
+            };
+            pipeline::PreparedIntegrationProduct {
+                id: product.id.clone(),
+                product: product.product,
+                requested_method: product.method.label().into(),
+                primary: product.id == implicit_primary_id,
+                dependency: product.dependency().map(str::to_string),
+                eligible: reasons.is_empty(),
+                reasons,
+                requested_drizzle: request.drizzle,
+                effective_drizzle: product.effective_drizzle(request.drizzle),
+                output_scale: product.requested_output_scale(request.drizzle),
+                estimated_ram_mb: (estimated_ram_mb as f64 * ram_factor).ceil() as u64,
+                estimated_vram_mb: (estimated_vram_mb as f64 * vram_factor).ceil() as u64,
+                estimated_disk_mb: (estimated_disk_mb as f64 * disk_factor).ceil() as u64,
+                estimated_seconds: estimated_seconds * time_factor,
+                compute_engine,
+                compute_reason,
+            }
+        })
+        .collect::<Vec<_>>();
+    // Calibración/registro se reutilizan, pero cada producto conserva su
+    // integración y publicación. Tiempo/disco suman ramas; RAM/VRAM reflejan
+    // el pico de la rama más exigente.
+    let estimated_ram_mb = integration_products
+        .iter()
+        .map(|product| product.estimated_ram_mb)
+        .max()
+        .unwrap_or(estimated_ram_mb);
+    let estimated_vram_mb = integration_products
+        .iter()
+        .map(|product| product.estimated_vram_mb)
+        .max()
+        .unwrap_or(estimated_vram_mb);
+    let estimated_disk_mb = integration_products
+        .iter()
+        .map(|product| product.estimated_disk_mb)
+        .sum::<u64>()
+        .max(estimated_disk_mb);
+    let estimated_seconds = integration_products
+        .iter()
+        .map(|product| product.estimated_seconds)
+        .sum::<f32>()
+        .max(estimated_seconds);
+    let comet = comet_assessment.map(
+        |(eligible, requires_confirmation, reasons, observation_count, confirmed_count)| {
+            pipeline::PreparedCometPlan {
+                eligible,
+                requires_confirmation,
+                reasons,
+                observation_count,
+                confirmed_count,
+                estimated_seconds: estimated_seconds * 2.15,
+                estimated_disk_mb: estimated_disk_mb.saturating_mul(3),
+            }
+        },
+    );
+
     PreparedStackPlan {
         session_map,
         calibration_batches,
@@ -11139,6 +15219,8 @@ fn prepare_deepsky_stack_impl(
         scientific_eligible,
         scientific_eligibility_reasons,
         sampling_advisor,
+        integration_products,
+        comet,
     }
 }
 
@@ -11169,7 +15251,15 @@ fn ds_resolve_auto_for_run(
         .filter(|(key, _)| {
             !matches!(
                 key.as_str(),
-                "n_lights" | "sessions" | "narrowband" | "dark_nebula" | "background_over_noise" | "gradient_strength" | "stars_per_mpx" | "fwhm_px" | "dithering_rms_px"
+                "n_lights"
+                    | "sessions"
+                    | "narrowband"
+                    | "dark_nebula"
+                    | "background_over_noise"
+                    | "gradient_strength"
+                    | "stars_per_mpx"
+                    | "fwhm_px"
+                    | "dithering_rms_px"
             )
         })
         .map(|(key, value)| format!("{key}={value}"))
@@ -11184,6 +15274,478 @@ fn ds_resolve_auto_for_run(
         ),
     );
     resolved
+}
+
+/// Convierte SCI float32 a espejo de pantalla. Los NaN de NO_COVERAGE se
+/// conservan intactos en `DeepSkyResult`/FITS/DQ; sólo esta copia de vista usa
+/// vecinos finitos para que un hueco de Drizzle no se dibuje como un glifo
+/// negro ni contamine la comparación visual.
+fn ds_preview_rgb16(data: &[f32], width: usize, height: usize, channels: usize) -> Vec<u16> {
+    let pixels = width.saturating_mul(height);
+    if channels == 0 || data.len() < pixels.saturating_mul(channels) {
+        return Vec::new();
+    }
+    let mut rgb16 = vec![0u16; pixels * 3];
+    rgb16
+        .par_chunks_mut(3)
+        .enumerate()
+        .for_each(|(pixel, output)| {
+            let x = pixel % width;
+            let y = pixel / width;
+            for display_channel in 0..3 {
+                let channel = display_channel.min(channels - 1);
+                let direct = data[pixel * channels + channel];
+                let value = if direct.is_finite() {
+                    direct
+                } else {
+                    let mut replacement = None;
+                    for radius in 1..=12isize {
+                        let mut sum = 0.0f64;
+                        let mut count = 0usize;
+                        for dy in -radius..=radius {
+                            for dx in -radius..=radius {
+                                if dx.abs() != radius && dy.abs() != radius {
+                                    continue;
+                                }
+                                let nx = x as isize + dx;
+                                let ny = y as isize + dy;
+                                if nx < 0 || ny < 0 || nx >= width as isize || ny >= height as isize
+                                {
+                                    continue;
+                                }
+                                let sample =
+                                    data[(ny as usize * width + nx as usize) * channels + channel];
+                                if sample.is_finite() {
+                                    sum += sample as f64;
+                                    count += 1;
+                                }
+                            }
+                        }
+                        if count >= 3 {
+                            replacement = Some((sum / count as f64) as f32);
+                            break;
+                        }
+                    }
+                    replacement.unwrap_or(0.0)
+                };
+                output[display_channel] = value.clamp(0.0, 65535.0) as u16;
+            }
+        });
+    rgb16
+}
+
+fn ds_stack_result_for_linear(result: &DeepSkyResult) -> Result<StackResult, String> {
+    let npx = result.width.saturating_mul(result.height);
+    if result.channels == 0 || result.data.len() < npx.saturating_mul(result.channels) {
+        return Err("El producto lineal derivado tiene una forma inválida".into());
+    }
+    let mut rgb16 = vec![0u16; npx * 3];
+    for pixel in 0..npx {
+        for channel in 0..3 {
+            let value = result.data[pixel * result.channels + channel.min(result.channels - 1)];
+            rgb16[pixel * 3 + channel] = if value.is_finite() {
+                value.clamp(0.0, 65535.0) as u16
+            } else {
+                0
+            };
+        }
+    }
+    Ok(StackResult {
+        data: rgb16,
+        width: result.width,
+        height: result.height,
+        is_mono: result.channels == 1,
+        is_surface: false,
+    })
+}
+
+fn ds_preview_for_linear_result(
+    result: &DeepSkyResult,
+    prefix: &str,
+) -> Result<(StackResult, String), String> {
+    // Publica primero una vista acotada y deja caer todos sus temporales antes
+    // de crear el espejo RGB16 de geometria completa. Asi nunca coexisten dos
+    // RGB16 full-res, RGB8, RGBA y PNG durante una reanudacion.
+    let preview = ds_poststack_master_preview(
+        &result.data,
+        result.width,
+        result.height,
+        result.channels,
+        prefix,
+    )?;
+    let stack_result = ds_stack_result_for_linear(result)?;
+    Ok((stack_result, preview))
+}
+
+fn ds_product_runtime_disclosure(
+    product: pipeline::DeepSkyIntegrationProductKind,
+    result: &DeepSkyResult,
+) -> (String, Option<String>, bool, usize) {
+    let scientific_eligible = result
+        .recipe
+        .get("scientificEligible")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let no_coverage_pixels = result
+        .recipe
+        .pointer("/scientificProducts/noCoveragePixels")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let fallback_reason = match product {
+        pipeline::DeepSkyIntegrationProductKind::Struct => result
+            .recipe
+            .get("structFallback")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                result
+                    .struct_map
+                    .is_none()
+                    .then(|| "STRUCT no produjo un mapa validado; sólo se conserva su SCI de dependencia NebulaFusion".to_string())
+            }),
+        pipeline::DeepSkyIntegrationProductKind::Eidr => result
+            .recipe
+            .get("eidrFallback")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                let effective = result
+                    .recipe
+                    .pointer("/integrationMethod/effective/method")
+                    .and_then(serde_json::Value::as_str);
+                (effective != Some("eidr")).then(|| {
+                    "EIDR no superó su puerta científica; la salida efectiva es Classic".to_string()
+                })
+            }),
+        _ => None,
+    };
+    let status = if fallback_reason.is_some() {
+        "fallback"
+    } else if no_coverage_pixels > 0 {
+        "warning"
+    } else {
+        "ready"
+    };
+    (
+        status.to_string(),
+        fallback_reason,
+        scientific_eligible,
+        no_coverage_pixels,
+    )
+}
+
+fn ds_result_comparison_geometry(
+    result: &DeepSkyResult,
+) -> Option<pipeline::DeepSkyComparisonGeometry> {
+    let reference_path = result
+        .recipe
+        .get("frames")?
+        .as_array()?
+        .iter()
+        .find(|frame| {
+            frame
+                .get("reference")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })?
+        .get("path")?
+        .as_str()?
+        .to_string();
+    let crop = result.recipe.get("crop")?;
+    let read = |name: &str| crop.get(name)?.as_u64().map(|value| value as usize);
+    let geometry = pipeline::DeepSkyComparisonGeometry {
+        reference_path,
+        source_width: read("sourceWidth")?,
+        source_height: read("sourceHeight")?,
+        x: read("x")?,
+        y: read("y")?,
+        width_before_output_binning: read("widthBeforeOutputBinning")?,
+        height_before_output_binning: read("heightBeforeOutputBinning")?,
+        output_width: read("outputWidth")?,
+        output_height: read("outputHeight")?,
+    };
+    let valid = geometry.source_width > 0
+        && geometry.source_height > 0
+        && geometry.width_before_output_binning > 0
+        && geometry.height_before_output_binning > 0
+        && geometry.output_width > 0
+        && geometry.output_height > 0
+        && geometry.x < geometry.source_width
+        && geometry.y < geometry.source_height
+        && geometry
+            .x
+            .checked_add(geometry.width_before_output_binning)
+            .is_some_and(|right| right <= geometry.source_width)
+        && geometry
+            .y
+            .checked_add(geometry.height_before_output_binning)
+            .is_some_and(|bottom| bottom <= geometry.source_height);
+    valid.then_some(geometry)
+}
+
+/// B11b — Distancia elíptica normalizada ρ = √((dx/rx)² + (dy/ry)²).
+/// `coma_radius_px` es un radio FÍSICO en el detector; con escalas de salida
+/// anisótropas (drizzle asimétrico, binning desigual, corrección de aspecto)
+/// su imagen en la cuadrícula efectiva es una ELIPSE de semiejes
+/// rx = r·scale_x, ry = r·scale_y. Un círculo con `min(scale_x, scale_y)`
+/// sub-enmascara la coma a lo largo del eje de mayor escala (cola cometaria
+/// tratada como fondo). ρ = 1 es el borde de la coma; el suavizado y las
+/// exclusiones de fondo se expresan en ρ, no en píxeles, para que sean
+/// isótropos en coordenadas del detector.
+fn ds_comet_elliptical_rho(dx: f32, dy: f32, radius_x: f32, radius_y: f32) -> f32 {
+    let nx = dx / radius_x.max(1e-6);
+    let ny = dy / radius_y.max(1e-6);
+    (nx * nx + ny * ny).sqrt()
+}
+
+/// B11c — Paso de muestreo COPRIMO con el ancho. Si `gcd(step, width) = g > 1`
+/// el recorrido row-major `(0..npx).step_by(step)` sólo visita las columnas
+/// `x ≡ 0 (mod g)`: la mediana muestreada hereda el ruido de patrón de
+/// columna del sensor (banding CMOS, offsets de ADC por columna) en vez de
+/// promediar sobre todas las columnas. Con gcd = 1 los índices módulo `width`
+/// forman un ciclo completo y las muestras rotan por todas las columnas.
+/// Incrementar el paso sólo REDUCE el número de muestras (sigue acotado por
+/// el presupuesto), nunca introduce sesgo.
+fn ds_coprime_sampling_step(base: usize, width: usize) -> usize {
+    fn gcd(mut a: usize, mut b: usize) -> usize {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    }
+    let mut step = base.max(1);
+    if width <= 1 {
+        return step;
+    }
+    // La brecha máxima entre coprimos consecutivos de `width` (función de
+    // Jacobsthal) es minúscula para cualquier ancho de sensor real; el tope
+    // sólo blinda el bucle, jamás se alcanza.
+    for _ in 0..4096 {
+        if gcd(step, width) == 1 {
+            return step;
+        }
+        step += 1;
+    }
+    1 // paso 1 siempre es coprimo: muestrea todo (más lento, nunca sesgado)
+}
+
+/// Fondo robusto (mediana muestreada) por canal FUERA de la máscara cometaria.
+/// La exclusión usa ρ < 1.35 (mismo margen relativo que el antiguo
+/// `radius·1.35`, ahora isótropo en el detector) y el paso de muestreo es
+/// coprimo con el ancho (B11c) para no heredar el patrón de columna.
+fn ds_comet_channel_backgrounds(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    channels: usize,
+    anchor_x: f32,
+    anchor_y: f32,
+    radius_x: f32,
+    radius_y: f32,
+) -> Result<Vec<f32>, String> {
+    let npx = width * height;
+    let step = ds_coprime_sampling_step(npx / 300_000, width);
+    let mut backgrounds = vec![0.0f32; channels];
+    for (channel, background) in backgrounds.iter_mut().enumerate() {
+        let mut samples = Vec::new();
+        for pixel in (0..npx).step_by(step) {
+            let x = (pixel % width) as f32;
+            let y = (pixel / width) as f32;
+            if ds_comet_elliptical_rho(x - anchor_x, y - anchor_y, radius_x, radius_y) < 1.35 {
+                continue;
+            }
+            let value = data[pixel * channels + channel];
+            if value.is_finite() {
+                samples.push(value);
+            }
+        }
+        if samples.is_empty() {
+            return Err("No hay fondo suficiente fuera de la máscara cometaria".into());
+        }
+        samples.sort_by(f32::total_cmp);
+        *background = samples[samples.len() / 2];
+    }
+    Ok(backgrounds)
+}
+
+fn ds_comet_layer_products(
+    stars: &DeepSkyResult,
+    mut comet_aligned: DeepSkyResult,
+    request: &pipeline::CometStackRequest,
+) -> Result<(DeepSkyResult, DeepSkyResult), String> {
+    if stars.width != comet_aligned.width
+        || stars.height != comet_aligned.height
+        || stars.channels != comet_aligned.channels
+        || stars.data.len() != comet_aligned.data.len()
+    {
+        return Err(
+            "Las ramas estelar y cometaria no comparten geometría; desactiva crop/binning no uniforme"
+                .into(),
+        );
+    }
+    let npx = stars.width * stars.height;
+    let channels = stars.channels;
+    if comet_aligned.coverage.len() != npx
+        || comet_aligned.weight.len() != npx
+        || comet_aligned
+            .dq
+            .as_ref()
+            .is_some_and(|plane| plane.len() != npx)
+    {
+        return Err(
+            "La rama cometaria no conserva coverage/weight/DQ en la geometría del máster".into(),
+        );
+    }
+    let effective_grid = comet_aligned
+        .recipe
+        .pointer("/cometAlignment/effectiveGrid")
+        .ok_or(
+            "La rama cometaria no declaró su cuadrícula efectiva; no se aplicará una máscara en coordenadas supuestas",
+        )?;
+    let number = |field: &str| -> Result<f32, String> {
+        effective_grid
+            .get(field)
+            .and_then(serde_json::Value::as_f64)
+            .map(|value| value as f32)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| format!("cometAlignment.effectiveGrid.{field} ausente o no finito"))
+    };
+    let anchor_x = number("anchorX")?;
+    let anchor_y = number("anchorY")?;
+    let scale_x = number("outputScaleX")?;
+    let scale_y = number("outputScaleY")?;
+    if scale_x <= 0.0 || scale_y <= 0.0 {
+        return Err("La escala efectiva de la rama cometaria debe ser positiva".into());
+    }
+    // B11b: la máscara es la imagen ELÍPTICA del círculo físico de la coma
+    // bajo la escala por eje (ver ds_comet_elliptical_rho). El borde interior
+    // al 82% y el smoothstep se mantienen, ahora en ρ (isótropos en detector).
+    let radius_x = request.coma_radius_px * scale_x;
+    let radius_y = request.coma_radius_px * scale_y;
+
+    let backgrounds = ds_comet_channel_backgrounds(
+        &comet_aligned.data,
+        stars.width,
+        stars.height,
+        channels,
+        anchor_x,
+        anchor_y,
+        radius_x,
+        radius_y,
+    )?;
+
+    let mut mask = vec![0.0f32; npx];
+    for (pixel, value) in mask.iter_mut().enumerate() {
+        let x = (pixel % stars.width) as f32;
+        let y = (pixel / stars.width) as f32;
+        let rho = ds_comet_elliptical_rho(x - anchor_x, y - anchor_y, radius_x, radius_y);
+        *value = if rho <= 0.82 {
+            1.0
+        } else if rho >= 1.0 {
+            0.0
+        } else {
+            let t = (1.0 - rho) / 0.18;
+            t * t * (3.0 - 2.0 * t)
+        };
+    }
+    for pixel in 0..npx {
+        if mask[pixel] <= 0.0 {
+            comet_aligned.data[pixel * channels..pixel * channels + channels].fill(f32::NAN);
+            comet_aligned.coverage[pixel] = 0.0;
+            comet_aligned.weight[pixel] = 0.0;
+            continue;
+        }
+        for channel in 0..channels {
+            let index = pixel * channels + channel;
+            comet_aligned.data[index] =
+                (comet_aligned.data[index] - backgrounds[channel]) * mask[pixel];
+        }
+        comet_aligned.coverage[pixel] *= mask[pixel];
+        comet_aligned.weight[pixel] *= mask[pixel];
+    }
+    let comet_dq = comet_aligned.dq.get_or_insert_with(|| vec![0u32; npx]);
+    for pixel in 0..npx {
+        if mask[pixel] <= 0.0 {
+            comet_dq[pixel] |=
+                crate::deepsky_variance::dq::NO_COVERAGE | crate::deepsky_variance::dq::EDGE;
+        }
+    }
+    // Both the robust background estimate and the star/comet branches reuse
+    // the same exposures. Their covariance is not available, so publishing
+    // the inherited VAR/NEFF would be mathematically false.
+    comet_aligned.variance = None;
+    comet_aligned.neff = None;
+    comet_aligned.id = new_job_id("ds-comet-layer");
+    comet_aligned.method = "comet-cross-trajectory-residual".into();
+    if let Some(recipe) = comet_aligned.recipe.as_object_mut() {
+        recipe.insert(
+            "cometLayer".into(),
+            serde_json::json!({
+                "kind": "comet",
+                "source": "cometAlignedRobustIntegration",
+                "starSuppression": "crossTrajectoryRobustRejection",
+                "starModelSubtraction": false,
+                "backgroundSubtraction": "perChannelMedianOutsideMask",
+                "maskRadiusPx": request.coma_radius_px,
+                "maskEdge": "smoothstep18Percent",
+                "signedResidual": true,
+                "validationStatus": "experimental",
+                "uncertainty": {
+                    "variancePublished": false,
+                    "neffPublished": false,
+                    "reason": "shared-input covariance and background-model uncertainty unavailable",
+                },
+                "linear": true,
+            }),
+        );
+    }
+
+    let mut combined = stars.clone();
+    combined.id = new_job_id("ds-comet-combined");
+    for (value, comet_value) in combined.data.iter_mut().zip(&comet_aligned.data) {
+        if value.is_finite() && comet_value.is_finite() {
+            *value += *comet_value;
+        }
+    }
+    combined.variance = None;
+    combined.neff = None;
+    combined.dq = stars.dq.clone();
+    if let (Some(combined_dq), Some(comet_dq)) = (combined.dq.as_mut(), comet_aligned.dq.as_ref()) {
+        for pixel in 0..npx {
+            if mask[pixel] > 0.0
+                && comet_aligned.data[pixel * channels..pixel * channels + channels]
+                    .iter()
+                    .all(|value| value.is_finite())
+            {
+                combined_dq[pixel] |= comet_dq[pixel]
+                    & !(crate::deepsky_variance::dq::NO_COVERAGE
+                        | crate::deepsky_variance::dq::EDGE);
+            }
+        }
+    }
+    combined.method = "linear-stars-plus-signed-comet-residual".into();
+    combined.struct_map = None;
+    combined.struct_residual = None;
+    combined.recoverability = None;
+    if let Some(recipe) = combined.recipe.as_object_mut() {
+        recipe.insert(
+            "cometLayer".into(),
+            serde_json::json!({
+                "kind": "combined",
+                "starsResultId": stars.id,
+                "cometResultId": comet_aligned.id,
+                "composition": "stars + signed comet residual under soft mask",
+                "validationStatus": "experimental",
+                "uncertainty": {
+                    "variancePublished": false,
+                    "neffPublished": false,
+                    "reason": "star and comet branches share exposures; covariance is unavailable",
+                },
+                "linear": true,
+            }),
+        );
+    }
+    Ok((comet_aligned, combined))
 }
 
 #[tauri::command]
@@ -11201,69 +15763,606 @@ async fn run_deepsky_stack(
     if !plan.valid {
         return Err(plan.errors.join("\n"));
     }
-    // Acción de usuario nueva: rearme del flag global bajo el gate. El grupo
-    // interno (stack_deepsky_impl) NO rearma, así el Cancelar no se pierde.
+    // Acción de usuario nueva: rearme único del conjunto. Cada producto usa el
+    // mismo caché calibrado/registrado y no rearma la cancelación entre ellos.
     ds_begin_user_action(&state);
+    state.deep_sky_products.lock().unwrap().clear();
+    *state.deep_sky_active_product.lock().unwrap() = None;
+    // Un resultado activo previo puede contener SCI + VAR + NEFF + DQ y un
+    // espejo Drizzle 2×. Conservarlo durante todo el nuevo stack duplica el
+    // pico de RAM y puede impedir precisamente la reanudación tras presión de
+    // memoria. Los runs v2 ya lo dejaron durable por producto; al comenzar una
+    // acción explícita liberamos también las derivaciones ligadas a sus bytes.
+    let previous_linear = state.deep_sky_result.lock().unwrap().take();
+    let previous_preview = state.stacked_image.lock().unwrap().take();
+    let released_previous = previous_linear.is_some() || previous_preview.is_some();
+    drop(previous_linear);
+    drop(previous_preview);
+    state
+        .deconv_cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+    state
+        .wavelet_cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+    state
+        .filter_cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+    if released_previous {
+        log_to_front(
+            &app,
+            "INFO",
+            "El máster activo anterior se liberó de RAM; sus checkpoints durables permanecen disponibles.",
+        );
+    }
     let started = std::time::Instant::now();
-    let effective_method = request.resolved_integration_method();
-    let preview_path = stack_deepsky_impl(
-        app,
-        state.clone(),
-        request.lights,
-        request.darks,
-        request.flats,
-        request.dark_flats,
-        request.bias,
-        Some(request.kappa_high.max(request.kappa_low)),
-        Some(request.rejection != "average"),
-        request.cosmetic,
-        Some(request.gradient),
-        Some(request.drizzle),
-        request.optimize_dark,
-        Some(request.pixfrac),
-        Some(request.normalization == "local"),
-        Some(request.auto_crop),
-        Some(request.interpolation),
-        request.clip_iters,
-        request.pedestal,
-        Some(request.rejection),
-        Some(request.kappa_low),
-        Some(request.kappa_high),
-        Some(request.normalization),
-        Some(request.compute_policy),
-        Some(request.local_weighting),
-        request.work_dir.clone(),
-        Some(effective_method),
-        Some(request.capture_mode),
-        Some(request.calibration_policy),
-        Some(request.calibration_overrides),
-    )
-    .await?;
-    let result = state.deep_sky_result.lock().unwrap();
-    let ds = result
+    let products = request.resolved_integration_products();
+    let product_count = products.len();
+    let primary_product_request = products
+        .iter()
+        .find(|product| product.primary)
+        .or_else(|| products.first())
+        .cloned()
+        .ok_or("No hay productos de integración solicitados")?;
+    let primary_id = primary_product_request.id.clone();
+    let comet_request = request.comet.clone().filter(|comet| comet.enabled);
+    let cache_base = request
+        .work_dir
         .as_ref()
-        .ok_or("El motor terminó sin publicar un resultado lineal")?;
-    let recipe_path = std::env::temp_dir()
-        .join("astro_stacker_previews")
-        .join(format!("{}_recipe.json", ds.id));
-    ds_write_recipe(&recipe_path, ds).map_err(|error| {
-        format!(
-            "El máster terminó y permanece en memoria, pero no se pudo guardar su receta reproducible: {error}"
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_dir())
+        .or_else(|| {
+            request
+                .lights
+                .first()
+                .and_then(|path| std::path::Path::new(path).parent())
+                .map(std::path::Path::to_path_buf)
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    let output_dir = if product_count > 1 || comet_request.is_some() {
+        Some(ds_create_friendly_output_dir(
+            &cache_base,
+            "Apilado_Cielo_Profundo",
+        )?)
+    } else {
+        None
+    };
+    let mut output_guard = output_dir.clone().map(|path| DsSessionOutputGuard {
+        path,
+        committed: false,
+        preserved_children: Vec::new(),
+    });
+    let mut product_handles = Vec::with_capacity(products.len());
+    let mut primary_result: Option<(DeepSkyResult, StackResult)> = None;
+    let mut inactive_results = std::collections::BTreeMap::new();
+
+    for (product_index, product) in products.into_iter().enumerate() {
+        cancellation_checkpoint(
+            state.cancel_requested.as_ref(),
+            &format!("preparación del producto {}", product.id),
+        )?;
+        emit_progress(
+            &app,
+            &format!(
+                "Producto {}/{} · {}",
+                product_index + 1,
+                product_count.max(1),
+                product.id
+            ),
+            product_index as f32 * 100.0 / product_count.max(1) as f32,
+            None,
+        );
+        let product_started = std::time::Instant::now();
+        let product_drizzle = product.effective_drizzle(request.drizzle);
+        let product_output_scale = product.requested_output_scale(request.drizzle);
+        let resume_fingerprint =
+            ds_product_resume_fingerprint_for_product(&request, &product)?;
+        let restored_checkpoint = match ds_try_restore_product_checkpoint(
+            &cache_base,
+            &resume_fingerprint,
+            &product.id,
+        ) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) if error.contains("presupuesto seguro actual") => return Err(error),
+            Err(error) => {
+                log_to_front(&app, "WARN", &error);
+                None
+            }
+        };
+        let (mut result, stacked, preview_path, mut checkpoint_entry, cache_hit) =
+            if let Some((result, entry)) = restored_checkpoint {
+                let (stacked, preview_path) =
+                    ds_preview_for_linear_result(&result, "deepsky_resumed_product")?;
+                log_to_front(
+                    &app,
+                    "SUCCESS",
+                    &format!(
+                        "{} restaurado desde un checkpoint completo y compatible; no se repite calibración, registro ni integración.",
+                        product.id
+                    ),
+                );
+                emit_progress(
+                    &app,
+                    &format!(
+                        "{}: checkpoint compatible restaurado; se omiten calibración, registro e integración.",
+                        product.id
+                    ),
+                    ((product_index + 1) as f32 * 100.0 / product_count.max(1) as f32)
+                        .min(99.0),
+                    None,
+                );
+                (result, stacked, preview_path, Some(entry), true)
+            } else {
+                let preview_path = stack_deepsky_impl(
+                    app.clone(),
+                    state.clone(),
+                    request.lights.clone(),
+                    request.darks.clone(),
+                    request.flats.clone(),
+                    request.dark_flats.clone(),
+                    request.bias.clone(),
+                    Some(request.kappa_high.max(request.kappa_low)),
+                    Some(request.rejection != "average"),
+                    request.cosmetic,
+                    Some(request.gradient),
+                    Some(product_drizzle),
+                    request.optimize_dark,
+                    Some(request.pixfrac),
+                    Some(request.normalization == "local"),
+                    Some(if comet_request.is_some() {
+                        false
+                    } else {
+                        request.auto_crop
+                    }),
+                    Some(request.interpolation.clone()),
+                    request.clip_iters,
+                    request.pedestal,
+                    Some(request.rejection.clone()),
+                    Some(request.kappa_low),
+                    Some(request.kappa_high),
+                    Some(request.normalization.clone()),
+                    Some(request.compute_policy),
+                    Some(request.local_weighting),
+                    request.work_dir.clone(),
+                    Some(product.method.clone()),
+                    Some(request.capture_mode),
+                    Some(request.calibration_policy),
+                    Some(request.calibration_overrides.clone()),
+                    None,
+                )
+                .await?;
+                let result = state
+                    .deep_sky_result
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or("El motor terminó sin publicar un resultado lineal")?;
+                let stacked = state
+                    .stacked_image
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or("El motor terminó sin publicar el espejo de vista previa")?;
+                (result, stacked, preview_path, None, false)
+            };
+        let effective_recipe = result
+            .recipe
+            .pointer("/integrationMethod/effective")
+            .cloned();
+        if let Some(recipe) = result.recipe.as_object_mut() {
+            recipe.insert(
+                "integrationProducts".into(),
+                serde_json::json!([{
+                    "id": product.id,
+                    "product": product.product,
+                    "primary": product.id == primary_id,
+                    "dependency": product.dependency(),
+                    "requestedMethod": product.method,
+                    "requestedDrizzle": request.drizzle,
+                    "effectiveDrizzle": product_drizzle,
+                    "outputScale": product_output_scale,
+                    "resumedFromCheckpoint": cache_hit,
+                    "effective": effective_recipe,
+                }]),
+            );
+        }
+        let (product_status, product_fallback_reason, scientific_eligible, no_coverage_pixels) =
+            ds_product_runtime_disclosure(product.product, &result);
+        if let Some(entry) = result
+            .recipe
+            .pointer_mut("/integrationProducts/0")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            entry.insert(
+                "status".into(),
+                serde_json::Value::String(product_status.clone()),
+            );
+            entry.insert(
+                "fallbackReason".into(),
+                product_fallback_reason
+                    .clone()
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            entry.insert(
+                "scientificEligible".into(),
+                serde_json::Value::Bool(scientific_eligible),
+            );
+            entry.insert(
+                "noCoveragePixels".into(),
+                serde_json::json!(no_coverage_pixels),
+            );
+        }
+        let is_primary = product.id == primary_id;
+        if is_primary {
+            match spcc_try_autosolve_result(&mut result, request.work_dir.clone()) {
+                Ok(solution) => log_to_front(
+                    &app,
+                    "SUCCESS",
+                    &format!(
+                        "Astrometría automática: {} inliers · RMS {:.2} px · fuente {}.",
+                        solution.inliers, solution.rms_px, solution.source
+                    ),
+                ),
+                Err(error) => {
+                    let friendly = if error.starts_with("ASTROMETRY_CATALOG_REQUIRED") {
+                        "Astrometría automática pendiente: falta el mosaico Gaia local. El máster se conserva y el editor ofrece resolver en línea."
+                    } else if error.contains("RA/Dec/escala") {
+                        "Astrometría automática pendiente: faltan RA, Dec o escala en las cabeceras. El editor solicitará esos datos."
+                    } else {
+                        "Astrometría automática pendiente; revisa el diagnóstico en el editor."
+                    };
+                    log_to_front(&app, "WARN", friendly);
+                }
+            }
+        }
+        ds_mark_product_resume_recipe(&mut result, &resume_fingerprint, &product.id);
+        let resident_bytes = ds_result_resident_bytes(&result);
+        if checkpoint_entry.is_none() {
+            checkpoint_entry = Some(ds_spill_product_checkpoint(
+                &cache_base,
+                &resume_fingerprint,
+                &product.id,
+                &result,
+            )?);
+            log_to_front(
+                &app,
+                "INFO",
+                &format!(
+                    "{} quedó publicado como checkpoint atómico ({:.1} GB); sobrevivirá a una cancelación de las ramas siguientes.",
+                    product.id,
+                    resident_bytes as f64 / 1_073_741_824.0
+                ),
+            );
+        } else if cache_hit {
+            log_to_front(
+                &app,
+                "INFO",
+                &format!("{} usa el checkpoint compatible ya publicado.", product.id),
+            );
+        }
+        let mut recipe_path = std::env::temp_dir()
+            .join("astro_stacker_previews")
+            .join(format!("{}_recipe.json", result.id));
+        ds_write_recipe(&recipe_path, &result).map_err(|error| {
+            format!("El máster terminó, pero no se pudo guardar su receta reproducible: {error}")
+        })?;
+        let (bundle, product_output_dir, master_fits) = if let Some(root) = &output_dir {
+            let output_name = ds_product_output_folder_name(
+                product_index,
+                product.product,
+                product_drizzle,
+                &product_status,
+            );
+            let product_dir = root.join(&output_name);
+            let export_id =
+                ds_product_output_base_name(product.product, product_drizzle, &product_status);
+            std::fs::create_dir_all(&product_dir)
+                .map_err(|error| format!("Carpeta del producto '{}': {error}", product.id))?;
+            let product_recipe_path = product_dir.join("Receta_Reproducible.json");
+            ds_write_recipe(&product_recipe_path, &result)?;
+            recipe_path = product_recipe_path;
+            let (master_fits, _, _, bundle) = ds_export_session_result(
+                &result,
+                &product_dir,
+                &export_id,
+                &product.id,
+                "PRODUCT",
+                &DualBandExtractionOptions::default(),
+                request.capture_mode,
+                request.calibration_policy,
+                false,
+                state.cancel_requested.as_ref(),
+            )?;
+            if let Some(guard) = output_guard.as_mut() {
+                guard.preserve_child(product_dir.clone());
+            }
+            (
+                Some(bundle),
+                Some(product_dir.display().to_string()),
+                Some(master_fits),
+            )
+        } else {
+            (None, None, None)
+        };
+        let effective_method = result
+            .recipe
+            .pointer("/integrationMethod/effective/method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| product.method.label())
+            .to_string();
+        product_handles.push(pipeline::DeepSkyProductResultHandle {
+            id: product.id.clone(),
+            product: product.product,
+            primary: is_primary,
+            dependency: product.dependency().map(str::to_string),
+            status: product_status,
+            fallback_reason: product_fallback_reason,
+            scientific_eligible,
+            no_coverage_pixels,
+            requested_method: product.method.label().into(),
+            effective_method,
+            requested_drizzle: request.drizzle,
+            effective_drizzle: product_drizzle,
+            output_scale: product_output_scale,
+            result_id: result.id.clone(),
+            preview_path: preview_path.clone(),
+            width: result.width,
+            height: result.height,
+            channels: result.channels,
+            engine: result.engine.clone(),
+            frames_used: result.frames_used,
+            frames_rejected: result.frames_rejected,
+            elapsed_seconds: product_started.elapsed().as_secs_f32(),
+            resumed_from_checkpoint: cache_hit,
+            recipe_path: Some(recipe_path.display().to_string()),
+            output_dir: product_output_dir,
+            master_fits,
+            scientific_bundle: bundle,
+            comparison: ds_result_comparison_geometry(&result),
+        });
+        if product_count > 1 || comet_request.is_some() {
+            log_to_front(
+                &app,
+                "INFO",
+                &format!(
+                    "{} quedó a salvo en NVMe ({:.1} GB) y se liberó de RAM antes de la siguiente rama.",
+                    product.id,
+                    resident_bytes as f64 / 1_073_741_824.0
+                ),
+            );
+            let entry = checkpoint_entry
+                .take()
+                .ok_or("El producto terminó sin un checkpoint durable")?;
+            inactive_results.insert(product.id.clone(), entry);
+            drop(result);
+            drop(stacked);
+        } else if is_primary {
+            primary_result = Some((result, stacked));
+        } else {
+            return Err(format!(
+                "El único producto ejecutado '{}' no coincide con el primario '{}'",
+                product.id, primary_id
+            ));
+        }
+    }
+
+    if let Some(root) = &output_dir {
+        ds_write_products_readme(root, &product_handles)?;
+    }
+
+    if primary_result.is_none() {
+        let primary_entry = inactive_results
+            .remove(&primary_id)
+            .ok_or("No se conservó el producto primario en el caché temporal")?;
+        let result = ds_load_product_from_disk(&primary_id, &primary_entry)?;
+        let stacked = ds_stack_result_for_linear(&result)?;
+        primary_result = Some((result, stacked));
+    }
+
+    let mut comet_handle = None;
+    if let Some(comet) = comet_request {
+        cancellation_checkpoint(state.cancel_requested.as_ref(), "registro cometario")?;
+        emit_progress(
+            &app,
+            "Cometa: segunda rama, registro por trayectoria...",
+            72.0,
+            None,
+        );
+        let _raw_comet_preview = stack_deepsky_impl(
+            app.clone(),
+            state.clone(),
+            request.lights.clone(),
+            request.darks.clone(),
+            request.flats.clone(),
+            request.dark_flats.clone(),
+            request.bias.clone(),
+            Some(request.kappa_high.max(request.kappa_low)),
+            Some(request.rejection != "average"),
+            request.cosmetic,
+            Some(request.gradient),
+            Some(primary_product_request.effective_drizzle(request.drizzle)),
+            request.optimize_dark,
+            Some(request.pixfrac),
+            Some(request.normalization == "local"),
+            Some(false),
+            Some(request.interpolation.clone()),
+            request.clip_iters,
+            request.pedestal,
+            Some(request.rejection.clone()),
+            Some(request.kappa_low),
+            Some(request.kappa_high),
+            Some(request.normalization.clone()),
+            Some(request.compute_policy),
+            Some(request.local_weighting),
+            request.work_dir.clone(),
+            Some(primary_product_request.method.clone()),
+            Some(request.capture_mode),
+            Some(request.calibration_policy),
+            Some(request.calibration_overrides.clone()),
+            Some(comet.clone()),
         )
-    })?;
-    let recipe_path = Some(recipe_path.display().to_string());
+        .await?;
+        let comet_aligned = state
+            .deep_sky_result
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or("La rama cometaria no publicó resultado lineal")?;
+        let _ = state
+            .stacked_image
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or("La rama cometaria no publicó vista previa")?;
+        let star_result = primary_result
+            .as_ref()
+            .map(|(result, _)| result)
+            .ok_or("No se conservó la rama estelar primaria")?;
+        let (comet_layer, combined_layer) =
+            ds_comet_layer_products(star_result, comet_aligned, &comet)?;
+        let (comet_stacked, comet_preview) =
+            ds_preview_for_linear_result(&comet_layer, "deepsky_comet")?;
+        let (combined_stacked, combined_preview) =
+            ds_preview_for_linear_result(&combined_layer, "deepsky_comet_combined")?;
+        let preview_root = std::env::temp_dir().join("astro_stacker_previews");
+        std::fs::create_dir_all(&preview_root)
+            .map_err(|error| format!("Carpeta de recetas cometarias: {error}"))?;
+        let comet_recipe_path = preview_root.join(format!("{}_recipe.json", comet_layer.id));
+        let combined_recipe_path = preview_root.join(format!("{}_recipe.json", combined_layer.id));
+        ds_write_recipe(&comet_recipe_path, &comet_layer)?;
+        ds_write_recipe(&combined_recipe_path, &combined_layer)?;
+
+        let mut comet_output_dir = None;
+        let mut combined_output_dir = None;
+        if let Some(root) = &output_dir {
+            if comet.keep_separate_layers {
+                let directory = root.join("90_Cometa_Separado");
+                std::fs::create_dir_all(&directory)
+                    .map_err(|error| format!("Carpeta de capa cometaria: {error}"))?;
+                let _ = ds_export_session_result(
+                    &comet_layer,
+                    &directory,
+                    "Cometa_Separado",
+                    "Cometa",
+                    "COMET",
+                    &DualBandExtractionOptions::default(),
+                    request.capture_mode,
+                    request.calibration_policy,
+                    false,
+                    state.cancel_requested.as_ref(),
+                )?;
+                if let Some(guard) = output_guard.as_mut() {
+                    guard.preserve_child(directory.clone());
+                }
+                comet_output_dir = Some(directory.display().to_string());
+            }
+            let directory = root.join("91_Estrellas_y_Cometa");
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| format!("Carpeta de capa combinada: {error}"))?;
+            let _ = ds_export_session_result(
+                &combined_layer,
+                &directory,
+                "Estrellas_y_Cometa",
+                "Estrellas + cometa",
+                "COMBINED",
+                &DualBandExtractionOptions::default(),
+                request.capture_mode,
+                request.calibration_policy,
+                false,
+                state.cancel_requested.as_ref(),
+            )?;
+            if let Some(guard) = output_guard.as_mut() {
+                guard.preserve_child(directory.clone());
+            }
+            combined_output_dir = Some(directory.display().to_string());
+        }
+        let primary_handle = product_handles
+            .iter()
+            .find(|product| product.primary)
+            .ok_or("No se publicó la capa estelar primaria")?;
+        let mut layers = vec![pipeline::CometLayerHandle {
+            id: primary_id.clone(),
+            kind: pipeline::CometLayerKind::Stars,
+            result_id: primary_handle.result_id.clone(),
+            preview_path: primary_handle.preview_path.clone(),
+            recipe_path: primary_handle.recipe_path.clone(),
+            output_dir: primary_handle.output_dir.clone(),
+        }];
+        if comet.keep_separate_layers {
+            layers.push(pipeline::CometLayerHandle {
+                id: "comet:layer".into(),
+                kind: pipeline::CometLayerKind::Comet,
+                result_id: comet_layer.id.clone(),
+                preview_path: comet_preview,
+                recipe_path: Some(comet_recipe_path.display().to_string()),
+                output_dir: comet_output_dir,
+            });
+            let cache_root = output_dir
+                .as_deref()
+                .ok_or("Falta la carpeta temporal para la capa cometaria")?;
+            let entry = ds_spill_product_to_disk(cache_root, "comet:layer", &comet_layer)?;
+            inactive_results.insert("comet:layer".into(), entry);
+            drop(comet_layer);
+            drop(comet_stacked);
+        }
+        layers.push(pipeline::CometLayerHandle {
+            id: "comet:combined".into(),
+            kind: pipeline::CometLayerKind::Combined,
+            result_id: combined_layer.id.clone(),
+            preview_path: combined_preview,
+            recipe_path: Some(combined_recipe_path.display().to_string()),
+            output_dir: combined_output_dir,
+        });
+        let cache_root = output_dir
+            .as_deref()
+            .ok_or("Falta la carpeta temporal para la capa combinada")?;
+        let entry = ds_spill_product_to_disk(cache_root, "comet:combined", &combined_layer)?;
+        inactive_results.insert("comet:combined".into(), entry);
+        drop(combined_layer);
+        drop(combined_stacked);
+        comet_handle = Some(pipeline::CometStackResultHandle {
+            confidence: comet.trajectory.confidence,
+            trajectory: comet.trajectory,
+            layers,
+        });
+    }
+
+    let (primary_result, primary_stacked) =
+        primary_result.ok_or("No se pudo conservar el producto primario")?;
+    *state.stacked_image.lock().unwrap() = Some(primary_stacked);
+    *state.deep_sky_result.lock().unwrap() = Some(primary_result);
+    *state.deep_sky_products.lock().unwrap() = inactive_results;
+    *state.deep_sky_active_product.lock().unwrap() = Some(primary_id.clone());
+    if let Some(guard) = output_guard.as_mut() {
+        guard.committed = true;
+    }
+    let primary = product_handles
+        .iter()
+        .find(|product| product.primary)
+        .ok_or("No se publicó el producto primario")?;
+    let comparison = primary.comparison.clone();
     Ok(DeepSkyResultHandle {
-        result_id: ds.id.clone(),
-        preview_path,
-        width: ds.width,
-        height: ds.height,
-        channels: ds.channels,
+        result_id: primary.result_id.clone(),
+        preview_path: primary.preview_path.clone(),
+        width: primary.width,
+        height: primary.height,
+        channels: primary.channels,
         linear: true,
-        engine: ds.engine.clone(),
-        frames_used: ds.frames_used,
-        frames_rejected: ds.frames_rejected,
+        engine: primary.engine.clone(),
+        frames_used: primary.frames_used,
+        frames_rejected: primary.frames_rejected,
         elapsed_seconds: started.elapsed().as_secs_f32(),
-        recipe_path,
+        recipe_path: primary.recipe_path.clone(),
+        primary_product_id: primary_id,
+        products: product_handles,
+        comet: comet_handle,
+        comparison,
     })
 }
 
@@ -11395,6 +16494,152 @@ fn ds_session_safe_name(value: &str) -> String {
     }
 }
 
+fn ds_create_friendly_output_dir(
+    base: &std::path::Path,
+    prefix: &str,
+) -> Result<std::path::PathBuf, String> {
+    let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+    for attempt in 0..100usize {
+        let suffix = if attempt == 0 {
+            String::new()
+        } else {
+            format!("_{:02}", attempt + 1)
+        };
+        let path = base.join(format!("{prefix}_{timestamp}{suffix}"));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "No se pudo crear la carpeta de resultados '{}': {error}",
+                    path.display()
+                ))
+            }
+        }
+    }
+    Err("No se pudo reservar un nombre único para la carpeta de resultados".into())
+}
+
+fn ds_product_output_base_name(
+    product: pipeline::DeepSkyIntegrationProductKind,
+    effective_drizzle: f32,
+    status: &str,
+) -> String {
+    let mut name = match product {
+        pipeline::DeepSkyIntegrationProductKind::Classic if effective_drizzle > 1.01 => {
+            let scale = if (effective_drizzle - effective_drizzle.round()).abs() < 0.01 {
+                format!("{:.0}", effective_drizzle)
+            } else {
+                format!("{effective_drizzle:.2}").replace('.', "_")
+            };
+            format!("Classic_Drizzle_{scale}x")
+        }
+        pipeline::DeepSkyIntegrationProductKind::Classic => "Classic".into(),
+        pipeline::DeepSkyIntegrationProductKind::NebulaFusionSci => "NebulaFusion_SCI".into(),
+        pipeline::DeepSkyIntegrationProductKind::Struct => "STRUCT".into(),
+        pipeline::DeepSkyIntegrationProductKind::Eidr => "EIDR".into(),
+    };
+    match (product, status) {
+        (pipeline::DeepSkyIntegrationProductKind::Struct, "fallback") => {
+            name.push_str("__SCI_Dependencia_STRUCT_No_Generado")
+        }
+        (pipeline::DeepSkyIntegrationProductKind::Eidr, "fallback") => {
+            name.push_str("__Classic_Conservado_EIDR_No_Validado")
+        }
+        (_, "fallback") => name.push_str("__Fallback_Registrado"),
+        (_, "warning") => name.push_str("__Revisar_Cobertura"),
+        _ => {}
+    }
+    name
+}
+
+fn ds_product_output_folder_name(
+    product_index: usize,
+    product: pipeline::DeepSkyIntegrationProductKind,
+    effective_drizzle: f32,
+    status: &str,
+) -> String {
+    format!(
+        "{:02}_{}",
+        product_index + 1,
+        ds_product_output_base_name(product, effective_drizzle, status)
+    )
+}
+
+fn ds_write_products_readme(
+    output_dir: &std::path::Path,
+    products: &[pipeline::DeepSkyProductResultHandle],
+) -> Result<(), String> {
+    use std::fmt::Write as _;
+    let mut text = String::from(
+        "ZENITH ASTRO STACKER · RESULTADOS DE CIELO PROFUNDO\n\
+         =================================================\n\n\
+         Empieza por la carpeta del producto marcado como PRINCIPAL.\n\
+         Cada Máster_*.fits es lineal float32 y conserva el rango científico.\n\
+         La carpeta Diagnostico_Cientifico contiene mapas de cobertura, rechazo,\n\
+         varianza, NEFF, DQ y recuperabilidad cuando el motor puede publicarlos.\n\
+         Receta_Reproducible.json registra parámetros, fallbacks y procedencia.\n\n\
+         PRODUCTOS DE ESTE APILADO\n",
+    );
+    for product in products {
+        let marker = if product.primary {
+            "PRINCIPAL"
+        } else {
+            "alternativo"
+        };
+        let purpose = match product.product {
+            pipeline::DeepSkyIntegrationProductKind::Classic => {
+                "integración robusta de compatibilidad amplia"
+            }
+            pipeline::DeepSkyIntegrationProductKind::NebulaFusionSci => {
+                "máster SCI ponderado por varianza con VAR, NEFF y DQ"
+            }
+            pipeline::DeepSkyIntegrationProductKind::Struct => {
+                "evidencia estructural derivada de NebulaFusion; no sustituye al SCI"
+            }
+            pipeline::DeepSkyIntegrationProductKind::Eidr => {
+                "reconstrucción validada por modelo; si falla conserva Classic"
+            }
+        };
+        let _ = writeln!(
+            text,
+            "- {} · {} · {} · estado={} · motor efectivo={}{}",
+            product.product.label(),
+            marker,
+            purpose,
+            product.status,
+            product.effective_method,
+            product
+                .fallback_reason
+                .as_deref()
+                .map(|reason| format!(" · aviso: {reason}"))
+                .unwrap_or_default()
+        );
+    }
+    text.push_str(
+        "\nCACHÉ REUTILIZABLE\n\
+         La carpeta oculta .zenith-cache/Cielo_Profundo conserva calibración,\n\
+         análisis y registro validados. Reapilar los mismos raws reutiliza esas\n\
+         etapas; cambiar la receta de integración recalcula únicamente el máster.\n\
+         Puede eliminarse para forzar una preparación completamente nueva.\n\n\
+         MAPAS PRINCIPALES\n\
+         - Cobertura: soporte geométrico de las tomas.\n\
+         - Peso_Efectivo: señal que sobrevivió al rechazo.\n\
+         - Rechazo_Bajo / Rechazo_Alto: outliers descartados.\n\
+         - Varianza y NEFF: incertidumbre y número efectivo de muestras.\n\
+         - Calidad_DQ: bitmask; documenta saturación, interpolación y fallbacks.\n\
+         - Recuperabilidad_EIDR: zonas donde la reconstrucción fue sostenible.\n\n\
+         Si aparecen 90_Cometa_Separado o 91_Estrellas_y_Cometa, son las\n\
+         capas cometaria y compuesta solicitadas, no cachés temporales.\n",
+    );
+    let path = output_dir.join("00_LEEME_Resultados.txt");
+    let temporary = output_dir.join(".00_LEEME_Resultados.txt.part");
+    std::fs::write(&temporary, text)
+        .map_err(|error| format!("No se pudo escribir la guía de resultados: {error}"))?;
+    std::fs::rename(&temporary, &path)
+        .map_err(|error| format!("No se pudo publicar la guía de resultados: {error}"))
+}
+
 fn ds_result_quality(result: &DeepSkyResult) -> DeepSkyQualitySummary {
     let n = result.width.saturating_mul(result.height).max(1);
     let coverage_max = result
@@ -11490,6 +16735,49 @@ fn ds_extract_dual_band_planes(
     Ok((primary, oiii))
 }
 
+/// HOO is meaningful only for an OSC Ha+OIII acquisition. A generic RGB
+/// master, a mono line stack or an already-combined palette must not be
+/// reinterpreted as dual-band merely because it has three channels.
+fn ds_hoo_block_reason(recipe: &serde_json::Value) -> Option<String> {
+    if recipe.get("operation").and_then(serde_json::Value::as_str)
+        == Some("linearChannelCombination")
+    {
+        return Some(
+            "HOO ya no se aplica: el máster actual es una combinación de canales terminada.".into(),
+        );
+    }
+    let capture_mode = recipe
+        .get("captureMode")
+        .or_else(|| recipe.pointer("/parameters/captureMode"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let first_light = recipe
+        .get("inputs")
+        .or_else(|| recipe.get("recipe").and_then(|value| value.get("inputs")))
+        .and_then(|value| value.get("lights"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|values| values.first())
+        .and_then(serde_json::Value::as_str);
+    let filter = recipe
+        .get("filterProfile")
+        .and_then(serde_json::Value::as_str)
+        .and_then(ds_filter_token)
+        .or_else(|| first_light.and_then(ds_filter_of_path));
+    if filter == Some("SII_OIII") {
+        return Some(
+            "HOO no corresponde al filtro SII+OIII; usa una combinación SOO/SHO explícita.".into(),
+        );
+    }
+    if capture_mode == "dualbandosc" || capture_mode == "dual_band_osc" {
+        return None;
+    }
+    if filter == Some("HA_OIII") {
+        return None;
+    }
+    Some("HOO está bloqueado: el máster no declara una adquisición OSC Ha+OIII/dual-band.".into())
+}
+
 /// Render the current OSC dual-band RGB master as a derived HOO composite:
 /// Ha (from R, crosstalk-suppressed) → R; OIII (G·w + B·(1−w)) → both G and B.
 /// This is the standard one-shot-colour dual-band mapping (SV220/L-eXtreme…): it
@@ -11516,6 +16804,9 @@ fn deepsky_dualband_hoo(
                 "El máster es monocromo; la combinación HOO necesita un máster OSC/RGB dual-band."
                     .into(),
             );
+        }
+        if let Some(reason) = ds_hoo_block_reason(&r.recipe) {
+            return Err(reason);
         }
         let (ha, oiii) = ds_extract_dual_band_planes(&r.data, r.channels, green_w, suppress)?;
         let npx = r.width * r.height;
@@ -11548,9 +16839,9 @@ fn deepsky_dualband_hoo(
             is_mono: false,
             is_surface: false,
         });
-        state.deconv_cache.lock().unwrap().clear();
-        state.wavelet_cache.lock().unwrap().clear();
-        state.filter_cache.lock().unwrap().clear();
+        state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
     let preview8 = ds_render_stretch(&rgb16, w, h, false, 2.8, 0.25);
     let mut rgba = Vec::with_capacity(npx * 4);
@@ -11657,6 +16948,7 @@ fn ds_export_session_result(
     extraction: &DualBandExtractionOptions,
     capture_mode: pipeline::DeepSkyCaptureMode,
     calibration_policy: pipeline::DeepSkyCalibrationPolicy,
+    extract_components: bool,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<
     (
@@ -11688,6 +16980,7 @@ fn ds_export_session_result(
             "Bundle científico: se esperaban 1 o 3 canales, se recibieron {channels}"
         ));
     }
+    let wcs_metadata = ds_wcs_fits_metadata(&result.recipe, result.width, result.height);
 
     let mut manifest_warnings = Vec::new();
     let recipe_capture_mode = match result.recipe.get("captureMode") {
@@ -11729,9 +17022,7 @@ fn ds_export_session_result(
 
     let mut fallbacks = std::collections::BTreeSet::new();
     ds_session_collect_fallbacks(
-        result
-            .recipe
-            .pointer("/integrationMethod/fallbacks"),
+        result.recipe.pointer("/integrationMethod/fallbacks"),
         &mut fallbacks,
     );
     ds_session_collect_fallbacks(result.recipe.pointer("/eidr/fallbacks"), &mut fallbacks);
@@ -11774,18 +17065,15 @@ fn ds_export_session_result(
     bundle_metadata.insert("engine".into(), result.engine.clone());
     bundle_metadata.insert("rejectionMethod".into(), result.method.clone());
     bundle_metadata.insert("framesUsed".into(), result.frames_used.to_string());
-    bundle_metadata.insert(
-        "framesRejected".into(),
-        result.frames_rejected.to_string(),
-    );
-    if let Some(value) = ds_session_recipe_text(
-        result.recipe.pointer("/integrationMethod/requested"),
-    ) {
+    bundle_metadata.insert("framesRejected".into(), result.frames_rejected.to_string());
+    if let Some(value) =
+        ds_session_recipe_text(result.recipe.pointer("/integrationMethod/requested"))
+    {
         bundle_metadata.insert("integrationRequested".into(), value);
     }
-    if let Some(value) = ds_session_recipe_text(
-        result.recipe.pointer("/integrationMethod/effective"),
-    ) {
+    if let Some(value) =
+        ds_session_recipe_text(result.recipe.pointer("/integrationMethod/effective"))
+    {
         bundle_metadata.insert("integrationEffective".into(), value);
     }
     if let Some(value) = result
@@ -11822,18 +17110,21 @@ fn ds_export_session_result(
         .map_err(|error| format!("Bundle científico: reserva de manifiesto: {error}"))?;
 
     let safe = ds_session_safe_name(group_id);
-    let master = output_dir.join(format!("{safe}_master_linear_float32.fits"));
-    let metadata = vec![
-        ("ZASVER", "'hybrid-v2-2026.07'".into()),
-        ("ZASJOB", format!("'{}'", result.id)),
-        ("ZASGROUP", format!("'{}'", safe)),
-        ("ZASFILT", format!("'{}'", filter_profile)),
-        ("OBJECT", format!("'{}'", label.replace('\'', ""))),
-        ("NCOMBINE", format!("{:>20}", result.frames_used)),
-        ("EXTNAME", "'SCI'".into()),
-        ("ZASROLE", "'SCI'".into()),
-        ("BUNIT", DsFitsUnit::Adu.header_value().into()),
-    ];
+    let master = output_dir.join(format!("Master_{safe}_Lineal_float32.fits"));
+    let metadata = ds_metadata_with_wcs(
+        vec![
+            ("ZASVER", "'hybrid-v2-2026.07'".into()),
+            ("ZASJOB", format!("'{}'", result.id)),
+            ("ZASGROUP", format!("'{}'", safe)),
+            ("ZASFILT", format!("'{}'", filter_profile)),
+            ("OBJECT", format!("'{}'", label.replace('\'', ""))),
+            ("NCOMBINE", format!("{:>20}", result.frames_used)),
+            ("EXTNAME", "'SCI'".into()),
+            ("ZASROLE", "'SCI'".into()),
+            ("BUNIT", DsFitsUnit::Adu.header_value().into()),
+        ],
+        &wcs_metadata,
+    );
     ds_save_float32_fits_cancellable(
         &master,
         &result.data,
@@ -11855,6 +17146,9 @@ fn ds_export_session_result(
         "masterScience",
     ));
 
+    let diagnostics_dir = output_dir.join("Diagnostico_Cientifico");
+    std::fs::create_dir_all(&diagnostics_dir)
+        .map_err(|error| format!("Carpeta de diagnóstico científico: {error}"))?;
     let mut diagnostics = std::collections::BTreeMap::new();
     for (name, map) in [
         ("coverage", &result.coverage),
@@ -11865,33 +17159,50 @@ fn ds_export_session_result(
     ] {
         ds_session_require_product_len(name, map.len(), npx)?;
         cancellation_checkpoint(cancel, "exportación de diagnósticos de sesión")?;
-        let path = output_dir.join(format!("{safe}_{name}.fits"));
+        let friendly_name = match name {
+            "coverage" => "Cobertura",
+            "weight" => "Peso_Efectivo",
+            "rejection_low" => "Rechazo_Bajo",
+            "rejection_high" => "Rechazo_Alto",
+            "registration_residuals" => "Residuales_Registro",
+            _ => name,
+        };
+        let path = diagnostics_dir.join(format!("{friendly_name}.fits"));
         let unit = ds_map_fits_unit(name);
+        let metadata = ds_metadata_with_wcs(
+            vec![
+                ("EXTNAME", format!("'{}'", name.to_ascii_uppercase())),
+                ("ZASGROUP", format!("'{}'", safe)),
+                ("ZASMAP", format!("'{}'", name)),
+                ("BUNIT", unit.header_value().into()),
+            ],
+            &wcs_metadata,
+        );
         ds_save_float32_fits_cancellable(
             &path,
             map,
             result.width,
             result.height,
             1,
-            &[
-                ("EXTNAME", format!("'{}'", name.to_ascii_uppercase())),
-                ("ZASGROUP", format!("'{}'", safe)),
-                ("ZASMAP", format!("'{}'", name)),
-                ("BUNIT", unit.header_value().into()),
-            ],
+            &metadata,
             Some(cancel),
         )?;
         diagnostics.insert(name.into(), path.display().to_string());
         let (kind, role) = match name {
             "coverage" => (ScientificProductKind::Coverage, "geometricCoverage"),
-            "weight" => (ScientificProductKind::Coverage, "effectivePostRejectionWeight"),
+            "weight" => (
+                ScientificProductKind::Coverage,
+                "effectivePostRejectionWeight",
+            ),
             "rejection_low" => (ScientificProductKind::Rejection, "lowOutlierCount"),
             "rejection_high" => (ScientificProductKind::Rejection, "highOutlierCount"),
-            _ => (ScientificProductKind::Residual, "registrationResidualPixels"),
+            _ => (
+                ScientificProductKind::Residual,
+                "registrationResidualPixels",
+            ),
         };
-        let mut product = ds_session_manifest_product(
-            kind, &path, unit, width, height, 1, true, false, role,
-        );
+        let mut product =
+            ds_session_manifest_product(kind, &path, unit, width, height, 1, true, false, role);
         product.metadata.insert("productName".into(), name.into());
         bundle.products.push(product);
     }
@@ -11915,19 +17226,28 @@ fn ds_export_session_result(
         let Some(plane) = plane else { continue };
         ds_session_require_product_len(name, plane.len(), science_samples)?;
         cancellation_checkpoint(cancel, "exportación VAR/NEFF de sesión")?;
-        let path = output_dir.join(format!("{safe}_{name}.fits"));
+        let friendly_name = if name == "variance" {
+            "Varianza"
+        } else {
+            "Tomas_Efectivas_NEFF"
+        };
+        let path = diagnostics_dir.join(format!("{friendly_name}.fits"));
+        let metadata = ds_metadata_with_wcs(
+            vec![
+                ("EXTNAME", format!("'{}'", name.to_ascii_uppercase())),
+                ("ZASGROUP", format!("'{}'", safe)),
+                ("ZASROLE", format!("'{}'", name.to_ascii_uppercase())),
+                ("BUNIT", unit.header_value().into()),
+            ],
+            &wcs_metadata,
+        );
         ds_save_float32_fits_cancellable(
             &path,
             plane,
             result.width,
             result.height,
             result.channels,
-            &[
-                ("EXTNAME", format!("'{}'", name.to_ascii_uppercase())),
-                ("ZASGROUP", format!("'{}'", safe)),
-                ("ZASROLE", format!("'{}'", name.to_ascii_uppercase())),
-                ("BUNIT", unit.header_value().into()),
-            ],
+            &metadata,
             Some(cancel),
         )?;
         diagnostics.insert(name.into(), path.display().to_string());
@@ -11953,19 +17273,23 @@ fn ds_export_session_result(
             encoded.push(bits as f32);
         }
         cancellation_checkpoint(cancel, "exportación DQ de sesión")?;
-        let path = output_dir.join(format!("{safe}_dq.fits"));
+        let path = diagnostics_dir.join("Calidad_DQ.fits");
+        let metadata = ds_metadata_with_wcs(
+            vec![
+                ("EXTNAME", "'DQ'".into()),
+                ("ZASGROUP", format!("'{}'", safe)),
+                ("ZASROLE", "'DQ'".into()),
+                ("BUNIT", DsFitsUnit::Bitmask.header_value().into()),
+            ],
+            &wcs_metadata,
+        );
         ds_save_float32_fits_cancellable(
             &path,
             &encoded,
             result.width,
             result.height,
             1,
-            &[
-                ("EXTNAME", "'DQ'".into()),
-                ("ZASGROUP", format!("'{}'", safe)),
-                ("ZASROLE", "'DQ'".into()),
-                ("BUNIT", DsFitsUnit::Bitmask.header_value().into()),
-            ],
+            &metadata,
             Some(cancel),
         )?;
         diagnostics.insert("dq".into(), path.display().to_string());
@@ -12003,19 +17327,28 @@ fn ds_export_session_result(
         let Some(plane) = plane else { continue };
         ds_session_require_product_len(name, plane.len(), npx)?;
         cancellation_checkpoint(cancel, "exportación STRUCT de sesión")?;
-        let path = output_dir.join(format!("{safe}_{name}.fits"));
+        let friendly_name = if name == "struct" {
+            "Evidencia_STRUCT"
+        } else {
+            "Residual_STRUCT"
+        };
+        let path = diagnostics_dir.join(format!("{friendly_name}.fits"));
+        let metadata = ds_metadata_with_wcs(
+            vec![
+                ("EXTNAME", format!("'{}'", name.to_ascii_uppercase())),
+                ("ZASGROUP", format!("'{}'", safe)),
+                ("ZASEVID", "T".into()),
+                ("BUNIT", DsFitsUnit::Adu.header_value().into()),
+            ],
+            &wcs_metadata,
+        );
         ds_save_float32_fits_cancellable(
             &path,
             plane,
             result.width,
             result.height,
             1,
-            &[
-                ("EXTNAME", format!("'{}'", name.to_ascii_uppercase())),
-                ("ZASGROUP", format!("'{}'", safe)),
-                ("ZASEVID", "T".into()),
-                ("BUNIT", DsFitsUnit::Adu.header_value().into()),
-            ],
+            &metadata,
             Some(cancel),
         )?;
         diagnostics.insert(name.into(), path.display().to_string());
@@ -12037,19 +17370,23 @@ fn ds_export_session_result(
     if let Some(recov) = result.recoverability.as_deref() {
         ds_session_require_product_len("recov", recov.len(), npx)?;
         cancellation_checkpoint(cancel, "exportación RECOV de sesión")?;
-        let path = output_dir.join(format!("{safe}_recov.fits"));
+        let path = diagnostics_dir.join("Recuperabilidad_EIDR.fits");
+        let metadata = ds_metadata_with_wcs(
+            vec![
+                ("EXTNAME", "'RECOV'".into()),
+                ("ZASGROUP", format!("'{}'", safe)),
+                ("ZASEVID", "T".into()),
+                ("BUNIT", DsFitsUnit::Dimensionless.header_value().into()),
+            ],
+            &wcs_metadata,
+        );
         ds_save_float32_fits_cancellable(
             &path,
             recov,
             result.width,
             result.height,
             1,
-            &[
-                ("EXTNAME", "'RECOV'".into()),
-                ("ZASGROUP", format!("'{}'", safe)),
-                ("ZASEVID", "T".into()),
-                ("BUNIT", DsFitsUnit::Dimensionless.header_value().into()),
-            ],
+            &metadata,
             Some(cancel),
         )?;
         diagnostics.insert("recov".into(), path.display().to_string());
@@ -12068,16 +17405,22 @@ fn ds_export_session_result(
 
     let mut components = std::collections::BTreeMap::new();
     let profile = filter_profile.to_ascii_uppercase();
-    if matches!(profile.as_str(), "HA_OIII" | "SII_OIII") && result.channels >= 3 {
+    if extract_components
+        && matches!(profile.as_str(), "HA_OIII" | "SII_OIII")
+        && result.channels >= 3
+    {
         let primary_name = if profile == "HA_OIII" { "HA" } else { "SII" };
         let green = extraction.oiii_green_weight.clamp(0.0, 1.0);
         let suppress = extraction.crosstalk_suppression.clamp(0.0, 1.0);
         let (primary, oiii) =
             ds_extract_dual_band_planes(&result.data, result.channels, green, suppress)?;
+        let components_dir = output_dir.join("Canales_Separados");
+        std::fs::create_dir_all(&components_dir)
+            .map_err(|error| format!("Carpeta de canales separados: {error}"))?;
         for (name, plane) in [(primary_name, primary), ("OIII", oiii)] {
             // Without a measured camera+filter response matrix this RGB split
             // is useful but not a quantitative line-flux measurement.
-            let path = output_dir.join(format!("{safe}_{name}_proxy_linear_float32.fits"));
+            let path = components_dir.join(format!("Canal_{name}_Proxy_Lineal_float32.fits"));
             let capture_label = match recipe_capture_mode {
                 pipeline::DeepSkyCaptureMode::Auto => "AUTO",
                 pipeline::DeepSkyCaptureMode::BroadbandOsc => "BROADBAND_OSC",
@@ -12085,17 +17428,20 @@ fn ds_export_session_result(
                 pipeline::DeepSkyCaptureMode::DualBandOsc => "DUAL_BAND_OSC",
                 pipeline::DeepSkyCaptureMode::MonoNarrowband => "MONO_NARROWBAND",
             };
-            let component_metadata = vec![
-                ("ZASVER", "'hybrid-v2-2026.07'".into()),
-                ("ZASGROUP", format!("'{}'", safe)),
-                ("FILTER", format!("'{}_PROXY'", name)),
-                ("SRCFILT", format!("'{}'", profile)),
-                ("ZASROLE", "'PROXY_NOT_QUANTITATIVE'".into()),
-                ("ZASCAP", format!("'{capture_label}'")),
-                ("O3WGHT", format!("{:>20.6}", green)),
-                ("XTLKSUP", format!("{:>20.6}", suppress)),
-                ("BUNIT", DsFitsUnit::Adu.header_value().into()),
-            ];
+            let component_metadata = ds_metadata_with_wcs(
+                vec![
+                    ("ZASVER", "'hybrid-v2-2026.07'".into()),
+                    ("ZASGROUP", format!("'{}'", safe)),
+                    ("FILTER", format!("'{}_PROXY'", name)),
+                    ("SRCFILT", format!("'{}'", profile)),
+                    ("ZASROLE", "'PROXY_NOT_QUANTITATIVE'".into()),
+                    ("ZASCAP", format!("'{capture_label}'")),
+                    ("O3WGHT", format!("{:>20.6}", green)),
+                    ("XTLKSUP", format!("{:>20.6}", suppress)),
+                    ("BUNIT", DsFitsUnit::Adu.header_value().into()),
+                ],
+                &wcs_metadata,
+            );
             ds_save_float32_fits_cancellable(
                 &path,
                 &plane,
@@ -12118,11 +17464,12 @@ fn ds_export_session_result(
                 "spectralProxy",
             );
             product.metadata.insert("line".into(), name.into());
-            product.metadata.insert("quantitative".into(), "false".into());
-            product.metadata.insert(
-                "reason".into(),
-                "missingCameraFilterResponseMatrix".into(),
-            );
+            product
+                .metadata
+                .insert("quantitative".into(), "false".into());
+            product
+                .metadata
+                .insert("reason".into(), "missingCameraFilterResponseMatrix".into());
             bundle.products.push(product);
         }
     }
@@ -12137,13 +17484,53 @@ fn ds_export_session_result(
 struct DsSessionOutputGuard {
     path: std::path::PathBuf,
     committed: bool,
+    /// Hijos que ya terminaron su publicación atómica. Una cancelación de
+    /// ramas posteriores no puede borrar estos productos completos.
+    preserved_children: Vec<std::path::PathBuf>,
+}
+
+impl DsSessionOutputGuard {
+    fn preserve_child(&mut self, path: std::path::PathBuf) {
+        if path.parent() == Some(self.path.as_path()) && !self.preserved_children.contains(&path) {
+            self.preserved_children.push(path);
+        }
+    }
 }
 
 impl Drop for DsSessionOutputGuard {
     fn drop(&mut self) {
-        if !self.committed {
-            let _ = std::fs::remove_dir_all(&self.path);
+        if self.committed {
+            return;
         }
+        if self.preserved_children.is_empty() {
+            let _ = std::fs::remove_dir_all(&self.path);
+            return;
+        }
+        if let Ok(entries) = std::fs::read_dir(&self.path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if self.preserved_children.contains(&path) {
+                    continue;
+                }
+                if path.is_dir() {
+                    let _ = std::fs::remove_dir_all(path);
+                } else {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        let completed = self
+            .preserved_children
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect::<Vec<_>>()
+            .join("\n- ");
+        let _ = std::fs::write(
+            self.path.join("APILADO_INCOMPLETO__PRODUCTOS_PRESERVADOS.txt"),
+            format!(
+                "La ejecución fue cancelada o interrumpida después de publicar productos completos.\n\nProductos preservados:\n- {completed}\n\nAl repetir exactamente las mismas tomas y receta, Zenith reutilizará sus checkpoints compatibles.\n"
+            ),
+        );
     }
 }
 
@@ -12161,6 +17548,38 @@ async fn run_deepsky_session(
     // Acción de usuario nueva: rearme ÚNICO de la sesión; los grupos internos
     // no rearman y un Cancelar entre grupos se propaga al siguiente registro.
     ds_begin_user_action(&state);
+    state.deep_sky_products.lock().unwrap().clear();
+    *state.deep_sky_active_product.lock().unwrap() = None;
+    // Igual que el apilado de un solo grupo: el máster interactivo anterior y
+    // sus derivaciones no pueden convivir con la deserialización de un
+    // checkpoint multibanda grande. Las copias durables no se tocan.
+    let previous_linear = state.deep_sky_result.lock().unwrap().take();
+    let previous_preview = state.stacked_image.lock().unwrap().take();
+    let released_previous = previous_linear.is_some() || previous_preview.is_some();
+    drop(previous_linear);
+    drop(previous_preview);
+    state
+        .deconv_cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+    state
+        .wavelet_cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+    state
+        .filter_cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+    if released_previous {
+        log_to_front(
+            &app,
+            "INFO",
+            "El máster activo anterior se liberó de RAM; sus checkpoints durables permanecen disponibles para la sesión.",
+        );
+    }
     let started = std::time::Instant::now();
     let session_id = new_job_id("ds-session");
     let base = std::path::Path::new(&request.base_path);
@@ -12171,14 +17590,15 @@ async fn run_deepsky_session(
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(std::env::temp_dir)
     };
-    let output_dir = parent.join(format!(
-        "ZenithDeepSkySession_{}",
-        ds_session_safe_name(&session_id)
-    ));
-    std::fs::create_dir_all(&output_dir).map_err(|error| format!("Carpeta de sesión: {error}"))?;
+    // La caché durable vive fuera de la carpeta de salida fechada. Así un
+    // reintento crea resultados limpios, pero encuentra las ramas completas
+    // de la ejecución cancelada anterior.
+    let session_cache_base = parent.clone();
+    let output_dir = ds_create_friendly_output_dir(&parent, "Sesion_Cielo_Profundo")?;
     let mut output_guard = DsSessionOutputGuard {
         path: output_dir.clone(),
         committed: false,
+        preserved_children: Vec::new(),
     };
     // Flag de cancelación PROPIO de la sesión (job registry, bajo el gate):
     // los checkpoints entre grupos y de exportación ya no dependen del flag
@@ -12208,6 +17628,8 @@ async fn run_deepsky_session(
     let mut total_used = 0;
     let mut total_rejected = 0;
     let mut session_preview = String::new();
+    let mut final_primary: Option<(String, DeepSkyResult, StackResult)> = None;
+    let mut final_inactive_products = std::collections::BTreeMap::new();
 
     for (index, group) in request.groups.into_iter().enumerate() {
         cancellation_checkpoint(cancel.as_ref(), "sesión multibanda")?;
@@ -12240,62 +17662,355 @@ async fn run_deepsky_session(
             ds_resolve_auto_for_run(&app, resolved, &format!(" · grupo {}", group.label));
         let group_capture_mode = resolved.capture_mode;
         let group_calibration_policy = resolved.calibration_policy;
-        let group_method = resolved.resolved_integration_method();
+        let products = resolved.resolved_integration_products();
+        let primary_request = products
+            .iter()
+            .find(|product| product.primary)
+            .or_else(|| products.first())
+            .cloned()
+            .ok_or_else(|| format!("{}: no hay productos de integración", group.label))?;
+        let primary_id = primary_request.id.clone();
+        let product_count = products.len();
         let group_started = std::time::Instant::now();
-        let preview_path = stack_deepsky_impl(
-            app.clone(),
-            state.clone(),
-            resolved.lights,
-            resolved.darks,
-            resolved.flats,
-            resolved.dark_flats,
-            resolved.bias,
-            Some(resolved.kappa_high.max(resolved.kappa_low)),
-            Some(resolved.rejection != "average"),
-            resolved.cosmetic,
-            Some(resolved.gradient),
-            Some(resolved.drizzle),
-            resolved.optimize_dark,
-            Some(resolved.pixfrac),
-            Some(resolved.normalization == "local"),
-            Some(resolved.auto_crop),
-            Some(resolved.interpolation),
-            resolved.clip_iters,
-            resolved.pedestal,
-            Some(resolved.rejection),
-            Some(resolved.kappa_low),
-            Some(resolved.kappa_high),
-            Some(resolved.normalization),
-            Some(resolved.compute_policy),
-            Some(resolved.local_weighting),
-            resolved.work_dir.clone(),
-            Some(group_method),
-            Some(resolved.capture_mode),
-            Some(resolved.calibration_policy),
-            Some(resolved.calibration_overrides.clone()),
-        )
-        .await?;
-        let result = state
-            .deep_sky_result
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or("El grupo terminó sin publicar resultado float32")?;
         let canonical_filter = ds_filter_token(&group.filter_profile)
             .unwrap_or_else(|| group.filter_profile.trim())
             .to_ascii_uppercase();
-        let (master_fits, component_paths, diagnostic_paths, scientific_bundle) =
-            ds_export_session_result(
-            &result,
-            &output_dir,
-            &group.id,
-            &group.label,
-            &canonical_filter,
-            &request.extraction,
-            group_capture_mode,
-            group_calibration_policy,
-            cancel.as_ref(),
-        )?;
+        let group_dir = output_dir.join(format!(
+            "{:02}_{}_{}",
+            index + 1,
+            ds_session_safe_name(&group.label),
+            ds_session_safe_name(&canonical_filter)
+        ));
+        std::fs::create_dir_all(&group_dir)
+            .map_err(|error| format!("Carpeta del grupo '{}': {error}", group.label))?;
+        let mut group_output_guard = DsSessionOutputGuard {
+            path: group_dir.clone(),
+            committed: false,
+            preserved_children: Vec::new(),
+        };
+        let mut product_handles = Vec::with_capacity(products.len());
+        let mut component_paths = std::collections::BTreeMap::new();
+        let mut diagnostic_paths = std::collections::BTreeMap::new();
+        let mut scientific_bundle = ScientificBundleManifest::default();
+        let mut master_fits = String::new();
+        let mut inactive_products = std::collections::BTreeMap::new();
+
+        for (product_index, product) in products.into_iter().enumerate() {
+            cancellation_checkpoint(
+                cancel.as_ref(),
+                &format!("{} · producto {}", group.label, product.id),
+            )?;
+            emit_progress(
+                &app,
+                &format!(
+                    "Sesión multibanda {}/{} · {} · rama {}/{} ({})",
+                    index + 1,
+                    plan.groups.len(),
+                    group.label,
+                    product_index + 1,
+                    product_count.max(1),
+                    product.id
+                ),
+                ((index as f32 + product_index as f32 / product_count.max(1) as f32) * 100.0)
+                    / plan.groups.len().max(1) as f32,
+                None,
+            );
+            let product_started = std::time::Instant::now();
+            let product_drizzle = product.effective_drizzle(resolved.drizzle);
+            let product_output_scale = product.requested_output_scale(resolved.drizzle);
+            let resume_fingerprint = ds_session_product_resume_fingerprint(
+                &group.id,
+                &canonical_filter,
+                &resolved,
+                &product,
+            )?;
+            let restored_checkpoint = match ds_try_restore_product_checkpoint(
+                &session_cache_base,
+                &resume_fingerprint,
+                &product.id,
+            ) {
+                Ok(checkpoint) => checkpoint,
+                Err(error) if error.contains("presupuesto seguro actual") => return Err(error),
+                Err(error) => {
+                    log_to_front(&app, "WARN", &error);
+                    None
+                }
+            };
+            let (mut result, stacked, preview_path, mut checkpoint_entry, cache_hit) =
+                if let Some((result, entry)) = restored_checkpoint {
+                    let (stacked, preview_path) = ds_preview_for_linear_result(
+                        &result,
+                        "deepsky_session_resumed_product",
+                    )?;
+                    log_to_front(
+                        &app,
+                        "SUCCESS",
+                        &format!(
+                            "{} · {} se reanudó desde un checkpoint completo; no se repiten calibración, registro ni integración.",
+                            group.label, product.id
+                        ),
+                    );
+                    emit_progress(
+                        &app,
+                        &format!(
+                            "{} · {}: checkpoint compatible restaurado.",
+                            group.label, product.id
+                        ),
+                        ((index as f32
+                            + (product_index + 1) as f32 / product_count.max(1) as f32)
+                            * 100.0)
+                            / plan.groups.len().max(1) as f32,
+                        None,
+                    );
+                    (result, stacked, preview_path, Some(entry), true)
+                } else {
+                    let preview_path = stack_deepsky_impl(
+                        app.clone(),
+                        state.clone(),
+                        resolved.lights.clone(),
+                        resolved.darks.clone(),
+                        resolved.flats.clone(),
+                        resolved.dark_flats.clone(),
+                        resolved.bias.clone(),
+                        Some(resolved.kappa_high.max(resolved.kappa_low)),
+                        Some(resolved.rejection != "average"),
+                        resolved.cosmetic,
+                        Some(resolved.gradient),
+                        Some(product_drizzle),
+                        resolved.optimize_dark,
+                        Some(resolved.pixfrac),
+                        Some(resolved.normalization == "local"),
+                        Some(resolved.auto_crop),
+                        Some(resolved.interpolation.clone()),
+                        resolved.clip_iters,
+                        resolved.pedestal,
+                        Some(resolved.rejection.clone()),
+                        Some(resolved.kappa_low),
+                        Some(resolved.kappa_high),
+                        Some(resolved.normalization.clone()),
+                        Some(resolved.compute_policy),
+                        Some(resolved.local_weighting),
+                        resolved.work_dir.clone(),
+                        Some(product.method.clone()),
+                        Some(resolved.capture_mode),
+                        Some(resolved.calibration_policy),
+                        Some(resolved.calibration_overrides.clone()),
+                        None,
+                    )
+                    .await?;
+                    let result = state
+                        .deep_sky_result
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or("El grupo terminó sin publicar resultado float32")?;
+                    let stacked = state
+                        .stacked_image
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or("El grupo terminó sin publicar su vista previa")?;
+                    (result, stacked, preview_path, None, false)
+                };
+            let effective_recipe = result
+                .recipe
+                .pointer("/integrationMethod/effective")
+                .cloned();
+            if let Some(recipe) = result.recipe.as_object_mut() {
+                recipe.insert(
+                    "integrationProducts".into(),
+                    serde_json::json!([{
+                        "id": product.id,
+                        "product": product.product,
+                        "primary": product.id == primary_id,
+                        "dependency": product.dependency(),
+                        "requestedMethod": product.method,
+                        "requestedDrizzle": resolved.drizzle,
+                        "effectiveDrizzle": product_drizzle,
+                        "outputScale": product_output_scale,
+                        "resumedFromCheckpoint": cache_hit,
+                        "effective": effective_recipe,
+                    }]),
+                );
+            }
+            let (product_status, product_fallback_reason, scientific_eligible, no_coverage_pixels) =
+                ds_product_runtime_disclosure(product.product, &result);
+            if let Some(entry) = result
+                .recipe
+                .pointer_mut("/integrationProducts/0")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                entry.insert(
+                    "status".into(),
+                    serde_json::Value::String(product_status.clone()),
+                );
+                entry.insert(
+                    "fallbackReason".into(),
+                    product_fallback_reason
+                        .clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                entry.insert(
+                    "scientificEligible".into(),
+                    serde_json::Value::Bool(scientific_eligible),
+                );
+                entry.insert(
+                    "noCoveragePixels".into(),
+                    serde_json::json!(no_coverage_pixels),
+                );
+            }
+            ds_mark_session_product_resume_recipe(
+                &mut result,
+                &resume_fingerprint,
+                &product.id,
+                &group.id,
+                &canonical_filter,
+            );
+            let resident_bytes = ds_result_resident_bytes(&result);
+            if checkpoint_entry.is_none() {
+                checkpoint_entry = Some(ds_spill_product_checkpoint(
+                    &session_cache_base,
+                    &resume_fingerprint,
+                    &product.id,
+                    &result,
+                )?);
+                log_to_front(
+                    &app,
+                    "INFO",
+                    &format!(
+                        "{} · {} quedó publicado como checkpoint atómico ({:.1} GB); sobrevivirá a una cancelación de grupos o ramas posteriores.",
+                        group.label,
+                        product.id,
+                        resident_bytes as f64 / 1_073_741_824.0
+                    ),
+                );
+            } else if cache_hit {
+                log_to_front(
+                    &app,
+                    "INFO",
+                    &format!(
+                        "{} · {} usa el checkpoint multibanda compatible ya publicado.",
+                        group.label, product.id
+                    ),
+                );
+            }
+            let is_primary = product.id == primary_id;
+            let product_dir = group_dir.join(ds_product_output_folder_name(
+                product_index,
+                product.product,
+                product_drizzle,
+                &product_status,
+            ));
+            std::fs::create_dir_all(&product_dir).map_err(|error| {
+                format!(
+                    "Carpeta del producto '{}' en '{}': {error}",
+                    product.id, group.label
+                )
+            })?;
+            let recipe_path = product_dir.join("Receta_Reproducible.json");
+            ds_write_recipe(&recipe_path, &result)?;
+            let export_product_id = format!(
+                "{}_{}",
+                ds_session_safe_name(&group.label),
+                ds_product_output_base_name(product.product, product_drizzle, &product_status)
+            );
+            let (product_master, product_components, product_diagnostics, product_bundle) =
+                ds_export_session_result(
+                    &result,
+                    &product_dir,
+                    &export_product_id,
+                    &format!("{} · {}", group.label, product.id),
+                    &canonical_filter,
+                    &request.extraction,
+                    group_capture_mode,
+                    group_calibration_policy,
+                    is_primary,
+                    cancel.as_ref(),
+                )?;
+            // Sólo después de cerrar la publicación completa se conserva esta
+            // carpeta. Si la exportación anterior retorna por cancelación, el
+            // guardia de grupo elimina exclusivamente la rama parcial.
+            group_output_guard.preserve_child(product_dir.clone());
+            output_guard.preserve_child(group_dir.clone());
+            let effective_method = result
+                .recipe
+                .pointer("/integrationMethod/effective/method")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| product.method.label())
+                .to_string();
+            let handle = pipeline::DeepSkyProductResultHandle {
+                id: product.id.clone(),
+                product: product.product,
+                primary: is_primary,
+                dependency: product.dependency().map(str::to_string),
+                status: product_status,
+                fallback_reason: product_fallback_reason,
+                scientific_eligible,
+                no_coverage_pixels,
+                requested_method: product.method.label().into(),
+                effective_method,
+                requested_drizzle: resolved.drizzle,
+                effective_drizzle: product_drizzle,
+                output_scale: product_output_scale,
+                result_id: result.id.clone(),
+                preview_path,
+                width: result.width,
+                height: result.height,
+                channels: result.channels,
+                engine: result.engine.clone(),
+                frames_used: result.frames_used,
+                frames_rejected: result.frames_rejected,
+                elapsed_seconds: product_started.elapsed().as_secs_f32(),
+                resumed_from_checkpoint: cache_hit,
+                recipe_path: Some(recipe_path.display().to_string()),
+                output_dir: Some(product_dir.display().to_string()),
+                master_fits: Some(product_master.clone()),
+                scientific_bundle: Some(product_bundle.clone()),
+                comparison: ds_result_comparison_geometry(&result),
+            };
+            if is_primary {
+                master_fits = product_master;
+                component_paths = product_components;
+                diagnostic_paths = product_diagnostics;
+                scientific_bundle = product_bundle;
+            }
+            log_to_front(
+                &app,
+                "INFO",
+                &format!(
+                    "{} · {} quedó a salvo en NVMe ({:.1} GB); RAM liberada para la siguiente rama.",
+                    group.label,
+                    product.id,
+                    resident_bytes as f64 / 1_073_741_824.0
+                ),
+            );
+            let entry = checkpoint_entry
+                .take()
+                .ok_or("El producto multibanda terminó sin checkpoint durable")?;
+            inactive_products.insert(product.id.clone(), entry);
+            drop(result);
+            drop(stacked);
+            product_handles.push(handle);
+        }
+
+        // Todas las ramas de este grupo ya fueron publicadas; desde aquí un
+        // fallo al reabrir el primario o construir la receta no debe retirarlas.
+        group_output_guard.committed = true;
+
+        let primary_entry = inactive_products.remove(&primary_id).ok_or_else(|| {
+            format!(
+                "{}: no se conservó el producto primario en el caché temporal",
+                group.label
+            )
+        })?;
+        let result = ds_load_product_from_disk(&primary_id, &primary_entry)?;
+        let stacked = ds_stack_result_for_linear(&result)?;
+        let primary_handle = product_handles
+            .iter()
+            .find(|product| product.primary)
+            .ok_or_else(|| format!("{}: no se publicó el producto primario", group.label))?;
+        let primary_preview = primary_handle.preview_path.clone();
         if !component_paths.is_empty() {
             warnings.push(format!(
                 "{}: Ha/OIII se exportaron como proxies heurísticos; se requiere una matriz espectral cámara-filtro para cuantificarlos",
@@ -12313,11 +18028,13 @@ async fn run_deepsky_session(
         // El estado interactivo conserva el último grupo; la vista inicial de
         // la sesión debe corresponder al mismo máster para que el re-estirado
         // no salte silenciosamente a otra integración.
-        session_preview = preview_path.clone();
+        session_preview = primary_preview.clone();
         group_recipes.push(serde_json::json!({
             "id": group.id.clone(),
             "label": group.label.clone(),
             "filterProfile": canonical_filter.clone(),
+            "primaryProductId": primary_id.clone(),
+            "products": product_handles.clone(),
             "stackRecipe": result.recipe.clone(),
             "masterFits": master_fits.clone(),
             "componentPaths": component_paths.clone(),
@@ -12328,9 +18045,11 @@ async fn run_deepsky_session(
             id: group.id,
             label: group.label,
             filter_profile: canonical_filter,
+            primary_product_id: primary_id.clone(),
+            products: product_handles,
             scientific_bundle,
             master_fits,
-            preview_path,
+            preview_path: primary_preview,
             component_paths,
             diagnostic_paths,
             frames_used: result.frames_used,
@@ -12338,6 +18057,16 @@ async fn run_deepsky_session(
             elapsed_seconds: group_started.elapsed().as_secs_f32(),
             quality: ds_result_quality(&result),
         });
+        if index + 1 == plan.groups.len() {
+            final_primary = Some((primary_id, result, stacked));
+            final_inactive_products = inactive_products;
+        }
+    }
+    if let Some((primary_id, result, stacked)) = final_primary {
+        *state.deep_sky_result.lock().unwrap() = Some(result);
+        *state.stacked_image.lock().unwrap() = Some(stacked);
+        *state.deep_sky_products.lock().unwrap() = final_inactive_products;
+        *state.deep_sky_active_product.lock().unwrap() = Some(primary_id);
     }
     if all_components
         .get("OIII")
@@ -12345,7 +18074,7 @@ async fn run_deepsky_session(
     {
         warnings.push("Se conservaron las dos extracciones OIII por separado; deben registrarse antes de combinarlas para no degradar estrellas".into());
     }
-    let recipe_path = output_dir.join("session_recipe.json");
+    let recipe_path = output_dir.join("Receta_Sesion_Reproducible.json");
     let recipe = serde_json::json!({
         "schemaVersion": "zenith-deepsky-session-v2",
         "sessionId": session_id,
@@ -12378,6 +18107,21 @@ async fn run_deepsky_session(
     }
     std::fs::rename(&temp_recipe, &recipe_path)
         .map_err(|error| format!("Receta de sesión commit: {error}"))?;
+    let readme_path = output_dir.join("00_LEEME_Resultados.txt");
+    std::fs::write(
+        &readme_path,
+        "ZENITH ASTRO STACKER · SESIÓN DE CIELO PROFUNDO\n\
+         ===============================================\n\n\
+         Las carpetas numeradas corresponden a cada grupo/filtro de captura.\n\
+         Dentro de cada grupo, las subcarpetas numeradas son productos de\n\
+         integración independientes. Empieza por el producto PRINCIPAL indicado\n\
+         en Receta_Sesion_Reproducible.json.\n\n\
+         Máster_*.fits: imagen lineal float32.\n\
+         Diagnostico_Cientifico: cobertura, rechazo, VAR, NEFF, DQ y RECOV.\n\
+         Receta_Reproducible.json: parámetros y fallbacks de ese producto.\n\
+         .zenith-cache/Cielo_Profundo: caché reutilizable de preparación y registro.\n",
+    )
+    .map_err(|error| format!("No se pudo escribir la guía de la sesión: {error}"))?;
     output_guard.committed = true;
     Ok(DeepSkySessionResultHandle {
         session_id,
@@ -12413,9 +18157,15 @@ fn ds_reject_pixel(
     // is neither too tight on low-signal narrowband nor mis-scaled after drizzle.
     sigma_floor: f32,
 ) -> f32 {
-    let n = samples.len();
     *rejected_low = 0.0;
     *rejected_high = 0.0;
+    // A warped frame can legitimately contribute NaN outside its coverage.
+    // Those samples carry no scientific information and must never reach the
+    // robust sorter. `partial_cmp(...).unwrap_or(Equal)` made NaN compare equal
+    // to every finite value, which is non-transitive and Rust's checked stable
+    // sort correctly rejects it with "does not implement a total order".
+    samples.retain(|(value, weight)| value.is_finite() && weight.is_finite() && *weight > 0.0);
+    let n = samples.len();
     if n == 0 {
         *cov = 0.0;
         return 0.0;
@@ -12433,7 +18183,7 @@ fn ds_reject_pixel(
         *cov = w;
         return m;
     }
-    samples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    samples.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
     let median = |s: &[(f32, f64)]| -> f32 {
         let m = s.len() / 2;
         if s.len() % 2 == 1 {
@@ -12442,8 +18192,21 @@ fn ds_reject_pixel(
             0.5 * (s[m - 1].0 + s[m].0)
         }
     };
-    let original = samples.clone();
-    let original_weight: f64 = original.iter().map(|&(_, w)| w).sum();
+    // B5 — Atribución EXACTA por cola de los mapas de rechazo. Cada muestra
+    // realmente rechazada emite su peso REAL (peso de frame × calidad local)
+    // en el lado del límite/ventana que violó: por debajo → rej_lo, por encima
+    // → rej_hi. Es la misma semántica que los shaders GPU (reject_tiled:
+    // `v < lo → rej_lo`, resto del rechazo → rej_hi; streaming: `v < lower →
+    // low, v > upper → high`), así los FITS Rechazo_Bajo/Alto diagnostican el
+    // fenómeno físico correcto (píxel frío/muerto vs rayo cósmico/satélite).
+    // El reparto proporcional anterior usaba las masas de cola COMPLETAS
+    // (incluyendo muestras conservadas) e invertía el diagnóstico: un frío
+    // aislado entre N−1 muestras altas se reportaba mayoritariamente como
+    // caliente. La suma rej_lo+rej_hi sigue siendo el peso rechazado total
+    // (original − superviviente): cada muestra eliminada cuenta UNA vez con su
+    // peso exacto, sin inventar ni perder cobertura.
+    let mut rej_lo = 0.0f64;
+    let mut rej_hi = 0.0f64;
     let result = match method {
         "median" => {
             *cov = samples.iter().map(|&(_, w)| w).sum();
@@ -12451,6 +18214,9 @@ fn ds_reject_pixel(
         }
         "minmax" => {
             // Drop the single lowest and highest, weighted-mean the rest.
+            // Por construcción el mínimo viola la cola baja y el máximo la alta.
+            rej_lo += samples[0].1;
+            rej_hi += samples[n - 1].1;
             let (m, w) = wmean(&samples[1..n - 1]);
             *cov = w;
             m
@@ -12461,6 +18227,13 @@ fn ds_reject_pixel(
             let fhi = ((k_high / 20.0).clamp(0.0, 0.45) * n as f32).round() as usize;
             let a = flo.min(n / 2);
             let b = (n - fhi).max(a + 1);
+            // El rango [0,a) cae por la banda inferior y [b,n) por la superior.
+            for &(_, w) in &samples[..a] {
+                rej_lo += w;
+            }
+            for &(_, w) in &samples[b..] {
+                rej_hi += w;
+            }
             let (m, w) = wmean(&samples[a..b]);
             *cov = w;
             m
@@ -12468,14 +18241,13 @@ fn ds_reject_pixel(
         "linearfit" => {
             // Fit value ≈ a·rank + b over the sorted samples; reject residuals
             // beyond −κ_low·σ / +κ_high·σ; refit up to 4×. Robust to gradients.
-            let mut kept: Vec<(f32, f64)> = samples.clone();
             for _ in 0..4 {
-                let m = kept.len();
+                let m = samples.len();
                 if m < 3 {
                     break;
                 }
                 let (mut sx, mut sy, mut sxx, mut sxy) = (0.0f64, 0.0, 0.0, 0.0);
-                for (i, &(v, _)) in kept.iter().enumerate() {
+                for (i, &(v, _)) in samples.iter().enumerate() {
                     let x = i as f64 / (m - 1) as f64;
                     sx += x;
                     sy += v as f64;
@@ -12491,100 +18263,111 @@ fn ds_reject_pixel(
                 } else {
                     (0.0, sy / m as f64)
                 };
-                let mut res: Vec<f64> = kept
+                // Evita reservar dos Vec por píxel e iteración. Recalcular
+                // el residual escalar es mucho más barato que millones de
+                // allocs sobre másters grandes.
+                let residual_at = |i: usize, value: f32| {
+                    value as f64 - (a * (i as f64 / (m - 1) as f64) + b)
+                };
+                let mean_r = samples
                     .iter()
                     .enumerate()
-                    .map(|(i, &(v, _))| v as f64 - (a * (i as f64 / (m - 1) as f64) + b))
-                    .collect();
-                let mean_r = res.iter().sum::<f64>() / m as f64;
-                let sd = (res.iter().map(|r| (r - mean_r).powi(2)).sum::<f64>() / m as f64)
+                    .map(|(i, &(value, _))| residual_at(i, value))
+                    .sum::<f64>()
+                    / m as f64;
+                let sd = (samples
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(value, _))| (residual_at(i, value) - mean_r).powi(2))
+                    .sum::<f64>()
+                    / m as f64)
                     .sqrt()
                     .max(sigma_floor as f64);
                 let (lo, hi) = (-(k_low as f64) * sd, k_high as f64 * sd);
-                let before = kept.len();
-                let mut idx = 0;
-                kept.retain(|_| {
-                    let keep = res[idx] >= lo && res[idx] <= hi;
-                    idx += 1;
-                    keep
+                let before = samples.len();
+                // Espejo del shader GPU: residuo bajo −κ_low·σ → cola baja con
+                // su peso real; cualquier otro rechazo (r > +κ_high·σ) → alta.
+                let mut i = 0usize;
+                samples.retain(|&(value, weight)| {
+                    let residual = residual_at(i, value);
+                    i += 1;
+                    if residual >= lo && residual <= hi {
+                        true
+                    } else if residual < lo {
+                        rej_lo += weight;
+                        false
+                    } else {
+                        rej_hi += weight;
+                        false
+                    }
                 });
-                let _ = &mut res;
-                if kept.len() == before || kept.len() < 3 {
+                if samples.len() == before || samples.len() < 3 {
                     break;
                 }
             }
-            let (m, w) = wmean(&kept);
+            let (m, w) = wmean(samples);
             *cov = w;
             m
         }
         _ => {
             // "winsorized" (default per-pixel): iterative Winsorized sigma clip.
-            let mut kept: Vec<(f32, f64)> = samples.clone();
             for _ in 0..5 {
-                let m = kept.len();
+                let m = samples.len();
                 if m < 3 {
                     break;
                 }
-                let med = median(&kept);
-                let mean = kept.iter().map(|&(v, _)| v as f64).sum::<f64>() / m as f64;
-                let sd = (kept
-                    .iter()
-                    .map(|&(v, _)| (v as f64 - mean).powi(2))
-                    .sum::<f64>()
-                    / m as f64)
-                    .sqrt()
+                let med = median(samples);
+                // Arranque robusto sin asignaciones: el IQR no permite que un
+                // único satélite/píxel muerto infle el propio límite que debe
+                // Winsorizarlo. La varianza de la pila YA Winsorizada, que sí
+                // define la ventana κσ, usa abajo pesos y divisor exactos.
+                let q1 = samples[(m - 1) / 4].0 as f64;
+                let q3 = samples[3 * (m - 1) / 4].0 as f64;
+                let robust_sd = ((q3 - q1).abs() / 1.348_979_5)
+                    .max(sigma_floor as f64)
                     .max(1e-6);
                 // Winsorize the tails at med ± 1.5σ, then correct the spread.
-                let (wlo, whi) = (med as f64 - 1.5 * sd, med as f64 + 1.5 * sd);
-                let wmeanv = kept
-                    .iter()
-                    .map(|&(v, _)| (v as f64).clamp(wlo, whi))
-                    .sum::<f64>()
-                    / m as f64;
-                let wsd = (kept
-                    .iter()
-                    .map(|&(v, _)| ((v as f64).clamp(wlo, whi) - wmeanv).powi(2))
-                    .sum::<f64>()
-                    / m as f64)
-                    .sqrt();
+                let (wlo, whi) = (
+                    med as f64 - 1.5 * robust_sd,
+                    med as f64 + 1.5 * robust_sd,
+                );
+                let Some((_, winsorized_variance)) =
+                    ds_weighted_unbiased_stats(samples, |v| (v as f64).clamp(wlo, whi))
+                else {
+                    break;
+                };
+                let wsd = winsorized_variance.sqrt();
                 let sw = (wsd * 1.134).max(sigma_floor as f64); // Winsorization bias correction
                 let (lo, hi) = (
                     med as f64 - k_low as f64 * sw,
                     med as f64 + k_high as f64 * sw,
                 );
-                let before = kept.len();
-                kept.retain(|&(v, _)| (v as f64) >= lo && (v as f64) <= hi);
-                if kept.len() == before || kept.len() < 3 {
+                let before = samples.len();
+                // Espejo del shader GPU: valor bajo la ventana → cola baja con
+                // su peso real; cualquier otro rechazo (v > hi) → cola alta.
+                samples.retain(|&(value, weight)| {
+                    let value = value as f64;
+                    if value >= lo && value <= hi {
+                        true
+                    } else if value < lo {
+                        rej_lo += weight;
+                        false
+                    } else {
+                        rej_hi += weight;
+                        false
+                    }
+                });
+                if samples.len() == before || samples.len() < 3 {
                     break;
                 }
             }
-            let (m, w) = wmean(&kept);
+            let (m, w) = wmean(samples);
             *cov = w;
             m
         }
     };
-    // Los motores devuelven el peso sobreviviente exacto. Para los mapas bajo/
-    // alto distribuimos ese peso rechazado según la masa de cada cola respecto
-    // al estimador final; en minmax/percentile/sigma es exacto y en métodos
-    // iterativos conserva exactamente el total rechazado sin inventar señal.
-    let rejected = (original_weight - *cov).max(0.0);
-    if rejected > 0.0 {
-        let low_tail: f64 = original
-            .iter()
-            .filter(|(v, _)| *v < result)
-            .map(|&(_, w)| w)
-            .sum();
-        let high_tail: f64 = original
-            .iter()
-            .filter(|(v, _)| *v >= result)
-            .map(|&(_, w)| w)
-            .sum();
-        let tails = low_tail + high_tail;
-        if tails > 0.0 {
-            *rejected_low = rejected * low_tail / tails;
-            *rejected_high = rejected * high_tail / tails;
-        }
-    }
+    *rejected_low = rej_lo;
+    *rejected_high = rej_hi;
     result
 }
 
@@ -12811,8 +18594,8 @@ fn ds_integrate_tiled(
                             .unwrap_or(1.0);
                     }
                 }
-                let mut px_cov = 0.0f64;
-                let mut px_pre = 0.0f64;
+                let mut px_cov = f64::INFINITY;
+                let mut px_pre = f64::INFINITY;
                 for c in 0..ch {
                     buf.clear();
                     let s0 = base + (x * ch + c) * n;
@@ -12825,9 +18608,8 @@ fn ds_integrate_tiled(
                     let mut cov = 0.0f64;
                     let mut rej_low = 0.0f64;
                     let mut rej_high = 0.0f64;
-                    if c == 0 {
-                        px_pre = buf.iter().map(|&(_, w)| w).sum(); // geometric coverage
-                    }
+                    let channel_pre: f64 = buf.iter().map(|&(_, w)| w).sum();
+                    px_pre = px_pre.min(channel_pre);
                     fd_row[x * ch + c] = ds_reject_pixel(
                         &mut buf,
                         method,
@@ -12838,14 +18620,17 @@ fn ds_integrate_tiled(
                         &mut rej_high,
                         sigma_floor,
                     );
+                    px_cov = px_cov.min(cov);
+                    if cov <= 0.0 || !cov.is_finite() {
+                        fd_row[x * ch + c] = f32::NAN;
+                    }
                     if c == 0 {
-                        px_cov = cov;
                         low_row[x] = rej_low;
                         high_row[x] = rej_high;
                     }
                 }
-                cov_row[x] = px_cov;
-                pre_row[x] = px_pre;
+                cov_row[x] = if px_cov.is_finite() { px_cov } else { 0.0 };
+                pre_row[x] = if px_pre.is_finite() { px_pre } else { 0.0 };
             }
         });
     }
@@ -12956,6 +18741,79 @@ fn ds_merge_gpu_welford_into(
     }
 }
 
+/// Decide si una celda con cobertura puede construir una ventana κσ.
+///
+/// No se usa el peso acumulado como sustituto del número de muestras. Ese
+/// proxy falla con pesos heterogéneos: un frame de peso 1.0 en cualquier zona
+/// podía fijar el umbral global y dejar sin rechazo a ocho frames de peso 0.1
+/// en otra zona. Abrir la ventana para toda cobertura positiva es seguro: con
+/// una sola muestra la varianza es cero y la propia muestra coincide con la
+/// media, por lo que no puede rechazarse; con dos o más aportes el clip deja de
+/// depender de la escala arbitraria de los pesos. Además evita reservar otro
+/// plano npx·canales (cientos de MB en másters de 60 MP) sólo para este gate.
+fn ds_clip_window_has_coverage(weight: f64) -> bool {
+    weight.is_finite() && weight > 0.0
+}
+
+/// Varianza muestral ponderada no sesgada a partir de momentos crudos.
+///
+/// Para pesos de fiabilidad arbitrarios, el divisor correcto es
+/// `W - Σw²/W`; equivalentemente, la varianza poblacional se multiplica por
+/// `W²/(W²-Σw²)`. Inferir N desde `W/peso_medio` sólo era exacto con pesos
+/// iguales y estrechaba indebidamente la ventana κσ cuando una toma dominaba.
+/// `None` significa que queda una sola muestra efectiva (o momentos inválidos):
+/// en ese caso no existe una dispersión estimable y el caller debe mantener la
+/// ventana abierta, nunca inventar una sigma.
+fn ds_weighted_unbiased_variance(
+    sum: f64,
+    sumsq: f64,
+    weight: f64,
+    weight_sq: f64,
+) -> Option<f64> {
+    if !sum.is_finite()
+        || !sumsq.is_finite()
+        || !weight.is_finite()
+        || !weight_sq.is_finite()
+        || weight <= 0.0
+        || weight_sq <= 0.0
+    {
+        return None;
+    }
+    let denominator = weight - weight_sq / weight;
+    if !denominator.is_finite() || denominator <= f64::EPSILON * weight.max(1.0) {
+        return None;
+    }
+    let m2 = (sumsq - sum * sum / weight).max(0.0);
+    let variance = m2 / denominator;
+    variance.is_finite().then_some(variance)
+}
+
+/// Mismos momentos, calculados directamente sobre una pila tiled. `map`
+/// permite medir tanto los valores originales como las colas Winsorizadas sin
+/// reservar vectores auxiliares por píxel.
+fn ds_weighted_unbiased_stats(
+    samples: &[(f32, f64)],
+    map: impl Fn(f32) -> f64,
+) -> Option<(f64, f64)> {
+    let (mut sum, mut sumsq, mut weight, mut weight_sq) = (0.0, 0.0, 0.0, 0.0);
+    for &(value, w) in samples {
+        if !value.is_finite() || !w.is_finite() || w <= 0.0 {
+            continue;
+        }
+        let value = map(value);
+        if !value.is_finite() {
+            continue;
+        }
+        sum += w * value;
+        sumsq += w * value * value;
+        weight += w;
+        weight_sq += w * w;
+    }
+    let mean = sum / weight;
+    ds_weighted_unbiased_variance(sum, sumsq, weight, weight_sq)
+        .map(|variance| (mean, variance))
+}
+
 /// Share of frames routed to the CPU in the concurrent CPU+GPU split (P2.D). The
 /// GPU is normally much faster per frame, so the CPU takes a minority; a real
 /// timed run (the pass wall-times are logged) can raise or lower this. Kept
@@ -13007,6 +18865,12 @@ fn ds_integrate_hybrid_split(
     String,
 > {
     use crate::gpu_deepsky::{FrameMeta, IntegrateConfig};
+    if n_iters > 0 {
+        return Err(
+            "split GPU no expone Σw² por muestra aceptada; sigma-clip requiere CPU exacta"
+                .into(),
+        );
+    }
     let n = registered.len();
     let npx = w * h;
     // Split contiguously: the GPU (the faster unit) takes the majority.
@@ -13185,8 +19049,10 @@ fn ds_integrate_hybrid_split(
         let mut hi = vec![f32::MAX; npx * ch];
         for i in 0..npx * ch {
             let wv = wgt[i];
-            if wv > 1.0 {
+            if ds_clip_window_has_coverage(wv) {
                 let mu = sum[i] / wv;
+                // Inalcanzable mientras GpuPassResult no publique Σw²; el
+                // guard de entrada obliga a usar el motor CPU exacto.
                 let var = (sq[i] / wv - mu * mu).max(0.0);
                 let sd = var.sqrt().max(sigma_floor as f64);
                 lo[i] = (mu - kappa_low as f64 * sd) as f32;
@@ -13228,11 +19094,9 @@ fn ds_integrate_hybrid_split(
     let per_pixel = |wc: &[f64]| -> Vec<f64> {
         (0..npx)
             .map(|p| {
-                let mut s = 0.0f64;
-                for c in 0..ch {
-                    s += wc[p * ch + c];
-                }
-                s / ch as f64
+                (0..ch)
+                    .map(|c| wc[p * ch + c])
+                    .fold(f64::INFINITY, f64::min)
             })
             .collect()
     };
@@ -13302,6 +19166,12 @@ fn ds_integrate_gpu_streaming(
     String,
 > {
     use crate::gpu_deepsky::{FrameMeta, IntegrateConfig};
+    if n_iters > 0 {
+        return Err(
+            "GPU streaming no expone Σw² por muestra aceptada; sigma-clip requiere CPU exacta"
+                .into(),
+        );
+    }
 
     let metas: Vec<FrameMeta> = registered
         .iter()
@@ -13374,8 +19244,11 @@ fn ds_integrate_gpu_streaming(
         for i in 0..npx * ch {
             // Weight is now per-channel (aligned with mean/moment2 indices).
             let wv = current.weight[i];
-            if wv > 1.0 {
-                let sd = (current.moment2[i] / wv).max(0.0).sqrt().max(sigma_floor);
+            if ds_clip_window_has_coverage(wv as f64) {
+                // Inalcanzable mientras GpuPassResult no publique Σw²; el
+                // guard de entrada obliga a usar el motor CPU exacto.
+                let var = (current.moment2[i] / wv).max(0.0) as f64;
+                let sd = (var.sqrt() as f32).max(sigma_floor);
                 lo[i] = current.mean[i] - kappa_low * sd;
                 hi[i] = current.mean[i] + kappa_high * sd;
             }
@@ -13399,11 +19272,9 @@ fn ds_integrate_gpu_streaming(
     let per_pixel = |w: &[f32]| -> Vec<f64> {
         (0..npx)
             .map(|p| {
-                let mut s = 0.0f64;
-                for c in 0..ch {
-                    s += w[p * ch + c] as f64;
-                }
-                s / ch as f64
+                (0..ch)
+                    .map(|c| w[p * ch + c] as f64)
+                    .fold(f64::INFINITY, f64::min)
             })
             .collect()
     };
@@ -13717,6 +19588,10 @@ fn ds_frame_quality_weight(
 #[allow(clippy::too_many_arguments)]
 fn ds_run_eidr(
     app: &tauri::AppHandle,
+    telemetry_job_id: &str,
+    telemetry_started: std::time::Instant,
+    telemetry_sys: &std::sync::Mutex<System>,
+    telemetry_cache_hits: usize,
     cfg: &pipeline::EidrConfig,
     registered: &[(usize, DsTransform, f64)],
     load_cached: &dyn Fn(usize) -> Result<DsImage, String>,
@@ -13811,8 +19686,8 @@ fn ds_run_eidr(
             "EIDR: faltan PSF medidas en {geometry_only} de {n} frame(s); no se sustituirán por una PSF nominal"
         ));
     }
-    let gamma_nominal = eidr_target_psf(&psfs)
-        .ok_or("EIDR: no se pudo estimar una PSF objetivo física")?;
+    let gamma_nominal =
+        eidr_target_psf(&psfs).ok_or("EIDR: no se pudo estimar una PSF objetivo física")?;
 
     // --- Geometrías afines (los modelos no afines se excluyen, §7.8) ---
     let median_fwhm = {
@@ -13820,7 +19695,7 @@ fn ds_run_eidr(
         if fw.is_empty() {
             2.5
         } else {
-            fw.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            fw.sort_by(|a, b| a.total_cmp(b));
             fw[fw.len() / 2]
         }
     };
@@ -13870,8 +19745,7 @@ fn ds_run_eidr(
 
     // --- Puerta de recuperabilidad por escala (escalera con fallback) ---
     let sigma_of = |k: usize, c: usize| -> f64 {
-        let sigma = frame_noise[registered[k].0][c.min(2)] as f64
-            * norms[k].0[c.min(2)] as f64;
+        let sigma = frame_noise[registered[k].0][c.min(2)] as f64 * norms[k].0[c.min(2)] as f64;
         if sigma.is_finite() && sigma > 0.0 {
             sigma
         } else {
@@ -14010,8 +19884,7 @@ fn ds_run_eidr(
     }
     if kept_idx.len() < 4 {
         return Err(
-            "EIDR: se requieren al menos 4 frames utilizables (3 solve + 1 holdout)"
-                .into(),
+            "EIDR: se requieren al menos 4 frames utilizables (3 solve + 1 holdout)".into(),
         );
     }
     let mut op = EidrOperator {
@@ -14104,9 +19977,7 @@ fn ds_run_eidr(
             return Err("EIDR: sin cobertura en el lienzo".into());
         }
         let mid = pos.len() / 2;
-        pos.select_nth_unstable_by(mid, |a, b| {
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        pos.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
         pos[mid]
     };
     let pen = eidr_freq_penalty(&gate_report, op.w_out, op.h_out, diag_med);
@@ -14132,7 +20003,8 @@ fn ds_run_eidr(
     // física verificada ANTES del primer uso; sin paridad no hay GPU.
     let spatial_variance_requires_cpu = op.frames.iter().any(EidrFrameOp::has_spatial_inv_var);
     if compute_policy.allows_gpu() && spatial_variance_requires_cpu {
-        let reason = "GPU EIDR no admite todavía Σ^-1 espacial; se usa CPU para preservar VAR/DQ por píxel";
+        let reason =
+            "GPU EIDR no admite todavía Σ^-1 espacial; se usa CPU para preservar VAR/DQ por píxel";
         fallbacks.push(reason.into());
         log_to_front(app, "WARN", &format!("EIDR: {reason}."));
     }
@@ -14154,6 +20026,11 @@ fn ds_run_eidr(
     if gpu_allowed {
         log_to_front(app, "INFO", "EIDR: matvec en GPU (paridad CPU verificada).");
     }
+    let eidr_engine = if gpu_allowed {
+        "EIDR GPU matvec + control científico CPU"
+    } else {
+        "EIDR CPU forward-model + PCG"
+    };
     let mut huber_adopted = 0usize;
     let mut huber_reverted = 0usize;
     let mut refine_applied = 0usize;
@@ -14226,12 +20103,26 @@ fn ds_run_eidr(
         if meds.is_empty() {
             return None;
         }
-        meds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        meds.sort_by(|a, b| a.total_cmp(b));
         Some(meds[meds.len() / 2])
     };
 
     for c in 0..ch_out {
         cancellation_checkpoint(cancel, "EIDR: solve")?;
+        let channel_phase = format!("EIDR · canal {}/{}", c + 1, ch_out);
+        emit_deepsky_pipeline_telemetry(
+            app,
+            telemetry_job_id,
+            &channel_phase,
+            eidr_engine,
+            c,
+            ch_out,
+            telemetry_started,
+            telemetry_sys,
+            0,
+            telemetry_cache_hits,
+            None,
+        );
         emit_progress(
             app,
             &format!("EIDR: canal {}/{} — sistema normal...", c + 1, ch_out),
@@ -14253,13 +20144,7 @@ fn ds_run_eidr(
                 o1.adjoint_sigma_accum(fi, c, &plane_buf, &mut sigma_scratch, b1)?;
             }
             if holdout.contains(&fi) {
-                op.adjoint_sigma_accum(
-                    fi,
-                    c,
-                    &plane_buf,
-                    &mut sigma_scratch,
-                    &mut b_hold,
-                )?;
+                op.adjoint_sigma_accum(fi, c, &plane_buf, &mut sigma_scratch, &mut b_hold)?;
                 hold_planes.push((fi, plane_buf.clone()));
             }
         }
@@ -14276,6 +20161,7 @@ fn ds_run_eidr(
             .map(|(&a, &b)| a - b)
             .collect();
         let aone_all = eidr_backprojected_flat(&op, c, &all);
+        let mut channel_telemetry_last = std::time::Instant::now();
         let mut progress_cb = |k: usize, kmax: usize| {
             if k % 8 == 0 {
                 emit_progress(
@@ -14284,6 +20170,22 @@ fn ds_run_eidr(
                     45.0 + 45.0 * (c as f32 + 0.5) / ch_out as f32,
                     None,
                 );
+            }
+            if channel_telemetry_last.elapsed() >= std::time::Duration::from_secs(2) {
+                emit_deepsky_pipeline_telemetry(
+                    app,
+                    telemetry_job_id,
+                    &channel_phase,
+                    eidr_engine,
+                    c,
+                    ch_out,
+                    telemetry_started,
+                    telemetry_sys,
+                    0,
+                    telemetry_cache_hits,
+                    None,
+                );
+                channel_telemetry_last = std::time::Instant::now();
             }
         };
         // Solve con matvec GPU (contexto fresco por solve: los buffers llevan
@@ -14425,13 +20327,7 @@ fn ds_run_eidr(
                 let mut nhold: Vec<(usize, Vec<f32>)> = Vec::new();
                 for &fi in &all {
                     extract_plane(fi, c, &mut plane_buf)?;
-                    op.adjoint_sigma_accum(
-                        fi,
-                        c,
-                        &plane_buf,
-                        &mut sigma_scratch,
-                        &mut nb_all,
-                    )?;
+                    op.adjoint_sigma_accum(fi, c, &plane_buf, &mut sigma_scratch, &mut nb_all)?;
                     if holdout.contains(&fi) {
                         op.adjoint_sigma_accum(
                             fi,
@@ -14469,11 +20365,10 @@ fn ds_run_eidr(
                     _ => false,
                 };
                 if better {
-                    shifts.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+                    shifts.sort_by(|x, y| x.total_cmp(y));
                     refine_applied = n_shifted;
                     refine_p90_px = shifts[(shifts.len() * 9 / 10).min(shifts.len() - 1)];
-                    publication_pilot =
-                        eidr_pilot(&nb_all, &eidr_backprojected_flat(&op, c, &all));
+                    publication_pilot = eidr_pilot(&nb_all, &eidr_backprojected_flat(&op, c, &all));
                     b_all = nb_all;
                     b_train = nb_train;
                     diag_all = nd_all;
@@ -14530,13 +20425,7 @@ fn ds_run_eidr(
                     extract_plane(fi, c, &mut plane_buf)?;
                     let wts = eidr_irls_weights(&op, fi, c, &z_h, &plane_buf, cfg.huber_delta);
                     op.frames[fi].robust_w = Some(wts);
-                    op.adjoint_sigma_accum(
-                        fi,
-                        c,
-                        &plane_buf,
-                        &mut sigma_scratch,
-                        &mut bt,
-                    )?;
+                    op.adjoint_sigma_accum(fi, c, &plane_buf, &mut sigma_scratch, &mut bt)?;
                 }
                 let dt = diag_of(&op, c, &train);
                 let (zr, _r) = solve_with(&op, &train, &bt, &dt, &z_h, &mut progress_cb)?;
@@ -14558,18 +20447,11 @@ fn ds_run_eidr(
                 let mut nb_all = vec![0.0f64; n_out];
                 for &fi in &all {
                     extract_plane(fi, c, &mut plane_buf)?;
-                    op.adjoint_sigma_accum(
-                        fi,
-                        c,
-                        &plane_buf,
-                        &mut sigma_scratch,
-                        &mut nb_all,
-                    )?;
+                    op.adjoint_sigma_accum(fi, c, &plane_buf, &mut sigma_scratch, &mut nb_all)?;
                 }
                 b_all = nb_all;
                 diag_all = diag_of(&op, c, &all);
-                publication_pilot =
-                    eidr_pilot(&b_all, &eidr_backprojected_flat(&op, c, &all));
+                publication_pilot = eidr_pilot(&b_all, &eidr_backprojected_flat(&op, c, &all));
                 z_train = z_h;
                 chi2_ref = chi2_h;
             } else {
@@ -14654,11 +20536,24 @@ fn ds_run_eidr(
         for &fi in &all {
             op.frames[fi].robust_w = None;
         }
+        emit_deepsky_pipeline_telemetry(
+            app,
+            telemetry_job_id,
+            &channel_phase,
+            eidr_engine,
+            c + 1,
+            ch_out,
+            telemetry_started,
+            telemetry_sys,
+            0,
+            telemetry_cache_hits,
+            None,
+        );
     }
     let chi2_median = if chi2_medians.is_empty() {
         None
     } else {
-        chi2_medians.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        chi2_medians.sort_by(|a, b| a.total_cmp(b));
         Some(chi2_medians[chi2_medians.len() / 2])
     };
     if let Some(chi2) = chi2_median {
@@ -14671,12 +20566,8 @@ fn ds_run_eidr(
             ),
         );
     }
-    let publication = eidr_validate_publication(
-        &channel_reports,
-        &finite_channels,
-        &channel_holdouts,
-        nk,
-    )?;
+    let publication =
+        eidr_validate_publication(&channel_reports, &finite_channels, &channel_holdouts, nk)?;
 
     // --- Recorte del pad y ensamblado de productos ---
     let (w2, h2) = (
@@ -14750,9 +20641,13 @@ fn ds_run_eidr(
         .iter()
         .map(|report| report.ridge)
         .fold(0.0f64, f64::max);
-    let (geometry_sample_count, geometry_p95_error_px, geometry_max_error_px, geometry_min_jacobian) =
-        ds_eidr_geometry_summary(&geometry_reports)
-            .ok_or("EIDR: no existe un diagnóstico geométrico full-field publicable")?;
+    let (
+        geometry_sample_count,
+        geometry_p95_error_px,
+        geometry_max_error_px,
+        geometry_min_jacobian,
+    ) = ds_eidr_geometry_summary(&geometry_reports)
+        .ok_or("EIDR: no existe un diagnóstico geométrico full-field publicable")?;
     if geometry_max_error_px > 0.02 || geometry_min_jacobian <= 0.0 {
         return Err(format!(
             "EIDR: geometría full-field no publicable (máx {geometry_max_error_px:.5} px, Jacobiano mín {geometry_min_jacobian:.6})"
@@ -14793,8 +20688,7 @@ fn ds_run_eidr(
         tile_apt_pixels: tile_publication.apt_pixels,
         tile_degraded_pixels: tile_publication.degraded_pixels,
         tile_fallback_pixels: tile_publication.fallback_pixels,
-        native_cutoff_cycles_per_output_px: tile_publication
-            .native_cutoff_cycles_per_output_px,
+        native_cutoff_cycles_per_output_px: tile_publication.native_cutoff_cycles_per_output_px,
         tile_classes: tile_publication.tile_classes,
         publication_channels: publication.channels.len(),
         solver_iterations,
@@ -14915,6 +20809,7 @@ async fn stack_deepsky(
         capture_mode,
         calibration_policy,
         calibration_overrides,
+        None,
     )
     .await
 }
@@ -14951,6 +20846,7 @@ async fn stack_deepsky_impl(
     capture_mode: Option<pipeline::DeepSkyCaptureMode>,
     calibration_policy: Option<pipeline::DeepSkyCalibrationPolicy>,
     calibration_overrides: Option<Vec<pipeline::DeepSkyCalibrationOverride>>,
+    comet_alignment: Option<pipeline::CometStackRequest>,
 ) -> Result<String, String> {
     let ds_run_started = std::time::Instant::now();
     let ds_result_id = new_job_id("ds-result");
@@ -14988,21 +20884,28 @@ async fn stack_deepsky_impl(
     let local_weighting = local_weighting.unwrap_or(false);
     // Asignaciones manuales (estilo PixInsight): validadas contra las listas
     // del request; una regla sin lights afectados o sin ficheros se ignora.
-    let calibration_overrides: Vec<pipeline::DeepSkyCalibrationOverride> = calibration_overrides
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|over| {
-            !over.darks.is_empty() || !over.flats.is_empty() || over.skip_flats || over.skip_darks
-        })
-        .collect();
+    let mut calibration_overrides: Vec<pipeline::DeepSkyCalibrationOverride> =
+        calibration_overrides
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|over| {
+                !over.darks.is_empty()
+                    || !over.flats.is_empty()
+                    || !over.dark_flats.is_empty()
+                    || !over.bias.is_empty()
+                    || over.skip_flats
+                    || over.skip_darks
+                    || over.skip_dark_flats
+                    || over.skip_bias
+            })
+            .collect();
     // Omisiones explícitas por light (skip): sin flat/dark para esos lights,
     // sin error de contrato y con divulgación en decisiones y receta.
-    let mut manual_skip_flats: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    let mut manual_skip_darks: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut manual_skip_flats: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut manual_skip_darks: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut manual_skip_bias: std::collections::HashSet<String> = std::collections::HashSet::new();
     for over in &calibration_overrides {
-        if !over.skip_flats && !over.skip_darks {
+        if !over.skip_flats && !over.skip_darks && !over.skip_bias && !over.skip_dark_flats {
             continue;
         }
         let affected: Vec<String> = if over.lights.is_empty() {
@@ -15019,7 +20922,10 @@ async fn stack_deepsky_impl(
                 manual_skip_flats.insert(path.clone());
             }
             if over.skip_darks {
-                manual_skip_darks.insert(path);
+                manual_skip_darks.insert(path.clone());
+            }
+            if over.skip_bias {
+                manual_skip_bias.insert(path.clone());
             }
         }
     }
@@ -15058,9 +20964,7 @@ async fn stack_deepsky_impl(
         let lights_missing_metadata = light_probes
             .iter()
             .filter(|probe| probe.ok)
-            .filter(|probe| {
-                !probe.signature_missing.is_empty() || probe.store_layout.is_none()
-            })
+            .filter(|probe| !probe.signature_missing.is_empty() || probe.store_layout.is_none())
             .count();
         if lights_missing_metadata > 0 {
             log_to_front(
@@ -15072,22 +20976,10 @@ async fn stack_deepsky_impl(
             );
         }
     }
-    calibration_contract_errors.extend(
-        [
-            &bias_selection,
-            &dark_selection,
-            &flat_selection,
-            &dark_flat_selection,
-        ]
-        .into_iter()
-        .flat_map(|selection| selection.blocking_reasons.iter().cloned()),
-    );
     let effective_bias_probes = ds_selected_probes(&bias_probes, &bias_selection);
     let effective_dark_probes = ds_selected_probes(&dark_probes, &dark_selection);
-    let effective_flat_probes =
-        ds_selected_probes(&flat_reference_probes, &flat_selection);
-    let effective_dark_flat_probes =
-        ds_selected_probes(&dark_flat_probes, &dark_flat_selection);
+    let effective_flat_probes = ds_selected_probes(&flat_reference_probes, &flat_selection);
+    let effective_dark_flat_probes = ds_selected_probes(&dark_flat_probes, &dark_flat_selection);
     let mut calibration_decisions = ds_prepare_calibration_decisions(
         &light_probes,
         &effective_bias_probes,
@@ -15096,7 +20988,25 @@ async fn stack_deepsky_impl(
         &effective_dark_flat_probes,
         calibration_policy,
     );
-    ds_apply_manual_overrides_to_decisions(&mut calibration_decisions, &calibration_overrides);
+    ds_apply_manual_overrides_to_decisions(
+        &mut calibration_decisions,
+        &calibration_overrides,
+        &light_probes,
+        &bias_probes,
+        &dark_probes,
+        &flat_reference_probes,
+        &dark_flat_probes,
+    );
+    // A rule can remain in the auditable decisions even when it is unsafe,
+    // but only its revalidated roles are allowed to reach master creation.
+    calibration_overrides = ds_sanitize_manual_overrides_for_runtime(
+        &calibration_overrides,
+        &light_probes,
+        &bias_probes,
+        &dark_probes,
+        &flat_reference_probes,
+        &dark_flat_probes,
+    );
     calibration_contract_errors.extend(
         calibration_decisions
             .iter()
@@ -15125,18 +21035,11 @@ async fn stack_deepsky_impl(
             calibration_contract_errors.join("\n")
         ));
     }
+    // La degradación efectiva se decide DESPUÉS de aplicar y sanear los
+    // overrides. Los fallos del selector automático no degradan una corrida
+    // que quedó completamente cubierta por lotes manuales revalidados.
     let calibration_degraded = !calibration_contract_errors.is_empty()
-        || [
-            &bias_selection,
-            &dark_selection,
-            &flat_selection,
-            &dark_flat_selection,
-        ]
-        .into_iter()
-        .any(|selection| selection.degraded)
-        || calibration_decisions
-            .iter()
-            .any(|decision| decision.degraded);
+        || ds_calibration_requires_classic(&calibration_decisions);
     let mut calibration_method_fallback: Option<String> = None;
     if calibration_degraded
         && !matches!(
@@ -15145,7 +21048,7 @@ async fn stack_deepsky_impl(
         )
     {
         let reason = format!(
-            "Calibración AllowDegraded no cumple los supuestos científicos de {}; fallback efectivo a Classic",
+            "La calibración efectiva no cumple los supuestos científicos de {}; fallback efectivo a Classic",
             requested_integration_method.label()
         );
         calibration_method_fallback = Some(reason.clone());
@@ -15257,10 +21160,11 @@ async fn stack_deepsky_impl(
     // Dark optimization por defecto ON cuando hay darks Y bias (necesita bias
     // para aislar la señal térmica); escala el master dark a cada light.
     let use_dark_opt = optimize_dark.unwrap_or(!darks.is_empty() && !bias.is_empty());
-    let pixfrac = pixfrac.unwrap_or(0.8).clamp(0.4, 1.0); // drizzle drop shrink
-                                                          // Normalization mode: "scaling" (additive+scaling, default) · "additive"
-                                                          // (offset only) · "none" · "local" (per-cell field). The legacy `local_norm`
-                                                          // bool still forces "local" for backward compatibility.
+    let requested_pixfrac = pixfrac.unwrap_or(0.8).clamp(0.4, 1.0);
+    let mut pixfrac = requested_pixfrac; // puede elevarse de forma explícita para CFA Drizzle seguro
+                                         // Normalization mode: "scaling" (additive+scaling, default) · "additive"
+                                         // (offset only) · "none" · "local" (per-cell field). The legacy `local_norm`
+                                         // bool still forces "local" for backward compatibility.
     let requested_normalization = normalization.unwrap_or_else(|| "scaling".into());
     let norm_mode = if local_norm.unwrap_or(false) {
         "local".to_string()
@@ -15317,7 +21221,9 @@ async fn stack_deepsky_impl(
         None,
     );
     if !light_probes.iter().any(|probe| probe.ok) {
-        return Err("Ningún light tiene metadatos/imagen válidos para seleccionar calibraciones".into());
+        return Err(
+            "Ningún light tiene metadatos/imagen válidos para seleccionar calibraciones".into(),
+        );
     }
     for warning in bias_selection
         .warnings
@@ -15421,6 +21327,79 @@ async fn stack_deepsky_impl(
                 source_paths: paths,
             });
         }
+    }
+    // Bias manual por regla. A diferencia del histórico `master_bias` global,
+    // estos másters sólo llegan a los lights declarados por el override.
+    let mut override_bias_masters: Vec<Option<DsCalibrationMaster>> = Vec::new();
+    let mut override_bias_probes: Vec<Option<DsProbe>> = Vec::new();
+    let mut manual_bias_for_light: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (over_idx, over) in calibration_overrides.iter().enumerate() {
+        if over.bias.is_empty() {
+            override_bias_masters.push(None);
+            override_bias_probes.push(None);
+            continue;
+        }
+        cancellation_checkpoint(cancel.as_ref(), "master bias manual")?;
+        let label = format!("bias manual {}", over_idx + 1);
+        let probe = ds_single_master_representative(
+            &over.bias,
+            crate::deepsky_calibration_contract::CalibrationRole::Bias,
+            &label,
+        )?;
+        let built = ds_build_master(
+            &app,
+            &over.bias,
+            &label,
+            false,
+            &cancel,
+            work_root.as_deref(),
+        )?;
+        if built.is_some() {
+            let affected = if over.lights.is_empty() {
+                lights.clone()
+            } else {
+                lights
+                    .iter()
+                    .filter(|path| over.lights.iter().any(|light| light == *path))
+                    .cloned()
+                    .collect()
+            };
+            for path in affected {
+                manual_bias_for_light.insert(path, over_idx);
+            }
+        }
+        override_bias_masters.push(built);
+        override_bias_probes.push(probe);
+    }
+    // Dark-flats manuales por regla/exposición. Se mantienen RAW y sólo se
+    // consumen al construir el flat manual de la misma regla.
+    let mut override_dark_flat_masters: Vec<Vec<DsRawDarkFlatMaster>> = Vec::new();
+    for (over_idx, over) in calibration_overrides.iter().enumerate() {
+        let mut masters = Vec::new();
+        for (exposure, paths) in ds_group_darks_by_exposure(
+            &over.dark_flats,
+            crate::deepsky_calibration_contract::CalibrationRole::DarkFlat,
+        ) {
+            cancellation_checkpoint(cancel.as_ref(), "master dark-flat manual")?;
+            let label = format!("dark-flat manual {} ({:?}s)", over_idx + 1, exposure);
+            let calibration_probe = ds_single_master_representative(
+                &paths,
+                crate::deepsky_calibration_contract::CalibrationRole::DarkFlat,
+                &label,
+            )?;
+            if let Some(master) =
+                ds_build_master(&app, &paths, &label, false, &cancel, work_root.as_deref())?
+            {
+                masters.push(DsRawDarkFlatMaster {
+                    exposure,
+                    master,
+                    calibration_probe,
+                    source_paths: paths,
+                });
+            }
+        }
+        override_dark_flat_masters.push(masters);
     }
     // Darks grouped by EXPOSURE (WBPP-style): mixing 60 s and 300 s darks into
     // one median master calibrates every light wrong. One master per exposure
@@ -15540,27 +21519,42 @@ async fn stack_deepsky_impl(
                 None
             }
         };
-        let built = ds_build_master(&app, &over.darks, &label, false, &cancel, work_root.as_deref())?
-            .map(|mut d| {
-                let mut bias_subtracted = false;
-                if let Some(b) = master_bias.as_ref() {
-                    if ds_master_is_compatible(&d.image, &b.image) {
-                        for (dv, bv) in d.image.data.iter_mut().zip(b.image.data.iter()) {
-                            *dv -= *bv;
-                        }
-                        bias_subtracted = true;
+        let built = ds_build_master(
+            &app,
+            &over.darks,
+            &label,
+            false,
+            &cancel,
+            work_root.as_deref(),
+        )?
+        .map(|mut d| {
+            let mut bias_subtracted = false;
+            let selected_bias = if over.skip_bias {
+                None
+            } else {
+                override_bias_masters
+                    .get(over_idx)
+                    .and_then(Option::as_ref)
+                    .or(master_bias.as_ref())
+            };
+            if let Some(b) = selected_bias {
+                if ds_master_is_compatible(&d.image, &b.image) {
+                    for (dv, bv) in d.image.data.iter_mut().zip(b.image.data.iter()) {
+                        *dv -= *bv;
                     }
+                    bias_subtracted = true;
                 }
-                let glow = ds_dark_has_amp_glow(&d.image);
-                DsDarkMaster {
-                    exposure: calibration_probe.as_ref().and_then(|p| p.exptime),
-                    master: d,
-                    amp_glow: glow,
-                    bias_subtracted,
-                    calibration_probe,
-                    source_paths: over.darks.clone(),
-                }
-            });
+            }
+            let glow = ds_dark_has_amp_glow(&d.image);
+            DsDarkMaster {
+                exposure: calibration_probe.as_ref().and_then(|p| p.exptime),
+                master: d,
+                amp_glow: glow,
+                bias_subtracted,
+                calibration_probe,
+                source_paths: over.darks.clone(),
+            }
+        });
         if built.is_some() {
             let affected = if over.lights.is_empty() {
                 lights.clone()
@@ -15651,8 +21645,7 @@ async fn stack_deepsky_impl(
     // Cumplimiento de la promesa AllowDegraded: un flat calibrado inválido
     // degrada la corrida — NF/EIDR caen a Classic con razón visible y el
     // resultado deja de ser elegible como científico.
-    let flat_data_degraded =
-        flat_data_degraded_flag.load(std::sync::atomic::Ordering::Relaxed);
+    let flat_data_degraded = flat_data_degraded_flag.load(std::sync::atomic::Ordering::Relaxed);
     if flat_data_degraded
         && calibration_method_fallback.is_none()
         && !matches!(
@@ -15685,13 +21678,38 @@ async fn stack_deepsky_impl(
             continue;
         }
         cancellation_checkpoint(cancel.as_ref(), "master flat manual")?;
+        let selected_bias = if over.skip_bias {
+            None
+        } else {
+            override_bias_masters
+                .get(over_idx)
+                .and_then(Option::as_ref)
+                .or(master_bias.as_ref())
+        };
+        let selected_bias_probe = if over.skip_bias {
+            None
+        } else {
+            override_bias_probes
+                .get(over_idx)
+                .and_then(Option::as_ref)
+                .or(master_bias_probe.as_ref())
+        };
+        let selected_dark_flats: &[DsRawDarkFlatMaster] = if over.skip_dark_flats {
+            &[]
+        } else {
+            override_dark_flat_masters
+                .get(over_idx)
+                .filter(|masters| !masters.is_empty())
+                .map(Vec::as_slice)
+                .unwrap_or(dark_flat_masters.as_slice())
+        };
         let built = ds_build_calibrated_flat_master(
             &app,
             &over.flats,
             &format!("flat manual {}", over_idx + 1),
-            master_bias.as_ref(),
-            master_bias_probe.as_ref(),
-            &dark_flat_masters,
+            selected_bias,
+            selected_bias_probe,
+            selected_dark_flats,
             calibration_policy,
             &cancel,
             work_root.as_deref(),
@@ -15743,10 +21761,7 @@ async fn stack_deepsky_impl(
             return Ok(None);
         }
         if let Some(&over_idx) = manual_flat_for_light.get(path) {
-            if let Some(master) = override_flat_masters
-                .get(over_idx)
-                .and_then(|m| m.as_ref())
-            {
+            if let Some(master) = override_flat_masters.get(over_idx).and_then(|m| m.as_ref()) {
                 return Ok(Some(master));
             }
         }
@@ -15763,25 +21778,12 @@ async fn stack_deepsky_impl(
         {
             return Ok(Some(flat));
         }
-        // Sin flat de la MISMA noche: el de la noche adyacente (Δ1 día) es la
-        // misma sesión óptica (flats del atardecer siguiente o del amanecer).
-        if let Some((_, flat)) = flat_masters
-            .iter()
-            .filter(|(master_night, _)| {
-                ds_night_distance(night.as_deref(), master_night.as_deref()) <= 1
-            })
-            .min_by_key(|(master_night, _)| {
-                ds_night_distance(night.as_deref(), master_night.as_deref())
-            })
-        {
-            return Ok(Some(flat));
-        }
         if matches!(
             calibration_policy,
             pipeline::DeepSkyCalibrationPolicy::Strict
         ) {
             return Err(format!(
-                "Strict: el light '{}' ({}) no tiene master flat de su misma sesión",
+                "Strict: el light '{}' ({}) no tiene master flat exacto ni una reutilización explícita validada",
                 std::path::Path::new(path)
                     .file_name()
                     .unwrap_or_default()
@@ -15793,7 +21795,7 @@ async fn stack_deepsky_impl(
             &app,
             "WARN",
             &format!(
-                "AllowDegraded: light '{}' no tiene flat de su misma sesión ({}); se omite el flat, nunca se sustituye por la noche más cercana.",
+                "AllowDegraded: light '{}' no tiene flat exacto ni reutilización validada ({}); se omite el flat, nunca se sustituye por la noche más cercana.",
                 std::path::Path::new(path)
                     .file_name()
                     .unwrap_or_default()
@@ -15807,6 +21809,7 @@ async fn stack_deepsky_impl(
     // Inicialización única del motor de píxeles. El self-test cubre tanto la
     // fórmula de calibración como warp/integración. Auto/Hybrid deshabilitan
     // sólo esta etapa ante fallo; GpuOnly devuelve un error verificable.
+    let mut gpu_preprocessing_backend: Option<String> = None;
     let mut gpu_calibration_enabled = if compute_policy.allows_gpu() {
         match crate::gpu_stack::gpu_runtime() {
             None if matches!(compute_policy, ComputePolicy::GpuOnly) => {
@@ -15830,6 +21833,7 @@ async fn stack_deepsky_impl(
                 false
             }
             Some(rt) => {
+                gpu_preprocessing_backend = Some(format!("{} ({})", rt.backend, rt.adapter_name));
                 log_to_front(
                     &app,
                     "SUCCESS",
@@ -15866,8 +21870,12 @@ async fn stack_deepsky_impl(
     let mut drizzle_input_bayer: Option<Option<i32>> = None;
     let cache_dir = work_root
         .clone()
-        .map(|root| root.join("zenith_cache"))
-        .unwrap_or_else(|| std::env::temp_dir().join("astro_stacker_cache"));
+        .map(|root| root.join(".zenith-cache").join("Cielo_Profundo"))
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("astro_stacker_cache")
+                .join("deep_sky")
+        });
     let _ = std::fs::create_dir_all(&cache_dir);
     let prototype = lights
         .iter()
@@ -15899,29 +21907,26 @@ async fn stack_deepsky_impl(
                 "rgb".into()
             }
         });
-    let integration_cache_contract = serde_json::to_string(&integration_method)
-        .unwrap_or_else(|_| "integration-method-unserializable".into());
-    let integration_cache_hash = {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        integration_cache_contract.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
-    };
+    // El almacén contiene calibración + análisis previos a la integración. No
+    // depende de Classic/NF/EIDR; sí depende del layout CFA/demosaiced y del
+    // resto de la receta radiométrica. Excluir el método permite que un
+    // conjunto de productos calibre y registre una sola vez.
+    let calibration_override_fingerprint =
+        ds_calibration_overrides_fingerprint(&calibration_overrides);
     let cache_fingerprint = format!(
-        "calv4-fs{flat_sessions}-{}-{}x{}x{}-layout{}-direct{}-method{}-cos{}-dark{}-ped{:?}-drz{:.2}-capture{:?}-policy{:?}",
+        "prepv9-fs{flat_sessions}-{}-{}x{}x{}-layout{}-direct{}-cos{}-dark{}-ped{:?}-capture{:?}-policy{:?}-assign{}",
         ds_source_fingerprint(&[&lights, &darks, &flats, &dark_flats, &bias]),
         prototype.w,
         prototype.h,
         cached_channels,
         cache_layout,
         cache_cfa_direct,
-        integration_cache_hash,
         use_cosmetic,
         use_dark_opt,
         pedestal,
-        drz,
         capture_mode,
         calibration_policy,
+        calibration_override_fingerprint,
     );
     let cache_file_key: String = cache_fingerprint
         .chars()
@@ -16065,13 +22070,8 @@ async fn stack_deepsky_impl(
                         .into_iter()
                         .map(|value| value.max(0.0).round() as u32)
                         .collect();
-                    let publishable = ds_uncertainty_is_publishable(
-                        &variance,
-                        &dq,
-                        img.w,
-                        img.h,
-                        img.ch,
-                    );
+                    let publishable =
+                        ds_uncertainty_is_publishable(&variance, &dq, img.w, img.h, img.ch);
                     DsCalibratedUncertainty {
                         publishable,
                         variance,
@@ -16092,11 +22092,7 @@ async fn stack_deepsky_impl(
                     img = match ds_read_image(p) {
                         Ok(value) => value,
                         Err(error) => {
-                            log_to_front(
-                                &app,
-                                "WARN",
-                                &format!("Light omitido {} ({})", p, error),
-                            );
+                            log_to_front(&app, "WARN", &format!("Light omitido {} ({})", p, error));
                             continue;
                         }
                     };
@@ -16136,6 +22132,15 @@ async fn stack_deepsky_impl(
         // proves bias isolation, no amp glow, linearity and <=1% residual.
         let light_exp = ds_probe_exptime(p);
         let master_flat_light = flat_for_light(p)?;
+        let master_bias_light = if manual_skip_bias.contains(p.as_str()) {
+            None
+        } else {
+            manual_bias_for_light
+                .get(p.as_str())
+                .and_then(|&over_idx| override_bias_masters.get(over_idx))
+                .and_then(Option::as_ref)
+                .or(master_bias.as_ref())
+        };
         let current_light_probe = light_probes.iter().find(|probe| probe.path == p.as_str());
         let core_compatible = |master: &&DsDarkMaster| {
             current_light_probe
@@ -16152,9 +22157,7 @@ async fn stack_deepsky_impl(
                             .map(|seconds| (light_seconds / seconds.max(0.01)).ln().abs())
                             .unwrap_or(0.7)
                     };
-                    distance(a.exposure)
-                        .partial_cmp(&distance(b.exposure))
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    distance(a.exposure).total_cmp(&distance(b.exposure))
                 }),
             None => dark_masters
                 .iter()
@@ -16198,8 +22201,8 @@ async fn stack_deepsky_impl(
             && exact_dark.is_none()
             && !dark_masters.is_empty()
             && matches!(
-            calibration_policy,
-            pipeline::DeepSkyCalibrationPolicy::Strict
+                calibration_policy,
+                pipeline::DeepSkyCalibrationPolicy::Strict
             )
         {
             return Err(format!(
@@ -16251,7 +22254,7 @@ async fn stack_deepsky_impl(
                     if dark_scaling_failure.is_none() {
                         match ds_measure_dark_scaling(
                             evidence_light,
-                            master_bias.as_ref().map(|master| &master.image),
+                            master_bias_light.map(|master| &master.image),
                             &candidate.master.image,
                             ratio,
                             candidate.amp_glow,
@@ -16335,7 +22338,7 @@ async fn stack_deepsky_impl(
             }
             calibrated_uncertainty = ds_calibrate_scientific(
                 &mut img,
-                master_bias.as_ref(),
+                master_bias_light,
                 selected_dark,
                 master_flat_light,
                 dark_k,
@@ -16412,13 +22415,15 @@ async fn stack_deepsky_impl(
             for sample in 0..img.data.len() {
                 if img.data[sample].to_bits() != before_cosmetic[sample].to_bits() {
                     let pixel = sample / img.ch;
-                    calibrated_uncertainty.dq[pixel] |=
-                        crate::deepsky_variance::dq::HOT_COLD
-                            | crate::deepsky_variance::dq::INTERPOLATED;
+                    calibrated_uncertainty.dq[pixel] |= crate::deepsky_variance::dq::HOT_COLD
+                        | crate::deepsky_variance::dq::INTERPOLATED;
                     calibrated_uncertainty.variance[sample] = f32::NAN;
-                    calibrated_uncertainty.fallback_reason.get_or_insert_with(|| {
-                        "VAR parcial: píxeles cosméticos interpolados se marcan DQ y VAR=NaN".into()
-                    });
+                    calibrated_uncertainty
+                        .fallback_reason
+                        .get_or_insert_with(|| {
+                            "VAR parcial: píxeles cosméticos interpolados se marcan DQ y VAR=NaN"
+                                .into()
+                        });
                 }
             }
             calibrated_uncertainty.publishable = uncertainty_was_publishable
@@ -16445,8 +22450,7 @@ async fn stack_deepsky_impl(
             .as_ref()
             .map(|_| calibrated_uncertainty.clone());
         if let Some(cid) = img.bayer {
-            (img, calibrated_uncertainty) =
-                ds_debayer_scientific(img, calibrated_uncertainty, cid);
+            (img, calibrated_uncertainty) = ds_debayer_scientific(img, calibrated_uncertainty, cid);
         }
         // Lock the output geometry from the FIRST fully-processed light.
         if dims.is_none() {
@@ -16574,17 +22578,24 @@ async fn stack_deepsky_impl(
         frame_bgs.push(bg_lvl);
         frame_bgs_rgb.push(ds_channel_backgrounds(&img));
         if i % 4 == 0 || i + 1 == lights.len() {
+            let telemetry_engine = if gpu_preprocessing_used {
+                format!(
+                    "CPU calibración VAR/DQ y debayer + GPU cosmética/mapa estelar · {} + CPU PSF",
+                    gpu_preprocessing_backend.as_deref().unwrap_or("wgpu")
+                )
+            } else if gpu_calibration_used {
+                format!(
+                    "CPU calibración científica + GPU preproceso · {} + CPU PSF",
+                    gpu_preprocessing_backend.as_deref().unwrap_or("wgpu")
+                )
+            } else {
+                "CPU Rayon/SIMD".into()
+            };
             emit_deepsky_pipeline_telemetry(
                 &app,
                 &ds_result_id,
                 "calibrate_detect",
-                if gpu_preprocessing_used {
-                    "Hybrid GPU calibrate/cosmetic/debayer/star-map + CPU PSF"
-                } else if gpu_calibration_used {
-                    "Hybrid GPU calibrate + CPU PSF"
-                } else {
-                    "CPU Rayon/SIMD"
-                },
+                &telemetry_engine,
                 i + 1,
                 lights.len(),
                 ds_run_started,
@@ -16597,7 +22608,11 @@ async fn stack_deepsky_impl(
     }
 
     let (w, h, ch) = dims.ok_or("Ningun light valido.")?;
-    let cfa_drizzle_pattern = drizzle_input_bayer.flatten();
+    // El layout persistido y el kernel efectivo son decisiones distintas. El
+    // almacén puede conservar CFA calibrado y, si el dithering no sostiene un
+    // Drizzle Bayer denso, el loader lo demosaica al vuelo sin recalibrar.
+    let stored_cfa_pattern = drizzle_input_bayer.flatten();
+    let mut cfa_drizzle_pattern = stored_cfa_pattern;
     // DRIZZLE output canvas (integer upscale during integration): with dithered
     // subframes each landing at a different sub-pixel offset in the finer grid,
     // this recovers resolution and cuts pixelation (PixInsight/DSS drizzle).
@@ -16646,8 +22661,8 @@ async fn stack_deepsky_impl(
         .ok_or("No se pudo crear el almacén DQ de calibración")?
         .mark_complete()?;
     let frame_store = frame_store.ok_or("No se pudo crear el almacén de frames calibrados")?;
-    let calibration_variance_store = calibration_variance_store
-        .ok_or("No se pudo crear el almacén VAR de calibración")?;
+    let calibration_variance_store =
+        calibration_variance_store.ok_or("No se pudo crear el almacén VAR de calibración")?;
     let calibration_dq_store =
         calibration_dq_store.ok_or("No se pudo crear el almacén DQ de calibración")?;
     log_to_front(
@@ -16669,9 +22684,7 @@ async fn stack_deepsky_impl(
         .enumerate()
         .max_by(|(_, (_, sa, fa, _, ea)), (_, (_, sb, fb, _, eb))| {
             let score = |s: usize, f: f32, e: f32| (s as f32) / f.max(0.5) * (1.0 - e).max(0.1);
-            score(sa.len(), *fa, *ea)
-                .partial_cmp(&score(sb.len(), *fb, *eb))
-                .unwrap_or(std::cmp::Ordering::Equal)
+            score(sa.len(), *fa, *ea).total_cmp(&score(sb.len(), *fb, *eb))
         })
         .map(|(i, _)| i)
         .unwrap_or(0);
@@ -16729,7 +22742,9 @@ async fn stack_deepsky_impl(
         log_to_front(
             &app,
             "SUCCESS",
-            "Registro: transformaciones, holdout y Jacobianos reutilizados de la caché científica v6.",
+            &format!(
+                "Registro: transformaciones, holdout y Jacobianos reutilizados de la caché científica v{DS_PREP_CACHE_VERSION}."
+            ),
         );
         cached_registration.unwrap().transforms
     } else {
@@ -16774,7 +22789,7 @@ async fn stack_deepsky_impl(
         &ds_result_id,
         "register",
         if registration_reused {
-            "Cache registro científico v6"
+            "Caché de registro científico reutilizada"
         } else {
             "CPU biyectivo + holdout espacial + Jacobiano"
         },
@@ -16836,7 +22851,7 @@ async fn stack_deepsky_impl(
             return 0.0;
         }
         let mut fl: Vec<f32> = stars.iter().map(|s| s.2).collect();
-        fl.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        fl.sort_by(|a, b| b.total_cmp(a));
         let take = fl.len().min(20);
         let flux: f32 = fl.iter().take(take).sum::<f32>() / take as f32;
         flux / (noise * noise).max(1.0)
@@ -16915,6 +22930,79 @@ async fn stack_deepsky_impl(
                 quality_exclusions.insert(i, reason);
             }
         }
+    }
+    let mut comet_effective_anchor_native: Option<(f32, f32)> = None;
+    let mut comet_detector_reference_path: Option<String> = None;
+    if let Some(comet) = comet_alignment.as_ref().filter(|request| request.enabled) {
+        let mut observations = std::collections::HashMap::new();
+        for observation in &comet.observations {
+            observations.insert(observation.frame_path.as_str(), observation);
+        }
+        let mut chronological = comet.observations.iter().collect::<Vec<_>>();
+        chronological.sort_by(|left, right| left.timestamp_unix.total_cmp(&right.timestamp_unix));
+        let detector_reference = chronological
+            .first()
+            .ok_or("La trayectoria cometaria no contiene observaciones")?;
+        let detector_reference_index = frames
+            .iter()
+            .position(|frame| frame.0 == detector_reference.frame_path)
+            .ok_or_else(|| {
+                format!(
+                    "El light de referencia del detector cometario ya no está en la corrida: {}",
+                    detector_reference.frame_path
+                )
+            })?;
+        let detector_to_stack = transforms
+            .get(detector_reference_index)
+            .and_then(|registration| registration.as_ref())
+            .map(|registration| registration.transform)
+            .ok_or_else(|| {
+                format!(
+                    "No se pudo proyectar la referencia cometaria '{}' a la referencia estelar efectiva; corrige el registro o elige otro corpus",
+                    detector_reference.frame_path
+                )
+            })?;
+        let mut times: Vec<f64> = chronological
+            .iter()
+            .map(|observation| observation.timestamp_unix)
+            .collect();
+        times.sort_by(f64::total_cmp);
+        let anchor_time = times
+            .get(times.len() / 2)
+            .copied()
+            .unwrap_or(comet.trajectory.epoch_unix);
+        let dt = (anchor_time - comet.trajectory.epoch_unix) as f32;
+        let anchor_x = comet.trajectory.x_at_epoch + comet.trajectory.velocity_x_px_s * dt;
+        let anchor_y = comet.trajectory.y_at_epoch + comet.trajectory.velocity_y_px_s * dt;
+        for (frame_index, transform, _) in &mut registered {
+            let path = frames
+                .get(*frame_index)
+                .map(|frame| frame.0.as_str())
+                .ok_or("Índice de frame cometario fuera de rango")?;
+            let observation = observations
+                .get(path)
+                .ok_or_else(|| format!("Falta predicción cometaria para {path}"))?;
+            let (dx, dy) = ds_comet_translation_in_stack_grid(
+                detector_to_stack,
+                anchor_x,
+                anchor_y,
+                observation.registered_x,
+                observation.registered_y,
+            )?;
+            *transform = transform.translated_output(dx, dy);
+        }
+        let (stack_anchor_x, stack_anchor_y) = detector_to_stack.forward(anchor_x, anchor_y);
+        comet_effective_anchor_native = Some((stack_anchor_x, stack_anchor_y));
+        comet_detector_reference_path = Some(detector_reference.frame_path.clone());
+        log_to_front(
+            &app,
+            "INFO",
+            &format!(
+                "Registro cometario compuesto en una sola interpolación: {} tomas · ancla efectiva ({stack_anchor_x:.1}, {stack_anchor_y:.1}) · RMS detector {:.2} px.",
+                registered.len(),
+                comet.trajectory.rms_px
+            ),
+        );
     }
     if worst_ecc.0 > 0.55 {
         let nm = std::path::Path::new(&worst_ecc.1)
@@ -17026,8 +23114,7 @@ async fn stack_deepsky_impl(
             (x as f64, y as f64)
         })
         .collect();
-    let dither_diagnostics =
-        crate::deepsky_noise::analyze_dither_positions(&registered_centres);
+    let dither_diagnostics = crate::deepsky_noise::analyze_dither_positions(&registered_centres);
     if dither_diagnostics.walking_noise_risk {
         log_to_front(
             &app,
@@ -17051,12 +23138,39 @@ async fn stack_deepsky_impl(
         );
     }
     let mut drizzle_dither_positions = None;
+    let mut drizzle_sampling_adjustment: Option<String> = None;
+    let mut cfa_drizzle_rgb_fallback: Option<String> = None;
     if drz > 1.01 {
         // En CFA importa también la paridad 2×2 del mosaico; mono/RGB usa la
         // fase módulo 1. Ambos se cuantizan en cuatro celdas por eje.
-        let dither_positions =
-            ds_count_dither_positions(&registered, w, h, cfa_drizzle_pattern.is_some());
+        let requested_cfa = cfa_drizzle_pattern.is_some();
+        let dither_positions = ds_count_dither_positions(&registered, w, h, requested_cfa);
         drizzle_dither_positions = Some(dither_positions);
+        if requested_cfa
+            && ds_cfa_drizzle_needs_rgb_fallback(drz, registered.len(), dither_positions)
+        {
+            let reason = format!(
+                "CFA Drizzle {:.0}× no publicable con {} tomas y {dither_positions}/16 fases: se conserva Drizzle {:.0}× sobre RGB float32 calibrado para evitar la malla Bayer",
+                drz,
+                registered.len(),
+                drz,
+            );
+            log_to_front(&app, "WARN", &reason);
+            cfa_drizzle_rgb_fallback = Some(reason);
+            cfa_drizzle_pattern = None;
+        }
+        let (safe_pixfrac, adjustment) = ds_safe_drizzle_pixfrac(
+            pixfrac,
+            drz,
+            cfa_drizzle_pattern.is_some(),
+            registered.len(),
+            dither_positions,
+        );
+        pixfrac = safe_pixfrac;
+        if let Some(reason) = adjustment {
+            log_to_front(&app, "WARN", &reason);
+            drizzle_sampling_adjustment = Some(reason);
+        }
         if registered.len() < 8 || dither_positions < 4 {
             log_to_front(
                 &app,
@@ -17088,7 +23202,8 @@ async fn stack_deepsky_impl(
     let registration_residuals =
         ds_registration_residual_map(&ref_stars, &star_catalogs, &registered, w, h, w_out, h_out);
 
-    let fallback_demosaic_cache = std::sync::atomic::AtomicBool::new(false);
+    let fallback_demosaic_cache =
+        std::sync::atomic::AtomicBool::new(cfa_drizzle_rgb_fallback.is_some());
     let load_cached = |i: usize| -> Result<DsImage, String> {
         let image = DsImage {
             data: frame_store.get(
@@ -17098,8 +23213,8 @@ async fn stack_deepsky_impl(
             )?,
             w,
             h,
-            ch: if cfa_drizzle_pattern.is_some() { 1 } else { ch },
-            bayer: cfa_drizzle_pattern,
+            ch: if stored_cfa_pattern.is_some() { 1 } else { ch },
+            bayer: stored_cfa_pattern,
         };
         if fallback_demosaic_cache.load(std::sync::atomic::Ordering::Relaxed) {
             if let Some(pattern) = image.bayer {
@@ -17108,51 +23223,44 @@ async fn stack_deepsky_impl(
         }
         Ok(image)
     };
-    let load_cached_uncertainty =
-        |i: usize| -> Result<DsCalibratedUncertainty, String> {
-            let source_index = *frame_cache_indices
-                .get(i)
-                .ok_or("Indice de frame VAR/DQ fuera de rango")?;
-            let variance = calibration_variance_store.get(source_index)?;
-            let dq_f32 = calibration_dq_store.get(source_index)?;
-            if dq_f32.len() != w.saturating_mul(h) {
-                return Err("Caché DQ con geometría incompatible".into());
-            }
-            let dq: Vec<u32> = dq_f32
-                .into_iter()
-                .map(|value| value.max(0.0).round() as u32)
-                .collect();
-            let variance_channels = variance
-                .len()
-                .checked_div(w.saturating_mul(h).max(1))
-                .unwrap_or(0);
-            let publishable = ds_uncertainty_is_publishable(
-                &variance,
-                &dq,
-                w,
-                h,
-                variance_channels,
-            );
-            let uncertainty = DsCalibratedUncertainty {
-                publishable,
-                variance,
-                dq,
-                fallback_reason: None,
-            };
-            if fallback_demosaic_cache.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Some(pattern) = cfa_drizzle_pattern {
-                    let dummy = DsImage {
-                        data: vec![0.0; w * h],
-                        w,
-                        h,
-                        ch: 1,
-                        bayer: Some(pattern),
-                    };
-                    return Ok(ds_debayer_scientific(dummy, uncertainty, pattern).1);
-                }
-            }
-            Ok(uncertainty)
+    let load_cached_uncertainty = |i: usize| -> Result<DsCalibratedUncertainty, String> {
+        let source_index = *frame_cache_indices
+            .get(i)
+            .ok_or("Indice de frame VAR/DQ fuera de rango")?;
+        let variance = calibration_variance_store.get(source_index)?;
+        let dq_f32 = calibration_dq_store.get(source_index)?;
+        if dq_f32.len() != w.saturating_mul(h) {
+            return Err("Caché DQ con geometría incompatible".into());
+        }
+        let dq: Vec<u32> = dq_f32
+            .into_iter()
+            .map(|value| value.max(0.0).round() as u32)
+            .collect();
+        let variance_channels = variance
+            .len()
+            .checked_div(w.saturating_mul(h).max(1))
+            .unwrap_or(0);
+        let publishable = ds_uncertainty_is_publishable(&variance, &dq, w, h, variance_channels);
+        let uncertainty = DsCalibratedUncertainty {
+            publishable,
+            variance,
+            dq,
+            fallback_reason: None,
         };
+        if fallback_demosaic_cache.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(pattern) = stored_cfa_pattern {
+                let dummy = DsImage {
+                    data: vec![0.0; w * h],
+                    w,
+                    h,
+                    ch: 1,
+                    bayer: Some(pattern),
+                };
+                return Ok(ds_debayer_scientific(dummy, uncertainty, pattern).1);
+            }
+        }
+        Ok(uncertainty)
+    };
 
     // --- 3.5 PER-FRAME NORMALIZATION (SIRIL/WBPP): match every frame's sky
     // level and noise scale to the reference so moon/cloud/gradient variations
@@ -17234,10 +23342,8 @@ async fn stack_deepsky_impl(
             None,
         );
         let longest = w.max(h).max(1) as f64;
-        let proxy_w = ((w as f64 * 192.0 / longest).round() as usize)
-            .clamp(LN_G.min(w), w.max(1));
-        let proxy_h = ((h as f64 * 192.0 / longest).round() as usize)
-            .clamp(LN_G.min(h), h.max(1));
+        let proxy_w = ((w as f64 * 192.0 / longest).round() as usize).clamp(LN_G.min(w), w.max(1));
+        let proxy_h = ((h as f64 * 192.0 / longest).round() as usize).clamp(LN_G.min(h), h.max(1));
         let mut proxies: Vec<(Vec<f32>, Vec<u8>)> = Vec::new();
         proxies
             .try_reserve_exact(registered.len())
@@ -17257,24 +23363,18 @@ async fn stack_deepsky_impl(
                 ));
             }
             proxies.push(ds_registered_background_proxy(
-                &img,
-                t,
-                w,
-                h,
-                proxy_w,
-                proxy_h,
-                norms[k].0,
+                &img, t, w, h, proxy_w, proxy_h, norms[k].0,
             )?);
         }
         let registered_background: Vec<crate::deepsky_background::RegisteredBackgroundFrame<'_>> =
             proxies
                 .iter()
-                .map(|(data, coverage)| {
-                    crate::deepsky_background::RegisteredBackgroundFrame {
+                .map(
+                    |(data, coverage)| crate::deepsky_background::RegisteredBackgroundFrame {
                         data,
                         coverage: Some(coverage),
-                    }
-                })
+                    },
+                )
                 .collect();
         match crate::deepsky_background::solve_symmetric_local_normalization(
             &registered_background,
@@ -17546,30 +23646,92 @@ async fn stack_deepsky_impl(
         "median" | "winsorized" | "linearfit" | "percentile" | "minmax"
     ) && drz <= 1.01;
 
-    let n_iters: usize = if use_clip && !use_tiled && registered.len() >= 4 {
-        clip_iters
-            .map(|v| v.clamp(1, 3) as usize)
-            .unwrap_or(if registered.len() >= 6 { 2 } else { 1 })
+    let n_iters = if use_clip {
+        ds_effective_clip_iterations(&rejection, clip_iters, registered.len()) as usize
     } else {
         0
     };
 
-    // GPU v2 cubre streaming (media/sigma) y el rechazo tiled Winsorized /
-    // linear-fit. Mediana/percentil/minmax permanecen CPU hasta disponer de
-    // kernels con paridad; drizzle conserva el kernel drop/CFA especializado.
+    let runtime_product = match integration_method.as_ref() {
+        Some(pipeline::DeepSkyIntegrationMethod::NebulaFusion(_)) => {
+            pipeline::DeepSkyIntegrationProductKind::NebulaFusionSci
+        }
+        Some(pipeline::DeepSkyIntegrationMethod::Eidr(_)) => {
+            pipeline::DeepSkyIntegrationProductKind::Eidr
+        }
+        _ => pipeline::DeepSkyIntegrationProductKind::Classic,
+    };
+    let runtime_gpu = crate::gpu_stack::gpu_runtime();
+    let runtime_capability = ComputeCapability {
+        gpu_available: runtime_gpu.is_some(),
+        parity_ok: runtime_gpu.is_some()
+            && crate::gpu_deepsky::ensure_parity()
+            && crate::gpu_deepsky::ensure_advanced_warp_parity(),
+        // La integración streaming se divide en bandas; el presupuesto exacto
+        // se vuelve a comprobar al crear cada binding.
+        required_vram_mb: 64,
+        vram_budget_mb: runtime_gpu
+            .as_ref()
+            .map(|runtime| runtime.vram_budget / (1024 * 1024))
+            .unwrap_or(0),
+    };
+    let runtime_compute_decision = pipeline::resolve_deep_sky_compute_eligibility(
+        compute_policy,
+        ds_compute_workload_for_product(
+            runtime_product,
+            &rejection,
+            n_iters as u32,
+            drz,
+        ),
+        &runtime_capability,
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(reason) = runtime_compute_decision.required_cpu_reason {
+        log_to_front(
+            &app,
+            "INFO",
+            &format!("Cómputo efectivo de integración: CPU requerida — {reason}."),
+        );
+    } else if let Some(reason) = &runtime_compute_decision.fallback_reason {
+        log_to_front(
+            &app,
+            "WARN",
+            &format!("Cómputo efectivo de integración: fallback CPU — {reason}."),
+        );
+    }
+
+    // GPU v2 cubre streaming sin rechazo. Sigma/Winsorized y los demás métodos
+    // permanecen CPU hasta que el contrato GPU publique Σw² y cobertura por
+    // canal; drizzle conserva el kernel drop/CFA especializado en CPU.
     let gpu_transform_supported = registered.iter().all(|&(_, t, _)| t.to_gpu().is_some());
     // Rescate de detalle v2: los pesos por región cubren TODOS los motores —
     // streaming CPU/GPU (shader con rejilla de calidad, paridad en
     // ensure_parity), tiled CPU/GPU (ensure_tiled_parity) y drizzle.
-    let gpu_stream_supported = !use_tiled && drz <= 1.01 && gpu_transform_supported;
-    let gpu_tiled_supported = use_tiled && matches!(rejection.as_str(), "winsorized" | "linearfit");
+    // Los resultados GPU actuales no publican Σw² por muestra aceptada. Sin
+    // ese momento no existe corrección no sesgada exacta con pesos desiguales;
+    // sigma y Winsorized se enrutan a CPU en lugar de estrechar silenciosamente
+    // sus ventanas. El kernel tiled, además, sólo devuelve cobertura del canal
+    // 0 y no puede auditar un canal RGB totalmente rechazado; se conserva CPU
+    // hasta que el contrato GPU publique cobertura por canal.
+    let gpu_stream_supported = runtime_compute_decision.uses_gpu()
+        && !use_tiled
+        && drz <= 1.01
+        && gpu_transform_supported
+        && n_iters == 0;
+    let gpu_tiled_supported = false;
     let gpu_supported = gpu_stream_supported || gpu_tiled_supported;
     if matches!(compute_policy, ComputePolicy::GpuOnly) && !gpu_supported {
         return Err(if !gpu_transform_supported {
             "GPU only: una transformación de registro no es invertible en el warp GPU.".into()
+        } else if n_iters > 0 {
+            "GPU only: sigma-clip ponderado requiere Σw² exacto; usa Hybrid/Auto para el motor CPU científico."
+                .into()
+        } else if rejection == "winsorized" {
+            "GPU only: Winsorized ponderado requiere Σw² exacto; usa Hybrid/Auto para el motor CPU tiled."
+                .into()
         } else if use_tiled {
             format!(
-                "GPU only: el rechazo '{}' conserva CPU tiled hasta disponer de un kernel con paridad. Usa Winsorized, linear-fit o sigma.",
+                "GPU only: el rechazo '{}' conserva CPU tiled hasta publicar cobertura por canal. Usa Hybrid/Auto.",
                 rejection
             )
         } else {
@@ -17595,7 +23757,7 @@ async fn stack_deepsky_impl(
         if ns.is_empty() {
             4.0
         } else {
-            ns.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            ns.sort_by(|a, b| a.total_cmp(b));
             ns[ns.len() / 2].max(1e-3)
         }
     };
@@ -17738,7 +23900,10 @@ async fn stack_deepsky_impl(
         Some(Ok((data, cov, weight, rejected_low, rejected_high, rej, mean_cov, peak, tiles))) => {
             used_gpu = true;
             peak_vram_mb = peak_vram_mb.max((peak.saturating_add(1_048_575) / 1_048_576) as u64);
-            effective_engine = "Hybrid CPU + GPU wgpu".into();
+            effective_engine = format!(
+                "Hybrid CPU + GPU por etapas · {}",
+                gpu_preprocessing_backend.as_deref().unwrap_or("wgpu")
+            );
             log_to_front(
                 &app,
                 "SUCCESS",
@@ -17790,12 +23955,16 @@ async fn stack_deepsky_impl(
     };
 
     let mut nf_products: Option<crate::nebula_fusion::NfLiteProducts> = None;
+    // NebulaFusion pondera por 1/VAR; ese peso fotométrico no describe la
+    // huella geométrica del sensor y no debe gobernar el auto-recorte.
+    let mut crop_coverage_override: Option<Vec<f64>> = None;
     let mut nf_full_report: Option<(f32, usize, usize)> = None;
     let mut nf_full_fallback: Option<String> = None;
     let mut nf_struct: Option<(Vec<f32>, Vec<f32>)> = None;
     let mut nf_struct_accepted: Option<Vec<(usize, usize)>> = None;
     let mut nf_struct_fallback: Option<String> = None;
     let mut nf_parameter_fallbacks: Vec<String> = Vec::new();
+    let mut nf_recovered_saturated_pixels = 0usize;
     let mut classic_moment_products = false;
     let mut classic_calibration_products = false;
     let mut eidr_runtime_fallback: Option<String> = None;
@@ -17815,6 +23984,10 @@ async fn stack_deepsky_impl(
         );
         match ds_run_eidr(
             &app,
+            &ds_result_id,
+            ds_run_started,
+            &ds_telemetry_sys,
+            frame_store.read_hits(),
             ecfg,
             &registered,
             &load_cached,
@@ -17970,6 +24143,8 @@ async fn stack_deepsky_impl(
         nf_full_fallback = out.full_fallback.clone();
         nf_struct_fallback = out.struct_fallback.clone();
         nf_parameter_fallbacks = out.parameter_fallbacks.clone();
+        nf_recovered_saturated_pixels = out.recovered_saturated_pixels;
+        crop_coverage_override = Some(std::mem::take(&mut out.crop_coverage));
         if let (Some(sm), Some(sr)) = (out.struct_map.take(), out.struct_residual.take()) {
             nf_struct = Some((sm, sr));
         }
@@ -18002,6 +24177,16 @@ async fn stack_deepsky_impl(
                 &app,
                 "WARN",
                 &format!("NebulaFusion parámetro efectivo degradado: {reason}."),
+            );
+        }
+        if out.recovered_saturated_pixels > 0 {
+            log_to_front(
+                &app,
+                "WARN",
+                &format!(
+                    "NebulaFusion conservó {} píxel(es) de núcleos saturados como límite inferior observado. DQ y VAR/NEFF declaran que no son fotometría válida.",
+                    out.recovered_saturated_pixels
+                ),
             );
         }
         effective_engine = if out.full_report.is_some() {
@@ -18155,26 +24340,42 @@ async fn stack_deepsky_impl(
         let mut sq = vec![0.0f64; npx * ch];
         // Weight is per-channel everywhere now (per-channel rejection): npx·ch.
         let mut wgt = vec![0.0f64; npx * ch];
-        // Σw² is required for an honest NEFF and variance of the weighted
-        // mean. The current drizzle kernels do not expose it, so scientific
-        // products remain explicitly unavailable for drizzle instead of being
-        // guessed from geometric coverage.
-        let mut weight_sq = (drz <= 1.01).then(|| vec![0.0f64; npx * ch]);
+        // Σw² is required for the exact unbiased κσ window with arbitrary
+        // frame/local/drop weights. Allocate it fallibly: if a huge canvas
+        // cannot reserve the extra plane, rejection remains open (no false
+        // clipping) instead of using a biased proxy or aborting the process.
+        let needs_weight_sq = n_iters > 0 || drz <= 1.01;
+        let mut weight_sq = if needs_weight_sq {
+            let mut plane = Vec::<f64>::new();
+            match plane.try_reserve_exact(npx.saturating_mul(ch)) {
+                Ok(()) => {
+                    plane.resize(npx * ch, 0.0);
+                    Some(plane)
+                }
+                Err(error) => {
+                    log_to_front(
+                        &app,
+                        "WARN",
+                        &format!(
+                            "Sin memoria para Σw² exacto ({error}); se conserva la integración, pero el rechazo κσ queda desactivado para no estrechar una ventana sesgada."
+                        ),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // Reduce the per-channel weight to a per-pixel coverage map for the
         // auto-crop / QA planes (CFA keeps its Bayer-density normalization).
         let cov_reduce = |wgt: &[f64]| -> Vec<f64> {
             if cfa_drizzle.is_some() {
                 ds_cfa_coverage(wgt)
             } else {
-                (0..npx)
-                    .map(|p| {
-                        let mut s = 0.0f64;
-                        for c in 0..ch {
-                            s += wgt[p * ch + c];
-                        }
-                        s / ch as f64
-                    })
-                    .collect()
+                // DQ is spatial, not per-channel. A RGB pixel is scientifically
+                // covered only when EVERY channel has a surviving sample; using
+                // the mean hid a fully rejected channel behind the other two.
+                ds_complete_channel_coverage(wgt, ch)
             }
         };
         for (k, &(i, t, fw)) in registered.iter().enumerate() {
@@ -18212,7 +24413,7 @@ async fn stack_deepsky_impl(
                     wq_ref,
                     None,
                     None,
-                    None,
+                    weight_sq.as_mut(),
                 );
             } else if drz > 1.01 {
                 ds_drizzle_accumulate(
@@ -18232,6 +24433,7 @@ async fn stack_deepsky_impl(
                     norms[k],
                     loc_ref,
                     wq_ref,
+                    weight_sq.as_mut(),
                 );
             } else {
                 ds_warp_accumulate(
@@ -18297,9 +24499,12 @@ async fn stack_deepsky_impl(
                 // κσ window from the current (raw, then progressively clipped) stats.
                 for i in 0..npx * ch {
                     let wv = wgt[i];
-                    if wv > 1.0 {
+                    let variance = weight_sq.as_ref().and_then(|w2| {
+                        ds_weighted_unbiased_variance(sum[i], sq[i], wv, w2[i])
+                    });
+                    if ds_clip_window_has_coverage(wv) && variance.is_some() {
                         let mu = sum[i] / wv;
-                        let var = (sq[i] / wv - mu * mu).max(0.0);
+                        let var = variance.expect("validado arriba");
                         let sd = var.sqrt().max(sigma_floor as f64);
                         lo[i] = (mu - kappa_low as f64 * sd) as f32;
                         hi[i] = (mu + kappa_high as f64 * sd) as f32;
@@ -18356,7 +24561,7 @@ async fn stack_deepsky_impl(
                             wq_ref,
                             None,
                             None,
-                            None,
+                            weight_sq.as_mut(),
                         );
                     } else if drz > 1.01 {
                         ds_drizzle_accumulate(
@@ -18376,6 +24581,7 @@ async fn stack_deepsky_impl(
                             norms[k],
                             loc_ref,
                             wq_ref,
+                            weight_sq.as_mut(),
                         );
                     } else {
                         ds_warp_accumulate(
@@ -18419,6 +24625,10 @@ async fn stack_deepsky_impl(
                     let wv = wgt[i];
                     if wv > 0.0 {
                         final_data[i] = (sum[i] / wv) as f32;
+                    } else {
+                        // No conservar silenciosamente el valor de la pasada
+                        // anterior cuando ESTE canal perdió todas sus muestras.
+                        final_data[i] = f32::NAN;
                     }
                 }
             }
@@ -18443,46 +24653,42 @@ async fn stack_deepsky_impl(
             );
         }
         let sum_cov: f64 = final_coverage.iter().sum();
-        if let Some(weight_sq) = weight_sq.as_ref() {
-            nf_products = ds_classic_products_from_moments(
-                &sum,
-                &sq,
-                &wgt,
-                weight_sq,
-                npx,
-                ch,
-            );
-            classic_moment_products = nf_products.is_some();
-            let bounds = final_clip_bounds
-                .as_ref()
-                .map(|(lo, hi)| (lo.as_slice(), hi.as_slice()));
-            match ds_classic_products_from_calibration(
-                &load_cached,
-                &load_cached_uncertainty,
-                &registered,
-                &norms,
-                &loc_fields,
-                LN_G,
-                w_out,
-                h_out,
-                ch,
-                &wq_fields,
-                WQ_G,
-                use_lanczos,
-                bounds,
-                cancel.as_ref(),
-            )? {
-                Some(products) => {
-                    nf_products = Some(products);
-                    classic_moment_products = true;
-                    classic_calibration_products = true;
-                }
-                None => {
-                    log_to_front(
-                        &app,
-                        "WARN",
-                        "Classic: no se pudo alinear el contrato VAR/DQ de calibración; se conserva VAR empírica de los momentos, sin etiquetarla como propagada.",
-                    );
+        if drz <= 1.01 {
+            if let Some(weight_sq) = weight_sq.as_ref() {
+                nf_products =
+                    ds_classic_products_from_moments(&sum, &sq, &wgt, weight_sq, npx, ch);
+                classic_moment_products = nf_products.is_some();
+                let bounds = final_clip_bounds
+                    .as_ref()
+                    .map(|(lo, hi)| (lo.as_slice(), hi.as_slice()));
+                match ds_classic_products_from_calibration(
+                    &load_cached,
+                    &load_cached_uncertainty,
+                    &registered,
+                    &norms,
+                    &loc_fields,
+                    LN_G,
+                    w_out,
+                    h_out,
+                    ch,
+                    &wq_fields,
+                    WQ_G,
+                    use_lanczos,
+                    bounds,
+                    cancel.as_ref(),
+                )? {
+                    Some(products) => {
+                        nf_products = Some(products);
+                        classic_moment_products = true;
+                        classic_calibration_products = true;
+                    }
+                    None => {
+                        log_to_front(
+                            &app,
+                            "WARN",
+                            "Classic: no se pudo alinear el contrato VAR/DQ de calibración; se conserva VAR empírica de los momentos, sin etiquetarla como propagada.",
+                        );
+                    }
                 }
             }
         }
@@ -18503,13 +24709,16 @@ async fn stack_deepsky_impl(
         )
     };
 
-    // Every integration backend shares the same scientific no-coverage
-    // invariant.  The CPU streaming path already applies it locally, but the
-    // common pass is required for tiled/GPU/NebulaFusion/EIDR as well: a zero
-    // in those buffers is an implementation sentinel, never measured signal.
-    let _ = ds_mark_uncovered_nan(&mut final_data, &weight_map, ch);
+    // Classic usa el peso como autoridad de cobertura. NF y EIDR publican un
+    // contrato SCI/DQ propio: volver a convertir peso cero en NaN destruía los
+    // límites inferiores saturados de NF y los tiles nativos conservados por
+    // EIDR.
+    if nf_products.is_none() && eidr_outcome.is_none() {
+        let _ = ds_mark_uncovered_nan(&mut final_data, &weight_map, ch);
+    }
 
-    // (frame cache removed by _cache_guard on drop — every exit path)
+    // El almacén v9 permanece para una corrida warm; cada manifiesto/CRC evita
+    // consumir una entrada incompleta o una receta de calibración distinta.
 
     // EIDR: el lienzo pasa a la escala efectiva; los mapas por píxel del
     // pipeline clásico se recalculan o anulan a ese tamaño.
@@ -18533,8 +24742,7 @@ async fn stack_deepsky_impl(
             neff: std::mem::take(&mut e.neff),
             dq: std::mem::take(&mut e.dq),
             masked_samples: 0,
-            variance_origin:
-                crate::deepsky_variance::VarianceOrigin::HybridEmpiricalPropagated,
+            variance_origin: crate::deepsky_variance::VarianceOrigin::HybridEmpiricalPropagated,
             g1g2_offset_max: None,
         });
         eidr_recov = Some(std::mem::take(&mut e.recov));
@@ -18543,9 +24751,10 @@ async fn stack_deepsky_impl(
     // --- 4.4 AUTO-CROP low-coverage borders (dithered/rotated stacks) ---
     let original_w = w_out;
     let original_h = h_out;
-    let (final_data, w_out, h_out, crop_x, crop_y, npx) = if use_crop {
+    let crop_coverage = crop_coverage_override.as_deref().unwrap_or(&wgt1);
+    let (final_data, w_out, h_out, crop_x, crop_y, npx) = {
         let (cropped, nw, nh, x0, y0) =
-            ds_autocrop_with_origin(&final_data, &wgt1, w_out, h_out, ch);
+            ds_apply_autocrop(use_crop, &final_data, crop_coverage, w_out, h_out, ch);
         if nw != w_out || nh != h_out {
             log_to_front(
                 &app,
@@ -18557,8 +24766,6 @@ async fn stack_deepsky_impl(
             );
         }
         (cropped, nw, nh, x0, y0, nw * nh)
-    } else {
-        (final_data, w_out, h_out, 0, 0, w_out * h_out)
     };
     let wgt1 = ds_crop_plane(&wgt1, original_w, original_h, crop_x, crop_y, w_out, h_out);
     let weight_map = ds_crop_plane(
@@ -18646,6 +24853,8 @@ async fn stack_deepsky_impl(
     // Área ponderada tras el auto-crop: SCI conserva la fotometría de
     // superficie; VAR se propaga con Σa²·VAR/(Σa)²; NEFF media ponderada;
     // DQ con NO_COVERAGE solo si todo el bloque carece de cobertura.
+    let cropped_w = w_out;
+    let cropped_h = h_out;
     let (
         mut final_data,
         w_out,
@@ -18742,6 +24951,24 @@ async fn stack_deepsky_impl(
             nf_products,
         )
     };
+    let comet_effective_grid = comet_effective_anchor_native.map(|(native_x, native_y)| {
+        let pre_crop_scale_x = original_w as f32 / w.max(1) as f32;
+        let pre_crop_scale_y = original_h as f32 / h.max(1) as f32;
+        let post_crop_scale_x = w_out as f32 / cropped_w.max(1) as f32;
+        let post_crop_scale_y = h_out as f32 / cropped_h.max(1) as f32;
+        serde_json::json!({
+            "detectorReferencePath": comet_detector_reference_path,
+            "anchorX": (native_x * pre_crop_scale_x - crop_x as f32) * post_crop_scale_x,
+            "anchorY": (native_y * pre_crop_scale_y - crop_y as f32) * post_crop_scale_y,
+            "outputScaleX": pre_crop_scale_x * post_crop_scale_x,
+            "outputScaleY": pre_crop_scale_y * post_crop_scale_y,
+            "cropXBeforeOutputBinning": crop_x,
+            "cropYBeforeOutputBinning": crop_y,
+            "width": w_out,
+            "height": h_out,
+            "coordinateSpace": "effectiveStackOutput",
+        })
+    });
     if calibration_degraded {
         if let Some(products) = nf_products.as_mut() {
             for flags in &mut products.dq {
@@ -18807,12 +25034,8 @@ async fn stack_deepsky_impl(
         } else {
             0.0
         };
-        let detector_pattern = crate::deepsky_noise::analyze_detector_pattern(
-            &luma,
-            w_out,
-            h_out,
-            nz as f64,
-        );
+        let detector_pattern =
+            crate::deepsky_noise::analyze_detector_pattern(&luma, w_out, h_out, nz as f64);
         if detector_pattern
             .as_ref()
             .is_some_and(|diagnostics| diagnostics.banding_detected)
@@ -18902,14 +25125,8 @@ async fn stack_deepsky_impl(
     // in the shared `StackResult` (still u16, shared with the planetary path). Fully
     // unifying `StackResult` to f32 so in-app deconv/wavelet also see the unclamped
     // linear data is deferred to P4 (LinearFrame contract).
-    let mut rgb16 = vec![0u16; npx * 3];
     let preview_linear = derived_preview_data.as_deref().unwrap_or(&final_data);
-    for i in 0..npx {
-        for c in 0..3 {
-            let v = preview_linear[i * ch + c.min(ch - 1)];
-            rgb16[i * 3 + c] = v.clamp(0.0, 65535.0) as u16;
-        }
-    }
+    let rgb16 = ds_preview_rgb16(preview_linear, w_out, h_out, ch);
 
     let preview8 = ds_render_stretch(&rgb16, w_out, h_out, false, 2.8, 0.25);
     let mut rgba = Vec::with_capacity(npx * 4);
@@ -19089,6 +25306,12 @@ async fn stack_deepsky_impl(
         "darkFlats": dark_flats,
         "bias": bias,
     });
+    if gpu_preprocessing_used && !effective_engine.to_ascii_lowercase().contains("gpu") {
+        effective_engine.push_str(&format!(
+            " + GPU cosmética/mapa estelar · {}",
+            gpu_preprocessing_backend.as_deref().unwrap_or("wgpu")
+        ));
+    }
     let parameters_recipe = serde_json::json!({
         "computePolicy": compute_policy,
         "captureMode": capture_mode,
@@ -19118,16 +25341,42 @@ async fn stack_deepsky_impl(
             "maximumJacobian": maximum_jacobian,
             "cacheVersion": DS_PREP_CACHE_VERSION,
         },
+        "reusableCache": {
+            "version": DS_PREP_CACHE_VERSION,
+            "path": cache_dir.display().to_string(),
+            "layout": cache_layout,
+            "calibratedFramesReused": cache_was_reused,
+            "analysisReused": analysis_cache_reused,
+            "registrationReused": registration_reused,
+            "readHits": frame_store.read_hits(),
+            "bytesWritten": frame_store.bytes_written(),
+            "scope": "calibración, análisis y registro; la integración se recalcula si cambia su receta",
+        },
         "interpolation": if use_lanczos { "lanczos3" } else { "bilinear" },
         "drizzle": drz,
+        "requestedPixfrac": requested_pixfrac,
         "pixfrac": pixfrac,
+        "drizzleSamplingAdjustment": drizzle_sampling_adjustment,
+        "requestedCfaDrizzlePattern": stored_cfa_pattern,
         "cfaDrizzlePattern": cfa_drizzle_pattern,
+        "cfaDrizzleRgbFallback": cfa_drizzle_rgb_fallback,
         "ditherPositions": drizzle_dither_positions,
         "ditherDiagnostics1x": dither_diagnostics,
         "detectorPattern": detector_pattern_diagnostics,
         "cosmetic": use_cosmetic,
         "darkOptimization": use_dark_opt,
         "autoCrop": use_crop,
+        "crop": {
+            "enabled": use_crop,
+            "sourceWidth": original_w,
+            "sourceHeight": original_h,
+            "x": crop_x,
+            "y": crop_y,
+            "widthBeforeOutputBinning": cropped_w,
+            "heightBeforeOutputBinning": cropped_h,
+            "outputWidth": w_out,
+            "outputHeight": h_out,
+        },
         "optionalAbeScnr": {
             "requested": use_gradient,
             "effective": derived_preview_data.is_some(),
@@ -19137,10 +25386,12 @@ async fn stack_deepsky_impl(
         "pedestal": pedestal,
     });
     let output_pedestal_state = if !calibration_decisions.is_empty()
-        && calibration_decisions
-            .iter()
-            .all(|decision| matches!(decision.pedestal_state, pipeline::PedestalState::BiasSubtracted))
-    {
+        && calibration_decisions.iter().all(|decision| {
+            matches!(
+                decision.pedestal_state,
+                pipeline::PedestalState::BiasSubtracted
+            )
+        }) {
         pipeline::PedestalState::BiasSubtracted
     } else {
         pipeline::PedestalState::RawIncludesBias
@@ -19213,9 +25464,8 @@ async fn stack_deepsky_impl(
             })
         })
         .unwrap_or(0);
-    let scientific_output_eligible = !calibration_degraded
-        && nf_products.is_some()
-        && uncertainty_unavailable_pixels == 0;
+    let scientific_output_eligible =
+        !calibration_degraded && nf_products.is_some() && uncertainty_unavailable_pixels == 0;
     let scientific_products_recipe = serde_json::json!({
         "SCI": {"present": true, "unit": "ADU", "linear": true},
         "VAR": {
@@ -19253,6 +25503,18 @@ async fn stack_deepsky_impl(
         "noCoveragePixels": no_coverage_pixels,
         "scientificEligible": scientific_output_eligible,
     });
+    let comet_alignment_recipe = comet_alignment
+        .as_ref()
+        .map(|request| {
+            let mut value = serde_json::to_value(request).unwrap_or_else(|_| serde_json::json!({}));
+            if let (Some(object), Some(effective_grid)) =
+                (value.as_object_mut(), comet_effective_grid.clone())
+            {
+                object.insert("effectiveGrid".into(), effective_grid);
+            }
+            value
+        })
+        .unwrap_or(serde_json::Value::Null);
     let recipe = serde_json::json!({
         "schemaVersion": pipeline::DEEP_SKY_RECIPE_SCHEMA_VERSION,
         "sourceFingerprint": ds_source_fingerprint(&[&lights, &darks, &flats, &dark_flats, &bias]),
@@ -19263,6 +25525,7 @@ async fn stack_deepsky_impl(
         "outputPedestalState": output_pedestal_state,
         "outputCalibrationSignature": output_calibration_signature.clone(),
         "integrationMethod": integration_recipe,
+        "cometAlignment": comet_alignment_recipe,
         "scientificProducts": scientific_products_recipe,
         "variance": {
             "origin": nf_products
@@ -19284,6 +25547,7 @@ async fn stack_deepsky_impl(
         "eidrFallback": eidr_runtime_fallback,
         "dualBandExtraction": dual_band_recipe,
         "cfaG1G2OffsetMax": nf_products.as_ref().and_then(|p| p.g1g2_offset_max),
+        "recoveredSaturatedCorePixels": nf_recovered_saturated_pixels,
         "outputBin": match nf_output_bin {
             Some((3, 4)) => "0.75x",
             Some((1, 2)) => "0.5x",
@@ -19342,9 +25606,8 @@ async fn stack_deepsky_impl(
                                 | crate::deepsky_variance::dq::NAN_INPUT
                                 | crate::deepsky_variance::dq::FLAT_INVALID);
                         }
-                        let var_unavailable = (0..ch).any(|c| {
-                            !products.variance[pixel * ch + c].is_finite()
-                        });
+                        let var_unavailable =
+                            (0..ch).any(|c| !products.variance[pixel * ch + c].is_finite());
                         if var_unavailable {
                             products.dq[pixel] |=
                                 crate::deepsky_variance::dq::EIDR_UNCERTAINTY_UNAVAILABLE;
@@ -19406,9 +25669,9 @@ async fn stack_deepsky_impl(
             is_mono: ch == 1,
             is_surface: false,
         });
-        state.deconv_cache.lock().unwrap().clear();
-        state.wavelet_cache.lock().unwrap().clear();
-        state.filter_cache.lock().unwrap().clear();
+        state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
     {
         let mut linear = state.deep_sky_result.lock().unwrap();
@@ -19427,6 +25690,8 @@ async fn stack_deepsky_impl(
                 effective_engine.clone()
             } else if used_gpu {
                 "hybrid_wgpu".into()
+            } else if gpu_preprocessing_used {
+                "cpu_science_plus_gpu_preprocess".into()
             } else if use_tiled {
                 "cpu_tiled".into()
             } else {
@@ -19443,6 +25708,11 @@ async fn stack_deepsky_impl(
             struct_map: nf_struct.as_ref().map(|(sm, _)| sm.clone()),
             struct_residual: nf_struct.as_ref().map(|(_, sr)| sr.clone()),
             recoverability: eidr_recov.clone(),
+            source_data: None,
+            source_variance: None,
+            source_layout: None,
+            post_stack_recipe: PostStackRecipe::default(),
+            astrometry_solution: None,
         });
     }
 
@@ -19487,7 +25757,11 @@ async fn stack_deepsky_impl(
         registered.len(),
         ds_run_started,
         &ds_telemetry_sys,
-        if used_gpu { peak_vram_mb } else { 0 },
+        if used_gpu || gpu_preprocessing_used {
+            peak_vram_mb
+        } else {
+            0
+        },
         frame_store.read_hits(),
         None,
     );
@@ -19583,8 +25857,7 @@ mod ds_tests {
 
     #[test]
     fn test_ds_classifies_nina_flatwizard_from_fits_role() {
-        let path =
-            "/Calibracion/mixed/2026-04-17_13-02-39_0000160FlatWizard_0.00_10.fits";
+        let path = "/Calibracion/mixed/2026-04-17_13-02-39_0000160FlatWizard_0.00_10.fits";
         assert_eq!(
             ds_classify_header(path, Some("DARK"), Some("FlatWizard")),
             Some("dark_flats")
@@ -19594,7 +25867,11 @@ mod ds_tests {
             Some("flats")
         );
         assert_eq!(
-            ds_classify_header("/Calibracion/DARK/Dark_600s.fits", Some("DARK"), Some("M42")),
+            ds_classify_header(
+                "/Calibracion/DARK/Dark_600s.fits",
+                Some("DARK"),
+                Some("M42")
+            ),
             Some("darks")
         );
         // Regression from a real capture set: the camera software wrote LIGHT
@@ -19646,10 +25923,7 @@ mod ds_tests {
             }),
             Some(11)
         );
-        assert_eq!(
-            ds_bayer_id_from_layout(&pipeline::StoreLayout::Mono),
-            None
-        );
+        assert_eq!(ds_bayer_id_from_layout(&pipeline::StoreLayout::Mono), None);
     }
 
     #[test]
@@ -19703,6 +25977,388 @@ mod ds_tests {
             .reasons
             .iter()
             .any(|reason| reason.starts_with("flat:")));
+    }
+
+    #[test]
+    fn test_manual_calibration_reuse_is_revalidated_and_typed() {
+        let light = ds_test_probe("light.fits", ds_test_signature());
+        let dark = ds_test_probe("dark.fits", ds_test_signature());
+        let dir = std::env::temp_dir().join(format!(
+            "zas-flat-reuse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reused_flat_signature = ds_test_signature();
+        reused_flat_signature.session = Some("2026-10-20".into());
+        let flats = (0..3)
+            .map(|index| {
+                let path = dir.join(format!("flat-{index}.tiff"));
+                let image =
+                    image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_fn(64, 48, |x, y| {
+                        let illumination = 20_000u16
+                            .saturating_add((x * 80) as u16)
+                            .saturating_add((y * 35) as u16);
+                        image::Luma([illumination.saturating_add(index)])
+                    });
+                image.save(&path).unwrap();
+                ds_test_probe(
+                    path.to_string_lossy().as_ref(),
+                    reused_flat_signature.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut decisions = ds_prepare_calibration_decisions(
+            std::slice::from_ref(&light),
+            &[],
+            &[],
+            &[],
+            &[],
+            pipeline::DeepSkyCalibrationPolicy::Strict,
+        );
+        let over = pipeline::DeepSkyCalibrationOverride {
+            lights: vec![light.path.clone()],
+            darks: vec![dark.path.clone()],
+            flats: flats.iter().map(|flat| flat.path.clone()).collect(),
+            reason: Some("reutilizar flats de otra campaña con tren estable".into()),
+            ..Default::default()
+        };
+        ds_apply_manual_overrides_to_decisions(
+            &mut decisions,
+            std::slice::from_ref(&over),
+            std::slice::from_ref(&light),
+            &[],
+            std::slice::from_ref(&dark),
+            &flats,
+            &[],
+        );
+        let decision = &decisions[0];
+        assert!(decision.manual);
+        assert!(decision.compatible);
+        assert!(!decision.degraded);
+        assert!(decision.scientific_eligible);
+        assert_eq!(
+            decision.assignment_tier,
+            pipeline::CalibrationAssignmentTier::ValidatedReuse
+        );
+        assert!(decision.dark_master_path.is_some());
+        assert!(decision.flat_master_path.is_some());
+        let evidence = decision.reuse_evidence.as_ref().unwrap();
+        assert!(evidence.stable);
+        assert_eq!(
+            evidence.schema_version,
+            pipeline::CALIBRATION_DECISION_SCHEMA_VERSION
+        );
+        assert_eq!(evidence.sampled_frames, 3);
+        assert_eq!(evidence.fingerprint_sha256.len(), 64);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("fingerprint estable")));
+        let unstable_path = dir.join("flat-unstable.tiff");
+        let unstable = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_fn(64, 48, |x, y| {
+            let base = 20_000u16
+                .saturating_add((x * 80) as u16)
+                .saturating_add((y * 35) as u16);
+            image::Luma([if x > 31 { base / 2 } else { base }])
+        });
+        unstable.save(&unstable_path).unwrap();
+        let unstable_paths = vec![
+            flats[0].path.clone(),
+            flats[1].path.clone(),
+            unstable_path.to_string_lossy().into_owned(),
+        ];
+        let unstable_evidence = ds_measure_flat_reuse_evidence(&unstable_paths);
+        assert!(!unstable_evidence.stable);
+        assert!(unstable_evidence.maximum_profile_delta > 0.08);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_user_verified_flat_reuse_only_completes_missing_identity() {
+        let light = ds_test_probe("light-user-verified.fits", ds_test_signature());
+        let dark = ds_test_probe("dark-user-verified.fits", ds_test_signature());
+        let dir = std::env::temp_dir().join(format!(
+            "zas-flat-user-verified-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut next_night_signature = ds_test_signature();
+        next_night_signature.session = Some("2026-07-20".into());
+        next_night_signature.sensor = None;
+        next_night_signature.read_mode = None;
+        next_night_signature.roi = None;
+        next_night_signature.optical_train = None;
+        next_night_signature.adc_bits = None;
+        next_night_signature.white_level_adu = None;
+        let flats = (0..3)
+            .map(|index| {
+                let path = dir.join(format!("flat-user-verified-{index}.tiff"));
+                let image =
+                    image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_fn(64, 48, |x, y| {
+                        image::Luma([20_000u16
+                            .saturating_add((x * 60) as u16)
+                            .saturating_add((y * 25) as u16)
+                            .saturating_add(index)])
+                    });
+                image.save(&path).unwrap();
+                ds_test_probe(
+                    path.to_string_lossy().as_ref(),
+                    next_night_signature.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let base_override = pipeline::DeepSkyCalibrationOverride {
+            lights: vec![light.path.clone()],
+            darks: vec![dark.path.clone()],
+            flats: flats.iter().map(|flat| flat.path.clone()).collect(),
+            reason: Some("flats capturados al día siguiente sin cambiar el tren".into()),
+            ..Default::default()
+        };
+
+        let mut unconfirmed = ds_prepare_calibration_decisions(
+            std::slice::from_ref(&light),
+            &[],
+            &[],
+            &[],
+            &[],
+            pipeline::DeepSkyCalibrationPolicy::Strict,
+        );
+        ds_apply_manual_overrides_to_decisions(
+            &mut unconfirmed,
+            std::slice::from_ref(&base_override),
+            std::slice::from_ref(&light),
+            &[],
+            std::slice::from_ref(&dark),
+            &flats,
+            &[],
+        );
+        assert_eq!(
+            unconfirmed[0].assignment_tier,
+            pipeline::CalibrationAssignmentTier::ForcedUnsafe
+        );
+        assert!(!unconfirmed[0].scientific_eligible);
+        assert!(unconfirmed[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("confirmación explícita")));
+
+        let verified_override = pipeline::DeepSkyCalibrationOverride {
+            user_verified_scientific: true,
+            user_verification_reason: Some(
+                "mismo sensor, read mode, ROI y tren óptico; sólo cambió la fecha".into(),
+            ),
+            ..base_override.clone()
+        };
+        let mut verified = ds_prepare_calibration_decisions(
+            std::slice::from_ref(&light),
+            &[],
+            &[],
+            &[],
+            &[],
+            pipeline::DeepSkyCalibrationPolicy::Strict,
+        );
+        ds_apply_manual_overrides_to_decisions(
+            &mut verified,
+            std::slice::from_ref(&verified_override),
+            std::slice::from_ref(&light),
+            &[],
+            std::slice::from_ref(&dark),
+            &flats,
+            &[],
+        );
+        assert_eq!(
+            verified[0].assignment_tier,
+            pipeline::CalibrationAssignmentTier::UserVerified
+        );
+        assert!(verified[0].compatible);
+        assert!(verified[0].scientific_eligible);
+        assert!(verified[0].user_verified_scientific);
+        assert!(verified[0]
+            .reuse_evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.stable));
+
+        let mut wrong_filter_signature = next_night_signature;
+        wrong_filter_signature.filter = Some("OIII".into());
+        let wrong_filter_flats = flats
+            .iter()
+            .map(|flat| ds_test_probe(&flat.path, wrong_filter_signature.clone()))
+            .collect::<Vec<_>>();
+        let mut rejected = ds_prepare_calibration_decisions(
+            std::slice::from_ref(&light),
+            &[],
+            &[],
+            &[],
+            &[],
+            pipeline::DeepSkyCalibrationPolicy::AllowDegraded,
+        );
+        ds_apply_manual_overrides_to_decisions(
+            &mut rejected,
+            std::slice::from_ref(&verified_override),
+            std::slice::from_ref(&light),
+            &[],
+            std::slice::from_ref(&dark),
+            &wrong_filter_flats,
+            &[],
+        );
+        assert_eq!(
+            rejected[0].assignment_tier,
+            pipeline::CalibrationAssignmentTier::ForcedUnsafe
+        );
+        assert!(!rejected[0].compatible);
+        assert!(!rejected[0].scientific_eligible);
+        assert!(rejected[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("filter")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_manual_bias_and_dark_flat_are_first_class_decisions() {
+        let light = ds_test_probe("light-manual-roles.fits", ds_test_signature());
+        let dark = ds_test_probe("dark-manual-roles.fits", ds_test_signature());
+        let flat = ds_test_probe("flat-manual-roles.fits", ds_test_signature());
+        let bias = ds_test_probe("bias-manual-roles.fits", ds_test_signature());
+        let dark_flat = ds_test_probe("dark-flat-manual-roles.fits", ds_test_signature());
+        let mut decisions = ds_prepare_calibration_decisions(
+            std::slice::from_ref(&light),
+            &[],
+            std::slice::from_ref(&dark),
+            std::slice::from_ref(&flat),
+            &[],
+            pipeline::DeepSkyCalibrationPolicy::Strict,
+        );
+        let over = pipeline::DeepSkyCalibrationOverride {
+            lights: vec![light.path.clone()],
+            flats: vec![flat.path.clone()],
+            dark_flats: vec![dark_flat.path.clone()],
+            bias: vec![bias.path.clone()],
+            reason: Some("selección explícita de pedestal del flat".into()),
+            ..Default::default()
+        };
+        ds_apply_manual_overrides_to_decisions(
+            &mut decisions,
+            std::slice::from_ref(&over),
+            std::slice::from_ref(&light),
+            std::slice::from_ref(&bias),
+            std::slice::from_ref(&dark),
+            std::slice::from_ref(&flat),
+            std::slice::from_ref(&dark_flat),
+        );
+        let decision = &decisions[0];
+        assert!(decision.compatible);
+        assert!(decision.scientific_eligible);
+        assert_eq!(
+            decision.bias_master_path.as_deref(),
+            Some("manual://1 bias")
+        );
+        assert_eq!(
+            decision.dark_flat_master_path.as_deref(),
+            Some("manual://1 dark-flats")
+        );
+        assert_eq!(
+            decision.flat_master_path.as_deref(),
+            Some("manual://1 flats")
+        );
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("dark-flats manuales validados")));
+        assert!(!ds_calibration_requires_classic(&decisions));
+
+        let mut skipped_flat = ds_prepare_calibration_decisions(
+            std::slice::from_ref(&light),
+            &[],
+            std::slice::from_ref(&dark),
+            std::slice::from_ref(&flat),
+            &[],
+            pipeline::DeepSkyCalibrationPolicy::Strict,
+        );
+        let skip = pipeline::DeepSkyCalibrationOverride {
+            lights: vec![light.path.clone()],
+            skip_flats: true,
+            reason: Some("omisión explícita para probar el gate científico".into()),
+            ..Default::default()
+        };
+        ds_apply_manual_overrides_to_decisions(
+            &mut skipped_flat,
+            std::slice::from_ref(&skip),
+            std::slice::from_ref(&light),
+            &[],
+            std::slice::from_ref(&dark),
+            std::slice::from_ref(&flat),
+            &[],
+        );
+        assert!(!skipped_flat[0].scientific_eligible);
+        assert!(ds_calibration_requires_classic(&skipped_flat));
+    }
+
+    #[test]
+    fn test_manual_incompatible_flat_never_becomes_compatible_or_reaches_runtime() {
+        let light = ds_test_probe("light.fits", ds_test_signature());
+        let dark = ds_test_probe("dark.fits", ds_test_signature());
+        let mut wrong_flat_signature = ds_test_signature();
+        wrong_flat_signature.filter = Some("OIII".into());
+        let wrong_flat = ds_test_probe("flat-wrong-filter.fits", wrong_flat_signature);
+        let mut decisions = ds_prepare_calibration_decisions(
+            std::slice::from_ref(&light),
+            &[],
+            &[],
+            &[],
+            &[],
+            pipeline::DeepSkyCalibrationPolicy::AllowDegraded,
+        );
+        let over = pipeline::DeepSkyCalibrationOverride {
+            lights: vec![light.path.clone()],
+            darks: vec![dark.path.clone()],
+            flats: vec![wrong_flat.path.clone()],
+            force_unsafe: true,
+            reason: Some("selección de otra firma".into()),
+            ..Default::default()
+        };
+        ds_apply_manual_overrides_to_decisions(
+            &mut decisions,
+            std::slice::from_ref(&over),
+            std::slice::from_ref(&light),
+            &[],
+            std::slice::from_ref(&dark),
+            std::slice::from_ref(&wrong_flat),
+            &[],
+        );
+        let decision = &decisions[0];
+        assert!(!decision.compatible);
+        assert!(decision.degraded);
+        assert!(!decision.scientific_eligible);
+        assert_eq!(
+            decision.assignment_tier,
+            pipeline::CalibrationAssignmentTier::ForcedUnsafe
+        );
+        assert!(decision.flat_master_path.is_none());
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("filter")));
+
+        let safe = ds_sanitize_manual_overrides_for_runtime(
+            &[over],
+            &[light],
+            &[],
+            &[dark],
+            &[wrong_flat],
+            &[],
+        );
+        assert_eq!(safe.len(), 1);
+        assert_eq!(safe[0].darks.len(), 1);
+        assert!(safe[0].flats.is_empty());
     }
 
     #[test]
@@ -19787,19 +26443,62 @@ mod ds_tests {
         let report = ds_flat_linearity_report(&flat, &signature).unwrap();
         assert_eq!(report.saturated_samples, 1);
         assert_eq!(report.nonlinear_samples, 3);
-        assert_ne!(
-            report.dq[10] & crate::deepsky_variance::dq::SATURATED,
-            0
-        );
-        assert_ne!(
-            report.dq[20] & crate::deepsky_variance::dq::NONLINEAR,
-            0
-        );
+        assert_ne!(report.dq[10] & crate::deepsky_variance::dq::SATURATED, 0);
+        assert_ne!(report.dq[20] & crate::deepsky_variance::dq::NONLINEAR, 0);
         assert!(report.invalid_frame_reason().is_some());
 
         signature.white_level_adu = None;
         let adc_report = ds_flat_linearity_report(&flat, &signature).unwrap();
         assert_eq!(adc_report.white_level_adu, 4095.0);
+    }
+
+    #[test]
+    fn test_ds_flat_linearity_infers_left_shifted_14_bit_fits_codes() {
+        let mut signature = ds_test_signature();
+        signature.white_level_adu = None;
+        signature.adc_bits = None;
+        // Patrón medido en N.I.N.A. + SV405CC: muestras de 14 bits
+        // desplazadas dos posiciones dentro del FITS unsigned de 16 bits.
+        let data = (0..4_000)
+            .map(|index| 24_000.0 + ((index % 2_000) * 4) as f32)
+            .collect::<Vec<_>>();
+        let flat = DsImage {
+            data,
+            w: 4_000,
+            h: 1,
+            ch: 1,
+            bayer: None,
+        };
+        let report = ds_flat_linearity_report(&flat, &signature).unwrap();
+        assert_eq!(report.white_level_adu, 65_532.0);
+        assert!(report.white_level_inferred);
+        assert!(report.white_level_source.contains("ADC 14-bit << 2"));
+        assert!(report.invalid_frame_reason().is_none());
+
+        signature.adc_bits = Some(14);
+        let declared_adc = ds_flat_linearity_report(&flat, &signature).unwrap();
+        assert_eq!(declared_adc.white_level_adu, 65_532.0);
+        assert!(declared_adc.white_level_inferred);
+    }
+
+    #[test]
+    fn test_ds_flat_linearity_still_fails_closed_without_quantization_evidence() {
+        let mut signature = ds_test_signature();
+        signature.white_level_adu = None;
+        signature.adc_bits = None;
+        let flat = DsImage {
+            data: (0..2_000)
+                .map(|index| 20_000.0 + (index % 1_001) as f32)
+                .collect(),
+            w: 2_000,
+            h: 1,
+            ch: 1,
+            bayer: None,
+        };
+        let error = ds_flat_linearity_report(&flat, &signature).unwrap_err();
+        assert!(error.contains("cuantización"));
+        assert!(error.contains("whiteLevelAdu"));
+        assert!(error.contains("adcBits"));
     }
 
     #[test]
@@ -19849,17 +26548,10 @@ mod ds_tests {
             0,
             crate::deepsky_variance::dq::EIDR_UNCERTAINTY_UNAVAILABLE,
             crate::deepsky_variance::dq::NO_COVERAGE,
-            crate::deepsky_variance::dq::NAN_INPUT
-                | crate::deepsky_variance::dq::FLAT_INVALID,
+            crate::deepsky_variance::dq::NAN_INPUT | crate::deepsky_variance::dq::FLAT_INVALID,
         ];
-        ds_reconcile_scientific_planes_with_dq(
-            &mut science,
-            &mut variance,
-            &mut neff,
-            &dq,
-            2,
-        )
-        .unwrap();
+        ds_reconcile_scientific_planes_with_dq(&mut science, &mut variance, &mut neff, &dq, 2)
+            .unwrap();
 
         assert_eq!(&science[..2], &[10.0, 11.0]);
         assert_eq!(&variance[..2], &[1.0, 1.5]);
@@ -19880,14 +26572,9 @@ mod ds_tests {
         let mut science = vec![1.0f32; 2];
         let mut variance = vec![1.0f32; 2];
         let mut neff = vec![1.0f32; 1];
-        let error = ds_reconcile_scientific_planes_with_dq(
-            &mut science,
-            &mut variance,
-            &mut neff,
-            &[0],
-            2,
-        )
-        .unwrap_err();
+        let error =
+            ds_reconcile_scientific_planes_with_dq(&mut science, &mut variance, &mut neff, &[0], 2)
+                .unwrap_err();
         assert!(error.contains("incompatibles"));
     }
 
@@ -19909,16 +26596,10 @@ mod ds_tests {
         assert_eq!(products.dq[0], 0);
         assert!(products.variance[1].is_nan());
         assert_eq!(products.neff[1], 0.0);
-        assert_ne!(
-            products.dq[1] & crate::deepsky_variance::dq::NO_COVERAGE,
-            0
-        );
+        assert_ne!(products.dq[1] & crate::deepsky_variance::dq::NO_COVERAGE, 0);
     }
 
-    fn calibration_master_for_test(
-        image: DsImage,
-        variance: Vec<f32>,
-    ) -> DsCalibrationMaster {
+    fn calibration_master_for_test(image: DsImage, variance: Vec<f32>) -> DsCalibrationMaster {
         let len = image.data.len();
         DsCalibrationMaster {
             image,
@@ -19943,8 +26624,7 @@ mod ds_tests {
             ch: 1,
             bayer: None,
         };
-        let raw_light_variance =
-            crate::deepsky_variance::empirical_channel_variance(&light)[0];
+        let raw_light_variance = crate::deepsky_variance::empirical_channel_variance(&light)[0];
         let bias = calibration_master_for_test(
             DsImage {
                 data: vec![100.0; w * h],
@@ -19975,8 +26655,7 @@ mod ds_tests {
             calibration_probe: None,
         };
         let uncertainty =
-            ds_calibrate_scientific(&mut light, Some(&bias), Some(&dark), None, 1.0)
-                .unwrap();
+            ds_calibrate_scientific(&mut light, Some(&bias), Some(&dark), None, 1.0).unwrap();
         assert!((light.data[0] - 880.0).abs() < 1.0e-6);
         assert!((uncertainty.variance[0] - (raw_light_variance + 9.0)).abs() < 1.0e-5);
         assert!(uncertainty.publishable);
@@ -19986,9 +26665,7 @@ mod ds_tests {
     fn test_ds_scientific_weak_flat_is_nan_and_dq_not_clamped() {
         let (w, h) = (8usize, 8usize);
         let mut light = DsImage {
-            data: (0..w * h)
-                .map(|index| 500.0 + (index % 5) as f32)
-                .collect(),
+            data: (0..w * h).map(|index| 500.0 + (index % 5) as f32).collect(),
             w,
             h,
             ch: 1,
@@ -20022,8 +26699,7 @@ mod ds_tests {
         let mut variance = vec![4.0f32; 8];
         let mut dq = vec![0u32; 8];
         variance[2] = f32::NAN;
-        dq[2] = crate::deepsky_variance::dq::HOT_COLD
-            | crate::deepsky_variance::dq::INTERPOLATED;
+        dq[2] = crate::deepsky_variance::dq::HOT_COLD | crate::deepsky_variance::dq::INTERPOLATED;
         assert!(ds_uncertainty_is_publishable(&variance, &dq, 8, 1, 1));
 
         dq[2] = 0;
@@ -20162,9 +26838,8 @@ mod ds_tests {
         // los valores iguales, cualquier combinación de pesos debe devolver
         // exactamente ese valor (sin sesgo del estimador).
         for method in ["sigma", "winsorized", "median", "percentile", "average"] {
-            let mut samples: Vec<(f32, f64)> = (0..12)
-                .map(|k| (500.0f32, 0.2 + k as f64 * 0.13))
-                .collect();
+            let mut samples: Vec<(f32, f64)> =
+                (0..12).map(|k| (500.0f32, 0.2 + k as f64 * 0.13)).collect();
             let (mut cov, mut lo, mut hi) = (0.0, 0.0, 0.0);
             let out = ds_reject_pixel(
                 &mut samples,
@@ -20181,6 +26856,810 @@ mod ds_tests {
                 "{method}: estimador {out} sesgado con pesos desiguales"
             );
         }
+    }
+
+    #[test]
+    fn test_ds_reject_pixel_discards_non_finite_samples_without_sort_panic() {
+        let mut samples = vec![
+            (f32::NAN, 1.0),
+            (100.0, 1.0),
+            (101.0, 1.0),
+            (f32::INFINITY, 1.0),
+            (102.0, 1.0),
+            (103.0, 1.0),
+            (104.0, 1.0),
+            (105.0, 1.0),
+            (106.0, 1.0),
+            (107.0, 1.0),
+            (108.0, f64::NAN),
+            (109.0, 0.0),
+        ];
+        let (mut coverage, mut rejected_low, mut rejected_high) = (0.0, 0.0, 0.0);
+        let output = ds_reject_pixel(
+            &mut samples,
+            "median",
+            3.0,
+            3.0,
+            &mut coverage,
+            &mut rejected_low,
+            &mut rejected_high,
+            1.0,
+        );
+        assert_eq!(samples.len(), 8);
+        assert!((output - 103.5).abs() < f32::EPSILON);
+        assert!((coverage - 8.0).abs() < f64::EPSILON);
+        assert!(samples
+            .iter()
+            .all(|(value, weight)| value.is_finite() && weight.is_finite() && *weight > 0.0));
+    }
+
+    fn ds_product_cache_fixture() -> DeepSkyResult {
+        DeepSkyResult {
+            id: "cache-fixture".into(),
+            data: vec![1.0, f32::NAN, -2.0, 4.0],
+            width: 2,
+            height: 2,
+            channels: 1,
+            coverage: vec![1.0, 0.0, 1.0, 1.0],
+            weight: vec![2.0; 4],
+            rejection_low: vec![0.0; 4],
+            rejection_high: vec![0.0; 4],
+            registration_residuals: vec![0.25; 4],
+            engine: "cache-test".into(),
+            method: "winsorized".into(),
+            frames_used: 8,
+            frames_rejected: 1,
+            elapsed_seconds: 1.5,
+            recipe: serde_json::json!({"schemaVersion": "zenith-deepsky-recipe-v5"}),
+            variance: Some(vec![0.5; 4]),
+            neff: Some(vec![7.0; 4]),
+            dq: Some(vec![0, 1, 0, 0]),
+            struct_map: Some(vec![0.1; 4]),
+            struct_residual: Some(vec![0.2; 4]),
+            recoverability: Some(vec![0.9; 4]),
+            source_data: None,
+            source_variance: None,
+            source_layout: None,
+            post_stack_recipe: PostStackRecipe::default(),
+            astrometry_solution: None,
+        }
+    }
+
+    fn ds_product_switch_fixture(
+        next_path: std::path::PathBuf,
+    ) -> (
+        Option<String>,
+        std::collections::BTreeMap<String, DeepSkyProductCacheEntry>,
+        Option<DeepSkyResult>,
+        Option<StackResult>,
+    ) {
+        let previous = ds_product_cache_fixture();
+        let preview = ds_stack_result_for_linear(&previous).unwrap();
+        let mut products = std::collections::BTreeMap::new();
+        products.insert(
+            "next".into(),
+            DeepSkyProductCacheEntry::transient(next_path, 1),
+        );
+        (
+            Some("previous".into()),
+            products,
+            Some(previous),
+            Some(preview),
+        )
+    }
+
+    #[test]
+    fn test_deepsky_select_product_spill_failure_keeps_complete_state() {
+        let root = std::env::temp_dir().join(new_job_id("ds-select-spill-rollback"));
+        let (mut active, mut products, mut current, mut preview) =
+            ds_product_switch_fixture(root.join("next.zds-cache"));
+        let expected_data = current.as_ref().unwrap().data.clone();
+        let expected_preview = preview.as_ref().unwrap().data.clone();
+
+        let error = ds_select_product_transaction(
+            "next",
+            &mut active,
+            &mut products,
+            &mut current,
+            &mut preview,
+            8 * 1024 * 1024 * 1024,
+            |_, _, _| Err("spill inyectado".into()),
+            |_, _, _| -> Result<DeepSkyResult, String> {
+                panic!("no debe intentar cargar después de fallar el spill")
+            },
+            |_| -> Result<StackResult, String> {
+                panic!("no debe reconstruir la preview después de fallar el spill")
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "spill inyectado");
+        assert_eq!(active.as_deref(), Some("previous"));
+        assert_eq!(
+            current
+                .as_ref()
+                .unwrap()
+                .data
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected_data
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(preview.as_ref().unwrap().data, expected_preview);
+        assert!(products.contains_key("next"));
+        assert!(!products.contains_key("previous"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_deepsky_select_product_budget_failure_is_rejected_before_spill() {
+        let root = std::env::temp_dir().join(new_job_id("ds-select-budget-rollback"));
+        let (mut active, mut products, mut current, mut preview) =
+            ds_product_switch_fixture(root.join("next.zds-cache"));
+        products.get_mut("next").unwrap().stored_bytes = 16 * 1024 * 1024 * 1024;
+        let expected_data = current
+            .as_ref()
+            .unwrap()
+            .data
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        let expected_preview = preview.as_ref().unwrap().data.clone();
+
+        let error = ds_select_product_transaction(
+            "next",
+            &mut active,
+            &mut products,
+            &mut current,
+            &mut preview,
+            128 * 1024 * 1024,
+            |_, _, _| -> Result<DeepSkyProductCacheEntry, String> {
+                panic!("el presupuesto debe bloquear antes del spill")
+            },
+            |_, _, _| -> Result<DeepSkyResult, String> {
+                panic!("el presupuesto debe bloquear antes de la carga")
+            },
+            |_| -> Result<StackResult, String> {
+                panic!("el presupuesto debe bloquear antes de crear la preview")
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("presupuesto seguro actual"), "{error}");
+        assert_eq!(active.as_deref(), Some("previous"));
+        assert_eq!(
+            current
+                .as_ref()
+                .unwrap()
+                .data
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected_data
+        );
+        assert_eq!(preview.as_ref().unwrap().data, expected_preview);
+        assert!(products.contains_key("next"));
+        assert!(!products.contains_key("previous"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_deepsky_select_product_load_budget_failure_rolls_back_without_losing_entry() {
+        let root = std::env::temp_dir().join(new_job_id("ds-select-load-rollback"));
+        let (mut active, mut products, mut current, mut preview) =
+            ds_product_switch_fixture(root.join("next.zds-cache"));
+        let previous = current.as_ref().unwrap().clone();
+        let expected_preview = preview.as_ref().unwrap().data.clone();
+        let spill_path = root.join("previous.zds-cache");
+
+        let error = ds_select_product_transaction(
+            "next",
+            &mut active,
+            &mut products,
+            &mut current,
+            &mut preview,
+            8 * 1024 * 1024 * 1024,
+            |_, _, _| {
+                Ok(DeepSkyProductCacheEntry::transient(
+                    spill_path.clone(),
+                    1,
+                ))
+            },
+            |product_id, _, _| {
+                if product_id == "next" {
+                    Err("presupuesto seguro actual insuficiente".into())
+                } else {
+                    Ok(previous.clone())
+                }
+            },
+            |_| -> Result<StackResult, String> {
+                panic!("la carga siguiente falló: debe conservarse la preview anterior")
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("presupuesto seguro actual"), "{error}");
+        assert_eq!(active.as_deref(), Some("previous"));
+        assert_eq!(
+            current
+                .as_ref()
+                .unwrap()
+                .data
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            previous
+                .data
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(preview.as_ref().unwrap().data, expected_preview);
+        assert!(products.contains_key("next"));
+        assert!(!products.contains_key("previous"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_deepsky_product_cache_roundtrip_is_lossless_and_self_cleaning() {
+        let root = std::env::temp_dir().join(format!(
+            "zas-ds-product-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let result = ds_product_cache_fixture();
+        // Serialization and cleanup must not depend on the runner's current
+        // free space. Production still uses `available_disk_bytes`; this test
+        // supplies a deterministic ample budget and exercises the exact same
+        // spill implementation after the safety gate.
+        let entry = ds_spill_product_to_disk_with_space_probe(
+            &root,
+            "EIDR",
+            &result,
+            |_| Some(8 * 1024 * 1024 * 1024),
+        )
+        .unwrap();
+        let cache_path = entry.path.clone();
+        assert!(cache_path.is_file());
+        let loaded = ds_load_product_from_disk("EIDR", &entry).unwrap();
+        assert_eq!(loaded.id, result.id);
+        assert_eq!(
+            loaded
+                .data
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            result
+                .data
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(loaded.variance, result.variance);
+        assert_eq!(loaded.neff, result.neff);
+        assert_eq!(loaded.dq, result.dq);
+        drop(entry);
+        assert!(!cache_path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_deepsky_product_cache_rejects_payload_corruption() {
+        use std::io::{Read as _, Seek as _, Write as _};
+
+        let root = std::env::temp_dir().join(new_job_id("ds-product-integrity-test"));
+        std::fs::create_dir_all(&root).unwrap();
+        let fingerprint = "integrity-fingerprint";
+        let mut result = ds_product_cache_fixture();
+        ds_mark_product_resume_recipe(&mut result, fingerprint, "classic");
+        let entry = ds_spill_product_checkpoint_with_space_probe(
+            &root,
+            fingerprint,
+            "classic",
+            &result,
+            |_| Some(8 * 1024 * 1024 * 1024),
+        )
+        .unwrap();
+
+        // bincode fixint: [u64 id_len][id][u64 data_len][f32...]. Cambiar un
+        // byte de mantisa mantiene el payload decodificable; sólo la firma debe
+        // impedir que esos píxeles se acepten como producto científico.
+        let data_byte = (DS_PRODUCT_CACHE_MAGIC.len()
+            + DS_PRODUCT_CACHE_DIGEST_BYTES
+            + std::mem::size_of::<u64>()
+            + result.id.len()
+            + std::mem::size_of::<u64>()
+            + 1) as u64;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&entry.path)
+            .unwrap();
+        file.seek(std::io::SeekFrom::Start(data_byte)).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0x5a;
+        file.seek(std::io::SeekFrom::Start(data_byte)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_data().unwrap();
+
+        let error = ds_load_product_from_disk("classic", &entry).unwrap_err();
+        assert!(error.contains("integridad SHA-256"), "{error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_deepsky_product_cache_validates_original_source_layout() {
+        let mut result = ds_product_cache_fixture();
+        result.source_data = Some(result.data.clone());
+        result.source_variance = result.variance.clone();
+        result.source_layout = Some(PostStackSourceLayout {
+            width: result.width,
+            height: result.height,
+            coverage: result.coverage.clone(),
+            weight: result.weight.clone(),
+            rejection_low: result.rejection_low.clone(),
+            rejection_high: result.rejection_high.clone(),
+            registration_residuals: result.registration_residuals.clone(),
+            neff: result.neff.clone(),
+            dq: result.dq.clone(),
+            struct_map: result.struct_map.clone(),
+            struct_residual: result.struct_residual.clone(),
+            recoverability: result.recoverability.clone(),
+        });
+        ds_validate_cached_result(&result).unwrap();
+
+        result.source_data.as_mut().unwrap().pop();
+        let error = ds_validate_cached_result(&result).unwrap_err();
+        assert!(error.contains("source_data truncado"), "{error}");
+        result.source_data = Some(result.data.clone());
+        result
+            .source_layout
+            .as_mut()
+            .unwrap()
+            .coverage
+            .pop();
+        let error = ds_validate_cached_result(&result).unwrap_err();
+        assert!(error.contains("source.coverage truncado"), "{error}");
+    }
+
+    #[test]
+    fn test_deepsky_product_cache_low_memory_budget_has_no_unsafe_floor() {
+        const MIB: u64 = 1024 * 1024;
+
+        assert_eq!(ds_product_cache_safe_load_budget(100 * MIB), 16 * MIB + 819 * 1024 + 204);
+        assert!(ds_product_cache_fits_load_budget(16 * MIB, 100 * MIB));
+        assert!(!ds_product_cache_fits_load_budget(17 * MIB, 100 * MIB));
+        assert!(
+            !ds_product_cache_fits_load_budget(200 * MIB, 100 * MIB),
+            "un piso artificial de 256 MiB reintroduciría el OOM"
+        );
+        assert_eq!(
+            ds_product_cache_safe_load_budget(DS_PRODUCT_RESTORE_PREVIEW_RESERVE_BYTES),
+            0,
+            "sin reserva para la vista acotada no debe intentarse deserializar"
+        );
+    }
+
+    #[test]
+    fn test_deepsky_scientific_previews_are_bounded_and_keep_sparse_events() {
+        let width = 3201usize;
+        let height = 2usize;
+        let mut rejection = vec![0.0f32; width * height];
+        rejection[0] = 7.0;
+        let (reduced_rejection, preview_width, preview_height) =
+            ds_scalar_preview_bounded(width, height, DsScalarPreviewAggregation::Max, |pixel| {
+                Some(rejection[pixel])
+            });
+        assert!(preview_width <= DS_POSTSTACK_PREVIEW_MAX_EDGE);
+        assert!(preview_height <= DS_POSTSTACK_PREVIEW_MAX_EDGE);
+        assert_eq!(reduced_rejection[0], 7.0);
+
+        let mut dq = vec![0u32; width * height];
+        dq[0] = 0b0001;
+        dq[1] = 0b0100;
+        let (reduced_dq, dq_width, dq_height) = ds_dq_preview_bounded(&dq, width, height);
+        assert_eq!((dq_width, dq_height), (preview_width, preview_height));
+        assert_eq!(reduced_dq[0] as u32, 0b0101);
+    }
+
+    #[test]
+    fn test_deepsky_compute_workload_matches_effective_runtime_recipe() {
+        assert_eq!(ds_effective_clip_iterations("average", Some(3), 120), 0);
+        assert_eq!(ds_effective_clip_iterations("sigma", None, 120), 2);
+        assert_eq!(ds_effective_clip_iterations("sigma", Some(3), 3), 0);
+        assert_eq!(
+            ds_compute_workload_for_product(
+                pipeline::DeepSkyIntegrationProductKind::Classic,
+                "sigma",
+                2,
+                1.0,
+            )
+            .required_cpu_reason(),
+            Some(pipeline::DeepSkyRequiredCpuReason::IterativeSigma)
+        );
+        assert_eq!(
+            ds_compute_workload_for_product(
+                pipeline::DeepSkyIntegrationProductKind::Classic,
+                "average",
+                0,
+                2.0,
+            )
+            .required_cpu_reason(),
+            Some(pipeline::DeepSkyRequiredCpuReason::ClassicDrizzle)
+        );
+        assert_eq!(
+            ds_compute_workload_for_product(
+                pipeline::DeepSkyIntegrationProductKind::Eidr,
+                "average",
+                0,
+                1.0,
+            )
+            .required_cpu_reason(),
+            Some(pipeline::DeepSkyRequiredCpuReason::EidrSpatialInverseVariance)
+        );
+    }
+
+    #[test]
+    fn test_deepsky_completed_product_checkpoint_survives_drop_and_rejects_wrong_recipe() {
+        let root = std::env::temp_dir().join(format!(
+            "zas-ds-product-resume-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let fingerprint = "compatible-recipe-fingerprint";
+        let mut result = ds_product_cache_fixture();
+        ds_mark_product_resume_recipe(&mut result, fingerprint, "classic");
+        let entry = ds_spill_product_checkpoint_with_space_probe(
+            &root,
+            fingerprint,
+            "classic",
+            &result,
+            |_| Some(8 * 1024 * 1024 * 1024),
+        )
+        .unwrap();
+        let durable_path = entry.path.clone();
+        drop(entry);
+        assert!(
+            durable_path.is_file(),
+            "un checkpoint publicado no puede borrarse al cancelar el trabajo"
+        );
+
+        let (restored, restored_entry) =
+            ds_try_restore_product_checkpoint(&root, fingerprint, "classic")
+                .unwrap()
+                .expect("el reintento idéntico debe reconocer el producto");
+        assert_eq!(restored.id, result.id);
+        drop(restored_entry);
+        assert!(durable_path.is_file());
+
+        let wrong_fingerprint = "changed-recipe-fingerprint";
+        let wrong_path = ds_product_resume_path(&root, wrong_fingerprint, "classic");
+        std::fs::create_dir_all(wrong_path.parent().unwrap()).unwrap();
+        std::fs::copy(&durable_path, &wrong_path).unwrap();
+        let error = ds_try_restore_product_checkpoint(&root, wrong_fingerprint, "classic")
+            .unwrap_err();
+        assert!(error.contains("incompatible"), "{error}");
+        assert!(
+            !wrong_path.exists(),
+            "un archivo movido a otra receta no puede convertirse en falso hit"
+        );
+        assert!(durable_path.is_file());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_multiband_resume_fingerprint_isolated_by_group_and_product_not_siblings() {
+        let request = pipeline::DeepSkyStackRequest::default();
+        let classic = request.resolved_integration_products().remove(0);
+        let first = ds_session_product_resume_fingerprint_with_engine_identity(
+            "group-ha",
+            "HA",
+            &request,
+            &classic,
+            "engine-test",
+        )
+        .unwrap();
+
+        let mut with_sibling = request.clone();
+        with_sibling.integration_products = vec![
+            pipeline::DeepSkyIntegrationProductRequest {
+                id: "classic-visible-id".into(),
+                product: pipeline::DeepSkyIntegrationProductKind::Classic,
+                primary: false,
+                method: classic.method.clone(),
+            },
+            pipeline::DeepSkyIntegrationProductRequest {
+                id: "eidr-primary".into(),
+                product: pipeline::DeepSkyIntegrationProductKind::Eidr,
+                primary: true,
+                method: pipeline::DeepSkyIntegrationMethod::Eidr(pipeline::EidrConfig {
+                    version: 1,
+                    scale: pipeline::EidrScalePolicy::Auto,
+                    solve_mode: pipeline::EidrSolveMode::ScientificQuadratic,
+                    max_iterations: 60,
+                    huber_delta: 2.5,
+                    holdout_fraction: 0.15,
+                    refine_registration: false,
+                    warm_start: true,
+                    multigrid: true,
+                    cfa_direct: false,
+                }),
+            },
+        ];
+        let renamed_classic = with_sibling.integration_products[0].clone();
+        assert_eq!(
+            first,
+            ds_session_product_resume_fingerprint_with_engine_identity(
+                "group-ha",
+                "ha",
+                &with_sibling,
+                &renamed_classic,
+                "engine-test",
+            )
+            .unwrap(),
+            "un hermano, id visible o cambio de primario no puede invalidar Classic"
+        );
+        assert_ne!(
+            first,
+            ds_session_product_resume_fingerprint_with_engine_identity(
+                "group-oiii",
+                "HA",
+                &request,
+                &classic,
+                "engine-test",
+            )
+            .unwrap(),
+            "dos grupos científicos no deben compartir namespace"
+        );
+        assert_ne!(
+            first,
+            ds_session_product_resume_fingerprint_with_engine_identity(
+                "group-ha",
+                "OIII",
+                &request,
+                &classic,
+                "engine-test",
+            )
+            .unwrap(),
+            "la identidad de banda vive fuera del request y debe participar"
+        );
+        assert_ne!(
+            first,
+            ds_session_product_resume_fingerprint_with_engine_identity(
+                "group-ha",
+                "HA",
+                &with_sibling,
+                &with_sibling.integration_products[1],
+                "engine-test",
+            )
+            .unwrap(),
+            "productos científicamente distintos necesitan checkpoints distintos"
+        );
+    }
+
+    #[test]
+    fn test_multiband_cancel_preserves_published_group_and_retry_checkpoint() {
+        let root = std::env::temp_dir().join(new_job_id("ds-session-resume-contract"));
+        let cache = root.join("cache");
+        let output = root.join("output");
+        let group = output.join("01_Ha_HA");
+        let complete = group.join("01_Classic");
+        let partial = group.join("02_EIDR");
+        std::fs::create_dir_all(&complete).unwrap();
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(complete.join("Master.fits"), b"complete").unwrap();
+        std::fs::write(partial.join("Master.fits.part"), b"partial").unwrap();
+
+        let fingerprint = "session-group-product-fingerprint";
+        let mut result = ds_product_cache_fixture();
+        ds_mark_session_product_resume_recipe(
+            &mut result,
+            fingerprint,
+            "classic",
+            "group-ha",
+            "HA",
+        );
+        let entry = ds_spill_product_checkpoint_with_space_probe(
+            &cache,
+            fingerprint,
+            "classic",
+            &result,
+            |_| Some(8 * 1024 * 1024 * 1024),
+        )
+        .unwrap();
+        let checkpoint_path = entry.path.clone();
+        drop(entry);
+
+        {
+            let mut session_guard = DsSessionOutputGuard {
+                path: output.clone(),
+                committed: false,
+                preserved_children: Vec::new(),
+            };
+            let mut group_guard = DsSessionOutputGuard {
+                path: group.clone(),
+                committed: false,
+                preserved_children: Vec::new(),
+            };
+            group_guard.preserve_child(complete.clone());
+            session_guard.preserve_child(group.clone());
+        }
+
+        assert!(complete.join("Master.fits").is_file());
+        assert!(!partial.exists(), "una rama parcial no puede parecer publicada");
+        assert!(checkpoint_path.is_file());
+        let (restored, restored_entry) =
+            ds_try_restore_product_checkpoint(&cache, fingerprint, "classic")
+                .unwrap()
+                .expect("el reintento idéntico debe recuperar la rama completa");
+        assert_eq!(
+            restored.recipe.pointer("/resumeCheckpoint/scope"),
+            Some(&serde_json::json!("multibandGroup"))
+        );
+        assert_eq!(
+            restored.recipe.pointer("/resumeCheckpoint/groupId"),
+            Some(&serde_json::json!("group-ha"))
+        );
+        drop(restored_entry);
+        assert!(checkpoint_path.is_file());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_deepsky_product_resume_fingerprint_invalidates_inputs_and_configuration() {
+        use std::io::{Seek as _, Write as _};
+
+        let root = std::env::temp_dir().join(format!(
+            "zas-ds-resume-fingerprint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let light = root.join("light.fits");
+        std::fs::write(&light, vec![0x11u8; 2 * 1024 * 1024]).unwrap();
+        let request = pipeline::DeepSkyStackRequest {
+            lights: vec![light.to_string_lossy().to_string()],
+            work_dir: Some(root.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let first = ds_product_resume_fingerprint(&request).unwrap();
+        assert_eq!(first, ds_product_resume_fingerprint(&request).unwrap());
+        let product = request.resolved_integration_products().remove(0);
+        assert_ne!(
+            ds_product_resume_fingerprint_for_product_with_engine_identity(
+                &request,
+                &product,
+                "engine-a",
+            )
+            .unwrap(),
+            ds_product_resume_fingerprint_for_product_with_engine_identity(
+                &request,
+                &product,
+                "engine-b",
+            )
+            .unwrap(),
+            "una revisión distinta del motor no puede reutilizar productos"
+        );
+
+        let mut changed_recipe = request.clone();
+        changed_recipe.kappa_high += 0.25;
+        assert_ne!(
+            first,
+            ds_product_resume_fingerprint(&changed_recipe).unwrap(),
+            "un parámetro científico distinto no puede reutilizar el producto"
+        );
+
+        let mut with_sibling = request.clone();
+        with_sibling.integration_products = vec![
+            pipeline::DeepSkyIntegrationProductRequest {
+                id: "classic-visible-id".into(),
+                product: pipeline::DeepSkyIntegrationProductKind::Classic,
+                primary: false,
+                method: product.method.clone(),
+            },
+            pipeline::DeepSkyIntegrationProductRequest {
+                id: "nebula-fusion".into(),
+                product: pipeline::DeepSkyIntegrationProductKind::NebulaFusionSci,
+                primary: true,
+                method: pipeline::DeepSkyIntegrationMethod::NebulaFusion(
+                    pipeline::NebulaFusionConfig::default(),
+                ),
+            },
+        ];
+        let classic_with_sibling = with_sibling.integration_products[0].clone();
+        assert_eq!(
+            first,
+            ds_product_resume_fingerprint_for_product(&with_sibling, &classic_with_sibling)
+                .unwrap(),
+            "productos hermanos, id visible y producto principal no deben invalidar Classic"
+        );
+
+        let original = std::fs::metadata(&light).unwrap();
+        let original_modified = original.modified().unwrap();
+        let original_sampled =
+            ds_sampled_file_content_digest(&light, original.len()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&light)
+            .unwrap();
+        file.seek(std::io::SeekFrom::Start(original.len() / 2))
+            .unwrap();
+        file.write_all(&vec![0xA7u8; 4096]).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+        let changed = std::fs::metadata(&light).unwrap();
+        assert_eq!(changed.len(), original.len());
+        assert_eq!(changed.modified().unwrap(), original_modified);
+        assert_ne!(
+            original_sampled,
+            ds_sampled_file_content_digest(&light, changed.len()).unwrap(),
+            "el muestreo distribuido debe cubrir una reescritura central"
+        );
+        assert_ne!(
+            first,
+            ds_product_resume_fingerprint(&request).unwrap(),
+            "una toma reescrita en el centro con tamaño+mtime preservados debe invalidar el producto"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_deepsky_comparison_geometry_matches_reference_crop_and_output() {
+        let mut result = ds_product_cache_fixture();
+        result.recipe = serde_json::json!({
+            "frames": [
+                { "path": "/tmp/not-the-reference.fits", "reference": false },
+                { "path": "/tmp/reference.fits", "reference": true }
+            ],
+            "crop": {
+                "enabled": true,
+                "sourceWidth": 8000,
+                "sourceHeight": 6000,
+                "x": 800,
+                "y": 600,
+                "widthBeforeOutputBinning": 6400,
+                "heightBeforeOutputBinning": 4800,
+                "outputWidth": 12800,
+                "outputHeight": 9600
+            }
+        });
+
+        let geometry = ds_result_comparison_geometry(&result)
+            .expect("una receta válida debe publicar geometría comparable");
+        assert_eq!(geometry.reference_path, "/tmp/reference.fits");
+        assert_eq!((geometry.x, geometry.y), (800, 600));
+        assert_eq!(
+            (
+                geometry.width_before_output_binning,
+                geometry.height_before_output_binning,
+            ),
+            (6400, 4800)
+        );
+        assert_eq!((geometry.output_width, geometry.output_height), (12800, 9600));
+
+        result.recipe["crop"]["x"] = serde_json::json!(2000);
+        assert!(
+            ds_result_comparison_geometry(&result).is_none(),
+            "un recorte fuera del sensor no puede fingir un encuadre sincronizado"
+        );
     }
 
     #[test]
@@ -20251,7 +27730,10 @@ mod ds_tests {
             ds_resolve_auto_recipe(auto_request("l"), &signals, 10, true);
         assert_eq!(resolved.rejection, "winsorized");
         assert!(resolved.kappa_high >= 3.5, "κ alto conserva emisión débil");
-        assert!(resolved.kappa_low >= 4.0, "κ_low 4.0 no recorta la cola oscura");
+        assert!(
+            resolved.kappa_low >= 4.0,
+            "κ_low 4.0 no recorta la cola oscura"
+        );
         assert_eq!(resolved.normalization, "additive");
         assert!(!resolved.gradient);
         assert!(reasons.iter().any(|r| r.contains("fondo tenue")));
@@ -20271,11 +27753,12 @@ mod ds_tests {
         assert_eq!(resolved.kappa_low, 2.5);
 
         // Sin RAM 2x: sólo razón informativa, drizzle 1x y receta base intacta.
-        let (resolved, reasons, _) =
-            ds_resolve_auto_recipe(auto_request("l"), &signals, 10, false);
+        let (resolved, reasons, _) = ds_resolve_auto_recipe(auto_request("l"), &signals, 10, false);
         assert_eq!(resolved.drizzle, 1.0);
         assert_eq!(resolved.rejection, "winsorized");
-        assert!(reasons.iter().any(|r| r.contains("Drizzle 2× quedaría disponible")));
+        assert!(reasons
+            .iter()
+            .any(|r| r.contains("Drizzle 2× quedaría disponible")));
 
         // FWHM grande (sin submuestreo): tampoco activa.
         let mut signals = auto_signals(60);
@@ -20331,6 +27814,279 @@ mod ds_tests {
         );
         assert_eq!(ds_night_distance(Some("2026-03-02"), Some("2026-03-05")), 3);
         assert!(ds_night_distance(None, Some("2026-03-05")) > 1_000);
+    }
+
+    #[test]
+    fn test_dark_flat_session_batch_covers_multiple_flat_exposures_without_mixing_them() {
+        let mut flat_short_signature = ds_test_signature();
+        flat_short_signature.exposure_seconds = Some(0.160);
+        flat_short_signature.temperature_c = Some(-3.0);
+        let flat_short = ds_test_probe("flat-ha-0.160.fits", flat_short_signature.clone());
+
+        let mut flat_long_signature = flat_short_signature.clone();
+        flat_long_signature.exposure_seconds = Some(0.240);
+        let flat_long = ds_test_probe("flat-oiii-0.240.fits", flat_long_signature.clone());
+
+        let dark_flat_short = ds_test_probe("dark-flat-0.160.fits", flat_short_signature.clone());
+        let dark_flat_long = ds_test_probe("dark-flat-0.240.fits", flat_long_signature);
+        let mut unrelated_signature = flat_short_signature;
+        unrelated_signature.exposure_seconds = Some(1.0);
+        let unrelated = ds_test_probe("dark-flat-1.000.fits", unrelated_signature);
+        let candidates = vec![dark_flat_short, dark_flat_long, unrelated];
+        let paths = candidates
+            .iter()
+            .map(|probe| probe.path.clone())
+            .collect::<Vec<_>>();
+        let over = pipeline::DeepSkyCalibrationOverride {
+            dark_flats: paths.clone(),
+            ..Default::default()
+        };
+        let assessment = ds_assess_manual_calibration_role(
+            &over,
+            &paths,
+            &[flat_short, flat_long],
+            &candidates,
+            crate::deepsky_calibration_contract::CalibrationRole::DarkFlat,
+            false,
+        )
+        .unwrap();
+        assert!(assessment.safe, "{:?}", assessment.reasons);
+        assert_eq!(
+            assessment.tier,
+            pipeline::CalibrationAssignmentTier::AutomaticExact
+        );
+        assert_eq!(
+            ds_master_signature_groups(
+                candidates.iter(),
+                crate::deepsky_calibration_contract::CalibrationRole::DarkFlat,
+            )
+            .len(),
+            3,
+            "el lote visual es uno, pero el motor conserva tres submásters por firma"
+        );
+    }
+
+    #[test]
+    fn test_channel_combination_rejects_rgb_and_cfa_masters() {
+        let mono = DsImage {
+            data: vec![1.0; 4],
+            w: 2,
+            h: 2,
+            ch: 1,
+            bayer: None,
+        };
+        assert!(ds_require_mono_channel_master(mono, "mono.fits").is_ok());
+
+        let rgb = DsImage {
+            data: vec![1.0; 12],
+            w: 2,
+            h: 2,
+            ch: 3,
+            bayer: None,
+        };
+        let error = ds_require_mono_channel_master(rgb, "rgb.fits")
+            .err()
+            .unwrap();
+        assert!(error.contains("No se convertirá RGB a luminancia"));
+
+        let cfa = DsImage {
+            data: vec![1.0; 4],
+            w: 2,
+            h: 2,
+            ch: 1,
+            bayer: Some(0),
+        };
+        let error = ds_require_mono_channel_master(cfa, "cfa.fits")
+            .err()
+            .unwrap();
+        assert!(error.contains("CFA/Bayer"));
+    }
+
+    #[test]
+    fn test_channel_combination_registration_uses_lanczos_interior() {
+        let (w, h) = (18usize, 18usize);
+        let mut data = vec![0.0f32; w * h];
+        // This sample is inside the Lanczos 6×6 support of (8.75, 8.65), but
+        // outside its bilinear 2×2 support. A bilinear regression would turn
+        // the asserted output back into exactly zero.
+        data[7 * w + 7] = 1.0;
+        let image = DsImage {
+            data,
+            w,
+            h,
+            ch: 1,
+            bayer: None,
+        };
+        let transform = DsTransform::from_similarity((1.0, 0.0, 0.25, 0.35));
+        let (warped, coverage) = ds_warp_single(&image, transform, w, h);
+        let output_index = 9 * w + 9;
+        let (source_x, source_y) = transform.inverse(9.0, 9.0).unwrap();
+        let mut expected = [0.0f32; 3];
+        ds_sample_lanczos3(&image, ds_l3_lut(), source_x, source_y, &mut expected);
+        assert_eq!(coverage[output_index], 1.0);
+        assert!(
+            expected[0].abs() > 1e-5,
+            "el soporte Lanczos de prueba no alcanzó el impulso"
+        );
+        assert!(
+            (warped[output_index] - expected[0]).abs() < 1e-6,
+            "el combinador dejó de usar Lanczos-3 en el interior"
+        );
+    }
+
+    #[test]
+    fn hoo_requires_an_explicit_ha_oiii_osc_contract() {
+        assert!(ds_hoo_block_reason(&serde_json::json!({
+            "captureMode": "dualBandOsc"
+        }))
+        .is_none());
+        assert!(ds_hoo_block_reason(&serde_json::json!({
+            "captureMode": "auto",
+            "filterProfile": "HA_OIII"
+        }))
+        .is_none());
+        for recipe in [
+            serde_json::json!({"captureMode": "broadbandOsc"}),
+            serde_json::json!({"captureMode": "monoNarrowband", "filterProfile": "HA"}),
+            serde_json::json!({"captureMode": "dualBandOsc", "filterProfile": "SII_OIII"}),
+            serde_json::json!({
+                "operation": "linearChannelCombination",
+                "combinationMode": "hoo"
+            }),
+        ] {
+            assert!(
+                ds_hoo_block_reason(&recipe).is_some(),
+                "debió bloquear {recipe}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_adjacent_night_flat_requires_explicit_validated_reuse() {
+        let probe = |name: &str, session: &str| DsProbe {
+            path: format!("/{name}.fits"),
+            name: name.into(),
+            w: 2,
+            h: 2,
+            ch: 1,
+            exptime: Some(1.0),
+            bayer: None,
+            temp: None,
+            gain: None,
+            binning: Some(1),
+            filter: Some("L".into()),
+            date_obs: Some(format!("{session}T22:00:00")),
+            frame_type: None,
+            object: None,
+            signature: pipeline::CalibrationSignature {
+                session: Some(session.into()),
+                ..Default::default()
+            },
+            store_layout: Some(pipeline::StoreLayout::Mono),
+            signature_warnings: Vec::new(),
+            signature_missing: Vec::new(),
+            ok: true,
+            error: None,
+        };
+        let light = probe("light", "2026-03-01");
+        let adjacent_flat = probe("flat", "2026-03-02");
+        let report = ds_compare_probe_calibration(
+            &light,
+            &adjacent_flat,
+            crate::deepsky_calibration_contract::CalibrationRole::Flat,
+            pipeline::DeepSkyCalibrationPolicy::Strict,
+        );
+        assert!(!report.compatible);
+        assert!(!report.scientific_eligible);
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("reutilización explícita validada")));
+    }
+
+    #[test]
+    fn test_comet_layers_keep_signed_signal_and_do_not_invent_covariance() {
+        let (w, h) = (64usize, 64usize);
+        let npx = w * h;
+        let result = |id: &str, data: Vec<f32>| DeepSkyResult {
+            id: id.into(),
+            data,
+            width: w,
+            height: h,
+            channels: 1,
+            coverage: vec![10.0; npx],
+            weight: vec![10.0; npx],
+            rejection_low: vec![0.0; npx],
+            rejection_high: vec![0.0; npx],
+            registration_residuals: Vec::new(),
+            engine: "fixture".into(),
+            method: "fixture".into(),
+            frames_used: 10,
+            frames_rejected: 0,
+            elapsed_seconds: 0.0,
+            recipe: serde_json::json!({
+                "cometAlignment": {
+                    "effectiveGrid": {
+                        "anchorX": 32.0,
+                        "anchorY": 32.0,
+                        "outputScaleX": 1.0,
+                        "outputScaleY": 1.0,
+                    }
+                }
+            }),
+            variance: Some(vec![4.0; npx]),
+            neff: Some(vec![10.0; npx]),
+            dq: Some(vec![0; npx]),
+            struct_map: None,
+            struct_residual: None,
+            recoverability: None,
+            source_data: None,
+            source_variance: None,
+            source_layout: None,
+            post_stack_recipe: PostStackRecipe::default(),
+            astrometry_solution: None,
+        };
+        let stars = result("stars", vec![100.0; npx]);
+        let mut comet_data = vec![10.0; npx];
+        let center = 32 * w + 32;
+        comet_data[center] = 5.0;
+        let comet_aligned = result("comet-aligned", comet_data);
+        let request = pipeline::CometStackRequest {
+            enabled: true,
+            observations: vec![pipeline::CometObservation {
+                timestamp_unix: 1_000.0,
+                registered_x: 32.0,
+                registered_y: 32.0,
+                confirmed: true,
+                ..Default::default()
+            }],
+            trajectory: pipeline::CometTrajectory {
+                epoch_unix: 1_000.0,
+                x_at_epoch: 32.0,
+                y_at_epoch: 32.0,
+                confidence: 1.0,
+                ..Default::default()
+            },
+            coma_radius_px: 16.0,
+            ..Default::default()
+        };
+        let (comet, combined) = ds_comet_layer_products(&stars, comet_aligned, &request).unwrap();
+        assert_eq!(comet.data[center], -5.0);
+        assert_eq!(combined.data[center], 95.0);
+        assert!(comet.variance.is_none() && comet.neff.is_none());
+        assert!(combined.variance.is_none() && combined.neff.is_none());
+        assert!(comet.data[0].is_nan());
+        assert_eq!(comet.coverage[0], 0.0);
+        assert_ne!(
+            comet.dq.as_ref().unwrap()[0] & crate::deepsky_variance::dq::NO_COVERAGE,
+            0
+        );
+        assert_eq!(
+            combined.dq.as_ref().unwrap()[0] & crate::deepsky_variance::dq::NO_COVERAGE,
+            0
+        );
+        assert_eq!(comet.method, "comet-cross-trajectory-residual");
+        assert_eq!(combined.method, "linear-stars-plus-signed-comet-residual");
     }
 
     #[test]
@@ -20564,8 +28320,8 @@ mod ds_tests {
             })
             .collect();
 
-        let reg = ds_match_triangles_in_field(&ref_stars, &tgt_stars, w, h)
-            .expect("registro fallido");
+        let reg =
+            ds_match_triangles_in_field(&ref_stars, &tgt_stars, w, h).expect("registro fallido");
         assert!(reg.inliers >= 20, "pocos inliers: {}", reg.inliers);
         assert!(reg.holdout_count >= reg.inliers.div_ceil(5));
         assert!(
@@ -20668,11 +28424,12 @@ mod ds_tests {
         let reference = vec![(-1.0, 0.0), (1.0, 0.0), (4.0, 0.0)];
         let first = ds_bijective_nearest_indices(transform, &target, &reference, 2.0);
         let second = ds_bijective_nearest_indices(transform, &target, &reference, 2.0);
-        assert_eq!(first, second, "los empates deben resolverse de forma estable");
-        let targets: std::collections::BTreeSet<_> =
-            first.iter().map(|pair| pair.0).collect();
-        let references: std::collections::BTreeSet<_> =
-            first.iter().map(|pair| pair.1).collect();
+        assert_eq!(
+            first, second,
+            "los empates deben resolverse de forma estable"
+        );
+        let targets: std::collections::BTreeSet<_> = first.iter().map(|pair| pair.0).collect();
+        let references: std::collections::BTreeSet<_> = first.iter().map(|pair| pair.1).collect();
         assert_eq!(targets.len(), first.len());
         assert_eq!(references.len(), first.len());
         assert!(first.contains(&(0, 0)), "el empate elige el índice menor");
@@ -20711,8 +28468,8 @@ mod ds_tests {
             })
             .collect();
         let similarity = ds_solve_similarity(&pairs).expect("similitud");
-        let selected = ds_select_registration_model(similarity, &pairs, 512, 512)
-            .expect("registro válido");
+        let selected =
+            ds_select_registration_model(similarity, &pairs, 512, 512).expect("registro válido");
         assert_eq!(selected.transform.model, DsRegistrationModel::Similarity);
         assert!(selected.holdout_count >= pairs.len().div_ceil(5));
         assert!(selected.holdout_p95 < 0.05);
@@ -20741,8 +28498,8 @@ mod ds_tests {
             "una variación de área >1.5× a través del sensor no es plausible"
         );
 
-        let identity = ds_transform_field_report(DsTransform::identity(), 512, 512)
-            .expect("identidad válida");
+        let identity =
+            ds_transform_field_report(DsTransform::identity(), 512, 512).expect("identidad válida");
         assert!((identity.min_jacobian - 1.0).abs() < 1e-9);
         assert!((identity.p95_jacobian - 1.0).abs() < 1e-9);
         assert!((identity.max_jacobian - 1.0).abs() < 1e-9);
@@ -20785,28 +28542,14 @@ mod ds_tests {
             ch,
             bayer: None,
         };
-        let measurement = ds_measure_dark_scaling(
-            &light,
-            Some(&bias),
-            &dark,
-            k_true,
-            false,
-            true,
-        )
-        .expect("evidencia lineal exacta");
+        let measurement = ds_measure_dark_scaling(&light, Some(&bias), &dark, k_true, false, true)
+            .expect("evidencia lineal exacta");
         assert!((measurement.scale - k_true).abs() < 1.0e-6);
         assert!(measurement.correlation >= 0.995);
         assert!(measurement.linearity_r2 >= 0.995);
         assert!(measurement.residual_fraction <= 0.01);
-        let glow_error = ds_measure_dark_scaling(
-            &light,
-            Some(&bias),
-            &dark,
-            k_true,
-            true,
-            true,
-        )
-        .unwrap_err();
+        let glow_error =
+            ds_measure_dark_scaling(&light, Some(&bias), &dark, k_true, true, true).unwrap_err();
         assert!(glow_error.contains("amp glow"));
     }
 
@@ -20934,20 +28677,24 @@ mod ds_tests {
         for probe in &mut flat_probes {
             probe.store_layout = Some(pipeline::StoreLayout::Mono);
         }
-        assert!(ds_compare_probe_calibration(
-            &reference,
-            &flat_probes[0],
-            crate::deepsky_calibration_contract::CalibrationRole::Flat,
-            pipeline::DeepSkyCalibrationPolicy::Strict,
-        )
-        .compatible);
-        assert!(!ds_compare_probe_calibration(
-            &reference,
-            &flat_probes[1],
-            crate::deepsky_calibration_contract::CalibrationRole::Flat,
-            pipeline::DeepSkyCalibrationPolicy::Strict,
-        )
-        .compatible);
+        assert!(
+            ds_compare_probe_calibration(
+                &reference,
+                &flat_probes[0],
+                crate::deepsky_calibration_contract::CalibrationRole::Flat,
+                pipeline::DeepSkyCalibrationPolicy::Strict,
+            )
+            .compatible
+        );
+        assert!(
+            !ds_compare_probe_calibration(
+                &reference,
+                &flat_probes[1],
+                crate::deepsky_calibration_contract::CalibrationRole::Flat,
+                pipeline::DeepSkyCalibrationPolicy::Strict,
+            )
+            .compatible
+        );
         let bias_probe = flat_probes[0].clone();
         let bias_only_decisions = ds_prepare_calibration_decisions(
             &[reference.clone()],
@@ -21031,7 +28778,9 @@ mod ds_tests {
             pedestal: Some(0.0),
             local_weighting: false,
             work_dir: None,
+            integration_products: Vec::new(),
             integration_method: None,
+            comet: None,
             scientific_products: false,
         };
         // Receta v4: sin integration_method el método efectivo es Classic con
@@ -21281,9 +29030,36 @@ mod ds_tests {
             let _guard = DsSessionOutputGuard {
                 path: path.clone(),
                 committed: false,
+                preserved_children: Vec::new(),
             };
         }
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_deepsky_cancel_preserves_only_fully_published_product_directories() {
+        let path = std::env::temp_dir().join(new_job_id("ds-products-cancel-test"));
+        let complete = path.join("01_Classic");
+        let partial = path.join("02_NebulaFusion");
+        std::fs::create_dir_all(&complete).unwrap();
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(complete.join("Master.fits"), b"complete").unwrap();
+        std::fs::write(partial.join("Master.fits.part"), b"partial").unwrap();
+        {
+            let mut guard = DsSessionOutputGuard {
+                path: path.clone(),
+                committed: false,
+                preserved_children: Vec::new(),
+            };
+            guard.preserve_child(complete.clone());
+        }
+        assert!(complete.join("Master.fits").is_file());
+        assert!(!partial.exists());
+        assert!(
+            path.join("APILADO_INCOMPLETO__PRODUCTOS_PRESERVADOS.txt")
+                .is_file()
+        );
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]
@@ -21400,6 +29176,7 @@ mod ds_tests {
             ([1.0; 3], [0.0; 3]),
             None,
             None,
+            None,
         );
         let tw: f64 = wgt.iter().sum();
         let expected = (w * h) as f64 * (pixfrac * scale).powi(2) as f64;
@@ -21478,6 +29255,7 @@ mod ds_tests {
             ([1.0; 3], [0.0; 3]),
             None,
             None,
+            None,
         );
         let c0 = centroid_x(&sum);
         assert!(
@@ -21505,6 +29283,7 @@ mod ds_tests {
             2.0,
             1.0,
             ([1.0; 3], [0.0; 3]),
+            None,
             None,
             None,
         );
@@ -21698,6 +29477,209 @@ mod ds_tests {
         }
     }
 
+    /// B12 — transformada proyectiva usada por los dos tests de invariancia
+    /// de banda: h7 = 0.04 pone el horizonte inverso (v = 25 en la referencia,
+    /// fila 50 de la salida a 2×) DENTRO del lienzo. Las esquinas del
+    /// rectángulo de banda única — Y su punto central (v = 32, también tras
+    /// el horizonte) — se invierten con el signo cambiado: sin el muestreo de
+    /// aristas el bbox de banda única colapsaba a la fila 0 de entrada
+    /// mientras el multibanda quedaba casi completo — el resultado dependía
+    /// del número de hilos del pool.
+    fn ds_test_strong_projective() -> DsTransform {
+        DsTransform {
+            model: DsRegistrationModel::Projective,
+            h: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.04, 1.0],
+            poly: [0.0; 12],
+            norm: [0.0, 0.0, 1.0],
+        }
+    }
+
+    #[test]
+    fn test_ds_drizzle_nonlinear_bbox_uses_provably_conservative_full_frame() {
+        let projective = ds_test_strong_projective();
+        let local = DsTransform {
+            model: DsRegistrationModel::LocalDistortion,
+            h: DsTransform::identity().h,
+            poly: [0.0, 0.0, 0.02, -0.015, 0.01, 0.0, 0.0, 0.0, -0.01, 0.02, -0.005, 0.0],
+            norm: [32.0, 24.0, 32.0],
+        };
+        for transform in [projective, local] {
+            assert_eq!(
+                ds_drizzle_band_input_bbox(transform, 128, 17, 31, 1.0, 2.0, 64, 48),
+                Some((0, 63, 0, 47)),
+                "una cota no lineal muestreada no puede sustituir al fallback completo"
+            );
+        }
+        assert_eq!(
+            ds_drizzle_band_input_bbox(projective, 128, 0, 1, 1.0, 2.0, 0, 48),
+            None
+        );
+    }
+
+    #[test]
+    fn test_ds_drizzle_projective_bbox_is_band_partition_invariant() {
+        // La acumulación por píxel de salida debe ser independiente del
+        // particionado en bandas: mismas contribuciones, mismo orden
+        // row-major → sumas y pesos BIT-idénticos con 1 u 8 bandas.
+        let (w, h) = (64usize, 64usize);
+        let data: Vec<f32> = (0..w * h).map(|i| 100.0 + (i % 97) as f32).collect();
+        let img = DsImage {
+            data,
+            w,
+            h,
+            ch: 1,
+            bayer: None,
+        };
+        let t = ds_test_strong_projective();
+        let (wo, ho) = (w * 2, h * 2);
+        let run = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let mut sum = vec![0.0f64; wo * ho];
+            let mut wgt = vec![0.0f64; wo * ho];
+            pool.install(|| {
+                ds_drizzle_accumulate(
+                    &img,
+                    t,
+                    &mut sum,
+                    None,
+                    &mut wgt,
+                    None,
+                    None,
+                    wo,
+                    ho,
+                    1,
+                    1.0,
+                    2.0,
+                    1.0,
+                    ([1.0; 3], [0.0; 3]),
+                    None,
+                    None,
+                    None,
+                );
+            });
+            (sum, wgt)
+        };
+        let (sum_single, wgt_single) = run(1); // band_h = h → banda única
+        let (sum_multi, wgt_multi) = run(8); // partición multibanda del pool
+        assert!(
+            sum_single
+                .iter()
+                .zip(&sum_multi)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "las sumas deben ser BIT-idénticas con 1 u 8 bandas"
+        );
+        assert!(
+            wgt_single
+                .iter()
+                .zip(&wgt_multi)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "los pesos deben ser BIT-idénticos con 1 u 8 bandas"
+        );
+        // Cobertura completa: cada gota (2×2 px de salida) conserva su área
+        // salvo el recorte del borde x<0. El déficit de banda única del bbox
+        // antiguo (sólo la fila 0 de entrada) dejaba el peso total en ~1.6%.
+        let expected = (w * h) as f64 * 4.0;
+        let total: f64 = wgt_single.iter().sum();
+        assert!(
+            total > expected * 0.95 && total <= expected * 1.001,
+            "peso total {total} vs esperado {expected}"
+        );
+    }
+
+    #[test]
+    fn test_ds_drizzle_cfa_projective_bbox_matches_band_partitions() {
+        // Mismo invariante para el kernel CFA (que además carecía del margen
+        // +1 de la convención centro): bit-identidad entre particionados y
+        // cobertura no trivial bajo la proyectiva fuerte.
+        let (w, h) = (64usize, 64usize);
+        let mut raw = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                raw[y * w + x] = [1000.0, 2000.0, 3000.0][ds_cfa_channel(8, x, y)];
+            }
+        }
+        let img = DsImage {
+            data: raw,
+            w,
+            h,
+            ch: 1,
+            bayer: Some(8),
+        };
+        let t = ds_test_strong_projective();
+        let (wo, ho) = (w * 2, h * 2);
+        let run = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let mut sum = vec![0.0f64; wo * ho * 3];
+            let mut wgt = vec![0.0f64; wo * ho * 3];
+            pool.install(|| {
+                ds_drizzle_cfa_accumulate(
+                    &img,
+                    8,
+                    t,
+                    &mut sum,
+                    None,
+                    &mut wgt,
+                    None,
+                    None,
+                    wo,
+                    ho,
+                    1.0,
+                    2.0,
+                    1.0,
+                    ([1.0; 3], [0.0; 3]),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            });
+            (sum, wgt)
+        };
+        let (sum_single, wgt_single) = run(1);
+        let (sum_multi, wgt_multi) = run(8);
+        assert!(
+            sum_single
+                .iter()
+                .zip(&sum_multi)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "las sumas CFA deben ser BIT-idénticas con 1 u 8 bandas"
+        );
+        assert!(
+            wgt_single
+                .iter()
+                .zip(&wgt_multi)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "los pesos CFA deben ser BIT-idénticos con 1 u 8 bandas"
+        );
+        // El peso total por canal refleja la densidad Bayer (R:G:B = ¼:½:¼)
+        // sobre TODO el frame de entrada, no sólo la fila 0 del bbox roto.
+        let per_channel = |wgt: &[f64], c: usize| -> f64 {
+            wgt.iter().skip(c).step_by(3).sum()
+        };
+        let (r, g, b) = (
+            per_channel(&wgt_single, 0),
+            per_channel(&wgt_single, 1),
+            per_channel(&wgt_single, 2),
+        );
+        let expected = (w * h) as f64 * 4.0;
+        let total = r + g + b;
+        assert!(
+            total > expected * 0.95 && total <= expected * 1.001,
+            "peso total CFA {total} vs esperado {expected}"
+        );
+        assert!(
+            (g / total - 0.5).abs() < 0.02 && (r / total - 0.25).abs() < 0.02,
+            "densidades Bayer R={r} G={g} B={b}"
+        );
+    }
+
     #[test]
     fn test_ds_dither_position_count_covers_mono_rgb_and_cfa() {
         let registered = [
@@ -21728,6 +29710,91 @@ mod ds_tests {
         ];
         assert_eq!(ds_count_dither_positions(&undithered, 100, 80, false), 1);
         assert_eq!(ds_count_dither_positions(&undithered, 100, 80, true), 1);
+    }
+
+    #[test]
+    fn test_ds_safe_drizzle_pixfrac_closes_sparse_cfa_coverage() {
+        let (sparse, sparse_reason) = ds_safe_drizzle_pixfrac(0.8, 2.0, true, 15, 12);
+        assert_eq!(sparse, 1.0);
+        assert!(
+            sparse_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("15 tomas")
+                    && reason.contains("12/16 fases")),
+            "{sparse_reason:?}"
+        );
+
+        let (dense, dense_reason) = ds_safe_drizzle_pixfrac(0.8, 2.0, true, 40, 16);
+        assert_eq!(dense, 0.8);
+        assert!(dense_reason.is_none());
+
+        let (rgb, rgb_reason) = ds_safe_drizzle_pixfrac(0.7, 2.0, false, 12, 4);
+        assert_eq!(rgb, 0.7);
+        assert!(rgb_reason.is_none());
+    }
+
+    #[test]
+    fn test_sparse_cfa_drizzle_uses_rgb_fallback_instead_of_a_bayer_mesh() {
+        assert!(ds_cfa_drizzle_needs_rgb_fallback(2.0, 15, 12));
+        assert!(ds_cfa_drizzle_needs_rgb_fallback(2.0, 40, 15));
+        assert!(!ds_cfa_drizzle_needs_rgb_fallback(2.0, 40, 16));
+        assert!(!ds_cfa_drizzle_needs_rgb_fallback(1.0, 8, 1));
+    }
+
+    #[test]
+    fn test_product_output_names_explain_scale_and_fallbacks() {
+        assert_eq!(
+            ds_product_output_folder_name(
+                0,
+                pipeline::DeepSkyIntegrationProductKind::Classic,
+                2.0,
+                "ready",
+            ),
+            "01_Classic_Drizzle_2x"
+        );
+        assert_eq!(
+            ds_product_output_folder_name(
+                2,
+                pipeline::DeepSkyIntegrationProductKind::Struct,
+                1.0,
+                "fallback",
+            ),
+            "03_STRUCT__SCI_Dependencia_STRUCT_No_Generado"
+        );
+        assert_eq!(
+            ds_product_output_folder_name(
+                3,
+                pipeline::DeepSkyIntegrationProductKind::Eidr,
+                1.0,
+                "fallback",
+            ),
+            "04_EIDR__Classic_Conservado_EIDR_No_Validado"
+        );
+    }
+
+    #[test]
+    fn test_reusable_cache_invalidates_when_manual_assignment_changes() {
+        let original = pipeline::DeepSkyCalibrationOverride {
+            lights: vec!["light-01.fits".into()],
+            flats: vec!["flat-night-a.fits".into()],
+            user_verified_scientific: true,
+            user_verification_reason: Some("Mismo tren óptico".into()),
+            ..Default::default()
+        };
+        let mut changed = original.clone();
+        changed.flats = vec!["flat-night-b.fits".into()];
+
+        let first = ds_calibration_overrides_fingerprint(&[original.clone()]);
+        assert_eq!(
+            first,
+            ds_calibration_overrides_fingerprint(&[original]),
+            "la misma asignación debe conservar la caché"
+        );
+        assert_ne!(
+            first,
+            ds_calibration_overrides_fingerprint(&[changed]),
+            "cambiar el flat manual debe invalidar calibración, análisis y registro"
+        );
     }
 
     #[test]
@@ -21791,16 +29858,16 @@ mod ds_tests {
             .expect("una toma mediocre pero válida conserva un peso bajo real");
         assert!(retained >= 0.05 && retained < 0.3, "peso {retained}");
 
-        let cloudy = ds_frame_quality_weight(2.2, 2.0, 5.0, 100.0, 0.20, 0.20, 0.15)
-            .unwrap_err();
+        let cloudy = ds_frame_quality_weight(2.2, 2.0, 5.0, 100.0, 0.20, 0.20, 0.15).unwrap_err();
         assert!(cloudy.contains("transparencia"), "{cloudy}");
-        let trailed = ds_frame_quality_weight(2.2, 2.0, 80.0, 100.0, 0.70, 0.20, 0.15)
-            .unwrap_err();
+        let trailed = ds_frame_quality_weight(2.2, 2.0, 80.0, 100.0, 0.70, 0.20, 0.15).unwrap_err();
         assert!(trailed.contains("alargadas"), "{trailed}");
         let bad_registration =
-            ds_frame_quality_weight(2.2, 2.0, 80.0, 100.0, 0.20, 1.0, 0.15)
-                .unwrap_err();
-        assert!(bad_registration.contains("astrométrico"), "{bad_registration}");
+            ds_frame_quality_weight(2.2, 2.0, 80.0, 100.0, 0.20, 1.0, 0.15).unwrap_err();
+        assert!(
+            bad_registration.contains("astrométrico"),
+            "{bad_registration}"
+        );
     }
 
     #[test]
@@ -21822,6 +29889,56 @@ mod ds_tests {
         let uni = vec![50.0f64; w * h];
         let (_, uw, uh) = ds_autocrop(&data, &uni, w, h, ch);
         assert_eq!((uw, uh), (w, h), "cobertura uniforme no debe recortar");
+    }
+
+    #[test]
+    fn test_ds_autocrop_disabled_is_an_exact_noop() {
+        let (w, h, ch) = (8usize, 6usize, 1usize);
+        let data = (0..w * h).map(|value| value as f32).collect::<Vec<_>>();
+        let mut coverage = vec![0.0f64; w * h];
+        for y in 2..4 {
+            for x in 2..6 {
+                coverage[y * w + x] = 100.0;
+            }
+        }
+        let (output, nw, nh, x0, y0) = ds_apply_autocrop(false, &data, &coverage, w, h, ch);
+        assert_eq!((nw, nh, x0, y0), (w, h, 0, 0));
+        assert_eq!(output, data);
+    }
+
+    #[test]
+    fn test_ds_preview_repairs_non_finite_pixels_without_touching_science() {
+        let (w, h, ch) = (3usize, 3usize, 1usize);
+        let mut science = vec![100.0f32; w * h * ch];
+        science[0] = 7.0;
+        science[4] = f32::NAN;
+        let preview = ds_preview_rgb16(&science, w, h, ch);
+
+        assert_eq!(&preview[0..3], &[7, 7, 7]);
+        assert_eq!(&preview[4 * 3..4 * 3 + 3], &[88, 88, 88]);
+        assert!(science[4].is_nan(), "la reparación debe ser sólo de vista");
+    }
+
+    #[test]
+    fn test_ds_clip_window_never_uses_weight_as_sample_count() {
+        // El caso que dejaba el sigma-clip apagado: ocho aportes de 0.1 bajo
+        // un frame global de peso 1.0. Cualquier cobertura positiva abre la
+        // ventana independientemente de la escala de pesos.
+        assert!(ds_clip_window_has_coverage(0.1));
+        assert!(ds_clip_window_has_coverage(0.8));
+        assert!(ds_clip_window_has_coverage(1.0));
+        assert!(!ds_clip_window_has_coverage(0.0));
+        assert!(!ds_clip_window_has_coverage(-0.1));
+        assert!(!ds_clip_window_has_coverage(f64::NAN));
+
+        // Una muestra aislada sigue siendo estable: su varianza poblacional
+        // es cero y por tanto el límite contiene exactamente a la muestra.
+        let sample = 123.0f64;
+        let weight = 0.1f64;
+        let mean = sample * weight / weight;
+        let variance = (sample * sample * weight / weight - mean * mean).max(0.0);
+        assert_eq!(variance, 0.0);
+        assert_eq!(mean, sample);
     }
 
     #[test]
@@ -21894,6 +30011,59 @@ mod ds_tests {
     }
 
     #[test]
+    fn test_ds_reject_pixel_cold_outlier_reports_only_low_tail() {
+        // B5: un único píxel frío entre cuatro muestras altas debe emitir TODO
+        // su peso en Rechazo_Bajo y nada en Rechazo_Alto (es el frío quien
+        // violó la ventana inferior). El reparto proporcional antiguo usaba
+        // las masas de cola COMPLETAS (incluyendo las conservadas) y daba
+        // low=0.2/high=0.8 aquí: un defecto de píxel frío se reportaba como
+        // caliente en el FITS científico.
+        let mut s: Vec<(f32, f64)> = [1.0f32, 100.0, 100.0, 100.0, 100.0]
+            .iter()
+            .map(|&v| (v, 1.0))
+            .collect();
+        let (mut cov, mut lo, mut hi) = (0.0, 0.0, 0.0);
+        let r = ds_reject_pixel(&mut s, "winsorized", 3.0, 3.0, &mut cov, &mut lo, &mut hi, 4.0);
+        assert!((r - 100.0).abs() < 1e-4, "estimador {r} (esperado 100)");
+        assert_eq!(lo, 1.0, "el frío debe reportarse íntegro en la cola baja");
+        assert_eq!(hi, 0.0, "ninguna muestra violó la cola alta");
+        assert!((cov - 4.0).abs() < 1e-12, "cobertura {cov}");
+        // Conservación: low+high sigue siendo el peso rechazado total.
+        assert!((lo + hi - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_ds_reject_pixel_two_sided_outliers_split_by_violated_tail() {
+        // B5 bilateral: fríos (1 y 50) bajo la ventana y un caliente (200)
+        // sobre ella. Con κ=1.5 el primer ciclo Winsorized rechaza 1 (low) y
+        // 200 (high) y el segundo rechaza 50 (low): low=2.0 y high=1.0 exactos
+        // con pesos unitarios. El reparto proporcional antiguo daba justo lo
+        // contrario (low=1.0/high=2.0) porque las tres muestras conservadas de
+        // 100 engordaban la masa de la cola alta.
+        let data = [1.0f32, 50.0, 100.0, 100.0, 100.0, 200.0];
+        let mut s: Vec<(f32, f64)> = data.iter().map(|&v| (v, 1.0)).collect();
+        let (mut cov, mut lo, mut hi) = (0.0, 0.0, 0.0);
+        let r = ds_reject_pixel(&mut s, "winsorized", 1.5, 1.5, &mut cov, &mut lo, &mut hi, 4.0);
+        assert!((r - 100.0).abs() < 1e-4, "estimador {r} (esperado 100)");
+        assert_eq!(lo, 2.0, "1 y 50 violaron la ventana inferior");
+        assert_eq!(hi, 1.0, "200 violó la ventana superior");
+        assert!((cov - 3.0).abs() < 1e-12, "cobertura {cov}");
+
+        // minmax: por construcción el mínimo (1) es low y el máximo (200) high.
+        let mut s = data.iter().map(|&v| (v, 1.0)).collect();
+        let r = ds_reject_pixel(&mut s, "minmax", 3.0, 3.0, &mut cov, &mut lo, &mut hi, 4.0);
+        assert!((r - 87.5).abs() < 1e-4, "minmax estimador {r}");
+        assert_eq!(lo, 1.0, "minmax: solo el mínimo va a la cola baja");
+        assert_eq!(hi, 1.0, "minmax: solo el máximo va a la cola alta");
+
+        // percentile κ=3 sobre n=6 recorta 1 rango por cola: mismo reparto.
+        let mut s = data.iter().map(|&v| (v, 1.0)).collect();
+        let _ = ds_reject_pixel(&mut s, "percentile", 3.0, 3.0, &mut cov, &mut lo, &mut hi, 4.0);
+        assert_eq!(lo, 1.0, "percentile: rango inferior a la cola baja");
+        assert_eq!(hi, 1.0, "percentile: rango superior a la cola alta");
+    }
+
+    #[test]
     fn test_ds_norm_scale_decision_distinguishes_normalized_from_adu() {
         // SIRIL/PI normalized 0..1 (peak in [0,1], tiny mean) → ×65535.
         assert_eq!(ds_norm_scale_decision(0.92, 0.05, None), 65535.0);
@@ -21910,7 +30080,10 @@ mod ds_tests {
     fn test_ds_nonfinite_inputs_are_detected_instead_of_sanitized_to_zero() {
         let samples = [0.0, -3.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
         assert_eq!(ds_nonfinite_sample_count(&samples), 3);
-        assert_eq!(samples[0], 0.0, "un cero real sigue siendo una muestra válida");
+        assert_eq!(
+            samples[0], 0.0,
+            "un cero real sigue siendo una muestra válida"
+        );
         assert!(samples[2].is_nan(), "el lector no debe fabricar un cero");
     }
 
@@ -22216,6 +30389,11 @@ mod ds_tests {
             struct_map: None,
             struct_residual: None,
             recoverability: None,
+            source_data: None,
+            source_variance: None,
+            source_layout: None,
+            post_stack_recipe: PostStackRecipe::default(),
+            astrometry_solution: None,
         };
         ds_write_recipe(&path, &result).unwrap();
         let recipe: serde_json::Value =
@@ -22306,6 +30484,71 @@ mod ds_tests {
     }
 
     #[test]
+    fn test_ds_wcs_metadata_is_identical_for_sci_and_same_geometry_maps() {
+        let recipe = serde_json::json!({
+            "wcs": {
+                "ctype": "TAN",
+                "crval1": 274.7,
+                "crval2": -13.8,
+                "crpix1": 1000.5,
+                "crpix2": 800.5,
+                "cd11": -2.7777777778e-4,
+                "cd12": 0.0,
+                "cd21": 0.0,
+                "cd22": 2.7777777778e-4,
+                "pixelWidth": 2000,
+                "pixelHeight": 1600,
+                "geometryFingerprint": "wcs-grid-fixture"
+            }
+        });
+        let wcs = ds_wcs_fits_metadata(&recipe, 2000, 1600);
+        assert!(wcs.iter().any(|(key, _)| *key == "CTYPE1"));
+        assert!(wcs.iter().any(|(key, _)| *key == "CRPIX1"));
+        assert!(wcs.iter().any(|(key, _)| *key == "CD2_2"));
+        assert!(wcs.iter().any(|(key, _)| *key == "ZASWCSFP"));
+
+        let sci = ds_metadata_with_wcs(
+            vec![("EXTNAME", "'SCI'".into()), ("BUNIT", "'ADU'".into())],
+            &wcs,
+        );
+        let dq = ds_metadata_with_wcs(
+            vec![("EXTNAME", "'DQ'".into()), ("BUNIT", "'BITMASK'".into())],
+            &wcs,
+        );
+        for key in [
+            "CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2", "CD1_1", "CD1_2", "CD2_1",
+            "CD2_2",
+        ] {
+            let sci_value = sci
+                .iter()
+                .find(|(candidate, _)| *candidate == key)
+                .map(|(_, value)| value.clone());
+            let dq_value = dq
+                .iter()
+                .find(|(candidate, _)| *candidate == key)
+                .map(|(_, value)| value.clone());
+            assert_eq!(sci_value, dq_value, "{key} debe coincidir");
+        }
+        let invalid = ds_wcs_fits_metadata(&recipe, 1000, 800);
+        assert!(
+            invalid.iter().all(|(key, _)| !key.starts_with("CTYPE")),
+            "una geometría distinta no debe publicar una proyección"
+        );
+        assert!(invalid
+            .iter()
+            .any(|(key, value)| *key == "ZASWCSIV" && value.contains("GEOMETRY_MISMATCH")));
+
+        let path = std::env::temp_dir().join(format!("zas-wcs-header-{}.fits", std::process::id()));
+        ds_save_float32_fits(&path, &[1.0], 1, 1, 1, &sci).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let header = String::from_utf8_lossy(&bytes[..2880]);
+        for keyword in ["CTYPE1", "CRVAL1", "CRPIX1", "CD1_1", "CD2_2"] {
+            assert!(header.contains(keyword), "falta {keyword} en FITS");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn test_ds_fits_bunit_matches_scientific_product() {
         let dir = std::env::temp_dir().join(format!("zas-bunit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -22325,7 +30568,11 @@ mod ds_tests {
                 header.contains(&format!("BUNIT   = {expected}")),
                 "{name}: {header}"
             );
-            assert_eq!(header.matches("BUNIT").count(), 1, "BUNIT duplicado en {name}");
+            assert_eq!(
+                header.matches("BUNIT").count(),
+                1,
+                "BUNIT duplicado en {name}"
+            );
         }
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -22384,6 +30631,11 @@ mod ds_tests {
             struct_map: Some(vec![100.0, 101.0, 102.0, 103.0]),
             struct_residual: Some(vec![-1.0, 0.0, 1.0, 2.0]),
             recoverability: Some(vec![0.9, 0.8, 0.7, 0.6]),
+            source_data: None,
+            source_variance: None,
+            source_layout: None,
+            post_stack_recipe: PostStackRecipe::default(),
+            astrometry_solution: None,
         };
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let (master, components, diagnostics, bundle) = ds_export_session_result(
@@ -22395,12 +30647,16 @@ mod ds_tests {
             &DualBandExtractionOptions::default(),
             DeepSkyCaptureMode::Auto,
             DeepSkyCalibrationPolicy::Strict,
+            true,
             &cancel,
         )
         .unwrap();
 
         assert!(std::path::Path::new(&master).is_file());
-        assert_eq!(bundle.recipe_schema, pipeline::DEEP_SKY_RECIPE_SCHEMA_VERSION);
+        assert_eq!(
+            bundle.recipe_schema,
+            pipeline::DEEP_SKY_RECIPE_SCHEMA_VERSION
+        );
         assert_eq!(bundle.capture_mode, DeepSkyCaptureMode::DualBandOsc);
         assert_eq!(
             bundle.calibration_policy,
@@ -22469,5 +30725,797 @@ mod ds_tests {
     fn test_ds_eidr_empty_cfa_gate_merge_is_an_error_not_a_panic() {
         let error = ds_eidr_merge_cfa_gate_reports(Vec::new()).unwrap_err();
         assert!(error.contains("no hay reportes"), "{error}");
+    }
+
+    #[test]
+    fn test_ds_comet_trajectory_recovers_known_linear_motion() {
+        let observations = (0..7)
+            .map(|index| {
+                let dt = index as f64 * 12.0;
+                pipeline::CometObservation {
+                    frame_path: format!("light_{index:03}.fits"),
+                    timestamp_unix: 1_720_000_000.0 + dt,
+                    registered_x: 120.0 + 0.42 * dt as f32,
+                    registered_y: 88.0 - 0.17 * dt as f32,
+                    confirmed: true,
+                }
+            })
+            .collect::<Vec<_>>();
+        let trajectory = ds_fit_comet_observations(&observations).unwrap();
+        assert!((trajectory.velocity_x_px_s - 0.42).abs() < 1e-4);
+        assert!((trajectory.velocity_y_px_s + 0.17).abs() < 1e-4);
+        assert!(trajectory.rms_px < 1e-3);
+        assert!(trajectory.confidence > 0.95);
+    }
+
+    #[test]
+    fn test_ds_comet_trajectory_requires_three_confirmed_timestamps() {
+        let observations = (0..3)
+            .map(|index| pipeline::CometObservation {
+                frame_path: format!("light_{index}.fits"),
+                timestamp_unix: 1000.0 + index as f64,
+                registered_x: index as f32,
+                registered_y: index as f32,
+                confirmed: index < 2,
+            })
+            .collect::<Vec<_>>();
+        let error = ds_fit_comet_observations(&observations).unwrap_err();
+        assert!(error.contains("tres posiciones"), "{error}");
+    }
+
+    #[test]
+    fn test_ds_comet_output_translation_is_composed_into_one_transform() {
+        let translated = DsTransform::identity().translated_output(4.5, -2.25);
+        let (x, y) = translated.forward(10.0, 20.0);
+        assert!((x - 14.5).abs() < 1e-6);
+        assert!((y - 17.75).abs() < 1e-6);
+        assert_eq!(translated.model, DsRegistrationModel::Similarity);
+    }
+
+    #[test]
+    fn test_ds_comet_translation_uses_effective_stack_reference_grid() {
+        // 90° + escala 2 + traslación. Un delta detector (2,2) se convierte
+        // en (-4,4); usarlo crudo desalinearía la rama cuando el apilador
+        // escoge una referencia distinta a la primera toma cronológica.
+        let detector_to_stack = DsTransform::from_similarity((0.0, 2.0, 10.0, 20.0));
+        let (dx, dy) =
+            ds_comet_translation_in_stack_grid(detector_to_stack, 3.0, 4.0, 1.0, 2.0).unwrap();
+        assert!((dx + 4.0).abs() < 1e-6);
+        assert!((dy - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_ds_comet_residual_cutoff_is_true_mad() {
+        // B11a — caso de auditoría: residuos base ~2.2 px y blunder de 9 px.
+        // MAD real: med = 2.3, mad = 1.4826·0.2 → corte ≈ 3.19 px. El corte
+        // antiguo `3·mediana` daba ≈ 6.9 px (escala con el NIVEL, no con la
+        // dispersión) y DEJABA PASAR el blunder.
+        let residuals = [2.0f32, 2.1, 2.2, 2.3, 2.4, 9.0];
+        let cutoff = ds_comet_residual_cutoff(&residuals);
+        assert!(
+            (cutoff - (2.3 + 3.0 * 1.4826 * 0.2)).abs() < 1e-4,
+            "corte {cutoff}"
+        );
+        assert!(9.0 > cutoff, "el blunder de 9 px debe quedar fuera");
+        assert!(
+            residuals
+                .iter()
+                .filter(|&&residual| residual < 9.0)
+                .all(|&residual| residual <= cutoff),
+            "los residuos base deben sobrevivir al corte {cutoff}"
+        );
+        assert!(
+            cutoff < 6.75,
+            "regresión: el corte antiguo 3·mediana (≈6.9) no rechazaba el blunder"
+        );
+
+        // Residuos diminutos: el corte MAD puro sería 0.74 px, por debajo de
+        // la incertidumbre del centroide manual. El suelo de 1.5 px evita el
+        // sobre-rechazo y aun así expulsa el blunder de 4 px.
+        let small = [0.2f32, 0.2, 0.3, 0.3, 0.4, 4.0];
+        let cutoff = ds_comet_residual_cutoff(&small);
+        assert!((cutoff - 1.5).abs() < 1e-6, "suelo 1.5 esperado: {cutoff}");
+        assert!(4.0 > cutoff, "el blunder de 4 px debe quedar fuera");
+        assert!(small
+            .iter()
+            .filter(|&&residual| residual < 4.0)
+            .all(|&residual| residual <= cutoff));
+
+        // Conjunto homogéneo: nadie supera med + 3·MAD → sin rechazos.
+        let homogeneous = [2.0f32, 2.1, 2.2, 2.3, 2.4];
+        let cutoff = ds_comet_residual_cutoff(&homogeneous);
+        assert!(
+            homogeneous.iter().all(|&residual| residual <= cutoff),
+            "un conjunto homogéneo no debe perder puntos (corte {cutoff})"
+        );
+    }
+
+    #[test]
+    fn test_ds_comet_trajectory_rejects_blunder_and_recovers_motion() {
+        // Nueve posiciones exactas sobre la recta + un blunder de 9 px (núcleo
+        // confundido con una estrella) en el timestamp central, donde su
+        // palanca sobre la pendiente es mínima pero contamina la media. El
+        // corte robusto lo expulsa y el reajuste recupera la velocidad
+        // verdadera con RMS sub-píxel.
+        let base = 1_720_000_000.0f64;
+        let mut observations: Vec<pipeline::CometObservation> = [
+            0.0f64, 12.0, 24.0, 36.0, 48.0, 72.0, 84.0, 96.0, 108.0,
+        ]
+        .iter()
+        .map(|&dt| pipeline::CometObservation {
+            frame_path: format!("light_{dt:03.0}.fits"),
+            timestamp_unix: base + dt,
+            registered_x: 50.0 + 0.40 * dt as f32,
+            registered_y: 90.0 - 0.25 * dt as f32,
+            confirmed: true,
+        })
+        .collect();
+        observations.push(pipeline::CometObservation {
+            frame_path: "light_blunder.fits".into(),
+            timestamp_unix: base + 60.0,
+            registered_x: 50.0 + 0.40 * 60.0,
+            registered_y: 90.0 - 0.25 * 60.0 + 9.0,
+            confirmed: true,
+        });
+        let trajectory = ds_fit_comet_observations(&observations).unwrap();
+        assert!(
+            (trajectory.velocity_x_px_s - 0.40).abs() < 1e-3,
+            "vx {}",
+            trajectory.velocity_x_px_s
+        );
+        assert!(
+            (trajectory.velocity_y_px_s + 0.25).abs() < 1e-3,
+            "vy {}",
+            trajectory.velocity_y_px_s
+        );
+        assert!(
+            trajectory.rms_px < 0.5,
+            "RMS {} — el blunder debe quedar fuera del ajuste",
+            trajectory.rms_px
+        );
+    }
+
+    #[test]
+    fn test_ds_comet_mask_is_elliptical_under_anisotropic_scale() {
+        // B11b — escala x2 / y1: la imagen del círculo físico de 16 px es una
+        // elipse 32×16. El círculo antiguo con min(escala) = 1 cortaba en
+        // 16 px también sobre el eje mayor y trataba media coma como fondo.
+        let (radius_x, radius_y) = (16.0f32 * 2.0, 16.0f32 * 1.0);
+        // Eje mayor (x): borde en 32 px.
+        assert!(ds_comet_elliptical_rho(31.0, 0.0, radius_x, radius_y) < 1.0);
+        assert!(ds_comet_elliptical_rho(33.0, 0.0, radius_x, radius_y) > 1.0);
+        // Eje menor (y): borde en 16 px.
+        assert!(ds_comet_elliptical_rho(0.0, 15.0, radius_x, radius_y) < 1.0);
+        assert!(ds_comet_elliptical_rho(0.0, 17.0, radius_x, radius_y) > 1.0);
+        // Punto sobre el eje mayor que el círculo antiguo (radio 16) trataba
+        // como fondo pese a estar dentro de la coma física.
+        assert!(ds_comet_elliptical_rho(20.0, 0.0, radius_x, radius_y) <= 0.82);
+    }
+
+    #[test]
+    fn test_ds_comet_layer_mask_follows_anisotropic_output_scale() {
+        // B11b extremo a extremo: con outputScaleX=2 / outputScaleY=1 la
+        // máscara de la capa cometaria debe conservar señal a 28 px sobre el
+        // eje x (ρ = 0.875, dentro de la elipse 32×16) y descartar 28 px
+        // sobre el eje y (ρ = 1.75, fuera).
+        let (w, h) = (96usize, 96usize);
+        let npx = w * h;
+        let result = |id: &str, data: Vec<f32>| DeepSkyResult {
+            id: id.into(),
+            data,
+            width: w,
+            height: h,
+            channels: 1,
+            coverage: vec![10.0; npx],
+            weight: vec![10.0; npx],
+            rejection_low: vec![0.0; npx],
+            rejection_high: vec![0.0; npx],
+            registration_residuals: Vec::new(),
+            engine: "fixture".into(),
+            method: "fixture".into(),
+            frames_used: 10,
+            frames_rejected: 0,
+            elapsed_seconds: 0.0,
+            recipe: serde_json::json!({
+                "cometAlignment": {
+                    "effectiveGrid": {
+                        "anchorX": 48.0,
+                        "anchorY": 48.0,
+                        "outputScaleX": 2.0,
+                        "outputScaleY": 1.0,
+                    }
+                }
+            }),
+            variance: None,
+            neff: None,
+            dq: Some(vec![0; npx]),
+            struct_map: None,
+            struct_residual: None,
+            recoverability: None,
+            source_data: None,
+            source_variance: None,
+            source_layout: None,
+            post_stack_recipe: PostStackRecipe::default(),
+            astrometry_solution: None,
+        };
+        let stars = result("stars", vec![100.0; npx]);
+        let comet_aligned = result("comet-aligned", vec![10.0; npx]);
+        let request = pipeline::CometStackRequest {
+            enabled: true,
+            observations: vec![pipeline::CometObservation {
+                timestamp_unix: 1_000.0,
+                registered_x: 48.0,
+                registered_y: 48.0,
+                confirmed: true,
+                ..Default::default()
+            }],
+            trajectory: pipeline::CometTrajectory {
+                epoch_unix: 1_000.0,
+                x_at_epoch: 48.0,
+                y_at_epoch: 48.0,
+                confidence: 1.0,
+                ..Default::default()
+            },
+            coma_radius_px: 16.0,
+            ..Default::default()
+        };
+        let (comet, _combined) = ds_comet_layer_products(&stars, comet_aligned, &request).unwrap();
+        let center = 48 * w + 48;
+        let on_major = 48 * w + (48 + 28); // ρ = 28/32 = 0.875 → transición
+        let on_minor = (48 + 28) * w + 48; // ρ = 28/16 = 1.75 → fuera
+        let beyond_major = 48 * w + (48 + 34); // ρ = 34/32 > 1 → fuera
+        assert!(comet.data[center].is_finite());
+        assert!(
+            comet.data[on_major].is_finite(),
+            "el círculo antiguo (radio min-escala = 16) descartaba la coma sobre el eje mayor"
+        );
+        assert!(comet.data[on_minor].is_nan(), "fuera de la elipse en y");
+        assert!(comet.data[beyond_major].is_nan(), "fuera de la elipse en x");
+        assert_eq!(comet.coverage[on_minor], 0.0);
+        assert!(comet.coverage[on_major] > 0.0);
+    }
+
+    #[test]
+    fn test_ds_comet_background_sampling_stride_avoids_column_pattern() {
+        // B11c — 600 columnas con sesgo +50 ADU cada 8 columnas (patrón de
+        // columna CMOS). Con npx/300k = 8 y gcd(8, 600) = 8 el muestreo
+        // antiguo caía SIEMPRE en las columnas sesgadas: su "mediana de
+        // fondo" era 150 en un frame cuya mediana global es 100.
+        let (w, h) = (600usize, 4000usize);
+        let data: Vec<f32> = (0..w * h)
+            .map(|i| if (i % w) % 8 == 0 { 150.0 } else { 100.0 })
+            .collect();
+        // Demostración del fallo con el paso alineado antiguo.
+        let mut aligned = Vec::new();
+        for pixel in (0..w * h).step_by(8) {
+            aligned.push(data[pixel]);
+        }
+        aligned.sort_by(f32::total_cmp);
+        assert_eq!(
+            aligned[aligned.len() / 2],
+            150.0,
+            "el paso alineado hereda el patrón de columna"
+        );
+        // Paso coprimo: 8→11 (9 y 10 comparten factores con 600 = 2³·3·5²).
+        assert_eq!(ds_coprime_sampling_step(8, 600), 11);
+        assert_eq!(ds_coprime_sampling_step(1, 600), 1);
+        assert_eq!(ds_coprime_sampling_step(5, 600), 7);
+        // Con el paso coprimo las muestras rotan por todas las columnas y la
+        // mediana estimada coincide con la global. El ancla está fuera del
+        // frame: ninguna muestra queda excluida por la máscara cometaria.
+        let backgrounds =
+            ds_comet_channel_backgrounds(&data, w, h, 1, -1.0e4, -1.0e4, 8.0, 8.0).unwrap();
+        assert!(
+            (backgrounds[0] - 100.0).abs() < 1e-3,
+            "mediana estimada {} debe coincidir con la global (100)",
+            backgrounds[0]
+        );
+    }
+
+    #[test]
+    fn test_ds_directory_browser_lists_folders_without_selecting_files() {
+        let root = std::env::temp_dir().join(format!("zas-folder-browser-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Lights").join("2026-03-22")).unwrap();
+        std::fs::create_dir_all(root.join("Calibracion")).unwrap();
+        std::fs::create_dir_all(root.join(".oculta")).unwrap();
+        std::fs::write(root.join("no-es-carpeta.fits"), b"fixture").unwrap();
+
+        let listing = ds_list_directories(Some(root.to_string_lossy().as_ref())).unwrap();
+        assert_eq!(
+            std::path::Path::new(&listing.current),
+            root.canonicalize().unwrap()
+        );
+        assert!(listing.parent.is_some());
+        let names = listing
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![".oculta", "Calibracion", "Lights"]);
+        assert!(listing.entries[0].hidden);
+        assert!(!names.contains(&"no-es-carpeta.fits"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_ds_directory_browser_creates_and_renames_a_child_folder() {
+        let root = std::env::temp_dir().join(format!("zas-folder-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let created = ds_create_directory(root.to_string_lossy().as_ref(), "Resultados").unwrap();
+        assert_eq!(
+            std::path::Path::new(&created.current)
+                .file_name()
+                .and_then(|value| value.to_str()),
+            Some("Resultados")
+        );
+
+        let renamed = ds_rename_directory(&created.current, "Resultados finales").unwrap();
+        let names = renamed
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Resultados finales"]);
+        assert!(!root.join("Resultados").exists());
+        assert!(root.join("Resultados finales").is_dir());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_ds_directory_browser_rejects_unsafe_or_duplicate_names() {
+        let root = std::env::temp_dir().join(format!("zas-folder-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Existente")).unwrap();
+
+        assert!(ds_create_directory(root.to_string_lossy().as_ref(), "../fuera").is_err());
+        assert!(ds_create_directory(root.to_string_lossy().as_ref(), "Existente").is_err());
+        assert!(ds_rename_directory(
+            root.join("Existente").to_string_lossy().as_ref(),
+            "mal/nombre"
+        )
+        .is_err());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ---- B1: inyección LRGB multiplicativa con reserva aditiva ----
+
+    #[test]
+    fn test_lrgb_combine_channels_preserves_color_ratio() {
+        // Estrella roja saturada: el aditivo puro RGB+(L−Y) la dejaba casi
+        // gris. El multiplicativo debe conservar el ratio 10:1:1 dentro
+        // del 1% con L=2900.
+        let tau = 1e-4 * 2900.0;
+        let out = ds_lrgb_inject_pixel([1000.0, 100.0, 100.0], 2900.0, tau);
+        let rg = out[0] / out[1];
+        let rb = out[0] / out[2];
+        assert!((rg - 10.0).abs() / 10.0 < 0.01, "ratio R/G {rg}");
+        assert!((rb - 10.0).abs() / 10.0 < 0.01, "ratio R/B {rb}");
+        // La luma Rec.709 de la salida es exactamente L (régimen multiplicativo).
+        let y_out = 0.2126 * out[0] as f64 + 0.7152 * out[1] as f64 + 0.0722 * out[2] as f64;
+        assert!(
+            (y_out - 2900.0).abs() <= 1e-3 * 2900.0,
+            "luma {y_out} != 2900"
+        );
+    }
+
+    #[test]
+    fn test_lrgb_combine_channels_background_stays_bounded() {
+        // Fondo con Y≈0 y L moderado: régimen aditivo puro. Debe quedar
+        // finito y pegado a L, sin blowup del ratio por dividir entre Y≈0.
+        let tau = 1e-4 * 2900.0;
+        let out = ds_lrgb_inject_pixel([1e-6, -2e-6, 5e-7], 50.0, tau);
+        for v in out {
+            assert!(v.is_finite(), "canal no finito");
+            assert!((v - 50.0).abs() < 1.0, "canal {v} lejos de L=50");
+        }
+        // La luma de salida también es exactamente L en el régimen aditivo.
+        let y_out = 0.2126 * out[0] as f64 + 0.7152 * out[1] as f64 + 0.0722 * out[2] as f64;
+        assert!((y_out - 50.0).abs() <= 1e-3 * 50.0, "luma {y_out} != 50");
+    }
+
+    #[test]
+    fn test_lrgb_combine_channels_luma_matches_l_in_blend_regime() {
+        // Píxel en la zona de mezcla (τ < Y < 2τ, m ∈ (0,1)): la convexidad
+        // del blend garantiza luma == L también a medio camino.
+        let tau = 1.0f64;
+        let rgb = [3.0f32, 1.5, 2.0]; // Y = 0.2126·3 + 0.7152·1.5 + 0.0722·2 ≈ 1.85
+        let l = 12.0f32;
+        let y_in = 0.2126 * rgb[0] as f64 + 0.7152 * rgb[1] as f64 + 0.0722 * rgb[2] as f64;
+        assert!(
+            y_in > tau && y_in < 2.0 * tau,
+            "el caso debe caer en la zona de mezcla (Y={y_in})"
+        );
+        let out = ds_lrgb_inject_pixel(rgb, l, tau);
+        let y_out = 0.2126 * out[0] as f64 + 0.7152 * out[1] as f64 + 0.0722 * out[2] as f64;
+        assert!((y_out - l as f64).abs() <= 1e-3, "luma {y_out} != {l}");
+    }
+
+    #[test]
+    fn test_lrgb_combine_channels_tau_ignores_non_finite() {
+        // τ = 1e-4 · mediana(|L|) solo sobre finitos: NaN/inf no cuentan.
+        let ld = [f32::NAN, 100.0, f32::INFINITY, -300.0, 200.0];
+        let tau = ds_lrgb_tau(&ld); // |finitos| = {100, 200, 300} → mediana 200
+        assert!((tau - 0.02).abs() < 1e-9, "tau {tau}");
+        assert_eq!(ds_lrgb_tau(&[f32::NAN]), 0.0);
+    }
+
+    // ---- B8: el fondo local no descarta la mitad negativa del cielo ----
+
+    #[test]
+    fn test_ds_local_bg_grid_keeps_negative_sky() {
+        // Cielo calibrado SIN pedestal: distribución determinista y simétrica
+        // alrededor de −0.5. El filtro antiguo (v > 0) vaciaba la celda y
+        // devolvía 0.0; el percentil 25 verdadero incluye los negativos.
+        let (w, h) = (16usize, 16usize);
+        let n = w * h;
+        let mut luma = vec![0.0f32; n];
+        for (i, v) in luma.iter_mut().enumerate() {
+            // Rampa uniforme en [−1, 0]: media −0.5, sin RNG.
+            *v = -1.0 + i as f32 / (n - 1) as f32;
+        }
+        let grid = ds_local_bg_grid(&luma, w, h, 1, 1);
+        // Percentil 25 tal y como lo publica la función: sorted[len/4].
+        let expected = -1.0 + (n / 4) as f32 / (n - 1) as f32;
+        assert!(
+            (grid[0] - expected).abs() < 0.05,
+            "p25 {} esperado {expected}",
+            grid[0]
+        );
+        assert!(grid[0] < 0.0, "el fondo negativo no puede aplanarse a 0");
+    }
+
+    // ---- B10: varianza no sesgada exacta de ventanas κσ ----
+
+    #[test]
+    fn test_ds_weighted_unbiased_variance_is_exact_for_heterogeneous_weights() {
+        // Valores/pesos deliberadamente heterogéneos. Referencia directa:
+        // μ=Σwx/W; s²=Σw(x-μ)² / (W-Σw²/W).
+        let samples = [(2.0f64, 0.1f64), (5.0, 0.2), (11.0, 0.7)];
+        let weight: f64 = samples.iter().map(|&(_, w)| w).sum();
+        let weight_sq: f64 = samples.iter().map(|&(_, w)| w * w).sum();
+        let sum: f64 = samples.iter().map(|&(x, w)| x * w).sum();
+        let sumsq: f64 = samples.iter().map(|&(x, w)| x * x * w).sum();
+        let mean = sum / weight;
+        let direct = samples
+            .iter()
+            .map(|&(x, w)| w * (x - mean).powi(2))
+            .sum::<f64>()
+            / (weight - weight_sq / weight);
+        let got = ds_weighted_unbiased_variance(sum, sumsq, weight, weight_sq).unwrap();
+        assert!((got - direct).abs() < 1e-12, "{got} vs {direct}");
+
+        // Una muestra efectiva no tiene varianza estimable: la ventana debe
+        // quedar abierta, no recibir un factor aproximado.
+        assert!(ds_weighted_unbiased_variance(10.0, 100.0, 1.0, 1.0).is_none());
+        assert!(ds_weighted_unbiased_variance(0.0, 0.0, 0.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn test_ds_weighted_unbiased_stats_matches_equal_weight_bessel() {
+        let samples = vec![(1.0f32, 1.0f64), (2.0, 1.0), (3.0, 1.0)];
+        let (mean, variance) = ds_weighted_unbiased_stats(&samples, |v| v as f64).unwrap();
+        assert!((mean - 2.0).abs() < 1e-12);
+        assert!((variance - 1.0).abs() < 1e-12); // N-1 denominator
+    }
+
+    // ---- B13a: el borde del debayer replica, no inyecta cero duro ----
+
+    #[test]
+    fn test_ds_debayer_image_border_replicates_not_zero() {
+        // Mosaico RGGB constante por canal: TODOS los píxeles de salida
+        // (incluidos el marco de 1 px y las esquinas) deben valer exactamente
+        // las constantes por canal. Un 0.0 duro en el borde entraría en el
+        // registro estelar y en el modelo de fondo como cielo medido.
+        let (w, h) = (8usize, 6usize);
+        let (rv, gv, bv) = (1000.0f32, 200.0f32, 50.0f32);
+        let mut data = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                data[y * w + x] = match (x & 1, y & 1) {
+                    (0, 0) => rv,
+                    (1, 1) => bv,
+                    _ => gv,
+                };
+            }
+        }
+        let out = ds_debayer_image(
+            DsImage {
+                data,
+                w,
+                h,
+                ch: 1,
+                bayer: None,
+            },
+            8, // RGGB
+        );
+        assert_eq!(out.ch, 3);
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * w + x) * 3;
+                assert_eq!(out.data[o], rv, "R en ({x},{y})");
+                assert_eq!(out.data[o + 1], gv, "G en ({x},{y})");
+                assert_eq!(out.data[o + 2], bv, "B en ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn test_ds_fully_rejected_channel_becomes_nan_and_spatial_dq() {
+        // R y B sobreviven, G pierde TODAS las muestras. La media de pesos
+        // antigua daba cobertura 4/3 y dejaba en G el valor de la pasada
+        // anterior. El contrato espacial debe declarar NO_COVERAGE y SCI no
+        // puede publicar ese valor obsoleto como una medición actual.
+        let weights = [2.0f64, 0.0, 2.0];
+        let coverage = ds_complete_channel_coverage(&weights, 3);
+        assert_eq!(coverage, vec![0.0]);
+        let mut science = vec![100.0f32, 777.0, 300.0];
+        assert_eq!(ds_mark_uncovered_nan(&mut science, &coverage, 3), 1);
+        assert!(science.iter().all(|value| value.is_nan()));
+        let dq = ds_dq_from_coverage(&coverage);
+        assert_ne!(
+            dq[0] & crate::deepsky_variance::dq::NO_COVERAGE,
+            0,
+            "un canal vacío debe quedar auditado por DQ"
+        );
+    }
+
+    #[test]
+    fn test_ds_uncertainty_sigmas_cfa_even_stride_all_phases() {
+        // B3: RGGB con dimensiones PARES. Con 800×600 el barrido plano antiguo
+        // usaba step = (800·600)/200_000 = 2: índice plano par + w par ⇒ x
+        // siempre par, las fases con x impar (G de fila par y B) jamás se
+        // muestreaban, su población quedaba vacía y la sigma salía NaN — que
+        // fluía a frame_calibration_sigmas y al modelo de ruido de EIDR. El
+        // muestreo POR FASE debe devolver 3 sigmas finitas y ordenadas como el
+        // ruido inyectado σ_R=1 < σ_G=2 < σ_B=3, con cualquier paridad.
+        for (w, h) in [(640usize, 480usize), (800, 600)] {
+            let mut variance = vec![0.0f32; w * h];
+            let mut lcg = 0x2545_F491u32;
+            for y in 0..h {
+                for x in 0..w {
+                    let sigma = match (x & 1, y & 1) {
+                        (0, 0) => 1.0f32, // R
+                        (1, 1) => 3.0,    // B
+                        _ => 2.0,         // G
+                    };
+                    // Jitter determinista ±5%: la mediana debe trabajar sobre
+                    // una población real, no sobre una constante.
+                    lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let jitter = 1.0 + ((lcg >> 16) as f32 / 65_535.0 - 0.5) * 0.1;
+                    variance[y * w + x] = sigma * sigma * jitter;
+                }
+            }
+            let sigmas = ds_uncertainty_sigmas(&variance, w, h, 1, Some(8));
+            for (c, s) in sigmas.iter().enumerate() {
+                assert!(s.is_finite(), "sigma canal {c} no finita en {w}x{h}");
+            }
+            assert!(
+                sigmas[0] < sigmas[1] && sigmas[1] < sigmas[2],
+                "orden de sigmas {sigmas:?} en {w}x{h}"
+            );
+            for (c, expected) in [1.0f32, 2.0, 3.0].iter().enumerate() {
+                assert!(
+                    (sigmas[c] - expected).abs() < 0.1 * expected,
+                    "canal {c}: {} vs σ inyectada {expected}",
+                    sigmas[c]
+                );
+            }
+        }
+        // Imagen minúscula 2×2: exactamente una muestra por fase, sin NaN.
+        let tiny = ds_uncertainty_sigmas(&[1.0, 4.0, 4.0, 9.0], 2, 2, 1, Some(8));
+        assert!(tiny.iter().all(|s| s.is_finite()), "{tiny:?}");
+        assert!((tiny[0] - 1.0).abs() < 1e-6 && (tiny[2] - 3.0).abs() < 1e-6);
+        // 1×1: sólo existe la fase R; G y B deben heredar la sigma AGRUPADA
+        // (aquí la única población). JAMÁS NaN.
+        let one = ds_uncertainty_sigmas(&[4.0], 1, 1, 1, Some(8));
+        assert_eq!(one, [2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn test_ds_cosmetic_stats_cfa_per_phase_detects_moderate_hot_pixel() {
+        // B4: mosaico RGGB con G=1000±10 y R=B=500±10, píxel caliente en R a
+        // 800. Con stats MONO la mediana global cae en la población G y el
+        // "MAD" (~250·1.4826 ≈ 370) mide el OFFSET G↔R/B, no el ruido: el
+        // umbral m8+6·MAD ≈ 500+2200 es inalcanzable y el caliente sobrevive
+        // — y al ser un defecto FIJO del sensor apila coherente tras el
+        // registro. Con stats POR FASE el MAD de R es el del jitter (≈7.4) y
+        // el caliente cae. Nota: 800 y no 700 porque el detector exige además
+        // v > m8·1.5 (= ~750; puerta multiplicativa de paridad SIRIL, que no
+        // es objeto de este fix).
+        let (w, h) = (64usize, 64usize);
+        let mut data = vec![0.0f32; w * h];
+        let mut lcg = 0x9E37_79B9u32;
+        for y in 0..h {
+            for x in 0..w {
+                let base = match (x & 1, y & 1) {
+                    (0, 0) | (1, 1) => 500.0f32, // R y B
+                    _ => 1000.0,                 // G
+                };
+                lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let jitter = ((lcg >> 16) as f32 / 65_535.0 - 0.5) * 20.0; // ±10
+                data[y * w + x] = base + jitter;
+            }
+        }
+        let (hx, hy) = (10usize, 10usize); // fase (0,0) = R en RGGB
+        data[hy * w + hx] = 800.0;
+        let mut img = DsImage {
+            data,
+            w,
+            h,
+            ch: 1,
+            bayer: Some(8),
+        };
+        let (medians, noises) = ds_cosmetic_stats(&img);
+        assert_eq!(medians.len(), 4, "stats por fase Bayer");
+        // Fase R (índice ((y&1)<<1)|(x&1) = 0): mediana ~500 y ruido del
+        // jitter, NO el offset inter-canal de las stats mono.
+        assert!((medians[0] - 500.0).abs() < 15.0, "mediana R {}", medians[0]);
+        assert!(noises[0] < 20.0, "MAD de fase contaminado: {}", noises[0]);
+        assert!((medians[1] - 1000.0).abs() < 15.0, "mediana G {}", medians[1]);
+        assert!((medians[2] - 1000.0).abs() < 15.0, "mediana G {}", medians[2]);
+        assert!((medians[3] - 500.0).abs() < 15.0, "mediana B {}", medians[3]);
+
+        // Verificación de que el caso es probatorio: con la mediana/MAD del
+        // mosaico entrelazado (stats mono antiguas) el umbral quedaba
+        // inalcanzable para 800.
+        let mut mono = img.data.clone();
+        mono.sort_by(|a, b| a.total_cmp(b));
+        let mono_med = mono[mono.len() / 2];
+        let mut dev: Vec<f32> = mono.iter().map(|v| (v - mono_med).abs()).collect();
+        dev.sort_by(|a, b| a.total_cmp(b));
+        let mono_noise = (dev[dev.len() / 2] * 1.4826).max(2.0);
+        assert!(
+            800.0 < 500.0 + 6.0 * mono_noise,
+            "el escenario dejó de ser probatorio: umbral mono {}",
+            500.0 + 6.0 * mono_noise
+        );
+
+        let before = img.data.clone();
+        ds_cosmetic_hot_pixels_with_stats(&mut img, &medians, &noises);
+        let corrected = img.data[hy * w + hx];
+        assert!(
+            corrected < 550.0,
+            "caliente moderado no corregido: {corrected}"
+        );
+        // Sin falsos positivos: SOLO el caliente cambia; toda la G limpia (y
+        // el resto de R/B) queda intacta.
+        let mut changed = 0usize;
+        for y in 0..h {
+            for x in 0..w {
+                if img.data[y * w + x].to_bits() != before[y * w + x].to_bits() {
+                    changed += 1;
+                    assert_eq!((x, y), (hx, hy), "falso positivo en ({x},{y})");
+                }
+            }
+        }
+        assert_eq!(changed, 1, "exactamente una corrección");
+    }
+
+    #[test]
+    fn test_ds_fit_projective_hartley_large_coordinates() {
+        // B7(a): 40 correspondencias con coordenadas hasta ~6000 px y una
+        // homografía suave conocida. Sin normalización de Hartley los términos
+        // cruzados u·x ~ 3.6e7 llevan AtA a ~1e15 y las ecuaciones normales
+        // pierden la precisión del ajuste; normalizado, el error de mapeo es
+        // numéricamente nulo (< 0.01 px incluida la cuantización f32).
+        let h_true = [
+            1.01f64, 0.015, 40.0, -0.012, 0.995, -25.0, 3.0e-6, -2.0e-6, 1.0,
+        ];
+        let mut pairs: Vec<((f32, f32), (f32, f32))> = Vec::new();
+        for gy in 0..5 {
+            for gx in 0..8 {
+                let x = 60.0 + gx as f64 * 840.0; // hasta 5940 px
+                let y = 45.0 + gy as f64 * 980.0; // hasta 3965 px
+                let d = h_true[6] * x + h_true[7] * y + 1.0;
+                let u = (h_true[0] * x + h_true[1] * y + h_true[2]) / d;
+                let v = (h_true[3] * x + h_true[4] * y + h_true[5]) / d;
+                pairs.push(((x as f32, y as f32), (u as f32, v as f32)));
+            }
+        }
+        assert_eq!(pairs.len(), 40);
+        let t = ds_fit_projective(&pairs).expect("homografía con Hartley");
+        let stats = ds_transform_residual_stats(t, &pairs);
+        assert!(
+            stats.max < 0.01,
+            "error de mapeo máximo {} px con coordenadas grandes",
+            stats.max
+        );
+    }
+
+    #[test]
+    fn test_ds_fit_projective_degenerate_collinear_returns_none() {
+        // B7(b): puntos colineales ⇒ la homografía no está determinada (queda
+        // una familia con grados de libertad libres, AtA singular). En el
+        // espacio normalizado de Hartley el pivote absoluto 1e-12 de
+        // ds_solve_normal SÍ detecta la deficiencia de rango; en píxeles
+        // crudos ~6000 la escala ~1e15 de AtA la enmascaraba y salía una H
+        // espuria.
+        let pairs: Vec<((f32, f32), (f32, f32))> = (0..24)
+            .map(|i| {
+                let x = 30.0f32 + i as f32 * 250.0; // hasta 5780 px
+                let y = 0.7 * x + 12.0;
+                ((x, y), (x + 15.0, y - 8.0))
+            })
+            .collect();
+        assert!(ds_fit_projective(&pairs).is_none(), "colineal debe ser None");
+        // Nube degenerada a un punto: tampoco hay geometría que ajustar.
+        let point: Vec<((f32, f32), (f32, f32))> =
+            vec![((100.0, 100.0), (120.0, 90.0)); 12];
+        assert!(ds_fit_projective(&point).is_none());
+    }
+
+    #[test]
+    fn test_ds_sample_grid_cell_center_recovers_analytic_field() {
+        // B9(a): campo analítico f(u,v) = a + b·u + c·v representado con el
+        // binning del constructor (valor de celda = media de la celda = valor
+        // en su centro (j+0.5)/G para un campo lineal). El muestreo en los
+        // centros debe recuperar el campo EXACTO: con la convención antigua
+        // j/(G−1) el nodo j quedaba corrido media celda y el campo estirado
+        // G/(G−1), con error de hasta ~b/(2G) en las celdas de borde.
+        let (gw, gh) = (8usize, 6usize);
+        let (a, b, c) = (3.0f32, 8.0f32, -4.0f32);
+        let field = |u: f32, v: f32| a + b * u + c * v;
+        let grid: Vec<f32> = (0..gw * gh)
+            .map(|i| {
+                let u = ((i % gw) as f32 + 0.5) / gw as f32;
+                let v = ((i / gw) as f32 + 0.5) / gh as f32;
+                field(u, v)
+            })
+            .collect();
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let u = (gx as f32 + 0.5) / gw as f32;
+                let v = (gy as f32 + 0.5) / gh as f32;
+                let got = ds_sample_grid(&grid, gw, gh, u, v);
+                let want = field(u, v);
+                assert!(
+                    (got - want).abs() < 1e-4,
+                    "celda ({gx},{gy}): {got} vs {want}"
+                );
+            }
+        }
+        // Interior arbitrario (dentro de [0.5/G, 1−0.5/G]): la bilineal de un
+        // campo lineal entre centros es exacta.
+        for &(u, v) in &[(0.11f32, 0.62f32), (0.5, 0.5), (0.83, 0.21)] {
+            let got = ds_sample_grid(&grid, gw, gh, u, v);
+            assert!((got - field(u, v)).abs() < 1e-4, "punto interior ({u},{v})");
+        }
+    }
+
+    #[test]
+    fn test_ds_sample_grid_border_bias_bounded() {
+        // B9(b): en u=0 y u=1 la convención de centros extrapola constante
+        // desde el centro de la celda extrema: |error| ≤ |pendiente|·0.5/G
+        // (media celda), la cota física del binning. La convención antigua
+        // además repartía un sesgo sistemático ~b·(0.5−u)/G por TODO el campo
+        // (test anterior); aquí acotamos los bordes.
+        let (gw, gh) = (8usize, 8usize);
+        let (a, b, c) = (10.0f32, 8.0f32, 6.0f32);
+        let field = |u: f32, v: f32| a + b * u + c * v;
+        let grid: Vec<f32> = (0..gw * gh)
+            .map(|i| {
+                let u = ((i % gw) as f32 + 0.5) / gw as f32;
+                let v = ((i / gw) as f32 + 0.5) / gh as f32;
+                field(u, v)
+            })
+            .collect();
+        let half_u = 0.5 / gw as f32;
+        let half_v = 0.5 / gh as f32;
+        let v_mid = 0.5f32;
+        let e_left = (ds_sample_grid(&grid, gw, gh, 0.0, v_mid) - field(0.0, v_mid)).abs();
+        let e_right = (ds_sample_grid(&grid, gw, gh, 1.0, v_mid) - field(1.0, v_mid)).abs();
+        assert!(e_left <= b * half_u + 1e-4, "borde u=0: {e_left}");
+        assert!(e_right <= b * half_u + 1e-4, "borde u=1: {e_right}");
+        let u_mid = 0.5f32;
+        let e_top = (ds_sample_grid(&grid, gw, gh, u_mid, 0.0) - field(u_mid, 0.0)).abs();
+        let e_bottom = (ds_sample_grid(&grid, gw, gh, u_mid, 1.0) - field(u_mid, 1.0)).abs();
+        assert!(e_top <= c * half_v + 1e-4, "borde v=0: {e_top}");
+        assert!(e_bottom <= c * half_v + 1e-4, "borde v=1: {e_bottom}");
     }
 }

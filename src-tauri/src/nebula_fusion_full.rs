@@ -722,7 +722,7 @@ fn gamma_fija_segura(
 /// Percentil por rango más próximo sobre una copia ordenada.
 fn percentil(valores: &[f64], p: f64) -> f64 {
     let mut v: Vec<f64> = valores.to_vec();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v.sort_by(|a, b| a.total_cmp(b));
     let idx = ((v.len() - 1) as f64 * p).floor() as usize;
     v[idx]
 }
@@ -811,15 +811,7 @@ fn precisiones_espectrales_tile(
         }
         if let Some(store) = inputs.precision {
             let precision = leer_tile_canal(
-                store,
-                frame,
-                inputs.w,
-                inputs.h,
-                inputs.ch,
-                channel,
-                ox,
-                oy,
-                t,
+                store, frame, inputs.w, inputs.h, inputs.ch, channel, ox, oy, t,
             )?;
             if precision
                 .iter()
@@ -832,9 +824,7 @@ fn precisiones_espectrales_tile(
                 (f64::INFINITY, f64::NEG_INFINITY),
                 |(minimum, maximum), value| (minimum.min(*value), maximum.max(*value)),
             );
-            if !(mean > 0.0)
-                || !mean.is_finite()
-                || (maximum - minimum) / mean > MAX_RELATIVE_RANGE
+            if !(mean > 0.0) || !mean.is_finite() || (maximum - minimum) / mean > MAX_RELATIVE_RANGE
             {
                 return Ok(None);
             }
@@ -1099,18 +1089,16 @@ fn preparar_tile_con_datos(
             q[k] += transfer.g[k].conj() * buffer[k] * inv_noise;
         }
     }
-    Ok(
-        modo_desde_denominador(
-            inputs,
-            t,
-            inverse_variances,
-            neff_plano,
-            target_fwhm,
-            &d,
-            &fwhms,
-        )
-            .map(|mode| (mode, q)),
+    Ok(modo_desde_denominador(
+        inputs,
+        t,
+        inverse_variances,
+        neff_plano,
+        target_fwhm,
+        &d,
+        &fwhms,
     )
+    .map(|mode| (mode, q)))
 }
 
 pub(crate) fn combine_full(
@@ -1186,11 +1174,13 @@ pub(crate) fn combine_full(
         let mut candidate = None;
         'search: for &oy in &orig_y {
             for &ox in &orig_x {
-                if let Some(inverse_variances) =
-                    precisiones_espectrales_tile(inputs, c, ox, oy, t)?
+                if let Some(inverse_variances) = precisiones_espectrales_tile(inputs, c, ox, oy, t)?
                 {
                     let sum = inverse_variances.iter().sum::<f64>();
-                    let sum_sq = inverse_variances.iter().map(|value| value * value).sum::<f64>();
+                    let sum_sq = inverse_variances
+                        .iter()
+                        .map(|value| value * value)
+                        .sum::<f64>();
                     let neff = sum * sum / sum_sq.max(SIGMA2_SUELO);
                     if let Some(ModoCanal::Gls { fwhm_t, .. }) = preparar_modo_tile(
                         inputs,
@@ -1237,11 +1227,13 @@ pub(crate) fn combine_full(
                 // FFT sólo cuando cada frame tiene cobertura completa y una
                 // precision espacial demostrablemente estacionaria. El resto
                 // usa GLS espacial exacto, sin colapsar VAR a un sigma falso.
-                let spectral_precisions =
-                    precisiones_espectrales_tile(inputs, c, ox, oy, t)?;
+                let spectral_precisions = precisiones_espectrales_tile(inputs, c, ox, oy, t)?;
                 let prepared = if let Some(inverse_variances) = spectral_precisions.as_ref() {
                     let sum = inverse_variances.iter().sum::<f64>();
-                    let sum_sq = inverse_variances.iter().map(|value| value * value).sum::<f64>();
+                    let sum_sq = inverse_variances
+                        .iter()
+                        .map(|value| value * value)
+                        .sum::<f64>();
                     let neff_plano = sum * sum / sum_sq.max(SIGMA2_SUELO);
                     preparar_tile_con_datos(
                         inputs,
@@ -1307,9 +1299,7 @@ pub(crate) fn combine_full(
                         let datos = leer_tile_canal(inputs.warped, i, w, h, ch, c, ox, oy, t)?;
                         let valid = leer_tile_canal(inputs.validity, i, w, h, ch, c, ox, oy, t)?;
                         let precision = match inputs.precision {
-                            Some(store) => {
-                                Some(leer_tile_canal(store, i, w, h, ch, c, ox, oy, t)?)
-                            }
+                            Some(store) => Some(leer_tile_canal(store, i, w, h, ch, c, ox, oy, t)?),
                             None => None,
                         };
                         let scalar_precision = if precision.is_none() {
@@ -1980,7 +1970,10 @@ mod tests {
             cancel: &cancel,
         };
         let out = combine_full(&inputs, &mut |_, _, _| {}).expect("Full espacial");
-        assert_eq!(out.gls_tiles, 0, "VAR no estacionaria no debe entrar al FFT");
+        assert_eq!(
+            out.gls_tiles, 0,
+            "VAR no estacionaria no debe entrar al FFT"
+        );
         assert!(out.tiles_fallback > 0);
         // x=16 cae en franja de precision 1.0; x=40 en franja de 4.0.
         let left = 32 * w + 16;

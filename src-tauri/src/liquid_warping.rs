@@ -1336,6 +1336,42 @@ fn fast_sample_mono(
     fast_sample_mono_scalar(mono_buf, w_in, sx0, sy0, w_xs, fy, lut, drop_size)
 }
 
+/// Bounds of the non-negative 2x2 reconstruction footprint around a mono
+/// sample. Lanczos-3 remains the detail-preserving interpolator, but limiting
+/// its result to these immediate neighbours makes it monotonicity-preserving:
+/// distant negative lobes cannot create a second bright/dark contour around a
+/// high-contrast limb. Coordinates outside the frame use edge replication,
+/// matching the only physically available sample at that boundary.
+#[inline(always)]
+fn mono_linear_support_bounds(
+    mono_buf: &[u16],
+    w_in: usize,
+    h_in: usize,
+    sx0: isize,
+    sy0: isize,
+) -> (f32, f32) {
+    debug_assert!(w_in > 0 && h_in > 0 && mono_buf.len() >= w_in * h_in);
+    let last_x = w_in.saturating_sub(1) as isize;
+    let last_y = h_in.saturating_sub(1) as isize;
+    let x0 = sx0.clamp(0, last_x) as usize;
+    let x1 = (sx0 + 1).clamp(0, last_x) as usize;
+    let y0 = sy0.clamp(0, last_y) as usize;
+    let y1 = (sy0 + 1).clamp(0, last_y) as usize;
+    let values = [
+        mono_buf[y0 * w_in + x0],
+        mono_buf[y0 * w_in + x1],
+        mono_buf[y1 * w_in + x0],
+        mono_buf[y1 * w_in + x1],
+    ];
+    let mut min_v = u16::MAX;
+    let mut max_v = u16::MIN;
+    for value in values {
+        min_v = min_v.min(value);
+        max_v = max_v.max(value);
+    }
+    (min_v as f32, max_v as f32)
+}
+
 /// Mono variant of `accumulate_frame_liquid`: identical warp/IDW logic but
 /// samples a single channel. Avoids the historical mono→RGB triplication
 /// (3× RAM and 3× sampling cost for grayscale cameras).
@@ -1491,7 +1527,7 @@ pub fn accumulate_frame_liquid_mono(
                 w_xs[i] = lut.get(fx - kx as f32, drop_size);
             }
 
-            let (sum_v, sum_w, min_v, max_v) =
+            let (sum_v, sum_w, _wide_min_v, _wide_max_v) =
                 if sx0 >= 2 && sx0 + 3 < w_in as isize && sy0 >= 2 && sy0 + 3 < h_in as isize {
                     // FAST PATH (Interior Pixels) — SIMD (AVX2) con fallback escalar
                     fast_sample_mono(mono_buf, w_in, sx0, sy0, &w_xs, fy, lut, drop_size)
@@ -1532,11 +1568,14 @@ pub fn accumulate_frame_liquid_mono(
                 };
 
             if sum_w.abs() > 0.00001 {
-                // Symmetric range-based anti-ringing clamp (same policy as RGB):
-                // unbiased on dark structure, scale-invariant.
-                let band = (max_v - min_v) * 0.18 + 32.0;
-                let val =
-                    (sum_v / sum_w).clamp((min_v - band).max(0.0), (max_v + band).min(65535.0));
+                // MONO EDGE-SAFE LANCZOS: the former 6x6 ±18% allowance let
+                // negative Lanczos lobes become displaced contours at a solar
+                // limb. Preserve the Lanczos estimate whenever it lies inside
+                // the immediate 2x2 source support, otherwise clip only the
+                // invented extremum. RGB keeps its historical policy above.
+                let (support_min, support_max) =
+                    mono_linear_support_bounds(mono_buf, w_in, h_in, sx0, sy0);
+                let val = (sum_v / sum_w).clamp(support_min, support_max);
                 let tidx = row_off + x_out;
                 if tidx < acc_len {
                     unsafe {
@@ -2120,10 +2159,26 @@ mod drizzle_tests {
         // simétricos respecto al query; los restantes están lejos y fuerzan
         // un recorrido de varias celdas en un orden distinto al de sus índices.
         let mut points = vec![
-            ApPoint { x: 90.0, y: 100.0, size: 32 },
-            ApPoint { x: 110.0, y: 100.0, size: 32 },
-            ApPoint { x: 100.0, y: 90.0, size: 32 },
-            ApPoint { x: 100.0, y: 110.0, size: 32 },
+            ApPoint {
+                x: 90.0,
+                y: 100.0,
+                size: 32,
+            },
+            ApPoint {
+                x: 110.0,
+                y: 100.0,
+                size: 32,
+            },
+            ApPoint {
+                x: 100.0,
+                y: 90.0,
+                size: 32,
+            },
+            ApPoint {
+                x: 100.0,
+                y: 110.0,
+                size: 32,
+            },
         ];
         points.extend((0..100).map(|index| ApPoint {
             x: 300.0 + (index % 10) as f32 * 20.0,
@@ -2133,7 +2188,10 @@ mod drizzle_tests {
         let grid = ApSpatialGrid::build(&points).unwrap();
         let mut got = [(f32::MAX, 0u16); 8];
         grid.top_k_into(100.0, 100.0, 4, &mut got, &points);
-        assert_eq!(got[..4].iter().map(|entry| entry.1).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            got[..4].iter().map(|entry| entry.1).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
     }
 
     /// Campo constante → cada pixel de salida cubierto debe devolver EXACTAMENTE
@@ -2189,6 +2247,69 @@ mod drizzle_tests {
             "cobertura insuficiente: {} pixeles",
             covered
         );
+    }
+
+    /// Un limbo solar mono es, localmente, un escalón de alto contraste. Al
+    /// corregir un desplazamiento subpíxel, el remuestreo no debe inventar
+    /// lóbulos oscuros/brillantes fuera del soporte bilineal inmediato: esos
+    /// lóbulos se ven como contornos separados del disco al acumular frames.
+    #[test]
+    fn mono_lanczos_fractional_limb_is_monotone_and_bounded() {
+        let (w, h) = (64usize, 32usize);
+        let sky = 1_000u16;
+        let disc = 60_000u16;
+        let edge_x = 32usize;
+        let mut mono = vec![sky; w * h];
+        for row in mono.chunks_exact_mut(w) {
+            row[edge_x..].fill(disc);
+        }
+
+        let mut acc = vec![0.0f32; w * h];
+        let mut acc_w = vec![0.0f32; w * h];
+        accumulate_frame_liquid_mono(
+            &mut acc,
+            &mut acc_w,
+            &mono,
+            w,
+            h,
+            w,
+            h,
+            1.0,
+            0.0,
+            0.0,
+            0.37,
+            0.0,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            1.0,
+            1.0,
+        );
+
+        let y = h / 2;
+        let profile: Vec<f32> = (edge_x - 5..=edge_x + 4)
+            .map(|x| {
+                let index = y * w + x;
+                assert!(acc_w[index] > 0.0, "pixel sin cobertura en x={x}");
+                acc[index] / acc_w[index]
+            })
+            .collect();
+
+        for (offset, &value) in profile.iter().enumerate() {
+            let x = edge_x - 5 + offset;
+            assert!(
+                value >= sky as f32 - 0.5 && value <= disc as f32 + 0.5,
+                "ringing fuera del rango fuente en x={x}: {value}; perfil={profile:?}"
+            );
+        }
+        for pair in profile.windows(2) {
+            assert!(
+                pair[1] + 0.5 >= pair[0],
+                "contorno no monótono alrededor del limbo: {profile:?}"
+            );
+        }
     }
 
     /// Recuperación de detalle sub-pixel: una sinusoide con periodo 1.4 px

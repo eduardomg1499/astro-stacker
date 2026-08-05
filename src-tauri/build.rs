@@ -62,8 +62,7 @@ fn untracked_source_bytes() -> Vec<u8> {
                 .is_some_and(|extension| {
                     matches!(
                         extension.to_ascii_lowercase().as_str(),
-                        "rs"
-                            | "js"
+                        "rs" | "js"
                             | "mjs"
                             | "json"
                             | "toml"
@@ -127,10 +126,7 @@ fn main() {
     let worktree_fingerprint = if diff.is_empty() && untracked_sources.is_empty() {
         "clean".to_string()
     } else {
-        format!(
-            "fnv1a64-{:016x}",
-            fnv1a64(&[&diff, &untracked_sources])
-        )
+        format!("fnv1a64-{:016x}", fnv1a64(&[&diff, &untracked_sources]))
     };
     println!("cargo:rustc-env=ZAS_GIT_COMMIT={commit}");
     println!("cargo:rustc-env=ZAS_GIT_DIRTY={dirty}");

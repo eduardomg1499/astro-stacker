@@ -246,9 +246,10 @@ impl PlanetaryVramBudget {
             .state
             .lock()
             .map_err(|_| "Contador de VRAM planetaria dañado".to_string())?;
-        let next = state.used.checked_add(bytes).ok_or_else(|| {
-            format!("Reserva VRAM de {owner} desbordó el contador compartido")
-        })?;
+        let next = state
+            .used
+            .checked_add(bytes)
+            .ok_or_else(|| format!("Reserva VRAM de {owner} desbordó el contador compartido"))?;
         if next > self.inner.limit {
             return Err(format!(
                 "Presupuesto VRAM planetario compartido agotado por {owner}: solicita {} MB, en uso {} MB, límite {} MB",
@@ -481,9 +482,10 @@ fn fx_add_q8(slot: u32, v: f32) {
     acc[slot] = vec2<u32>(nlo, old.y + u32(hi) + carry);
 }
 
-// Muestreo Lanczos-3 6x6 con clamp anti-ringing simétrico — réplica del
-// sample_pixel de CPU (versión con bounds check = slow path; en el interior
-// produce exactamente los mismos términos que el fast path SIMD).
+// Muestreo Lanczos-3 6x6 — réplica del sample_pixel de CPU (versión con bounds
+// check = slow path; en el interior produce exactamente los mismos términos
+// que el fast path SIMD). Mono usa el límite monótono del soporte 2x2 inmediato;
+// RGB conserva el clamp histórico simétrico.
 // Devuelve vec4(val_rgb, marcador>0) — w<=0 significa sin cobertura.
 fn sample_lanczos(sx: f32, sy: f32, is_color: bool) -> vec4<f32> {
     let sxf = floor(sx);
@@ -526,9 +528,30 @@ fn sample_lanczos(sx: f32, sy: f32, is_color: bool) -> vec4<f32> {
         }
     }
     if (abs(sw) <= 0.00001) { return vec4<f32>(0.0, 0.0, 0.0, 0.0); }
-    let band = (mx - mn) * 0.18 + vec3<f32>(32.0, 32.0, 32.0);
-    let lov = max(mn - band, vec3<f32>(0.0, 0.0, 0.0));
-    let hiv = min(mx + band, vec3<f32>(65535.0, 65535.0, 65535.0));
+    var lov: vec3<f32>;
+    var hiv: vec3<f32>;
+    if (is_color) {
+        let band = (mx - mn) * 0.18 + vec3<f32>(32.0, 32.0, 32.0);
+        lov = max(mn - band, vec3<f32>(0.0, 0.0, 0.0));
+        hiv = min(mx + band, vec3<f32>(65535.0, 65535.0, 65535.0));
+    } else {
+        // MONO EDGE-SAFE LANCZOS: bounds from the non-negative bilinear
+        // footprint prevent distant negative lobes from drawing a second limb.
+        var support_min = 65535.0;
+        var support_max = 0.0;
+        for (var oy = 0; oy <= 1; oy = oy + 1) {
+            let py = clamp(y0 + oy, 0, i32(P.h_in) - 1);
+            let row = u32(py) * P.w_in;
+            for (var ox = 0; ox <= 1; ox = ox + 1) {
+                let px = clamp(x0 + ox, 0, i32(P.w_in) - 1);
+                let m = frame_val(row + u32(px));
+                support_min = min(support_min, m);
+                support_max = max(support_max, m);
+            }
+        }
+        lov = vec3<f32>(support_min, support_min, support_min);
+        hiv = vec3<f32>(support_max, support_max, support_max);
+    }
     let val = clamp(sum / sw, lov, hiv);
     return vec4<f32>(val, 1.0);
 }
@@ -1214,8 +1237,7 @@ impl GpuPassConfig {
             16
         };
         let bounds = if self.use_bounds {
-            n_px
-                .saturating_mul(4)
+            n_px.saturating_mul(4)
                 .saturating_mul(if self.is_color { 6 } else { 2 })
         } else {
             16
@@ -1233,8 +1255,7 @@ impl GpuPassConfig {
             )
             .saturating_add(bounds.max(16))
             .saturating_add(
-                n_px
-                    .saturating_mul(8)
+                n_px.saturating_mul(8)
                     .saturating_mul(self.planes() as u64)
                     .max(16),
             )
@@ -1735,21 +1756,19 @@ impl GpuPassAccumulator {
         let preferred_staging_count =
             download_staging_count(total_bytes, self.vram_bytes, self.rt.vram_budget);
         let staging_size = DOWNLOAD_CHUNK.min(total_bytes.max(16));
-        let (staging_count, _staging_vram_reservation) =
-            match self.rt.planetary_vram.try_reserve(
-                staging_size.saturating_mul(preferred_staging_count as u64),
-                "readback de acumulación planetaria",
-            ) {
-                Ok(reservation) => (preferred_staging_count, reservation),
-                Err(_) if preferred_staging_count > 1 => (
-                    1,
-                    self.rt.planetary_vram.try_reserve(
-                        staging_size,
-                        "readback de acumulación planetaria",
-                    )?,
-                ),
-                Err(error) => return Err(error),
-            };
+        let (staging_count, _staging_vram_reservation) = match self.rt.planetary_vram.try_reserve(
+            staging_size.saturating_mul(preferred_staging_count as u64),
+            "readback de acumulación planetaria",
+        ) {
+            Ok(reservation) => (preferred_staging_count, reservation),
+            Err(_) if preferred_staging_count > 1 => (
+                1,
+                self.rt
+                    .planetary_vram
+                    .try_reserve(staging_size, "readback de acumulación planetaria")?,
+            ),
+            Err(error) => return Err(error),
+        };
         let staging: Vec<wgpu::Buffer> = (0..staging_count)
             .map(|i| {
                 self.rt.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2236,8 +2255,7 @@ fn parity_scenario(
     let down = gpu.finish()?;
 
     // ----------------------------- COMPARACIÓN -----------------------------
-    let rmse_plane =
-        |cd: &[f64], cw: &[f64], gd: &[f64], gw_: &[f64]| -> (f64, f64, usize) {
+    let rmse_plane = |cd: &[f64], cw: &[f64], gd: &[f64], gw_: &[f64]| -> (f64, f64, usize) {
         let mut se = 0.0f64;
         let mut max_abs = 0.0f64;
         let mut n = 0f64;
@@ -2593,10 +2611,7 @@ mod tests {
             5
         );
         // Caso típico sin drizzle a 1×: banda pequeña → sigue en un submit.
-        assert_eq!(
-            stack_bands_per_submit(true, 400_000, 8, false, true, 4),
-            8
-        );
+        assert_eq!(stack_bands_per_submit(true, 400_000, 8, false, true, 4), 8);
     }
 
     #[test]

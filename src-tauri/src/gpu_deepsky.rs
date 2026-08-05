@@ -33,11 +33,16 @@ struct PixelParams {
 @group(0) @binding(3) var<storage, read> aux_noise: array<f32>;
 @group(0) @binding(4) var<storage, read_write> output_px: array<f32>;
 
+// Convención CENTRO-DE-CELDA, idéntica a ds_sample_grid en CPU: la rejilla se
+// construyó con binning floor(u·G), así que el nodo j vive en (j+0.5)/G y la
+// coordenada continua es clamp(u·G − 0.5, 0, G−1). La antigua u·(G−1)
+// desplazaba el campo media celda y lo estiraba G/(G−1). CPU y GPU deben
+// cambiar JUNTOS: los gates de paridad comparan ambos caminos píxel a píxel.
 fn grid_sample_bg(x: u32, gy: u32) -> f32 {
     let gw = P.grid_w;
     let gh = P.grid_h;
-    let fx = clamp((f32(x) / f32(P.w)) * f32(max(gw, 1u) - 1u), 0.0, f32(max(gw, 1u) - 1u));
-    let fy = clamp((f32(gy) / f32(P.full_h)) * f32(max(gh, 1u) - 1u), 0.0, f32(max(gh, 1u) - 1u));
+    let fx = clamp((f32(x) / f32(P.w)) * f32(max(gw, 1u)) - 0.5, 0.0, f32(max(gw, 1u) - 1u));
+    let fy = clamp((f32(gy) / f32(P.full_h)) * f32(max(gh, 1u)) - 0.5, 0.0, f32(max(gh, 1u) - 1u));
     let x0 = min(u32(floor(fx)), gw - 1u); let y0 = min(u32(floor(fy)), gh - 1u);
     let x1 = min(x0 + 1u, gw - 1u); let y1 = min(y0 + 1u, gh - 1u);
     let tx = fx - f32(x0); let ty = fy - f32(y0);
@@ -49,8 +54,8 @@ fn grid_sample_bg(x: u32, gy: u32) -> f32 {
 fn grid_sample_noise(x: u32, gy: u32) -> f32 {
     let gw = P.grid_w;
     let gh = P.grid_h;
-    let fx = clamp((f32(x) / f32(P.w)) * f32(max(gw, 1u) - 1u), 0.0, f32(max(gw, 1u) - 1u));
-    let fy = clamp((f32(gy) / f32(P.full_h)) * f32(max(gh, 1u) - 1u), 0.0, f32(max(gh, 1u) - 1u));
+    let fx = clamp((f32(x) / f32(P.w)) * f32(max(gw, 1u)) - 0.5, 0.0, f32(max(gw, 1u) - 1u));
+    let fy = clamp((f32(gy) / f32(P.full_h)) * f32(max(gh, 1u)) - 0.5, 0.0, f32(max(gh, 1u) - 1u));
     let x0 = min(u32(floor(fx)), gw - 1u); let y0 = min(u32(floor(fy)), gh - 1u);
     let x1 = min(x0 + 1u, gw - 1u); let y1 = min(y0 + 1u, gh - 1u);
     let tx = fx - f32(x0); let ty = fy - f32(y0);
@@ -91,8 +96,17 @@ fn cosmetic(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let m8 = 0.5 * (nb[3] + nb[4]);
     let v = input_px[i];
-    let noise = P.noise[c];
-    let med = P.med[c];
+    // CFA (same_color_step==2 con un solo plano): med/noise llegan POR FASE
+    // Bayer en los 4 slots del vec4, indexados ((gy&1)<<1)|(x&1) — paridad
+    // exacta con ds_cosmetic_stats/ds_cosmetic_hot_pixels_with_stats en CPU.
+    // Una única mediana/MAD del mosaico mezclaba G con R/B y el umbral 6·MAD
+    // quedaba inalcanzable para calientes moderados.
+    var stat = c;
+    if (P.same_color_step == 2u && P.channels == 1u) {
+        stat = ((gy & 1u) << 1u) | (x & 1u);
+    }
+    let noise = P.noise[stat];
+    let med = P.med[stat];
     if ((v > m8 + 6.0 * noise && v > m8 * 1.5)
         || (v < m8 - 6.0 * noise && v < med - 3.0 * noise)) {
         output_px[i] = m8;
@@ -104,13 +118,21 @@ fn debayer(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pixel = gid.x;
     let count = P.w * P.tile_h;
     if (pixel >= count) { return; }
-    let x = pixel % P.w;
-    let y = pixel / P.w;
-    let gy = P.global_y0 + y;
+    let dst_x = pixel % P.w;
+    let dst_y = pixel / P.w;
+    let dst_gy = P.global_y0 + dst_y;
     let o = pixel * 3u;
     output_px[o] = 0.0; output_px[o + 1u] = 0.0; output_px[o + 2u] = 0.0;
-    if (x == 0u || x + 1u >= P.w || gy == 0u || gy + 1u >= P.full_h || y == 0u || y + 1u >= P.tile_h) { return; }
-    let i = pixel;
+    // Igual que ds_debayer_image: el marco RGB replica el píxel interior más
+    // cercano en lugar de inyectar ceros. Se recalcula desde el CFA clamped;
+    // no se lee output_px porque invocations vecinas no tienen orden definido.
+    let x = clamp(dst_x, 1u, P.w - 2u);
+    let gy = clamp(dst_gy, 1u, P.full_h - 2u);
+    let y = gy - P.global_y0;
+    // Las filas halo que no se publican pueden no contener el vecindario
+    // completo. Toda fila publicada sí dispone del halo de un píxel.
+    if (y == 0u || y + 1u >= P.tile_h) { return; }
+    let i = y * P.w + x;
     let v = input_px[i];
     let u = input_px[i - P.w]; let d = input_px[i + P.w];
     let l = input_px[i - 1u]; let r = input_px[i + 1u];
@@ -189,10 +211,12 @@ static PIXEL_PIPELINES: std::sync::OnceLock<PixelPipelines> = std::sync::OnceLoc
 
 fn pixel_pipelines(rt: &'static crate::gpu_stack::GpuRuntime) -> &'static PixelPipelines {
     PIXEL_PIPELINES.get_or_init(|| {
-        let module = rt.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("zas-deepsky-pixel-preprocess-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(PIXEL_PREPROCESS_WGSL.into()),
-        });
+        let module = rt
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("zas-deepsky-pixel-preprocess-wgsl"),
+                source: wgpu::ShaderSource::Wgsl(PIXEL_PREPROCESS_WGSL.into()),
+            });
         let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -203,35 +227,45 @@ fn pixel_pipelines(rt: &'static crate::gpu_stack::GpuRuntime) -> &'static PixelP
             },
             count: None,
         };
-        let layout = rt.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("zas-deepsky-pixel-preprocess-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let layout = rt
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("zas-deepsky-pixel-preprocess-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                storage(1, true), storage(2, true), storage(3, true), storage(4, false),
-            ],
-        });
-        let pl = rt.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("zas-deepsky-pixel-preprocess-pipeline-layout"),
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
-        });
-        let make = |entry| rt.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(entry),
-            layout: Some(&pl),
-            module: &module,
-            entry_point: Some(entry),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+                    storage(1, true),
+                    storage(2, true),
+                    storage(3, true),
+                    storage(4, false),
+                ],
+            });
+        let pl = rt
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("zas-deepsky-pixel-preprocess-pipeline-layout"),
+                bind_group_layouts: &[&layout],
+                push_constant_ranges: &[],
+            });
+        let make = |entry| {
+            rt.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&pl),
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        };
         PixelPipelines {
             cosmetic: make("cosmetic"),
             debayer: make("debayer"),
@@ -264,13 +298,14 @@ struct RejectParams {
 @group(0) @binding(8) var<storage, read_write> rejected_high: array<f32>;
 @group(0) @binding(9) var<storage, read> quality_grids: array<f32>;
 
-// Bilineal idéntica a ds_sample_grid (nodos j/(G-1), clamp de bordes).
+// Bilineal idéntica a ds_sample_grid (nodos en centros de celda (j+0.5)/G,
+// coordenada clamp(u·G − 0.5, 0, G−1), clamp de bordes).
 fn quality_at(k: u32, pixel: u32) -> f32 {
     if (P.wq_g == 0u) { return 1.0; }
     let x = pixel % P.out_w;
     let y = P.oy0 + pixel / P.out_w;
-    let u = clamp(f32(x) / f32(P.out_w), 0.0, 1.0) * f32(P.wq_g - 1u);
-    let v = clamp(f32(y) / f32(P.full_h), 0.0, 1.0) * f32(P.wq_g - 1u);
+    let u = clamp(clamp(f32(x) / f32(P.out_w), 0.0, 1.0) * f32(P.wq_g) - 0.5, 0.0, f32(P.wq_g - 1u));
+    let v = clamp(clamp(f32(y) / f32(P.full_h), 0.0, 1.0) * f32(P.wq_g) - 0.5, 0.0, f32(P.wq_g - 1u));
     let x0 = min(u32(floor(u)), P.wq_g - 1u);
     let y0 = min(u32(floor(v)), P.wq_g - 1u);
     let x1 = min(x0 + 1u, P.wq_g - 1u);
@@ -484,10 +519,12 @@ static REJECT_PIPELINE: std::sync::OnceLock<RejectPipeline> = std::sync::OnceLoc
 
 fn reject_pipeline(rt: &'static crate::gpu_stack::GpuRuntime) -> &'static RejectPipeline {
     REJECT_PIPELINE.get_or_init(|| {
-        let module = rt.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("zas-deepsky-tiled-reject-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(TILED_REJECT_WGSL.into()),
-        });
+        let module = rt
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("zas-deepsky-tiled-reject-wgsl"),
+                source: wgpu::ShaderSource::Wgsl(TILED_REJECT_WGSL.into()),
+            });
         let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -498,37 +535,49 @@ fn reject_pipeline(rt: &'static crate::gpu_stack::GpuRuntime) -> &'static Reject
             },
             count: None,
         };
-        let layout = rt.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("zas-deepsky-tiled-reject-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let layout = rt
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("zas-deepsky-tiled-reject-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                storage(1, false), storage(2, true), storage(3, false),
-                storage(4, false), storage(5, false), storage(6, false),
-                storage(7, false), storage(8, false), storage(9, true),
-            ],
-        });
-        let pl = rt.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("zas-deepsky-tiled-reject-pipeline-layout"),
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
-        });
-        let pipeline = rt.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("zas-deepsky-tiled-reject-pipeline"),
-            layout: Some(&pl),
-            module: &module,
-            entry_point: Some("reject_tiled"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+                    storage(1, false),
+                    storage(2, true),
+                    storage(3, false),
+                    storage(4, false),
+                    storage(5, false),
+                    storage(6, false),
+                    storage(7, false),
+                    storage(8, false),
+                    storage(9, true),
+                ],
+            });
+        let pl = rt
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("zas-deepsky-tiled-reject-pipeline-layout"),
+                bind_group_layouts: &[&layout],
+                push_constant_ranges: &[],
+            });
+        let pipeline = rt
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("zas-deepsky-tiled-reject-pipeline"),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some("reject_tiled"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
         RejectPipeline { pipeline, layout }
     })
 }
@@ -596,14 +645,20 @@ pub fn reject_tiled_pass(
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let mk = |label: &'static str, size: u64, readback: bool| rt.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: size.max(4),
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | if readback { wgpu::BufferUsages::COPY_SRC } else { wgpu::BufferUsages::empty() },
-        mapped_at_creation: false,
-    });
+    let mk = |label: &'static str, size: u64, readback: bool| {
+        rt.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: size.max(4),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | if readback {
+                    wgpu::BufferUsages::COPY_SRC
+                } else {
+                    wgpu::BufferUsages::empty()
+                },
+            mapped_at_creation: false,
+        })
+    };
     let values = mk("zas-deepsky-tiled-values", stack_bytes, false);
     let frame_w = mk("zas-deepsky-tiled-frame-weights", frame_bytes, false);
     let work_w = mk("zas-deepsky-tiled-work-weights", stack_bytes, false);
@@ -613,46 +668,85 @@ pub fn reject_tiled_pass(
     let low = mk("zas-deepsky-tiled-reject-low", px_bytes, true);
     let high = mk("zas-deepsky-tiled-reject-high", px_bytes, true);
     let quality_buf = mk("zas-deepsky-tiled-quality", quality_bytes, false);
-    rt.queue.write_buffer(&values, 0, bytemuck::cast_slice(stack));
-    rt.queue.write_buffer(&frame_w, 0, bytemuck::cast_slice(frame_weights));
+    rt.queue
+        .write_buffer(&values, 0, bytemuck::cast_slice(stack));
+    rt.queue
+        .write_buffer(&frame_w, 0, bytemuck::cast_slice(frame_weights));
     if let Some((grids, _)) = quality {
-        rt.queue.write_buffer(&quality_buf, 0, bytemuck::cast_slice(grids));
+        rt.queue
+            .write_buffer(&quality_buf, 0, bytemuck::cast_slice(grids));
     }
     let (out_w, full_h, oy0) = strip;
-    rt.queue.write_buffer(&params, 0, bytemuck::bytes_of(&RejectParams {
-        pixels: pixels as u32,
-        channels: channels as u32,
-        frames: frames as u32,
-        method: method_id,
-        k_low,
-        k_high,
-        p0: sigma_floor,
-        p1: 0.0,
-        out_w: out_w.max(1) as u32,
-        full_h: full_h.max(1) as u32,
-        oy0: oy0 as u32,
-        wq_g: quality.map(|(_, g)| g as u32).unwrap_or(0),
-    }));
+    rt.queue.write_buffer(
+        &params,
+        0,
+        bytemuck::bytes_of(&RejectParams {
+            pixels: pixels as u32,
+            channels: channels as u32,
+            frames: frames as u32,
+            method: method_id,
+            k_low,
+            k_high,
+            p0: sigma_floor,
+            p1: 0.0,
+            out_w: out_w.max(1) as u32,
+            full_h: full_h.max(1) as u32,
+            oy0: oy0 as u32,
+            wq_g: quality.map(|(_, g)| g as u32).unwrap_or(0),
+        }),
+    );
     let pp = reject_pipeline(rt);
     let bind = rt.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("zas-deepsky-tiled-reject-bind"),
         layout: &pp.layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: values.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: frame_w.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: work_w.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: output.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: coverage.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 6, resource: present.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 7, resource: low.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 8, resource: high.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 9, resource: quality_buf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: params.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: values.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: frame_w.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: work_w.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: output.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: coverage.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: present.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: low.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: high.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: quality_buf.as_entire_binding(),
+            },
         ],
     });
-    let mut enc = rt.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("zas-deepsky-tiled-reject-encoder"),
-    });
+    let mut enc = rt
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("zas-deepsky-tiled-reject-encoder"),
+        });
     {
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("zas-deepsky-tiled-reject-pass"),
@@ -729,10 +823,12 @@ fn px(x: u32, y: u32, c: u32) -> f32 {
     return frame[(y * P.src_w + x) * P.channels + c];
 }
 
+// Normalización local: bilineal idéntica a ds_sample_grid (centros de celda,
+// clamp(u·G − 0.5, 0, G−1)); los campos LN se construyen con binning floor(u·G).
 fn grid_value(u0: f32, v0: f32, channel: u32) -> f32 {
     if ((P.flags & 4u) == 0u || P.ln_g == 0u) { return 0.0; }
-    let u = clamp(u0, 0.0, 1.0) * f32(P.ln_g - 1u);
-    let v = clamp(v0, 0.0, 1.0) * f32(P.ln_g - 1u);
+    let u = clamp(clamp(u0, 0.0, 1.0) * f32(P.ln_g) - 0.5, 0.0, f32(P.ln_g - 1u));
+    let v = clamp(clamp(v0, 0.0, 1.0) * f32(P.ln_g) - 0.5, 0.0, f32(P.ln_g - 1u));
     let x0 = min(u32(floor(u)), P.ln_g - 1u);
     let y0 = min(u32(floor(v)), P.ln_g - 1u);
     let x1 = min(x0 + 1u, P.ln_g - 1u);
@@ -748,11 +844,12 @@ fn grid_value(u0: f32, v0: f32, channel: u32) -> f32 {
 }
 
 // Rescate de detalle: bilineal idéntica a ds_sample_grid sobre la rejilla de
-// calidad (un solo canal). 1.0 exacto cuando el flag 32 está apagado.
+// calidad (un solo canal, centros de celda clamp(u·G − 0.5, 0, G−1)).
+// 1.0 exacto cuando el flag 32 está apagado.
 fn quality_value(u0: f32, v0: f32) -> f32 {
     if ((P.flags & 32u) == 0u || P.wq_g == 0u) { return 1.0; }
-    let u = clamp(u0, 0.0, 1.0) * f32(P.wq_g - 1u);
-    let v = clamp(v0, 0.0, 1.0) * f32(P.wq_g - 1u);
+    let u = clamp(clamp(u0, 0.0, 1.0) * f32(P.wq_g) - 0.5, 0.0, f32(P.wq_g - 1u));
+    let v = clamp(clamp(v0, 0.0, 1.0) * f32(P.wq_g) - 0.5, 0.0, f32(P.wq_g - 1u));
     let x0 = min(u32(floor(u)), P.wq_g - 1u);
     let y0 = min(u32(floor(v)), P.wq_g - 1u);
     let x1 = min(x0 + 1u, P.wq_g - 1u);
@@ -1039,10 +1136,12 @@ static CAL_PIPELINES: std::sync::OnceLock<CalPipelines> = std::sync::OnceLock::n
 
 fn calibration_pipelines(rt: &'static crate::gpu_stack::GpuRuntime) -> &'static CalPipelines {
     CAL_PIPELINES.get_or_init(|| {
-        let shader = rt.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("zas-deepsky-calibrate-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(CALIBRATE_WGSL.into()),
-        });
+        let shader = rt
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("zas-deepsky-calibrate-wgsl"),
+                source: wgpu::ShaderSource::Wgsl(CALIBRATE_WGSL.into()),
+            });
         let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -1053,45 +1152,56 @@ fn calibration_pipelines(rt: &'static crate::gpu_stack::GpuRuntime) -> &'static 
             },
             count: None,
         };
-        let layout = rt.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("zas-deepsky-calibrate-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let layout = rt
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("zas-deepsky-calibrate-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                storage(1, false), storage(2, true), storage(3, true), storage(4, true),
-            ],
-        });
-        let pipe_layout = rt.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("zas-deepsky-calibrate-pipeline-layout"),
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
-        });
-        let pipeline = rt.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("zas-deepsky-calibrate-pipeline"),
-            layout: Some(&pipe_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+                    storage(1, false),
+                    storage(2, true),
+                    storage(3, true),
+                    storage(4, true),
+                ],
+            });
+        let pipe_layout = rt
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("zas-deepsky-calibrate-pipeline-layout"),
+                bind_group_layouts: &[&layout],
+                push_constant_ranges: &[],
+            });
+        let pipeline = rt
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("zas-deepsky-calibrate-pipeline"),
+                layout: Some(&pipe_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
         CalPipelines { pipeline, layout }
     })
 }
 
 fn pipelines(rt: &'static crate::gpu_stack::GpuRuntime) -> &'static Pipelines {
     PIPELINES.get_or_init(|| {
-        let shader = rt.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("zas-deepsky-integrate-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(DS_WGSL.into()),
-        });
+        let shader = rt
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("zas-deepsky-integrate-wgsl"),
+                source: wgpu::ShaderSource::Wgsl(DS_WGSL.into()),
+            });
         let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -1102,41 +1212,59 @@ fn pipelines(rt: &'static crate::gpu_stack::GpuRuntime) -> &'static Pipelines {
             },
             count: None,
         };
-        let layout = rt.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("zas-deepsky-integrate-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let layout = rt
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("zas-deepsky-integrate-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                storage(1, true), storage(2, true), storage(3, true), storage(4, true),
-                storage(5, false), storage(6, false), storage(7, false), storage(8, true),
-                storage(9, false), storage(10, false), storage(11, true),
-            ],
-        });
-        let pipe_layout = rt.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("zas-deepsky-integrate-pipeline-layout"),
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
-        });
-        let pipeline = rt.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("zas-deepsky-integrate-pipeline"),
-            layout: Some(&pipe_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+                    storage(1, true),
+                    storage(2, true),
+                    storage(3, true),
+                    storage(4, true),
+                    storage(5, false),
+                    storage(6, false),
+                    storage(7, false),
+                    storage(8, true),
+                    storage(9, false),
+                    storage(10, false),
+                    storage(11, true),
+                ],
+            });
+        let pipe_layout = rt
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("zas-deepsky-integrate-pipeline-layout"),
+                bind_group_layouts: &[&layout],
+                push_constant_ranges: &[],
+            });
+        let pipeline = rt
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("zas-deepsky-integrate-pipeline"),
+                layout: Some(&pipe_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
         let lut_values: Vec<f32> = (0..=3072)
             .map(|i| {
                 let x = i as f32 / 1024.0;
-                if x < 1e-4 { 1.0 } else if x >= 3.0 { 0.0 } else {
+                if x < 1e-4 {
+                    1.0
+                } else if x >= 3.0 {
+                    0.0
+                } else {
                     let pix = std::f32::consts::PI * x;
                     3.0 * (pix.sin() * (pix / 3.0).sin()) / (pix * pix)
                 }
@@ -1148,8 +1276,13 @@ fn pipelines(rt: &'static crate::gpu_stack::GpuRuntime) -> &'static Pipelines {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        rt.queue.write_buffer(&lut, 0, bytemuck::cast_slice(&lut_values));
-        Pipelines { pipeline, layout, lut }
+        rt.queue
+            .write_buffer(&lut, 0, bytemuck::cast_slice(&lut_values));
+        Pipelines {
+            pipeline,
+            layout,
+            lut,
+        }
     })
 }
 
@@ -1170,9 +1303,15 @@ impl WarpTransform {
         let ib = -t.1 / det;
         Self {
             inverse_h: [
-                ia, -ib, -ia * t.2 + ib * t.3,
-                ib, ia, -ib * t.2 - ia * t.3,
-                0.0, 0.0, 1.0,
+                ia,
+                -ib,
+                -ia * t.2 + ib * t.3,
+                ib,
+                ia,
+                -ib * t.2 - ia * t.3,
+                0.0,
+                0.0,
+                1.0,
             ],
             poly: [0.0; 12],
             norm: [0.0, 0.0, 1.0],
@@ -1184,31 +1323,51 @@ impl WarpTransform {
         if self.local_distortion {
             let q = self.poly;
             let det = q[0] * q[7] - q[1] * q[6];
-            if det.abs() < 1e-12 { return None; }
+            if det.abs() < 1e-12 {
+                return None;
+            }
             let du = u - q[2];
             let dv = v - q[8];
             let mut xn = (q[7] * du - q[1] * dv) / det;
             let mut yn = (-q[6] * du + q[0] * dv) / det;
             for _ in 0..7 {
-                let fu = q[0]*xn + q[1]*yn + q[2] + q[3]*xn*xn + q[4]*xn*yn + q[5]*yn*yn - u;
-                let fv = q[6]*xn + q[7]*yn + q[8] + q[9]*xn*xn + q[10]*xn*yn + q[11]*yn*yn - v;
-                let j00 = q[0] + 2.0*q[3]*xn + q[4]*yn;
-                let j01 = q[1] + q[4]*xn + 2.0*q[5]*yn;
-                let j10 = q[6] + 2.0*q[9]*xn + q[10]*yn;
-                let j11 = q[7] + q[10]*xn + 2.0*q[11]*yn;
-                let jd = j00*j11 - j01*j10;
-                if jd.abs() < 1e-14 { return None; }
-                let dx = (j11*fu - j01*fv) / jd;
-                let dy = (-j10*fu + j00*fv) / jd;
+                let fu =
+                    q[0] * xn + q[1] * yn + q[2] + q[3] * xn * xn + q[4] * xn * yn + q[5] * yn * yn
+                        - u;
+                let fv = q[6] * xn
+                    + q[7] * yn
+                    + q[8]
+                    + q[9] * xn * xn
+                    + q[10] * xn * yn
+                    + q[11] * yn * yn
+                    - v;
+                let j00 = q[0] + 2.0 * q[3] * xn + q[4] * yn;
+                let j01 = q[1] + q[4] * xn + 2.0 * q[5] * yn;
+                let j10 = q[6] + 2.0 * q[9] * xn + q[10] * yn;
+                let j11 = q[7] + q[10] * xn + 2.0 * q[11] * yn;
+                let jd = j00 * j11 - j01 * j10;
+                if jd.abs() < 1e-14 {
+                    return None;
+                }
+                let dx = (j11 * fu - j01 * fv) / jd;
+                let dy = (-j10 * fu + j00 * fv) / jd;
                 xn -= dx;
                 yn -= dy;
             }
-            return Some((xn * self.norm[2] + self.norm[0], yn * self.norm[2] + self.norm[1]));
+            return Some((
+                xn * self.norm[2] + self.norm[0],
+                yn * self.norm[2] + self.norm[1],
+            ));
         }
         let h = self.inverse_h;
         let d = h[6] * u + h[7] * v + h[8];
-        if d.abs() < 1e-12 { return None; }
-        Some(((h[0] * u + h[1] * v + h[2]) / d, (h[3] * u + h[4] * v + h[5]) / d))
+        if d.abs() < 1e-12 {
+            return None;
+        }
+        Some((
+            (h[0] * u + h[1] * v + h[2]) / d,
+            (h[3] * u + h[4] * v + h[5]) / d,
+        ))
     }
 }
 
@@ -1242,7 +1401,12 @@ pub struct GpuPassResult {
 }
 
 #[derive(Clone, Copy)]
-struct Crop { x: usize, y: usize, w: usize, h: usize }
+struct Crop {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+}
 
 fn crop_for(cfg: &IntegrateConfig, meta: FrameMeta, y0: usize, y1: usize) -> Crop {
     // Un polinomio cuadrático puede alcanzar sus extremos dentro de una arista
@@ -1269,7 +1433,9 @@ fn crop_for(cfg: &IntegrateConfig, meta: FrameMeta, y0: usize, y1: usize) -> Cro
         (0.0, (y1 - 1) as f32),
         ((cfg.width - 1) as f32, (y1 - 1) as f32),
     ] {
-        let Some((sx, sy)) = meta.transform.inverse(ox * inv_scale, oy * inv_scale) else { continue; };
+        let Some((sx, sy)) = meta.transform.inverse(ox * inv_scale, oy * inv_scale) else {
+            continue;
+        };
         minx = minx.min(sx);
         maxx = maxx.max(sx);
         miny = miny.min(sy);
@@ -1299,7 +1465,11 @@ fn copy_crop(full: &[f32], cfg: &IntegrateConfig, crop: Crop) -> Vec<f32> {
     out
 }
 
-fn read_f32(rt: &crate::gpu_stack::GpuRuntime, buffer: &wgpu::Buffer, count: usize) -> Result<Vec<f32>, String> {
+fn read_f32(
+    rt: &crate::gpu_stack::GpuRuntime,
+    buffer: &wgpu::Buffer,
+    count: usize,
+) -> Result<Vec<f32>, String> {
     let bytes = (count * 4) as u64;
     let staging = rt.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("zas-deepsky-readback"),
@@ -1307,14 +1477,18 @@ fn read_f32(rt: &crate::gpu_stack::GpuRuntime, buffer: &wgpu::Buffer, count: usi
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let mut enc = rt.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("zas-deepsky-readback-encoder"),
-    });
+    let mut enc = rt
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("zas-deepsky-readback-encoder"),
+        });
     enc.copy_buffer_to_buffer(buffer, 0, &staging, 0, bytes);
     rt.queue.submit(Some(enc.finish()));
     let slice = staging.slice(0..bytes);
     let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
     crate::gpu_stack::wait_for_readback(&rt.device, &rx, "readback deepsky")?;
     let out = {
         let mapped = slice.get_mapped_range();
@@ -1325,7 +1499,11 @@ fn read_f32(rt: &crate::gpu_stack::GpuRuntime, buffer: &wgpu::Buffer, count: usi
 }
 
 #[derive(Clone, Copy)]
-enum PixelKernel { Cosmetic, Debayer, StarMap }
+enum PixelKernel {
+    Cosmetic,
+    Debayer,
+    StarMap,
+}
 
 #[allow(clippy::too_many_arguments)]
 fn run_pixel_tiles(
@@ -1372,30 +1550,63 @@ fn run_pixel_tiles(
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let make = |label: &str, size: u64, read_only: bool| rt.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: size.max(4),
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | if read_only { wgpu::BufferUsages::empty() } else { wgpu::BufferUsages::COPY_SRC },
-        mapped_at_creation: false,
-    });
+    let make = |label: &str, size: u64, read_only: bool| {
+        rt.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: size.max(4),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | if read_only {
+                    wgpu::BufferUsages::empty()
+                } else {
+                    wgpu::BufferUsages::COPY_SRC
+                },
+            mapped_at_creation: false,
+        })
+    };
     let input_buf = make("zas-deepsky-pixel-input", input_bytes, true);
     let output_buf = make("zas-deepsky-pixel-output", output_bytes, false);
     let bg_buf = make("zas-deepsky-pixel-bg", aux_bg_bytes, true);
     let noise_buf = make("zas-deepsky-pixel-noise", aux_noise_bytes, true);
     let zero = [0.0f32];
-    rt.queue.write_buffer(&bg_buf, 0, bytemuck::cast_slice(if aux_bg.is_empty() { &zero } else { aux_bg }));
-    rt.queue.write_buffer(&noise_buf, 0, bytemuck::cast_slice(if aux_noise.is_empty() { &zero } else { aux_noise }));
+    rt.queue.write_buffer(
+        &bg_buf,
+        0,
+        bytemuck::cast_slice(if aux_bg.is_empty() { &zero } else { aux_bg }),
+    );
+    rt.queue.write_buffer(
+        &noise_buf,
+        0,
+        bytemuck::cast_slice(if aux_noise.is_empty() {
+            &zero
+        } else {
+            aux_noise
+        }),
+    );
     let bind = rt.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("zas-deepsky-pixel-bind"),
         layout: &pp.layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: input_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: bg_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: noise_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: output_buf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: input_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: bg_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: noise_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: output_buf.as_entire_binding(),
+            },
         ],
     });
     let pipeline = match kernel {
@@ -1411,21 +1622,28 @@ fn run_pixel_tiles(
         let tile_h = src_y1 - src_y0;
         let input_start = src_y0 * w * input_channels;
         let input_end = src_y1 * w * input_channels;
-        rt.queue.write_buffer(&input_buf, 0, bytemuck::cast_slice(&input[input_start..input_end]));
+        rt.queue.write_buffer(
+            &input_buf,
+            0,
+            bytemuck::cast_slice(&input[input_start..input_end]),
+        );
         params.w = w as u32;
         params.tile_h = tile_h as u32;
         params.full_h = h as u32;
         params.channels = input_channels as u32;
         params.global_y0 = src_y0 as u32;
         params.halo = halo as u32;
-        rt.queue.write_buffer(&uniform, 0, bytemuck::bytes_of(&params));
+        rt.queue
+            .write_buffer(&uniform, 0, bytemuck::bytes_of(&params));
         let invocations = match kernel {
             PixelKernel::Cosmetic => tile_h * w * input_channels,
             PixelKernel::Debayer | PixelKernel::StarMap => tile_h * w,
         };
-        let mut enc = rt.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("zas-deepsky-pixel-encoder"),
-        });
+        let mut enc = rt
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("zas-deepsky-pixel-encoder"),
+            });
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("zas-deepsky-pixel-pass"),
@@ -1460,37 +1678,75 @@ pub fn cosmetic_hot_pixels(
     medians: &[f32],
     noises: &[f32],
 ) -> Result<u64, String> {
-    if !matches!(channels, 1 | 3) || medians.len() < channels || noises.len() < channels {
+    // CFA: ds_cosmetic_stats entrega 4 pares POR FASE Bayer (((y&1)<<1)|(x&1));
+    // los 4 slots del vec4 del uniform los transportan tal cual al kernel.
+    let expected_stats = if bayer && channels == 1 { 4 } else { channels };
+    if !matches!(channels, 1 | 3) || medians.len() < expected_stats || noises.len() < expected_stats
+    {
         return Err("Parámetros cosméticos GPU inválidos".into());
     }
     let mut med = [0.0f32; 4];
     let mut noise = [1.0f32; 4];
-    med[..channels].copy_from_slice(&medians[..channels]);
-    noise[..channels].copy_from_slice(&noises[..channels]);
+    med[..expected_stats].copy_from_slice(&medians[..expected_stats]);
+    noise[..expected_stats].copy_from_slice(&noises[..expected_stats]);
     let params = PixelParams {
-        w: 0, tile_h: 0, full_h: 0, channels: channels as u32,
-        global_y0: 0, halo: 0, rx: 0, ry: 0,
-        grid_w: 1, grid_h: 1, same_color_step: if bayer { 2 } else { 1 }, pad0: 0,
-        med, noise,
+        w: 0,
+        tile_h: 0,
+        full_h: 0,
+        channels: channels as u32,
+        global_y0: 0,
+        halo: 0,
+        rx: 0,
+        ry: 0,
+        grid_w: 1,
+        grid_h: 1,
+        same_color_step: if bayer { 2 } else { 1 },
+        pad0: 0,
+        med,
+        noise,
     };
     let out = run_pixel_tiles(
-        data, w, h, channels, channels, if bayer { 2 } else { 1 }, params,
-        &[], &[], PixelKernel::Cosmetic,
+        data,
+        w,
+        h,
+        channels,
+        channels,
+        if bayer { 2 } else { 1 },
+        params,
+        &[],
+        &[],
+        PixelKernel::Cosmetic,
     )?;
     data.copy_from_slice(&out);
     Ok((data.len() * 12) as u64)
 }
 
 pub fn debayer_float32(data: &[f32], w: usize, h: usize, cid: i32) -> Result<Vec<f32>, String> {
+    if w < 4 || h < 4 {
+        return Err("Debayer GPU requiere una imagen de al menos 4×4".into());
+    }
     let (rx, ry) = match cid {
-        8 => (0, 0), 9 => (1, 0), 10 => (0, 1), 11 => (1, 1),
+        8 => (0, 0),
+        9 => (1, 0),
+        10 => (0, 1),
+        11 => (1, 1),
         _ => return Err(format!("Patrón Bayer GPU no soportado: {cid}")),
     };
     let params = PixelParams {
-        w: 0, tile_h: 0, full_h: 0, channels: 1,
-        global_y0: 0, halo: 0, rx, ry,
-        grid_w: 1, grid_h: 1, same_color_step: 1, pad0: 0,
-        med: [0.0; 4], noise: [1.0; 4],
+        w: 0,
+        tile_h: 0,
+        full_h: 0,
+        channels: 1,
+        global_y0: 0,
+        halo: 0,
+        rx,
+        ry,
+        grid_w: 1,
+        grid_h: 1,
+        same_color_step: 1,
+        pad0: 0,
+        med: [0.0; 4],
+        noise: [1.0; 4],
     };
     run_pixel_tiles(data, w, h, 1, 3, 1, params, &[], &[], PixelKernel::Debayer)
 }
@@ -1508,10 +1764,20 @@ pub fn star_candidate_map(
         return Err("Grillas de estrellas GPU inválidas".into());
     }
     let params = PixelParams {
-        w: 0, tile_h: 0, full_h: 0, channels: 1,
-        global_y0: 0, halo: 0, rx: 0, ry: 0,
-        grid_w: grid_w as u32, grid_h: grid_h as u32, same_color_step: 1, pad0: 0,
-        med: [0.0; 4], noise: [1.0; 4],
+        w: 0,
+        tile_h: 0,
+        full_h: 0,
+        channels: 1,
+        global_y0: 0,
+        halo: 0,
+        rx: 0,
+        ry: 0,
+        grid_w: grid_w as u32,
+        grid_h: grid_h as u32,
+        same_color_step: 1,
+        pad0: 0,
+        med: [0.0; 4],
+        noise: [1.0; 4],
     };
     run_pixel_tiles(luma, w, h, 1, 1, 1, params, bg, noise, PixelKernel::StarMap)
 }
@@ -1531,7 +1797,9 @@ pub fn calibrate(
     }
     for (name, data) in [("bias", bias), ("dark", dark), ("flat", flat)] {
         if data.is_some_and(|v| v.len() != light.len()) {
-            return Err(format!("Master {name} con geometría distinta para calibración GPU"));
+            return Err(format!(
+                "Master {name} con geometría distinta para calibración GPU"
+            ));
         }
     }
     let rt = crate::gpu_stack::gpu_runtime().ok_or("No hay runtime wgpu")?;
@@ -1547,14 +1815,20 @@ pub fn calibrate(
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let mk = |label, readback| rt.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: bytes.max(4),
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | if readback { wgpu::BufferUsages::COPY_SRC } else { wgpu::BufferUsages::empty() },
-        mapped_at_creation: false,
-    });
+    let mk = |label, readback| {
+        rt.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes.max(4),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | if readback {
+                    wgpu::BufferUsages::COPY_SRC
+                } else {
+                    wgpu::BufferUsages::empty()
+                },
+            mapped_at_creation: false,
+        })
+    };
     let light_buf = mk("zas-deepsky-calibrate-light", true);
     let bias_buf = mk("zas-deepsky-calibrate-bias", false);
     let dark_buf = mk("zas-deepsky-calibrate-dark", false);
@@ -1563,11 +1837,26 @@ pub fn calibrate(
         label: Some("zas-deepsky-calibrate-bind"),
         layout: &pipes.layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: light_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: bias_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: dark_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: flat_buf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: params.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: light_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: bias_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: dark_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: flat_buf.as_entire_binding(),
+            },
         ],
     });
 
@@ -1575,18 +1864,39 @@ pub fn calibrate(
     while offset < light.len() {
         let n = chunk.min(light.len() - offset);
         let end = offset + n;
-        rt.queue.write_buffer(&light_buf, 0, bytemuck::cast_slice(&light[offset..end]));
-        if let Some(v) = bias { rt.queue.write_buffer(&bias_buf, 0, bytemuck::cast_slice(&v[offset..end])); }
-        if let Some(v) = dark { rt.queue.write_buffer(&dark_buf, 0, bytemuck::cast_slice(&v[offset..end])); }
-        if let Some(v) = flat { rt.queue.write_buffer(&flat_buf, 0, bytemuck::cast_slice(&v[offset..end])); }
+        rt.queue
+            .write_buffer(&light_buf, 0, bytemuck::cast_slice(&light[offset..end]));
+        if let Some(v) = bias {
+            rt.queue
+                .write_buffer(&bias_buf, 0, bytemuck::cast_slice(&v[offset..end]));
+        }
+        if let Some(v) = dark {
+            rt.queue
+                .write_buffer(&dark_buf, 0, bytemuck::cast_slice(&v[offset..end]));
+        }
+        if let Some(v) = flat {
+            rt.queue
+                .write_buffer(&flat_buf, 0, bytemuck::cast_slice(&v[offset..end]));
+        }
         let flags = (bias.is_some() as u32)
             | ((dark.is_some() as u32) << 1)
             | ((flat.is_some() as u32) << 2);
-        let p = CalParams { n: n as u32, flags, p0: 0, p1: 0, dark_scale, p2: 0.0, p3: 0.0, p4: 0.0 };
+        let p = CalParams {
+            n: n as u32,
+            flags,
+            p0: 0,
+            p1: 0,
+            dark_scale,
+            p2: 0.0,
+            p3: 0.0,
+            p4: 0.0,
+        };
         rt.queue.write_buffer(&params, 0, bytemuck::bytes_of(&p));
-        let mut enc = rt.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("zas-deepsky-calibrate-encoder"),
-        });
+        let mut enc = rt
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("zas-deepsky-calibrate-encoder"),
+            });
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("zas-deepsky-calibrate-pass"),
@@ -1655,21 +1965,31 @@ pub fn integrate_pass(
         let (crops, frame_capacity, bytes_needed) = loop {
             let y1 = (y0 + rows).min(cfg.height);
             let crops: Vec<Crop> = frames.iter().map(|&m| crop_for(cfg, m, y0, y1)).collect();
-            let frame_capacity = crops.iter().map(|c| c.w * c.h * cfg.channels).max().unwrap_or(1);
+            let frame_capacity = crops
+                .iter()
+                .map(|c| c.w * c.h * cfg.channels)
+                .max()
+                .unwrap_or(1);
             let out_elems = cfg.width * rows * cfg.channels;
             let out_px = cfg.width * rows;
             let bindings_ok = (out_elems * 4) as u64 <= rt.max_binding
                 && (frame_capacity * 4) as u64 <= rt.max_binding;
             // mean + M2 + lower + upper + weight + rechazo bajo/alto + fuente + grids/LUT.
-            let bytes = (out_elems * 16 + out_px * 12 + frame_capacity * 4
+            let bytes = (out_elems * 16
+                + out_px * 12
+                + frame_capacity * 4
                 + cfg.local_grid_size * cfg.local_grid_size * cfg.channels * 4
                 + wq_cells * 4
                 + 32 * 1024) as u64;
-            if bindings_ok && bytes <= rt.vram_budget { break (crops, frame_capacity, bytes); }
+            if bindings_ok && bytes <= rt.vram_budget {
+                break (crops, frame_capacity, bytes);
+            }
             if rows == 1 {
                 return Err(format!(
                     "La banda mínima GPU requiere {} MB; presupuesto {} MB / binding {} MB",
-                    bytes / (1024 * 1024), rt.vram_budget / (1024 * 1024), rt.max_binding / (1024 * 1024)
+                    bytes / (1024 * 1024),
+                    rt.vram_budget / (1024 * 1024),
+                    rt.max_binding / (1024 * 1024)
                 ));
             }
             rows = (rows / 2).max(1);
@@ -1691,12 +2011,32 @@ pub fn integrate_pass(
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let frame_buf = mk("zas-deepsky-frame-crop", frame_capacity, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+        let frame_buf = mk(
+            "zas-deepsky-frame-crop",
+            frame_capacity,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
         let local_cells = cfg.local_grid_size * cfg.local_grid_size;
-        let local_buf = mk("zas-deepsky-local-grid", local_cells * cfg.channels, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
-        let quality_buf = mk("zas-deepsky-quality-grid", wq_cells, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
-        let lower_buf = mk("zas-deepsky-lower", out_elems, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
-        let upper_buf = mk("zas-deepsky-upper", out_elems, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+        let local_buf = mk(
+            "zas-deepsky-local-grid",
+            local_cells * cfg.channels,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let quality_buf = mk(
+            "zas-deepsky-quality-grid",
+            wq_cells,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let lower_buf = mk(
+            "zas-deepsky-lower",
+            out_elems,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let upper_buf = mk(
+            "zas-deepsky-upper",
+            out_elems,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
         let rw = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
         let mean_buf = mk("zas-deepsky-mean", out_elems, rw);
         let m2_buf = mk("zas-deepsky-m2", out_elems, rw);
@@ -1707,25 +2047,69 @@ pub fn integrate_pass(
 
         if let Some((lo, hi)) = bounds {
             let off = y0 * cfg.width * cfg.channels;
-            rt.queue.write_buffer(&lower_buf, 0, bytemuck::cast_slice(&lo[off..off + out_elems]));
-            rt.queue.write_buffer(&upper_buf, 0, bytemuck::cast_slice(&hi[off..off + out_elems]));
+            rt.queue.write_buffer(
+                &lower_buf,
+                0,
+                bytemuck::cast_slice(&lo[off..off + out_elems]),
+            );
+            rt.queue.write_buffer(
+                &upper_buf,
+                0,
+                bytemuck::cast_slice(&hi[off..off + out_elems]),
+            );
         }
         let bind = rt.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("zas-deepsky-integrate-bind"),
             layout: &pipes.layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: frame_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: local_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: lower_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: upper_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: mean_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: m2_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: weight_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: pipes.lut.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: rejected_low_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: rejected_high_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: quality_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: frame_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: local_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: lower_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: upper_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: mean_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: m2_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: weight_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: pipes.lut.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: rejected_low_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: rejected_high_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: quality_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -1745,7 +2129,8 @@ pub fn integrate_pass(
                 return Err(format!("Frame {} cambió de geometría", meta.index));
             }
             let cropped = copy_crop(&full, cfg, *crop);
-            rt.queue.write_buffer(&frame_buf, 0, bytemuck::cast_slice(&cropped));
+            rt.queue
+                .write_buffer(&frame_buf, 0, bytemuck::cast_slice(&cropped));
             let has_local = local_fields[k].as_ref().is_some_and(|f| !f.is_empty());
             if let Some(field) = local_fields[k].as_ref() {
                 if field.len() >= local_cells * cfg.channels {
@@ -1775,40 +2160,83 @@ pub fn integrate_pass(
             let has_quality = wq_fields[k].as_ref().is_some_and(|f| f.len() >= wq_cells);
             if let Some(field) = wq_fields[k].as_ref() {
                 if field.len() >= wq_cells {
-                    rt.queue
-                        .write_buffer(&quality_buf, 0, bytemuck::cast_slice(&field[..wq_cells]));
+                    rt.queue.write_buffer(
+                        &quality_buf,
+                        0,
+                        bytemuck::cast_slice(&field[..wq_cells]),
+                    );
                 }
             }
             let mut flags = 0u32;
-            if cfg.lanczos { flags |= 1; }
-            if bounds.is_some() { flags |= 2; }
-            if has_local { flags |= 4; }
-            if cfg.track_m2 { flags |= 8; }
-            if meta.transform.local_distortion { flags |= 16; }
-            if has_quality { flags |= 32; }
+            if cfg.lanczos {
+                flags |= 1;
+            }
+            if bounds.is_some() {
+                flags |= 2;
+            }
+            if has_local {
+                flags |= 4;
+            }
+            if cfg.track_m2 {
+                flags |= 8;
+            }
+            if meta.transform.local_distortion {
+                flags |= 16;
+            }
+            if has_quality {
+                flags |= 32;
+            }
             let m = meta.transform.inverse_h;
             let q = meta.transform.poly;
             let p = Params {
-                src_w: crop.w as u32, src_h: crop.h as u32,
-                out_w: cfg.width as u32, tile_rows: rows as u32,
-                tile_y0: y0 as u32, channels: cfg.channels as u32,
-                flags, ln_g: cfg.local_grid_size as u32,
-                full_w: cfg.width as u32, full_h: cfg.height as u32,
-                src_x0: crop.x as u32, src_y0: crop.y as u32,
-                out_h: cfg.height as u32, p0: 0, p1: 0,
+                src_w: crop.w as u32,
+                src_h: crop.h as u32,
+                out_w: cfg.width as u32,
+                tile_rows: rows as u32,
+                tile_y0: y0 as u32,
+                channels: cfg.channels as u32,
+                flags,
+                ln_g: cfg.local_grid_size as u32,
+                full_w: cfg.width as u32,
+                full_h: cfg.height as u32,
+                src_x0: crop.x as u32,
+                src_y0: crop.y as u32,
+                out_h: cfg.height as u32,
+                p0: 0,
+                p1: 0,
                 p2: if has_quality { wq_grid as u32 } else { 0 },
-                m0: m[0], m1: m[1], m2: m[2], m3: m[3],
-                m4: m[4], m5: m[5], m6: m[6], m7: m[7], m8: m[8],
+                m0: m[0],
+                m1: m[1],
+                m2: m[2],
+                m3: m[3],
+                m4: m[4],
+                m5: m[5],
+                m6: m[6],
+                m7: m[7],
+                m8: m[8],
                 inv_scale: 1.0 / cfg.scale.max(1.0),
-                norm_mul: meta.norm.0[0], norm_add: meta.norm.1[0],
+                norm_mul: meta.norm.0[0],
+                norm_add: meta.norm.1[0],
                 frame_weight: meta.weight,
-                norm_cx: meta.transform.norm[0], norm_cy: meta.transform.norm[1],
+                norm_cx: meta.transform.norm[0],
+                norm_cy: meta.transform.norm[1],
                 norm_scale: meta.transform.norm[2],
-                q0: q[0], q1: q[1], q2: q[2], q3: q[3],
-                q4: q[4], q5: q[5], q6: q[6], q7: q[7],
-                q8: q[8], q9: q[9], q10: q[10], q11: q[11],
-                norm_mul1: meta.norm.0[1], norm_add1: meta.norm.1[1],
-                norm_mul2: meta.norm.0[2], norm_add2: meta.norm.1[2],
+                q0: q[0],
+                q1: q[1],
+                q2: q[2],
+                q3: q[3],
+                q4: q[4],
+                q5: q[5],
+                q6: q[6],
+                q7: q[7],
+                q8: q[8],
+                q9: q[9],
+                q10: q[10],
+                q11: q[11],
+                norm_mul1: meta.norm.0[1],
+                norm_add1: meta.norm.1[1],
+                norm_mul2: meta.norm.0[2],
+                norm_add2: meta.norm.1[2],
             };
             // Band each frame's tile dispatch under ~2M px so no single compute
             // pass runs long enough to trip the Metal/Windows GPU watchdog on a
@@ -1822,10 +2250,13 @@ pub fn integrate_pass(
                 let mut pb = p;
                 pb.p0 = by as u32; // band_y0
                 pb.p1 = (by + this) as u32; // band_y1
-                rt.queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&pb));
-                let mut enc = rt.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("zas-deepsky-integrate-encoder"),
-                });
+                rt.queue
+                    .write_buffer(&params_buf, 0, bytemuck::bytes_of(&pb));
+                let mut enc = rt
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("zas-deepsky-integrate-encoder"),
+                    });
                 {
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("zas-deepsky-integrate-pass"),
@@ -1833,7 +2264,11 @@ pub fn integrate_pass(
                     });
                     pass.set_pipeline(&pipes.pipeline);
                     pass.set_bind_group(0, &bind, &[]);
-                    pass.dispatch_workgroups((cfg.width as u32).div_ceil(8), (this as u32).div_ceil(8), 1);
+                    pass.dispatch_workgroups(
+                        (cfg.width as u32).div_ceil(8),
+                        (this as u32).div_ceil(8),
+                        1,
+                    );
                 }
                 rt.queue.submit(Some(enc.finish()));
                 rt.device.poll(wgpu::Maintain::Poll);
@@ -1898,7 +2333,12 @@ pub fn ensure_parity() -> bool {
         .collect();
     let cal_ok = calibrate(&mut cal_light, Some(&bias), Some(&dark), Some(&flat), 1.25)
         .ok()
-        .is_some_and(|_| cal_light.iter().zip(expected.iter()).all(|(a, b)| (*a - *b).abs() <= 0.05));
+        .is_some_and(|_| {
+            cal_light
+                .iter()
+                .zip(expected.iter())
+                .all(|(a, b)| (*a - *b).abs() <= 0.05)
+        });
     if !cal_ok {
         DS_PARITY.store(PARITY_FAILED, Ordering::Release);
         return false;
@@ -1907,14 +2347,41 @@ pub fn ensure_parity() -> bool {
     let w = 48usize;
     let h = 32usize;
     let frames: Vec<Vec<f32>> = (0..3)
-        .map(|k| (0..w * h).map(|i| ((i * 17 + k * 31) % 60000) as f32 + 100.0).collect())
+        .map(|k| {
+            (0..w * h)
+                .map(|i| ((i * 17 + k * 31) % 60000) as f32 + 100.0)
+                .collect()
+        })
         .collect();
     let metas = vec![
-        FrameMeta { index: 0, transform: WarpTransform::from_similarity((1.0, 0.0, 0.0, 0.0)), weight: 1.0, norm: ([1.0; 3], [0.0; 3]) },
-        FrameMeta { index: 1, transform: WarpTransform::from_similarity((1.0, 0.0, 0.35, -0.2)), weight: 0.8, norm: ([0.98; 3], [12.0; 3]) },
-        FrameMeta { index: 2, transform: WarpTransform::from_similarity((1.0, 0.0, -0.25, 0.3)), weight: 0.65, norm: ([1.02; 3], [-9.0; 3]) },
+        FrameMeta {
+            index: 0,
+            transform: WarpTransform::from_similarity((1.0, 0.0, 0.0, 0.0)),
+            weight: 1.0,
+            norm: ([1.0; 3], [0.0; 3]),
+        },
+        FrameMeta {
+            index: 1,
+            transform: WarpTransform::from_similarity((1.0, 0.0, 0.35, -0.2)),
+            weight: 0.8,
+            norm: ([0.98; 3], [12.0; 3]),
+        },
+        FrameMeta {
+            index: 2,
+            transform: WarpTransform::from_similarity((1.0, 0.0, -0.25, 0.3)),
+            weight: 0.65,
+            norm: ([1.02; 3], [-9.0; 3]),
+        },
     ];
-    let cfg = IntegrateConfig { width: w, height: h, channels: 1, scale: 1.0, lanczos: false, local_grid_size: 1, track_m2: true };
+    let cfg = IntegrateConfig {
+        width: w,
+        height: h,
+        channels: 1,
+        scale: 1.0,
+        lanczos: false,
+        local_grid_size: 1,
+        track_m2: true,
+    };
     let local = vec![None, None, None];
     let cancel = std::sync::atomic::AtomicBool::new(false);
     // Dos escenarios: sin calidad (camino histórico) y con grids de calidad
@@ -1934,39 +2401,55 @@ pub fn ensure_parity() -> bool {
     let no_quality: Vec<Option<Vec<f32>>> = vec![None, None, None];
     let mut ok = true;
     for wq in [&no_quality, &quality_fields] {
-        let gpu = integrate_pass(&cfg, &metas, &local, wq, wq_g, None, &|i: usize| Ok(frames[i].clone()), &cancel, |_, _, _| {});
+        let gpu = integrate_pass(
+            &cfg,
+            &metas,
+            &local,
+            wq,
+            wq_g,
+            None,
+            &|i: usize| Ok(frames[i].clone()),
+            &cancel,
+            |_, _, _| {},
+        );
         let scenario_ok = gpu.ok().is_some_and(|got| {
             let mut cpu = vec![0.0f64; w * h];
             let mut wt = vec![0.0f64; w * h];
             for (k, m) in metas.iter().enumerate() {
                 let src = &frames[m.index];
-                for y in 0..h { for x in 0..w {
-                    let Some((sx, sy)) = m.transform.inverse(x as f32, y as f32) else { continue; };
-                    if sx < 0.0 || sy < 0.0 || sx >= (w - 1) as f32 || sy >= (h - 1) as f32 { continue; }
-                    let x0 = sx.floor() as usize;
-                    let y0 = sy.floor() as usize;
-                    let fx = sx - x0 as f32;
-                    let fy = sy - y0 as f32;
-                    let v = src[y0 * w + x0] * (1.0 - fx) * (1.0 - fy)
-                        + src[y0 * w + x0 + 1] * fx * (1.0 - fy)
-                        + src[(y0 + 1) * w + x0] * (1.0 - fx) * fy
-                        + src[(y0 + 1) * w + x0 + 1] * fx * fy;
-                    let v = v * m.norm.0[0] + m.norm.1[0];
-                    let q = wq[k]
-                        .as_ref()
-                        .map(|g| {
-                            crate::ds_sample_grid(
-                                g,
-                                wq_g,
-                                wq_g,
-                                x as f32 / w as f32,
-                                y as f32 / h as f32,
-                            ) as f64
-                        })
-                        .unwrap_or(1.0);
-                    cpu[y * w + x] += v as f64 * m.weight as f64 * q;
-                    wt[y * w + x] += m.weight as f64 * q;
-                }}
+                for y in 0..h {
+                    for x in 0..w {
+                        let Some((sx, sy)) = m.transform.inverse(x as f32, y as f32) else {
+                            continue;
+                        };
+                        if sx < 0.0 || sy < 0.0 || sx >= (w - 1) as f32 || sy >= (h - 1) as f32 {
+                            continue;
+                        }
+                        let x0 = sx.floor() as usize;
+                        let y0 = sy.floor() as usize;
+                        let fx = sx - x0 as f32;
+                        let fy = sy - y0 as f32;
+                        let v = src[y0 * w + x0] * (1.0 - fx) * (1.0 - fy)
+                            + src[y0 * w + x0 + 1] * fx * (1.0 - fy)
+                            + src[(y0 + 1) * w + x0] * (1.0 - fx) * fy
+                            + src[(y0 + 1) * w + x0 + 1] * fx * fy;
+                        let v = v * m.norm.0[0] + m.norm.1[0];
+                        let q = wq[k]
+                            .as_ref()
+                            .map(|g| {
+                                crate::ds_sample_grid(
+                                    g,
+                                    wq_g,
+                                    wq_g,
+                                    x as f32 / w as f32,
+                                    y as f32 / h as f32,
+                                ) as f64
+                            })
+                            .unwrap_or(1.0);
+                        cpu[y * w + x] += v as f64 * m.weight as f64 * q;
+                        wt[y * w + x] += m.weight as f64 * q;
+                    }
+                }
             }
             let mut se = 0.0f64;
             let mut n = 0usize;
@@ -1984,8 +2467,8 @@ pub fn ensure_parity() -> bool {
                 }
             }
             let rmse = (se / n.max(1) as f64).sqrt();
-            let photometric_error = (candidate_flux - reference_flux).abs()
-                / reference_flux.abs().max(1e-9);
+            let photometric_error =
+                (candidate_flux - reference_flux).abs() / reference_flux.abs().max(1e-9);
             if rmse > 0.5 || photometric_error > 0.001 {
                 eprintln!(
                     "[gpu deep-sky parity] wq={} RMSE={rmse:.6} ADU, error fotométrico={:.6}%",
@@ -1997,7 +2480,10 @@ pub fn ensure_parity() -> bool {
         });
         ok &= scenario_ok;
     }
-    DS_PARITY.store(if ok { PARITY_OK } else { PARITY_FAILED }, Ordering::Release);
+    DS_PARITY.store(
+        if ok { PARITY_OK } else { PARITY_FAILED },
+        Ordering::Release,
+    );
     ok
 }
 
@@ -2016,14 +2502,18 @@ pub fn ensure_advanced_warp_parity() -> bool {
         .map(|i| (i % w) as f32 * 7.0 + (i / w) as f32 * 13.0 + 100.0)
         .collect();
     let projective = WarpTransform {
-        inverse_h: [1.002, 0.011, -1.3, -0.007, 0.997, 0.8, 0.00008, -0.00005, 1.0],
+        inverse_h: [
+            1.002, 0.011, -1.3, -0.007, 0.997, 0.8, 0.00008, -0.00005, 1.0,
+        ],
         poly: [0.0; 12],
         norm: [0.0, 0.0, 1.0],
         local_distortion: false,
     };
     let local = WarpTransform {
         inverse_h: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-        poly: [24.0, 0.0, 24.0, 0.7, -0.25, 0.2, 0.0, 24.0, 18.0, -0.15, 0.3, -0.6],
+        poly: [
+            24.0, 0.0, 24.0, 0.7, -0.25, 0.2, 0.0, 24.0, 18.0, -0.15, 0.3, -0.6,
+        ],
         norm: [24.0, 18.0, 24.0],
         local_distortion: true,
     };
@@ -2085,9 +2575,7 @@ pub fn ensure_advanced_warp_parity() -> bool {
         }
         let rmse = (squared_error / compared.max(1) as f64).sqrt();
         if compared <= w * h / 2 || rmse > 0.5 {
-            eprintln!(
-                "[gpu deep-sky advanced warp parity] samples={compared}, RMSE={rmse:.6} ADU"
-            );
+            eprintln!("[gpu deep-sky advanced warp parity] samples={compared}, RMSE={rmse:.6} ADU");
             all_ok = false;
             break;
         }
@@ -2110,11 +2598,21 @@ pub fn ensure_pixel_preprocess_parity() -> bool {
         .map(|i| ((i * 37 + (i / w) * 101) % 68000) as f32 - 1200.0)
         .collect();
     let cpu_debayer = crate::ds_debayer_image(
-        crate::DsImage { data: cfa.clone(), w, h, ch: 1, bayer: Some(8) },
+        crate::DsImage {
+            data: cfa.clone(),
+            w,
+            h,
+            ch: 1,
+            bayer: Some(8),
+        },
         8,
     );
     let debayer_ok = debayer_float32(&cfa, w, h, 8).ok().is_some_and(|gpu| {
-        cpu_debayer.data.iter().zip(&gpu).all(|(a, b)| (a - b).abs() <= 0.01)
+        cpu_debayer
+            .data
+            .iter()
+            .zip(&gpu)
+            .all(|(a, b)| (a - b).abs() <= 0.01)
     });
 
     let mut raw: Vec<f32> = (0..w * h)
@@ -2122,14 +2620,53 @@ pub fn ensure_pixel_preprocess_parity() -> bool {
         .collect();
     raw[17 * w + 22] = 62000.0;
     raw[31 * w + 49] = -5000.0;
-    let mut cpu_cosmetic = crate::DsImage { data: raw.clone(), w, h, ch: 1, bayer: None };
+    let mut cpu_cosmetic = crate::DsImage {
+        data: raw.clone(),
+        w,
+        h,
+        ch: 1,
+        bayer: None,
+    };
     let (med, noise) = crate::ds_cosmetic_stats(&cpu_cosmetic);
     crate::ds_cosmetic_hot_pixels_with_stats(&mut cpu_cosmetic, &med, &noise);
     let cosmetic_ok = cosmetic_hot_pixels(&mut raw, w, h, 1, false, &med, &noise)
         .is_ok_and(|_| raw == cpu_cosmetic.data);
 
+    // Cosmética CFA: stats POR FASE Bayer (4 pares en el vec4) y umbral por
+    // fase también en el kernel. Un mosaico RGGB con offset G↔R/B y un
+    // caliente moderado en R sólo se corrige si la indexación de fase
+    // ((gy&1)<<1)|(x&1) coincide EXACTAMENTE entre CPU y WGSL; si divergen,
+    // este gate desactiva el preprocesado GPU y se cae a CPU (seguro).
+    let mut raw_cfa: Vec<f32> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            let base = match (x & 1, y & 1) {
+                (0, 0) | (1, 1) => 500.0f32, // R y B
+                _ => 1000.0,                 // G
+            };
+            base + ((i * 13 + y * 5) % 21) as f32 - 10.0
+        })
+        .collect();
+    raw_cfa[12 * w + 20] = 900.0; // caliente moderado en fase R
+    let mut cpu_cfa = crate::DsImage {
+        data: raw_cfa.clone(),
+        w,
+        h,
+        ch: 1,
+        bayer: Some(8),
+    };
+    let (med_cfa, noise_cfa) = crate::ds_cosmetic_stats(&cpu_cfa);
+    crate::ds_cosmetic_hot_pixels_with_stats(&mut cpu_cfa, &med_cfa, &noise_cfa);
+    let cosmetic_cfa_ok = cpu_cfa.data[12 * w + 20] < 900.0
+        && cosmetic_hot_pixels(&mut raw_cfa, w, h, 1, true, &med_cfa, &noise_cfa)
+            .is_ok_and(|_| raw_cfa == cpu_cfa.data);
+
     let mut scene = vec![800.0f32; w * h];
-    for &(cx, cy, amp) in &[(15.3, 13.7, 18000.0), (34.2, 20.4, 22000.0), (49.1, 35.8, 20000.0)] {
+    for &(cx, cy, amp) in &[
+        (15.3, 13.7, 18000.0),
+        (34.2, 20.4, 22000.0),
+        (49.1, 35.8, 20000.0),
+    ] {
         for y in 0..h {
             for x in 0..w {
                 let r2 = (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2);
@@ -2139,15 +2676,22 @@ pub fn ensure_pixel_preprocess_parity() -> bool {
     }
     let cpu_stars = crate::ds_detect_stars_impl(&scene, w, h, 120, false);
     let gpu_stars = crate::ds_detect_stars_impl(&scene, w, h, 120, true);
-    let stars_ok = cpu_stars.ok().zip(gpu_stars.ok()).is_some_and(|(cpu, gpu)| {
-        cpu.len() == gpu.len() && cpu.iter().zip(gpu).all(|(a, b)| {
-            (a.0 - b.0).abs() <= 0.01
-                && (a.1 - b.1).abs() <= 0.01
-                && (a.2 - b.2).abs() <= a.2.abs().max(1.0) * 0.001
-        })
-    });
-    let ok = debayer_ok && cosmetic_ok && stars_ok;
-    DS_PIXEL_PARITY.store(if ok { PARITY_OK } else { PARITY_FAILED }, Ordering::Release);
+    let stars_ok = cpu_stars
+        .ok()
+        .zip(gpu_stars.ok())
+        .is_some_and(|(cpu, gpu)| {
+            cpu.len() == gpu.len()
+                && cpu.iter().zip(gpu).all(|(a, b)| {
+                    (a.0 - b.0).abs() <= 0.01
+                        && (a.1 - b.1).abs() <= 0.01
+                        && (a.2 - b.2).abs() <= a.2.abs().max(1.0) * 0.001
+                })
+        });
+    let ok = debayer_ok && cosmetic_ok && cosmetic_cfa_ok && stars_ok;
+    DS_PIXEL_PARITY.store(
+        if ok { PARITY_OK } else { PARITY_FAILED },
+        Ordering::Release,
+    );
     ok
 }
 
@@ -2167,8 +2711,7 @@ pub fn ensure_tiled_parity() -> bool {
         for c in 0..channels {
             for k in 0..frames {
                 let i = (p * channels + c) * frames + k;
-                stack[i] = 900.0 + p as f32 * 31.0 + c as f32 * 17.0
-                    + (k as f32 - 5.0) * 2.5;
+                stack[i] = 900.0 + p as f32 * 31.0 + c as f32 * 17.0 + (k as f32 - 5.0) * 2.5;
             }
             stack[(p * channels + c) * frames + (p + 2) % frames] += 900.0;
             stack[(p * channels + c) * frames + (p + 7) % frames] -= 420.0;
@@ -2185,69 +2728,60 @@ pub fn ensure_tiled_parity() -> bool {
     let mut ok = true;
     for method in ["winsorized", "linearfit"] {
         for quality in [None, Some((&quality_grids[..], wq_g))] {
-        let got = match reject_tiled_pass(
-            &stack,
-            &weights,
-            pixels,
-            channels,
-            method,
-            3.0,
-            2.5,
-            4.0,
-            quality,
-            strip,
-        ) {
-            Ok(v) => v,
-            Err(_) => {
-                ok = false;
-                break;
-            }
-        };
-        let mut max_data = 0.0f32;
-        let mut max_cov = 0.0f64;
-        let mut max_rej = 0.0f64;
-        for p in 0..pixels {
-            // Peso efectivo con calidad: misma convención que el CPU tiled
-            // (ds_sample_grid en coordenadas normalizadas de salida).
-            let quality_for = |k: usize| -> f64 {
-                match quality {
-                    None => 1.0,
-                    Some((grids, g)) => {
-                        let x = p % strip.0;
-                        let y = strip.2 + p / strip.0;
-                        crate::ds_sample_grid(
-                            &grids[k * g * g..(k + 1) * g * g],
-                            g,
-                            g,
-                            x as f32 / strip.0 as f32,
-                            y as f32 / strip.1 as f32,
-                        ) as f64
-                    }
+            let got = match reject_tiled_pass(
+                &stack, &weights, pixels, channels, method, 3.0, 2.5, 4.0, quality, strip,
+            ) {
+                Ok(v) => v,
+                Err(_) => {
+                    ok = false;
+                    break;
                 }
             };
-            for c in 0..channels {
-                let base = (p * channels + c) * frames;
-                let mut samples: Vec<(f32, f64)> = (0..frames)
-                    .filter_map(|k| {
-                        let v = stack[base + k];
-                        v.is_finite()
-                            .then(|| (v, weights[k] as f64 * quality_for(k)))
-                    })
-                    .collect();
-                let (mut cov, mut lo, mut hi) = (0.0, 0.0, 0.0);
-                let expected = crate::ds_reject_pixel(
-                    &mut samples,
-                    method,
-                    3.0,
-                    2.5,
-                    &mut cov,
-                    &mut lo,
-                    &mut hi,
-                    4.0,
-                );
-                max_data = max_data.max((got.data[p * channels + c] - expected).abs());
-                if (got.data[p * channels + c] - expected).abs() > 0.5 {
-                    eprintln!(
+            let mut max_data = 0.0f32;
+            let mut max_cov = 0.0f64;
+            let mut max_rej = 0.0f64;
+            for p in 0..pixels {
+                // Peso efectivo con calidad: misma convención que el CPU tiled
+                // (ds_sample_grid en coordenadas normalizadas de salida).
+                let quality_for = |k: usize| -> f64 {
+                    match quality {
+                        None => 1.0,
+                        Some((grids, g)) => {
+                            let x = p % strip.0;
+                            let y = strip.2 + p / strip.0;
+                            crate::ds_sample_grid(
+                                &grids[k * g * g..(k + 1) * g * g],
+                                g,
+                                g,
+                                x as f32 / strip.0 as f32,
+                                y as f32 / strip.1 as f32,
+                            ) as f64
+                        }
+                    }
+                };
+                for c in 0..channels {
+                    let base = (p * channels + c) * frames;
+                    let mut samples: Vec<(f32, f64)> = (0..frames)
+                        .filter_map(|k| {
+                            let v = stack[base + k];
+                            v.is_finite()
+                                .then(|| (v, weights[k] as f64 * quality_for(k)))
+                        })
+                        .collect();
+                    let (mut cov, mut lo, mut hi) = (0.0, 0.0, 0.0);
+                    let expected = crate::ds_reject_pixel(
+                        &mut samples,
+                        method,
+                        3.0,
+                        2.5,
+                        &mut cov,
+                        &mut lo,
+                        &mut hi,
+                        4.0,
+                    );
+                    max_data = max_data.max((got.data[p * channels + c] - expected).abs());
+                    if (got.data[p * channels + c] - expected).abs() > 0.5 {
+                        eprintln!(
                         "[gpu tiled mismatch] {method} p={p} c={c} gpu={} cpu={} gpu_cov={} cpu_cov={} low={} high={}",
                         got.data[p * channels + c],
                         expected,
@@ -2256,29 +2790,41 @@ pub fn ensure_tiled_parity() -> bool {
                         got.rejected_low[p],
                         got.rejected_high[p],
                     );
-                    ok = false;
-                }
-                if c == 0 {
-                    let rejected_gpu = got.rejected_low[p] + got.rejected_high[p];
-                    max_cov = max_cov.max((got.coverage[p] as f64 - cov).abs());
-                    max_rej = max_rej.max((rejected_gpu as f64 - (lo + hi)).abs());
-                    if (got.coverage[p] as f64 - cov).abs() > 0.002
-                        || (rejected_gpu as f64 - (lo + hi)).abs() > 0.002
-                    {
                         ok = false;
+                    }
+                    if c == 0 {
+                        // B5: los planos bajo/alto se comparan POR SEPARADO con
+                        // la misma tolerancia que antes usaba solo la suma. La
+                        // suma es invariante a la atribución (peso rechazado
+                        // total), así que comparar solo low+high dejaba pasar
+                        // una divergencia CPU↔GPU en el reparto por cola — y
+                        // esos planos se exportan como FITS científico
+                        // Rechazo_Bajo/Alto (frío vs caliente).
+                        let d_low = (got.rejected_low[p] as f64 - lo).abs();
+                        let d_high = (got.rejected_high[p] as f64 - hi).abs();
+                        max_cov = max_cov.max((got.coverage[p] as f64 - cov).abs());
+                        max_rej = max_rej.max(d_low).max(d_high);
+                        if (got.coverage[p] as f64 - cov).abs() > 0.002
+                            || d_low > 0.002
+                            || d_high > 0.002
+                        {
+                            ok = false;
+                        }
                     }
                 }
             }
-        }
-        if max_data > 0.5 || max_cov > 0.002 || max_rej > 0.002 {
-            eprintln!(
+            if max_data > 0.5 || max_cov > 0.002 || max_rej > 0.002 {
+                eprintln!(
                 "[gpu tiled parity] {method} wq={}: data={max_data} coverage={max_cov} rejection={max_rej}",
                 quality.is_some()
             );
-        }
+            }
         }
     }
-    DS_TILED_PARITY.store(if ok { PARITY_OK } else { PARITY_FAILED }, Ordering::Release);
+    DS_TILED_PARITY.store(
+        if ok { PARITY_OK } else { PARITY_FAILED },
+        Ordering::Release,
+    );
     ok
 }
 
@@ -2288,6 +2834,42 @@ mod tests {
     fn calibration_shader_never_clamps_a_weak_flat_into_signal() {
         assert!(!super::CALIBRATE_WGSL.contains("max(flat[i], 0.05)"));
         assert!(super::CALIBRATE_WGSL.contains("0x7fc00000u"));
+    }
+
+    #[test]
+    fn grid_sampling_wgsl_uses_cell_center_convention() {
+        // B9: las rejillas (bg/nz estelar, LN, WQ) se CONSTRUYEN con binning
+        // floor(u·G), así que el nodo j vive en el centro (j+0.5)/G y el
+        // muestreo debe usar clamp(u·G − 0.5, 0, G−1) — exactamente lo que
+        // hace ds_sample_grid en CPU. La convención antigua u·(G−1) corría el
+        // campo media celda y lo estiraba G/(G−1). Este contrato impide que
+        // CPU y GPU diverjan sin disparar los gates de paridad físicos (que
+        // requieren hardware y van con #[ignore]).
+        for (shader, name) in [
+            (super::PIXEL_PREPROCESS_WGSL, "pixel preprocess"),
+            (super::TILED_REJECT_WGSL, "tiled reject"),
+            (super::DS_WGSL, "warp/integración"),
+        ] {
+            assert!(
+                shader.contains("- 0.5, 0.0,"),
+                "{name}: falta la convención centro-de-celda (u·G − 0.5)"
+            );
+        }
+        // Nodos-en-bordes prohibidos en los muestreadores de rejilla.
+        assert!(!super::PIXEL_PREPROCESS_WGSL.contains("* f32(max(gw, 1u) - 1u)"));
+        assert!(!super::TILED_REJECT_WGSL.contains("* f32(P.wq_g - 1u)"));
+        assert!(!super::DS_WGSL.contains("* f32(P.ln_g - 1u)"));
+        assert!(!super::DS_WGSL.contains("* f32(P.wq_g - 1u)"));
+    }
+
+    #[test]
+    fn cosmetic_wgsl_indexes_stats_by_bayer_phase() {
+        // B4: en un frame CFA (same_color_step==2, un plano) med/noise viajan
+        // POR FASE Bayer en los 4 slots del vec4, indexados ((gy&1)<<1)|(x&1)
+        // — la misma convención que ds_cosmetic_stats en CPU. Una única
+        // mediana/MAD del mosaico mezclaba G con R/B e inflaba el umbral.
+        assert!(super::PIXEL_PREPROCESS_WGSL.contains("((gy & 1u) << 1u) | (x & 1u)"));
+        assert!(super::PIXEL_PREPROCESS_WGSL.contains("P.same_color_step == 2u"));
     }
 
     fn lanczos3_lut() -> Vec<f32> {
@@ -2490,11 +3072,22 @@ mod tests {
             .collect();
         for cid in 8..=11 {
             let cpu = crate::ds_debayer_image(
-                crate::DsImage { data: cfa.clone(), w, h, ch: 1, bayer: Some(cid) },
+                crate::DsImage {
+                    data: cfa.clone(),
+                    w,
+                    h,
+                    ch: 1,
+                    bayer: Some(cid),
+                },
                 cid,
             );
             let gpu = super::debayer_float32(&cfa, w, h, cid).expect("debayer GPU");
-            let max = cpu.data.iter().zip(&gpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let max = cpu
+                .data
+                .iter()
+                .zip(&gpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
             assert!(max <= 0.01, "debayer cid={cid}, max diff={max}");
         }
 
@@ -2504,7 +3097,13 @@ mod tests {
             .collect();
         base[22 * w + 31] = 62000.0;
         base[45 * w + 67] = -4000.0;
-        let mut cpu_img = crate::DsImage { data: base.clone(), w, h, ch: 1, bayer: None };
+        let mut cpu_img = crate::DsImage {
+            data: base.clone(),
+            w,
+            h,
+            ch: 1,
+            bayer: None,
+        };
         let (med, noise) = crate::ds_cosmetic_stats(&cpu_img);
         crate::ds_cosmetic_hot_pixels_with_stats(&mut cpu_img, &med, &noise);
         let mut gpu = base;
@@ -2513,7 +3112,13 @@ mod tests {
 
         // Mapa denso GPU + centroides CPU debe entregar el mismo catálogo.
         let mut stars_img = vec![850.0f32; w * h];
-        for &(cx, cy, amp) in &[(18.3, 17.7, 16000.0), (43.2, 25.4, 22000.0), (72.1, 19.8, 18000.0), (30.5, 53.1, 24000.0), (69.6, 51.9, 21000.0)] {
+        for &(cx, cy, amp) in &[
+            (18.3, 17.7, 16000.0),
+            (43.2, 25.4, 22000.0),
+            (72.1, 19.8, 18000.0),
+            (30.5, 53.1, 24000.0),
+            (69.6, 51.9, 21000.0),
+        ] {
             for y in 0..h {
                 for x in 0..w {
                     let r2 = (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2);

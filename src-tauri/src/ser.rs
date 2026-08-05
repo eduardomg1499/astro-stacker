@@ -625,7 +625,8 @@ mod tests {
                             }
                         })
                         .collect();
-                    let mut payload = Vec::with_capacity(source.len() * if bits == 8 { 1 } else { 2 });
+                    let mut payload =
+                        Vec::with_capacity(source.len() * if bits == 8 { 1 } else { 2 });
                     for &sample in &source {
                         if bits == 8 {
                             payload.push(sample as u8);
@@ -642,18 +643,17 @@ mod tests {
                     let reader = SerReader::new(&path).expect("SER RGB/BGR válido");
                     assert_eq!(reader.info.bytes_per_pixel, if bits == 8 { 3 } else { 6 });
                     let canonical = reader.get_frame(0, color_id);
-                    let decoded = crate::raw_to_u16_buffer(
-                        &canonical,
-                        w,
-                        h,
-                        reader.info.bytes_per_pixel,
-                    );
+                    let decoded =
+                        crate::raw_to_u16_buffer(&canonical, w, h, reader.info.bytes_per_pixel);
                     let expected: Vec<u16> = if bits == 8 {
                         source.iter().map(|sample| sample * 257).collect()
                     } else {
                         source
                     };
-                    assert_eq!(decoded, expected, "CID={color_id}, bits={bits}, flag={flag}");
+                    assert_eq!(
+                        decoded, expected,
+                        "CID={color_id}, bits={bits}, flag={flag}"
+                    );
                     let _ = std::fs::remove_file(path);
                 }
             }
@@ -700,10 +700,7 @@ mod tests {
     fn yuv422_over_eight_bits_fails_explicit_preflight() {
         let (w, h) = (16usize, 16usize);
         let payload = vec![0u8; w * h * 4];
-        let path = temp_ser(
-            "yuv422_12bit",
-            &standard_ser(w, h, 12, 12, 0, 1, &payload),
-        );
+        let path = temp_ser("yuv422_12bit", &standard_ser(w, h, 12, 12, 0, 1, &payload));
         let error = SerReader::new(&path).expect_err("YUV422 >8-bit no es elegible");
         assert!(error.contains("YUV422 >8-bit"), "{error}");
         assert!(error.contains("preflight"), "{error}");

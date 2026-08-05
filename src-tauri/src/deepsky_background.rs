@@ -150,7 +150,7 @@ pub(crate) fn solve_background_graph(
                 // Mediana robusta de las diferencias (satélites/estrellas en
                 // celdas mal enmascaradas no arrastran la arista).
                 let mut ds: Vec<f64> = diffs.iter().map(|&(_, _, d)| d).collect();
-                ds.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+                ds.sort_by(|x, y| x.total_cmp(y));
                 let dij = ds[ds.len() / 2];
                 a[i][i] += w;
                 a[j][j] += w;
@@ -655,6 +655,7 @@ pub(crate) fn background_cell_samples(
 
 /// Modelo polinómico de fondo por canal. La corrección que la resta clásica
 /// aplicaría es `g(x,y) − level` (conserva la mediana del frame).
+#[derive(Clone)]
 pub(crate) struct BgModel {
     pub degree: usize,
     /// Coeficientes por canal en la base `ds_poly_basis` (coords x/w, y/h).
@@ -726,10 +727,41 @@ impl BgModel {
 /// percentil 15 por celda, 3 pasadas descartando > ajuste + 2.5σ): un canal
 /// sin muestras suficientes queda con `coeffs` vacío.
 pub(crate) fn fit_background_model(data: &[f32], w: usize, h: usize, ch: usize) -> Option<BgModel> {
+    fit_background_model_masked(data, w, h, ch, None)
+}
+
+/// Variante con máscara de exclusión por píxel. `true` significa que la
+/// muestra pertenece a nebulosa/galaxia/objeto y no puede influir en el
+/// modelo. La máscara solo afecta al muestreo; nunca altera el máster.
+pub(crate) fn fit_background_model_masked(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    ch: usize,
+    excluded: Option<&[bool]>,
+) -> Option<BgModel> {
+    fit_background_model_masked_degree(data, w, h, ch, excluded, 2)
+}
+
+/// Igual que `fit_background_model_masked`, pero conserva en la receta el
+/// grado elegido por el usuario experto. El rango 1..=4 evita modelos de alto
+/// orden mal condicionados sobre campos astronómicos con poco fondo real.
+pub(crate) fn fit_background_model_masked_degree(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    ch: usize,
+    excluded: Option<&[bool]>,
+    degree: usize,
+) -> Option<BgModel> {
     const GRID: usize = 32;
-    const DEG: usize = 2;
-    let nterms = (DEG + 1) * (DEG + 2) / 2;
-    if w < GRID * 3 || h < GRID * 3 {
+    let degree = degree.clamp(1, 4);
+    let nterms = (degree + 1) * (degree + 2) / 2;
+    if w < GRID * 3
+        || h < GRID * 3
+        || data.len() < w.saturating_mul(h).saturating_mul(ch)
+        || excluded.is_some_and(|mask| mask.len() != w.saturating_mul(h))
+    {
         return None;
     }
     let mut coeffs = vec![Vec::new(); ch];
@@ -751,7 +783,13 @@ pub(crate) fn fit_background_model(data: &[f32], w: usize, h: usize, ch: usize) 
                 while y < y1 {
                     let mut x = x0;
                     while x < x1 {
-                        cell.push(data[(y * w + x) * ch + c]);
+                        let pixel = y * w + x;
+                        if !excluded.is_some_and(|mask| mask[pixel]) {
+                            let value = data[pixel * ch + c];
+                            if value.is_finite() {
+                                cell.push(value);
+                            }
+                        }
                         x += sx;
                     }
                     y += sy;
@@ -759,7 +797,7 @@ pub(crate) fn fit_background_model(data: &[f32], w: usize, h: usize, ch: usize) 
                 if cell.len() < 8 {
                     continue;
                 }
-                cell.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                cell.sort_by(|a, b| a.total_cmp(b));
                 xs.push((x0 + x1) as f64 / 2.0 / w as f64);
                 ys.push((y0 + y1) as f64 / 2.0 / h as f64);
                 vs.push(cell[cell.len() * 3 / 20] as f64);
@@ -778,7 +816,7 @@ pub(crate) fn fit_background_model(data: &[f32], w: usize, h: usize, ch: usize) 
                     continue;
                 }
                 count += 1;
-                let b = crate::ds_poly_basis(xs[i], ys[i], DEG);
+                let b = crate::ds_poly_basis(xs[i], ys[i], degree);
                 for r in 0..nterms {
                     for cc in 0..nterms {
                         mat[r][cc] += b[r] * b[cc];
@@ -799,7 +837,7 @@ pub(crate) fn fit_background_model(data: &[f32], w: usize, h: usize, ch: usize) 
             let mut res: Vec<f64> = Vec::new();
             for i in 0..vs.len() {
                 if keep[i] {
-                    let f: f64 = crate::ds_poly_basis(xs[i], ys[i], DEG)
+                    let f: f64 = crate::ds_poly_basis(xs[i], ys[i], degree)
                         .iter()
                         .zip(&coef)
                         .map(|(b, cc)| b * cc)
@@ -808,11 +846,11 @@ pub(crate) fn fit_background_model(data: &[f32], w: usize, h: usize, ch: usize) 
                 }
             }
             let mut ares: Vec<f64> = res.iter().map(|r| r.abs()).collect();
-            ares.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            ares.sort_by(|a, b| a.total_cmp(b));
             let sigma = ares[ares.len() / 2] * 1.4826 + 1e-6;
             for i in 0..vs.len() {
                 if keep[i] {
-                    let f: f64 = crate::ds_poly_basis(xs[i], ys[i], DEG)
+                    let f: f64 = crate::ds_poly_basis(xs[i], ys[i], degree)
                         .iter()
                         .zip(&coef)
                         .map(|(b, cc)| b * cc)
@@ -829,14 +867,14 @@ pub(crate) fn fit_background_model(data: &[f32], w: usize, h: usize, ch: usize) 
         let mut fitted: Vec<f64> = (0..vs.len())
             .filter(|&i| keep[i])
             .map(|i| {
-                crate::ds_poly_basis(xs[i], ys[i], DEG)
+                crate::ds_poly_basis(xs[i], ys[i], degree)
                     .iter()
                     .zip(&coef)
                     .map(|(b, cc)| b * cc)
                     .sum()
             })
             .collect();
-        fitted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        fitted.sort_by(|a, b| a.total_cmp(b));
         level[c] = fitted[fitted.len() / 2];
         coeffs[c] = coef;
     }
@@ -844,7 +882,238 @@ pub(crate) fn fit_background_model(data: &[f32], w: usize, h: usize, ch: usize) 
         return None;
     }
     Some(BgModel {
-        degree: DEG,
+        degree,
+        coeffs,
+        level,
+        w,
+        h,
+        ch,
+    })
+}
+
+fn bg_weighted_robust_fit(
+    xs: &[f64],
+    ys: &[f64],
+    values: &[f64],
+    weights: &[f64],
+    degree: usize,
+) -> Option<Vec<f64>> {
+    let nterms = (degree + 1) * (degree + 2) / 2;
+    if xs.len() != ys.len()
+        || xs.len() != values.len()
+        || xs.len() != weights.len()
+        || xs.len() < nterms * 2
+    {
+        return None;
+    }
+    let mut robust = vec![1.0f64; values.len()];
+    let mut coeffs = Vec::new();
+    for _ in 0..6 {
+        let mut matrix = vec![vec![0.0f64; nterms + 1]; nterms];
+        let mut effective = 0usize;
+        for index in 0..values.len() {
+            let weight = weights[index] * robust[index];
+            if !weight.is_finite() || weight <= 1e-9 {
+                continue;
+            }
+            effective += 1;
+            let basis = crate::ds_poly_basis(xs[index], ys[index], degree);
+            for row in 0..nterms {
+                for column in 0..nterms {
+                    matrix[row][column] += weight * basis[row] * basis[column];
+                }
+                matrix[row][nterms] += weight * basis[row] * values[index];
+            }
+        }
+        if effective < nterms * 2 {
+            return None;
+        }
+        // Regularización numérica mínima, relativa a la traza: estabiliza
+        // coordenadas válidas pero casi colineales sin ocultar una matriz
+        // realmente singular.
+        let trace = (0..nterms)
+            .map(|index| matrix[index][index].abs())
+            .sum::<f64>()
+            .max(1.0);
+        for index in 0..nterms {
+            matrix[index][index] += trace * 1e-12;
+        }
+        coeffs = crate::ds_solve_linear_n(&mut matrix, nterms)?;
+
+        let residuals = (0..values.len())
+            .map(|index| {
+                let estimate = crate::ds_poly_basis(xs[index], ys[index], degree)
+                    .iter()
+                    .zip(&coeffs)
+                    .map(|(basis, coefficient)| basis * coefficient)
+                    .sum::<f64>();
+                values[index] - estimate
+            })
+            .collect::<Vec<_>>();
+        let mut ordered = residuals.clone();
+        ordered.sort_by(|a, b| a.total_cmp(b));
+        let center = ordered[ordered.len() / 2];
+        let mut absolute = residuals
+            .iter()
+            .map(|residual| (residual - center).abs())
+            .collect::<Vec<_>>();
+        absolute.sort_by(|a, b| a.total_cmp(b));
+        let sigma = (absolute[absolute.len() / 2] * 1.4826).max(1e-9);
+        let huber = 1.5 * sigma;
+        robust
+            .iter_mut()
+            .zip(residuals.iter())
+            .for_each(|(weight, residual)| {
+                let distance = (residual - center).abs();
+                *weight = if distance <= huber {
+                    1.0
+                } else {
+                    (huber / distance).clamp(0.0, 1.0)
+                };
+            });
+    }
+    (!coeffs.is_empty()).then_some(coeffs)
+}
+
+/// Ajuste DBE-like desde muestras circulares explícitas. Cada muestra aporta
+/// el percentil 20 de sus píxeles válidos por canal; después un IRLS Huber
+/// ponderado rechaza estrellas o estructura residual sin convertir las
+/// muestras en simples rectángulos de exclusión.
+pub(crate) fn fit_background_model_samples(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    ch: usize,
+    samples: &[crate::pipeline::PostStackBackgroundSample],
+    degree: usize,
+    excluded: Option<&[bool]>,
+) -> Result<BgModel, String> {
+    let degree = degree.clamp(1, 4);
+    let pixels = w.saturating_mul(h);
+    if w < 16
+        || h < 16
+        || ch == 0
+        || data.len() < pixels.saturating_mul(ch)
+        || excluded.is_some_and(|mask| mask.len() != pixels)
+    {
+        return Err("La geometría o la máscara DQ no coincide con el máster".into());
+    }
+    let enabled = samples
+        .iter()
+        .filter(|sample| sample.enabled)
+        .collect::<Vec<_>>();
+    let nterms = (degree + 1) * (degree + 2) / 2;
+    if enabled.len() < nterms * 2 {
+        return Err(format!(
+            "El grado {degree} requiere al menos {} muestras de fondo habilitadas",
+            nterms * 2
+        ));
+    }
+    for (index, sample) in enabled.iter().enumerate() {
+        if !sample.x.is_finite()
+            || !sample.y.is_finite()
+            || !sample.radius.is_finite()
+            || !sample.weight.is_finite()
+            || !(0.0..=1.0).contains(&sample.x)
+            || !(0.0..=1.0).contains(&sample.y)
+            || !(0.002..=0.25).contains(&sample.radius)
+            || !(0.01..=100.0).contains(&sample.weight)
+        {
+            return Err(format!(
+                "La muestra de fondo habilitada {} tiene posición, radio o peso inválido",
+                index + 1
+            ));
+        }
+    }
+    let (min_x, max_x) = enabled.iter().fold((1.0f32, 0.0f32), |(lo, hi), sample| {
+        (lo.min(sample.x), hi.max(sample.x))
+    });
+    let (min_y, max_y) = enabled.iter().fold((1.0f32, 0.0f32), |(lo, hi), sample| {
+        (lo.min(sample.y), hi.max(sample.y))
+    });
+    if max_x - min_x < 0.25 || max_y - min_y < 0.25 {
+        return Err(
+            "Las muestras de fondo no cubren el campo: distribúyelas en ancho y alto".into(),
+        );
+    }
+
+    let mut xs = Vec::with_capacity(enabled.len());
+    let mut ys = Vec::with_capacity(enabled.len());
+    let mut values = vec![Vec::<f64>::with_capacity(enabled.len()); ch];
+    let mut weights = Vec::with_capacity(enabled.len());
+    for sample in enabled {
+        let center_x = (sample.x * (w.saturating_sub(1)) as f32).round() as isize;
+        let center_y = (sample.y * (h.saturating_sub(1)) as f32).round() as isize;
+        let radius = (sample.radius * w.min(h) as f32).round().max(2.0) as isize;
+        let x0 = (center_x - radius).max(0) as usize;
+        let x1 = (center_x + radius + 1).min(w as isize) as usize;
+        let y0 = (center_y - radius).max(0) as usize;
+        let y1 = (center_y + radius + 1).min(h as isize) as usize;
+        let stride = ((radius as usize * 2 + 1) / 48).max(1);
+        let mut cells = vec![Vec::<f32>::new(); ch];
+        for y in (y0..y1).step_by(stride) {
+            for x in (x0..x1).step_by(stride) {
+                let dx = x as isize - center_x;
+                let dy = y as isize - center_y;
+                if dx * dx + dy * dy > radius * radius {
+                    continue;
+                }
+                let pixel = y * w + x;
+                if excluded.is_some_and(|mask| mask[pixel]) {
+                    continue;
+                }
+                for channel in 0..ch {
+                    let value = data[pixel * ch + channel];
+                    if value.is_finite() {
+                        cells[channel].push(value);
+                    }
+                }
+            }
+        }
+        let valid = cells.iter().map(Vec::len).min().unwrap_or(0);
+        if valid < 8 {
+            continue;
+        }
+        xs.push(sample.x as f64);
+        ys.push(sample.y as f64);
+        weights.push(sample.weight as f64 * (valid as f64).sqrt());
+        for channel in 0..ch {
+            cells[channel].sort_by(|a, b| a.total_cmp(b));
+            values[channel].push(cells[channel][cells[channel].len() / 5] as f64);
+        }
+    }
+    if xs.len() < nterms * 2 {
+        return Err(format!(
+            "Sólo {} muestras conservan suficientes píxeles válidos; se requieren {}",
+            xs.len(),
+            nterms * 2
+        ));
+    }
+
+    let mut coeffs = Vec::with_capacity(ch);
+    let mut level = Vec::with_capacity(ch);
+    for channel_values in &values {
+        let coefficients = bg_weighted_robust_fit(&xs, &ys, channel_values, &weights, degree)
+            .ok_or_else(|| {
+                "Las muestras producen un modelo singular; redistribúyelas por el campo".to_string()
+            })?;
+        let mut fitted = xs
+            .iter()
+            .zip(ys.iter())
+            .map(|(x, y)| {
+                crate::ds_poly_basis(*x, *y, degree)
+                    .iter()
+                    .zip(&coefficients)
+                    .map(|(basis, coefficient)| basis * coefficient)
+                    .sum::<f64>()
+            })
+            .collect::<Vec<_>>();
+        fitted.sort_by(|a, b| a.total_cmp(b));
+        level.push(fitted[fitted.len() / 2]);
+        coeffs.push(coefficients);
+    }
+    Ok(BgModel {
+        degree,
         coeffs,
         level,
         w,

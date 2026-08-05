@@ -102,7 +102,7 @@ fn validate_rgb_stack(image: &StackResult) -> Result<(), String> {
 /// Classifies an RGB16 buffer by sampling the whole image instead of trusting a
 /// single centre pixel. Mosaic canvases commonly have black or neutral padding
 /// at the centre, which previously caused colour results to be marked as mono.
-fn rgb16_buffer_is_monochrome(data: &[u16]) -> bool {
+pub fn rgb16_buffer_is_monochrome(data: &[u16]) -> bool {
     let pixel_count = data.len() / 3;
     if pixel_count == 0 {
         return true;
@@ -137,10 +137,10 @@ fn rgb16_buffer_is_monochrome(data: &[u16]) -> bool {
 #[tauri::command]
 fn reset_postprocess_state(state: State<'_, AppState>) -> Result<usize, String> {
     state.active_req_id.fetch_add(1, Ordering::SeqCst);
-    *state.processed_image.lock().unwrap() = None;
-    state.deconv_cache.lock().unwrap().clear();
-    state.wavelet_cache.lock().unwrap().clear();
-    state.filter_cache.lock().unwrap().clear();
+    *state.processed_image.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    state.deconv_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.wavelet_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state.filter_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     clear_editor_previews();
     Ok(state.result_generation.fetch_add(1, Ordering::SeqCst) + 1)
 }
@@ -1007,12 +1007,35 @@ fn build_solar_prominence_confidence(
         .collect();
     // Coherencia: un píxel de ruido no sobrevive al blur; un cuerpo sí.
     let coherence = apply_gaussian_blur(&raw, width, height, 2.6);
-    Some(
-        raw.par_iter()
-            .zip(coherence.par_iter())
-            .map(|(&value, &support)| value * post_smoothstep(0.10, 0.38, support))
-            .collect(),
-    )
+    let combined: Vec<f32> = raw.par_iter()
+        .zip(coherence.par_iter())
+        .map(|(&value, &support)| value * post_smoothstep(0.10, 0.38, support))
+        .collect();
+    // Suavizado espacial continuo para evitar zanjas, anillos y bordes duros de máscara alrededor de protuberancias y limbo.
+    let mut smooth_confidence = apply_gaussian_blur(&combined, width, height, 5.0);
+    // El suavizado no puede atravesar el soporte científico del disco. Sin esta
+    // reconciliación, una confianza minúscula se filtraba hacia tonos medios y
+    // alteraba una curva que debía ser idéntica; en sentido contrario, señal del
+    // limbo contaminaba el cielo y podía volver blanco un halo al invertirlo.
+    // El blur aporta continuidad únicamente DENTRO del soporte detectado; no
+    // debe crear confianza donde el detector combinado había dado cero.
+    smooth_confidence
+        .par_iter_mut()
+        .zip(combined.par_iter())
+        .for_each(|(confidence, &support)| {
+            if support <= f32::EPSILON {
+                *confidence = 0.0;
+            }
+        });
+    if let Some(mask) = disk_mask {
+        smooth_confidence
+            .par_iter_mut()
+            .zip(mask.par_iter())
+            .for_each(|(confidence, &signal)| {
+                *confidence *= (1.0 - signal).clamp(0.0, 1.0);
+            });
+    }
+    Some(smooth_confidence)
 }
 
 #[inline]
@@ -1448,7 +1471,8 @@ fn apply_advanced_postprocess_with(
                     // cielo protegido, que sigue invirtiéndose y volviendo a su
                     // negro medido.
                     let inverted = 1.0 - solar_luma;
-                    solar_luma = inverted + (solar_luma - inverted) * prominence_confidence;
+                    let prominence_blend = post_smoothstep(0.05, 0.45, prominence_confidence);
+                    solar_luma = inverted + (solar_luma - inverted) * (prominence_blend * 0.75);
                 }
 
                 // Protección de fondo EN LUMINANCIA y ANTES del falso color.
@@ -1465,10 +1489,13 @@ fn apply_advanced_postprocess_with(
                 if let Some((background_floor, background_ceiling)) = solar_background {
                     let intensity_background =
                         1.0 - post_smoothstep(background_floor, background_ceiling, source_mono);
+                    // `compute_border_connected_sky_mask` ya publica un borde
+                    // continuo. Volver a desenfocarlo expandía la clasificación
+                    // a ambos lados del limbo y rompía la separación cielo/disco.
                     let spatial_background = solar_signal_mask
                         .as_ref()
                         .map(|mask| 1.0 - mask[pixel_index].clamp(0.0, 1.0))
-                        .unwrap_or(0.0);
+                        .unwrap_or(intensity_background);
                     // Las protuberancias viven legítimamente dentro del cielo
                     // conectado al borde. El rescate primario es la confianza
                     // consciente del cuerpo (exceso sobre el modelo radial del
@@ -1528,24 +1555,10 @@ fn apply_advanced_postprocess_with(
                         params.solar.highlight_color,
                     );
                     let strength = params.solar.color_strength.clamp(0.0, 1.0);
-                    // El guarda de blancos mira la SALIDA, no la fuente. Atado
-                    // a la intensidad de la fuente (desde 0.72) despintaba el
-                    // limbo entero — el anillo blanco que se leía como
-                    // "quemado". La paleta ya se auto-desatura al encajar en
-                    // gama cerca del blanco; esto solo evita chroma duro en el
-                    // último tramo.
-                    let white_guard = post_smoothstep(0.93, 0.995, solar_luma) * 0.5;
-                    // La estructura detectada fuera del disco recibe la paleta
-                    // con plena autoridad: es la única forma de que una
-                    // protuberancia tenue "agarre" el rojo en vez de quedarse
-                    // en gris translúcido.
-                    let effective_strength = (strength
-                        * (1.0 - white_guard)
-                        * (1.0 + prominence_confidence * 0.35))
-                        .min(1.0);
-                    r = solar_luma + (mapped[0] - solar_luma) * effective_strength;
-                    g = solar_luma + (mapped[1] - solar_luma) * effective_strength;
-                    b = solar_luma + (mapped[2] - solar_luma) * effective_strength;
+                    // Intercambio de canales natural y continuo sobre todo el cuadro sin modulación de máscara
+                    r = solar_luma + (mapped[0] - solar_luma) * strength;
+                    g = solar_luma + (mapped[1] - solar_luma) * strength;
+                    b = solar_luma + (mapped[2] - solar_luma) * strength;
                 } else {
                     r = solar_luma;
                     g = solar_luma;

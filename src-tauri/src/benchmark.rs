@@ -694,7 +694,10 @@ fn parse_dataset_matrix() -> Result<BenchmarkDatasetMatrix, String> {
         || policy.deep_sky_scientific.max_read_amplification_hard
             < policy.deep_sky_scientific.max_read_amplification
         || !policy.competitor.require_every_run
-        || policy.quality_superiority.minimum_objective_wins_per_dataset == 0
+        || policy
+            .quality_superiority
+            .minimum_objective_wins_per_dataset
+            == 0
         || !policy.quality_superiority.require_independent_reference
         || !policy.evidence.sha256_required
         || !policy.evidence.acceptance_evidence_required
@@ -3823,7 +3826,10 @@ mod tests {
             .required_scenarios
             .iter()
             .filter(|scenario| scenario.domain == "planetary")
-            .all(|scenario| scenario.acceptance.iter().any(|id| id == "quality-superiority")));
+            .all(|scenario| scenario
+                .acceptance
+                .iter()
+                .any(|id| id == "quality-superiority")));
         for required_planetary_case in [
             "planetary-ser-raw-format-matrix",
             "planetary-ser-mono-solar-halpha",
@@ -4089,12 +4095,21 @@ mod tests {
             ("zenithCompositeScore".into(), 0.91),
             ("competitorCompositeScore".into(), 0.88),
         ]);
-        assert!(quality_superiority_metrics_pass(&requirement(passing.clone()), &policy));
+        assert!(quality_superiority_metrics_pass(
+            &requirement(passing.clone()),
+            &policy
+        ));
         passing.insert("objectiveWins".into(), 0.0);
-        assert!(!quality_superiority_metrics_pass(&requirement(passing.clone()), &policy));
+        assert!(!quality_superiority_metrics_pass(
+            &requirement(passing.clone()),
+            &policy
+        ));
         passing.insert("objectiveWins".into(), 2.0);
         passing.insert("objectiveLosses".into(), 1.0);
-        assert!(!quality_superiority_metrics_pass(&requirement(passing), &policy));
+        assert!(!quality_superiority_metrics_pass(
+            &requirement(passing),
+            &policy
+        ));
     }
 
     #[test]

@@ -88,9 +88,7 @@ impl LinearFrame {
             ));
         }
         match (&self.metadata.layout, self.channels) {
-            (StoreLayout::Rgb, 3)
-            | (StoreLayout::Mono, 1)
-            | (StoreLayout::Cfa { .. }, 1) => {}
+            (StoreLayout::Rgb, 3) | (StoreLayout::Mono, 1) | (StoreLayout::Cfa { .. }, 1) => {}
             (layout, channels) => {
                 return Err(format!(
                     "LinearFrame: layout {layout:?} incompatible con {channels} canal(es)"
@@ -193,10 +191,7 @@ impl LinearFrame {
         offset: [f32; 3],
     ) -> Result<(), String> {
         for channel in 0..self.channels {
-            if !gain[channel].is_finite()
-                || gain[channel] <= 0.0
-                || !offset[channel].is_finite()
-            {
+            if !gain[channel].is_finite() || gain[channel] <= 0.0 || !offset[channel].is_finite() {
                 return Err(format!(
                     "LinearFrame: normalización inválida en canal {channel}"
                 ));

@@ -125,21 +125,30 @@ mod tests {
     fn robust_mean_excludes_nonfinite_samples() {
         let mut values = vec![10.0, 12.0, f32::NAN, f32::INFINITY];
         let mut scratch = Vec::new();
-        assert_eq!(robust_calibration_mean(&mut values, &mut scratch), Some(11.0));
+        assert_eq!(
+            robust_calibration_mean(&mut values, &mut scratch),
+            Some(11.0)
+        );
     }
 
     #[test]
     fn robust_mean_uses_mean_for_small_clean_stack() {
         let mut values = vec![8.0, 10.0, 12.0, 14.0];
         let mut scratch = Vec::new();
-        assert_eq!(robust_calibration_mean(&mut values, &mut scratch), Some(11.0));
+        assert_eq!(
+            robust_calibration_mean(&mut values, &mut scratch),
+            Some(11.0)
+        );
     }
 
     #[test]
     fn robust_mean_preserves_quantized_consensus() {
         let mut values = vec![42.0, 42.0, 42.0, 42.0, 42.0, 43.0];
         let mut scratch = Vec::new();
-        assert_eq!(robust_calibration_mean(&mut values, &mut scratch), Some(42.0));
+        assert_eq!(
+            robust_calibration_mean(&mut values, &mut scratch),
+            Some(42.0)
+        );
     }
 
     #[test]

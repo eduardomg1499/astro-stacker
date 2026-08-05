@@ -165,8 +165,7 @@ pub(crate) fn combine_master_store_robust(
                     values.clear();
                     values.extend(frame_tiles.iter().map(|frame| frame[pixel]));
                     match crate::deepsky_calibration_stats::robust_calibration_stats(
-                        values,
-                        deviations,
+                        values, deviations,
                     ) {
                         Some(stats) => {
                             let mut flags = 0u32;
@@ -255,9 +254,7 @@ pub(crate) fn calibrated_numerator_variance(
         }
         DarkVarianceConvention::SharedBiasSubtractedThermal => {
             // L-B-k(D-B) = L-kD+(k-1)B.
-            light_variance
-                + k2 * dark_variance
-                + (dark_scale - 1.0).powi(2) * bias_variance
+            light_variance + k2 * dark_variance + (dark_scale - 1.0).powi(2) * bias_variance
         }
     };
     Ok(value)
@@ -690,8 +687,7 @@ mod tests {
             let u1 = (seed >> 8) as f32 / (1u32 << 24) as f32;
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
             let u2 = (seed >> 8) as f32 / (1u32 << 24) as f32;
-            (-2.0 * u1.max(1e-7).ln()).sqrt()
-                * (2.0 * std::f32::consts::PI * u2).cos()
+            (-2.0 * u1.max(1e-7).ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
         };
         let mut data = vec![0.0f32; w * h];
         for y in 0..h {
@@ -1248,8 +1244,7 @@ mod tests {
             vec![50_000.0, 20.0, f32::NAN],
         ];
         let store = make_store(&frames);
-        let master =
-            combine_master_store_robust(&store, frames.len(), 3, &no_cancel()).unwrap();
+        let master = combine_master_store_robust(&store, frames.len(), 3, &no_cancel()).unwrap();
         assert!((master.data[0] - 10.0).abs() < 0.01);
         assert_eq!(master.neff[0], 5.0);
         assert!((master.rejected_fraction[0] - 1.0 / 6.0).abs() < 1.0e-6);
@@ -1341,9 +1336,11 @@ mod tests {
                     values.push((radius * angle.sin()) as f32);
                 }
             }
-            let stats =
-                crate::deepsky_calibration_stats::robust_calibration_stats(&mut values, &mut scratch)
-                    .unwrap();
+            let stats = crate::deepsky_calibration_stats::robust_calibration_stats(
+                &mut values,
+                &mut scratch,
+            )
+            .unwrap();
             let standard_error = (stats.variance_of_mean as f64).sqrt();
             if standard_error.is_finite() && standard_error > 0.0 {
                 let z = (stats.mean as f64 / standard_error).abs();

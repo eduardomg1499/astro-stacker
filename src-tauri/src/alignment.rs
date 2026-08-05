@@ -1323,10 +1323,7 @@ pub fn precompute_lucas_kanade_reference(
     let half = (box_size / 2) as i32;
     let axi = ax as i32;
     let ayi = ay as i32;
-    if axi - half < 1
-        || ayi - half < 1
-        || axi + half >= w as i32 - 1
-        || ayi + half >= h as i32 - 1
+    if axi - half < 1 || ayi - half < 1 || axi + half >= w as i32 - 1 || ayi + half >= h as i32 - 1
     {
         return None;
     }
@@ -1376,17 +1373,9 @@ pub fn refine_shift_lucas_kanade(
     box_size: usize,
     iterations: usize,
 ) -> Option<(f32, f32)> {
-    let reference =
-        precompute_lucas_kanade_reference(master, w, h, ax, ay, box_size)?;
+    let reference = precompute_lucas_kanade_reference(master, w, h, ax, ay, box_size)?;
     refine_shift_lucas_kanade_precomputed(
-        master,
-        target,
-        w,
-        h,
-        &reference,
-        shift_dx,
-        shift_dy,
-        iterations,
+        master, target, w, h, &reference, shift_dx, shift_dy, iterations,
     )
 }
 
@@ -1502,8 +1491,12 @@ unsafe fn refine_shift_lucas_kanade_precomputed_unchecked(
             for ox in -half..half {
                 let x = (axi + ox) as usize;
                 let i = row_m + x;
-                let gx = (*master.get_unchecked(i + 1) as f64 - *master.get_unchecked(i - 1) as f64) * 0.5;
-                let gy = (*master.get_unchecked(i + w) as f64 - *master.get_unchecked(i - w) as f64) * 0.5;
+                let gx = (*master.get_unchecked(i + 1) as f64
+                    - *master.get_unchecked(i - 1) as f64)
+                    * 0.5;
+                let gy = (*master.get_unchecked(i + w) as f64
+                    - *master.get_unchecked(i - w) as f64)
+                    * 0.5;
 
                 let sxf = x as f32 + pdx;
                 let sx0 = sxf as usize;
@@ -1564,8 +1557,6 @@ unsafe fn refine_shift_lucas_kanade_precomputed_unchecked(
     }
     Some((best_dx, best_dy))
 }
-
-
 
 #[cfg(test)]
 fn refine_shift_lucas_kanade_checked(
@@ -2309,7 +2300,17 @@ pub fn refine_best_match_sad_from_coarse(
     coarse_scale: f32,
 ) -> (f32, f32, u64) {
     let (dx, dy, sad, _saturated) = refine_best_match_sad_from_coarse_checked(
-        ref_edges, tgt_edges, w, h, ax, ay, fx_est, fy_est, box_size, coarse_dx, coarse_dy,
+        ref_edges,
+        tgt_edges,
+        w,
+        h,
+        ax,
+        ay,
+        fx_est,
+        fy_est,
+        box_size,
+        coarse_dx,
+        coarse_dy,
         coarse_scale,
     );
     (dx, dy, sad)
@@ -2821,7 +2822,18 @@ mod tests {
             }
         }
         let (_dxf, _dyf, _sf, sat_far) = refine_best_match_sad_from_coarse_checked(
-            &ramp_master, &ramp_target, w, h, ax, ay, ax, ay, 32, 20.0, 20.0, 1.0,
+            &ramp_master,
+            &ramp_target,
+            w,
+            h,
+            ax,
+            ay,
+            ax,
+            ay,
+            32,
+            20.0,
+            20.0,
+            1.0,
         );
         assert!(sat_far, "una semilla lejana sobre estructura debe saturar");
     }
@@ -3080,8 +3092,7 @@ mod tests {
         // Semilla ya óptima: el SSD no puede reducirse. El gate no debe
         // publicar una actualización numérica sin mejora objetiva.
         assert!(
-            refine_shift_lucas_kanade(&master, &master, w, h, 48, 48, 0.0, 0.0, 32, 3)
-                .is_none()
+            refine_shift_lucas_kanade(&master, &master, w, h, 48, 48, 0.0, 0.0, 32, 3).is_none()
         );
     }
 
@@ -3111,46 +3122,24 @@ mod tests {
         let (ax, ay, box_size, search_r) = (48usize, 40usize, 24usize, 4i32);
 
         let shifted = make_shifted(2, -1);
-        let (dx, dy, _) = find_best_match_sad(
-            &reference, &shifted, w, ax, ay, ax, ay, box_size, search_r,
-        );
+        let (dx, dy, _) =
+            find_best_match_sad(&reference, &shifted, w, ax, ay, ax, ay, box_size, search_r);
         assert_eq!((dx as i32, dy as i32), (2, -1));
         let unique = diagnose_sad_match(
-            &reference,
-            &shifted,
-            w,
-            ax,
-            ay,
-            ax,
-            ay,
-            box_size,
-            search_r,
-            dx as i32,
-            dy as i32,
+            &reference, &shifted, w, ax, ay, ax, ay, box_size, search_r, dx as i32, dy as i32,
         );
         assert_eq!(unique.best_sad, 0);
         assert!(unique.runner_up_sad.unwrap_or(0) > 0);
         assert!(unique.normalized_margin > 0.0);
         assert!(!unique.touches_search_border);
         assert!(!sad_match_needs_exact_diagnostics(
-            &reference,
-            &shifted,
-            w,
-            ax,
-            ay,
-            ax,
-            ay,
-            box_size,
-            search_r,
-            dx as i32,
-            dy as i32,
+            &reference, &shifted, w, ax, ay, ax, ay, box_size, search_r, dx as i32, dy as i32,
             0.03,
         ));
 
         let flat = vec![7000u16; w * h];
-        let ambiguous = diagnose_sad_match(
-            &flat, &flat, w, ax, ay, ax, ay, box_size, search_r, 0, 0,
-        );
+        let ambiguous =
+            diagnose_sad_match(&flat, &flat, w, ax, ay, ax, ay, box_size, search_r, 0, 0);
         assert_eq!(ambiguous.best_sad, 0);
         assert_eq!(ambiguous.runner_up_sad, Some(0));
         assert_eq!(ambiguous.normalized_margin, 0.0);

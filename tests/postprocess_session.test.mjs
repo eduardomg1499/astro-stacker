@@ -704,9 +704,16 @@ test("deep-sky calibration is linked from one WBPP-style table per light group",
   assert.ok(!main.includes("dsNightPaths"), "los índices del plan ya no gobiernan el ligado");
   assert.ok(!main.includes("dsBatchIndex"));
 
-  // Sólo se ofrece desplegable para los roles que el backend sabe forzar.
-  assert.ok(main.includes('{ kind: "flats", labelKey: "deepsky.step_flat_s", fallback: "Flats", icon: "icon-lightbulb", linkable: true }'));
-  assert.ok(main.includes('{ kind: "bias", labelKey: "deepsky.step_bias_s", fallback: "Bias", icon: "icon-film", linkable: false }'));
+  // Los cuatro roles llegan al contrato tipado del backend y, por tanto, los
+  // cuatro se resuelven desde la misma fila en lugar de mostrar chips inertes.
+  for (const role of [
+    '{ kind: "flats", labelKey: "deepsky.step_flat_s", fallback: "Flats", icon: "icon-lightbulb", linkable: true }',
+    '{ kind: "darks", labelKey: "deepsky.step_dark_s", fallback: "Darks", icon: "icon-moon", linkable: true }',
+    '{ kind: "darkFlats", labelKey: "deepsky.step_dark_flat_s", fallback: "Dark-flats", icon: "icon-moon", linkable: true }',
+    '{ kind: "bias", labelKey: "deepsky.step_bias_s", fallback: "Bias", icon: "icon-film", linkable: true }',
+  ]) {
+    assert.ok(main.includes(role), `falta el rol seleccionable: ${role}`);
+  }
 
   for (const lang of ["es", "en", "fr", "it"]) {
     const locale = JSON.parse(await readFile(
@@ -744,6 +751,21 @@ test("standard stacking, colour grading and mosaic share the corrected contracts
     "batch assistant must explain scan scope before the recursion choice opens");
   assert.ok(mosaic.includes('document.getElementById("chk-rgb-align")'));
   assert.ok(mosaic.includes("adaptiveUsm: p?.adaptiveUsm"));
+});
+
+test("comet layers participate in the result product state and keep specific disclosure", async () => {
+  const main = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+  assert.ok(main.includes('dsResultProducts.set(String(layer.id), {'));
+  assert.ok(main.includes('product: String(layer.kind)'));
+  assert.ok(main.includes('comet: "capa cometaria lineal separada'));
+  assert.ok(main.includes('combined: "composición lineal de estrellas y cometa'));
+});
+
+test("web fixtures keep same-origin previews and Milky Way treats .fts as scientific FITS", async () => {
+  const main = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+  assert.ok(main.includes('const hasTauriAssetProtocol = typeof window !== "undefined" && !!window.__TAURI_INTERNALS__'));
+  assert.match(main, /hasTauriAssetProtocol && typeof convertFileSrc === "function"[\s\S]*?convertFileSrc\(normalized\)[\s\S]*?: normalized/);
+  assert.ok(main.includes('!/\\.(?:fits?|fts)$/i.test(String(path))'));
 });
 
 test("the 16-bit white-level range can represent the exact neutral endpoint", async () => {

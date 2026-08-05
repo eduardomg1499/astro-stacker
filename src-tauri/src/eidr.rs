@@ -634,7 +634,7 @@ pub(crate) fn eidr_target_psf(psfs: &[Option<MoffatPsf>]) -> Option<MoffatPsf> {
     if fw.is_empty() {
         return None;
     }
-    fw.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    fw.sort_by(|a, b| a.total_cmp(b));
     let p80 = fw[((fw.len() - 1) as f32 * 0.8).round() as usize];
     let mut betas: Vec<f32> = psfs
         .iter()
@@ -642,7 +642,7 @@ pub(crate) fn eidr_target_psf(psfs: &[Option<MoffatPsf>]) -> Option<MoffatPsf> {
         .map(|p| p.beta)
         .filter(|b| b.is_finite())
         .collect();
-    betas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    betas.sort_by(|a, b| a.total_cmp(b));
     let beta = if betas.is_empty() {
         2.5
     } else {
@@ -1062,10 +1062,9 @@ impl EidrOperator {
             .frames
             .get(fi)
             .ok_or_else(|| format!("EIDR: frame {fi} fuera de rango en adjunto"))?;
-        let pixels = f
-            .w
-            .checked_mul(f.h)
-            .ok_or("EIDR: dimensiones del frame desbordan")?;
+        let pixels =
+            f.w.checked_mul(f.h)
+                .ok_or("EIDR: dimensiones del frame desbordan")?;
         if plane.len() != pixels || grad.len() != self.w_out.saturating_mul(self.h_out) {
             return Err("EIDR: dimensiones incompatibles en adjunto Sigma^-1".into());
         }
@@ -1489,9 +1488,7 @@ fn eidr_freq_penalty_apply(
     h: usize,
     out: &mut [f64],
 ) -> Result<(), String> {
-    let n = w
-        .checked_mul(h)
-        .ok_or("EIDR: dimensiones FFT desbordan")?;
+    let n = w.checked_mul(h).ok_or("EIDR: dimensiones FFT desbordan")?;
     if n == 0 || p_in.len() != n || out.len() != n || pen.omega.len() != n {
         return Err("EIDR: dimensiones incompatibles en penalización espectral".into());
     }
@@ -1584,9 +1581,7 @@ pub(crate) fn eidr_solve_channel(
         return Err("EIDR: ningún píxel de salida tiene cobertura".into());
     }
     let mid = pos.len() / 2;
-    pos.select_nth_unstable_by(mid, |a, b| {
-        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    pos.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
     let ridge = (cfg.ridge_rel * pos[mid]).max(1e-30);
     drop(pos);
 
@@ -1594,11 +1589,7 @@ pub(crate) fn eidr_solve_channel(
     let mut z = eidr_try_capacity(n, "solución PCG")?;
     z.extend(z0.iter().map(|&value| value as f64));
     let mut bp = eidr_try_capacity(n, "RHS regularizado del PCG")?;
-    bp.extend(
-        b.iter()
-            .zip(z.iter())
-            .map(|(&bv, &zv)| bv + ridge * zv),
-    );
+    bp.extend(b.iter().zip(z.iter()).map(|(&bv, &zv)| bv + ridge * zv));
     if bp.iter().any(|value| !value.is_finite()) {
         return Err("EIDR: el término derecho regularizado no es finito".into());
     }
@@ -1955,7 +1946,11 @@ pub(crate) fn eidr_holdout_stat(
                 Some(values) => values.get(idx).copied().unwrap_or(f64::NAN),
                 None => {
                     let ivar = f.inv_var_at(idx, c) as f64;
-                    if ivar > 0.0 { 1.0 / ivar } else { f64::NAN }
+                    if ivar > 0.0 {
+                        1.0 / ivar
+                    } else {
+                        f64::NAN
+                    }
                 }
             };
             let predicted = pred[idx];
@@ -1986,9 +1981,7 @@ pub(crate) fn eidr_holdout_stat(
     }
     let mean = r2.iter().sum::<f64>() / r2.len() as f64;
     let mid = r2.len() / 2;
-    r2.select_nth_unstable_by(mid, |a, b| {
-        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    r2.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
     let median = r2[mid] / 0.454936; // mediana de χ² con 1 gdl
     EidrHoldoutStat {
         chi2_mean: mean,
@@ -2823,12 +2816,20 @@ fn eidr_native_band_limited(
         for y in 0..h {
             let fy = {
                 let f = y as f64 / h as f64;
-                if f >= 0.5 { f - 1.0 } else { f }
+                if f >= 0.5 {
+                    f - 1.0
+                } else {
+                    f
+                }
             };
             for x in 0..w {
                 let fx = {
                     let f = x as f64 / w as f64;
-                    if f >= 0.5 { f - 1.0 } else { f }
+                    if f >= 0.5 {
+                        f - 1.0
+                    } else {
+                        f
+                    }
                 };
                 let radius = fx.hypot(fy);
                 let gain = if radius <= pass {
@@ -2979,8 +2980,7 @@ pub(crate) fn eidr_apply_tile_publication_gate(
         }
         if class != 0 {
             uncertainty_unavailable_pixels += 1;
-            planes.dq[pixel] |=
-                crate::deepsky_variance::dq::EIDR_UNCERTAINTY_UNAVAILABLE;
+            planes.dq[pixel] |= crate::deepsky_variance::dq::EIDR_UNCERTAINTY_UNAVAILABLE;
             if class == 2 {
                 planes.dq[pixel] |= crate::deepsky_variance::dq::EIDR_FALLBACK_NATIVE;
             }
@@ -3796,26 +3796,18 @@ mod tests {
         op.frames.truncate(1);
         let f = &mut op.frames[0];
         let pixels = f.w * f.h;
-        assert!(EidrSpatialInvVar::new(
-            EidrInvVarLayout::Mono,
-            vec![1.0; pixels - 1],
-            f.w,
-            f.h
-        )
-        .is_err());
+        assert!(
+            EidrSpatialInvVar::new(EidrInvVarLayout::Mono, vec![1.0; pixels - 1], f.w, f.h)
+                .is_err()
+        );
 
         let p = 5 * f.w + 7;
         let mut inverse = vec![1.0f32; pixels * 3];
         inverse[p * 3] = 0.01; // varianza 100x mayor que el resto
         inverse[p * 3 + 1] = f32::NAN;
         inverse[p * 3 + 2] = -2.0;
-        let spatial = EidrSpatialInvVar::new(
-            EidrInvVarLayout::RgbInterleaved,
-            inverse,
-            f.w,
-            f.h,
-        )
-        .unwrap();
+        let spatial =
+            EidrSpatialInvVar::new(EidrInvVarLayout::RgbInterleaved, inverse, f.w, f.h).unwrap();
         f.set_spatial_inv_var(Some(spatial)).unwrap();
 
         assert!((f.inv_var_at(p, 0) - 0.01).abs() < 1e-7);
@@ -3855,9 +3847,7 @@ mod tests {
             op.frames[0].h,
         )
         .unwrap();
-        op.frames[0]
-            .set_spatial_inv_var(Some(spatial))
-            .unwrap();
+        op.frames[0].set_spatial_inv_var(Some(spatial)).unwrap();
 
         let n_out = op.w_out * op.h_out;
         let z: Vec<f32> = (0..n_out)
@@ -3912,12 +3902,17 @@ mod tests {
 
         op.frames[0].robust_w = Some(
             (0..pixels)
-                .map(|p| if p % 29 == 0 { 0.0 } else { 0.2 + 0.8 * lcg(&mut state) as f32 })
+                .map(|p| {
+                    if p % 29 == 0 {
+                        0.0
+                    } else {
+                        0.2 + 0.8 * lcg(&mut state) as f32
+                    }
+                })
                 .collect(),
         );
         let mut weight_sq = vec![0.0f64; n_out];
-        op.precision_weight_sq_accum(0, 0, &mut weight_sq)
-            .unwrap();
+        op.precision_weight_sq_accum(0, 0, &mut weight_sq).unwrap();
         for q in [n_out / 5, n_out / 2, 4 * n_out / 5] {
             let mut basis = vec![0.0f32; n_out];
             basis[q] = 1.0;
@@ -4296,7 +4291,7 @@ mod tests {
         }
         let mut dpos: Vec<f64> = diag_all.iter().copied().filter(|&d| d > 0.0).collect();
         let dm = dpos.len() / 2;
-        dpos.select_nth_unstable_by(dm, |a, b| a.partial_cmp(b).unwrap());
+        dpos.select_nth_unstable_by(dm, |a, b| a.total_cmp(b));
         let pen = eidr_freq_penalty(&rep, op.w_out, op.h_out, dpos[dm]);
         let z_all = eidr_solve_subset(&op, &datas, &all, pen.as_ref());
         // El taper vive EN el objetivo (λ_F·ω de §7.3): amortigua las bandas
@@ -4376,7 +4371,7 @@ mod tests {
                         total += v;
                     }
                 }
-                ring.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                ring.sort_by(|a, b| a.0.total_cmp(&b.0));
                 let mut acc = 0.0;
                 for (r, v) in ring {
                     acc += v;
@@ -4386,7 +4381,7 @@ mod tests {
                     }
                 }
             }
-            hs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            hs.sort_by(|a, b| a.total_cmp(b));
             hs[hs.len() / 2]
         };
         let (hfd_e, hfd_d) = (hfd(&z_res), hfd(&dz_all));
@@ -4904,7 +4899,7 @@ mod tests {
         }
         let mut dpos: Vec<f64> = diag.iter().copied().filter(|&d| d > 0.0).collect();
         let dm = dpos.len() / 2;
-        dpos.select_nth_unstable_by(dm, |a, b| a.partial_cmp(b).unwrap());
+        dpos.select_nth_unstable_by(dm, |a, b| a.total_cmp(b));
         let pen = eidr_freq_penalty(&rep, op.w_out, op.h_out, dpos[dm]);
         let z = eidr_solve_subset(&op, &datas, &all, pen.as_ref());
         let dz = drizzle_ref(&datas, &dithers, &all, 96, 80, 2.0, 0.9);
@@ -4924,10 +4919,10 @@ mod tests {
                 }
             }
             let mid = vals.len() / 2;
-            vals.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+            vals.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
             let med = vals[mid];
             let mut devs: Vec<f32> = vals.iter().map(|&v| (v - med).abs()).collect();
-            devs.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+            devs.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
             let sigma = devs[mid] * 1.4826;
             let thr = med + 5.0 * sigma.max(1e-3);
             let mut n = 0usize;
@@ -5197,7 +5192,10 @@ mod tests {
         assert!(report.frac_fallback > 0.99);
         assert!(!report.scale_supported());
         assert!(!report.science_publishable());
-        assert!(report.tiles.iter().all(|tile| tile.class == 2 && tile.r_band == 0.0));
+        assert!(report
+            .tiles
+            .iter()
+            .all(|tile| tile.class == 2 && tile.r_band == 0.0));
         assert!(report.recov_map(192, 128).iter().all(|&value| value == 0.0));
 
         // Una PSF numéricamente presente pero físicamente inválida tampoco
@@ -5218,12 +5216,36 @@ mod tests {
             tiles_x: 4,
             tiles_y: 1,
             tiles: vec![
-                EidrTileGate { tx: 0, ty: 0, kappa: 2.0, r_band: 0.8, class: 0 },
-                EidrTileGate { tx: 1, ty: 0, kappa: 3.0, r_band: 0.7, class: 0 },
-                EidrTileGate { tx: 2, ty: 0, kappa: 40.0, r_band: 0.25, class: 1 },
+                EidrTileGate {
+                    tx: 0,
+                    ty: 0,
+                    kappa: 2.0,
+                    r_band: 0.8,
+                    class: 0,
+                },
+                EidrTileGate {
+                    tx: 1,
+                    ty: 0,
+                    kappa: 3.0,
+                    r_band: 0.7,
+                    class: 0,
+                },
+                EidrTileGate {
+                    tx: 2,
+                    ty: 0,
+                    kappa: 40.0,
+                    r_band: 0.25,
+                    class: 1,
+                },
                 // r_band deliberadamente no cero: RECOV y SCI deben obedecer
                 // class=2 y publicar cero/fallback de todas formas.
-                EidrTileGate { tx: 3, ty: 0, kappa: f64::INFINITY, r_band: 0.9, class: 2 },
+                EidrTileGate {
+                    tx: 3,
+                    ty: 0,
+                    kappa: f64::INFINITY,
+                    r_band: 0.9,
+                    class: 2,
+                },
             ],
             frac_apt: 0.5,
             frac_degrade: 0.25,

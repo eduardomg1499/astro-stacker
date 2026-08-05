@@ -257,8 +257,7 @@ fn pattern_from_profiles(
         row_lag1_correlation: row_lag,
         column_lag1_correlation: col_lag,
         banding_sigma,
-        banding_detected: banding_sigma >= 0.5
-            && (row_lag.abs() >= 0.5 || col_lag.abs() >= 0.5),
+        banding_detected: banding_sigma >= 0.5 && (row_lag.abs() >= 0.5 || col_lag.abs() >= 0.5),
     })
 }
 

@@ -26,8 +26,8 @@
 
 #![allow(dead_code)]
 
-use std::sync::atomic::AtomicBool;
 use rayon::prelude::*;
+use std::sync::atomic::AtomicBool;
 
 /// Lado de la celda nativa para la medición de σ (px).
 const SIGMA_CELL_PX: usize = 64;
@@ -57,6 +57,11 @@ pub(crate) struct NfLiteOutput {
     pub final_data: Vec<f32>,
     /// Cobertura de la pasada de totales (pre-máscaras) — la usa el auto-crop.
     pub wgt1: Vec<f64>,
+    /// Cobertura geométrica efectiva para decidir el recorte. A diferencia de
+    /// `wgt1`, no depende de la escala absoluta de la precisión 1/VAR: usa
+    /// NEFF, de modo que un fondo con menor ruido no puede hacerse pasar por
+    /// una huella de sensor más pequeña.
+    pub crop_coverage: Vec<f64>,
     /// Cobertura/peso final (post-máscaras), media entre canales.
     pub weight_map: Vec<f64>,
     pub rejection_low: Vec<f64>,
@@ -85,6 +90,11 @@ pub(crate) struct NfLiteOutput {
     /// separado la configuración solicitada; este objeto impide presentarla
     /// como efectiva cuando Full, STRUCT o cross-fit cayeron por un gate.
     pub effective_config: NfEffectiveConfig,
+    /// Píxeles de núcleos estelares saturados que no tenían ninguna muestra
+    /// lineal publicable y se conservaron como límite inferior observado.
+    /// SCI queda finito para no crear huecos negros; DQ mantiene SATURATED e
+    /// INTERPOLATED y VAR/NEFF permanecen no disponibles.
+    pub recovered_saturated_pixels: usize,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -160,7 +170,9 @@ impl NfCalibrationUncertainty {
             }
         }
         if valid == 0 {
-            return Err("NebulaFusion: VAR/DQ no contiene ninguna muestra cientifica valida".into());
+            return Err(
+                "NebulaFusion: VAR/DQ no contiene ninguna muestra cientifica valida".into(),
+            );
         }
         Ok(())
     }
@@ -225,6 +237,236 @@ fn nf_finalize_scientific_pixels(
         }
     }
     Ok(())
+}
+
+/// Muestrea un límite inferior observado para un píxel cuya vecindad contiene
+/// SATURATED/NONLINEAR, sin admitir otros defectos fatales. Esta ruta no
+/// convierte la muestra en fotometría válida: sólo evita que un núcleo
+/// estelar recortado por el sensor se publique como un cuadrado negro.
+fn nf_sample_saturated_lower_bound(
+    image: &crate::DsImage,
+    uncertainty: &NfCalibrationUncertainty,
+    sxf: f32,
+    syf: f32,
+    science: &mut [f32; 3],
+) -> Option<u32> {
+    if image.ch != uncertainty.ch
+        || !matches!(image.ch, 1 | 3)
+        || sxf < 0.0
+        || syf < 0.0
+        || sxf >= (image.w.saturating_sub(1)) as f32
+        || syf >= (image.h.saturating_sub(1)) as f32
+    {
+        return None;
+    }
+    let x0 = sxf.floor() as usize;
+    let y0 = syf.floor() as usize;
+    let fx = sxf - x0 as f32;
+    let fy = syf - y0 as f32;
+    let coefficients = [
+        (1.0 - fx) * (1.0 - fy),
+        fx * (1.0 - fy),
+        (1.0 - fx) * fy,
+        fx * fy,
+    ];
+    let source_pixels = [
+        y0 * image.w + x0,
+        y0 * image.w + x0 + 1,
+        (y0 + 1) * image.w + x0,
+        (y0 + 1) * image.w + x0 + 1,
+    ];
+    let saturation_mask =
+        crate::deepsky_variance::dq::SATURATED | crate::deepsky_variance::dq::NONLINEAR;
+    let disallowed = nf_fatal_input_dq() & !saturation_mask;
+    let mut observed_flags = 0u32;
+    for channel in 0..image.ch {
+        let mut value = 0.0f64;
+        let mut coefficient_sum = 0.0f64;
+        for tap in 0..4 {
+            let coefficient = coefficients[tap];
+            if coefficient <= f32::EPSILON {
+                continue;
+            }
+            let pixel = source_pixels[tap];
+            let flags = uncertainty.dq[pixel];
+            if flags & disallowed != 0 {
+                return None;
+            }
+            observed_flags |= flags & saturation_mask;
+            let sample = image.data[pixel * image.ch + channel];
+            if !sample.is_finite() {
+                return None;
+            }
+            value += coefficient as f64 * sample as f64;
+            coefficient_sum += coefficient as f64;
+        }
+        if coefficient_sum <= f64::EPSILON {
+            return None;
+        }
+        science[channel] = (value / coefficient_sum) as f32;
+    }
+    (observed_flags != 0 && science[..image.ch].iter().all(|value| value.is_finite()))
+        .then_some(observed_flags)
+}
+
+/// Recupera únicamente componentes interiores y pequeños de NO_COVERAGE que
+/// proceden de saturación coherente en los raws registrados. Los bordes y los
+/// huecos geométricos grandes permanecen NaN. El valor publicado es la mediana
+/// de las muestras normalizadas observadas (un límite inferior censurado);
+/// nunca se inventa VAR/NEFF para esos píxeles.
+fn nf_recover_saturated_cores(
+    ctx: &NfLiteContext,
+    load: &dyn Fn(usize) -> Result<crate::DsImage, String>,
+    load_uncertainty: Option<&dyn Fn(usize) -> Result<NfCalibrationUncertainty, String>>,
+    science: &mut [f32],
+    variance: &mut [f32],
+    neff: &mut [f32],
+    dq: &mut [u32],
+) -> Result<usize, String> {
+    let Some(load_uncertainty) = load_uncertainty else {
+        return Ok(0);
+    };
+    let pixels = ctx
+        .w_out
+        .checked_mul(ctx.h_out)
+        .ok_or("NebulaFusion: geometría de recuperación saturada fuera de rango")?;
+    if science.len() != pixels.saturating_mul(ctx.ch)
+        || variance.len() != science.len()
+        || neff.len() != science.len()
+        || dq.len() != pixels
+    {
+        return Err("NebulaFusion: planos incompatibles al recuperar núcleos saturados".into());
+    }
+
+    const MAX_COMPONENT_PIXELS: usize = 256;
+    const MAX_RECOVERY_PIXELS: usize = 4096;
+    const EDGE_MARGIN: usize = 4;
+    let mut visited = vec![false; pixels];
+    let mut candidates = Vec::new();
+    for seed in 0..pixels {
+        if visited[seed] || dq[seed] & crate::deepsky_variance::dq::NO_COVERAGE == 0 {
+            continue;
+        }
+        let mut queue = std::collections::VecDeque::from([seed]);
+        let mut component = Vec::new();
+        visited[seed] = true;
+        let mut touches_edge = false;
+        while let Some(pixel) = queue.pop_front() {
+            component.push(pixel);
+            let x = pixel % ctx.w_out;
+            let y = pixel / ctx.w_out;
+            touches_edge |= x < EDGE_MARGIN
+                || y < EDGE_MARGIN
+                || x + EDGE_MARGIN >= ctx.w_out
+                || y + EDGE_MARGIN >= ctx.h_out;
+            for neighbor in [
+                x.checked_sub(1).map(|nx| y * ctx.w_out + nx),
+                (x + 1 < ctx.w_out).then_some(y * ctx.w_out + x + 1),
+                y.checked_sub(1).map(|ny| ny * ctx.w_out + x),
+                (y + 1 < ctx.h_out).then_some((y + 1) * ctx.w_out + x),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !visited[neighbor]
+                    && dq[neighbor] & crate::deepsky_variance::dq::NO_COVERAGE != 0
+                {
+                    visited[neighbor] = true;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        if !touches_edge && component.len() <= MAX_COMPONENT_PIXELS {
+            let remaining = MAX_RECOVERY_PIXELS.saturating_sub(candidates.len());
+            candidates.extend(component.into_iter().take(remaining));
+            if candidates.len() >= MAX_RECOVERY_PIXELS {
+                break;
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+
+    let mut observed = vec![Vec::<f32>::new(); candidates.len() * ctx.ch];
+    let mut observed_flags = vec![0u32; candidates.len()];
+    for (k, &(frame_index, transform, _)) in ctx.registered.iter().enumerate() {
+        crate::pipeline::cancellation_checkpoint(
+            ctx.cancel,
+            "NebulaFusion: recuperación de núcleos saturados",
+        )?;
+        let image = load(frame_index)?;
+        let uncertainty = load_uncertainty(frame_index)?;
+        uncertainty.validate_for(&image)?;
+        let local = ctx.loc_fields[k]
+            .as_ref()
+            .map(|field| (field.as_slice(), ctx.loc_grid, ctx.loc_grid));
+        for (candidate_index, &pixel) in candidates.iter().enumerate() {
+            let x = pixel % ctx.w_out;
+            let y = pixel / ctx.w_out;
+            let Some((sx, sy)) = transform.inverse(x as f32, y as f32) else {
+                continue;
+            };
+            let mut sampled = [f32::NAN; 3];
+            let Some(flags) =
+                nf_sample_saturated_lower_bound(&image, &uncertainty, sx, sy, &mut sampled)
+            else {
+                continue;
+            };
+            observed_flags[candidate_index] |= flags;
+            for channel in 0..ctx.ch {
+                let local_offset = local
+                    .map(|(grid, gw, gh)| {
+                        crate::ds_sample_local_field(
+                            grid,
+                            gw,
+                            gh,
+                            ctx.ch,
+                            channel,
+                            x as f32 / ctx.w_out as f32,
+                            y as f32 / ctx.h_out as f32,
+                        )
+                    })
+                    .unwrap_or(0.0);
+                let value = sampled[channel] * ctx.norms[k].0[channel]
+                    + ctx.norms[k].1[channel]
+                    + local_offset;
+                if value.is_finite() {
+                    observed[candidate_index * ctx.ch + channel].push(value);
+                }
+            }
+        }
+    }
+
+    let mut recovered = 0usize;
+    for (candidate_index, &pixel) in candidates.iter().enumerate() {
+        let enough =
+            (0..ctx.ch).all(|channel| observed[candidate_index * ctx.ch + channel].len() >= 2);
+        if !enough || observed_flags[candidate_index] == 0 {
+            continue;
+        }
+        for channel in 0..ctx.ch {
+            let values = &mut observed[candidate_index * ctx.ch + channel];
+            values.sort_by(|left, right| left.total_cmp(right));
+            let middle = values.len() / 2;
+            let value = if values.len() % 2 == 0 {
+                0.5 * (values[middle - 1] + values[middle])
+            } else {
+                values[middle]
+            };
+            let index = pixel * ctx.ch + channel;
+            science[index] = value;
+            variance[index] = f32::NAN;
+            neff[index] = 0.0;
+        }
+        dq[pixel] &=
+            !(crate::deepsky_variance::dq::NO_COVERAGE | crate::deepsky_variance::dq::NAN_INPUT);
+        dq[pixel] |= observed_flags[candidate_index]
+            | crate::deepsky_variance::dq::INTERPOLATED
+            | crate::deepsky_variance::dq::EIDR_UNCERTAINTY_UNAVAILABLE;
+        recovered += 1;
+    }
+    Ok(recovered)
 }
 
 /// Configuración efectiva del motor. Vive junto al contexto para que ninguna
@@ -540,11 +782,7 @@ fn nf_accumulate_formal_warp(
             let Some((sx, sy)) = transform.inverse(x as f32, y as f32) else {
                 continue;
             };
-            if sx < 0.0
-                || sy < 0.0
-                || sx >= (image.w - 1) as f32
-                || sy >= (image.h - 1) as f32
-            {
+            if sx < 0.0 || sy < 0.0 || sx >= (image.w - 1) as f32 || sy >= (image.h - 1) as f32 {
                 continue;
             }
             let mut sampled_science = [f32::NAN; 3];
@@ -576,9 +814,8 @@ fn nf_accumulate_formal_warp(
                         )
                     })
                     .unwrap_or(0.0);
-                let value = sampled_science[channel] * multiply
-                    + ctx.norms[k].1[channel]
-                    + local_offset;
+                let value =
+                    sampled_science[channel] * multiply + ctx.norms[k].1[channel] + local_offset;
                 if !value.is_finite()
                     || !normalized_variance.is_finite()
                     || normalized_variance <= 0.0
@@ -649,16 +886,10 @@ fn nf_accumulate_formal_cfa(
             )
         };
         let mut weight_sq_band = weight_sq_ptr.map(|ptr| unsafe {
-            std::slice::from_raw_parts_mut(
-                (ptr as *mut f64).add(oy0 * ctx.w_out * 3),
-                band_samples,
-            )
+            std::slice::from_raw_parts_mut((ptr as *mut f64).add(oy0 * ctx.w_out * 3), band_samples)
         });
         let mut variance_band = variance_ptr.map(|ptr| unsafe {
-            std::slice::from_raw_parts_mut(
-                (ptr as *mut f64).add(oy0 * ctx.w_out * 3),
-                band_samples,
-            )
+            std::slice::from_raw_parts_mut((ptr as *mut f64).add(oy0 * ctx.w_out * 3), band_samples)
         });
         for iy in 0..image.h {
             for ix in 0..image.w {
@@ -732,8 +963,7 @@ fn nf_accumulate_formal_cfa(
                             plane[index] += precision * precision;
                         }
                         if let Some(plane) = variance_band.as_deref_mut() {
-                            plane[index] +=
-                                precision * precision * normalized_variance as f64;
+                            plane[index] += precision * precision * normalized_variance as f64;
                         }
                     }
                 }
@@ -1127,6 +1357,30 @@ fn cov_reduce(wgt: &[f64], npx: usize, ch: usize) -> Vec<f64> {
         .collect()
 }
 
+/// Cobertura apta para geometría a partir del número efectivo de muestras.
+/// Se conserva el peor canal: el auto-recorte sólo considera estable un píxel
+/// cuando todos los canales publicables tienen soporte. La magnitud queda en
+/// "tomas efectivas", no en precisión fotométrica, y por tanto es comparable
+/// entre el centro y los bordes de un mismo sensor.
+fn crop_coverage_from_neff(neff: &[f32], npx: usize, ch: usize) -> Vec<f64> {
+    if ch == 0 || neff.len() != npx.saturating_mul(ch) {
+        return vec![0.0; npx];
+    }
+    (0..npx)
+        .map(|pixel| {
+            let mut support = f32::INFINITY;
+            for channel in 0..ch {
+                let value = neff[pixel * ch + channel];
+                if !value.is_finite() || value <= 0.0 {
+                    return 0.0;
+                }
+                support = support.min(value);
+            }
+            support as f64
+        })
+        .collect()
+}
+
 fn struct_allocation_error(label: &str, error: std::collections::TryReserveError) -> String {
     format!("STRUCT omitido: no se pudo reservar {label}: {error}")
 }
@@ -1275,9 +1529,7 @@ fn fit_channel_psfs(
 pub(crate) fn run_lite(
     ctx: &NfLiteContext,
     load: &dyn Fn(usize) -> Result<crate::DsImage, String>,
-    load_uncertainty: Option<
-        &dyn Fn(usize) -> Result<NfCalibrationUncertainty, String>,
-    >,
+    load_uncertainty: Option<&dyn Fn(usize) -> Result<NfCalibrationUncertainty, String>>,
     progress: &mut dyn FnMut(&str, usize, usize),
 ) -> Result<NfLiteOutput, String> {
     let (w_out, h_out, ch) = (ctx.w_out, ctx.h_out, ctx.ch);
@@ -1831,12 +2083,8 @@ pub(crate) fn run_lite(
                         crate::frame_store::AdaptiveFrameStore::new(n, npx * ch, &dir, &tag)?;
                     let mut vstore =
                         crate::frame_store::AdaptiveFrameStore::new(n, npx * ch, &dir, &vtag)?;
-                    let mut pstore = crate::frame_store::AdaptiveFrameStore::new(
-                        n,
-                        npx * ch,
-                        &dir,
-                        &ptag,
-                    )?;
+                    let mut pstore =
+                        crate::frame_store::AdaptiveFrameStore::new(n, npx * ch, &dir, &ptag)?;
                     for (k, &(i, t, _fw)) in ctx.registered.iter().enumerate() {
                         crate::pipeline::cancellation_checkpoint(
                             ctx.cancel,
@@ -1916,14 +2164,21 @@ pub(crate) fn run_lite(
         }
     }
 
-    nf_finalize_scientific_pixels(
+    nf_finalize_scientific_pixels(&mut final_data, &mut variance, &mut neff, &mut dq, npx, ch)?;
+    let recovered_saturated_pixels = nf_recover_saturated_cores(
+        ctx,
+        load,
+        load_uncertainty,
         &mut final_data,
         &mut variance,
         &mut neff,
         &mut dq,
-        npx,
-        ch,
     )?;
+    if recovered_saturated_pixels > 0 {
+        parameter_fallbacks.push(format!(
+            "{recovered_saturated_pixels} píxel(es) de núcleos estelares saturados conservaron el límite inferior observado; DQ=SATURATED|INTERPOLATED y VAR/NEFF no disponibles"
+        ));
+    }
 
     // --- STRUCT (F7): validación split-half sobre el SCI definitivo ---
     let mut struct_map: Option<Vec<f32>> = None;
@@ -1997,21 +2252,20 @@ pub(crate) fn run_lite(
         full_active: full_report.is_some(),
         tile_size: full_report.map(|_| ctx.config.tile_size),
         max_psf_leakage: full_report.map(|_| ctx.config.max_psf_leakage),
-        max_noise_amplification: full_report
-            .map(|_| ctx.config.max_noise_amplification),
+        max_noise_amplification: full_report.map(|_| ctx.config.max_noise_amplification),
         // empiricalPsd=true currently fails its explicit gate, so no
         // successful effective configuration can claim it.
         empirical_psd: false,
         struct_active: struct_accepted.is_some(),
         fdr_q: struct_accepted.as_ref().map(|_| ctx.config.fdr_q),
-        min_split_sigma: struct_accepted
-            .as_ref()
-            .map(|_| ctx.config.min_split_sigma),
+        min_split_sigma: struct_accepted.as_ref().map(|_| ctx.config.min_split_sigma),
     };
+    let crop_coverage = crop_coverage_from_neff(&neff, npx, ch);
 
     Ok(NfLiteOutput {
         final_data,
         wgt1,
+        crop_coverage,
         weight_map,
         rejection_low,
         rejection_high,
@@ -2037,6 +2291,7 @@ pub(crate) fn run_lite(
         struct_fallback,
         parameter_fallbacks,
         effective_config,
+        recovered_saturated_pixels,
     })
 }
 
@@ -2099,6 +2354,27 @@ mod tests {
 
     fn no_cancel() -> AtomicBool {
         AtomicBool::new(false)
+    }
+
+    #[test]
+    fn crop_coverage_uses_effective_samples_and_the_worst_channel() {
+        let neff = vec![
+            5.0,
+            4.0,
+            3.0, // soporte publicable: 3
+            8.0,
+            f32::NAN,
+            7.0, // un canal inválido: sin cobertura
+            10.0,
+            0.0,
+            9.0, // un canal sin muestras: sin cobertura
+        ];
+        assert_eq!(crop_coverage_from_neff(&neff, 3, 3), vec![3.0, 0.0, 0.0]);
+        assert_eq!(
+            crop_coverage_from_neff(&neff, 4, 3),
+            vec![0.0; 4],
+            "una forma inconsistente nunca debe producir un recorte aparente"
+        );
     }
 
     fn flat_sensor(read_noise_e: f64) -> crate::deepsky_sim::SimSensor {
@@ -2884,8 +3160,8 @@ mod tests {
             },
         ];
         let excluded = 3 * w + 3;
-        uncertainties[0].dq[excluded] = crate::deepsky_variance::dq::HOT_COLD
-            | crate::deepsky_variance::dq::INTERPOLATED;
+        uncertainties[0].dq[excluded] =
+            crate::deepsky_variance::dq::HOT_COLD | crate::deepsky_variance::dq::INTERPOLATED;
         uncertainties[0].variance[excluded] = f32::NAN;
         let registered = identity_registered(2);
         let norms = neutral_norms(2);
@@ -2917,13 +3193,8 @@ mod tests {
             })
         };
         let load_uncertainty = |index: usize| Ok(uncertainties[index].clone());
-        let out = run_lite(
-            &ctx,
-            &load,
-            Some(&load_uncertainty),
-            &mut |_, _, _| {},
-        )
-        .expect("NF formal");
+        let out =
+            run_lite(&ctx, &load, Some(&load_uncertainty), &mut |_, _, _| {}).expect("NF formal");
 
         let clean = 2 * w + 2;
         assert!((out.final_data[clean] - 12.0).abs() < 1.0e-6);
@@ -2936,6 +3207,84 @@ mod tests {
         assert_eq!(
             out.products.variance_origin,
             crate::deepsky_variance::VarianceOrigin::HybridEmpiricalPropagated
+        );
+    }
+
+    #[test]
+    fn saturated_star_core_keeps_a_flagged_finite_lower_bound() {
+        let (w, h) = (12usize, 12usize);
+        let core = 6 * w + 6;
+        let mut frames = [vec![100.0f32; w * h], vec![100.0f32; w * h]];
+        frames[0][core] = 60_000.0;
+        frames[1][core] = 61_000.0;
+        let mut uncertainties = [
+            NfCalibrationUncertainty {
+                variance: vec![4.0; w * h],
+                dq: vec![0; w * h],
+                w,
+                h,
+                ch: 1,
+            },
+            NfCalibrationUncertainty {
+                variance: vec![4.0; w * h],
+                dq: vec![0; w * h],
+                w,
+                h,
+                ch: 1,
+            },
+        ];
+        for uncertainty in &mut uncertainties {
+            uncertainty.dq[core] = crate::deepsky_variance::dq::SATURATED;
+            uncertainty.variance[core] = f32::NAN;
+        }
+        let registered = identity_registered(2);
+        let norms = neutral_norms(2);
+        let loc = vec![None, None];
+        let cancel = no_cancel();
+        let ctx = NfLiteContext {
+            registered: &registered,
+            norms: &norms,
+            loc_fields: &loc,
+            loc_grid: 24,
+            w_out: w,
+            h_out: h,
+            ch: 1,
+            use_lanczos: false,
+            cancel: &cancel,
+            cfa: None,
+            full: false,
+            stars: &[],
+            struct_mode: false,
+            config: NfRuntimeConfig::default(),
+        };
+        let load = |index: usize| {
+            Ok(crate::DsImage {
+                data: frames[index].clone(),
+                w,
+                h,
+                ch: 1,
+                bayer: None,
+            })
+        };
+        let load_uncertainty = |index: usize| Ok(uncertainties[index].clone());
+        let out = run_lite(&ctx, &load, Some(&load_uncertainty), &mut |_, _, _| {})
+            .expect("NF formal con núcleo saturado");
+
+        assert_eq!(out.recovered_saturated_pixels, 1);
+        assert!((out.final_data[core] - 60_500.0).abs() < 1.0e-3);
+        assert!(out.products.variance[core].is_nan());
+        assert_eq!(out.products.neff[core], 0.0);
+        assert_eq!(
+            out.products.dq[core] & crate::deepsky_variance::dq::NO_COVERAGE,
+            0
+        );
+        assert_ne!(
+            out.products.dq[core] & crate::deepsky_variance::dq::SATURATED,
+            0
+        );
+        assert_ne!(
+            out.products.dq[core] & crate::deepsky_variance::dq::EIDR_UNCERTAINTY_UNAVAILABLE,
+            0
         );
     }
 
@@ -2967,15 +3316,8 @@ mod tests {
         let mut variance = vec![1.0, 1.0, f32::NAN];
         let mut neff = vec![2.0, 2.0, 0.0];
         let mut dq = vec![0u32];
-        nf_finalize_scientific_pixels(
-            &mut science,
-            &mut variance,
-            &mut neff,
-            &mut dq,
-            1,
-            3,
-        )
-        .expect("contrato RGB");
+        nf_finalize_scientific_pixels(&mut science, &mut variance, &mut neff, &mut dq, 1, 3)
+            .expect("contrato RGB");
         assert!(science.iter().all(|value| value.is_nan()));
         assert!(variance.iter().all(|value| value.is_nan()));
         assert!(neff.iter().all(|value| *value == 0.0));

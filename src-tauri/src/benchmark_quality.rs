@@ -1052,7 +1052,9 @@ mod tests {
     #[ignore = "runner manual con ficheros reales (ZAS_AB_CANDIDATE)"]
     fn f0_ab_compare() {
         let Ok(cand_path) = std::env::var("ZAS_AB_CANDIDATE") else {
-            eprintln!("SKIP f0_ab_compare: define ZAS_AB_CANDIDATE to run the manual A/B comparison");
+            eprintln!(
+                "SKIP f0_ab_compare: define ZAS_AB_CANDIDATE to run the manual A/B comparison"
+            );
             return;
         };
         let load = |p: &str| -> (Vec<u16>, usize, usize) {

@@ -1637,22 +1637,12 @@ fn plan_derotation_memory_with_available(
     }
     let (cyl_width, cyl_height) = derotation_cylindrical_dimensions(disc)?;
     let image_pixels = derotation_checked_mul(w as u64, h as u64, "píxeles de imagen")?;
-    let image_samples = derotation_checked_mul(
-        image_pixels,
-        channels as u64,
-        "muestras de imagen",
-    )?;
+    let image_samples =
+        derotation_checked_mul(image_pixels, channels as u64, "muestras de imagen")?;
     let image_bytes = derotation_checked_mul(image_samples, 2, "buffer de imagen")?;
-    let cyl_pixels = derotation_checked_mul(
-        cyl_width as u64,
-        cyl_height as u64,
-        "píxeles cilíndricos",
-    )?;
-    let cyl_samples = derotation_checked_mul(
-        cyl_pixels,
-        channels as u64,
-        "muestras cilíndricas",
-    )?;
+    let cyl_pixels =
+        derotation_checked_mul(cyl_width as u64, cyl_height as u64, "píxeles cilíndricos")?;
+    let cyl_samples = derotation_checked_mul(cyl_pixels, channels as u64, "muestras cilíndricas")?;
     let accum_bytes = derotation_checked_mul(cyl_samples, 4, "acumulador cilíndrico")?;
     let weight_bytes = derotation_checked_mul(cyl_pixels, 4, "pesos cilíndricos")?;
     let map_bytes = derotation_checked_mul(cyl_samples, 2, "mapa cilíndrico")?;
@@ -1779,8 +1769,7 @@ fn apply_limb_correction_cancelable(
             let correction = (1.0 / (1.0 - r2).sqrt().powf(strength)).min(3.0);
             let idx = (py * w + px) * channels;
             for c in 0..channels {
-                image[idx + c] =
-                    (image[idx + c] as f64 * correction).clamp(0.0, 65535.0) as u16;
+                image[idx + c] = (image[idx + c] as f64 * correction).clamp(0.0, 65535.0) as u16;
             }
         }
     }
@@ -1838,8 +1827,7 @@ fn project_to_cylindrical_cancelable(
                 .asin()
                 .clamp(-PI / 2.0, PI / 2.0);
             let lon = nx.atan2(nz * b0.cos() - corrected_y * b0.sin());
-            let cx_idx =
-                ((lon / PI + 0.5) * cyl_w as f64).clamp(0.0, (cyl_w - 1) as f64) as usize;
+            let cx_idx = ((lon / PI + 0.5) * cyl_w as f64).clamp(0.0, (cyl_w - 1) as f64) as usize;
             let cy_idx = ((lat / (PI / 2.0) + 1.0) * 0.5 * cyl_h as f64)
                 .clamp(0.0, (cyl_h - 1) as f64) as usize;
             let cyl_offset = cy_idx * cyl_w + cx_idx;
@@ -1994,8 +1982,7 @@ fn apply_edge_blend_inplace_cancelable(
             let r = (nx * nx + ny * ny).sqrt();
             let idx = (py * w + px) * channels;
             if r >= 1.0 {
-                derotated[idx..idx + channels]
-                    .copy_from_slice(&original[idx..idx + channels]);
+                derotated[idx..idx + channels].copy_from_slice(&original[idx..idx + channels]);
                 continue;
             }
             let inner_r = 1.0 - blend_width;
@@ -2092,11 +2079,7 @@ where
     let expected_samples = pixels
         .checked_mul(channels)
         .ok_or_else(|| "Overflow de muestras de derotación".to_string())?;
-    if w == 0
-        || h == 0
-        || !matches!(channels, 1 | 3)
-        || image.len() != expected_samples
-    {
+    if w == 0 || h == 0 || !matches!(channels, 1 | 3) || image.len() != expected_samples {
         return Err(format!(
             "Buffer de derotación inválido: {} muestras para {w}x{h}x{channels}",
             image.len()
@@ -2170,16 +2153,7 @@ where
         &cancel,
     )?;
     drop(cylindrical);
-    apply_edge_blend_inplace_cancelable(
-        &mut output,
-        image,
-        w,
-        h,
-        channels,
-        &disc,
-        0.08,
-        &cancel,
-    )?;
+    apply_edge_blend_inplace_cancelable(&mut output, image, w, h, channels, &disc, 0.08, &cancel)?;
     derotation_cancel_checkpoint(&cancel, "el cierre")?;
     Ok(output)
 }
@@ -2495,14 +2469,9 @@ mod tests {
             angle_deg: 0.0,
             phase: 1.0,
         };
-        let error = plan_derotation_memory_with_available(
-            10_000,
-            10_000,
-            3,
-            &disc,
-            2 * 1024 * 1024 * 1024,
-        )
-        .unwrap_err();
+        let error =
+            plan_derotation_memory_with_available(10_000, 10_000, 3, &disc, 2 * 1024 * 1024 * 1024)
+                .unwrap_err();
         assert!(error.contains("RAM insuficiente"), "{error}");
     }
 
@@ -2516,14 +2485,8 @@ mod tests {
             angle_deg: 0.0,
             phase: 1.0,
         };
-        let plan = plan_derotation_memory_with_available(
-            96,
-            80,
-            3,
-            &disc,
-            256 * 1024 * 1024,
-        )
-        .expect("a tiny derotation must not be rejected by a fixed OS reserve");
+        let plan = plan_derotation_memory_with_available(96, 80, 3, &disc, 256 * 1024 * 1024)
+            .expect("a tiny derotation must not be rejected by a fixed OS reserve");
         assert!(plan.required_peak_bytes < plan.working_budget);
     }
 
@@ -2558,23 +2521,11 @@ mod tests {
             Some(&disc),
         );
         let validated_disc = validate_disc_aspect(&disc, &JUPITER);
-        let diagnostic_plan = plan_derotation_memory_with_available(
-            w,
-            h,
-            3,
-            &validated_disc,
-            256 * 1024 * 1024,
-        )
-        .unwrap();
+        let diagnostic_plan =
+            plan_derotation_memory_with_available(w, h, 3, &validated_disc, 256 * 1024 * 1024)
+                .unwrap();
         let mut legacy_corrected = image.clone();
-        apply_limb_correction(
-            &mut legacy_corrected,
-            w,
-            h,
-            3,
-            &validated_disc,
-            0.35,
-        );
+        apply_limb_correction(&mut legacy_corrected, w, h, 3, &validated_disc, 0.35);
         let mut bounded_corrected = image.clone();
         apply_limb_correction_cancelable(
             &mut bounded_corrected,
@@ -2587,15 +2538,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bounded_corrected, legacy_corrected, "limb correction");
-        let legacy_cyl = project_to_cylindrical(
-            &legacy_corrected,
-            w,
-            h,
-            3,
-            &validated_disc,
-            &JUPITER,
-            1.5,
-        );
+        let legacy_cyl =
+            project_to_cylindrical(&legacy_corrected, w, h, 3, &validated_disc, &JUPITER, 1.5);
         let bounded_cyl = project_to_cylindrical_cancelable(
             &bounded_corrected,
             w,
@@ -2617,15 +2561,8 @@ mod tests {
             bounded_shifted.data, legacy_shifted.data,
             "cylindrical shift"
         );
-        let legacy_reprojected = reproject_to_disc(
-            &legacy_shifted,
-            &validated_disc,
-            w,
-            h,
-            3,
-            &JUPITER,
-            1.5,
-        );
+        let legacy_reprojected =
+            reproject_to_disc(&legacy_shifted, &validated_disc, w, h, 3, &JUPITER, 1.5);
         let mut bounded_reprojected = reproject_to_disc_cancelable(
             &bounded_shifted,
             &image,
@@ -2649,15 +2586,8 @@ mod tests {
             &|| false,
         )
         .unwrap();
-        let legacy_blended = apply_edge_blend(
-            &legacy_reprojected,
-            &image,
-            w,
-            h,
-            3,
-            &validated_disc,
-            0.08,
-        );
+        let legacy_blended =
+            apply_edge_blend(&legacy_reprojected, &image, w, h, 3, &validated_disc, 0.08);
         if bounded_reprojected != legacy_blended {
             let first = bounded_reprojected
                 .iter()

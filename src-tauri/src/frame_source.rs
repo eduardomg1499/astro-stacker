@@ -152,16 +152,14 @@ impl UnifiedFrameSource {
             // Un índice de frame es una posición de decodificación, no un
             // timestamp. Para FFmpeg recorremos desde cero una sola vez: usar
             // `-ss index/fps` no es exacto con GOP largos o video VFR.
-            crate::VideoInput::Ffmpeg(reader) => {
-                read_ffmpeg_batch_exact(
-                    reader,
-                    indices,
-                    roi,
-                    self.color_id,
-                    hardware_backend,
-                    allow_software_fallback,
-                )?
-            }
+            crate::VideoInput::Ffmpeg(reader) => read_ffmpeg_batch_exact(
+                reader,
+                indices,
+                roi,
+                self.color_id,
+                hardware_backend,
+                allow_software_fallback,
+            )?,
             _ => {
                 let mut frames = Vec::with_capacity(indices.len());
                 for &index in indices {
@@ -230,62 +228,62 @@ fn read_ffmpeg_batch_exact(
     selected_indices.dedup();
     if crate::ffmpeg_exact_frame_select_filter(&selected_indices).is_ok() {
         let run_selected = |backend: Option<&str>| -> Result<Vec<Vec<u8>>, String> {
-        let mut stream = crate::FfmpegStreamIterator::new_selected(
-            &reader.path,
-            reader.width,
-            reader.height,
-            region.x,
-            region.y,
-            region.width,
-            region.height,
-            color_id,
-            &reader.ffmpeg_path,
-            backend,
-            &reader.codec_name,
-            reader.rotation,
-            &selected_indices,
-        )?;
-        let mut decoded = std::collections::HashMap::with_capacity(selected_indices.len());
-        let mut buffer = vec![0u8; frame_size];
-        for &index in &selected_indices {
-            if !stream.read_frame_into(&mut buffer) {
-                return Err(format!(
-                    "FFmpeg terminó antes de materializar el frame exacto {index}"
-                ));
+            let mut stream = crate::FfmpegStreamIterator::new_selected(
+                &reader.path,
+                reader.width,
+                reader.height,
+                region.x,
+                region.y,
+                region.width,
+                region.height,
+                color_id,
+                &reader.ffmpeg_path,
+                backend,
+                &reader.codec_name,
+                reader.rotation,
+                &selected_indices,
+            )?;
+            let mut decoded = std::collections::HashMap::with_capacity(selected_indices.len());
+            let mut buffer = vec![0u8; frame_size];
+            for &index in &selected_indices {
+                if !stream.read_frame_into(&mut buffer) {
+                    return Err(format!(
+                        "FFmpeg terminó antes de materializar el frame exacto {index}"
+                    ));
+                }
+                decoded.insert(index, buffer.clone());
             }
-            decoded.insert(index, buffer.clone());
-        }
-        if backend.is_some() {
-            stream.validate_hardware_route()?;
-        }
-        // Mover cada frame al resultado, no clonarlo. En RGB48 3312x5888 una
-        // copia son ~111.6 MiB; el `get().cloned()` anterior duplicaba el top-N
-        // completo justo en el pico de la referencia robusta (hasta 2.23 GiB
-        // extra para 20 frames). Sólo duplicamos si el caller pidió de forma
-        // explícita el mismo índice más de una vez.
-        let mut remaining_uses = std::collections::HashMap::new();
-        for &index in indices {
-            *remaining_uses.entry(index).or_insert(0usize) += 1;
-        }
-        let mut ordered = Vec::with_capacity(indices.len());
-        for &index in indices {
-            let uses = remaining_uses
-                .get_mut(&index)
-                .ok_or_else(|| format!("FFmpeg perdió el contador del frame {index}"))?;
-            let frame = if *uses == 1 {
-                decoded
-                    .remove(&index)
-                    .ok_or_else(|| format!("FFmpeg no entregó el frame exacto {index}"))?
-            } else {
-                decoded
-                    .get(&index)
-                    .cloned()
-                    .ok_or_else(|| format!("FFmpeg no entregó el frame exacto {index}"))?
-            };
-            *uses -= 1;
-            ordered.push(frame);
-        }
-        Ok(ordered)
+            if backend.is_some() {
+                stream.validate_hardware_route()?;
+            }
+            // Mover cada frame al resultado, no clonarlo. En RGB48 3312x5888 una
+            // copia son ~111.6 MiB; el `get().cloned()` anterior duplicaba el top-N
+            // completo justo en el pico de la referencia robusta (hasta 2.23 GiB
+            // extra para 20 frames). Sólo duplicamos si el caller pidió de forma
+            // explícita el mismo índice más de una vez.
+            let mut remaining_uses = std::collections::HashMap::new();
+            for &index in indices {
+                *remaining_uses.entry(index).or_insert(0usize) += 1;
+            }
+            let mut ordered = Vec::with_capacity(indices.len());
+            for &index in indices {
+                let uses = remaining_uses
+                    .get_mut(&index)
+                    .ok_or_else(|| format!("FFmpeg perdió el contador del frame {index}"))?;
+                let frame = if *uses == 1 {
+                    decoded
+                        .remove(&index)
+                        .ok_or_else(|| format!("FFmpeg no entregó el frame exacto {index}"))?
+                } else {
+                    decoded
+                        .get(&index)
+                        .cloned()
+                        .ok_or_else(|| format!("FFmpeg no entregó el frame exacto {index}"))?
+                };
+                *uses -= 1;
+                ordered.push(frame);
+            }
+            Ok(ordered)
         };
         // Ruta HW primero si la sonda la confirmó; cualquier fallo (apertura
         // o stream truncado) reintenta por CPU, como en las pasadas de
@@ -322,9 +320,8 @@ fn read_ffmpeg_batch_exact(
             &reader.codec_name,
             reader.rotation,
         )?;
-        let frames = collect_exact_frames(indices, frame_size, |buffer| {
-            stream.read_frame_into(buffer)
-        })?;
+        let frames =
+            collect_exact_frames(indices, frame_size, |buffer| stream.read_frame_into(buffer))?;
         if backend.is_some() {
             stream.validate_hardware_route()?;
         }
@@ -396,7 +393,15 @@ mod tests {
         ));
         let duration = frames as f64 / 30.0;
         let mut cmd = std::process::Command::new("ffmpeg");
-        cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"]);
+        cmd.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+        ]);
         cmd.arg(format!("testsrc2=size=64x48:rate=30:duration={duration}"));
         if fragmented {
             // Sin nb_frames en el contenedor: el caso que obliga al conteo por
@@ -454,7 +459,12 @@ mod tests {
         let roi = source
             .read_batch(
                 &[5],
-                Some(FrameRoi { x: 8, y: 4, width: 32, height: 24 }),
+                Some(FrameRoi {
+                    x: 8,
+                    y: 4,
+                    width: 32,
+                    height: 24,
+                }),
             )
             .unwrap();
         assert_eq!(roi.frames[0].len(), 32 * 24 * 2);
@@ -506,10 +516,7 @@ mod tests {
         let mut green_frame = vec![0u8; 64 * 48 * 2];
         assert!(rgb.read_frame_into(&mut rgb_frame));
         assert!(green.read_frame_into(&mut green_frame));
-        for (pixel, actual_green) in rgb_frame
-            .chunks_exact(6)
-            .zip(green_frame.chunks_exact(2))
-        {
+        for (pixel, actual_green) in rgb_frame.chunks_exact(6).zip(green_frame.chunks_exact(2)) {
             assert_eq!(actual_green, &pixel[2..4]);
         }
         let _ = std::fs::remove_file(path);
@@ -590,7 +597,10 @@ mod tests {
                 }
             }
             assert!(first.iter().any(|&value| value != 0));
-            assert_ne!(first, last, "testsrc2 debe cambiar entre el primer y el último frame");
+            assert_ne!(
+                first, last,
+                "testsrc2 debe cambiar entre el primer y el último frame"
+            );
         };
 
         let inline: Vec<usize> = (0..2056).step_by(2).collect();
@@ -621,8 +631,14 @@ mod tests {
         // Premisa del fallback: el contenedor fragmentado NO declara nb_frames.
         let probe = std::process::Command::new("ffprobe")
             .args([
-                "-v", "error", "-select_streams", "v:0", "-show_entries",
-                "stream=nb_frames", "-of", "csv=p=0",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=nb_frames",
+                "-of",
+                "csv=p=0",
             ])
             .arg(&path)
             .output()
@@ -635,13 +651,23 @@ mod tests {
         // El MISMO comando que usa FfmpegReader::new como fallback.
         let counted = std::process::Command::new("ffprobe")
             .args([
-                "-v", "error", "-select_streams", "v:0", "-count_packets",
-                "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_packets",
+                "-show_entries",
+                "stream=nb_read_packets",
+                "-of",
+                "csv=p=0",
             ])
             .arg(&path)
             .output()
             .unwrap();
-        let n: usize = String::from_utf8_lossy(&counted.stdout).trim().parse().unwrap();
+        let n: usize = String::from_utf8_lossy(&counted.stdout)
+            .trim()
+            .parse()
+            .unwrap();
         assert_eq!(n, 40, "el conteo por paquetes debe dar los frames exactos");
         let _ = std::fs::remove_file(path);
     }
@@ -659,14 +685,19 @@ mod tests {
         // Ahora el índice se recorre desde cero y debe coincidir byte por byte
         // con el contrato exacto de UnifiedFrameSource.
         let reader = ffmpeg_reader_for(&path, 40, 10.0);
-        let exact_source = UnifiedFrameSource::from_input(
-            crate::VideoInput::Ffmpeg(reader.clone()),
-            0,
-        );
-        let expected = exact_source.read_batch(&[35], None).unwrap().frames.remove(0);
+        let exact_source =
+            UnifiedFrameSource::from_input(crate::VideoInput::Ffmpeg(reader.clone()), 0);
+        let expected = exact_source
+            .read_batch(&[35], None)
+            .unwrap()
+            .frames
+            .remove(0);
         let frame = reader.get_frame(35, 0);
         assert_eq!(frame.len(), 64 * 48 * 2);
-        assert_eq!(frame, expected, "get_frame debe preservar el índice absoluto");
+        assert_eq!(
+            frame, expected,
+            "get_frame debe preservar el índice absoluto"
+        );
         let _ = std::fs::remove_file(path);
     }
 

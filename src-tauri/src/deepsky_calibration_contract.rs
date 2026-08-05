@@ -7,9 +7,7 @@
 
 #![allow(dead_code)]
 
-use crate::pipeline::{
-    CalibrationSignature, DeepSkyCalibrationPolicy, PedestalState,
-};
+use crate::pipeline::{CalibrationSignature, DeepSkyCalibrationPolicy, PedestalState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CalibrationRole {
@@ -261,7 +259,10 @@ pub(crate) fn compare_calibration_signatures(
             if !list.is_empty() {
                 list.sort();
                 list.dedup();
-                reasons.push(format!("sin verificar (cabecera ausente): {}", list.join(", ")));
+                reasons.push(format!(
+                    "sin verificar (cabecera ausente): {}",
+                    list.join(", ")
+                ));
             }
         }
         return match policy {
@@ -348,9 +349,7 @@ pub(crate) fn validate_dark_scaling(evidence: DarkScalingEvidence) -> Result<f32
     if evidence.amp_glow_detected {
         return Err("dark scaling bloqueado: se detectó amp glow".into());
     }
-    if !evidence.exposure_ratio.is_finite()
-        || !(0.25..=4.0).contains(&evidence.exposure_ratio)
-    {
+    if !evidence.exposure_ratio.is_finite() || !(0.25..=4.0).contains(&evidence.exposure_ratio) {
         return Err("dark scaling bloqueado: razón de exposición inválida".into());
     }
     if !evidence.correlation.is_finite() || evidence.correlation < 0.995 {
@@ -406,9 +405,9 @@ pub(crate) fn validate_flat_pedestal(
                 "bias-only bloqueado: térmico {:.4}% > 0.1% del flat",
                 value * 100.0
             )),
-            _ => Err(
-                "bias-only bloqueado: falta validar que el térmico sea <=0.1% del flat".into(),
-            ),
+            _ => {
+                Err("bias-only bloqueado: falta validar que el térmico sea <=0.1% del flat".into())
+            }
         },
         (true, true, _) => Err(
             "convención de flat inválida: dark-flat crudo y bias restarían el pedestal dos veces"
@@ -458,7 +457,10 @@ mod tests {
         );
         assert!(!report.compatible);
         assert!(!report.scientific_eligible);
-        assert!(report.reasons.iter().any(|reason| reason.contains("exposure")));
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("exposure")));
     }
 
     #[test]
@@ -500,21 +502,25 @@ mod tests {
         let reference = signature();
         let mut dark = reference.clone();
         dark.temperature_c = Some(-9.0);
-        assert!(compare_calibration_signatures(
-            &reference,
-            &dark,
-            CalibrationRole::Dark,
-            DeepSkyCalibrationPolicy::Strict,
-        )
-        .compatible);
+        assert!(
+            compare_calibration_signatures(
+                &reference,
+                &dark,
+                CalibrationRole::Dark,
+                DeepSkyCalibrationPolicy::Strict,
+            )
+            .compatible
+        );
         dark.temperature_c = Some(-8.9);
-        assert!(!compare_calibration_signatures(
-            &reference,
-            &dark,
-            CalibrationRole::Dark,
-            DeepSkyCalibrationPolicy::Strict,
-        )
-        .compatible);
+        assert!(
+            !compare_calibration_signatures(
+                &reference,
+                &dark,
+                CalibrationRole::Dark,
+                DeepSkyCalibrationPolicy::Strict,
+            )
+            .compatible
+        );
     }
 
     #[test]

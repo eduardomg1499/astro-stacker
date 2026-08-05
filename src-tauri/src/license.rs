@@ -420,7 +420,9 @@ impl LicenseManager {
             // mantenemos el chequeo agresivo cerca del vencimiento y para las anuales.
             (
                 key,
-                force || stale || (guard.is_pro_verified && (expiry_near || license_type == "ANNUAL")),
+                force
+                    || stale
+                    || (guard.is_pro_verified && (expiry_near || license_type == "ANNUAL")),
             )
         };
 

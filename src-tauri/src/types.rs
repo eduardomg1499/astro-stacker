@@ -2629,7 +2629,39 @@ impl VideoInput {
             }
         }
 
-        // Intentar FFmpeg para el resto (o si SER nativo falla)
+        // Un AVI RAW8 suele transportar el mosaico CFA como Y800/MONO8 o
+        // como DIB de 8 bits con paleta gris. FFmpeg puede exponer ese último
+        // caso como `pal8` y convertirlo a RGB, lo que produce ColorID 100 y
+        // hace imposible aplicar después el patrón Bayer manual. El lector
+        // nativo es deliberadamente estricto: sólo acepta layouts raw
+        // verificables y rechaza codecs comprimidos, ambiguos y OpenDML para
+        // que éstos continúen por FFmpeg sin cambiar su flujo.
+        if ext == "avi" {
+            if cancel.as_ref().is_some_and(|check| check()) {
+                return Err("Apertura AVI cancelada o sustituida por otro trabajo".into());
+            }
+            match AviReader::new(path) {
+                Ok(r) => {
+                    println!(
+                        "DEBUG: [VideoInput] Using Native AVI Reader for: {} (CID={})",
+                        path, r.info.color_id
+                    );
+                    return Ok(VideoInput::Avi(r));
+                }
+                Err(err) => {
+                    log_to_front(
+                        app,
+                        "INFO",
+                        &format!(
+                            "AVI no es raw clásico verificable ({}). Delegando decodificación a FFmpeg...",
+                            err
+                        ),
+                    );
+                }
+            }
+        }
+
+        // Intentar FFmpeg para el resto (o si SER/AVI nativo falla)
         if cancel.as_ref().is_some_and(|check| check()) {
             return Err("Apertura FFmpeg cancelada o sustituida por otro trabajo".into());
         }
@@ -2639,12 +2671,6 @@ impl VideoInput {
                 return Ok(VideoInput::Ffmpeg(r));
             }
             Err(e) => {
-                // Fallback AVI nativo (Solo para archivos .avi reales)
-                if ext == "avi" {
-                    if let Ok(r) = AviReader::new(path) {
-                        return Ok(VideoInput::Avi(r));
-                    }
-                }
                 let hint = ffmpeg_install_hint();
                 if e.contains("Instala FFmpeg") || e.contains(&hint) {
                     return Err(format!("Error al abrir con FFmpeg: {}", e));
@@ -3026,11 +3052,64 @@ struct FilterCache {
     height: usize,
 }
 
+/// Producto científico inactivo respaldado por disco. Mantener cuatro
+/// `DeepSkyResult` completos (SCI + VAR + NEFF + DQ + diagnósticos) en RAM
+/// multiplica el pico de forma explosiva, especialmente con una rama Drizzle
+/// 2× y otra EIDR. El producto activo sigue íntegro en memoria; los demás se
+/// cargan bajo demanda sin recalcular.
+#[derive(Debug)]
+struct DeepSkyProductCacheEntry {
+    path: PathBuf,
+    stored_bytes: u64,
+    /// Los volcados de intercambio entre productos son efímeros y se borran
+    /// al salir del mapa en memoria. Un checkpoint ya publicado, en cambio,
+    /// debe sobrevivir a cancelación, OOM recuperable y reinicio de la app para
+    /// que el siguiente intento compatible no repita la integración.
+    remove_on_drop: bool,
+}
+
+impl DeepSkyProductCacheEntry {
+    fn transient(path: PathBuf, stored_bytes: u64) -> Self {
+        Self {
+            path,
+            stored_bytes,
+            remove_on_drop: true,
+        }
+    }
+
+    fn durable(path: PathBuf, stored_bytes: u64) -> Self {
+        Self {
+            path,
+            stored_bytes,
+            remove_on_drop: false,
+        }
+    }
+}
+
+impl Drop for DeepSkyProductCacheEntry {
+    fn drop(&mut self) {
+        if !self.remove_on_drop {
+            return;
+        }
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
+
 struct AppState {
     stacked_image: Mutex<Option<StackResult>>,
     /// Máster lineal float32 y mapas científicos de cielo profundo. Se mantiene
     /// separado del resultado planetario u16 para no perder headroom.
     deep_sky_result: Mutex<Option<DeepSkyLinearResult>>,
+    /// Productos v5 no activos. El producto visible vive en
+    /// `deep_sky_result`/`stacked_image`; los demás se conservan en un caché
+    /// temporal lossless para que Classic Drizzle, NF, STRUCT y EIDR no
+    /// permanezcan simultáneamente en RAM.
+    deep_sky_products:
+        Mutex<std::collections::BTreeMap<String, DeepSkyProductCacheEntry>>,
+    deep_sky_active_product: Mutex<Option<String>>,
     /// Last rendered 16-bit result for histogram, sampling and export parity.
     /// It is always derived again from `stacked_image`, never used as the base
     /// of the next edit, so adjustments cannot accumulate destructively.
@@ -3066,12 +3145,12 @@ struct AppState {
 }
 
 #[derive(Clone)]
-struct StackResult {
-    data: Vec<u16>,
-    width: usize,
-    height: usize,
-    is_mono: bool,
-    is_surface: bool, // Support for V2 surface handling
+pub struct StackResult {
+    pub data: Vec<u16>,
+    pub width: usize,
+    pub height: usize,
+    pub is_mono: bool,
+    pub is_surface: bool, // Support for V2 surface handling
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

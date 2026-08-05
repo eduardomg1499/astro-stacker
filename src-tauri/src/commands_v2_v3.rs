@@ -5101,6 +5101,37 @@ fn perform_standardized_analysis_attempt(
     // un caché aparentemente válido que luego asocia score al frame equivocado.
     let quality_selection_started = std::time::Instant::now();
     stats.sort_unstable_by_key(|frame| frame.idx);
+    // MONO SOLAR/PLANETARIO: el score puede ser normal aunque el SAD global
+    // haya elegido un mínimo falso en el borde de su búsqueda. Repararlo aquí
+    // evita publicar nuevas cachés contaminadas. Color/Bayer conserva por ahora
+    // su trayectoria histórica: el corpus reportado y reproducible es mono.
+    if !r.is_color_for(cid) {
+        let repair = repair_temporal_global_shift_outliers(&mut stats);
+        if repair.repaired > 0 {
+            let preview: Vec<String> = repair
+                .frame_indices
+                .iter()
+                .take(12)
+                .map(ToString::to_string)
+                .collect();
+            log_to_front(
+                app,
+                "WARN",
+                &format!(
+                    "Alineamiento mono: se corrigieron {} semillas globales temporalmente inválidas (frames {}; corrección máxima {:.1} px).",
+                    repair.repaired,
+                    preview.join(", "),
+                    repair.max_correction_px,
+                ),
+            );
+            crate::perf_trace::job_meta(pt, "global_shift_repairs", repair.repaired);
+            crate::perf_trace::job_meta(
+                pt,
+                "global_shift_max_correction_px",
+                repair.max_correction_px,
+            );
+        }
+    }
     let mut qg: Vec<f32> = stats.iter().map(|s| s.score as f32).collect();
     let mut si: Vec<usize> = (0..stats.len()).collect();
     si.sort_by(|&a, &b| stats[b].score.cmp(&stats[a].score));
@@ -7557,6 +7588,141 @@ fn planetary_frame_quality_order(
     b.score.cmp(&a.score).then_with(|| a.idx.cmp(&b.idx))
 }
 
+// El análisis global de textura trabaja a media resolución con una búsqueda
+// piramidal de ±64 px y un refino final de ±16 px. En coordenadas del frame
+// completo eso permite devolver exactamente ±160 px. Un mínimo falso pegado a
+// ese límite parece válido (el score de seeing es independiente) pero deja la
+// semilla mucho más lejos que la ventana local de los AP (±24 px): el frame se
+// integra como una copia desplazada del limbo. La trayectoria real de una
+// captura planetaria es temporalmente continua, así que usamos una mediana
+// amplia y MAD para detectar sólo saltos incompatibles con sus vecinos.
+const GLOBAL_SHIFT_TEMPORAL_RADIUS: usize = 16;
+const GLOBAL_SHIFT_OUTLIER_FLOOR_PX: f32 = 48.0;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct GlobalShiftRepairReport {
+    repaired: usize,
+    max_correction_px: f32,
+    frame_indices: Vec<usize>,
+}
+
+#[inline]
+fn median_f32(values: &mut [f32]) -> f32 {
+    values.sort_unstable_by(f32::total_cmp);
+    let middle = values.len() / 2;
+    if values.len() % 2 == 0 {
+        0.5 * (values[middle - 1] + values[middle])
+    } else {
+        values[middle]
+    }
+}
+
+/// Repara únicamente las semillas globales temporalmente imposibles. No toca
+/// score, selección local ni píxeles; la comprobación SAD por frame vuelve a
+/// medir después la posición real alrededor de esta semilla robusta. Se opera
+/// sobre una copia en memoria al consumir cachés antiguas, por lo que el
+/// análisis científico de origen no se reescribe silenciosamente.
+fn repair_temporal_global_shift_outliers(
+    frames: &mut [FrameAlignmentData],
+) -> GlobalShiftRepairReport {
+    if frames.len() < 7 {
+        return GlobalShiftRepairReport::default();
+    }
+
+    let original: Vec<(f32, f32)> = frames
+        .iter()
+        .map(|frame| (frame.x_shift, frame.y_shift))
+        .collect();
+    let mut suspect = vec![false; frames.len()];
+    let mut xs = Vec::with_capacity(GLOBAL_SHIFT_TEMPORAL_RADIUS * 2);
+    let mut ys = Vec::with_capacity(GLOBAL_SHIFT_TEMPORAL_RADIUS * 2);
+    let mut x_deviations = Vec::with_capacity(GLOBAL_SHIFT_TEMPORAL_RADIUS * 2);
+    let mut y_deviations = Vec::with_capacity(GLOBAL_SHIFT_TEMPORAL_RADIUS * 2);
+
+    for i in 0..frames.len() {
+        let start = i.saturating_sub(GLOBAL_SHIFT_TEMPORAL_RADIUS);
+        let end = (i + GLOBAL_SHIFT_TEMPORAL_RADIUS + 1).min(frames.len());
+        xs.clear();
+        ys.clear();
+        for (j, &(x, y)) in original.iter().enumerate().take(end).skip(start) {
+            if j != i && x.is_finite() && y.is_finite() {
+                xs.push(x);
+                ys.push(y);
+            }
+        }
+        if xs.len() < 6 {
+            continue;
+        }
+
+        let median_x = median_f32(&mut xs);
+        let median_y = median_f32(&mut ys);
+        x_deviations.clear();
+        y_deviations.clear();
+        x_deviations.extend(xs.iter().map(|value| (value - median_x).abs()));
+        y_deviations.extend(ys.iter().map(|value| (value - median_y).abs()));
+        let sigma_x = median_f32(&mut x_deviations) * 1.4826;
+        let sigma_y = median_f32(&mut y_deviations) * 1.4826;
+        // El suelo de 48 px deja intactos tracking/seeing normales. Cuando la
+        // captura realmente se mueve con rapidez, MAD eleva dinámicamente el
+        // umbral en vez de imponer una trayectoria artificialmente rígida.
+        let threshold_x = GLOBAL_SHIFT_OUTLIER_FLOOR_PX.max(sigma_x * 8.0 + 8.0);
+        let threshold_y = GLOBAL_SHIFT_OUTLIER_FLOOR_PX.max(sigma_y * 8.0 + 8.0);
+        let (x, y) = original[i];
+        suspect[i] = !x.is_finite()
+            || !y.is_finite()
+            || (x - median_x).abs() > threshold_x
+            || (y - median_y).abs() > threshold_y;
+    }
+
+    let mut report = GlobalShiftRepairReport::default();
+    let mut run_start = 0usize;
+    while run_start < frames.len() {
+        if !suspect[run_start] {
+            run_start += 1;
+            continue;
+        }
+        let mut run_end = run_start + 1;
+        while run_end < frames.len() && suspect[run_end] {
+            run_end += 1;
+        }
+        let previous = run_start.checked_sub(1).filter(|&index| !suspect[index]);
+        let next = (run_end < frames.len()).then_some(run_end);
+
+        // Si toda la secuencia fuese inconsistente no existe evidencia para
+        // inventar posiciones: dejarla intacta y permitir que el caller falle
+        // o solicite un nuevo análisis es más seguro.
+        if previous.is_none() && next.is_none() {
+            break;
+        }
+
+        for index in run_start..run_end {
+            let repaired = match (previous, next) {
+                (Some(left), Some(right)) => {
+                    let span = (frames[right].idx.saturating_sub(frames[left].idx)).max(1) as f32;
+                    let t = frames[index].idx.saturating_sub(frames[left].idx) as f32 / span;
+                    (
+                        original[left].0 + (original[right].0 - original[left].0) * t,
+                        original[left].1 + (original[right].1 - original[left].1) * t,
+                    )
+                }
+                (Some(left), None) => original[left],
+                (None, Some(right)) => original[right],
+                (None, None) => unreachable!(),
+            };
+            let correction = (original[index].0 - repaired.0)
+                .hypot(original[index].1 - repaired.1);
+            frames[index].x_shift = repaired.0;
+            frames[index].y_shift = repaired.1;
+            frames[index].global_shift = repaired;
+            report.repaired += 1;
+            report.max_correction_px = report.max_correction_px.max(correction);
+            report.frame_indices.push(frames[index].idx);
+        }
+        run_start = run_end;
+    }
+    report
+}
+
 /// La entrada ya está ordenada. Las desviaciones absolutas a la mediana forman
 /// dos secuencias ordenadas (desde el centro hacia cada extremo), por lo que su
 /// mediana se obtiene con un merge de sólo `n/2 + 1` pasos. Evita el segundo
@@ -8538,6 +8704,42 @@ fn stack_video_liquid_warping_attempt(
             &cached,
             &cache_expectation,
         )?;
+    }
+
+    // Compatibilidad con cachés ya existentes: reparar sólo la copia cargada
+    // en memoria. Así el usuario obtiene la defensa inmediatamente sin forzar
+    // otro análisis ni sobrescribir silenciosamente el artefacto de caché.
+    // Ambas categorías (Superficie y Planeta/Fase) pasan por este punto.
+    if !r.is_color_for(resolved_color_id) {
+        let stats = cached
+            .frame_stats
+            .as_mut()
+            .ok_or("Datos de analisis corruptos")?;
+        let repair = repair_temporal_global_shift_outliers(stats);
+        if repair.repaired > 0 {
+            let preview: Vec<String> = repair
+                .frame_indices
+                .iter()
+                .take(12)
+                .map(ToString::to_string)
+                .collect();
+            log_to_front(
+                &app,
+                "WARN",
+                &format!(
+                    "Protección de alineamiento mono: {} semillas globales inválidas reparadas antes del apilado (frames {}; máximo {:.1} px).",
+                    repair.repaired,
+                    preview.join(", "),
+                    repair.max_correction_px,
+                ),
+            );
+            crate::perf_trace::job_meta(pt, "global_shift_repairs", repair.repaired);
+            crate::perf_trace::job_meta(
+                pt,
+                "global_shift_max_correction_px",
+                repair.max_correction_px,
+            );
+        }
     }
 
     // 2. Identify Frames
@@ -11047,6 +11249,7 @@ fn stack_video_liquid_warping_attempt(
     let mut prefetch_error: Option<String> = None;
     let mut worker_error: Option<String> = None;
     let mut strict_gpu_error: Option<String> = None;
+    let rejected_global_alignments = std::sync::atomic::AtomicUsize::new(0);
     for (_batch_idx, chunk) in active_frames_data.chunks(frames_per_batch).enumerate() {
         if job_token.is_cancelled() {
             break; // cancelado por el usuario
@@ -11107,6 +11310,7 @@ fn stack_video_liquid_warping_attempt(
         let tele_mode_ref = &tele_mode;
         let tele_job_id_ref = &pipeline_job_id;
         let tele_hits_ref = &tele_cache_hits;
+        let rejected_global_ref = &rejected_global_alignments;
         let acceptance_ref = &frame_acceptance_masks;
         let signal_valid_ref = &ap_signal_valid;
         let dark_ratio_ref = &ap_dark_ratio;
@@ -11421,7 +11625,8 @@ fn stack_video_liquid_warping_attempt(
                                 && (est_y as usize) < h_ds
                             {
                                 let t_sg = std::time::Instant::now();
-                                let (cdx, cdy, _) = crate::alignment::find_best_match_sad(
+                                const GLOBAL_VERIFY_RADIUS: i32 = 16;
+                                let (cdx, cdy, sad) = crate::alignment::find_best_match_sad(
                                     &master_ds_buf,
                                     &sc.f_ds,
                                     w_ds,
@@ -11430,9 +11635,32 @@ fn stack_video_liquid_warping_attempt(
                                     est_x as usize,
                                     est_y as usize,
                                     vbox,
-                                    16,
+                                    GLOBAL_VERIFY_RADIUS,
                                 );
                                 crate::perf_trace::add_ns(pt, ptag, "sad_global", t_sg.elapsed().as_nanos(), 1);
+                                // Un mínimo en el borde no es una medición:
+                                // sólo informa que la posición real quedó fuera
+                                // de esta ventana. Dejarlo pasar entrega a los
+                                // AP una base que tampoco pueden recuperar y
+                                // dibuja una copia desplazada del limbo.
+                                let saturated = sad == u64::MAX
+                                    || cdx.abs() >= GLOBAL_VERIFY_RADIUS as f32 - 0.25
+                                    || cdy.abs() >= GLOBAL_VERIFY_RADIUS as f32 - 0.25;
+                                if saturated {
+                                    rejected_global_ref.fetch_add(1, Ordering::Relaxed);
+                                    tele_align_ref.fetch_add(
+                                        t_frame_start.elapsed().as_nanos() as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                    tele_align_last_ref.fetch_max(
+                                        tele_start_ref
+                                            .elapsed()
+                                            .as_nanos()
+                                            .min(u64::MAX as u128) as u64,
+                                        Ordering::AcqRel,
+                                    );
+                                    return;
+                                }
                                 let measured_dx = (est_x as f32 - cx as f32 + cdx) * 4.0;
                                 let measured_dy = (est_y as f32 - cy as f32 + cdy) * 4.0;
                                 if (measured_dx - render_dx).abs() > 6.0
@@ -11892,6 +12120,30 @@ fn stack_video_liquid_warping_attempt(
         );
         pt_guard.discard();
         return Err(restart);
+    }
+
+    let rejected_global = rejected_global_alignments.load(Ordering::Relaxed);
+    if rejected_global >= total_active {
+        return Err(
+            "La verificación global quedó fuera de rango en todos los frames seleccionados; vuelve a analizar o reduce el movimiento del origen. No se generó un apilado fantasma."
+                .into(),
+        );
+    }
+    if rejected_global > 0 {
+        log_to_front(
+            &app,
+            "WARN",
+            &format!(
+                "{pass_label}Protección anti-contorno: se omitieron {rejected_global} de {total_active} frames cuya reverificación global quedó en el límite de búsqueda."
+            ),
+        );
+        crate::perf_trace::add_ns(
+            pt,
+            ptag,
+            "global_alignment_rejected",
+            0,
+            rejected_global as u64,
+        );
     }
 
     // Collect the shared accumulators for this pass (acceso exclusivo de
@@ -16748,6 +17000,68 @@ mod zas_v3_tests {
         assert_eq!(top_n, (0..20).collect::<Vec<_>>());
     }
 
+    fn shift_timeline(count: usize, dx_per_frame: f32, dy_per_frame: f32) -> Vec<FrameAlignmentData> {
+        (0..count)
+            .map(|index| {
+                let mut frame = FrameAlignmentData::empty(index);
+                frame.x_shift = index as f32 * dx_per_frame;
+                frame.y_shift = index as f32 * dy_per_frame;
+                frame.global_shift = (frame.x_shift, frame.y_shift);
+                frame.score = 10_000 + index as u64;
+                frame
+            })
+            .collect()
+    }
+
+    #[test]
+    fn temporal_global_shift_repair_removes_boundary_false_matches_and_runs() {
+        let mut frames = shift_timeline(96, 0.125, -0.0625);
+        let expected = frames.clone();
+        for index in [17usize, 52, 53, 54, 55, 56, 91, 92, 93] {
+            frames[index].x_shift = if index % 2 == 0 { 160.0 } else { -94.0 };
+            frames[index].y_shift = -160.0;
+            frames[index].global_shift = (frames[index].x_shift, frames[index].y_shift);
+        }
+
+        let report = repair_temporal_global_shift_outliers(&mut frames);
+        assert_eq!(report.repaired, 9, "{report:?}");
+        assert!(report.max_correction_px > 150.0, "{report:?}");
+        assert_eq!(
+            report.frame_indices,
+            vec![17, 52, 53, 54, 55, 56, 91, 92, 93]
+        );
+        for index in report.frame_indices {
+            assert!((frames[index].x_shift - expected[index].x_shift).abs() < 1e-5);
+            assert!((frames[index].y_shift - expected[index].y_shift).abs() < 1e-5);
+            assert_eq!(frames[index].global_shift, (frames[index].x_shift, frames[index].y_shift));
+            assert_eq!(frames[index].score, expected[index].score);
+        }
+    }
+
+    #[test]
+    fn temporal_global_shift_repair_preserves_fast_motion_and_persistent_step() {
+        let mut frames = shift_timeline(100, 4.0, -2.0);
+        for frame in frames.iter_mut().skip(50) {
+            frame.x_shift += 80.0;
+            frame.y_shift -= 60.0;
+            frame.global_shift = (frame.x_shift, frame.y_shift);
+        }
+        let expected: Vec<(f32, f32)> = frames
+            .iter()
+            .map(|frame| (frame.x_shift, frame.y_shift))
+            .collect();
+
+        let report = repair_temporal_global_shift_outliers(&mut frames);
+        assert_eq!(report.repaired, 0, "{report:?}");
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| (frame.x_shift, frame.y_shift))
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
     #[test]
     fn robust_reference_keeps_best_frame_in_each_uncovered_pixel() {
         let master = vec![11u16, 22, 33, 44, 55, 66];
@@ -17240,6 +17554,91 @@ mod zas_v3_tests {
             contract: Some(expected.contract(roi)),
         };
         (expected, cached)
+    }
+
+    /// Opt-in real-data audit for a user-supplied solar mono cache. It stays a
+    /// no-op in normal CI and lets us verify that an external regression corpus
+    /// actually exercises the selected solar category + mono + multipoint
+    /// contract before an expensive stack is used as release evidence.
+    #[test]
+    fn external_solar_mono_cache_contract_and_geometry() {
+        let Ok(cache_path) = std::env::var("ZAS_SOLAR_MONO_CACHE") else {
+            return;
+        };
+        let cached = load_cached_analysis(&cache_path).expect("caché solar mono legible");
+        let contract = cached.contract.as_ref().expect("contrato a11 presente");
+        let expected_target = std::env::var("ZAS_SOLAR_MONO_EXPECT_TARGET")
+            .unwrap_or_else(|_| "surface".into());
+        assert_eq!(contract.resolved_color_id, 0, "el corpus debe ser mono");
+        assert_eq!(
+            contract.target_type, expected_target,
+            "el caché no corresponde a la categoría solar solicitada"
+        );
+        assert_eq!(
+            contract.is_surface,
+            expected_target == "surface",
+            "la bandera de categoría debe coincidir con el target normalizado"
+        );
+        assert!(contract.warping_analysis, "el corpus debe ejercitar alineación multipunto");
+
+        let points = cached.ap_points.as_deref().expect("malla AP presente");
+        let frames = cached.frame_stats.as_deref().expect("estadísticas por frame");
+        let shift_extent = frames.iter().fold(
+            (f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY),
+            |(min_x, max_x, min_y, max_y), frame| {
+                (
+                    min_x.min(frame.x_shift),
+                    max_x.max(frame.x_shift),
+                    min_y.min(frame.y_shift),
+                    max_y.max(frame.y_shift),
+                )
+            },
+        );
+        let nonempty_local = frames
+            .iter()
+            .filter(|frame| !frame.local_shifts.is_empty())
+            .count();
+        let grid_lengths: std::collections::BTreeSet<usize> = frames
+            .iter()
+            .filter_map(|frame| frame.grid_scores.as_ref().map(Vec::len))
+            .collect();
+        let x_extent = points.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |range, point| {
+            (range.0.min(point.x), range.1.max(point.x))
+        });
+        let y_extent = points.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |range, point| {
+            (range.0.min(point.y), range.1.max(point.y))
+        });
+        eprintln!(
+            "solar mono externo: frames={} best={:?} roi={:?} APs={} x={x_extent:?} y={y_extent:?} global={shift_extent:?} local_frames={} grid_lengths={grid_lengths:?}",
+            frames.len(),
+            cached.best_frame_idx,
+            cached.roi,
+            points.len(),
+            nonempty_local,
+        );
+        if std::env::var_os("ZAS_SOLAR_MONO_DUMP_SHIFTS").is_some() {
+            eprintln!("solar_shift_csv,frame,x_shift,y_shift,score");
+            for frame in frames {
+                eprintln!(
+                    "solar_shift_csv,{},{:.6},{:.6},{}",
+                    frame.idx, frame.x_shift, frame.y_shift, frame.score
+                );
+            }
+        }
+        let mut repaired_frames = frames.to_vec();
+        let repair = repair_temporal_global_shift_outliers(&mut repaired_frames);
+        eprintln!(
+            "solar mono externo: reparaciones={} frames={:?} correccion_max={:.3}px",
+            repair.repaired, repair.frame_indices, repair.max_correction_px
+        );
+        if std::env::var_os("ZAS_SOLAR_MONO_EXPECT_SHIFT_REPAIRS").is_some() {
+            assert!(
+                repair.repaired > 0,
+                "el corpus marcado como regresión debe activar la defensa temporal"
+            );
+        }
+        assert_eq!(frames.len(), contract.declared_frame_count);
+        assert!(points.len() >= 3, "la malla AP no puede caer a alineación global");
     }
 
     #[test]

@@ -83,8 +83,10 @@ impl PlanetScene {
 /// de calidad debe detectar).
 fn surface_texture(nx: f64, ny: f64) -> f64 {
     let bands = 0.20 * (ny * 9.0 + 0.6 * (nx * 3.0).sin()).sin();
-    let oval_a = -0.28 * (-(((nx - 0.35).powi(2) + (ny + 0.22).powi(2)) / (2.0 * 0.08f64.powi(2)))).exp();
-    let oval_b = 0.18 * (-(((nx + 0.30).powi(2) + (ny - 0.28).powi(2)) / (2.0 * 0.12f64.powi(2)))).exp();
+    let oval_a =
+        -0.28 * (-(((nx - 0.35).powi(2) + (ny + 0.22).powi(2)) / (2.0 * 0.08f64.powi(2)))).exp();
+    let oval_b =
+        0.18 * (-(((nx + 0.30).powi(2) + (ny - 0.28).powi(2)) / (2.0 * 0.12f64.powi(2)))).exp();
     let fine = 0.07 * (nx * 40.0).sin() * (ny * 37.0).cos();
     1.0 + bands + oval_a + oval_b + fine
 }
@@ -421,12 +423,22 @@ mod tests {
     #[test]
     fn sim_frames_are_deterministic() {
         let scene = PlanetScene::jupiter_like(96, 96);
-        let spec = FrameSpec { dx: 0.37, dy: -0.81, blur_sigma: 1.2, noise_adu: 90.0, seed: 7 };
+        let spec = FrameSpec {
+            dx: 0.37,
+            dy: -0.81,
+            blur_sigma: 1.2,
+            noise_adu: 90.0,
+            seed: 7,
+        };
         let a = make_frame_mono16(&scene, &spec);
         let b = make_frame_mono16(&scene, &spec);
         assert_eq!(a, b, "misma semilla debe dar el mismo frame bit a bit");
         let spec2 = FrameSpec { seed: 8, ..spec };
-        assert_ne!(a, make_frame_mono16(&scene, &spec2), "semillas distintas deben diferir");
+        assert_ne!(
+            a,
+            make_frame_mono16(&scene, &spec2),
+            "semillas distintas deben diferir"
+        );
     }
 
     #[test]
@@ -435,7 +447,13 @@ mod tests {
         let energy = |sigma: f64| -> f64 {
             let f = make_frame_mono16(
                 &scene,
-                &FrameSpec { dx: 0.0, dy: 0.0, blur_sigma: sigma, noise_adu: 0.0, seed: 1 },
+                &FrameSpec {
+                    dx: 0.0,
+                    dy: 0.0,
+                    blur_sigma: sigma,
+                    noise_adu: 0.0,
+                    seed: 1,
+                },
             );
             let mut e = 0.0f64;
             for y in 1..127usize {
@@ -450,7 +468,10 @@ mod tests {
         let e0 = energy(0.0);
         let e1 = energy(1.0);
         let e2 = energy(2.5);
-        assert!(e0 > e1 && e1 > e2, "el blur debe degradar la energía de gradiente: {e0} {e1} {e2}");
+        assert!(
+            e0 > e1 && e1 > e2,
+            "el blur debe degradar la energía de gradiente: {e0} {e1} {e2}"
+        );
     }
 
     #[test]
@@ -470,7 +491,8 @@ mod tests {
                 )
             })
             .collect();
-        let path = std::env::temp_dir().join(format!("zas_planetary_sim_{}.ser", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("zas_planetary_sim_{}.ser", std::process::id()));
         write_ser_16(&path, 64, 64, 0, &frames).unwrap();
         let reader = crate::ser::SerReader::new(&path).expect("SER sintético legible");
         assert_eq!(reader.info.width, 64);
@@ -480,7 +502,10 @@ mod tests {
         assert_eq!(reader.info.sample_bits, 16);
         let f1 = reader.get_frame(1, 0);
         let via_reader = crate::raw_to_u16_buffer(&f1, 64, 64, 2);
-        assert_eq!(via_reader, frames[1], "los píxeles deben sobrevivir el viaje por el lector de producción");
+        assert_eq!(
+            via_reader, frames[1],
+            "los píxeles deben sobrevivir el viaje por el lector de producción"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -499,7 +524,13 @@ mod tests {
         scene.tint = [1.3, 1.0, 0.7];
         let bayer = make_frame_bayer16(
             &scene,
-            &FrameSpec { dx: 0.0, dy: 0.0, blur_sigma: 0.0, noise_adu: 0.0, seed: 3 },
+            &FrameSpec {
+                dx: 0.0,
+                dy: 0.0,
+                blur_sigma: 0.0,
+                noise_adu: 0.0,
+                seed: 3,
+            },
             8,
         );
         // Media de fotositos R vs B dentro del disco (evitar fondo).
@@ -508,13 +539,22 @@ mod tests {
             for x in 24..40usize {
                 let v = bayer[y * 64 + x] as f64;
                 match cfa_channel(8, x, y) {
-                    0 => { sr += v; nr += 1.0; }
-                    2 => { sb += v; nb += 1.0; }
+                    0 => {
+                        sr += v;
+                        nr += 1.0;
+                    }
+                    2 => {
+                        sb += v;
+                        nb += 1.0;
+                    }
                     _ => {}
                 }
             }
         }
-        assert!(sr / nr > (sb / nb) * 1.5, "el tinte R>B debe verse en el mosaico");
+        assert!(
+            sr / nr > (sb / nb) * 1.5,
+            "el tinte R>B debe verse en el mosaico"
+        );
     }
 
     #[test]
@@ -524,8 +564,15 @@ mod tests {
         add_hot_pixels(&mut frame, w, &[(10, 12, 30_000)]);
         assert_eq!(frame[12 * w + 10], 30_100);
         add_satellite_trail(&mut frame, w, w, 0.0, 0.0, 63.0, 63.0, 2.0, 5_000);
-        assert!(frame[32 * w + 32] >= 5_100, "la diagonal debe llevar estela");
-        assert_eq!(frame[5 * w + 55], 100, "lejos de la estela no debe cambiar nada");
+        assert!(
+            frame[32 * w + 32] >= 5_100,
+            "la diagonal debe llevar estela"
+        );
+        assert_eq!(
+            frame[5 * w + 55],
+            100,
+            "lejos de la estela no debe cambiar nada"
+        );
     }
 
     #[test]
@@ -546,6 +593,9 @@ mod tests {
         }
         assert!(!ratios.is_empty());
         let mean: f64 = ratios.iter().sum::<f64>() / ratios.len() as f64;
-        assert!((mean - 1.12).abs() < 0.01, "delta de ganancia conocido: {mean}");
+        assert!(
+            (mean - 1.12).abs() < 0.01,
+            "delta de ganancia conocido: {mean}"
+        );
     }
 }

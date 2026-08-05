@@ -1822,14 +1822,427 @@ impl DeepSkyIntegrationMethod {
     }
 }
 
-/// Versión del contrato público de apilado de cielo profundo. La v4 añade
-/// dark-flats explícitos, modo de captura y una política de calibración que no
-/// permite degradaciones silenciosas.
-pub const DEEP_SKY_STACK_REQUEST_SCHEMA_VERSION: u16 = 4;
+/// Producto publicable solicitado. STRUCT conserva identidad propia aunque su
+/// cálculo dependa de NebulaFusion Full; nunca se anuncia como integrador.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DeepSkyIntegrationProductKind {
+    #[default]
+    Classic,
+    NebulaFusionSci,
+    Struct,
+    Eidr,
+}
+
+impl DeepSkyIntegrationProductKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::NebulaFusionSci => "nebula_fusion_sci",
+            Self::Struct => "struct",
+            Self::Eidr => "eidr",
+        }
+    }
+}
+
+/// Familia efectiva de rechazo que necesita conocer el planificador de
+/// cómputo de cielo profundo. El resolver no interpreta presets ni degrada
+/// métodos: preflight y runtime deben entregarle el método ya resuelto.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeepSkyRejectionMode {
+    /// Media ponderada sin rechazo de muestras.
+    #[default]
+    Average,
+    /// Kappa-sigma. Sólo es GPU-elegible cuando no se solicita ninguna
+    /// iteración; una o más iteraciones necesitan los momentos exactos CPU.
+    Sigma,
+    /// Rechazo por píxel genérico (median, percentile, min/max u otro motor
+    /// tiled que aún no conserva cobertura y Σw² por canal en GPU).
+    Tiled,
+    Winsorized,
+    LinearFit,
+}
+
+impl DeepSkyRejectionMode {
+    /// Adapta el nombre canónico ya validado por la receta actual. Los
+    /// métodos por píxel que comparten el motor tiled se colapsan únicamente
+    /// para decidir elegibilidad; su identidad original permanece en receta.
+    pub fn from_effective_label(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "average" => Some(Self::Average),
+            "sigma" => Some(Self::Sigma),
+            "winsorized" => Some(Self::Winsorized),
+            "linearfit" => Some(Self::LinearFit),
+            "median" | "percentile" | "minmax" | "tiled" => Some(Self::Tiled),
+            _ => None,
+        }
+    }
+}
+
+/// Hechos científicos ya resueltos para una rama de integración. No contiene
+/// estado de adapter ni hace I/O, por lo que el mismo valor puede evaluarse en
+/// preflight y volver a evaluarse en runtime sin divergencias.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DeepSkyComputeWorkload {
+    pub product: DeepSkyIntegrationProductKind,
+    pub rejection: DeepSkyRejectionMode,
+    pub clip_iterations: u32,
+    /// Drizzle clásico efectivo de esta rama. EIDR/NebulaFusion deben pasar
+    /// 1×: su propia escala de salida no es drizzle.
+    pub drizzle_scale: f32,
+    /// EIDR recibe normalmente Σ⁻¹ por píxel desde VAR. El kernel GPU actual
+    /// sólo admite una varianza escalar por frame/canal.
+    pub eidr_spatial_inverse_variance: bool,
+}
+
+impl Default for DeepSkyComputeWorkload {
+    fn default() -> Self {
+        Self {
+            product: DeepSkyIntegrationProductKind::Classic,
+            rejection: DeepSkyRejectionMode::Average,
+            clip_iterations: 0,
+            drizzle_scale: 1.0,
+            eidr_spatial_inverse_variance: false,
+        }
+    }
+}
+
+/// Razón científica estable por la que una rama debe conservar CPU. Se
+/// serializa para que UI, receta y telemetría puedan mostrar exactamente la
+/// misma decisión sin reconstruirla a partir de textos del motor.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeepSkyRequiredCpuReason {
+    IterativeSigma,
+    TiledRejection,
+    WinsorizedRejection,
+    LinearFitRejection,
+    ClassicDrizzle,
+    NebulaFusion,
+    StructDependency,
+    EidrSpatialInverseVariance,
+}
+
+impl DeepSkyRequiredCpuReason {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::IterativeSigma => {
+                "sigma iterativo requiere CPU para conservar momentos y rechazo reproducibles"
+            }
+            Self::TiledRejection => {
+                "el rechazo tiled requiere CPU para conservar cobertura y Σw² por canal"
+            }
+            Self::WinsorizedRejection => {
+                "Winsorized requiere CPU para conservar cobertura y Σw² por canal"
+            }
+            Self::LinearFitRejection => {
+                "linear-fit requiere CPU para conservar cobertura y Σw² por canal"
+            }
+            Self::ClassicDrizzle => {
+                "drizzle clásico requiere CPU hasta validar el drop-kernel GPU con paridad científica"
+            }
+            Self::NebulaFusion => "NebulaFusion conserva integración científica CPU",
+            Self::StructDependency => {
+                "STRUCT requiere la dependencia NebulaFusion Full ejecutada en CPU"
+            }
+            Self::EidrSpatialInverseVariance => {
+                "EIDR con varianza inversa espacial requiere CPU para aplicar Σ⁻¹ por píxel"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for DeepSkyRequiredCpuReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl DeepSkyComputeWorkload {
+    /// Restricción científica del producto, independiente de que exista GPU.
+    /// Las opciones Classic no se aplican por accidente a ramas NF/EIDR.
+    pub fn required_cpu_reason(self) -> Option<DeepSkyRequiredCpuReason> {
+        match self.product {
+            DeepSkyIntegrationProductKind::NebulaFusionSci => {
+                Some(DeepSkyRequiredCpuReason::NebulaFusion)
+            }
+            DeepSkyIntegrationProductKind::Struct => {
+                Some(DeepSkyRequiredCpuReason::StructDependency)
+            }
+            DeepSkyIntegrationProductKind::Eidr => self
+                .eidr_spatial_inverse_variance
+                .then_some(DeepSkyRequiredCpuReason::EidrSpatialInverseVariance),
+            DeepSkyIntegrationProductKind::Classic => {
+                if !self.drizzle_scale.is_finite()
+                    || (self.drizzle_scale - 1.0).abs() > f32::EPSILON
+                {
+                    return Some(DeepSkyRequiredCpuReason::ClassicDrizzle);
+                }
+                match self.rejection {
+                    DeepSkyRejectionMode::Average => None,
+                    DeepSkyRejectionMode::Sigma if self.clip_iterations == 0 => None,
+                    DeepSkyRejectionMode::Sigma => Some(DeepSkyRequiredCpuReason::IterativeSigma),
+                    DeepSkyRejectionMode::Tiled => Some(DeepSkyRequiredCpuReason::TiledRejection),
+                    DeepSkyRejectionMode::Winsorized => {
+                        Some(DeepSkyRequiredCpuReason::WinsorizedRejection)
+                    }
+                    DeepSkyRejectionMode::LinearFit => {
+                        Some(DeepSkyRequiredCpuReason::LinearFitRejection)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Decisión única consumible por preflight y runtime. `RequiredCpu` significa
+/// una restricción científica; `CpuSimd` sin `required_cpu_reason` significa
+/// selección explícita de CPU o fallback de capacidad.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepSkyComputeDecision {
+    pub requested_policy: ComputePolicy,
+    pub effective_engine: EffectiveEngine,
+    pub required_cpu_reason: Option<DeepSkyRequiredCpuReason>,
+    pub fallback_reason: Option<String>,
+}
+
+impl DeepSkyComputeDecision {
+    pub fn uses_gpu(&self) -> bool {
+        self.effective_engine.uses_gpu()
+    }
+
+    pub fn required_cpu(&self) -> bool {
+        self.required_cpu_reason.is_some()
+            && matches!(self.effective_engine, EffectiveEngine::RequiredCpu)
+    }
+}
+
+/// Error estricto: `GpuOnly` nunca convierte silenciosamente una rama no
+/// elegible en CPU. La variante conserva una razón científica tipada cuando
+/// existe; los fallos físicos conservan el diagnóstico de capacidad.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeepSkyComputeError {
+    GpuOnlyRequiresCpu { reason: DeepSkyRequiredCpuReason },
+    GpuOnlyUnavailable { reason: String },
+}
+
+impl std::fmt::Display for DeepSkyComputeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GpuOnlyRequiresCpu { reason } => {
+                write!(formatter, "GPU only no es elegible: {reason}")
+            }
+            Self::GpuOnlyUnavailable { reason } => formatter.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for DeepSkyComputeError {}
+
+/// Resuelve el motor efectivo de una rama de cielo profundo. La elegibilidad
+/// científica se evalúa antes que GPU/VRAM/paridad; así `GpuOnly` falla igual
+/// en preflight y runtime y Auto/Hybrid registran CPU requerida sin llamarla
+/// falsamente una ruta híbrida.
+pub fn resolve_deep_sky_compute_eligibility(
+    policy: ComputePolicy,
+    workload: DeepSkyComputeWorkload,
+    capability: &ComputeCapability,
+) -> Result<DeepSkyComputeDecision, DeepSkyComputeError> {
+    if let Some(reason) = workload.required_cpu_reason() {
+        if matches!(policy, ComputePolicy::GpuOnly) {
+            return Err(DeepSkyComputeError::GpuOnlyRequiresCpu { reason });
+        }
+        return Ok(DeepSkyComputeDecision {
+            requested_policy: policy,
+            effective_engine: EffectiveEngine::RequiredCpu,
+            required_cpu_reason: Some(reason),
+            fallback_reason: None,
+        });
+    }
+
+    match resolve_compute_policy(policy, capability) {
+        Ok(resolution) => Ok(DeepSkyComputeDecision {
+            requested_policy: policy,
+            effective_engine: if resolution.use_gpu {
+                EffectiveEngine::GpuCompute
+            } else {
+                EffectiveEngine::CpuSimd
+            },
+            required_cpu_reason: None,
+            fallback_reason: resolution.fallback_reason,
+        }),
+        Err(reason) => Err(DeepSkyComputeError::GpuOnlyUnavailable { reason }),
+    }
+}
+
+/// Una salida seleccionable dentro del mismo trabajo. `method` describe el
+/// motor/configuración que produce el producto; `product` describe qué salida
+/// ve el usuario. Así STRUCT puede declarar su dependencia sin fingir un motor
+/// independiente.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepSkyIntegrationProductRequest {
+    pub id: String,
+    pub product: DeepSkyIntegrationProductKind,
+    #[serde(default)]
+    pub primary: bool,
+    pub method: DeepSkyIntegrationMethod,
+}
+
+/// Punto del objeto móvil expresado en la cuadrícula del registro estelar.
+/// El detector entrega una predicción para cada light; primero, centro y
+/// último se confirman/corrigen antes de ejecutar.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CometObservation {
+    pub frame_path: String,
+    pub timestamp_unix: f64,
+    pub registered_x: f32,
+    pub registered_y: f32,
+    pub confirmed: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CometTrajectory {
+    pub epoch_unix: f64,
+    pub x_at_epoch: f32,
+    pub y_at_epoch: f32,
+    pub velocity_x_px_s: f32,
+    pub velocity_y_px_s: f32,
+    pub rms_px: f32,
+    pub confidence: f32,
+}
+
+/// Contrato del doble registro. Nunca se ejecuta con timestamps/confirmación
+/// insuficientes: un rastro inventado destruye tanto la coma como las estrellas.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CometStackRequest {
+    pub enabled: bool,
+    pub observations: Vec<CometObservation>,
+    pub trajectory: CometTrajectory,
+    pub keep_separate_layers: bool,
+    pub coma_radius_px: f32,
+    pub minimum_confidence: f32,
+}
+
+impl Default for CometStackRequest {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            observations: Vec::new(),
+            trajectory: CometTrajectory::default(),
+            keep_separate_layers: true,
+            coma_radius_px: 96.0,
+            minimum_confidence: 0.72,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CometLayerKind {
+    #[default]
+    Stars,
+    Comet,
+    Combined,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CometLayerHandle {
+    pub id: String,
+    pub kind: CometLayerKind,
+    pub result_id: String,
+    pub preview_path: String,
+    pub recipe_path: Option<String>,
+    pub output_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CometStackResultHandle {
+    pub trajectory: CometTrajectory,
+    pub confidence: f32,
+    pub layers: Vec<CometLayerHandle>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CometDetectionResult {
+    pub valid: bool,
+    pub requires_confirmation: bool,
+    pub observations: Vec<CometObservation>,
+    pub trajectory: Option<CometTrajectory>,
+    pub key_observation_indices: Vec<usize>,
+    pub reasons: Vec<String>,
+    pub used_wcs: bool,
+}
+
+impl DeepSkyIntegrationProductRequest {
+    pub fn dependency(&self) -> Option<&'static str> {
+        matches!(self.product, DeepSkyIntegrationProductKind::Struct).then_some("nebula_fusion_sci")
+    }
+
+    /// Drizzle pertenece exclusivamente a la rama Classic. Los motores
+    /// científicos conservan su propio muestreo y reciben siempre una
+    /// cuadrícula registrada 1×, aunque se ejecuten junto a un Classic
+    /// Drizzle 2×/3× dentro del mismo trabajo.
+    pub fn effective_drizzle(&self, requested_classic_drizzle: f32) -> f32 {
+        match &self.method {
+            DeepSkyIntegrationMethod::Classic(_) => requested_classic_drizzle.clamp(1.0, 3.0),
+            DeepSkyIntegrationMethod::NebulaFusion(_) | DeepSkyIntegrationMethod::Eidr(_) => 1.0,
+        }
+    }
+
+    /// Escala máxima solicitada por la rama. En EIDR Auto se presupuesta 2×;
+    /// la escala efectiva posterior queda en la receta del solver y puede
+    /// degradar de forma trazable a 1.5×/1×.
+    pub fn requested_output_scale(&self, requested_classic_drizzle: f32) -> f32 {
+        match &self.method {
+            DeepSkyIntegrationMethod::Classic(_) => requested_classic_drizzle.clamp(1.0, 3.0),
+            DeepSkyIntegrationMethod::NebulaFusion(config) => match config.output_bin {
+                OutputBinning::Native => 1.0,
+                OutputBinning::Bin0_75 => 0.75,
+                OutputBinning::Bin0_5 => 0.5,
+            },
+            DeepSkyIntegrationMethod::Eidr(config) => match config.scale {
+                EidrScalePolicy::X1 => 1.0,
+                EidrScalePolicy::X1_5 => 1.5,
+                EidrScalePolicy::X2 | EidrScalePolicy::Auto => 2.0,
+            },
+        }
+    }
+
+    pub fn method_matches_product(&self) -> bool {
+        match (&self.product, &self.method) {
+            (DeepSkyIntegrationProductKind::Classic, DeepSkyIntegrationMethod::Classic(_)) => true,
+            (
+                DeepSkyIntegrationProductKind::NebulaFusionSci,
+                DeepSkyIntegrationMethod::NebulaFusion(_),
+            ) => true,
+            (
+                DeepSkyIntegrationProductKind::Struct,
+                DeepSkyIntegrationMethod::NebulaFusion(config),
+            ) => matches!(config.mode, NebulaFusionMode::FullWithStruct),
+            (DeepSkyIntegrationProductKind::Eidr, DeepSkyIntegrationMethod::Eidr(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Versión del contrato público de apilado de cielo profundo. La v5 añade
+/// productos de integración paralelos y conserva lectura explícita de v4.
+pub const DEEP_SKY_STACK_REQUEST_SCHEMA_VERSION: u16 = 5;
+pub const DEEP_SKY_STACK_REQUEST_MIN_READABLE_VERSION: u16 = 4;
 pub const CALIBRATION_SIGNATURE_SCHEMA_VERSION: u16 = 1;
 pub const CALIBRATION_DECISION_SCHEMA_VERSION: u16 = 1;
 pub const SCIENTIFIC_BUNDLE_SCHEMA_VERSION: &str = "zenith-deepsky-scientific-bundle-v1";
-pub const DEEP_SKY_RECIPE_SCHEMA_VERSION: &str = "zenith-deepsky-recipe-v4";
+pub const DEEP_SKY_RECIPE_SCHEMA_VERSION: &str = "zenith-deepsky-recipe-v5";
 
 fn default_deep_sky_stack_request_schema_version() -> u16 {
     DEEP_SKY_STACK_REQUEST_SCHEMA_VERSION
@@ -1964,6 +2377,59 @@ impl Default for CalibrationSignature {
     }
 }
 
+/// Nivel auditable de una asignación de calibración.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CalibrationAssignmentTier {
+    /// Emparejado automático o manual validado contra la misma firma/sesión.
+    #[default]
+    AutomaticExact,
+    /// Firma física completa válida; el lote procede de otra noche y superó
+    /// el fingerprint normalizado de estabilidad calculado por el backend.
+    ValidatedReuse,
+    /// Sólo faltaba identidad extendida no medible en la cabecera. El usuario
+    /// certificó que el equipo no cambió y el backend mantuvo todos los gates
+    /// radiométricos/CFA además de validar el fingerprint del lote.
+    UserVerified,
+    /// El usuario eligió una firma que no supera el contrato. Nunca se aplica
+    /// como calibración científica ni se convierte internamente en compatible.
+    ForcedUnsafe,
+    /// Omisión explícita de ese rol de calibración.
+    Skipped,
+}
+
+/// Evidencia calculada por el backend para reutilizar un lote de flats fuera
+/// de la noche de captura. El fingerprint describe la forma de iluminación
+/// normalizada, no el nombre o la fecha de los ficheros.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CalibrationReuseEvidence {
+    #[serde(default = "default_calibration_decision_schema_version")]
+    pub schema_version: u16,
+    pub fingerprint_sha256: String,
+    pub sampled_frames: usize,
+    pub profile_cells: usize,
+    pub maximum_profile_rms: f32,
+    pub maximum_profile_delta: f32,
+    pub stable: bool,
+    pub reasons: Vec<String>,
+}
+
+impl Default for CalibrationReuseEvidence {
+    fn default() -> Self {
+        Self {
+            schema_version: CALIBRATION_DECISION_SCHEMA_VERSION,
+            fingerprint_sha256: String::new(),
+            sampled_frames: 0,
+            profile_cells: 0,
+            maximum_profile_rms: 0.0,
+            maximum_profile_delta: 0.0,
+            stable: false,
+            reasons: Vec::new(),
+        }
+    }
+}
+
 /// Decisión auditable de calibración por light/grupo. Sólo contiene rutas y
 /// metadata; los píxeles de los másters permanecen en el almacén científico.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1982,8 +2448,26 @@ pub struct PreparedCalibrationDecision {
     pub pedestal_state: PedestalState,
     pub compatible: bool,
     pub degraded: bool,
+    /// La decisión conserva todos los requisitos para NF/EIDR. Es más fuerte
+    /// que `compatible`: una omisión explícita puede ser válida para Classic
+    /// pero no científico-elegible.
+    #[serde(default)]
+    pub scientific_eligible: bool,
+    #[serde(default)]
+    pub assignment_tier: CalibrationAssignmentTier,
+    /// Existe para `ValidatedReuse` y `UserVerified`. Se calcula leyendo una
+    /// muestra acotada del lote y nunca se acepta desde la UI como verdad.
+    #[serde(default)]
+    pub reuse_evidence: Option<CalibrationReuseEvidence>,
+    /// Declaración explícita para completar únicamente identidad extendida
+    /// ausente en flats de otra noche. Nunca autoriza un mismatch conocido.
+    #[serde(default)]
+    pub user_verified_scientific: bool,
+    #[serde(default)]
+    pub user_verification_reason: Option<String>,
     /// true cuando el usuario forzó la calibración con una asignación manual
-    /// (estilo PixInsight): la elección queda registrada, nunca bloquea.
+    /// o eligió/omitió explícitamente un lote. Se conserva para compatibilidad
+    /// con recetas v4; `assignment_tier` es la autoridad del contrato v5.
     #[serde(default)]
     pub manual: bool,
     pub fallback: Option<String>,
@@ -2000,10 +2484,30 @@ pub struct DeepSkyCalibrationOverride {
     pub lights: Vec<String>,
     pub darks: Vec<String>,
     pub flats: Vec<String>,
+    pub dark_flats: Vec<String>,
+    pub bias: Vec<String>,
     /// No aplicar NINGÚN flat/dark a estos lights (decisión explícita del
     /// usuario; queda registrada y no produce error de contrato).
     pub skip_flats: bool,
     pub skip_darks: bool,
+    pub skip_dark_flats: bool,
+    pub skip_bias: bool,
+    /// Confirmación explícita de que la selección visual estaba marcada como
+    /// no segura. El backend nunca aplicará una firma incompatible; con
+    /// AllowDegraded la registrará y seguirá por Classic usando sólo
+    /// calibraciones automáticas válidas.
+    #[serde(default)]
+    pub force_unsafe: bool,
+    /// Certificación limitada a identidad extendida ausente en un flat
+    /// reutilizado entre noches. El backend decide si la declaración aplica.
+    #[serde(default)]
+    pub user_verified_scientific: bool,
+    #[serde(default)]
+    pub user_verification_reason: Option<String>,
+    /// Motivo legible aportado por la UI (grupo/noche/acción). No participa en
+    /// la compatibilidad; sólo hace auditable la intención del usuario.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 impl Default for PreparedCalibrationDecision {
@@ -2021,6 +2525,11 @@ impl Default for PreparedCalibrationDecision {
             pedestal_state: PedestalState::RawIncludesBias,
             compatible: false,
             degraded: false,
+            scientific_eligible: false,
+            assignment_tier: CalibrationAssignmentTier::AutomaticExact,
+            reuse_evidence: None,
+            user_verified_scientific: false,
+            user_verification_reason: None,
             manual: false,
             fallback: None,
             reasons: Vec::new(),
@@ -2168,9 +2677,18 @@ pub struct DeepSkyStackRequest {
     #[serde(default)]
     pub work_dir: Option<String>,
     /// Método de integración versionado. `None` ⇒ Classic derivado de los
-    /// campos planos de arriba (compatibilidad con UI/recetas existentes).
+    /// campos planos de arriba (compatibilidad de lectura v4). En v5
+    /// `integrationProducts` es la autoridad.
     #[serde(default)]
     pub integration_method: Option<DeepSkyIntegrationMethod>,
+    /// Productos solicitados en paralelo. Vacío conserva el contrato v4 y se
+    /// migra al producto representado por `integrationMethod`.
+    #[serde(default)]
+    pub integration_products: Vec<DeepSkyIntegrationProductRequest>,
+    /// Doble registro opcional para cometas. Ausente conserva exactamente el
+    /// flujo estelar normal.
+    #[serde(default)]
+    pub comet: Option<CometStackRequest>,
     /// Exporta los productos científicos (VAR/NEFF/DQ/…) cuando la ruta
     /// efectiva conserva la evidencia necesaria. El default v4 es `true`;
     /// una ruta incapaz de producirlos debe declarar la ausencia, no fabricar
@@ -2211,6 +2729,8 @@ impl Default for DeepSkyStackRequest {
             local_weighting: false,
             work_dir: None,
             integration_method: None,
+            integration_products: Vec::new(),
+            comet: None,
             scientific_products: true,
             calibration_overrides: Vec::new(),
         }
@@ -2218,15 +2738,59 @@ impl Default for DeepSkyStackRequest {
 }
 
 impl DeepSkyStackRequest {
-    /// Método efectivo: el solicitado, o Classic espejando los campos planos
-    /// (incluida la migración de `localWeighting` → `legacy_local_fwhm`).
-    pub fn resolved_integration_method(&self) -> DeepSkyIntegrationMethod {
-        self.integration_method.clone().unwrap_or_else(|| {
+    /// Lee v4 y v5. Escribir/crear usa siempre v5.
+    pub fn schema_is_readable(&self) -> bool {
+        (DEEP_SKY_STACK_REQUEST_MIN_READABLE_VERSION..=DEEP_SKY_STACK_REQUEST_SCHEMA_VERSION)
+            .contains(&self.schema_version)
+    }
+
+    /// Productos normalizados. Una petición v4 se representa como un único
+    /// producto primario sin alterar su método efectivo.
+    pub fn resolved_integration_products(&self) -> Vec<DeepSkyIntegrationProductRequest> {
+        if !self.integration_products.is_empty() {
+            return self.integration_products.clone();
+        }
+        let method = self.integration_method.clone().unwrap_or_else(|| {
             DeepSkyIntegrationMethod::Classic(ClassicIntegrationConfig {
                 version: 1,
                 legacy_local_fwhm: self.local_weighting,
             })
-        })
+        });
+        let product = match &method {
+            DeepSkyIntegrationMethod::Classic(_) => DeepSkyIntegrationProductKind::Classic,
+            DeepSkyIntegrationMethod::NebulaFusion(config)
+                if matches!(config.mode, NebulaFusionMode::FullWithStruct) =>
+            {
+                DeepSkyIntegrationProductKind::Struct
+            }
+            DeepSkyIntegrationMethod::NebulaFusion(_) => {
+                DeepSkyIntegrationProductKind::NebulaFusionSci
+            }
+            DeepSkyIntegrationMethod::Eidr(_) => DeepSkyIntegrationProductKind::Eidr,
+        };
+        vec![DeepSkyIntegrationProductRequest {
+            id: product.label().into(),
+            product,
+            primary: true,
+            method,
+        }]
+    }
+
+    /// Método efectivo: el solicitado, o Classic espejando los campos planos
+    /// (incluida la migración de `localWeighting` → `legacy_local_fwhm`).
+    pub fn resolved_integration_method(&self) -> DeepSkyIntegrationMethod {
+        let products = self.resolved_integration_products();
+        products
+            .iter()
+            .find(|product| product.primary)
+            .or_else(|| products.first())
+            .map(|product| product.method.clone())
+            .unwrap_or_else(|| {
+                DeepSkyIntegrationMethod::Classic(ClassicIntegrationConfig {
+                    version: 1,
+                    legacy_local_fwhm: self.local_weighting,
+                })
+            })
     }
 }
 
@@ -2346,6 +2910,12 @@ pub struct SessionMapEntry {
     pub flat_count: usize,
     pub flat_distance_days: i64,
     pub darks: String,
+    #[serde(default)]
+    pub dark_flats: String,
+    #[serde(default)]
+    pub bias: String,
+    #[serde(default)]
+    pub calibration_state: String,
     /// Paths de los lights de esta noche: la UI los usa para construir
     /// asignaciones manuales por sesión (ligar lotes → estos lights).
     #[serde(default)]
@@ -2437,6 +3007,54 @@ pub struct PreparedStackPlan {
     pub scientific_eligibility_reasons: Vec<String>,
     /// Diagnóstico de muestreo (None si no se pudieron medir estrellas).
     pub sampling_advisor: Option<SamplingAdvisorReport>,
+    /// Eligibilidad y coste visible de cada producto solicitado. Ninguna
+    /// sustitución se oculta detrás del producto Classic.
+    #[serde(default)]
+    pub integration_products: Vec<PreparedIntegrationProduct>,
+    #[serde(default)]
+    pub comet: Option<PreparedCometPlan>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedIntegrationProduct {
+    pub id: String,
+    pub product: DeepSkyIntegrationProductKind,
+    pub requested_method: String,
+    pub primary: bool,
+    pub dependency: Option<String>,
+    pub eligible: bool,
+    pub reasons: Vec<String>,
+    /// Valor global solicitado por el usuario para la rama Classic.
+    pub requested_drizzle: f32,
+    /// Valor realmente entregado a este motor (Classic=N×; NF/STRUCT/EIDR=1×).
+    pub effective_drizzle: f32,
+    /// Escala máxima solicitada por este producto; EIDR Auto presupuesta 2×.
+    pub output_scale: f32,
+    pub estimated_ram_mb: u64,
+    pub estimated_vram_mb: u64,
+    pub estimated_disk_mb: u64,
+    pub estimated_seconds: f32,
+    /// Motor previsto para esta rama después de aplicar las restricciones
+    /// científicas del rechazo/producto. Es divulgación, no elegibilidad.
+    #[serde(default)]
+    pub compute_engine: String,
+    /// Motivo estable cuando la integración debe conservar CPU o cuando la
+    /// GPU solicitada cae por capacidad/paridad/VRAM.
+    #[serde(default)]
+    pub compute_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedCometPlan {
+    pub eligible: bool,
+    pub requires_confirmation: bool,
+    pub reasons: Vec<String>,
+    pub observation_count: usize,
+    pub confirmed_count: usize,
+    pub estimated_seconds: f32,
+    pub estimated_disk_mb: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2453,6 +3071,72 @@ pub struct DeepSkyResultHandle {
     pub frames_rejected: usize,
     pub elapsed_seconds: f32,
     pub recipe_path: Option<String>,
+    #[serde(default)]
+    pub primary_product_id: String,
+    #[serde(default)]
+    pub products: Vec<DeepSkyProductResultHandle>,
+    #[serde(default)]
+    pub comet: Option<CometStackResultHandle>,
+    /// Geometría común para comparar el frame de referencia con el producto
+    /// primario. El frontend recorta la referencia en el mismo sistema de
+    /// coordenadas antes de aplicar zoom/pan sincronizados.
+    #[serde(default)]
+    pub comparison: Option<DeepSkyComparisonGeometry>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepSkyComparisonGeometry {
+    pub reference_path: String,
+    pub source_width: usize,
+    pub source_height: usize,
+    pub x: usize,
+    pub y: usize,
+    pub width_before_output_binning: usize,
+    pub height_before_output_binning: usize,
+    pub output_width: usize,
+    pub output_height: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepSkyProductResultHandle {
+    pub id: String,
+    pub product: DeepSkyIntegrationProductKind,
+    pub primary: bool,
+    pub dependency: Option<String>,
+    /// `ready`, `warning` o `fallback`. El producto solicitado conserva su
+    /// identidad aunque el motor haya publicado únicamente una dependencia o
+    /// un Classic seguro; la UI nunca debe presentarlo como éxito silencioso.
+    pub status: String,
+    pub fallback_reason: Option<String>,
+    pub scientific_eligible: bool,
+    pub no_coverage_pixels: usize,
+    pub requested_method: String,
+    pub effective_method: String,
+    pub requested_drizzle: f32,
+    pub effective_drizzle: f32,
+    pub output_scale: f32,
+    pub result_id: String,
+    pub preview_path: String,
+    pub width: usize,
+    pub height: usize,
+    pub channels: usize,
+    pub engine: String,
+    pub frames_used: usize,
+    pub frames_rejected: usize,
+    pub elapsed_seconds: f32,
+    /// `true` cuando esta rama se recuperó íntegra desde un checkpoint durable
+    /// compatible. Se expone de forma tipada para que UI/receta no dependan de
+    /// interpretar mensajes de progreso localizados.
+    #[serde(default)]
+    pub resumed_from_checkpoint: bool,
+    pub recipe_path: Option<String>,
+    pub output_dir: Option<String>,
+    pub master_fits: Option<String>,
+    pub scientific_bundle: Option<ScientificBundleManifest>,
+    #[serde(default)]
+    pub comparison: Option<DeepSkyComparisonGeometry>,
 }
 
 /// Una integración científica dentro de una sesión multibanda. Cada grupo se
@@ -2542,6 +3226,13 @@ pub struct DeepSkySessionGroupResult {
     pub id: String,
     pub label: String,
     pub filter_profile: String,
+    /// Producto que alimenta los campos históricos de este grupo.
+    #[serde(default)]
+    pub primary_product_id: String,
+    /// Todas las ramas solicitadas. Cada una conserva máster, receta, escala,
+    /// preview y bundle propios.
+    #[serde(default)]
+    pub products: Vec<DeepSkyProductResultHandle>,
     /// Índice autocontenido de todos los productos científicos y derivados
     /// publicados para este grupo. Evita que una sesión multibanda pierda
     /// VAR/NEFF/DQ/STRUCT/RECOV aunque el estado interactivo avance al grupo
@@ -2570,6 +3261,490 @@ pub struct DeepSkySessionResultHandle {
     pub elapsed_seconds: f32,
     pub warnings: Vec<String>,
     pub recipe_path: String,
+}
+
+/// Solución astrométrica explícita y reutilizable. La resolución de placa no
+/// está acoplada a la calibración de color: PCC puede consumir esta solución,
+/// pero resolver/validar WCS nunca modifica los píxeles.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AstrometrySolution {
+    pub ctype: String,
+    pub crval1: f64,
+    pub crval2: f64,
+    pub crpix1: f64,
+    pub crpix2: f64,
+    pub cd11: f64,
+    pub cd12: f64,
+    pub cd21: f64,
+    pub cd22: f64,
+    pub rms_px: f32,
+    pub inliers: usize,
+    pub handedness: String,
+    pub scale_arcsec_px: f64,
+    /// `localIndex`, `localCache` o `gaiaOnline`.
+    pub source: String,
+    pub cached: bool,
+}
+
+/// Modelo compacto y reproducible de extracción de gradiente. Guardamos los
+/// coeficientes, no una imagen de corrección de decenas de megapíxeles.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PostStackBackgroundMode {
+    #[default]
+    Auto,
+    Samples,
+}
+
+fn default_poststack_sample_radius() -> f32 {
+    0.02
+}
+
+fn default_poststack_sample_enabled() -> bool {
+    true
+}
+
+fn default_poststack_sample_weight() -> f32 {
+    1.0
+}
+
+/// Muestra circular de fondo expresada en coordenadas normalizadas sobre la
+/// revisión activa. No es una máscara: sus píxeles válidos alimentan
+/// directamente el ajuste robusto del modelo.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PostStackBackgroundSample {
+    pub x: f32,
+    pub y: f32,
+    #[serde(default = "default_poststack_sample_radius")]
+    pub radius: f32,
+    #[serde(default = "default_poststack_sample_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_poststack_sample_weight")]
+    pub weight: f32,
+}
+
+impl Default for PostStackBackgroundSample {
+    fn default() -> Self {
+        Self {
+            x: 0.5,
+            y: 0.5,
+            radius: default_poststack_sample_radius(),
+            enabled: true,
+            weight: default_poststack_sample_weight(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PostStackBackgroundModel {
+    #[serde(default)]
+    pub mode: PostStackBackgroundMode,
+    #[serde(default)]
+    pub samples: Vec<PostStackBackgroundSample>,
+    pub degree: usize,
+    pub coeffs: Vec<Vec<f64>>,
+    pub level: Vec<f64>,
+    pub width: usize,
+    pub height: usize,
+    pub channels: usize,
+    pub chromatic: bool,
+    pub protected_percent: f32,
+    pub split_half_ratio: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PostStackSourceOrigin {
+    #[default]
+    IntegrationProduct,
+    StandaloneMaster,
+}
+
+/// Clasificación mínima, explícita y no ambigua que necesita el Studio para
+/// decidir si ofrece PCC RGB, una ruta mono o separación dual-band.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PostStackSourceKind {
+    RgbBroadband,
+    Mono,
+    DualBand,
+    #[default]
+    Unknown,
+}
+
+/// Procedencia y geometría científica del máster abierto. La ruta puede
+/// apuntar al archivo externo, pero las revisiones nunca escriben sobre él.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PostStackSourceDescriptor {
+    pub id: String,
+    pub origin: PostStackSourceOrigin,
+    pub path: Option<String>,
+    pub file_name: Option<String>,
+    pub kind: PostStackSourceKind,
+    pub channels: usize,
+    pub linear: bool,
+    pub cfa: bool,
+    pub filter_profile: Option<String>,
+    pub component_filters: Vec<String>,
+    pub camera: Option<String>,
+    pub instrument: Option<String>,
+    pub has_variance: bool,
+    pub has_dq: bool,
+    pub routing_reason: String,
+}
+
+/// Recorte científico expresado sobre la geometría del máster fuente. Se
+/// conserva en píxeles enteros para que SCI y cada mapa diagnóstico usen
+/// exactamente la misma ventana.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PostStackCrop {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+    pub source_width: usize,
+    pub source_height: usize,
+}
+
+/// Parámetros de una transformación hiperbólica generalizada. La operación es
+/// opcional y convierte solamente la revisión derivada; `source_data` sigue
+/// siendo el máster lineal autoritativo.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PostStackStretch {
+    pub preset: String,
+    pub stretch: f32,
+    pub symmetry: f32,
+    pub local_intensity: f32,
+    pub black_point: f32,
+    pub white_point: f32,
+    pub linked: bool,
+}
+
+/// Punto normalizado de una curva tonal. El tuple struct conserva en JSON la
+/// forma compacta `[x, y]` usada por el editor y por las recetas exportadas.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+pub struct PostStackCurvePoint(pub f32, pub f32);
+
+fn default_poststack_saturation_scale() -> f32 {
+    1.0
+}
+
+fn default_poststack_hue_width() -> f32 {
+    45.0
+}
+
+/// Ajuste HSL acotado a una familia cromática. `center`, `width` y
+/// `hue_shift` se expresan en grados; saturación y luminosidad son deltas cuyo
+/// neutro es cero. Los ocho nombres admitidos se validan al reproducir la
+/// receta para que un archivo externo no pueda activar zonas ambiguas.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PostStackSelectiveHsl {
+    pub name: String,
+    pub center: f32,
+    #[serde(default = "default_poststack_hue_width")]
+    pub width: f32,
+    pub hue_shift: f32,
+    pub saturation: f32,
+    pub lightness: f32,
+}
+
+impl Default for PostStackSelectiveHsl {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            center: 0.0,
+            width: default_poststack_hue_width(),
+            hue_shift: 0.0,
+            saturation: 0.0,
+            lightness: 0.0,
+        }
+    }
+}
+
+/// Curvas de presentación reproducibles sobre float32. Las listas vacías son
+/// identidad; las curvas explícitas usan puntos normalizados y no implican
+/// cuantización ni clipping del máster derivado.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PostStackCurves {
+    pub master: Vec<PostStackCurvePoint>,
+    pub luminance: Vec<PostStackCurvePoint>,
+    pub red: Vec<PostStackCurvePoint>,
+    pub green: Vec<PostStackCurvePoint>,
+    pub blue: Vec<PostStackCurvePoint>,
+    pub saturation: Vec<PostStackCurvePoint>,
+    pub hue_shift: f32,
+    #[serde(default = "default_poststack_saturation_scale")]
+    pub saturation_scale: f32,
+    pub lightness: f32,
+    pub selective: Vec<PostStackSelectiveHsl>,
+}
+
+impl Default for PostStackCurves {
+    fn default() -> Self {
+        Self {
+            master: Vec::new(),
+            luminance: Vec::new(),
+            red: Vec::new(),
+            green: Vec::new(),
+            blue: Vec::new(),
+            saturation: Vec::new(),
+            hue_shift: 0.0,
+            saturation_scale: default_poststack_saturation_scale(),
+            lightness: 0.0,
+            selective: Vec::new(),
+        }
+    }
+}
+
+/// Rama visible/editable del laboratorio estelar. `Combined` mantiene la ruta
+/// compatible con recetas v1; `Object` y `Stars` sólo son válidas después de
+/// una separación atómica.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PostStackLayerTarget {
+    #[default]
+    Combined,
+    Object,
+    Stars,
+}
+
+impl PostStackLayerTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Combined => "combined",
+            Self::Object => "object",
+            Self::Stars => "stars",
+        }
+    }
+}
+
+/// PSF medida sobre la revisión lineal exacta que alimenta la restauración.
+/// El backend actual publica un modelo global conservador; el contrato deja
+/// explícitos ambos ejes para evolucionar a un campo espacial por tiles sin
+/// cambiar recetas.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PostStackPsfModel {
+    pub fwhm_x: f32,
+    pub fwhm_y: f32,
+    pub theta: f32,
+    pub beta: f32,
+    pub stars_used: usize,
+    pub confidence: f32,
+    pub measured: bool,
+}
+
+impl Default for PostStackPsfModel {
+    fn default() -> Self {
+        Self {
+            fwhm_x: 2.8,
+            fwhm_y: 2.8,
+            theta: 0.0,
+            beta: 2.5,
+            stars_used: 0,
+            confidence: 0.0,
+            measured: false,
+        }
+    }
+}
+
+/// Estado compacto de las ramas derivadas. Los píxeles se reconstruyen desde
+/// `source_data` y la receta; nunca se guardan como nueva autoridad científica.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostStackLayerState {
+    pub available: bool,
+    pub engine: String,
+    pub object_modified: bool,
+    pub stars_modified: bool,
+    pub recombined: bool,
+    pub exact_restore: bool,
+    pub domain: String,
+    /// Dominio de transferencia de cada rama. Permite mantener una edición
+    /// pendiente sin mezclar silenciosamente una rama lineal con otra
+    /// estirada.
+    pub object_domain: String,
+    pub stars_domain: String,
+    pub recombine_eligible: bool,
+    pub recombine_block_reason: Option<String>,
+    pub reconstruction_error: f32,
+    pub star_fraction: f32,
+    pub psf: Option<PostStackPsfModel>,
+}
+
+/// Una revisión derivada del máster. Todas las operaciones se recalculan desde
+/// `source_data`; repetir PCC o cualquier herramienta singleton nunca vuelve a
+/// aplicarla encima de su propio resultado.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "operation", rename_all = "camelCase")]
+pub enum PostStackOperation {
+    Crop {
+        crop: PostStackCrop,
+    },
+    Gradient {
+        model: PostStackBackgroundModel,
+    },
+    Astrometry {
+        solution: AstrometrySolution,
+    },
+    GaiaPcc {
+        gain_r: f64,
+        gain_g: f64,
+        gain_b: f64,
+        reference: String,
+        matched_stars: usize,
+        rms_px: f32,
+    },
+    DualBandPalette {
+        palette: String,
+        profile: String,
+        oiii_green_weight: f32,
+        crosstalk_suppression: f32,
+        neutralize: bool,
+    },
+    Deconvolution {
+        #[serde(default)]
+        target: PostStackLayerTarget,
+        psf: PostStackPsfModel,
+        iterations: usize,
+        regularization: f32,
+        deringing: f32,
+        flux_conservation: bool,
+    },
+    Denoise {
+        #[serde(default)]
+        target: PostStackLayerTarget,
+        strength: f32,
+        detail_protection: f32,
+        chroma_strength: f32,
+    },
+    StarSeparation {
+        engine: String,
+        sensitivity: f32,
+        scale: f32,
+        halo_protection: f32,
+        faint_star_protection: f32,
+        preserve_residual: bool,
+    },
+    Stretch {
+        #[serde(default)]
+        target: PostStackLayerTarget,
+        stretch: PostStackStretch,
+    },
+    Curves {
+        #[serde(default)]
+        target: PostStackLayerTarget,
+        #[serde(default)]
+        curves: PostStackCurves,
+    },
+    Detail {
+        #[serde(default)]
+        target: PostStackLayerTarget,
+        amount: f32,
+        radius: usize,
+        star_protection: f32,
+    },
+    StarAdjustment {
+        reduction: f32,
+        saturation: f32,
+        halo_suppression: f32,
+    },
+    Recombine {
+        object_weight: f32,
+        star_weight: f32,
+        residual_weight: f32,
+    },
+    Finish {
+        #[serde(default)]
+        target: PostStackLayerTarget,
+        saturation: f32,
+        contrast: f32,
+        highlight_protection: f32,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PostStackRecipe {
+    pub schema_version: u32,
+    pub cursor: usize,
+    pub operations: Vec<PostStackOperation>,
+}
+
+impl Default for PostStackRecipe {
+    fn default() -> Self {
+        Self {
+            schema_version: 2,
+            cursor: 0,
+            operations: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostStackRevisionState {
+    pub width: usize,
+    pub height: usize,
+    pub cursor: usize,
+    pub total: usize,
+    pub can_undo: bool,
+    pub can_redo: bool,
+    pub linear: bool,
+    pub operations: Vec<String>,
+    pub crop: Option<PostStackCrop>,
+    pub astrometry: Option<AstrometrySolution>,
+    /// Estado recuperable del intento automático/local. Se mantiene tipado en
+    /// la receta para que UI, exportación y telemetría expliquen lo mismo.
+    pub astrometry_status: Option<serde_json::Value>,
+    pub source: PostStackSourceDescriptor,
+    pub layers: Option<PostStackLayerState>,
+    pub preview: String,
+}
+
+/// Copia de la geometría y de los mapas científicos que acompañan a
+/// `source_data`. Permite deshacer un recorte bit a bit sin reintegrar.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PostStackSourceLayout {
+    pub width: usize,
+    pub height: usize,
+    pub coverage: Vec<f32>,
+    pub weight: Vec<f32>,
+    pub rejection_low: Vec<f32>,
+    pub rejection_high: Vec<f32>,
+    pub registration_residuals: Vec<f32>,
+    pub neff: Option<Vec<f32>>,
+    pub dq: Option<Vec<u32>>,
+    pub struct_map: Option<Vec<f32>>,
+    pub struct_residual: Option<Vec<f32>>,
+    pub recoverability: Option<Vec<f32>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhotometricColorCalibrationResult {
+    pub matched: usize,
+    pub detected: usize,
+    pub catalog: usize,
+    pub gain_r: f64,
+    pub gain_g: f64,
+    pub gain_b: f64,
+    pub anchor_stars: usize,
+    pub solved_scale_arcsec_px: f64,
+    pub rms_px: f32,
+    pub preview: String,
+    pub note: String,
+    pub method: String,
+    pub astrometry: AstrometrySolution,
+    pub post_stack: PostStackRevisionState,
 }
 
 /// Resultado científico separado del StackResult planetario u16. Los mapas se
@@ -2607,6 +3782,16 @@ pub struct DeepSkyResult {
     /// Mapa de recuperabilidad EIDR (R por tile, 0..1) a resolución del
     /// máster. Solo con motor EIDR (F9).
     pub recoverability: Option<Vec<f32>>,
+    /// Fuente lineal inmutable de la sesión de edición. Se materializa al
+    /// aplicar la primera revisión y nunca se sobrescribe.
+    pub source_data: Option<Vec<f32>>,
+    /// VAR correspondiente a `source_data`; PCC escala la VAR por ganancia² y
+    /// deshacer la recupera bit a bit.
+    pub source_variance: Option<Vec<f32>>,
+    /// Geometría y mapas correspondientes al máster fuente inmutable.
+    pub source_layout: Option<PostStackSourceLayout>,
+    pub post_stack_recipe: PostStackRecipe,
+    pub astrometry_solution: Option<AstrometrySolution>,
 }
 
 /// Alias transitorio para los módulos internos previos a la API tipada v2.
@@ -2844,6 +4029,191 @@ mod tests {
                 .unwrap()
                 .use_gpu
         );
+    }
+
+    fn eligible_deep_sky_gpu() -> ComputeCapability {
+        ComputeCapability {
+            gpu_available: true,
+            parity_ok: true,
+            required_vram_mb: 512,
+            vram_budget_mb: 4_096,
+        }
+    }
+
+    #[test]
+    fn deep_sky_compute_resolver_admits_only_effective_gpu_workloads() {
+        let cap = eligible_deep_sky_gpu();
+        assert_eq!(
+            DeepSkyRejectionMode::from_effective_label("average"),
+            Some(DeepSkyRejectionMode::Average)
+        );
+        assert_eq!(
+            DeepSkyRejectionMode::from_effective_label("median"),
+            Some(DeepSkyRejectionMode::Tiled)
+        );
+        assert_eq!(DeepSkyRejectionMode::from_effective_label("unknown"), None);
+        let average = DeepSkyComputeWorkload::default();
+        let decision =
+            resolve_deep_sky_compute_eligibility(ComputePolicy::Hybrid, average, &cap).unwrap();
+        assert_eq!(decision.effective_engine, EffectiveEngine::GpuCompute);
+        assert!(decision.uses_gpu());
+        assert!(!decision.required_cpu());
+        assert_eq!(decision.required_cpu_reason, None);
+        assert_eq!(decision.fallback_reason, None);
+
+        // Sigma sin iteraciones no abre ninguna ventana de rechazo y conserva
+        // la misma elegibilidad que average; al solicitar una iteración, el
+        // contrato cambia explícitamente a CPU (probado abajo).
+        let sigma_without_iterations = DeepSkyComputeWorkload {
+            rejection: DeepSkyRejectionMode::Sigma,
+            ..average
+        };
+        assert!(resolve_deep_sky_compute_eligibility(
+            ComputePolicy::GpuOnly,
+            sigma_without_iterations,
+            &cap
+        )
+        .unwrap()
+        .uses_gpu());
+
+        let cpu =
+            resolve_deep_sky_compute_eligibility(ComputePolicy::CpuOnly, average, &cap).unwrap();
+        assert_eq!(cpu.effective_engine, EffectiveEngine::CpuSimd);
+        assert_eq!(cpu.required_cpu_reason, None);
+        assert_eq!(cpu.fallback_reason, None);
+    }
+
+    #[test]
+    fn deep_sky_compute_resolver_types_every_required_cpu_path() {
+        let cap = eligible_deep_sky_gpu();
+        let cases = [
+            (
+                DeepSkyComputeWorkload {
+                    rejection: DeepSkyRejectionMode::Sigma,
+                    clip_iterations: 2,
+                    ..DeepSkyComputeWorkload::default()
+                },
+                DeepSkyRequiredCpuReason::IterativeSigma,
+            ),
+            (
+                DeepSkyComputeWorkload {
+                    rejection: DeepSkyRejectionMode::Tiled,
+                    ..DeepSkyComputeWorkload::default()
+                },
+                DeepSkyRequiredCpuReason::TiledRejection,
+            ),
+            (
+                DeepSkyComputeWorkload {
+                    rejection: DeepSkyRejectionMode::Winsorized,
+                    ..DeepSkyComputeWorkload::default()
+                },
+                DeepSkyRequiredCpuReason::WinsorizedRejection,
+            ),
+            (
+                DeepSkyComputeWorkload {
+                    rejection: DeepSkyRejectionMode::LinearFit,
+                    ..DeepSkyComputeWorkload::default()
+                },
+                DeepSkyRequiredCpuReason::LinearFitRejection,
+            ),
+            (
+                DeepSkyComputeWorkload {
+                    drizzle_scale: 2.0,
+                    ..DeepSkyComputeWorkload::default()
+                },
+                DeepSkyRequiredCpuReason::ClassicDrizzle,
+            ),
+            (
+                DeepSkyComputeWorkload {
+                    product: DeepSkyIntegrationProductKind::NebulaFusionSci,
+                    ..DeepSkyComputeWorkload::default()
+                },
+                DeepSkyRequiredCpuReason::NebulaFusion,
+            ),
+            (
+                DeepSkyComputeWorkload {
+                    product: DeepSkyIntegrationProductKind::Struct,
+                    ..DeepSkyComputeWorkload::default()
+                },
+                DeepSkyRequiredCpuReason::StructDependency,
+            ),
+            (
+                DeepSkyComputeWorkload {
+                    product: DeepSkyIntegrationProductKind::Eidr,
+                    eidr_spatial_inverse_variance: true,
+                    ..DeepSkyComputeWorkload::default()
+                },
+                DeepSkyRequiredCpuReason::EidrSpatialInverseVariance,
+            ),
+        ];
+
+        for (workload, expected_reason) in cases {
+            let decision =
+                resolve_deep_sky_compute_eligibility(ComputePolicy::Hybrid, workload, &cap)
+                    .unwrap();
+            assert_eq!(decision.effective_engine, EffectiveEngine::RequiredCpu);
+            assert_eq!(decision.required_cpu_reason, Some(expected_reason));
+            assert!(decision.required_cpu());
+            assert!(!decision.uses_gpu());
+            assert_eq!(decision.fallback_reason, None);
+
+            assert_eq!(
+                resolve_deep_sky_compute_eligibility(ComputePolicy::GpuOnly, workload, &cap,),
+                Err(DeepSkyComputeError::GpuOnlyRequiresCpu {
+                    reason: expected_reason,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn deep_sky_compute_resolver_keeps_scalar_variance_eidr_gpu_eligible() {
+        let cap = eligible_deep_sky_gpu();
+        let scalar_variance_eidr = DeepSkyComputeWorkload {
+            product: DeepSkyIntegrationProductKind::Eidr,
+            eidr_spatial_inverse_variance: false,
+            ..DeepSkyComputeWorkload::default()
+        };
+        let decision = resolve_deep_sky_compute_eligibility(
+            ComputePolicy::GpuOnly,
+            scalar_variance_eidr,
+            &cap,
+        )
+        .unwrap();
+        assert_eq!(decision.effective_engine, EffectiveEngine::GpuCompute);
+        assert_eq!(decision.required_cpu_reason, None);
+    }
+
+    #[test]
+    fn deep_sky_compute_resolver_preserves_capability_fallback_and_gpu_only_error() {
+        let no_gpu = ComputeCapability {
+            gpu_available: false,
+            ..eligible_deep_sky_gpu()
+        };
+        let auto = resolve_deep_sky_compute_eligibility(
+            ComputePolicy::Auto,
+            DeepSkyComputeWorkload::default(),
+            &no_gpu,
+        )
+        .unwrap();
+        assert_eq!(auto.effective_engine, EffectiveEngine::CpuSimd);
+        assert_eq!(auto.required_cpu_reason, None);
+        assert!(auto
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("ausente")));
+
+        let strict = resolve_deep_sky_compute_eligibility(
+            ComputePolicy::GpuOnly,
+            DeepSkyComputeWorkload::default(),
+            &no_gpu,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            strict,
+            DeepSkyComputeError::GpuOnlyUnavailable { .. }
+        ));
+        assert!(strict.to_string().contains("GPU only"));
     }
 
     #[test]
@@ -3215,7 +4585,7 @@ mod tests {
     }
 
     #[test]
-    fn deepsky_v4_legacy_request_defaults_are_strict_and_backward_compatible() {
+    fn deepsky_v5_defaults_are_strict_and_legacy_fields_remain_readable() {
         let request: DeepSkyStackRequest = serde_json::from_value(serde_json::json!({
             "lights": ["light-001.fits"]
         }))
@@ -3228,7 +4598,7 @@ mod tests {
         assert!(request.dark_flats.is_empty());
         assert_eq!(request.capture_mode, DeepSkyCaptureMode::Auto);
         assert_eq!(request.calibration_policy, DeepSkyCalibrationPolicy::Strict);
-        // Compute/profile conservan compatibilidad; v4 activa trazabilidad
+        // Compute/profile conservan compatibilidad; v5 activa trazabilidad
         // científica por defecto y cada ruta declara qué mapas pudo producir.
         assert_eq!(request.compute_policy, ComputePolicy::Hybrid);
         assert_eq!(request.profile, PipelineProfile::Balanced);
@@ -3236,7 +4606,7 @@ mod tests {
     }
 
     #[test]
-    fn deepsky_v4_serializes_canonical_camel_case_and_accepts_cli_aliases() {
+    fn deepsky_v5_serializes_canonical_camel_case_and_accepts_cli_aliases() {
         let request: DeepSkyStackRequest = serde_json::from_value(serde_json::json!({
             "lights": ["light.fits"],
             "dark_flats": ["df-001.fits"],
@@ -3257,6 +4627,144 @@ mod tests {
         assert_eq!(json["captureMode"], "dualBandOsc");
         assert_eq!(json["calibrationPolicy"], "allowDegraded");
         assert!(json.get("dark_flats").is_none());
+    }
+
+    #[test]
+    fn deepsky_v4_recipe_migrates_to_one_primary_product() {
+        let request: DeepSkyStackRequest = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 4,
+            "lights": ["light.fits"],
+            "integrationMethod": {
+                "method": "nebula_fusion",
+                "mode": "fullWithStruct",
+                "cfaDirect": false,
+                "outputBin": "native"
+            }
+        }))
+        .unwrap();
+
+        assert!(request.schema_is_readable());
+        let products = request.resolved_integration_products();
+        assert_eq!(products.len(), 1);
+        assert_eq!(products[0].product, DeepSkyIntegrationProductKind::Struct);
+        assert!(products[0].primary);
+        assert_eq!(products[0].dependency(), Some("nebula_fusion_sci"));
+        assert!(products[0].method_matches_product());
+    }
+
+    #[test]
+    fn deepsky_v5_all_products_are_parallel_and_struct_requires_full_dependency() {
+        let request: DeepSkyStackRequest = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 5,
+            "lights": ["light.fits"],
+            "integrationProducts": [
+                {
+                    "id": "classic",
+                    "product": "classic",
+                    "primary": true,
+                    "method": { "method": "classic", "version": 1 }
+                },
+                {
+                    "id": "nf",
+                    "product": "nebulaFusionSci",
+                    "method": {
+                        "method": "nebula_fusion",
+                        "mode": "lite",
+                        "cfaDirect": false,
+                        "outputBin": "native"
+                    }
+                },
+                {
+                    "id": "struct",
+                    "product": "struct",
+                    "method": {
+                        "method": "nebula_fusion",
+                        "mode": "fullWithStruct",
+                        "cfaDirect": false,
+                        "outputBin": "native"
+                    }
+                },
+                {
+                    "id": "eidr",
+                    "product": "eidr",
+                    "method": {
+                        "method": "eidr",
+                        "scale": "auto",
+                        "solveMode": "scientificQuadratic"
+                    }
+                }
+            ]
+        }))
+        .unwrap();
+
+        let products = request.resolved_integration_products();
+        assert_eq!(products.len(), 4);
+        assert_eq!(products.iter().filter(|product| product.primary).count(), 1);
+        assert!(products
+            .iter()
+            .all(|product| product.method_matches_product()));
+        assert_eq!(
+            products
+                .iter()
+                .find(|product| product.product == DeepSkyIntegrationProductKind::Struct)
+                .and_then(DeepSkyIntegrationProductRequest::dependency),
+            Some("nebula_fusion_sci")
+        );
+
+        let invalid_struct: DeepSkyIntegrationProductRequest =
+            serde_json::from_value(serde_json::json!({
+                "id": "bad-struct",
+                "product": "struct",
+                "method": {
+                    "method": "nebula_fusion",
+                    "mode": "lite",
+                    "cfaDirect": false,
+                    "outputBin": "native"
+                }
+            }))
+            .unwrap();
+        assert!(!invalid_struct.method_matches_product());
+    }
+
+    #[test]
+    fn deepsky_v5_classic_drizzle_and_eidr_use_independent_sampling_branches() {
+        let request: DeepSkyStackRequest = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 5,
+            "lights": ["light.fits"],
+            "drizzle": 2.0,
+            "integrationProducts": [
+                {
+                    "id": "classic",
+                    "product": "classic",
+                    "primary": true,
+                    "method": { "method": "classic", "version": 1 }
+                },
+                {
+                    "id": "eidr",
+                    "product": "eidr",
+                    "method": {
+                        "method": "eidr",
+                        "scale": "x2",
+                        "solveMode": "scientificQuadratic"
+                    }
+                }
+            ]
+        }))
+        .unwrap();
+
+        let products = request.resolved_integration_products();
+        let classic = products
+            .iter()
+            .find(|product| product.product == DeepSkyIntegrationProductKind::Classic)
+            .unwrap();
+        let eidr = products
+            .iter()
+            .find(|product| product.product == DeepSkyIntegrationProductKind::Eidr)
+            .unwrap();
+        assert_eq!(classic.effective_drizzle(request.drizzle), 2.0);
+        assert_eq!(classic.requested_output_scale(request.drizzle), 2.0);
+        assert_eq!(eidr.effective_drizzle(request.drizzle), 1.0);
+        assert_eq!(eidr.requested_output_scale(request.drizzle), 2.0);
     }
 
     #[test]
@@ -3302,6 +4810,11 @@ mod tests {
         assert_eq!(decision.pedestal_state, PedestalState::RawIncludesBias);
         assert!(!decision.compatible);
         assert!(!decision.degraded);
+        assert!(!decision.scientific_eligible);
+        assert_eq!(
+            decision.assignment_tier,
+            CalibrationAssignmentTier::AutomaticExact
+        );
 
         let mut bundle: ScientificBundleManifest = serde_json::from_str("{}").unwrap();
         assert_eq!(bundle.schema_version, SCIENTIFIC_BUNDLE_SCHEMA_VERSION);

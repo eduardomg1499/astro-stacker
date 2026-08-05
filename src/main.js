@@ -45,6 +45,34 @@ import {
     normalizeBatchOutputSettings
 } from "./batch_output.js";
 import { computeSafeExposureEv } from "./adaptive_postprocess.js";
+import {
+    SOURCE_KINDS,
+    classifyDeepSkySource,
+    planDeepSkyStudio,
+    buildDeepSkyStudioRequest,
+} from "./deepsky_studio_state.js";
+import {
+    applyMilkyWayEditorSafetyPlan,
+    attachMilkyWayOutputIdentity,
+    buildMilkyWayAtomicCropRequest,
+    describeMilkyWayGeometryRevision,
+    milkyWayEditorShouldAutoApplyStep,
+    milkyWayLayerPaths,
+    milkyWayPrimaryPath,
+    preserveMilkyWayRecipeIdentity,
+    resolveMilkyWayResultPath,
+} from "./milky_way_editor_bridge.js";
+import {
+    mapDeepSkyComparisonCrop,
+    normalizeDeepSkyProgressViewport,
+    panDeepSkyProgressViewport,
+    zoomDeepSkyProgressViewport,
+} from "./deepsky_progress_viewport.js";
+import {
+    deepSkyTelemetryComputeStatus,
+    describeDeepSkyComputePlan,
+    resolveDeepSkyComputePolicy,
+} from "./deepsky_compute_policy.js";
 
 let appWindow = null;
 // Persistencia de la categoría de objetivo: true mientras un cambio es
@@ -135,6 +163,14 @@ function translateBackendProgressText(value) {
         .replace(/Eliminando pixeles calientes y ruido residual/g, "Removing hot pixels and residual noise")
         .replace(/Aplicando Sharpening \(Wavelet Multi-Band\)/g, "Applying sharpening (multi-band wavelet)")
         .replace(/Guardando resultado/g, "Saving result")
+        .replace(/Validando entradas lineales, calibraci[oó]n y geometr[ií]a/g, "Validating linear inputs, calibration, and geometry")
+        .replace(/Toma (\d+)\/(\d+) calibrada antes de debayer/g, "Frame $1/$2 calibrated before demosaicing")
+        .replace(/Ramas independientes (\d+)\/(\d+)/g, "Independent branches $1/$2")
+        .replace(/Una sola interpolaci[oó]n · (\d+)\/(\d+)/g, "Single interpolation · $1/$2")
+        .replace(/(\d+) pasada\(s\) deterministas/g, "$1 deterministic pass(es)")
+        .replace(/FITS float32 y receta sincronizados; publicando carpeta/g, "Float32 FITS and recipe synchronized; publishing folder")
+        .replace(/M[aá]steres lineales, capas y receta publicados/g, "Linear masters, layers, and recipe published")
+        .replace(/(\d+) productos publicados con el mismo geometryId/g, "$1 products published with the same geometryId")
         .replace(/Completado/g, "Completed")
         .replace(/Listo/g, "Done");
 
@@ -762,6 +798,15 @@ function restartTutorialFlowFromSettings(flowName, startIndex = 0) {
 }
 
 async function checkLicenseAtStartup() {
+    // Los fixtures de UX ejecutan el frontend sin el puente nativo de Tauri.
+    // No deben inventar un fallo de licencia ni superponer su alerta al flujo
+    // que se está auditando. Este atajo sólo existe en Vite dev.
+    if (import.meta.env.DEV && new URLSearchParams(window.location.search).has("ux-fixture")) {
+        isProVersion = false;
+        licenseStatus = "FIXTURE";
+        licenseCheckComplete = true;
+        return;
+    }
     try {
         const info = await invoke("check_license_status");
         isProVersion = info.is_pro; // Backend devuelve TRUE si hay prueba vigente o licencia anual/PRO activa
@@ -2108,7 +2153,13 @@ function toDisplaySrc(src) {
         normalized &&
         !/^(?:data:|asset:|blob:|https?:)/i.test(normalized)
     ) {
-        return convertFileSrc(normalized);
+        // The web QA fixtures deliberately run without Tauri's asset protocol.
+        // Keep their same-origin preview paths usable while the native bundle
+        // continues to convert real filesystem paths through asset://.
+        const hasTauriAssetProtocol = typeof window !== "undefined" && !!window.__TAURI_INTERNALS__;
+        return hasTauriAssetProtocol && typeof convertFileSrc === "function"
+            ? convertFileSrc(normalized)
+            : normalized;
     }
     return normalized;
 }
@@ -2182,6 +2233,47 @@ function getComputePolicy() {
     })[getGpuMode()] || "auto";
 }
 window.getComputePolicy = getComputePolicy;
+
+function dsComputePolicyLabel(policy) {
+    return ({
+        auto: tr("settings.general.gpu_auto", "Auto (recomendado)"),
+        hybrid: tr("settings.general.gpu_hybrid", "Hybrid (experto/experimental)"),
+        gpu_only: tr("settings.general.gpu_force", "Solo GPU (estricto)"),
+        cpu_only: tr("settings.general.gpu_cpu", "Solo CPU"),
+    })[policy] || String(policy || "auto");
+}
+
+function dsResolvedComputePolicy() {
+    return resolveDeepSkyComputePolicy(
+        document.getElementById("sel-ds-compute")?.value || "global",
+        getComputePolicy(),
+        dsExperienceMode === "expert",
+    );
+}
+
+function dsSyncComputePolicyUi({ refresh = false } = {}) {
+    const selector = document.getElementById("sel-ds-compute");
+    const status = document.getElementById("ds-compute-effective");
+    const selected = selector?.value || "global";
+    const overrideActive = dsExperienceMode === "expert" && selected !== "global";
+    const effective = dsResolvedComputePolicy();
+    if (status) {
+        const key = overrideActive
+            ? "deepsky.compute_override_effective"
+            : "deepsky.compute_global_effective";
+        const fallback = overrideActive
+            ? "Anulación Experto efectiva: {{mode}}"
+            : "Configuración general efectiva: {{mode}}";
+        status.textContent = trFormat(key, { mode: dsComputePolicyLabel(effective) }, fallback);
+    }
+    if (refresh
+        && document.getElementById("deepsky-modal")?.style.display !== "none") {
+        dsRenderProcessPreview();
+        dsSchedulePreflight();
+    }
+    return effective;
+}
+window.dsResolvedComputePolicy = dsResolvedComputePolicy;
 
 function getDecodePolicy() {
     const value = localStorage.getItem("zas_decode_policy");
@@ -2259,7 +2351,8 @@ window.setPlanetaryColorOptionsAvailability = setPlanetaryColorOptionsAvailabili
             selGpu.value = getGpuMode();
             selGpu.addEventListener("change", () => {
                 localStorage.setItem("zas_gpu_mode", selGpu.value);
-                log("INFO", `Cómputo planetario: ${selGpu.value === "hybrid" ? "Hybrid experimental" : selGpu.value === "auto" ? "Auto" : selGpu.value === "gpu" ? "Solo GPU (estricto)" : "Solo CPU"}`);
+                log("INFO", `Cómputo científico (planetario + cielo profundo): ${selGpu.value === "hybrid" ? "Hybrid experimental" : selGpu.value === "auto" ? "Auto" : selGpu.value === "gpu" ? "Solo GPU (estricto)" : "Solo CPU"}`);
+                dsSyncComputePolicyUi({ refresh: true });
             });
         }
         const selDecode = document.getElementById("sel-decode-policy");
@@ -2297,7 +2390,7 @@ window.setPlanetaryColorOptionsAvailability = setPlanetaryColorOptionsAvailabili
                     "✔ {{name}} — {{backend}} · VRAM presupuestada: {{budget}} MB",
                 );
             }
-            log("INFO", `GPU detectada: ${info.name} (${info.backend}) — ${info.vram_budget_mb} MB presupuestados para cómputo planetario.`);
+            log("INFO", `GPU detectada: ${info.name} (${info.backend}) — ${info.vram_budget_mb} MB presupuestados para cómputo científico.`);
         } else {
             if (line) line.textContent = tr("settings.general.gpu_none", "Sin GPU compatible — análisis y apilado usan CPU (SIMD).");
         }
@@ -3191,78 +3284,142 @@ async function loadSystemFonts() {
 // GESTION DE MODALES PERSONALIZADOS
 // =========================================================================
 
-// =========================================================================
-// GESTION DE MODALES PERSONALIZADOS
-// =========================================================================
+const customModalQueue = [];
+let customModalActive = false;
+
+function customModalVisibleParent(overlay) {
+    return [...document.body.children]
+        .filter(element => element instanceof HTMLElement
+            && element !== overlay
+            && !element.inert
+            && getComputedStyle(element).display !== "none"
+            && (element.matches(".modal-overlay") || element.getAttribute("role") === "dialog"))
+        .sort((left, right) => {
+            const leftZ = Number.parseInt(getComputedStyle(left).zIndex, 10) || 0;
+            const rightZ = Number.parseInt(getComputedStyle(right).zIndex, 10) || 0;
+            return rightZ - leftZ;
+        })[0] || null;
+}
+
+function customModalRestoreBackground(previousDialog) {
+    if (previousDialog?.isConnected && getComputedStyle(previousDialog).display !== "none") {
+        dsSetBackgroundInert(true, previousDialog);
+    } else {
+        dsSetBackgroundInert(false);
+    }
+}
+
+function customModalDrainQueue() {
+    if (customModalActive || customModalQueue.length === 0) return;
+    customModalActive = true;
+    const request = customModalQueue.shift();
+    const overlay = $("#custom-modal-overlay");
+    const titleEl = $("#modal-title");
+    const msgEl = $("#modal-msg");
+    const btnOk = $("#btn-modal-ok");
+    const btnCancel = $("#btn-modal-cancel");
+    const boxEl = overlay?.querySelector(".modal-box");
+
+    if (!overlay || !titleEl || !msgEl || !btnOk || !btnCancel) {
+        request.resolve(true);
+        customModalActive = false;
+        queueMicrotask(customModalDrainQueue);
+        return;
+    }
+
+    const previousFocus = document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const previousDialog = customModalVisibleParent(overlay);
+    titleEl.textContent = String(request.title || "");
+    const hasStructuredHtml = /<\/?[a-z][\s\S]*>/i.test(String(request.msg));
+    msgEl.innerHTML = hasStructuredHtml
+        ? request.msg
+        : escapeHtml(String(request.msg)).replace(/\n/g, "<br>");
+    if (boxEl) {
+        boxEl.classList.toggle("ser-modal-box", Boolean(msgEl.querySelector(".ser-converter-modal")));
+    }
+
+    if (request.labelOk) {
+        btnOk.textContent = request.labelOk;
+        btnOk.style.display = "block";
+        btnOk.style.width = (request.type === "alert" || !request.labelCancel) ? "100%" : "auto";
+    } else {
+        btnOk.style.display = "none";
+    }
+    if (request.labelCancel) {
+        btnCancel.textContent = request.labelCancel;
+        btnCancel.style.display = "block";
+    } else {
+        btnCancel.style.display = "none";
+    }
+
+    overlay.style.display = "flex";
+    overlay.inert = false;
+    overlay.setAttribute("aria-hidden", "false");
+    // El diálogo global puede aparecer encima del asistente deep-sky. Debe
+    // tomar el relevo modal; de lo contrario dsSetBackgroundInert deja visible
+    // «Entendido», pero el navegador descarta todos sus clics y teclas.
+    dsSetBackgroundInert(true, overlay);
+
+    let finished = false;
+    const choices = [...msgEl.querySelectorAll("[data-modal-result]")];
+    const finish = value => {
+        if (finished) return;
+        finished = true;
+        btnOk.onclick = null;
+        btnCancel.onclick = null;
+        choices.forEach(choice => { choice.onclick = null; });
+        overlay.removeEventListener("keydown", onKeyDown);
+        overlay.style.display = "none";
+        overlay.setAttribute("aria-hidden", "true");
+        if (boxEl) boxEl.classList.remove("ser-modal-box");
+        customModalRestoreBackground(previousDialog);
+        if (previousFocus?.isConnected && !previousFocus.inert) {
+            previousFocus.focus({ preventScroll: true });
+        }
+        request.resolve(value);
+        customModalActive = false;
+        queueMicrotask(customModalDrainQueue);
+    };
+    const visibleActions = () => [btnCancel, ...choices, btnOk]
+        .filter(element => element.style.display !== "none" && !element.disabled);
+    const onKeyDown = event => {
+        if (event.key === "Escape") {
+            event.preventDefault();
+            finish(request.labelCancel ? false : true);
+            return;
+        }
+        if (event.key !== "Tab") return;
+        const actions = visibleActions();
+        if (actions.length === 0) return;
+        const index = actions.indexOf(document.activeElement);
+        const next = event.shiftKey
+            ? (index <= 0 ? actions.at(-1) : actions[index - 1])
+            : (index < 0 || index === actions.length - 1 ? actions[0] : actions[index + 1]);
+        event.preventDefault();
+        next?.focus();
+    };
+
+    overlay.addEventListener("keydown", onKeyDown);
+    if (btnOk.style.display !== "none") btnOk.onclick = () => finish(true);
+    if (btnCancel.style.display !== "none") btnCancel.onclick = () => finish(false);
+    choices.forEach(choice => {
+        choice.onclick = () => {
+            const rawValue = choice.dataset.modalResult;
+            finish(rawValue === "true" ? true : rawValue === "false" ? false : rawValue);
+        };
+    });
+    requestAnimationFrame(() => {
+        const target = btnOk.style.display !== "none" ? btnOk : visibleActions()[0];
+        target?.focus({ preventScroll: true });
+    });
+}
 
 function internalShowModal(title, msg, type, labelOk = "Aceptar", labelCancel = "Cancelar") {
     return new Promise((resolve) => {
-        const overlay = $("#custom-modal-overlay");
-        const titleEl = $("#modal-title");
-        const msgEl = $("#modal-msg");
-        const btnOk = $("#btn-modal-ok");
-        const btnCancel = $("#btn-modal-cancel");
-        const boxEl = overlay.querySelector(".modal-box");
-
-        if (!overlay) { resolve(true); return; }
-
-        titleEl.innerHTML = title;
-        const hasStructuredHtml = /<\/?[a-z][\s\S]*>/i.test(String(msg));
-        msgEl.innerHTML = hasStructuredHtml ? msg : String(msg).replace(/\n/g, "<br>");
-        if (boxEl) {
-            boxEl.classList.toggle("ser-modal-box", Boolean(msgEl.querySelector(".ser-converter-modal")));
-        }
-
-        // Hide buttons if labels are explicitly null
-        if (labelOk) {
-            btnOk.textContent = labelOk;
-            btnOk.style.display = 'block';
-            btnOk.style.width = (type === 'alert' || !labelCancel) ? '100%' : 'auto';
-        } else {
-            btnOk.style.display = 'none';
-        }
-
-        if (labelCancel) {
-            btnCancel.textContent = labelCancel;
-            btnCancel.style.display = 'block';
-        } else {
-            btnCancel.style.display = 'none';
-        }
-
-        overlay.style.display = "flex";
-
-        const cleanup = () => {
-            btnOk.onclick = null;
-            btnCancel.onclick = null;
-            overlay.style.display = "none";
-            if (boxEl) boxEl.classList.remove("ser-modal-box");
-            // Cleaning content listeners
-            const choices = msgEl.querySelectorAll('[data-modal-result]');
-            choices.forEach(c => c.onclick = null);
-        };
-
-        // Standard Button Handlers
-        if (btnOk.style.display !== 'none') {
-            btnOk.onclick = () => { cleanup(); resolve(true); };
-        }
-
-        if (btnCancel.style.display !== 'none') {
-            btnCancel.onclick = () => { cleanup(); resolve(false); };
-        }
-
-        // Custom Choice Handlers (Embedded in HTML)
-        const choices = msgEl.querySelectorAll('[data-modal-result]');
-        choices.forEach(choice => {
-            choice.onclick = () => {
-                const rawVal = choice.dataset.modalResult;
-                let val = rawVal;
-                if (rawVal === 'true') val = true;
-                if (rawVal === 'false') val = false;
-
-                cleanup();
-                resolve(val);
-            };
-        });
+        customModalQueue.push({ title, msg, type, labelOk, labelCancel, resolve });
+        customModalDrainQueue();
     });
 }
 
@@ -4914,6 +5071,10 @@ function updateTransform() {
             [ui.imgSource, ui.imgResult].forEach(img => {
                 if (img) img.style.imageRendering = pixelated ? "pixelated" : "auto";
             });
+            if (document.body.classList.contains("ds-poststack-workspace")) {
+                dsUpdateCropOverlay();
+                dsUpdateGradientLayerPosition();
+            }
 
             isPanningFrameRequested = false;
         });
@@ -10144,7 +10305,8 @@ if (btnAnalyzeFits) {
 
         ui.txtSelectedFile.textContent = "Secuencia FITS: " + currentFilePath;
         $("#analysis-actions").style.display = "block";
-        $("#stack-actions").style.display = "none";
+        const stackActions = $("#stack-actions");
+        if (stackActions) stackActions.style.display = "none";
 
         if (currentAnalysisMode.startsWith("planet")) {
             const btnManualAnchor = $("#btn-manual-anchor");
@@ -11127,7 +11289,13 @@ if (ui.btnAnimExport) {
                 try {
                     const status = await invoke("check_ffmpeg_status");
                     if (!status) {
-                        showFFmpegModal();
+                        showCustomAlert(
+                            tr("general.error", "Error"),
+                            tr(
+                                "animation.ffmpeg_missing",
+                                "FFmpeg no está disponible: la exportación MP4 necesita los binarios ffmpeg/ffprobe incluidos con la aplicación.",
+                            ),
+                        );
                         return;
                     }
                 } catch (e) { console.error("FFmpeg check failed", e); }
@@ -11529,6 +11697,7 @@ async function drawChart(data, cutVal, isSorted) {
 listen("log_event", (e) => log(e.payload.level, e.payload.msg));
 listen("backend_panic", (e) => {
     const msg = (e && e.payload != null) ? String(e.payload) : "Error interno";
+    const wasDeepSkyStacking = typeof dsStacking !== "undefined" && Boolean(dsStacking);
     log("ERROR", "Backend panic: " + msg);
     // DESBLOQUEO UI: tras un panic en el backend la promesa del invoke nunca
     // se resuelve — el finally del handler de apilado no corre, y el overlay
@@ -11545,6 +11714,13 @@ listen("backend_panic", (e) => {
         if (ui.btnStack) ui.btnStack.disabled = false;
         if (ui.btnBatchRun) ui.btnBatchRun.disabled = false;
     } catch (_) { }
+    if (wasDeepSkyStacking) {
+        const modal = document.getElementById("deepsky-modal");
+        if (modal && typeof dsPresentRunError === "function") {
+            void dsPresentRunError(modal, msg);
+            return;
+        }
+    }
     try {
         showCustomAlert(
             tr("general.backend_panic_title", "Error inesperado"),
@@ -11579,31 +11755,34 @@ listen("pipeline_telemetry", (e) => {
     _lastPipelineTelemetry = t;
     window._lastPipelineTelemetry = t;
     if (typeof dsStacking !== "undefined" && dsStacking && t.domain === "deep_sky") {
-        const eta = Number.isFinite(t.eta_seconds) ? ` · ETA ${dsFmtClock(t.eta_seconds * 1000)}` : "";
+        const hasEta = t.eta_seconds !== null
+            && t.eta_seconds !== undefined
+            && Number.isFinite(Number(t.eta_seconds))
+            && Number(t.eta_seconds) > 0;
+        const eta = hasEta ? ` · ETA ${dsFmtClock(Number(t.eta_seconds) * 1000)}` : "";
         const engine = t.engine ? ` · ${t.engine}` : "";
         const cur = document.getElementById("ds-prog-current");
         if (cur) cur.textContent = `${t.phase || "Proceso"}${engine}${eta}`;
         if (typeof dsProgressPhaseUpdate === "function") {
-            dsProgressPhaseUpdate(t.phase || "", t.phase === "complete");
+            // `stack_deepsky_impl` emite "complete" al terminar CADA rama
+            // (Classic/NF/STRUCT/EIDR). Sólo `dsProgressComplete`, tras volver
+            // el comando coordinador, puede cerrar las seis etapas globales.
+            dsProgressPhaseUpdate(t.phase || "", false);
         }
-        const resources = document.getElementById("ds-prog-resources");
-        if (resources) {
-            const throughput = Number.isFinite(t.throughput) ? `${t.throughput.toFixed(1)} elem/s` : "—";
-            const pct = (v) => Number.isFinite(v) ? `${v.toFixed(0)}%` : "—";
-            resources.style.display = "grid";
-            resources.innerHTML = `<span>Rendimiento <b style="color:#e2e8f0">${throughput}</b></span>
-                <span>CPU <b style="color:#e2e8f0">${pct(t.cpu_percent)}</b></span>
-                <span>GPU <b style="color:#e2e8f0">${pct(t.gpu_percent)}</b></span>
-                <span>RAM <b style="color:#e2e8f0">${t.ram_mb || 0} MB</b></span>
-                <span>VRAM <b style="color:#e2e8f0">${t.vram_mb || 0} MB</b></span>
-                <span>I/O <b style="color:#e2e8f0">${(t.io_read_mb || 0).toFixed(1)}/${(t.io_write_mb || 0).toFixed(1)} MB</b></span>
-                <span>Caché <b style="color:#e2e8f0">${t.cache_hits || 0}/${(t.cache_hits || 0) + (t.cache_misses || 0)}</b></span>
-                <span>Motor <b style="color:#e2e8f0">${escapeHtml(t.engine || "—")}</b></span>`;
+        if (typeof dsProgressRenderResources === "function") dsProgressRenderResources(t);
+        if (typeof dsProgressAppendDiagnostic === "function") {
+            const throughput = Number.isFinite(t.throughput) ? ` · ${t.throughput.toFixed(1)} elem/s` : "";
+            const engine = t.engine ? ` · ${t.engine}` : "";
+            dsProgressAppendDiagnostic(`${t.phase || "Proceso"}${engine}${throughput}${eta}`);
         }
         const warning = document.getElementById("ds-prog-warning");
         if (warning) {
-            warning.style.display = t.fallback_reason ? "block" : "none";
+            warning.hidden = !t.fallback_reason;
             warning.textContent = t.fallback_reason ? `Fallback: ${t.fallback_reason}` : "";
+        }
+        const diagnosticSummary = document.getElementById("ds-prog-diagnostic-summary");
+        if (diagnosticSummary && t.fallback_reason) {
+            diagnosticSummary.textContent = tr("deepsky.prog_fallback_active", "Fallback efectivo registrado");
         }
     }
 });
@@ -11830,6 +12009,7 @@ window.addEventListener("languageChanged", (e) => {
     updatePostHistoryUi();
     updateZenithGuide();
     paintAssistantPrimaryAction();
+    dsSyncComputePolicyUi();
     if (document.getElementById("deepsky-modal")?.style.display !== "none") {
         dsRenderSections(true);
         dsUpdateUI();
@@ -12312,7 +12492,7 @@ updateAlignModeUI();
 // con diagnóstico, e integración σ-clip. El resultado LINEAL entra al
 // mismo pipeline de post-procesado que los apilados planetarios.
 // ============================================================
-const DEEP_SKY_STACK_REQUEST_SCHEMA_VERSION = 4;
+const DEEP_SKY_STACK_REQUEST_SCHEMA_VERSION = 5;
 const dsFiles = { lights: [], darks: [], flats: [], darkFlats: [], bias: [] }; // DsProbe[]
 let dsSelectedGroup = null; // keyword activa o null = todos
 
@@ -12337,14 +12517,66 @@ function dsKeywords() {
     return raw.split(",").map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
 }
 
+function dsFileGroupingText(file) {
+    const signature = file?.signature || {};
+    return [
+        file?.name,
+        file?.path,
+        file?.date_obs,
+        file?.dateObs,
+        file?.filter,
+        signature.session,
+        signature.filter,
+        signature.camera,
+        signature.sensor,
+    ].filter(value => value !== null && value !== undefined)
+        .join(" ")
+        .toLowerCase();
+}
+
+function dsFileDateTags(file) {
+    const values = [
+        file?.signature?.session,
+        file?.date_obs,
+        file?.dateObs,
+        file?.path,
+        file?.name,
+    ];
+    const tags = new Set();
+    for (const value of values) {
+        const matches = String(value || "").matchAll(
+            /(?:19|20)\d{2}[-_. /](?:0[1-9]|1[0-2])[-_. /](?:0[1-9]|[12]\d|3[01])/g,
+        );
+        for (const match of matches) tags.add(match[0].replace(/[-_. /]/g, "-"));
+    }
+    return [...tags];
+}
+
+function dsKeywordLooksLikeDatePrefix(keyword) {
+    return /^(?:19|20)\d{2}(?:[-_. /](?:0?[1-9]|1[0-2]))?(?:[-_. /](?:0?[1-9]|[12]\d|3[01]))?$/.test(keyword);
+}
+
+// Las reglas temporales se expanden hasta la noche completa. Así `2026` o
+// `2026-04` no crean una bolsa gigantesca: producen chips 2026-04-02,
+// 2026-04-03… y esa misma identidad se aplica a todos los tipos de toma.
 function dsFileGroups(file) {
-    const n = file.name.toLowerCase();
-    return dsKeywords().filter(k => n.includes(k));
+    const text = dsFileGroupingText(file);
+    const dates = dsFileDateTags(file);
+    const groups = new Set();
+    for (const keyword of dsKeywords()) {
+        if (dsKeywordLooksLikeDatePrefix(keyword)) {
+            const prefix = keyword.replace(/[-_. /]/g, "-");
+            dates.filter(date => date.startsWith(prefix)).forEach(date => groups.add(date));
+        } else if (text.includes(keyword)) {
+            groups.add(keyword);
+        }
+    }
+    return [...groups];
 }
 
 function dsActiveLights() {
     if (!dsSelectedGroup) return dsFiles.lights.filter(f => f.ok);
-    return dsFiles.lights.filter(f => f.ok && f.name.toLowerCase().includes(dsSelectedGroup));
+    return dsFiles.lights.filter(f => f.ok && dsFileGroups(f).includes(dsSelectedGroup));
 }
 
 // Pool PRELIMINAR por etiqueta de sesión. Una coincidencia de nombre nunca
@@ -12353,7 +12585,11 @@ function dsActiveLights() {
 function dsMatchedCalib(kind) {
     const all = dsFiles[kind].filter(f => f.ok);
     if (!dsSelectedGroup) return all;
-    const tagged = all.filter(f => f.name.toLowerCase().includes(dsSelectedGroup));
+    // Una noche seleccionada filtra los lights, pero conserva la biblioteca
+    // completa de calibración para poder reutilizar flats/dark-flats de otro
+    // día mediante el contrato explícito.
+    if (/^(?:19|20)\d{2}-\d{2}-\d{2}$/.test(dsSelectedGroup)) return all;
+    const tagged = all.filter(f => dsFileGroups(f).includes(dsSelectedGroup));
     if (tagged.length > 0) return tagged;
     return all.filter(f => dsFileGroups(f).length === 0); // globales
 }
@@ -12362,11 +12598,52 @@ function dsFmtExp(e) {
     return (e === null || e === undefined) ? "—" : (e >= 10 ? e.toFixed(0) : e.toFixed(1)) + "s";
 }
 
+const DS_FILE_PAGE_SIZE = 120;
+const dsFileListState = new Map();
+
 function dsRenderFileList(container, kind, files, lightsRef) {
     container.innerHTML = "";
     if (files.length === 0) { container.style.display = "none"; return; }
     container.style.display = "block";
-    const shown = files.slice(0, 120);
+    const state = dsFileListState.get(kind) || { query: "", page: 0 };
+    dsFileListState.set(kind, state);
+    const query = state.query.trim().toLowerCase();
+    const filtered = query
+        ? files.filter(file => `${file.name || ""} ${file.path || ""} ${file.filter || ""}`
+            .toLowerCase().includes(query))
+        : files;
+    const pageCount = Math.max(1, Math.ceil(filtered.length / DS_FILE_PAGE_SIZE));
+    state.page = Math.max(0, Math.min(state.page, pageCount - 1));
+    const first = state.page * DS_FILE_PAGE_SIZE;
+    const shown = filtered.slice(first, first + DS_FILE_PAGE_SIZE);
+
+    const toolbar = document.createElement("div");
+    toolbar.className = "ds-file-list-toolbar";
+    const search = document.createElement("input");
+    search.className = "ds-file-list-search";
+    search.type = "search";
+    search.value = state.query;
+    search.placeholder = tr("deepsky.file_search", "Buscar por nombre, ruta o filtro…");
+    search.setAttribute("aria-label", search.placeholder);
+    const count = document.createElement("span");
+    count.className = "ds-file-list-count";
+    count.textContent = query
+        ? `${filtered.length} / ${files.length} ${tr("deepsky.files", "archivos")}`
+        : `${files.length} ${tr("deepsky.files", "archivos")}`;
+    toolbar.append(search, count);
+    const rowsHost = document.createElement("div");
+    rowsHost.className = "ds-file-list-rows";
+    container.append(toolbar, rowsHost);
+
+    search.addEventListener("input", () => {
+        state.query = search.value;
+        state.page = 0;
+        dsRenderFileList(container, kind, files, lightsRef);
+        const replacement = container.querySelector(".ds-file-list-search");
+        replacement?.focus();
+        if (replacement) replacement.setSelectionRange(replacement.value.length, replacement.value.length);
+    });
+
     shown.forEach(f => {
         const idx = dsFiles[kind].indexOf(f);
         const row = document.createElement("div");
@@ -12375,7 +12652,7 @@ function dsRenderFileList(container, kind, files, lightsRef) {
         row.dataset.path = f.path;
         // Grid: drag · estado · nombre · dims · exp · tags · alternativa de
         // reclasificación por teclado · borrar.
-        row.style.cssText = "display:grid; grid-template-columns:12px 14px minmax(0,1fr) 76px 48px auto 86px 24px; align-items:center; gap:7px; padding:3px 4px; font-size:0.64rem; color:#94a3b8; font-family:'Courier New',monospace; border-radius:6px; cursor:grab;";
+        row.style.cssText = "display:grid; grid-template-columns:12px 14px minmax(0,1fr) 76px 48px auto 94px 30px; align-items:center; gap:7px; padding:5px 4px; font-size:0.72rem; color:#94a3b8; font-family:'Courier New',monospace; border-radius:6px; cursor:grab;";
         row.addEventListener("mouseenter", () => { row.style.background = "rgba(124,58,237,0.10)"; });
         row.addEventListener("mouseleave", () => { row.style.background = "transparent"; });
         row.addEventListener("dragstart", (e) => {
@@ -12421,7 +12698,7 @@ function dsRenderFileList(container, kind, files, lightsRef) {
         const move = document.createElement("select");
         move.setAttribute("aria-label", `${tr("deepsky.reclassify", "Reclasificar")}: ${f.name}`);
         move.title = tr("deepsky.reclassify", "Reclasificar");
-        move.style.cssText = "min-width:0; width:86px; height:25px; padding:1px 3px; border:1px solid #334155; border-radius:6px; background:#0f172a; color:#94a3b8; font:0.58rem 'Courier New',monospace;";
+        move.style.cssText = "min-width:0; width:94px; height:30px; padding:2px 4px; border:1px solid #334155; border-radius:6px; background:#0f172a; color:#cbd5e1; font:0.66rem 'Courier New',monospace;";
         DS_SECTIONS.forEach(section => {
             const option = document.createElement("option");
             option.value = section.kind;
@@ -12436,18 +12713,46 @@ function dsRenderFileList(container, kind, files, lightsRef) {
         del.innerHTML = '<svg class="zas-icon zas-icon-inline"><use href="#icon-cross"></use></svg>';
         del.title = tr("deepsky.remove_file", "Quitar este archivo");
         del.setAttribute("aria-label", `${del.title}: ${f.name}`);
-        del.style.cssText = "width:24px; min-width:24px; height:24px; padding:0; border:0; background:transparent; color:#64748b; cursor:pointer; text-align:center;";
+        del.style.cssText = "width:30px; min-width:30px; height:30px; padding:0; border:0; background:transparent; color:#94a3b8; cursor:pointer; text-align:center;";
         del.addEventListener("click", (e) => { e.stopPropagation(); if (idx >= 0) { dsFiles[kind].splice(idx, 1); dsUpdateUI(); } });
         del.addEventListener("mouseenter", () => { del.style.color = "#f87171"; });
         del.addEventListener("mouseleave", () => { del.style.color = "#64748b"; });
         row.append(grip, status, name, dims, exp, tags, move, del);
-        container.appendChild(row);
+        rowsHost.appendChild(row);
     });
-    if (files.length > shown.length) {
-        const more = document.createElement("div");
-        more.style.cssText = "font-size:0.6rem; color:#64748b; padding:3px 2px; text-align:center;";
-        more.textContent = `… +${files.length - shown.length} ${tr("deepsky.files", "archivos")}`;
-        container.appendChild(more);
+    if (pageCount > 1) {
+        const pager = document.createElement("div");
+        pager.className = "ds-file-list-pager";
+        const previous = document.createElement("button");
+        previous.type = "button";
+        previous.textContent = tr("deepsky.page_previous", "← Anteriores");
+        previous.disabled = state.page === 0;
+        const label = document.createElement("span");
+        label.textContent = trFormat(
+            "deepsky.page_status",
+            { current: state.page + 1, total: pageCount, first: first + 1, last: first + shown.length },
+            `Página ${state.page + 1} de ${pageCount} · ${first + 1}–${first + shown.length}`,
+        );
+        const next = document.createElement("button");
+        next.type = "button";
+        next.textContent = tr("deepsky.page_next", "Siguientes →");
+        next.disabled = state.page >= pageCount - 1;
+        previous.addEventListener("click", () => {
+            state.page -= 1;
+            dsRenderFileList(container, kind, files, lightsRef);
+        });
+        next.addEventListener("click", () => {
+            state.page += 1;
+            dsRenderFileList(container, kind, files, lightsRef);
+        });
+        pager.append(previous, label, next);
+        container.appendChild(pager);
+    }
+    if (!shown.length) {
+        const empty = document.createElement("div");
+        empty.style.cssText = "font-size:.64rem;color:#94a3b8;padding:12px;text-align:center;";
+        empty.textContent = tr("deepsky.file_search_empty", "No hay archivos que coincidan con la búsqueda.");
+        rowsHost.appendChild(empty);
     }
 }
 
@@ -12460,6 +12765,399 @@ function dsMoveFile(fromKind, path, toKind) {
     if (!dsFiles[toKind].some(x => x.path === path)) dsFiles[toKind].push(f);
     log("INFO", `Movido a ${toKind.toUpperCase()}: ${f.name}`);
     dsUpdateUI();
+}
+
+function dsNormalizeDialogPath(value) {
+    if (typeof value === "string") return value;
+    if (value && typeof value.path === "string") return value.path;
+    return "";
+}
+
+let dsFolderPickerFixtureTree = null;
+
+function dsDirectoryFixtureTree() {
+    if (!dsFolderPickerFixtureTree) {
+        dsFolderPickerFixtureTree = new Map(Object.entries({
+            "/Volumes": ["GM7Predator", "ZenithDev"],
+            "/Volumes/GM7Predator": ["APILADOS", "Calibración", "Sesiones 2026"],
+            "/Volumes/GM7Predator/APILADOS": ["M42", "M31", "zenith_astrometry_index"],
+            "/Volumes/GM7Predator/APILADOS/M42": ["Lights", "Calibración", "Resultados"],
+            "/Volumes/GM7Predator/APILADOS/M42/Lights": ["2026-03-21", "2026-03-22"],
+            "/Volumes/GM7Predator/APILADOS/M42/Resultados": [],
+            "/Volumes/ZenithDev": ["Pruebas", "Exportaciones"],
+        }));
+    }
+    return dsFolderPickerFixtureTree;
+}
+
+function dsDirectoryFixtureListing(path) {
+    const tree = dsDirectoryFixtureTree();
+    const current = tree.has(path) ? path : "/Volumes/GM7Predator/APILADOS/M42";
+    const slash = current.lastIndexOf("/");
+    const parent = slash > 0 ? current.slice(0, slash) : null;
+    return {
+        current,
+        parent,
+        entries: (tree.get(current) || []).map(name => ({
+            name,
+            path: `${current}/${name}`.replace(/\/+/g, "/"),
+            hidden: false,
+        })),
+        shortcuts: [
+            { kind: "home", label: "Inicio", path: "/Volumes/GM7Predator" },
+            { kind: "volumes", label: "Discos y volúmenes", path: "/Volumes" },
+        ],
+    };
+}
+
+function dsValidateFolderName(name) {
+    const normalized = String(name || "").trim();
+    if (!normalized) throw new Error(tr("deepsky.folder_name_required", "Escribe un nombre para la carpeta."));
+    if (normalized === "." || normalized === ".." || /[\\/]/.test(normalized) || normalized.includes("\0")) {
+        throw new Error(tr("deepsky.folder_name_invalid", "El nombre contiene caracteres no permitidos."));
+    }
+    return normalized;
+}
+
+function dsDirectoryFixtureCreate(parent, name) {
+    const tree = dsDirectoryFixtureTree();
+    const normalized = dsValidateFolderName(name);
+    if (!tree.has(parent)) throw new Error("La carpeta superior no existe.");
+    const children = tree.get(parent);
+    if (children.includes(normalized)) throw new Error(`Ya existe una carpeta llamada "${normalized}".`);
+    children.push(normalized);
+    children.sort((left, right) => left.localeCompare(right));
+    const target = `${parent}/${normalized}`.replace(/\/+/g, "/");
+    tree.set(target, []);
+    return dsDirectoryFixtureListing(target);
+}
+
+function dsDirectoryFixtureRename(path, name) {
+    const tree = dsDirectoryFixtureTree();
+    const normalized = dsValidateFolderName(name);
+    const slash = path.lastIndexOf("/");
+    const parent = slash > 0 ? path.slice(0, slash) : null;
+    const previousName = path.slice(slash + 1);
+    if (!parent || !tree.has(parent) || !tree.has(path)) throw new Error("La carpeta ya no existe.");
+    const siblings = tree.get(parent);
+    if (normalized !== previousName && siblings.includes(normalized)) {
+        throw new Error(`Ya existe una carpeta llamada "${normalized}".`);
+    }
+    const target = `${parent}/${normalized}`.replace(/\/+/g, "/");
+    const moved = [...tree.entries()]
+        .filter(([key]) => key === path || key.startsWith(`${path}/`))
+        .sort(([left], [right]) => left.length - right.length);
+    for (const [key] of moved) tree.delete(key);
+    for (const [key, children] of moved) {
+        tree.set(`${target}${key.slice(path.length)}`, children);
+    }
+    const index = siblings.indexOf(previousName);
+    siblings[index] = normalized;
+    siblings.sort((left, right) => left.localeCompare(right));
+    return dsDirectoryFixtureListing(parent);
+}
+
+// Navegador explícito: un clic entra en una carpeta y sólo el botón principal
+// confirma. Evita que el doble clic del selector nativo macOS confunda
+// "abrir" con "elegir" y permite comprobar la ruta exacta antes de escanear o
+// guardar.
+function dsChooseDirectory({
+    title,
+    purpose = "source",
+    defaultPath = null,
+    recursive = false,
+} = {}) {
+    return new Promise(resolve => {
+        document.getElementById("ds-folder-picker")?.remove();
+        const useLabel = purpose === "destination"
+            ? tr("deepsky.folder_use_destination", "Guardar aquí")
+            : tr("deepsky.folder_use_source", "Usar esta carpeta");
+        const instruction = purpose === "destination"
+            ? tr(
+                "deepsky.folder_instruction_destination",
+                "Un clic abre una carpeta. Nada se selecciona hasta pulsar «Guardar aquí».",
+            )
+            : tr(
+                "deepsky.folder_instruction_source",
+                "Un clic abre una carpeta. Nada se selecciona hasta pulsar «Usar esta carpeta».",
+            );
+        const overlay = document.createElement("div");
+        overlay.id = "ds-folder-picker";
+        overlay.setAttribute("role", "dialog");
+        overlay.setAttribute("aria-modal", "true");
+        overlay.setAttribute("aria-labelledby", "ds-folder-picker-title");
+        overlay.innerHTML = `
+            <section class="ds-folder-picker-shell">
+                <header class="ds-folder-picker-head">
+                    <div>
+                        <span>${escapeHtml(purpose === "destination"
+                            ? tr("deepsky.folder_destination_kicker", "DESTINO DE LA SESIÓN")
+                            : tr("deepsky.folder_source_kicker", "ORIGEN DE LAS TOMAS"))}</span>
+                        <strong id="ds-folder-picker-title">${escapeHtml(title || tr("deepsky.folder_choose_title", "Elegir carpeta"))}</strong>
+                    </div>
+                    <button type="button" id="ds-folder-picker-close" class="ds-mini-btn" aria-label="${escapeHtml(tr("general.cancel", "Cancelar"))}">
+                        <svg class="zas-icon zas-icon-inline"><use href="#icon-cross"></use></svg>
+                    </button>
+                </header>
+                <div class="ds-folder-picker-pathbar">
+                    <button type="button" id="ds-folder-picker-parent" class="ds-folder-nav-button">
+                        <svg class="zas-icon zas-icon-inline"><use href="#icon-folder"></use></svg>
+                        ${escapeHtml(tr("deepsky.folder_up", "Subir"))}
+                    </button>
+                    <code id="ds-folder-picker-current">—</code>
+                    <button type="button" id="ds-folder-picker-new" class="ds-folder-nav-button">
+                        <svg class="zas-icon zas-icon-inline"><use href="#icon-plus"></use></svg>
+                        ${escapeHtml(tr("deepsky.folder_new", "Nueva carpeta"))}
+                    </button>
+                </div>
+                <div id="ds-folder-picker-shortcuts" class="ds-folder-picker-shortcuts"></div>
+                <label class="ds-folder-picker-search">
+                    <span>${escapeHtml(tr("deepsky.folder_filter", "Filtrar carpetas"))}</span>
+                    <input id="ds-folder-picker-query" type="search" autocomplete="off"
+                        placeholder="${escapeHtml(tr("deepsky.folder_filter_placeholder", "Escribe parte del nombre…"))}">
+                </label>
+                <p class="ds-folder-picker-instruction">${escapeHtml(instruction)}</p>
+                <form id="ds-folder-name-editor" class="ds-folder-name-editor" hidden>
+                    <label for="ds-folder-name-input" id="ds-folder-name-label">${escapeHtml(tr("deepsky.folder_new", "Nueva carpeta"))}</label>
+                    <input id="ds-folder-name-input" type="text" autocomplete="off" maxlength="180">
+                    <button type="button" id="ds-folder-name-cancel" class="secondary">${escapeHtml(tr("general.cancel", "Cancelar"))}</button>
+                    <button type="submit" id="ds-folder-name-submit">${escapeHtml(tr("deepsky.folder_create", "Crear"))}</button>
+                    <span id="ds-folder-name-error" role="alert"></span>
+                </form>
+                <div id="ds-folder-picker-list" class="ds-folder-picker-list" role="list"></div>
+                <div id="ds-folder-picker-status" class="ds-folder-picker-status" role="status" aria-live="polite"></div>
+                <footer class="ds-folder-picker-footer">
+                    <button type="button" id="ds-folder-picker-system" class="secondary">
+                        ${escapeHtml(tr("deepsky.folder_system_picker", "Usar selector del sistema"))}
+                    </button>
+                    <span></span>
+                    <button type="button" id="ds-folder-picker-cancel" class="secondary">${escapeHtml(tr("general.cancel", "Cancelar"))}</button>
+                    <button type="button" id="ds-folder-picker-use" class="ds-folder-picker-use" disabled>
+                        ${escapeHtml(useLabel)}
+                    </button>
+                </footer>
+            </section>`;
+        document.body.appendChild(overlay);
+        const parentDialog = document.getElementById("deepsky-modal");
+        const restoreDeepSky = !!parentDialog && getComputedStyle(parentDialog).display !== "none";
+        dsSetBackgroundInert(true, overlay);
+        let listing = null;
+        let query = "";
+        let loadSerial = 0;
+        let finished = false;
+        const currentNode = overlay.querySelector("#ds-folder-picker-current");
+        const parentButton = overlay.querySelector("#ds-folder-picker-parent");
+        const newButton = overlay.querySelector("#ds-folder-picker-new");
+        const list = overlay.querySelector("#ds-folder-picker-list");
+        const shortcuts = overlay.querySelector("#ds-folder-picker-shortcuts");
+        const status = overlay.querySelector("#ds-folder-picker-status");
+        const useButton = overlay.querySelector("#ds-folder-picker-use");
+        const queryInput = overlay.querySelector("#ds-folder-picker-query");
+        const nameEditor = overlay.querySelector("#ds-folder-name-editor");
+        const nameLabel = overlay.querySelector("#ds-folder-name-label");
+        const nameInput = overlay.querySelector("#ds-folder-name-input");
+        const nameSubmit = overlay.querySelector("#ds-folder-name-submit");
+        const nameError = overlay.querySelector("#ds-folder-name-error");
+        let nameEditorMode = "create";
+        let renamePath = null;
+        const finish = value => {
+            if (finished) return;
+            finished = true;
+            overlay.remove();
+            if (restoreDeepSky && parentDialog) dsSetBackgroundInert(true, parentDialog);
+            else dsSetBackgroundInert(false);
+            resolve(value);
+        };
+        const shortcutLabel = shortcut => ({
+            home: tr("deepsky.folder_home", "Inicio"),
+            volumes: tr("deepsky.folder_volumes", "Discos y volúmenes"),
+            root: tr("deepsky.folder_system", "Sistema"),
+            drive: shortcut.label,
+        })[shortcut.kind] || shortcut.label;
+        const render = () => {
+            if (!listing) return;
+            currentNode.textContent = listing.current;
+            currentNode.title = listing.current;
+            parentButton.disabled = !listing.parent;
+            newButton.disabled = false;
+            useButton.disabled = false;
+            shortcuts.innerHTML = (listing.shortcuts || []).map(shortcut => `
+                <button type="button" data-ds-folder-shortcut="${escapeHtml(shortcut.path)}">
+                    <svg class="zas-icon zas-icon-inline"><use href="#icon-folder"></use></svg>
+                    ${escapeHtml(shortcutLabel(shortcut))}
+                </button>`).join("");
+            shortcuts.querySelectorAll("[data-ds-folder-shortcut]").forEach(button => {
+                button.addEventListener("click", () => load(button.dataset.dsFolderShortcut));
+            });
+            const normalized = query.trim().toLowerCase();
+            const entries = (listing.entries || []).filter(entry =>
+                (!entry.hidden || normalized)
+                && (!normalized || entry.name.toLowerCase().includes(normalized)));
+            list.innerHTML = entries.length
+                ? entries.map(entry => `
+                    <div role="listitem" class="ds-folder-entry-row">
+                        <button type="button" class="ds-folder-entry" data-ds-folder-entry="${escapeHtml(entry.path)}">
+                            <svg class="zas-icon"><use href="#icon-folder"></use></svg>
+                            <span><strong>${escapeHtml(entry.name)}</strong><small>${escapeHtml(entry.path)}</small></span>
+                            <b>${escapeHtml(tr("deepsky.folder_open", "Abrir"))} →</b>
+                        </button>
+                        <button type="button" class="ds-folder-rename" data-ds-folder-rename="${escapeHtml(entry.path)}"
+                            data-ds-folder-name="${escapeHtml(entry.name)}"
+                            aria-label="${escapeHtml(`${tr("deepsky.folder_rename", "Renombrar")} ${entry.name}`)}">
+                            ${escapeHtml(tr("deepsky.folder_rename", "Renombrar"))}
+                        </button>
+                    </div>`).join("")
+                : `<div class="ds-folder-picker-empty">${escapeHtml(normalized
+                    ? tr("deepsky.folder_no_match", "No hay carpetas que coincidan.")
+                    : tr("deepsky.folder_empty", "Esta carpeta no contiene subcarpetas."))}</div>`;
+            list.querySelectorAll("[data-ds-folder-entry]").forEach(button => {
+                button.addEventListener("click", () => load(button.dataset.dsFolderEntry));
+            });
+            list.querySelectorAll("[data-ds-folder-rename]").forEach(button => {
+                button.addEventListener("click", () => openNameEditor(
+                    "rename",
+                    button.dataset.dsFolderRename,
+                    button.dataset.dsFolderName,
+                ));
+            });
+            status.textContent = trFormat(
+                "deepsky.folder_current_ready",
+                { count: entries.length },
+                `${entries.length} carpeta(s) · ruta lista para confirmar`,
+            );
+        };
+        const closeNameEditor = () => {
+            nameEditor.hidden = true;
+            nameError.textContent = "";
+            renamePath = null;
+            newButton.focus();
+        };
+        const openNameEditor = (mode, path = null, currentName = "") => {
+            if (!listing) return;
+            nameEditorMode = mode;
+            renamePath = path;
+            const renaming = mode === "rename";
+            nameLabel.textContent = renaming
+                ? tr("deepsky.folder_rename_title", "Nuevo nombre de la carpeta")
+                : tr("deepsky.folder_new_title", "Nombre de la nueva carpeta");
+            nameSubmit.textContent = renaming
+                ? tr("deepsky.folder_rename", "Renombrar")
+                : tr("deepsky.folder_create", "Crear");
+            nameInput.value = currentName;
+            nameError.textContent = "";
+            nameEditor.hidden = false;
+            requestAnimationFrame(() => {
+                nameInput.focus();
+                nameInput.select();
+            });
+        };
+        const editDirectory = async () => {
+            if (!listing) return;
+            try {
+                const name = dsValidateFolderName(nameInput.value);
+                nameSubmit.disabled = true;
+                nameError.textContent = "";
+                const fixture = !!document.body.dataset.dsFolderPickerFixture;
+                const next = nameEditorMode === "rename"
+                    ? (fixture
+                        ? dsDirectoryFixtureRename(renamePath, name)
+                        : await invoke("deepsky_rename_directory", { path: renamePath, name }))
+                    : (fixture
+                        ? dsDirectoryFixtureCreate(listing.current, name)
+                        : await invoke("deepsky_create_directory", { parent: listing.current, name }));
+                listing = next;
+                query = "";
+                queryInput.value = "";
+                nameEditor.hidden = true;
+                renamePath = null;
+                render();
+                status.textContent = nameEditorMode === "rename"
+                    ? tr("deepsky.folder_renamed", "Carpeta renombrada.")
+                    : tr("deepsky.folder_created", "Carpeta creada y abierta; ya puedes confirmarla.");
+            } catch (error) {
+                nameError.textContent = String(error);
+                nameInput.focus();
+            } finally {
+                nameSubmit.disabled = false;
+            }
+        };
+        const load = async path => {
+            const serial = ++loadSerial;
+            useButton.disabled = true;
+            parentButton.disabled = true;
+            newButton.disabled = true;
+            nameEditor.hidden = true;
+            list.innerHTML = `<div class="ds-folder-picker-loading">${escapeHtml(tr("deepsky.folder_loading", "Leyendo carpetas…"))}</div>`;
+            status.textContent = tr("deepsky.folder_loading", "Leyendo carpetas…");
+            try {
+                const next = document.body.dataset.dsFolderPickerFixture
+                    ? dsDirectoryFixtureListing(path || "/Volumes")
+                    : await invoke("deepsky_browse_directories", { path: path || null });
+                if (serial !== loadSerial || finished) return;
+                listing = next;
+                query = "";
+                queryInput.value = "";
+                render();
+            } catch (error) {
+                if (serial !== loadSerial || finished) return;
+                listing = null;
+                currentNode.textContent = path || "—";
+                list.innerHTML = `<div class="ds-folder-picker-error">${escapeHtml(String(error))}</div>`;
+                status.textContent = tr(
+                    "deepsky.folder_error_hint",
+                    "No se pudo abrir esa ruta. Sube de nivel o usa el selector del sistema.",
+                );
+                parentButton.disabled = !path;
+                parentButton.dataset.fallbackPath = path || "";
+            }
+        };
+        parentButton.addEventListener("click", () => {
+            if (listing?.parent) load(listing.parent);
+            else if (parentButton.dataset.fallbackPath) {
+                const value = parentButton.dataset.fallbackPath;
+                const slash = Math.max(value.lastIndexOf("/"), value.lastIndexOf("\\"));
+                load(slash > 0 ? value.slice(0, slash) : null);
+            }
+        });
+        queryInput.addEventListener("input", () => {
+            query = queryInput.value;
+            render();
+        });
+        newButton.addEventListener("click", () => openNameEditor("create"));
+        nameEditor.addEventListener("submit", event => {
+            event.preventDefault();
+            editDirectory();
+        });
+        overlay.querySelector("#ds-folder-name-cancel").addEventListener("click", closeNameEditor);
+        useButton.addEventListener("click", () => finish(listing?.current || null));
+        const cancel = () => finish(null);
+        overlay.querySelector("#ds-folder-picker-close").addEventListener("click", cancel);
+        overlay.querySelector("#ds-folder-picker-cancel").addEventListener("click", cancel);
+        overlay.addEventListener("click", event => { if (event.target === overlay) cancel(); });
+        overlay.addEventListener("keydown", event => {
+            if (event.key === "Escape") {
+                event.preventDefault();
+                if (!nameEditor.hidden) closeNameEditor();
+                else cancel();
+            } else {
+                dsTrapDialogFocus(event, overlay);
+            }
+        });
+        overlay.querySelector("#ds-folder-picker-system").addEventListener("click", async () => {
+            const selected = await openDialog({
+                directory: true,
+                multiple: false,
+                recursive,
+                canCreateDirectories: true,
+                defaultPath: listing?.current || defaultPath || undefined,
+                title,
+            });
+            const path = dsNormalizeDialogPath(selected);
+            if (path) finish(path);
+        });
+        requestAnimationFrame(() => overlay.querySelector("#ds-folder-picker-close")?.focus());
+        load(defaultPath);
+    });
 }
 
 function dsRenderSections(force = false) {
@@ -12536,9 +13234,18 @@ function dsRenderSections(force = false) {
         </span>`;
     };
     workBtn.addEventListener("click", async () => {
-        const dir = await openDialog({ directory: true, multiple: false, title: tr("deepsky.work_dir_pick", "Carpeta de trabajo y salida (cachés, masters y exportaciones)") });
-        if (dir === null) return;
-        if (dir) localStorage.setItem("zas_ds_workdir", dir);
+        const current = localStorage.getItem("zas_ds_workdir")
+            || localStorage.getItem("zas_ds_last_destination_dir")
+            || null;
+        const dir = await dsChooseDirectory({
+            purpose: "destination",
+            defaultPath: current,
+            recursive: true,
+            title: tr("deepsky.work_dir_pick", "Carpeta de trabajo y salida (cachés, masters y exportaciones)"),
+        });
+        if (!dir) return;
+        localStorage.setItem("zas_ds_workdir", dir);
+        localStorage.setItem("zas_ds_last_destination_dir", dir);
         await renderWorkDir();
         dsSchedulePreflight(true);
         log("INFO", `Carpeta de trabajo: ${dir}`);
@@ -12734,7 +13441,7 @@ function dsMetaBits(files) {
     return bits;
 }
 
-function dsSessionIdentity(file) {
+function dsAutomaticSessionIdentity(file) {
     const signatureSession = file?.signature?.session;
     if (signatureSession) return String(signatureSession);
     const observed = String(file?.date_obs || file?.dateObs || "");
@@ -12742,6 +13449,17 @@ function dsSessionIdentity(file) {
     const match = String(file?.path || file?.name || "").match(/20\d{2}[-_]\d{2}[-_]\d{2}/);
     if (match) return match[0].replaceAll("_", "-");
     return tr("deepsky.unknown_session", "Sesión sin fecha");
+}
+
+function dsSessionIdentity(file) {
+    const groups = dsFileGroups(file);
+    // Si el usuario combina una regla temporal con otra semántica
+    // (`2026, Ha`), la noche completa sigue siendo la identidad primaria.
+    // La etiqueta Ha continúa disponible como filtro/chip, pero no vuelve a
+    // fusionar en un solo lote tomas de días distintos.
+    const custom = groups.find(group => /^(?:19|20)\d{2}-\d{2}-\d{2}$/.test(group))
+        || groups[0];
+    return custom || dsAutomaticSessionIdentity(file);
 }
 
 function dsPreparedSessionEntries() {
@@ -12766,16 +13484,15 @@ function dsFormatIntegrationSeconds(seconds) {
 }
 
 let dsSessionOrganizerExpanded = false;
+let dsCalibrationSearch = "";
 
-// Roles de calibración de la tabla. `linkable` marca los que el backend sabe
-// forzar por asignación manual (`DeepSkyCalibrationOverride`): flats y darks se
-// ligan de verdad; dark-flats y bias se emparejan por firma y aquí sólo se
-// informan, para no ofrecer un desplegable que no cambiaría nada.
+// Roles de calibración de la tabla. Los cuatro viajan como rutas explícitas al
+// backend y vuelven a validarse allí; ningún desplegable es sólo decorativo.
 const DS_CALIBRATION_ROLES = [
     { kind: "flats", labelKey: "deepsky.step_flat_s", fallback: "Flats", icon: "icon-lightbulb", linkable: true },
     { kind: "darks", labelKey: "deepsky.step_dark_s", fallback: "Darks", icon: "icon-moon", linkable: true },
-    { kind: "darkFlats", labelKey: "deepsky.step_dark_flat_s", fallback: "Dark-flats", icon: "icon-moon", linkable: false },
-    { kind: "bias", labelKey: "deepsky.step_bias_s", fallback: "Bias", icon: "icon-film", linkable: false },
+    { kind: "darkFlats", labelKey: "deepsky.step_dark_flat_s", fallback: "Dark-flats", icon: "icon-moon", linkable: true },
+    { kind: "bias", labelKey: "deepsky.step_bias_s", fallback: "Bias", icon: "icon-film", linkable: true },
 ];
 
 // Una fila por (noche × filtro × exposición): la unidad real de emparejamiento,
@@ -12810,25 +13527,132 @@ function dsCalibrationRows(lights) {
 // noche y filtro, darks/dark-flats por exposición, bias único. Mismo criterio
 // de agrupación que usa el backend para publicar sus lotes.
 function dsCalibrationBlockLabel(kind, file) {
+    const session = dsSessionIdentity(file);
     if (kind === "flats") {
         const filter = dsFilterOfFile(file);
         const filterLabel = filter ? dsFilterLabel(filter) : tr("deepsky.broadband", "Banda ancha");
-        return `${dsSessionIdentity(file)} · ${filterLabel}`;
+        return `${session} · ${filterLabel} · ${dsFmtExp(file.exptime ?? null)}`;
     }
-    if (kind === "darks" || kind === "darkFlats") return dsFmtExp(file.exptime ?? null);
-    return tr("deepsky.session_all", "Todos");
+    if (kind === "darks" || kind === "darkFlats") {
+        return `${session} · ${dsFmtCalibrationExposure(file.exptime ?? null)}`;
+    }
+    return session;
+}
+
+function dsFmtCalibrationExposure(value) {
+    const exposure = Number(value);
+    if (!Number.isFinite(exposure)) return "exposición sin verificar";
+    if (exposure < 0.01) return `${exposure.toFixed(5)} s`;
+    if (exposure < 1) return `${exposure.toFixed(3)} s`;
+    if (exposure < 10) return `${exposure.toFixed(2)} s`;
+    return `${exposure.toFixed(exposure < 100 ? 1 : 0)} s`;
+}
+
+function dsDarkFlatSessionLabel(files) {
+    const session = dsSessionIdentity(files[0]);
+    const measured = files
+        .map(file => Number(file?.signature?.exposureSeconds ?? file?.exptime))
+        .filter(Number.isFinite)
+        .sort((left, right) => left - right);
+    const exposures = measured.reduce((groups, value) => {
+        if (!groups.some(existing => dsExactExposureMatch(existing, value))) groups.push(value);
+        return groups;
+    }, []);
+    if (!exposures.length) {
+        return `${session} · ${tr("deepsky.exposure_unverified", "exposición sin verificar")}`;
+    }
+    if (exposures.length === 1) return `${session} · ${dsFmtCalibrationExposure(exposures[0])}`;
+    return trFormat(
+        "deepsky.dark_flat_session_exposures",
+        {
+            session,
+            count: exposures.length,
+            first: dsFmtCalibrationExposure(exposures[0]),
+            last: dsFmtCalibrationExposure(exposures.at(-1)),
+        },
+        `${session} · ${exposures.length} exposiciones (${dsFmtCalibrationExposure(exposures[0])}–${dsFmtCalibrationExposure(exposures.at(-1))})`,
+    );
+}
+
+function dsCalibrationBlockIdentity(kind, file) {
+    const signature = file.signature || {};
+    const common = {
+        kind,
+        session: dsSessionIdentity(file),
+        geometry: [file.w, file.h, file.ch],
+        storeLayout: file.storeLayout || null,
+        camera: signature.camera ?? null,
+        sensor: signature.sensor ?? null,
+        readMode: signature.readMode ?? null,
+        gain: signature.gain ?? file.gain ?? null,
+        iso: signature.iso ?? null,
+        offset: signature.offset ?? null,
+        binning: [signature.binningX ?? file.binning ?? null, signature.binningY ?? file.binning ?? null],
+        roi: signature.roi ?? null,
+        cfaPattern: signature.cfaPattern ?? file.bayer ?? null,
+        cfaPhase: signature.cfaPhase ?? null,
+        adcBits: signature.adcBits ?? null,
+        whiteLevelAdu: signature.whiteLevelAdu ?? null,
+    };
+    if (kind === "flats") {
+        common.filter = dsFilterToken(signature.filter || file.filter);
+        common.opticalTrain = signature.opticalTrain ?? null;
+        common.exposureSeconds = signature.exposureSeconds ?? file.exptime ?? null;
+    } else if (kind === "darks" || kind === "darkFlats") {
+        common.exposureSeconds = signature.exposureSeconds ?? file.exptime ?? null;
+        if (kind === "darkFlats") {
+            const temperature = Number(signature.temperatureC ?? file.temp);
+            common.temperatureC = Number.isFinite(temperature)
+                ? Math.round(temperature * 10) / 10
+                : null;
+        }
+    }
+    return JSON.stringify(common);
+}
+
+function dsCalibrationBlockHash(value) {
+    let hash = 2166136261;
+    for (let index = 0; index < value.length; index += 1) {
+        hash ^= value.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
 }
 
 // Bloques derivados de los ficheros cargados. Los ids no dependen del preflight
 // —el ligado manual viaja al backend como rutas explícitas—, así que la tabla
 // puede ligar antes de que exista un plan preparado.
 function dsCalibrationBlocks(kind) {
+    if (kind === "darkFlats") {
+        const sessions = new Map();
+        for (const file of dsMatchedCalib(kind)) {
+            const session = dsSessionIdentity(file);
+            if (!sessions.has(session)) sessions.set(session, []);
+            sessions.get(session).push(file);
+        }
+        return [...sessions.entries()]
+            .map(([session, files]) => ({
+                id: `${kind}:${session}:${dsCalibrationBlockHash(`${kind}|${session}`)}`,
+                kind,
+                label: dsDarkFlatSessionLabel(files),
+                files: files.sort((left, right) =>
+                    String(left.path || left.name).localeCompare(String(right.path || right.name))),
+            }))
+            .sort((left, right) => left.label.localeCompare(right.label));
+    }
     const blocks = new Map();
     for (const file of dsMatchedCalib(kind)) {
         const label = dsCalibrationBlockLabel(kind, file);
-        const id = `${kind}:${label}`;
-        if (!blocks.has(id)) blocks.set(id, { id, kind, label, files: [] });
-        blocks.get(id).files.push(file);
+        const identity = dsCalibrationBlockIdentity(kind, file);
+        if (!blocks.has(identity)) {
+            blocks.set(identity, {
+                id: `${kind}:${label}:${dsCalibrationBlockHash(identity)}`,
+                kind,
+                label,
+                files: [],
+            });
+        }
+        blocks.get(identity).files.push(file);
     }
     return [...blocks.values()].sort((a, b) => a.label.localeCompare(b.label));
 }
@@ -12851,9 +13675,14 @@ function dsBlockFitsRow(kind, block, row) {
     }
     if (kind === "darkFlats") {
         // Un dark-flat empareja con la exposición de los FLATS, no con la de los
-        // lights: se contrasta contra los flats compatibles con esta fila.
-        const flatExposures = dsCalibrationBlocks("flats")
-            .filter(flatBlock => dsBlockFitsRow("flats", flatBlock, row))
+        // lights. Si ya hay un flat ligado se contrasta contra ESE bloque; así
+        // cambiar de flat actualiza de inmediato los candidatos dark-flat.
+        const flatChoice = dsCalibrationChoice(row.key, "flats");
+        const flatBlocks = dsCalibrationBlocks("flats");
+        const relevantFlats = flatChoice && !["auto", "skip"].includes(flatChoice)
+            ? flatBlocks.filter(flatBlock => flatBlock.id === flatChoice)
+            : flatBlocks.filter(flatBlock => dsBlockFitsRow("flats", flatBlock, row));
+        const flatExposures = relevantFlats
             .flatMap(flatBlock => flatBlock.files.map(file => Number(file.exptime)))
             .filter(Number.isFinite);
         if (!flatExposures.length) return false;
@@ -12861,6 +13690,146 @@ function dsBlockFitsRow(kind, block, row) {
             .some(exposure => dsExactExposureMatch(Number(file.exptime), exposure)));
     }
     return true; // bias: no hay exposición que casar
+}
+
+function dsFlatReuseSignatureComplete(light, flat) {
+    if (!light || !flat || light.w !== flat.w || light.h !== flat.h || light.ch !== flat.ch) {
+        return false;
+    }
+    const left = light.signature || {};
+    const right = flat.signature || {};
+    const presentEqual = (field) => left[field] !== null && left[field] !== undefined
+        && right[field] !== null && right[field] !== undefined
+        && JSON.stringify(left[field]) === JSON.stringify(right[field]);
+    const gainOrIso = (left.gain !== null && left.gain !== undefined)
+        || (right.gain !== null && right.gain !== undefined)
+        ? presentEqual("gain")
+        : presentEqual("iso");
+    const filterEqual = Boolean(dsFilterToken(left.filter || light.filter))
+        && dsFilterToken(left.filter || light.filter) === dsFilterToken(right.filter || flat.filter);
+    const cfaRequired = Boolean(left.cfaPattern || right.cfaPattern || light.bayer || flat.bayer);
+    const cfaEqual = !cfaRequired
+        || ((left.cfaPattern || light.bayer) === (right.cfaPattern || flat.bayer)
+            && presentEqual("cfaPhase"));
+    return ["camera", "sensor", "readMode", "binningX", "binningY", "roi", "opticalTrain"]
+        .every(presentEqual)
+        && gainOrIso
+        && filterEqual
+        && cfaEqual
+        && light.storeLayout
+        && flat.storeLayout
+        && JSON.stringify(light.storeLayout) === JSON.stringify(flat.storeLayout);
+}
+
+// Clasificación preliminar de un flat de otra noche. `attestable=true` significa
+// que no existe un mismatch conocido y sólo faltan campos de identidad que el
+// usuario puede confirmar. Los campos radiométricos/CFA nunca se certifican a
+// mano; si faltan o difieren, el lote permanece no seguro.
+function dsFlatReuseAttestationStatus(light, flat) {
+    if (!light || !flat || light.w !== flat.w || light.h !== flat.h || light.ch !== flat.ch) {
+        return { possible: false, attestable: false, missing: [], reason: "geometría distinta" };
+    }
+    if (!light.storeLayout || !flat.storeLayout
+        || JSON.stringify(light.storeLayout) !== JSON.stringify(flat.storeLayout)) {
+        return { possible: false, attestable: false, missing: [], reason: "CFA/store layout ausente o distinto" };
+    }
+    const left = light.signature || {};
+    const right = flat.signature || {};
+    const missing = [];
+    const exactRequired = (field, label = field) => {
+        if (left[field] === null || left[field] === undefined
+            || right[field] === null || right[field] === undefined) {
+            return { ok: false, reason: `${label} ausente` };
+        }
+        return JSON.stringify(left[field]) === JSON.stringify(right[field])
+            ? { ok: true }
+            : { ok: false, reason: `${label} distinto` };
+    };
+    const attestableIdentity = (field, label = field) => {
+        if (left[field] === null || left[field] === undefined
+            || right[field] === null || right[field] === undefined) {
+            missing.push(label);
+            return { ok: true };
+        }
+        return JSON.stringify(left[field]) === JSON.stringify(right[field])
+            ? { ok: true }
+            : { ok: false, reason: `${label} distinto` };
+    };
+    const critical = [
+        exactRequired("binningX"),
+        exactRequired("binningY"),
+        exactRequired("offset"),
+    ];
+    if (left.gain !== null && left.gain !== undefined
+        || right.gain !== null && right.gain !== undefined) {
+        critical.push(exactRequired("gain"));
+    } else {
+        critical.push(exactRequired("iso"));
+    }
+    const leftFilter = dsFilterToken(left.filter || light.filter);
+    const rightFilter = dsFilterToken(right.filter || flat.filter);
+    critical.push(leftFilter && rightFilter && leftFilter === rightFilter
+        ? { ok: true }
+        : { ok: false, reason: "filtro ausente o distinto" });
+    if (left.cfaPattern || right.cfaPattern || light.bayer || flat.bayer) {
+        critical.push(
+            (left.cfaPattern || light.bayer) === (right.cfaPattern || flat.bayer)
+                ? { ok: true }
+                : { ok: false, reason: "patrón CFA distinto" },
+            exactRequired("cfaPhase", "fase CFA"),
+        );
+    }
+    const failedCritical = critical.find(result => !result.ok);
+    if (failedCritical) {
+        return { possible: false, attestable: false, missing: [], reason: failedCritical.reason };
+    }
+    const identity = [
+        attestableIdentity("camera", "cámara"),
+        attestableIdentity("sensor", "sensor"),
+        attestableIdentity("readMode", "modo de lectura"),
+        attestableIdentity("roi", "ROI"),
+        attestableIdentity("opticalTrain", "tren óptico"),
+        attestableIdentity("adcBits", "ADC"),
+        attestableIdentity("whiteLevelAdu", "nivel blanco"),
+    ];
+    const failedIdentity = identity.find(result => !result.ok);
+    if (failedIdentity) {
+        return { possible: false, attestable: false, missing: [], reason: failedIdentity.reason };
+    }
+    return { possible: true, attestable: missing.length > 0, missing, reason: "" };
+}
+
+function dsBlockAssignmentTier(kind, block, row) {
+    if (!dsBlockFitsRow(kind, block, row)) return "forcedUnsafe";
+    if (kind !== "flats") return "preliminaryCandidate";
+    const sessions = [...new Set(block.files.map(dsSessionIdentity))];
+    if (sessions.includes(row.night)) {
+        const statuses = row.lights.flatMap(light =>
+            block.files.map(flat => dsFlatReuseAttestationStatus(light, flat)));
+        return statuses.length
+            && statuses.every(status => status.possible && !status.attestable)
+            ? "automaticExact"
+            : "preliminaryCandidate";
+    }
+    // La noche sólo orienta. Para otra fecha exigimos una firma completa en
+    // cada par light↔flat y un lote suficiente para medir estabilidad. El
+    // backend vuelve a leer hasta siete flats, calcula su fingerprint 32×24 y
+    // es la única autoridad que puede conservar `ValidatedReuse`.
+    if (block.files.length >= 3
+        && row.lights.length > 0
+        && row.lights.every(light => block.files.every(flat => dsFlatReuseSignatureComplete(light, flat)))) {
+        return "validatedReuse";
+    }
+    if (block.files.length >= 3 && row.lights.length > 0) {
+        const statuses = row.lights.flatMap(light =>
+            block.files.map(flat => dsFlatReuseAttestationStatus(light, flat)));
+        if (statuses.length && statuses.every(status => status.possible)) {
+            return statuses.some(status => status.attestable)
+                ? "userVerifiable"
+                : "validatedReuse";
+        }
+    }
+    return "forcedUnsafe";
 }
 
 function dsCalibrationChoice(rowKey, kind) {
@@ -12874,6 +13843,9 @@ function dsPruneCalibAssignments(rows) {
     for (const key of [...dsCalibAssignments.keys()]) {
         if (!validRows.has(key)) dsCalibAssignments.delete(key);
     }
+    for (const key of [...dsScientificAttestations.keys()]) {
+        if (!validRows.has(key)) dsScientificAttestations.delete(key);
+    }
     const validBlocks = new Set(DS_CALIBRATION_ROLES
         .flatMap(role => dsCalibrationBlocks(role.kind).map(block => block.id)));
     for (const [key, assignment] of dsCalibAssignments) {
@@ -12882,6 +13854,10 @@ function dsPruneCalibAssignments(rows) {
             if (choice !== "skip" && !validBlocks.has(choice)) delete assignment[kind];
         }
         if (!Object.keys(assignment).length) dsCalibAssignments.delete(key);
+        const flatChoice = assignment.flats;
+        if (!flatChoice || flatChoice === "skip" || !validBlocks.has(flatChoice)) {
+            dsScientificAttestations.delete(key);
+        }
     }
     for (const id of [...dsDisabledCalibBatches]) {
         if (!validBlocks.has(id)) dsDisabledCalibBatches.delete(id);
@@ -12905,7 +13881,12 @@ function dsRenderSessionOrganizer() {
     dsPruneCalibAssignments(allRows);
     const blocksByKind = new Map(DS_CALIBRATION_ROLES
         .map(role => [role.kind, dsCalibrationBlocks(role.kind)]));
-    const visibleRows = dsSessionOrganizerExpanded ? allRows : allRows.slice(0, 8);
+    const normalizedSearch = dsCalibrationSearch.trim().toLowerCase();
+    const filteredRows = normalizedSearch
+        ? allRows.filter(row => `${row.night} ${dsFilterLabel(row.filter)} ${row.expKey}`
+            .toLowerCase().includes(normalizedSearch))
+        : allRows;
+    const visibleRows = dsSessionOrganizerExpanded ? filteredRows : filteredRows.slice(0, 8);
 
     // Desplegable de un rol ligable: Auto · cada bloque compatible · el resto de
     // bloques agrupados aparte · Omitir. El recuento va en la propia opción para
@@ -12914,71 +13895,137 @@ function dsRenderSessionOrganizer() {
         const blocks = (blocksByKind.get(role.kind) || [])
             .filter(block => !dsDisabledCalibBatches.has(block.id));
         const choice = dsCalibrationChoice(row.key, role.kind);
-        const fitting = blocks.filter(block => dsBlockFitsRow(role.kind, block, row));
-        const others = blocks.filter(block => !dsBlockFitsRow(role.kind, block, row));
-        const option = (block) => `<option value="${escapeHtml(block.id)}"${choice === block.id ? " selected" : ""}>${escapeHtml(block.label)} · ${block.files.length}</option>`;
-        const autoLabel = fitting.length
-            ? `${tr("deepsky.linker_auto", "Auto (por firma)")} · ${fitting.length}`
+        const exact = blocks.filter(block => dsBlockAssignmentTier(role.kind, block, row) === "automaticExact");
+        const reusable = blocks.filter(block => dsBlockAssignmentTier(role.kind, block, row) === "validatedReuse");
+        const verifiable = blocks.filter(block => dsBlockAssignmentTier(role.kind, block, row) === "userVerifiable");
+        const candidates = blocks.filter(block => dsBlockAssignmentTier(role.kind, block, row) === "preliminaryCandidate");
+        const unsafe = blocks.filter(block => dsBlockAssignmentTier(role.kind, block, row) === "forcedUnsafe");
+        const option = (block, tier) => {
+            const prefix = tier === "automaticExact"
+                ? tr("deepsky.tier_exact", "Exacto")
+                : tier === "validatedReuse"
+                    ? tr("deepsky.tier_reusable", "Reutilizable validado")
+                    : tier === "userVerifiable"
+                        ? tr("deepsky.tier_user_verifiable", "Puede comprobarse")
+                    : tier === "preliminaryCandidate"
+                        ? tr("deepsky.tier_candidate", "Candidato · validar")
+                    : tr("deepsky.tier_unsafe", "Forzado no seguro");
+            return `<option value="${escapeHtml(block.id)}"${choice === block.id ? " selected" : ""}>${escapeHtml(prefix)} · ${escapeHtml(block.label)} · ${block.files.length}</option>`;
+        };
+        const automaticCount = exact.length + reusable.length + candidates.length;
+        const autoLabel = automaticCount
+            ? `${tr("deepsky.linker_auto", "Auto (por firma)")} · ${automaticCount}`
             : `${tr("deepsky.linker_auto", "Auto (por firma)")} · 0`;
         const parts = [`<option value="auto"${choice === "auto" ? " selected" : ""}>${escapeHtml(autoLabel)}</option>`];
-        if (fitting.length) {
-            parts.push(`<optgroup label="${escapeHtml(tr("deepsky.blocks_compatible", "Bloques compatibles"))}">${fitting.map(option).join("")}</optgroup>`);
+        if (exact.length) {
+            parts.push(`<optgroup label="${escapeHtml(tr("deepsky.tier_exact", "Exacto"))}">${exact.map(block => option(block, "automaticExact")).join("")}</optgroup>`);
         }
-        if (others.length) {
-            parts.push(`<optgroup label="${escapeHtml(tr("deepsky.blocks_other", "Otras firmas"))}">${others.map(option).join("")}</optgroup>`);
+        if (reusable.length) {
+            parts.push(`<optgroup label="${escapeHtml(tr("deepsky.tier_reusable", "Reutilizable validado"))}">${reusable.map(block => option(block, "validatedReuse")).join("")}</optgroup>`);
         }
-        const skipLabel = role.kind === "flats"
-            ? tr("deepsky.linker_skip_flats", "Omitir flats")
-            : tr("deepsky.linker_skip_darks", "Omitir darks");
+        if (verifiable.length) {
+            parts.push(`<optgroup label="${escapeHtml(tr("deepsky.tier_user_verifiable", "Puede comprobarse"))}">${verifiable.map(block => option(block, "userVerifiable")).join("")}</optgroup>`);
+        }
+        if (candidates.length) {
+            parts.push(`<optgroup label="${escapeHtml(tr("deepsky.tier_candidate", "Candidato · validar"))}">${candidates.map(block => option(block, "preliminaryCandidate")).join("")}</optgroup>`);
+        }
+        if (unsafe.length) {
+            parts.push(`<optgroup label="${escapeHtml(tr("deepsky.tier_unsafe", "Forzado no seguro"))}">${unsafe.map(block => option(block, "forcedUnsafe")).join("")}</optgroup>`);
+        }
+        const skipLabel = {
+            flats: tr("deepsky.linker_skip_flats", "Omitir flats"),
+            darks: tr("deepsky.linker_skip_darks", "Omitir darks"),
+            darkFlats: tr("deepsky.linker_skip_dark_flats", "Omitir dark-flats"),
+            bias: tr("deepsky.linker_skip_bias", "Omitir bias"),
+        }[role.kind];
         parts.push(`<option value="skip"${choice === "skip" ? " selected" : ""}>${escapeHtml(skipLabel)}</option>`);
         const linked = choice !== "auto";
         return `<select class="ds-sel ds-link-sel${linked ? " is-linked" : ""}" data-ds-link="${escapeHtml(row.key)}" data-ds-role="${role.kind}" aria-label="${escapeHtml(`${tr(role.labelKey, role.fallback)} · ${row.night}`)}">${parts.join("")}</select>`;
     };
 
-    // Rol informativo (dark-flats / bias): el backend los empareja por firma y
-    // no admite asignación manual, así que se muestra el recuento compatible y
-    // el estado resuelto en vez de un desplegable inerte.
-    const statusCell = (role, row, resolved) => {
-        const blocks = (blocksByKind.get(role.kind) || [])
-            .filter(block => !dsDisabledCalibBatches.has(block.id));
-        const fitting = blocks.filter(block => dsBlockFitsRow(role.kind, block, row));
-        const count = fitting.reduce((sum, block) => sum + block.files.length, 0);
-        const state = resolved ? "confirmed" : "pending";
-        const detail = resolved
-            ? tr("deepsky.signature_confirmed", "firma y exposición confirmadas")
-            : `${count} ${tr("deepsky.candidates", "candidatos")}`;
-        return `<span class="ds-calibration-chip ${state}" title="${escapeHtml(detail)}"><svg class="zas-icon zas-icon-inline" aria-hidden="true"><use href="#${resolved ? "icon-check" : "icon-search"}"></use></svg> ${escapeHtml(detail)}</span>`;
-    };
-
     const rowsHtml = visibleRows.map((row) => {
         const strict = strictEntries.get(row.night);
         const decisions = row.lights.map(light => decisionsByPath.get(light.path)).filter(Boolean);
-        const resolvedAll = decisions.length === row.lights.length && decisions.length > 0;
-        const darkFlatsResolved = resolvedAll
-            && decisions.every(decision => decision.darkFlatMasterPath || decision.dark_flat_master_path);
-        const biasResolved = resolvedAll
-            && decisions.every(decision => decision.biasMasterPath || decision.bias_master_path);
         const flatsStrict = Boolean(strict && Number(strict.flatCount) > 0);
         const darksStrict = Boolean(strict && strict.darks && strict.darks !== "—");
-        const state = flatsStrict && darksStrict ? "confirmed" : "pending";
-        const stateDetail = flatsStrict && darksStrict
-            ? tr("deepsky.signature_confirmed", "firma y exposición confirmadas")
-            : tr("deepsky.signature_pending_short", "firma pendiente");
+        const chosenTiers = DS_CALIBRATION_ROLES.map(({ kind }) => {
+            const choice = dsCalibrationChoice(row.key, kind);
+            if (choice === "auto") return null;
+            if (choice === "skip") return ["flats", "darks"].includes(kind) ? "skipped" : null;
+            const block = (blocksByKind.get(kind) || []).find(item => item.id === choice);
+            if (!block) return "forcedUnsafe";
+            const tier = dsBlockAssignmentTier(kind, block, row);
+            if (tier === "userVerifiable" && dsScientificAttestations.get(row.key)?.confirmed) {
+                return "userVerified";
+            }
+            return tier === "preliminaryCandidate" ? null : tier;
+        }).filter(Boolean);
+        const backendTiers = decisions
+            .map(decision => decision.assignmentTier || decision.assignment_tier)
+            .filter(Boolean);
+        const tiers = [...chosenTiers, ...backendTiers];
+        const rowTier = tiers.includes("forcedUnsafe")
+            ? "forcedUnsafe"
+            : tiers.includes("skipped")
+                ? "skipped"
+            : tiers.includes("userVerified")
+                ? "userVerified"
+            : tiers.includes("validatedReuse")
+                ? "validatedReuse"
+                : flatsStrict && darksStrict
+                    ? "automaticExact"
+                    : "pending";
+        const state = rowTier === "forcedUnsafe"
+            ? "unsafe"
+            : rowTier === "skipped"
+                ? "unsafe"
+            : rowTier === "userVerified"
+                ? "verified"
+            : rowTier === "validatedReuse"
+                ? "reusable"
+                : rowTier === "automaticExact"
+                    ? "confirmed"
+                    : "pending";
+        const stateDetail = rowTier === "forcedUnsafe"
+            ? tr("deepsky.tier_unsafe", "Forzado no seguro")
+            : rowTier === "skipped"
+                ? tr("deepsky.tier_skipped", "Calibración omitida")
+            : rowTier === "userVerified"
+                ? tr("deepsky.tier_user_verified", "Comprobado por ti")
+            : rowTier === "validatedReuse"
+                ? tr("deepsky.tier_reusable", "Reutilizable validado")
+                : rowTier === "automaticExact"
+                    ? tr("deepsky.tier_exact", "Exacto")
+                    : tr("deepsky.signature_pending_short", "firma pendiente");
         const exposureLabel = row.expKey === "?" ? "—" : dsFmtExp(Number(row.expKey));
         const integration = row.lights.reduce((sum, light) => sum + (Number(light.exptime) || 0), 0);
+        const flatChoice = dsCalibrationChoice(row.key, "flats");
+        const flatBlock = (blocksByKind.get("flats") || []).find(item => item.id === flatChoice);
+        const requiresAttestation = flatBlock
+            && dsBlockAssignmentTier("flats", flatBlock, row) === "userVerifiable";
+        const attestation = dsScientificAttestations.get(row.key);
+        const verificationRow = requiresAttestation
+            ? `<tr class="ds-verification-row" data-ds-verification-row="${escapeHtml(row.key)}"><td colspan="8">
+                <label class="ds-user-verification">
+                    <input type="checkbox" data-ds-scientific-attestation="${escapeHtml(row.key)}"${attestation?.confirmed ? " checked" : ""}>
+                    <span><strong>${tr("deepsky.verify_scientific_title", "Confirmar este flat como científicamente equivalente")}</strong>
+                    <small>${tr("deepsky.verify_scientific_body", "Confirmo que entre ambas noches no cambiaron cámara/sensor, modo de lectura, ROI, ADC ni tren óptico. Zenith seguirá bloqueando cualquier diferencia medible de geometría, gain/ISO, offset, binning, CFA, filtro o estabilidad del lote.")}</small></span>
+                </label>
+            </td></tr>`
+            : "";
         return `<tr data-ds-row="${escapeHtml(row.key)}">
-            <td class="ds-wbpp-group">
+            <td class="ds-wbpp-group" data-label="${escapeHtml(tr("deepsky.linker_night", "Noche (lights)"))}">
                 <strong>${escapeHtml(row.night)}</strong>
                 <span>${row.lights.length} lights · ${dsFormatIntegrationSeconds(integration)}</span>
             </td>
-            <td><span class="ds-filter-badge">${escapeHtml(dsFilterLabel(row.filter) || tr("deepsky.broadband", "Banda ancha"))}</span></td>
-            <td class="ds-wbpp-exp">${escapeHtml(exposureLabel)}</td>
-            <td>${linkSelect(DS_CALIBRATION_ROLES[0], row)}</td>
-            <td>${linkSelect(DS_CALIBRATION_ROLES[1], row)}</td>
-            <td>${statusCell(DS_CALIBRATION_ROLES[2], row, darkFlatsResolved)}</td>
-            <td>${statusCell(DS_CALIBRATION_ROLES[3], row, biasResolved)}</td>
-            <td><span class="ds-calibration-chip ${state}" title="${escapeHtml(stateDetail)}">${escapeHtml(stateDetail)}</span></td>
-        </tr>`;
+            <td data-label="${escapeHtml(tr("deepsky.linker_filter", "Filtro"))}"><span class="ds-filter-badge">${escapeHtml(dsFilterLabel(row.filter) || tr("deepsky.broadband", "Banda ancha"))}</span></td>
+            <td class="ds-wbpp-exp" data-label="${escapeHtml(tr("deepsky.exposure", "Exposición"))}">${escapeHtml(exposureLabel)}</td>
+            <td data-label="${escapeHtml(tr("deepsky.step_flat_s", "Flats"))}">${linkSelect(DS_CALIBRATION_ROLES[0], row)}</td>
+            <td data-label="${escapeHtml(tr("deepsky.step_dark_s", "Darks"))}">${linkSelect(DS_CALIBRATION_ROLES[1], row)}</td>
+            <td data-label="${escapeHtml(tr("deepsky.step_dark_flat_s", "Dark-flats"))}">${linkSelect(DS_CALIBRATION_ROLES[2], row)}</td>
+            <td data-label="${escapeHtml(tr("deepsky.step_bias_s", "Bias"))}">${linkSelect(DS_CALIBRATION_ROLES[3], row)}</td>
+            <td class="ds-wbpp-state" data-label="${escapeHtml(tr("deepsky.state", "Estado"))}"><span class="ds-calibration-chip ${state}" title="${escapeHtml(stateDetail)}">${escapeHtml(stateDetail)}</span></td>
+        </tr>${verificationRow}`;
     }).join("");
 
     const blockChips = DS_CALIBRATION_ROLES.flatMap(role => (blocksByKind.get(role.kind) || [])
@@ -12987,10 +14034,10 @@ function dsRenderSessionOrganizer() {
             <span>${escapeHtml(tr(role.labelKey, role.fallback))} · ${escapeHtml(block.label)} · ${block.files.length}</span>
         </label>`)).join("");
 
-    const toggle = allRows.length > 8
+    const toggle = filteredRows.length > 8
         ? `<button type="button" id="ds-session-toggle" class="ds-session-toggle">${dsSessionOrganizerExpanded
             ? tr("deepsky.groups_show_less", "Mostrar menos grupos")
-            : trFormat("deepsky.groups_show_all", { count: allRows.length }, `Mostrar los ${allRows.length} grupos`)}</button>`
+            : trFormat("deepsky.groups_show_all", { count: filteredRows.length }, `Mostrar los ${filteredRows.length} grupos`)}</button>`
         : "";
     const nights = new Set(allRows.map(row => row.night));
     panel.hidden = false;
@@ -12998,7 +14045,7 @@ function dsRenderSessionOrganizer() {
         <header class="ds-session-organizer-head">
             <div>
                 <strong>${tr("deepsky.sessions_title", "Noches y calibración")}</strong>
-                <span>${tr("deepsky.wbpp_hint", "Una fila por noche, filtro y exposición. Elige el bloque de flats o darks que quieres ligar a cada grupo, o déjalo en Auto para que la firma decida.")}</span>
+                <span>${tr("deepsky.wbpp_hint", "Una fila por noche, filtro y exposición. Puedes ligar flats, darks, dark-flats y bias; Auto deja que la firma decida. Si un flat correcto es de otra noche, Zenith te pedirá una confirmación explícita sólo para la identidad ausente.")}</span>
             </div>
             <div class="ds-session-summary">
                 <b>${nights.size} ${nights.size === 1 ? tr("deepsky.night", "noche") : tr("deepsky.nights", "noches")}</b>
@@ -13007,6 +14054,13 @@ function dsRenderSessionOrganizer() {
                 <b>${dsFormatIntegrationSeconds(totalExposure)}</b>
             </div>
         </header>
+        <div class="ds-linker-tools">
+            <input id="ds-calibration-search" type="search"
+                value="${escapeHtml(dsCalibrationSearch)}"
+                placeholder="${escapeHtml(tr("deepsky.calibration_search", "Buscar noche, filtro o exposición…"))}"
+                aria-label="${escapeHtml(tr("deepsky.calibration_search", "Buscar noche, filtro o exposición…"))}">
+            <button type="button" id="ds-apply-calibration-nights">${tr("deepsky.apply_compatible_nights", "Aplicar a noches compatibles")}</button>
+        </div>
         <div class="ds-wbpp-scroll">
             <table class="ds-wbpp-table">
                 <thead><tr>
@@ -13019,7 +14073,7 @@ function dsRenderSessionOrganizer() {
                     <th>${tr("deepsky.step_bias_s", "Bias")}</th>
                     <th>${tr("deepsky.state", "Estado")}</th>
                 </tr></thead>
-                <tbody>${rowsHtml}</tbody>
+                <tbody>${rowsHtml || `<tr><td colspan="8" style="padding:16px;text-align:center;color:#94a3b8;">${tr("deepsky.calibration_search_empty", "No hay grupos que coincidan con la búsqueda.")}</td></tr>`}</tbody>
             </table>
         </div>${toggle}
         ${blockChips ? `<details class="ds-block-list"${dsDisabledCalibBatches.size ? " open" : ""}>
@@ -13030,20 +14084,128 @@ function dsRenderSessionOrganizer() {
         dsSessionOrganizerExpanded = !dsSessionOrganizerExpanded;
         dsRenderSessionOrganizer();
     });
+    panel.querySelector("#ds-calibration-search")?.addEventListener("input", event => {
+        dsCalibrationSearch = event.target.value;
+        dsSessionOrganizerExpanded = false;
+        dsRenderSessionOrganizer();
+        const replacement = document.getElementById("ds-calibration-search");
+        replacement?.focus();
+        if (replacement) replacement.setSelectionRange(replacement.value.length, replacement.value.length);
+    });
+    panel.querySelector("#ds-apply-calibration-nights")?.addEventListener("click", () => {
+        const source = allRows.find(row => {
+            const assignment = dsCalibAssignments.get(row.key);
+            return assignment && Object.values(assignment).some(value => value && value !== "auto");
+        });
+        if (!source) {
+            showCustomAlert(
+                tr("deepsky.calibrations_title", "Calibraciones por lote y noche"),
+                tr("deepsky.apply_compatible_pick", "Elige primero un bloque en una fila; después podrás aplicarlo a noches compatibles."),
+            );
+            return;
+        }
+        const sourceAssignment = dsCalibAssignments.get(source.key) || {};
+        let applied = 0;
+        for (const row of allRows) {
+            if (row.key === source.key || row.filter !== source.filter || row.expKey !== source.expKey) continue;
+            const nextAssignment = { ...(dsCalibAssignments.get(row.key) || {}) };
+            let changed = false;
+            for (const kind of DS_CALIBRATION_ROLES.map(role => role.kind)) {
+                const choice = sourceAssignment[kind];
+                if (!choice || choice === "auto" || choice === "skip") continue;
+                const block = (blocksByKind.get(kind) || []).find(item => item.id === choice);
+                const tier = block ? dsBlockAssignmentTier(kind, block, row) : "forcedUnsafe";
+                if (!block || tier === "forcedUnsafe") continue;
+                nextAssignment[kind] = choice;
+                if (kind === "flats"
+                    && tier === "userVerifiable"
+                    && dsScientificAttestations.get(source.key)?.confirmed) {
+                    dsScientificAttestations.set(row.key, {
+                        confirmed: true,
+                        reason: `confirmación propagada desde ${source.night}`,
+                    });
+                }
+                changed = true;
+            }
+            if (changed) {
+                dsCalibAssignments.set(row.key, nextAssignment);
+                applied += 1;
+            }
+        }
+        dsSchedulePreflight(true);
+        dsRenderSessionOrganizer();
+        showCustomAlert(
+            tr("deepsky.calibrations_title", "Calibraciones por lote y noche"),
+            trFormat(
+                "deepsky.apply_compatible_done",
+                { count: applied },
+                applied
+                    ? `Asignación aplicada a ${applied} noche(s) con firma preliminar compatible. El backend volverá a validar cada light.`
+                    : "No había otras noches compatibles para esa firma.",
+            ),
+        );
+    });
     panel.querySelectorAll("select[data-ds-link]").forEach(select => {
-        select.addEventListener("change", () => {
+        select.addEventListener("change", async () => {
             const key = select.dataset.dsLink;
             const kind = select.dataset.dsRole;
+            const row = allRows.find(item => item.key === key);
+            const block = (blocksByKind.get(kind) || []).find(item => item.id === select.value);
+            const tier = row && block ? dsBlockAssignmentTier(kind, block, row) : null;
+            if (tier === "forcedUnsafe") {
+                const accepted = await showCustomChoice(
+                    tr("general.warning", "Aviso"),
+                    tr(
+                        "deepsky.force_unsafe_confirm",
+                        "Este lote no coincide con la firma preliminar. Zenith lo registrará como no seguro, no lo aplicará como calibración científica y desactivará NebulaFusion/EIDR. ¿Conservar esta elección para auditarla?",
+                    ),
+                );
+                if (!accepted) {
+                    dsRenderSessionOrganizer();
+                    return;
+                }
+            }
             const assignment = dsCalibAssignments.get(key) || {};
             if (select.value === "auto") delete assignment[kind];
             else assignment[kind] = select.value;
+            if (kind === "flats" && tier !== "userVerifiable") {
+                dsScientificAttestations.delete(key);
+            }
             if (Object.keys(assignment).length) dsCalibAssignments.set(key, assignment);
             else dsCalibAssignments.delete(key);
             // Re-render: la compatibilidad de dark-flats depende de los flats
             // elegidos, así que la fila entera puede cambiar de estado.
+            dsSchedulePreflight(true);
             dsRenderSessionOrganizer();
             document.querySelector(`select[data-ds-link="${CSS.escape(key)}"][data-ds-role="${kind}"]`)?.focus();
+        });
+    });
+    panel.querySelectorAll("input[data-ds-scientific-attestation]").forEach(checkbox => {
+        checkbox.addEventListener("change", async () => {
+            const key = checkbox.dataset.dsScientificAttestation;
+            const row = allRows.find(item => item.key === key);
+            if (!row) return;
+            if (checkbox.checked) {
+                const accepted = await showCustomChoice(
+                    tr("general.warning", "Aviso"),
+                    tr(
+                        "deepsky.verify_scientific_confirm",
+                        "Esta confirmación es una declaración científica: aseguras que entre las dos noches no cambió cámara/sensor, modo de lectura, ROI, ADC ni tren óptico. Zenith todavía comprobará geometría, gain/ISO, offset, binning, CFA, filtro y estabilidad del flat. Si cualquiera falla, el lote seguirá bloqueado. ¿Confirmar?",
+                    ),
+                );
+                if (!accepted) {
+                    checkbox.checked = false;
+                    return;
+                }
+                dsScientificAttestations.set(key, {
+                    confirmed: true,
+                    reason: `${row.night} · ${dsFilterLabel(row.filter)} · equivalencia de identidad confirmada por el usuario`,
+                });
+            } else {
+                dsScientificAttestations.delete(key);
+            }
             dsSchedulePreflight(true);
+            dsRenderSessionOrganizer();
         });
     });
     panel.querySelectorAll("input[data-ds-batch]").forEach(checkbox => {
@@ -13051,8 +14213,8 @@ function dsRenderSessionOrganizer() {
             const id = checkbox.dataset.dsBatch;
             if (checkbox.checked) dsDisabledCalibBatches.delete(id);
             else dsDisabledCalibBatches.add(id);
-            dsRenderSessionOrganizer();
             dsSchedulePreflight(true);
+            dsRenderSessionOrganizer();
         });
     });
 }
@@ -13071,14 +14233,24 @@ function dsRenderCalibrationPlan(container, lights) {
 
     const chip = (icon, color, label, count, detail, status) => {
         const col = status === "ok" ? "#34d399" : status === "candidate" ? "#7dd3fc" : status === "warn" ? "#fbbf24" : "#64748b";
-        const mark = status === "ok" ? "✓" : status === "candidate" ? "?" : status === "warn" ? "⚠︎" : "—"; // aviso en texto (VS15)
+        const statusIcon = status === "ok" ? "icon-check" : status === "candidate" ? "icon-search" : status === "warn" ? "icon-warning" : "";
+        const statusLabel = status === "ok"
+            ? tr("deepsky.status_ready", "Listo")
+            : status === "candidate"
+                ? tr("deepsky.status_candidate", "Candidato")
+                : status === "warn"
+                    ? tr("deepsky.status_warning", "Revisar")
+                    : tr("general.not_applicable", "No aplica");
+        const mark = statusIcon
+            ? `<svg class="zas-icon" aria-hidden="true" style="width:15px;height:15px;"><use href="#${statusIcon}"></use></svg>`
+            : "—";
         return `<div style="display:flex; align-items:center; gap:9px; padding:7px 13px; background:rgba(15,23,42,0.55); border:1px solid ${status === "warn" ? "rgba(245,158,11,0.35)" : "rgba(255,255,255,0.07)"}; border-radius:11px; flex:1 1 190px; min-width:170px;">
             <svg class="zas-icon" style="width:16px;height:16px;color:${color};"><use href="#${icon}"></use></svg>
             <div style="min-width:0; flex:1;">
                 <div style="font-size:0.72rem; color:#e2e8f0; font-weight:600;">${label}</div>
                 <div style="font-size:0.63rem; color:${status === "warn" ? "#fbbf24" : "#94a3b8"};">${count} ${detail}</div>
             </div>
-            <span style="color:${col}; font-weight:700; font-size:0.9rem;">${mark}</span>
+            <span role="img" aria-label="${escapeHtml(statusLabel)}" style="color:${col}; font-weight:700; font-size:0.9rem;">${mark}</span>
         </div>`;
     };
 
@@ -13164,10 +14336,10 @@ function dsRenderCalibrationPlan(container, lights) {
     }).join("");
 
     const note = warned
-        ? `<div style="font-size:0.62rem; color:#fbbf24; margin-top:2px;">⚠︎ ${tr("deepsky.plan_scale_note", "Hay darks de otra exposición. No se aceptarán ni escalarán salvo que el backend valide pedestal, ausencia de amp glow, linealidad, correlación y residuo.")}</div>`
+        ? `<div style="font-size:0.62rem; color:#fbbf24; margin-top:2px;"><svg class="zas-icon zas-icon-inline" aria-hidden="true"><use href="#icon-warning"></use></svg> ${tr("deepsky.plan_scale_note", "Hay darks de otra exposición. No se aceptarán ni escalarán salvo que el backend valide pedestal, ausencia de amp glow, linealidad, correlación y residuo.")}</div>`
         : "";
     const darkFlatNote = darkFlatWarned
-        ? `<div style="font-size:0.62rem; color:#fbbf24; margin-top:2px;">⚠︎ ${tr("deepsky.plan_dark_flat_note", "Los dark-flats no coinciden con la exposición de los flats. La política Strict bloqueará la calibración incompatible.")}</div>`
+        ? `<div style="font-size:0.62rem; color:#fbbf24; margin-top:2px;"><svg class="zas-icon zas-icon-inline" aria-hidden="true"><use href="#icon-warning"></use></svg> ${tr("deepsky.plan_dark_flat_note", "Los dark-flats no coinciden con la exposición de los flats. La política Strict bloqueará la calibración incompatible.")}</div>`
         : "";
     // Una sesión multibanda coordina varios masters sin mezclar sus muestras.
     const mixNote = distinctFilters.length >= 2
@@ -13197,7 +14369,7 @@ function dsUpdateMultibandControls() {
     const panel = document.getElementById("ds-multiband-options");
     if (!panel) return;
     const groups = dsIntegrationGroups(dsActiveLights());
-    const multiband = groups.length > 1;
+    const multiband = groups.length > 1 && !dsCometEnabled();
     panel.hidden = !multiband;
     const summary = document.getElementById("ds-multiband-summary");
     if (summary) {
@@ -13215,9 +14387,11 @@ function dsUpdateMultibandControls() {
             : tr("deepsky.multiband_waiting", "Se mostrará cuando Zenith detecte dos o más perfiles espectrales.");
     }
     const runLabel = document.querySelector("#btn-deepsky-run span");
-    if (runLabel) runLabel.textContent = multiband
-        ? tr("deepsky.run_multiband", "Apilar sesión multibanda")
-        : tr("deepsky.run", "Apilar Cielo Profundo");
+    if (runLabel) runLabel.textContent = dsCometEnabled()
+        ? tr("deepsky.run_comet", "Apilar estrellas y cometa")
+        : multiband
+            ? tr("deepsky.run_multiband", "Apilar sesión multibanda")
+            : tr("deepsky.run", "Apilar Cielo Profundo");
 }
 
 function dsRenderSessionResult(result) {
@@ -13229,6 +14403,13 @@ function dsRenderSessionResult(result) {
         const outputs = Object.entries(group.componentPaths || {})
             .map(([name, path]) => `<li><b>${escapeHtml(name)}</b><span title="${escapeHtml(path)}">${escapeHtml(path.split(/[\\/]/).pop())}</span></li>`)
             .join("");
+        const productOutputs = (group.products || []).map(product => {
+            const master = String(product.masterFits || "").split(/[\\/]/).pop();
+            const sampling = product.product === "classic"
+                ? `Drizzle ${Number(product.effectiveDrizzle || 1).toFixed(0)}×`
+                : `${tr("deepsky.output_scale", "salida")} ${Number(product.outputScale || 1).toFixed(Number(product.outputScale || 1) % 1 ? 2 : 0)}× · ${tr("deepsky.internal_grid", "rejilla interna")} 1×`;
+            return `<li><b>${escapeHtml(product.id)}${product.primary ? ` · ${tr("deepsky.primary_short", "Principal")}` : ""}</b><span title="${escapeHtml(product.masterFits || "")}">${escapeHtml(sampling)}${master ? ` · ${escapeHtml(master)}` : ""}</span></li>`;
+        }).join("");
         const recommendations = (q.recommendations || []).map(item => `<li>${escapeHtml(item)}</li>`).join("");
         // Manifiesto científico tipado del grupo: productos SCI/VAR/NEFF/DQ y
         // diagnósticos con geometría y unidades, más fallbacks y avisos. Nunca
@@ -13271,6 +14452,7 @@ function dsRenderSessionResult(result) {
         return `<article class="ds-quality-card">
             <div class="ds-quality-head"><div><strong>${escapeHtml(dsFilterLabel(group.filterProfile))}</strong><span>${trFormat("deepsky.quality_frame_counts", { used: group.framesUsed, rejected: group.framesRejected }, `${group.framesUsed} usadas · ${group.framesRejected} rechazadas`)}</span></div><b data-grade="${escapeHtml(grade)}">${gradeLabel}</b></div>
             <div class="ds-quality-metrics"><span>${tr("deepsky.quality_coverage", "Cobertura")} <b>${Number(q.coveragePercent || 0).toFixed(1)}%</b></span><span>${tr("deepsky.quality_rejection", "Rechazo")} <b>${Number(q.rejectionPercent || 0).toFixed(1)}%</b></span><span>${tr("deepsky.quality_background_noise", "Ruido de fondo")} <b>${Number(q.backgroundNoise || 0).toFixed(2)}</b></span></div>
+            ${productOutputs ? `<ul class="ds-output-list">${productOutputs}</ul>` : ""}
             ${outputs ? `<ul class="ds-output-list">${outputs}</ul>` : ""}
             ${bundleBlock}
             <ul class="ds-quality-recommendations">${recommendations}</ul>
@@ -13300,16 +14482,249 @@ function dsRenderSessionResult(result) {
 let dsActivePreset = "auto";
 let dsWizardStep = 0;
 let dsPreparedPlan = null;
+let dsSessionRevision = 0;
+let dsPreparedPlanRevision = -1;
 let dsPreflightSerial = 0;
 let dsPreflightTimer = null;
 let dsFrameInspection = [];
+let dsCometDetection = null;
 // Ligado MANUAL de calibración por GRUPO (`noche|filtro|exposición`, la misma
-// unidad que muestra la tabla): clave → { flats, darks } con valores id de
-// bloque o "skip"; ausente = automático por firma. Los bloques se derivan de los
-// ficheros cargados (`dsCalibrationBlocks`), así que ligar no exige un plan
-// preparado y el override viaja al backend como rutas explícitas.
+// unidad que muestra la tabla): clave → { flats, darks, darkFlats, bias } con
+// valores id de bloque o "skip"; ausente = automático por firma. Los bloques
+// se derivan de los ficheros cargados (`dsCalibrationBlocks`), así que ligar no
+// exige un plan preparado y el override viaja al backend como rutas explícitas.
 const dsCalibAssignments = new Map();
+// La certificación del usuario NO reemplaza la validación del backend. Sólo
+// permite completar identidad extendida ausente (sensor/read-mode/ROI/tren)
+// en flats de otra noche; geometría, gain/ISO, binning, CFA, filtro y el
+// fingerprint del lote siguen siendo gates medidos.
+const dsScientificAttestations = new Map();
 const dsDisabledCalibBatches = new Set();
+let dsExperienceMode = localStorage.getItem("zas_ds_experience") === "expert"
+    ? "expert"
+    : "essential";
+
+function dsMountCalibrationControls() {
+    const slot = document.getElementById("ds-calibration-controls-slot");
+    const controls = document.getElementById("ds-calibration-options");
+    if (!slot || !controls || controls.parentElement === slot) return;
+    controls.classList.add("ds-calibration-step-controls");
+    slot.appendChild(controls);
+}
+
+// La elección de salidas es una decisión principal, también en Esencial.
+// Sólo los parámetros internos de cada motor permanecen dentro de Experto.
+function dsMountProductControls() {
+    const slot = document.getElementById("ds-product-controls-slot");
+    const grid = document.getElementById("ds-product-grid");
+    const primary = document.getElementById("sel-ds-primary-product")?.closest(".ds-primary-row");
+    const hint = document.getElementById("ds-product-selection-hint");
+    const summary = document.getElementById("ds-product-combination-summary");
+    const compatibility = document.getElementById("ds-product-compatibility");
+    const eligibility = document.getElementById("ds-method-eligibility");
+    if (!slot || !grid || grid.parentElement === slot) return;
+    slot.append(grid);
+    if (primary) slot.append(primary);
+    if (hint) slot.append(hint);
+    if (summary) slot.append(summary);
+    if (compatibility) slot.append(compatibility);
+    if (eligibility) slot.append(eligibility);
+}
+
+function dsSetExperienceMode(mode, persist = true) {
+    dsExperienceMode = mode === "expert" ? "expert" : "essential";
+    const modal = document.getElementById("deepsky-modal");
+    if (modal) modal.dataset.experience = dsExperienceMode;
+    document.querySelectorAll("#deepsky-modal [data-ds-experience]").forEach(button => {
+        button.setAttribute("aria-pressed", String(button.dataset.dsExperience === dsExperienceMode));
+    });
+    const customNotice = document.getElementById("ds-custom-essential-state");
+    if (customNotice) {
+        customNotice.hidden = !(dsExperienceMode === "essential" && dsActivePreset === "custom");
+    }
+    dsRenderRecipeImpact(dsPreparedPlan);
+    dsRenderGuide(dsPreparedPlan);
+    dsSyncComputePolicyUi({ refresh: true });
+    if (persist) localStorage.setItem("zas_ds_experience", dsExperienceMode);
+}
+
+async function dsOpenCometPreview(observation) {
+    let overlay = document.getElementById("ds-comet-preview");
+    overlay?.remove();
+    const previousFocus = document.activeElement;
+    const parentDialog = document.getElementById("deepsky-modal");
+    const restoreDeepSky = !!parentDialog && getComputedStyle(parentDialog).display !== "none";
+    overlay = document.createElement("div");
+    overlay.id = "ds-comet-preview";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-labelledby", "ds-comet-preview-title");
+    overlay.style.cssText = "position:fixed;inset:0;z-index:12000;background:rgba(2,6,23,.9);display:flex;align-items:center;justify-content:center;padding:24px;";
+    overlay.innerHTML = `<div style="width:min(1040px,94vw);max-height:92vh;display:flex;flex-direction:column;gap:10px;padding:12px;border:1px solid #334155;border-radius:14px;background:#0f172a;">
+        <div style="display:flex;align-items:center;gap:10px;color:#cbd5e1;font-size:.72rem;">
+            <b id="ds-comet-preview-title" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(pathBaseName(observation.framePath))}</b>
+            <span style="color:#94a3b8;margin-left:auto;">X ${Number(observation.registeredX).toFixed(1)} · Y ${Number(observation.registeredY).toFixed(1)}</span>
+            <button type="button" id="ds-comet-preview-close" class="secondary" style="width:auto;padding:6px 12px;">${tr("deepsky.close", "Cerrar")}</button>
+        </div>
+        <div id="ds-comet-preview-body" style="min-height:260px;display:grid;place-items:center;color:#94a3b8;">${tr("deepsky.loading_frame", "Cargando y estirando la toma…")}</div>
+        <small style="color:#94a3b8;line-height:1.45;">${tr("deepsky.comet_registered_note", "Las coordenadas pertenecen a la cuadrícula registrada por estrellas. Corrígelas en la fila y confirma el núcleo.")}</small>
+    </div>`;
+    document.body.appendChild(overlay);
+    dsSetBackgroundInert(true, overlay);
+    const closePreview = () => {
+        overlay.remove();
+        if (restoreDeepSky && parentDialog) dsSetBackgroundInert(true, parentDialog);
+        else dsSetBackgroundInert(false);
+        previousFocus?.focus?.();
+    };
+    overlay.addEventListener("click", event => {
+        if (event.target === overlay) closePreview();
+    });
+    overlay.querySelector("#ds-comet-preview-close")?.addEventListener("click", closePreview);
+    overlay.addEventListener("keydown", event => {
+        if (event.key === "Escape") { event.preventDefault(); closePreview(); return; }
+        if (event.key !== "Tab") return;
+        const focusable = [...overlay.querySelectorAll("button:not([disabled]),[href],input:not([disabled]),[tabindex='0']")]
+            .filter(element => element.offsetParent !== null);
+        if (!focusable.length) return;
+        const first = focusable[0];
+        const last = focusable.at(-1);
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    });
+    overlay.querySelector("#ds-comet-preview-close")?.focus();
+    try {
+        const src = await invoke("deepsky_frame_preview", {
+            path: observation.framePath,
+            strength: dsFrameViewerStretch / 100,
+            balanced: dsFrameViewerBalance,
+        });
+        const body = overlay.querySelector("#ds-comet-preview-body");
+        if (body) body.innerHTML = `<img src="${escapeHtml(src)}" alt="Vista registrada para confirmar el núcleo del cometa" style="max-width:100%;max-height:72vh;object-fit:contain;border-radius:9px;">`;
+    } catch (error) {
+        const body = overlay.querySelector("#ds-comet-preview-body");
+        if (body) body.textContent = String(error);
+    }
+}
+
+async function dsRefitCometFromConfirmed() {
+    if (!dsCometDetection?.observations?.length) return;
+    const keys = dsCometDetection.keyObservationIndices || [];
+    if (!keys.length || !keys.every(index => dsCometDetection.observations[index]?.confirmed)) {
+        dsRenderCometDetection();
+        dsSchedulePreflight(true);
+        return;
+    }
+    try {
+        const trajectory = await invoke("fit_deepsky_comet_trajectory", {
+            observations: dsCometDetection.observations,
+        });
+        dsCometDetection.trajectory = trajectory;
+        dsCometDetection.observations = dsCometDetection.observations.map((observation, index) => {
+            if (observation.confirmed) return observation;
+            const dt = observation.timestampUnix - trajectory.epochUnix;
+            return {
+                ...observation,
+                registeredX: trajectory.xAtEpoch + trajectory.velocityXPxS * dt,
+                registeredY: trajectory.yAtEpoch + trajectory.velocityYPxS * dt,
+            };
+        });
+        dsCometDetection.valid = trajectory.confidence >= 0.72 && trajectory.rmsPx <= 3;
+        dsCometDetection.requiresConfirmation = false;
+        dsCometDetection.reasons = dsCometDetection.valid
+            ? []
+            : [tr("deepsky.comet_low_confidence", "La trayectoria aún tiene baja confianza; revisa las coordenadas.")];
+    } catch (error) {
+        dsCometDetection.valid = false;
+        dsCometDetection.reasons = [String(error)];
+    }
+    dsRenderCometDetection();
+    dsSchedulePreflight(true);
+}
+
+function dsRenderCometDetection() {
+    const panel = document.getElementById("ds-comet-panel");
+    const status = document.getElementById("ds-comet-status");
+    const keyframes = document.getElementById("ds-comet-keyframes");
+    if (panel) panel.hidden = !dsCometEnabled();
+    if (!status || !keyframes) return;
+    keyframes.innerHTML = "";
+    if (!dsCometDetection?.observations?.length) {
+        status.textContent = tr("deepsky.comet_pending", "Detecta y confirma el núcleo en la primera, central y última toma.");
+        status.dataset.state = "pending";
+        return;
+    }
+    const trajectory = dsCometDetection.trajectory;
+    const confidence = Number(trajectory?.confidence || 0);
+    const rms = Number(trajectory?.rmsPx || 0);
+    const reasons = (dsCometDetection.reasons || []).join(" · ");
+    status.dataset.state = dsCometDetection.valid ? "ready" : "review";
+    status.textContent = `${tr("deepsky.comet_trajectory", "Trayectoria")} · ${Math.round(confidence * 100)}% · RMS ${rms.toFixed(2)} px${reasons ? ` · ${reasons}` : ""}`;
+    const labels = [
+        tr("deepsky.comet_first", "Primera"),
+        tr("deepsky.comet_middle", "Central"),
+        tr("deepsky.comet_last", "Última"),
+    ];
+    [...new Set(dsCometDetection.keyObservationIndices || [])].forEach((index, order) => {
+        const observation = dsCometDetection.observations[index];
+        if (!observation) return;
+        const row = document.createElement("div");
+        row.className = "ds-comet-point";
+        row.dataset.index = String(index);
+        row.innerHTML = `
+            <b title="${escapeHtml(observation.framePath)}">${escapeHtml(labels[order] || pathBaseName(observation.framePath))} · ${escapeHtml(pathBaseName(observation.framePath))}</b>
+            <input type="number" step="0.1" data-comet-axis="x" value="${Number(observation.registeredX).toFixed(2)}" aria-label="X">
+            <input type="number" step="0.1" data-comet-axis="y" value="${Number(observation.registeredY).toFixed(2)}" aria-label="Y">
+            <button type="button" class="secondary" data-comet-preview style="width:auto;min-height:36px;padding:6px 10px;">${tr("deepsky.comet_view", "Ver")}</button>
+            <label><input type="checkbox" data-comet-confirm ${observation.confirmed ? "checked" : ""}> ${tr("deepsky.comet_confirm", "Confirmar")}</label>`;
+        row.querySelector("[data-comet-preview]")?.addEventListener("click", () => dsOpenCometPreview(observation));
+        row.querySelectorAll("[data-comet-axis]").forEach(input => {
+            input.addEventListener("change", () => {
+                const value = Number(input.value);
+                if (Number.isFinite(value)) {
+                    if (input.dataset.cometAxis === "x") observation.registeredX = value;
+                    else observation.registeredY = value;
+                }
+                dsRefitCometFromConfirmed();
+            });
+        });
+        row.querySelector("[data-comet-confirm]")?.addEventListener("change", event => {
+            observation.confirmed = event.target.checked;
+            dsRefitCometFromConfirmed();
+        });
+        keyframes.appendChild(row);
+    });
+}
+
+async function dsDetectComet() {
+    const button = document.getElementById("btn-ds-detect-comet");
+    const status = document.getElementById("ds-comet-status");
+    const lights = dsActiveLights().filter(frame => !dsDiscardedPaths.has(frame.path));
+    if (lights.length < 5) {
+        if (status) status.textContent = tr("deepsky.comet_need_lights", "Añade al menos cinco lights con DATE-OBS para resolver una trayectoria robusta.");
+        return;
+    }
+    if (button) button.disabled = true;
+    if (status) status.textContent = tr("deepsky.comet_detecting", "Registrando muestras y buscando movimiento…");
+    try {
+        dsCometDetection = await invoke("detect_deepsky_comet", {
+            lights: lights.map(frame => frame.path),
+        });
+    } catch (error) {
+        dsCometDetection = {
+            valid: false,
+            requiresConfirmation: true,
+            observations: [],
+            trajectory: null,
+            keyObservationIndices: [],
+            reasons: [String(error)],
+        };
+    } finally {
+        if (button) button.disabled = false;
+    }
+    dsRenderCometDetection();
+    dsSchedulePreflight(true);
+}
 
 // Diagnósticos globales de la última inspección: predicción de dithering
 // (walking noise) y patrón de detector. Los publica inspect_deepsky_frames.
@@ -13367,6 +14782,91 @@ function dsEnsureCaptureModeOptions() {
     select.insertBefore(option, dualBandOsc);
 }
 
+function dsIntegrationMethodForProduct(product) {
+    const value = (id, fallback) => document.getElementById(id)?.value ?? fallback;
+    const checked = (id, fallback = false) => document.getElementById(id)?.checked ?? fallback;
+    if (product === "classic") {
+        return {
+            method: "classic",
+            version: 1,
+            legacyLocalFwhm: checked("chk-ds-localw", false),
+        };
+    }
+    if (product === "eidr") {
+        return {
+            method: "eidr",
+            scale: value("sel-ds-eidrscale", "auto"),
+            solveMode: value("sel-ds-eidrmode", "scientificQuadratic"),
+            cfaDirect: checked("chk-ds-cfadirect", false),
+            refineRegistration: checked("chk-ds-eidrrefine", false),
+        };
+    }
+    const struct = product === "struct";
+    return {
+        method: "nebula_fusion",
+        mode: struct ? "fullWithStruct" : value("sel-ds-nfmode", "lite"),
+        cfaDirect: checked("chk-ds-cfadirect", false),
+        outputBin: value("sel-ds-outputbin", "native"),
+    };
+}
+
+function dsBuildIntegrationProducts() {
+    const order = [
+        ["classic", "chk-ds-product-classic"],
+        ["nebula_fusion_sci", "chk-ds-product-nf"],
+        ["struct", "chk-ds-product-struct"],
+        ["eidr", "chk-ds-product-eidr"],
+    ];
+    const selected = order
+        .filter(([, id]) => document.getElementById(id)?.checked)
+        .map(([product]) => product);
+    const primarySelect = document.getElementById("sel-ds-primary-product");
+    let primary = primarySelect?.value || selected[0] || "";
+    if (!selected.includes(primary)) {
+        primary = selected[0] || "";
+        if (primarySelect) primarySelect.value = primary;
+    }
+    const legacy = document.getElementById("sel-ds-method");
+    if (legacy && primary) {
+        legacy.value = primary === "nebula_fusion_sci"
+            ? (document.getElementById("sel-ds-nfmode")?.value === "full"
+                ? "nebula_fusion_full"
+                : "nebula_fusion")
+            : primary === "struct" ? "nebula_fusion_struct" : primary;
+    }
+    return selected.map(product => ({
+        id: product,
+        product: product === "nebula_fusion_sci" ? "nebulaFusionSci" : product,
+        primary: product === primary,
+        method: dsIntegrationMethodForProduct(product),
+    }));
+}
+
+function dsCometEnabled() {
+    return document.getElementById("sel-ds-target-mode")?.value === "comet";
+}
+
+function dsBuildCometRequest() {
+    if (!dsCometEnabled()) return null;
+    const radius = Number(document.getElementById("num-ds-comet-radius")?.value);
+    return {
+        enabled: true,
+        observations: dsCometDetection?.observations || [],
+        trajectory: dsCometDetection?.trajectory || {
+            epochUnix: 0,
+            xAtEpoch: 0,
+            yAtEpoch: 0,
+            velocityXPxS: 0,
+            velocityYPxS: 0,
+            rmsPx: 9999,
+            confidence: 0,
+        },
+        keepSeparateLayers: document.getElementById("chk-ds-comet-layers")?.checked !== false,
+        comaRadiusPx: Number.isFinite(radius) ? radius : 96,
+        minimumConfidence: 0.72,
+    };
+}
+
 function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
     // Los descartes manuales de la inspección PSF se excluyen SIEMPRE (plan,
     // apilado individual y multibanda pasan por aquí).
@@ -13376,9 +14876,6 @@ function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
     const value = (id, fallback) => document.getElementById(id)?.value ?? fallback;
     const checked = (id, fallback = false) => document.getElementById(id)?.checked ?? fallback;
     const rejection = value("sel-ds-rejection", "sigma");
-    // Método de integración (F3): con "classic" NO se envía el campo para que el
-    // backend use el motor clásico exacto; NebulaFusion viaja como objeto camelCase.
-    const dsMethod = value("sel-ds-method", "classic");
     const pedestalRaw = value("sel-ds-pedestal", "0");
     const profile = ({ auto: "auto", fast: "fast", balanced: "balanced", max: "maximum_quality" })[dsActivePreset] || "custom";
     return {
@@ -13391,40 +14888,13 @@ function dsBuildStackRequest(lightOverride = null, filterOverride = null) {
         bias: dsCalibrationForIntegration("bias", filter).map(f => f.path),
         captureMode: value("sel-ds-capture-mode", "auto"),
         calibrationPolicy: value("sel-ds-calibration-policy", "strict"),
-        computePolicy: value("sel-ds-compute", "hybrid"),
+        // Esencial hereda Configuración general. Sólo el selector Experto
+        // puede anularla; el request siempre lleva la política ya resuelta.
+        computePolicy: dsResolvedComputePolicy(),
         profile,
         rejection,
-        ...(dsMethod === "eidr"
-            ? {
-                integrationMethod: {
-                    method: "eidr",
-                    // F9: sucesor forward-model de drizzle. La escala Auto la
-                    // decide la PSF medida + la puerta de recuperabilidad; los
-                    // fallbacks quedan en receta (nunca silenciosos).
-                    scale: value("sel-ds-eidrscale", "auto"),
-                    solveMode: value("sel-ds-eidrmode", "scientificQuadratic"),
-                    cfaDirect: checked("chk-ds-cfadirect", false),
-                    refineRegistration: checked("chk-ds-eidrrefine", false),
-                },
-            }
-            : {}),
-        ...(dsMethod === "nebula_fusion" || dsMethod === "nebula_fusion_full" || dsMethod === "nebula_fusion_struct"
-            ? {
-                integrationMethod: {
-                    method: "nebula_fusion",
-                    // F6: Full recombina por frecuencia; F7: +STRUCT valida
-                    // las estructuras por mitades (requiere >=16 tomas).
-                    mode: dsMethod === "nebula_fusion_struct"
-                        ? "fullWithStruct"
-                        : dsMethod === "nebula_fusion_full" ? "full" : "lite",
-                    // F4: CFA directo y super-binning de salida (solo viajan con
-                    // NebulaFusion; el preflight valida cfaDirect sin lights CFA
-                    // y Full+cfaDirect).
-                    cfaDirect: checked("chk-ds-cfadirect", false),
-                    outputBin: value("sel-ds-outputbin", "native"),
-                },
-            }
-            : {}),
+        integrationProducts: dsBuildIntegrationProducts(),
+        comet: dsBuildCometRequest(),
         kappaLow: parseFloat(value("num-ds-kappa-low", "3")) || 3,
         kappaHigh: parseFloat(value("num-ds-kappa-high", "3")) || 3,
         clipIters: parseInt(value("sel-ds-clipiters", "")) || null,
@@ -13457,6 +14927,12 @@ function dsBuildCalibrationOverrides(lights, filter, value) {
         }
         return (blockCache.get(kind).get(id)?.files || []).map(file => file.path);
     };
+    const blockFor = (kind, id) => {
+        if (!blockCache.has(kind)) {
+            blockCache.set(kind, new Map(dsCalibrationBlocks(kind).map(block => [block.id, block])));
+        }
+        return blockCache.get(kind).get(id) || null;
+    };
     for (const row of dsCalibrationRows(lights)) {
         const assignment = dsCalibAssignments.get(row.key);
         if (!assignment) continue;
@@ -13464,36 +14940,104 @@ function dsBuildCalibrationOverrides(lights, filter, value) {
             lights: row.lights.map(file => file.path),
             darks: [],
             flats: [],
+            darkFlats: [],
+            bias: [],
             skipFlats: false,
             skipDarks: false,
+            skipDarkFlats: false,
+            skipBias: false,
+            forceUnsafe: false,
+            userVerifiedScientific: false,
+            userVerificationReason: null,
+            reason: `${row.night} · ${dsFilterLabel(row.filter) || tr("deepsky.broadband", "Banda ancha")} · ${row.expKey}`,
         };
         let meaningful = false;
-        for (const kind of ["flats", "darks"]) {
+        for (const kind of DS_CALIBRATION_ROLES.map(role => role.kind)) {
             const choice = assignment[kind];
             if (!choice || choice === "auto") continue;
             if (choice === "skip") {
-                entry[kind === "flats" ? "skipFlats" : "skipDarks"] = true;
+                const skipKey = {
+                    flats: "skipFlats",
+                    darks: "skipDarks",
+                    darkFlats: "skipDarkFlats",
+                    bias: "skipBias",
+                }[kind];
+                entry[skipKey] = true;
                 meaningful = true;
                 continue;
             }
             const paths = blockPaths(kind, choice);
             if (paths.length) {
                 entry[kind] = paths;
+                const block = blockFor(kind, choice);
+                const tier = block ? dsBlockAssignmentTier(kind, block, row) : "forcedUnsafe";
+                if (tier === "userVerifiable") {
+                    const attestation = dsScientificAttestations.get(row.key);
+                    entry.userVerifiedScientific = Boolean(attestation?.confirmed);
+                    entry.userVerificationReason = attestation?.reason || null;
+                    if (!entry.userVerifiedScientific) entry.forceUnsafe = true;
+                } else if (tier === "forcedUnsafe") {
+                    entry.forceUnsafe = true;
+                }
                 meaningful = true;
+            }
+        }
+        // Bias y dark-flat calibran al FLAT, no sólo al light. Si el usuario
+        // deja Flats en Auto pero elige/omite uno de esos roles, materializamos
+        // dentro del override el mismo bloque de flat exacto/reutilizable que
+        // Auto habría elegido, de modo que la decisión sí llegue al ejecutor.
+        if ((entry.darkFlats.length || entry.skipDarkFlats || entry.bias.length || entry.skipBias)
+            && !entry.flats.length
+            && !entry.skipFlats) {
+            const automaticFlat = dsCalibrationBlocks("flats")
+                .filter(block => !dsDisabledCalibBatches.has(block.id))
+                .map(block => ({ block, tier: dsBlockAssignmentTier("flats", block, row) }))
+                .find(candidate => ["automaticExact", "validatedReuse", "preliminaryCandidate"].includes(candidate.tier));
+            if (automaticFlat) {
+                entry.flats = automaticFlat.block.files.map(file => file.path);
             }
         }
         if (meaningful) overrides.push(entry);
     }
     if (value("sel-ds-manual-darks", "auto") === "all") {
-        overrides.push({ lights: [], darks: dsCalibrationForIntegration("darks", filter).map(f => f.path), flats: [], skipFlats: false, skipDarks: false });
+        overrides.push({
+            lights: [],
+            darks: dsCalibrationForIntegration("darks", filter).map(f => f.path),
+            flats: [],
+            darkFlats: [],
+            bias: [],
+            skipFlats: false,
+            skipDarks: false,
+            skipDarkFlats: false,
+            skipBias: false,
+            forceUnsafe: true,
+            userVerifiedScientific: false,
+            userVerificationReason: null,
+            reason: tr("deepsky.manual_all_darks_reason", "forzado global de todos los darks"),
+        });
     }
     if (value("sel-ds-manual-flats", "auto") === "all") {
-        overrides.push({ lights: [], darks: [], flats: dsCalibrationForIntegration("flats", filter).map(f => f.path), skipFlats: false, skipDarks: false });
+        overrides.push({
+            lights: [],
+            darks: [],
+            flats: dsCalibrationForIntegration("flats", filter).map(f => f.path),
+            darkFlats: [],
+            bias: [],
+            skipFlats: false,
+            skipDarks: false,
+            skipDarkFlats: false,
+            skipBias: false,
+            forceUnsafe: true,
+            userVerifiedScientific: false,
+            userVerificationReason: null,
+            reason: tr("deepsky.manual_all_flats_reason", "forzado global de todos los flats"),
+        });
     }
     return overrides;
 }
 
 function dsIsMultibandSession() {
+    if (dsCometEnabled()) return false;
     const enabled = document.getElementById("chk-ds-multiband-session")?.checked ?? true;
     return enabled && dsIntegrationGroups(dsActiveLights()).length > 1;
 }
@@ -13565,6 +15109,7 @@ function dsFormatSessionPreflight(plan) {
                 <span>~${Math.max(1, Math.round(p.estimatedSeconds || 0))} s</span>
             </div>
             <div class="ds-component-flow"><span>${tr("deepsky.outputs", "Salidas")}:</span>${components || `<span class="ds-component-chip">${tr("deepsky.master", "Máster")}</span>`}</div>
+            ${dsFormatIntegrationBranches(p)}
             ${dsFormatSamplingAdvisor(p.samplingAdvisor)}
             ${dsFormatSessionMap(p.sessionMap)}
             ${dsFormatCalibrationDecisions(p.calibrationDecisions)}
@@ -13578,24 +15123,106 @@ function dsFormatSessionPreflight(plan) {
     <div class="ds-session-groups">${groups}</div>${alerts}`;
 }
 
-// Matriz lights↔flats por sesión (estilo PixInsight): qué flats calibran cada
-// noche de lights, con exposición total y distancia en días.
+function dsFormatIntegrationBranches(plan) {
+    const products = plan?.integrationProducts || [];
+    if (!products.length) return "";
+    const labels = {
+        classic: tr("deepsky.product_classic", "Classic"),
+        nebulaFusionSci: tr("deepsky.product_nf", "NebulaFusion SCI"),
+        struct: tr("deepsky.product_struct", "STRUCT"),
+        eidr: tr("deepsky.product_eidr", "EIDR"),
+    };
+    const rows = products.map(product => {
+        const label = labels[product.product] || product.id || product.product;
+        const drizzle = Number(product.effectiveDrizzle ?? 1);
+        const scale = Number(product.outputScale ?? drizzle);
+        const sampling = product.product === "classic"
+            ? `Drizzle ${drizzle.toFixed(drizzle % 1 ? 1 : 0)}×`
+            : `${tr("deepsky.internal_grid", "rejilla interna")} ${drizzle.toFixed(0)}× · ${tr("deepsky.output_scale", "salida")} ${scale.toFixed(scale % 1 ? 2 : 0)}×`;
+        const compute = [product.computeEngine, product.computeReason].filter(Boolean).join(" · ");
+        return `<span data-state="${product.eligible === false ? "blocked" : "ready"}"><b>${escapeHtml(label)}</b><small>${escapeHtml(sampling)} · ${tr("deepsky.separate_master", "máster separado")}</small>${compute ? `<small class="ds-product-compute"><b>${tr("deepsky.accel", "motor")}:</b> ${escapeHtml(compute)}</small>` : ""}</span>`;
+    }).join("");
+    return `<div class="ds-integration-branches">
+        <strong>${escapeHtml(trFormat(
+            "deepsky.product_parallel_title",
+            { count: products.length },
+            `${products.length} flujos paralelos · másters separados`,
+        ))}</strong>
+        <div>${rows}</div>
+    </div>`;
+}
+
+function dsRequestedIntegrationBranchPlan() {
+    const drizzle = Math.max(
+        1,
+        Math.min(3, Number(document.getElementById("sel-ds-drizzle")?.value) || 1),
+    );
+    const outputScale = product => {
+        if (product.product === "classic") return drizzle;
+        if (product.product === "eidr") {
+            return {
+                x1: 1,
+                x1_5: 1.5,
+                x2: 2,
+                auto: 2,
+            }[product.method?.scale] || 1;
+        }
+        return {
+            native: 1,
+            bin0_75: 0.75,
+            bin0_5: 0.5,
+        }[product.method?.outputBin] || 1;
+    };
+    return {
+        integrationProducts: dsBuildIntegrationProducts().map(product => ({
+            ...product,
+            eligible: true,
+            requestedDrizzle: drizzle,
+            effectiveDrizzle: product.product === "classic" ? drizzle : 1,
+            outputScale: outputScale(product),
+        })),
+    };
+}
+
+// Resumen efectivo por sesión. Consume el estado POST-override publicado por
+// el backend; por eso un flat ligado y validado deja de aparecer como “—”.
 function dsFormatSessionMap(map) {
     if (!map?.length) return "";
     const fmtExp = (s) => s >= 3600 ? `${(s / 3600).toFixed(1)} h` : s >= 60 ? `${Math.round(s / 60)} min` : `${Math.round(s)} s`;
-    const rows = map.map(e => `<tr style="border-top:1px solid rgba(148,163,184,.1);">
-        <td style="padding:4px 8px;color:#e2e8f0;">${escapeHtml(e.night)}</td>
-        <td style="padding:4px 8px;text-align:right;">${e.lights}</td>
-        <td style="padding:4px 8px;text-align:right;">${fmtExp(e.exposureSeconds || 0)}</td>
-        <td style="padding:4px 8px;color:${e.flatDistanceDays > 30 ? "#fcd34d" : "#cbd5e1"};">${e.flatNight ? `${escapeHtml(e.flatNight)} · ${e.flatCount} ${tr("deepsky.frames_lower", "tomas")}${e.flatDistanceDays > 0 && e.flatDistanceDays < 3650 ? ` · Δ${e.flatDistanceDays} d` : ""}` : "—"}</td>
-        <td style="padding:4px 8px;color:#94a3b8;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(e.darks || "")}">${escapeHtml((e.darks || "—").replace(/^darks: /, ""))}</td>
-    </tr>`).join("");
+    const roleText = (value, prefix) => escapeHtml(String(value || "—").replace(new RegExp(`^${prefix}:\\s*`, "i"), ""));
+    const stateInfo = (state) => ({
+        exact: [tr("deepsky.tier_exact", "Exacto"), "#6ee7b7", "rgba(52,211,153,.18)"],
+        validatedReuse: [tr("deepsky.tier_reusable", "Reutilizable validado"), "#67e8f9", "rgba(34,211,238,.16)"],
+        userVerified: [tr("deepsky.tier_user_verified", "Comprobado por ti"), "#c4b5fd", "rgba(167,139,250,.18)"],
+        skipped: [tr("deepsky.tier_skipped", "Calibración omitida"), "#fbbf24", "rgba(251,191,36,.14)"],
+        forcedUnsafe: [tr("deepsky.tier_unsafe", "Forzado no seguro"), "#fca5a5", "rgba(248,113,113,.16)"],
+        incomplete: [tr("deepsky.calibration_incomplete", "Opcional incompleta"), "#fcd34d", "rgba(251,191,36,.12)"],
+        blocked: [tr("deepsky.decision_blocked", "Bloqueada"), "#fca5a5", "rgba(248,113,113,.16)"],
+    }[state] || [tr("deepsky.signature_pending_short", "firma pendiente"), "#94a3b8", "rgba(148,163,184,.12)"]);
+    const rows = map.map(e => {
+        const [stateLabel, stateColor, stateBackground] = stateInfo(e.calibrationState);
+        const flatColor = ["forcedUnsafe", "blocked"].includes(e.calibrationState)
+            ? "#fca5a5"
+            : e.flatDistanceDays > 30
+                ? "#fcd34d"
+                : "#cbd5e1";
+        return `<tr style="border-top:1px solid rgba(148,163,184,.1);">
+        <td style="padding:6px 8px;color:#e2e8f0;">${escapeHtml(e.night)}</td>
+        <td style="padding:6px 8px;text-align:right;">${e.lights}</td>
+        <td style="padding:6px 8px;text-align:right;">${fmtExp(e.exposureSeconds || 0)}</td>
+        <td style="padding:6px 8px;color:${flatColor};">${e.flatNight ? `${escapeHtml(e.flatNight)} · ${e.flatCount} ${tr("deepsky.frames_lower", "tomas")}${e.flatDistanceDays > 0 && e.flatDistanceDays < 3650 ? ` · Δ${e.flatDistanceDays} d` : ""}` : "—"}</td>
+        <td style="padding:6px 8px;color:#94a3b8;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(e.darks || "")}">${roleText(e.darks, "darks")}</td>
+        <td style="padding:6px 8px;color:#94a3b8;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(e.darkFlats || "")}">${roleText(e.darkFlats, "dark-flats")}</td>
+        <td style="padding:6px 8px;color:#94a3b8;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(e.bias || "")}">${roleText(e.bias, "bias")}</td>
+        <td style="padding:6px 8px;"><span style="display:inline-flex;padding:3px 7px;border-radius:999px;color:${stateColor};background:${stateBackground};font-weight:700;white-space:nowrap;">${escapeHtml(stateLabel)}</span></td>
+    </tr>`;
+    }).join("");
     return `<div style="margin-top:10px;">
-        <div style="font-size:.62rem;color:#a5b4fc;font-weight:700;letter-spacing:.05em;margin-bottom:4px;">${tr("deepsky.session_matrix", "CALIBRACIÓN POR SESIÓN")}</div>
+        <div style="font-size:.68rem;color:#a5b4fc;font-weight:700;letter-spacing:.05em;margin-bottom:5px;">${tr("deepsky.session_matrix", "CALIBRACIÓN EFECTIVA POR SESIÓN")}</div>
         <div style="overflow:auto;border:1px solid rgba(148,163,184,.12);border-radius:8px;">
-        <table style="width:100%;border-collapse:collapse;font-size:.6rem;min-width:540px;">
+        <table style="width:100%;border-collapse:collapse;font-size:.66rem;min-width:1040px;">
             <thead style="background:#111827;color:#94a3b8;"><tr>
-                <th style="padding:4px 8px;text-align:left;">${tr("deepsky.session_night", "Noche (lights)")}</th><th style="padding:4px 8px;text-align:right;">Lights</th><th style="padding:4px 8px;text-align:right;">${tr("deepsky.exposure", "Exposición")}</th><th style="padding:4px 8px;text-align:left;">${tr("deepsky.session_flats", "Flats que aplicará")}</th><th style="padding:4px 8px;text-align:left;">Darks</th>
+                <th style="padding:6px 8px;text-align:left;">${tr("deepsky.session_night", "Noche (lights)")}</th><th style="padding:6px 8px;text-align:right;">Lights</th><th style="padding:6px 8px;text-align:right;">${tr("deepsky.exposure", "Exposición")}</th><th style="padding:6px 8px;text-align:left;">${tr("deepsky.session_flats", "Flats que aplicará")}</th><th style="padding:6px 8px;text-align:left;">Darks</th><th style="padding:6px 8px;text-align:left;">Dark-flats</th><th style="padding:6px 8px;text-align:left;">Bias</th><th style="padding:6px 8px;text-align:left;">${tr("deepsky.state", "Estado")}</th>
             </tr></thead><tbody>${rows}</tbody>
         </table></div></div>`;
 }
@@ -13609,14 +15236,31 @@ function dsFormatCalibrationDecisions(decisions) {
     const rows = visible.map(decision => {
         const ok = decision.compatible && !decision.degraded;
         const reasons = (decision.reasons || []).join(" · ");
-        const status = decision.manual
-            ? tr("deepsky.decision_manual", "Manual")
+        const tier = decision.assignmentTier || decision.assignment_tier;
+        const status = tier === "userVerified"
+            ? tr("deepsky.tier_user_verified", "Comprobado por ti")
+            : tier === "validatedReuse"
+                ? tr("deepsky.tier_reusable", "Reutilizable validado")
+                : tier === "forcedUnsafe"
+                    ? tr("deepsky.tier_unsafe", "Forzado no seguro")
+                    : tier === "skipped"
+                        ? tr("deepsky.tier_skipped", "Calibración omitida")
+                        : decision.manual
+                            ? tr("deepsky.decision_manual", "Manual validada")
             : ok
                 ? tr("deepsky.decision_exact", "Exacta")
                 : decision.degraded
                     ? tr("deepsky.decision_degraded", "Degradada")
                     : tr("deepsky.decision_blocked", "Bloqueada");
-        const color = decision.manual ? "#7dd3fc" : ok ? "#6ee7b7" : decision.degraded ? "#fcd34d" : "#fca5a5";
+        const color = tier === "userVerified"
+            ? "#c4b5fd"
+            : tier === "validatedReuse" || decision.manual
+                ? "#7dd3fc"
+                : ok
+                    ? "#6ee7b7"
+                    : decision.degraded
+                        ? "#fcd34d"
+                        : "#fca5a5";
         return `<tr style="border-top:1px solid rgba(148,163,184,.1);">
             <td style="padding:4px 8px;color:#e2e8f0;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(decision.framePath || "")}">${escapeHtml(pathBaseName(decision.framePath || ""))}</td>
             <td style="padding:4px 8px;color:${color};font-weight:700;">${status}</td>
@@ -13714,19 +15358,24 @@ function dsRenderRecipeImpact(plan) {
     }
     const members = dsPlanMembers(plan);
     const profile = dsActivePreset || "auto";
+    const essentialCustom = dsExperienceMode === "essential" && profile === "custom";
     const profileLabel = {
         auto: tr("deepsky.preset_auto_measured", "Auto (receta medida)"),
         fast: tr("deepsky.preset_fast", "Rápido"),
         balanced: tr("deepsky.preset_balanced", "Equilibrado"),
         max: tr("deepsky.preset_max", "Máxima calidad"),
-        custom: tr("deepsky.preset_custom", "Personalizado"),
+        custom: essentialCustom
+            ? tr("deepsky.expert_recipe_saved", "Configuración experta guardada")
+            : tr("deepsky.preset_custom", "Personalizado"),
     }[profile] || profile;
     const impactLabel = {
         auto: tr("deepsky.impact_auto", "Adaptado a las mediciones actuales"),
         fast: tr("deepsky.impact_fast", "Prioriza tiempo y memoria"),
         balanced: tr("deepsky.impact_balanced", "Equilibra detalle, rechazo y coste"),
         max: tr("deepsky.impact_max", "Prioriza rechazo y normalización local"),
-        custom: tr("deepsky.impact_custom", "Usa tus controles visibles"),
+        custom: essentialCustom
+            ? tr("deepsky.expert_recipe_edit_hint", "Cambia a Experto para editarla")
+            : tr("deepsky.impact_custom", "Usa tus controles visibles"),
     }[profile] || "";
     const reasons = [...new Set([
         ...(plan.recommendationReasons || []),
@@ -13872,7 +15521,7 @@ function dsFormatPreflight(plan) {
     <div style="margin:0 0 8px;padding:7px 9px;border:1px solid rgba(34,211,238,.2);border-radius:8px;background:rgba(8,145,178,.06);color:#a5f3fc;">
         <b>${tr("deepsky.recommended_profile", "Perfil recomendado")}: ${escapeHtml(recommendedLabel)}</b>
         ${recommendation ? `<div style="margin-top:3px;color:#94a3b8;line-height:1.45;">${recommendation}</div>` : ""}
-    </div>${resolvedBlock}${dsFormatSamplingAdvisor(plan.samplingAdvisor)}${alerts}${groupRows}${dsFormatSessionMap(plan.sessionMap)}${dsFormatCalibrationDecisions(plan.calibrationDecisions)}<div style="margin-top:8px;">${stages}</div>
+    </div>${resolvedBlock}${dsFormatIntegrationBranches(plan)}${dsFormatSamplingAdvisor(plan.samplingAdvisor)}${alerts}${groupRows}${dsFormatSessionMap(plan.sessionMap)}${dsFormatCalibrationDecisions(plan.calibrationDecisions)}<div style="margin-top:8px;">${stages}</div>
     ${normModel ? `<details style="margin-top:7px;"><summary style="cursor:pointer;color:#a5f3fc;">${tr("deepsky.normalization_model", "Modelo de normalización a inspeccionar")}</summary><div style="padding-top:5px;">${normModel}</div></details>` : ""}`;
 }
 
@@ -13900,6 +15549,31 @@ function dsFormatReviewPlan(plan) {
     const compactAlerts = blockerGroups.slice(0, 2)
         .map(group => `<div>• ${group.items.length > 1 ? `×${group.items.length} ` : ""}${escapeHtml(group.items[0])}</div>`)
         .join("");
+    const preparedBranchPlan = plan.integrationProducts?.length
+        ? plan
+        : members.find(member => member.integrationProducts?.length);
+    const requestedBranchPlan = dsRequestedIntegrationBranchPlan();
+    const preparedProducts = preparedBranchPlan?.integrationProducts || [];
+    const requestedProducts = requestedBranchPlan.integrationProducts;
+    const preparedIds = new Set(preparedProducts.map(product => product.product));
+    const preparedMatchesSelection = preparedProducts.length === requestedProducts.length
+        && requestedProducts.every(product => preparedIds.has(product.product));
+    const branchPlan = preparedMatchesSelection ? preparedBranchPlan : requestedBranchPlan;
+    const branchProducts = branchPlan?.integrationProducts || [];
+    const branchGroupCount = Math.max(1, members.length);
+    const branchMasterCount = branchProducts.length * branchGroupCount;
+    const branchSummary = branchProducts.length > 1
+        ? `${dsFormatIntegrationBranches(branchPlan)}
+            <div class="ds-integration-branch-note">${trFormat(
+                "deepsky.review_parallel_outputs",
+                {
+                    masters: branchMasterCount,
+                    groups: branchGroupCount,
+                    products: branchProducts.length,
+                },
+                `Se crearán ${branchMasterCount} másters separados: ${branchGroupCount} integración(es) × ${branchProducts.length} ramas. Parten de las mismas tomas y decisiones de calibración; cada rama ejecuta su propio muestreo, integración y exportación.`,
+            )}</div>`
+        : "";
     return `
         <div class="ds-review-grid">
             <section class="ds-review-card" data-state="${plan.valid ? "ready" : "review"}">
@@ -13920,6 +15594,7 @@ function dsFormatReviewPlan(plan) {
                 <span>~${Math.max(1, Math.round(seconds))} s · RAM ~${Math.round(ram)} MB · ${tr("deepsky.disk", "Disco")} ~${Math.round(disk)} MB</span>
             </section>
         </div>
+        ${branchSummary}
         <details class="ds-review-technical">
             <summary>${tr("deepsky.review_technical", "Ver plan técnico, firmas y fallbacks")}</summary>
             <div class="ds-review-technical-body">${dsFormatPreflight(plan)}</div>
@@ -13939,13 +15614,54 @@ function dsSpotlight(target) {
     setTimeout(() => target.classList.remove("ds-spotlight"), 2800);
 }
 
-// Lleva a la tabla de calibración (paso "Datos"), que es donde se liga cada
-// grupo de lights con su bloque de flats o darks.
-function dsOpenLinkerAndSpotlight() {
+function dsCalibrationRoleFromText(text) {
+    const value = String(text || "").toLowerCase();
+    if (/dark[- ]?flat/.test(value)) return "darkFlats";
+    if (/\bbias\b/.test(value)) return "bias";
+    if (/\bflat/.test(value)) return "flats";
+    if (/\bdark/.test(value)) return "darks";
+    return "flats";
+}
+
+function dsCalibrationGuideTarget(text) {
+    const role = dsCalibrationRoleFromText(text);
+    const decisions = dsPreparedCalibrationDecisions();
+    const prefix = role === "darkFlats" ? "dark-flat" : role.replace(/s$/, "");
+    const decision = decisions.find(item =>
+        (item.reasons || []).some(reason =>
+            String(reason).toLowerCase().startsWith(`${prefix}:`)));
+    const rows = dsCalibrationRows(dsActiveLights().filter(file => file.ok));
+    const row = decision
+        ? rows.find(candidate => candidate.lights.some(light => light.path === decision.framePath))
+        : rows.find(candidate => String(text).includes(candidate.night));
+    return { role, rowKey: row?.key || rows[0]?.key || null, night: row?.night || null };
+}
+
+// Lleva a la fila Y al rol exacto que debe resolverse. Si el backend no pudo
+// identificar una toma concreta, enfoca el primer control del rol.
+function dsOpenLinkerAndSpotlight(target = null) {
+    dsSetWizardStep(1, true);
+    requestAnimationFrame(() => {
+        const selector = target?.rowKey && target?.role
+            ? `select[data-ds-link="${CSS.escape(target.rowKey)}"][data-ds-role="${target.role}"]`
+            : target?.role
+                ? `select[data-ds-role="${target.role}"]`
+                : null;
+        const control = selector ? document.querySelector(selector) : null;
+        dsSpotlight(control || document.getElementById("ds-session-organizer")
+            || document.getElementById("ds-preflight-inspection"));
+        control?.focus();
+    });
+}
+
+function dsOpenCometCorrection() {
     dsSetWizardStep(0, true);
     requestAnimationFrame(() => {
-        const table = document.getElementById("ds-session-organizer");
-        dsSpotlight(table || document.getElementById("ds-preflight-inspection"));
+        const target = document.getElementById("btn-ds-detect-comet")
+            || document.getElementById("ds-comet-panel")
+            || document.getElementById("sel-ds-target-mode");
+        dsSpotlight(target);
+        target?.focus?.();
     });
 }
 
@@ -13954,28 +15670,101 @@ function dsGuideItems(plan) {
     if (!dsActiveLights().length) {
         items.push({
             kind: "error",
-            text: tr("deepsky.guide_add_lights", "Añade lights para empezar"),
+            title: tr("deepsky.guide_add_lights", "Añade lights para empezar"),
+            detail: tr("deepsky.guide_add_lights_detail", "Importa la carpeta de la sesión; después podrás reclasificar o quitar cualquier toma desde Grupos de tomas."),
             actionLabel: tr("deepsky.guide_go_data", "Ir a Datos"),
             run: () => { dsSetWizardStep(0, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("btn-ds-scan-folder") || document.getElementById("btn-ds-lights"))); },
         });
         return items;
     }
-    if (!plan) return items;
+    if (!plan) {
+        items.push({
+            kind: "warn",
+            title: tr("deepsky.guide_refreshing", "Actualizando diagnóstico"),
+            detail: tr(
+                "deepsky.guide_refreshing_detail",
+                "Zenith está recalculando grupos, calibraciones y elegibilidad con la selección actual. Los mensajes anteriores ya no se consideran válidos.",
+            ),
+        });
+        return items;
+    }
+    const reviewFrames = dsFrameInspection.filter(row =>
+        row.rejectable && !dsDiscardedPaths.has(row.path));
+    if (reviewFrames.length) {
+        items.push({
+            kind: "warn",
+            title: trFormat(
+                "deepsky.guide_review_frames",
+                { count: reviewFrames.length },
+                `${reviewFrames.length} toma(s) necesitan una decisión`,
+            ),
+            detail: tr("deepsky.guide_review_frames_detail", "Abre Calidad: allí puedes ver cada light, conservarlo o descartarlo de forma reversible. Nada se elimina del disco."),
+            actionLabel: tr("deepsky.guide_review_lights", "Seleccionar o descartar lights"),
+            run: () => {
+                dsSetWizardStep(2, true);
+                requestAnimationFrame(() => dsSpotlight(document.getElementById("ds-frame-inspection")));
+            },
+        });
+    }
     const errors = plan.errors || [];
-    for (const group of dsGroupAlertMessages(errors).slice(0, 4)) {
-        const sample = group.items[0].length > 160 ? `${group.items[0].slice(0, 157)}…` : group.items[0];
+    for (const group of dsGroupAlertMessages(errors).slice(0, 3)) {
+        const raw = group.items[0];
+        const sample = raw.length > 190 ? `${raw.slice(0, 187)}…` : raw;
         const item = {
             kind: "error",
-            text: (group.items.length > 1 ? `×${group.items.length} · ` : "") + sample,
+            title: (group.items.length > 1 ? `×${group.items.length} · ` : "") + sample,
+            detail: "",
         };
-        if (/flat|dark|bias|calibraci/i.test(group.key)) {
-            item.actionLabel = tr("deepsky.guide_fix_linker", "Ligar calibración");
-            item.run = dsOpenLinkerAndSpotlight;
+        if (/comet|cometa|trayector|núcleo|nucleo|timestamp|date-obs|epoch|velocity/i.test(`${group.key} ${raw}`)) {
+            item.title = tr("deepsky.guide_comet_title", "Revisar trayectoria del cometa");
+            item.detail = sample;
+            item.actionLabel = tr("deepsky.guide_comet_action", "Detectar o confirmar el núcleo");
+            item.run = dsOpenCometCorrection;
+        } else if (/producto|product|eidr|nebulafusion|struct|drizzle|pixfrac|rechazo|rejection|normaliz|interpol|kappa|gpu only/i.test(group.key)) {
+            item.title = tr("deepsky.guide_method_title", "Resolver el método");
+            item.detail = sample;
+            item.actionLabel = tr("deepsky.guide_method_action", "Revisar productos y parámetros");
+            item.run = () => {
+                dsSetWizardStep(3, true);
+                requestAnimationFrame(() => dsSpotlight(
+                    document.getElementById("ds-product-combination-summary")
+                    || document.getElementById("ds-product-grid"),
+                ));
+            };
+        } else if (/flat|dark|bias|calibraci/i.test(group.key)) {
+            const target = dsCalibrationGuideTarget(raw);
+            const roleLabel = {
+                flats: tr("deepsky.step_flat_s", "Flats"),
+                darks: tr("deepsky.step_dark_s", "Darks"),
+                darkFlats: tr("deepsky.step_dark_flat_s", "Dark-flats"),
+                bias: tr("deepsky.step_bias_s", "Bias"),
+            }[target.role];
+            item.title = trFormat(
+                "deepsky.guide_resolve_role",
+                { role: roleLabel },
+                `Resolver ${roleLabel}${target.night ? ` · ${target.night}` : ""}`,
+            );
+            item.detail = `${sample} ${tr("deepsky.guide_calibration_detail", "Usa el desplegable resaltado. Auto conserva coincidencias exactas; un flat correcto de otra noche puede requerir tu confirmación de equipo.")}`;
+            item.actionLabel = trFormat(
+                "deepsky.guide_choose_role",
+                { role: roleLabel },
+                `Elegir ${roleLabel}`,
+            );
+            item.run = () => dsOpenLinkerAndSpotlight(target);
+        } else if (/fwhm|psf|ruido|eccentric|estrella|calidad/i.test(group.key)) {
+            item.detail = sample;
+            item.actionLabel = tr("deepsky.guide_review_lights", "Seleccionar o descartar lights");
+            item.run = () => {
+                dsSetWizardStep(2, true);
+                requestAnimationFrame(() => dsSpotlight(document.getElementById("ds-frame-inspection")));
+            };
         } else if (/light|lineal|PNG|JPEG/i.test(group.key)) {
+            item.detail = tr("deepsky.guide_data_detail", "Vuelve a Datos para quitar, reclasificar o reemplazar las tomas señaladas.");
             item.actionLabel = tr("deepsky.guide_go_data", "Ir a Datos");
             item.run = () => { dsSetWizardStep(0, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("btn-ds-scan-folder") || document.getElementById("btn-ds-lights"))); };
         } else {
-            item.actionLabel = tr("deepsky.guide_view", "Ver detalle");
+            item.detail = sample;
+            item.actionLabel = tr("deepsky.guide_view", "Ver diagnóstico técnico");
             item.run = () => { dsSetWizardStep(1, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("ds-preflight-inspection"))); };
         }
         items.push(item);
@@ -13983,21 +15772,24 @@ function dsGuideItems(plan) {
     const eligibility = dsCollectEligibility(plan);
     if (!eligibility.eligible && eligibility.reasons.length) {
         const firstReason = eligibility.reasons[0];
+        const target = dsCalibrationGuideTarget(firstReason);
         items.push({
             kind: "warn",
-            text: `${tr("deepsky.guide_engines_off", "NebulaFusion/EIDR desactivados")}: ${firstReason}`,
+            title: tr("deepsky.guide_engines_off", "NebulaFusion/EIDR desactivados"),
+            detail: firstReason,
             actionLabel: /flat|dark/i.test(firstReason)
-                ? (/añade/i.test(firstReason) ? tr("deepsky.guide_go_data", "Ir a Datos") : tr("deepsky.guide_fix_linker", "Ligar calibración"))
+                ? (/añade/i.test(firstReason) ? tr("deepsky.guide_go_data", "Ir a Datos") : tr("deepsky.guide_fix_linker", "Resolver calibración"))
                 : tr("deepsky.guide_go_data", "Ir a Datos"),
             run: /añade|PNG|JPEG/i.test(firstReason)
                 ? () => { dsSetWizardStep(0, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("btn-ds-scan-folder") || document.getElementById("btn-ds-lights"))); }
-                : dsOpenLinkerAndSpotlight,
+                : () => dsOpenLinkerAndSpotlight(target),
         });
     }
     if (!plan.valid && document.getElementById("sel-ds-calibration-policy")?.value === "strict") {
         items.push({
             kind: "warn",
-            text: tr("deepsky.guide_strict", "La política Estricta bloquea al primer incumplimiento; puedes continuar en modo degradado (queda registrado)"),
+            title: tr("deepsky.guide_strict_title", "Strict está bloqueando el plan"),
+            detail: tr("deepsky.guide_strict", "Corrige primero la asignación. Si aceptas un resultado no científico, Permitir degradación continúa y registra cada concesión."),
             actionLabel: tr("deepsky.proceed_degraded", "Continuar en modo degradado"),
             run: () => {
                 const policy = document.getElementById("sel-ds-calibration-policy");
@@ -14012,9 +15804,10 @@ function dsGuideItems(plan) {
     if (plan.valid) {
         items.push({
             kind: "ok",
-            text: tr("deepsky.guide_ready", "Plan válido: todo listo para apilar"),
+            title: tr("deepsky.guide_ready", "Plan válido: todo listo para apilar"),
+            detail: tr("deepsky.guide_ready_detail", "Revisa el producto primario, las salidas lineales y el destino antes de ejecutar."),
             actionLabel: tr("deepsky.guide_go_run", "Ir a Revisar y apilar"),
-            run: () => { dsSetWizardStep(3, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("btn-deepsky-run"))); },
+            run: () => { dsSetWizardStep(4, true); requestAnimationFrame(() => dsSpotlight(document.getElementById("btn-deepsky-run"))); },
         });
     }
     return items;
@@ -14029,37 +15822,50 @@ function dsRenderGuide(plan) {
         card?.remove();
         return;
     }
+    // Esencial responde “qué hago ahora” con una sola acción. El diagnóstico,
+    // las consecuencias y la salida degradada siguen disponibles en Experto;
+    // mostrarlas todas al principiante recreaba el panel de alertas que esta
+    // guía debía simplificar.
+    const visibleItems = dsExperienceMode === "essential"
+        ? [items.find(item => item.kind === "error") || items.find(item => item.kind === "warn") || items[0]]
+        : items;
     if (!card) {
         card = document.createElement("div");
         card.id = "ds-guide";
         host.appendChild(card);
     }
-    const blockers = items.filter(item => item.kind === "error").length;
+    const blockers = visibleItems.filter(item => item.kind === "error").length;
+    const recommendations = visibleItems.filter(item => item.kind === "warn").length;
     const dotColor = { error: "#f87171", warn: "#fbbf24", ok: "#34d399" };
     card.classList.toggle("collapsed", dsGuideCollapsed);
     card.innerHTML = `
         <div class="ds-guide-head">
-            <svg class="zas-icon zas-icon-inline" style="color:#a78bfa;"><use href="#icon-${blockers ? "warning" : "check"}"></use></svg>
-            <b>${tr("deepsky.guide_title", "Asistente inteligente")}</b>
+            <svg class="zas-icon zas-icon-inline" style="color:#a78bfa;"><use href="#icon-${blockers || recommendations ? "warning" : "check"}"></use></svg>
+            <b>${tr("deepsky.guide_title", "Acciones recomendadas")}</b>
             <span style="color:#94a3b8;">${blockers
                 ? trFormat("deepsky.guide_pending", { n: blockers }, `${blockers} por resolver`)
+                : recommendations
+                    ? trFormat("deepsky.guide_recommendations", { n: recommendations }, `${recommendations} por revisar`)
                 : tr("deepsky.guide_all_clear", "sin bloqueos")}</span>
             <button type="button" id="ds-guide-toggle" class="ds-mini-btn" title="${tr("deepsky.guide_toggle", "Mostrar u ocultar la guía")}">${dsGuideCollapsed ? "▲" : "▼"}</button>
         </div>
         <div class="ds-guide-body">
-            ${items.map((item, index) => `
-                <div class="ds-guide-item">
+            ${visibleItems.map((item, index) => `
+                <article class="ds-guide-item" data-kind="${item.kind}">
                     <span class="ds-guide-dot" style="background:${dotColor[item.kind]};"></span>
-                    <span class="ds-guide-text" title="${escapeHtml(item.text)}">${escapeHtml(item.text)}</span>
+                    <div class="ds-guide-copy">
+                        <strong>${escapeHtml(item.title || "")}</strong>
+                        ${item.detail ? `<span>${escapeHtml(item.detail)}</span>` : ""}
+                    </div>
                     ${item.run ? `<button type="button" class="ds-guide-action" data-guide="${index}">${escapeHtml(item.actionLabel)}</button>` : ""}
-                </div>`).join("")}
+                </article>`).join("")}
         </div>`;
     card.querySelector("#ds-guide-toggle")?.addEventListener("click", () => {
         dsGuideCollapsed = !dsGuideCollapsed;
         dsRenderGuide(plan);
     });
     card.querySelectorAll(".ds-guide-action").forEach(button => {
-        button.addEventListener("click", () => items[Number(button.dataset.guide)]?.run?.());
+        button.addEventListener("click", () => visibleItems[Number(button.dataset.guide)]?.run?.());
     });
 }
 
@@ -14073,8 +15879,10 @@ function dsCollectEligibility(plan) {
     return { eligible, reasons };
 }
 
-function dsApplyPreparedPlan(plan) {
+function dsApplyPreparedPlan(plan, revision = dsSessionRevision) {
+    if (revision !== dsSessionRevision) return;
     dsPreparedPlan = plan;
+    dsPreparedPlanRevision = revision;
     // El ligado manual ya NO se indexa desde el plan: sus claves son grupos
     // (`noche|filtro|exposición`) y sus bloques se derivan de los ficheros
     // cargados, así que `dsRenderSessionOrganizer` los poda por sí solo. Purgar
@@ -14103,6 +15911,50 @@ function dsApplyPreparedPlan(plan) {
             if (option) option.disabled = !scientificEligible;
         }
         methodSelect.title = scientificEligible ? "" : eligibilityReasons.join(" · ");
+    }
+    for (const id of ["chk-ds-product-nf", "chk-ds-product-struct", "chk-ds-product-eidr"]) {
+        const checkbox = document.getElementById(id);
+        if (!checkbox) continue;
+        checkbox.disabled = !scientificEligible;
+        checkbox.closest(".ds-product-card")?.setAttribute(
+            "title",
+            scientificEligible ? "" : eligibilityReasons.join(" · "),
+        );
+    }
+    const productPlans = new Map(
+        (plan?.integrationProducts || []).map(product => [product.product, product]),
+    );
+    document.querySelectorAll("#ds-product-grid .ds-product-compute").forEach(node => node.remove());
+    for (const input of document.querySelectorAll("#ds-product-grid [data-ds-product]")) {
+        const key = input.dataset.dsProduct === "nebula_fusion_sci"
+            ? "nebulaFusionSci"
+            : input.dataset.dsProduct;
+        const productPlan = productPlans.get(key);
+        if (!productPlan) continue;
+        const card = input.closest(".ds-product-card");
+        const copyHost = card?.querySelector(".ds-product-copy");
+        const copy = copyHost?.querySelector("small:not(.ds-product-compute)");
+        let computeDisclosure = copyHost?.querySelector(".ds-product-compute");
+        const computeText = [productPlan.computeEngine, productPlan.computeReason]
+            .filter(Boolean)
+            .join(" · ");
+        if (computeText && copyHost) {
+            if (!computeDisclosure) {
+                computeDisclosure = document.createElement("small");
+                computeDisclosure.className = "ds-product-compute";
+                copyHost.append(computeDisclosure);
+            }
+            computeDisclosure.textContent = `${tr("deepsky.accel", "motor")}: ${computeText}`;
+        } else {
+            computeDisclosure?.remove();
+        }
+        if (copy && productPlan.eligible) {
+            copy.dataset.plan = "ready";
+            copy.title = `${Math.round(productPlan.estimatedSeconds)} s · ${productPlan.estimatedRamMb} MB RAM · ${productPlan.estimatedDiskMb} MB disco${computeText ? ` · ${computeText}` : ""}`;
+        } else if (copy) {
+            copy.dataset.plan = "blocked";
+            copy.title = (productPlan.reasons || []).join(" · ");
+        }
     }
     // Caja "para activar NF/EIDR falta…": razones accionables junto al método.
     const eligibilityBox = document.getElementById("ds-method-eligibility");
@@ -14211,6 +16063,7 @@ function dsRenderFrameInspection(rows) {
     if (!rows?.length) {
         panel.dataset.state = "idle";
         panel.textContent = tr("deepsky.inspect_no_frames", "No hay tomas inspeccionables.");
+        dsRenderGuide(dsPreparedPlan);
         return;
     }
     const rejected = rows.filter(row => row.rejectable).length;
@@ -14276,6 +16129,10 @@ function dsRenderFrameInspection(rows) {
             if (row) dsOpenFramePreview(row, rows);
         });
     });
+    // La inspección termina después del preflight. Actualizar aquí evita que
+    // la guía conserve el estado "todo listo" mientras la tabla ya muestra
+    // lights dudosos con acciones Conservar/Descartar.
+    dsRenderGuide(dsPreparedPlan);
 }
 
 // Conserva el scroll de la tabla y de los contenedores del asistente al
@@ -14512,10 +16369,12 @@ async function dsInspectFrames(force = false) {
 }
 
 async function dsPreparePlan() {
+    const revision = dsSessionRevision;
     const serial = ++dsPreflightSerial;
     const stackRequest = dsBuildStackRequest();
     if (!stackRequest.lights.length) {
         dsPreparedPlan = null;
+        dsPreparedPlanRevision = revision;
         dsRenderRecipeImpact(null);
         for (const id of ["ds-preflight-inspection", "ds-preflight-review"]) {
             const panel = document.getElementById(id);
@@ -14549,31 +16408,127 @@ async function dsPreparePlan() {
         const command = multiband ? "prepare_deepsky_session" : "prepare_deepsky_stack";
         const request = multiband ? dsBuildSessionRequest() : stackRequest;
         const plan = await invoke(command, { request });
-        if (serial !== dsPreflightSerial) return null;
-        dsApplyPreparedPlan(plan);
+        if (serial !== dsPreflightSerial || revision !== dsSessionRevision) return null;
+        dsApplyPreparedPlan(plan, revision);
         return plan;
     } catch (e) {
-        if (serial !== dsPreflightSerial) return null;
-        dsApplyPreparedPlan({ valid: false, errors: [String(e)], warnings: [], groups: [], stages: {} });
+        if (serial !== dsPreflightSerial || revision !== dsSessionRevision) return null;
+        dsApplyPreparedPlan(
+            { valid: false, errors: [String(e)], warnings: [], groups: [], stages: {} },
+            revision,
+        );
         return null;
     }
 }
 
-function dsSchedulePreflight(immediate = false) {
+function dsInvalidatePreparedPlan() {
+    dsSessionRevision += 1;
+    dsPreflightSerial += 1;
+    dsPreparedPlan = null;
+    dsPreparedPlanRevision = -1;
+    dsRenderRecipeImpact(null);
+    document.querySelectorAll("#ds-product-grid .ds-product-compute").forEach(node => node.remove());
+    const hasLights = dsActiveLights().length > 0;
+    const message = hasLights
+        ? tr("deepsky.reading_headers", "Leyendo cabeceras y preparando el plan…")
+        : tr("deepsky.preflight_empty", "Añade lights para preparar el plan.");
+    for (const id of ["ds-preflight-inspection", "ds-preflight-review"]) {
+        const panel = document.getElementById(id);
+        if (!panel) continue;
+        panel.classList.remove("ds-refreshing");
+        panel.dataset.state = "idle";
+        panel.textContent = message;
+    }
+    const eligibilityBox = document.getElementById("ds-method-eligibility");
+    if (eligibilityBox) {
+        eligibilityBox.style.display = "none";
+        eligibilityBox.innerHTML = "";
+    }
+    for (const id of ["chk-ds-product-nf", "chk-ds-product-struct", "chk-ds-product-eidr"]) {
+        const checkbox = document.getElementById(id);
+        if (!checkbox) continue;
+        checkbox.disabled = hasLights;
+        checkbox.closest(".ds-product-card")?.setAttribute(
+            "title",
+            hasLights ? tr("deepsky.guide_refreshing", "Actualizando diagnóstico") : "",
+        );
+    }
+    const run = document.getElementById("btn-deepsky-run");
+    if (run) {
+        run.disabled = true;
+        run.style.opacity = ".5";
+    }
+    dsRenderGuide(null);
+    dsSyncWizard();
+}
+
+function dsSchedulePreflight(immediate = false, invalidate = true) {
+    if (document.body.dataset.dsUxFixture) return;
     clearTimeout(dsPreflightTimer);
+    if (invalidate) dsInvalidatePreparedPlan();
     dsPreflightTimer = setTimeout(dsPreparePlan, immediate ? 0 : 180);
 }
 
+function dsPlanCorrectionStep(plan) {
+    if (!plan) return 1;
+    const members = plan?.sessionId
+        ? (plan.groups || []).map(group => group.plan).filter(Boolean)
+        : [plan];
+    const productBlocked = members.some(member =>
+        (member.integrationProducts || []).some(product => product.eligible === false));
+    if (productBlocked) return 3;
+    const errors = [
+        ...(plan.errors || []),
+        ...members.flatMap(member => member.errors || []),
+    ].join(" ").toLowerCase();
+    if (/comet|cometa|trayector|núcleo|nucleo|timestamp|date-obs|epoch|velocity/.test(errors)) return 0;
+    if (/producto|product|eidr|nebulafusion|struct|drizzle|pixfrac|rechazo|rejection|normaliz|interpol|kappa|gpu only|compute policy/.test(errors)) {
+        return 3;
+    }
+    if (/psf|fwhm|eccentric|calidad|quality|ruido|noise/.test(errors)) return 2;
+    if (/geometr|canales incompat|bayer|cfa\/rgb|png|jpeg|selecciona al menos (un|1) light|no hay lights/.test(errors)) {
+        return 0;
+    }
+    return 1;
+}
+
+function dsFirstIncompleteStep(target) {
+    const requested = Math.max(0, Math.min(4, Number(target) || 0));
+    if (requested >= 1 && dsActiveLights().length < 1) return 0;
+    const planInvalid = !dsPreparedPlan || !dsPreparedPlan.valid;
+    const correctionStep = dsPlanCorrectionStep(dsPreparedPlan);
+    if (requested >= 2 && planInvalid && correctionStep <= 1) return correctionStep;
+    if (requested >= 3 && !dsFrameInspection?.length) return 2;
+    if (requested >= 3 && planInvalid && correctionStep === 2) return 2;
+    if (requested >= 4 && planInvalid) return correctionStep;
+    return requested;
+}
+
 function dsSetWizardStep(next, force = false) {
-    const requested = Math.max(0, Math.min(3, Number(next) || 0));
-    if (!force && requested > 2 && dsPreparedPlan && !dsPreparedPlan.valid) {
-        dsWizardStep = 1;
-    } else {
-        dsWizardStep = requested;
+    const requested = Math.max(0, Math.min(4, Number(next) || 0));
+    dsWizardStep = force || requested <= dsWizardStep
+        ? requested
+        : dsFirstIncompleteStep(requested);
+    const redirectedToRequiredStep = !force && dsWizardStep !== requested;
+    if (dsWizardStep === 4 && dsPreparedPlan) {
+        const review = document.getElementById("ds-preflight-review");
+        if (review) {
+            review.innerHTML = dsFormatReviewPlan(dsPreparedPlan)
+                + dsFormatInspectionDiagnostics();
+        }
     }
     dsSyncWizard();
-    if (dsWizardStep === 1 || dsWizardStep === 3) dsSchedulePreflight(true);
-    if (dsWizardStep === 1) dsInspectFrames();
+    if (redirectedToRequiredStep) {
+        // Si una etapa futura está bloqueada, el foco debe acompañar a la
+        // página que realmente quedó activa. Dejarlo sobre la pestaña pedida
+        // dibujaba dos estados destacados y hacía parecer que el contenido y
+        // la navegación estaban desincronizados.
+        requestAnimationFrame(() => {
+            document.querySelector(`#deepsky-modal .ds-wizard-step[data-step="${dsWizardStep}"]`)?.focus();
+        });
+    }
+    if ([1, 3, 4].includes(dsWizardStep)) dsSchedulePreflight(true, false);
+    if (dsWizardStep === 2) dsInspectFrames();
     const scroll = document.getElementById("ds-wizard-scroll");
     if (scroll) scroll.scrollTop = 0;
     const box = document.querySelector("#deepsky-modal .ds-wizard-box");
@@ -14581,12 +16536,12 @@ function dsSetWizardStep(next, force = false) {
         box.scrollTop = 0;
         requestAnimationFrame(() => { box.scrollTop = 0; });
     }
-    const blocked = dsWizardStep === 3 && dsPreparedPlan && !dsPreparedPlan.valid;
+    const blocked = dsWizardStep === 4 && dsPreparedPlan && !dsPreparedPlan.valid;
     setAssistantJourney({
         flow: "deepsky",
         stage: blocked ? "blocked" : "guide",
         workflowStep: dsWizardStep,
-        workflowTotal: 4,
+        workflowTotal: 5,
     }, {
         open: dsWizardStep === 0,
         announceKey: `deepsky:step:${dsWizardStep}:${blocked ? "blocked" : "ready"}`,
@@ -14596,11 +16551,18 @@ function dsSetWizardStep(next, force = false) {
 function dsWizardStepState(step) {
     const hasLights = dsActiveLights().length > 0;
     if (!hasLights) return "pending";
-    if (step === 0) return "ready";
-    if (!dsPreparedPlan) return step === 1 ? "review" : "pending";
-    if (!dsPreparedPlan.valid) return "review";
-    if (step === 1 && !dsFrameInspection?.length) return "review";
-    return "ready";
+    const correctionStep = dsPreparedPlan?.valid ? null : dsPlanCorrectionStep(dsPreparedPlan);
+    if (step === 0) return correctionStep === 0 ? "review" : "ready";
+    if (step === 1) {
+        if (!dsPreparedPlan) return "review";
+        return !dsPreparedPlan.valid && correctionStep === 1 ? "review" : "ready";
+    }
+    if (step === 2) return dsFrameInspection?.length ? "ready" : "review";
+    if (!dsPreparedPlan) return "pending";
+    if (step === 3) {
+        return !dsPreparedPlan.valid && correctionStep === 3 ? "review" : "ready";
+    }
+    return dsPreparedPlan.valid ? "ready" : "review";
 }
 
 function dsSyncWizard() {
@@ -14631,20 +16593,31 @@ function dsSyncWizard() {
     const run = document.getElementById("btn-deepsky-run");
     const combine = document.getElementById("btn-deepsky-combine-open");
     if (prev) prev.style.visibility = dsWizardStep === 0 ? "hidden" : "visible";
-    if (next) next.style.display = dsWizardStep < 3 ? "block" : "none";
-    if (run) run.style.display = dsWizardStep === 3 ? "flex" : "none";
+    if (next) {
+        next.style.display = dsWizardStep < 4 ? "block" : "none";
+        next.disabled = dsWizardStepState(dsWizardStep) !== "ready";
+        const labels = [
+            tr("deepsky.next_calibrations", "Resolver calibraciones →"),
+            tr("deepsky.next_quality", "Revisar calidad →"),
+            tr("deepsky.next_method", "Preparar método →"),
+            tr("deepsky.next_review", "Revisar y apilar →"),
+        ];
+        if (labels[dsWizardStep]) next.textContent = labels[dsWizardStep];
+    }
+    if (run) run.style.display = dsWizardStep === 4 ? "flex" : "none";
     if (combine) combine.style.display = dsWizardStep === 0 ? "flex" : "none";
     const status = document.getElementById("ds-wizard-status");
     if (status) {
-        const messageKey = dsWizardStep === 3
+        const messageKey = dsWizardStep === 4
             ? (dsPreparedPlan?.valid
                 ? "footer_ready"
                 : (dsActiveLights().length ? "footer_fix" : "footer_add_lights"))
             : `footer_${dsWizardStep}`;
         const fallbacks = {
             footer_0: "selecciona y agrupa los datos",
-            footer_1: "revisa compatibilidad y calibraciones",
-            footer_2: "elige perfil u opciones avanzadas",
+            footer_1: "resuelve calibraciones por lote y noche",
+            footer_2: "revisa la calidad de las tomas",
+            footer_3: "elige el método y sus productos",
             footer_ready: "plan listo para ejecutar",
             footer_fix: "corrige las alertas del plan",
             footer_add_lights: "añade lights para preparar el plan",
@@ -14653,18 +16626,18 @@ function dsSyncWizard() {
             "deepsky.footer_status",
             {
                 current: dsWizardStep + 1,
-                total: 4,
+                total: 5,
                 message: tr(`deepsky.${messageKey}`, fallbacks[messageKey]),
             },
-            `Paso ${dsWizardStep + 1} de 4 · ${fallbacks[messageKey]}`,
+            `Paso ${dsWizardStep + 1} de 5 · ${fallbacks[messageKey]}`,
         );
     }
     const assistant = document.getElementById("ds-step-assistant");
     const assistantText = document.getElementById("ds-step-assistant-text");
     const assistantProgress = document.getElementById("ds-step-assistant-progress");
     if (assistant && assistantText) {
-        const blocked = dsWizardStep === 3 && !!dsActiveLights().length && !dsPreparedPlan?.valid;
-        const stepKey = dsWizardStep === 3
+        const blocked = dsWizardStep === 4 && !!dsActiveLights().length && !dsPreparedPlan?.valid;
+        const stepKey = dsWizardStep === 4
             ? (dsPreparedPlan?.valid
                 ? "step_assistant_ready"
                 : dsActiveLights().length
@@ -14673,8 +16646,9 @@ function dsSyncWizard() {
             : `step_assistant_${dsWizardStep}`;
         const fallbacks = {
             step_assistant_0: "Añade lights; las calibraciones son opcionales. Zenith agrupará firmas compatibles y evitará mezclas silenciosas.",
-            step_assistant_1: "Revisa agrupación, PSF y calibraciones. Los avisos explican qué corregir antes de integrar.",
-            step_assistant_2: "Auto es el punto de partida recomendado. Abre los controles avanzados sólo cuando tu objetivo lo necesite.",
+            step_assistant_1: "Confirma sólo las excepciones. Exacto y Reutilizable validado preservan la elegibilidad científica.",
+            step_assistant_2: "Revisa qué tomas conservar. Ningún descarte sugerido cambia tus datos sin confirmación.",
+            step_assistant_3: "Auto es el punto de partida recomendado. Experto abre el control completo sin cambiar la receta por sí solo.",
             step_assistant_ready: "El plan es compatible. Confirma las salidas lineales y ejecuta cuando estés listo.",
             step_assistant_blocked: "Hay bloqueos pendientes. La guía te lleva al control exacto que debes corregir.",
             step_assistant_empty: "Añade lights para que pueda preparar y validar el plan de integración.",
@@ -14682,7 +16656,7 @@ function dsSyncWizard() {
         assistantText.textContent = tr(`deepsky.${stepKey}`, fallbacks[stepKey]);
         assistant.dataset.state = blocked ? "warning" : "active";
     }
-    if (assistantProgress) assistantProgress.textContent = `${dsWizardStep + 1} / 4`;
+    if (assistantProgress) assistantProgress.textContent = `${dsWizardStep + 1} / 5`;
 }
 
 function dsSetPresetButtons(name) {
@@ -14693,6 +16667,10 @@ function dsSetPresetButtons(name) {
 function dsApplyPreset(name) {
     dsActivePreset = name;
     dsSetPresetButtons(name);
+    const customNotice = document.getElementById("ds-custom-essential-state");
+    if (customNotice) {
+        customNotice.hidden = !(dsExperienceMode === "essential" && name === "custom");
+    }
     const p = DS_PRESETS[name];
     if (!p) {
         // "custom" y "auto" no tocan controles; AUTO además refresca el plan
@@ -14728,6 +16706,10 @@ function dsApplyPreset(name) {
 // Un cambio manual pasa el preset a "Personalizado".
 function dsMarkCustomPreset() {
     if (dsActivePreset !== "custom") { dsActivePreset = "custom"; dsSetPresetButtons("custom"); }
+    const customNotice = document.getElementById("ds-custom-essential-state");
+    if (customNotice) {
+        customNotice.hidden = dsExperienceMode !== "essential";
+    }
     dsRenderProcessPreview();
     dsRenderRecipeImpact(dsPreparedPlan);
     dsSchedulePreflight();
@@ -14797,27 +16779,53 @@ function dsRenderProcessPreview() {
     stages.push(stage(true, "icon-chart", tr("deepsky.st_stretch", "Estirado STF")));
 
     // Los métodos por-píxel cargan el stack completo por franjas → más pesados.
-    const perPixel = ["winsorized", "median", "percentile", "minmax"].includes(rejection);
+    // La estimación no anuncia aceleración hasta que exista paridad científica
+    // en el motor efectivo; tiled/Winsorized/linearfit siguen siendo CPU.
+    const perPixel = ["winsorized", "linearfit", "median", "percentile", "minmax", "tiled"].includes(rejection);
     const gi = window._gpuInfo;
-    const compute = val("sel-ds-compute", "hybrid");
-    const gpuTiled = gi?.available && compute !== "cpu_only"
-        && rejection === "winsorized" && drz <= 1;
-    const engineMult = perPixel && drz <= 1 ? (gpuTiled ? 1.15 : 1.7) : 1.0;
+    const compute = dsResolvedComputePolicy();
+    const computePlan = describeDeepSkyComputePlan({
+        policy: compute,
+        gpuAvailable: gi?.available === true,
+        rejection,
+        clipIters: perPixel ? 1 : nIters,
+        drizzle: drz,
+        products: dsBuildIntegrationProducts(),
+        cosmetic: on("chk-ds-cosmetic"),
+    });
+    const engineMult = perPixel && drz <= 1 ? 1.7 : 1.0;
     const mpIn = (w * h) / 1e6, mpOut = (wOut * hOut) / 1e6;
     const secs = dsEstimateTime(n, mpIn, mpOut, perPixel ? 1 : nIters, drz, engineMult);
     const fmtT = (s) => s < 90 ? `${Math.max(1, Math.round(s))} s` : `${(s / 60).toFixed(s < 600 ? 1 : 0)} min`;
     const fmtSize = (mb) => mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${Math.round(mb)} MB`;
     const ramMB = (wOut * hOut * ch * 8 * 3 + w * h * ch * 4) / 1e6; // acumuladores f64 + 1 frame
     const outMB = (wOut * hOut * 3 * 2) / 1e6;                        // TIFF 16-bit RGB
-    // Indicador del motor previsto. Winsorized ejecuta el rechazo
-    // tiled en GPU; la CPU conserva warp/modelos y valida paridad.
-    const canGpuIntegrate = gi?.available && compute !== "cpu_only"
-        && (!perPixel || gpuTiled) && drz <= 1;
-    const accel = canGpuIntegrate
-        ? `<span>${tr("deepsky.accel", "motor")}: <b>${gpuTiled ? "Hybrid CPU warp + GPU tiled" : "Hybrid CPU+GPU"}</b> · ${escapeHtml(gi.name)} · wgpu</span>`
-        : gi?.available && compute !== "cpu_only"
-            ? `<span>${tr("deepsky.accel", "motor")}: <b>Hybrid</b> · GPU calibración / CPU integración</span>`
-            : `<span>${tr("deepsky.accel", "motor")}: <b>CPU</b> (rayon)</span>`;
+    const cpuReason = ({
+        cpu_policy: tr("deepsky.compute_cpu_policy", "Sólo CPU solicitado"),
+        gpu_unavailable: tr("deepsky.compute_gpu_unavailable", "GPU compatible no disponible"),
+        drizzle_cpu: tr("deepsky.compute_drizzle_cpu", "Drizzle conserva integración científica CPU"),
+        sigma_iterative_cpu: tr("deepsky.compute_sigma_cpu", "Sigma iterativo conserva integración científica CPU"),
+        tiled_rejection_cpu: tr("deepsky.compute_tiled_cpu", "Rechazo tiled/Winsorized/linearfit conserva integración científica CPU"),
+        scientific_cpu: tr("deepsky.compute_scientific_cpu", "Esta integración conserva el motor científico CPU"),
+    })[computePlan.classicCpuReason] || "";
+    const productCpu = computePlan.cpuProducts.length
+        ? tr("deepsky.compute_product_cpu", "NebulaFusion, STRUCT y EIDR conservan integración científica CPU")
+        : "";
+    const gpuName = gi?.available
+        ? `${escapeHtml(gi.name)}${gi.backend ? ` · ${escapeHtml(gi.backend)}` : ""}`
+        : "";
+    const engineParts = [];
+    if (computePlan.classicIntegrationGpu) {
+        engineParts.push(tr("deepsky.compute_gpu_classic", "GPU prevista: integración Classic 1× sin rechazo iterativo"));
+    }
+    if (computePlan.gpuStageAssist) {
+        engineParts.push(tr("deepsky.compute_gpu_support", "GPU prevista si pasa validación: cosmética y mapa estelar; CPU: calibración científica, registro y modelos"));
+    }
+    if (cpuReason) engineParts.push(cpuReason);
+    if (productCpu) engineParts.push(productCpu);
+    const accel = `<span>${tr("deepsky.accel", "motor")}: <b>${escapeHtml(
+        engineParts.join(" · ") || tr("deepsky.compute_cpu_stage", "Etapa científica CPU"),
+    )}</b>${gpuName ? ` · ${gpuName}` : ""}</span>`;
     const tech = [
         `<span><b>${used.length}</b>/${lights.length} lights</span>`,
         w ? `<span>${w}×${h}${drz > 1 ? ` → <b>${wOut}×${hOut}</b>` : ""} · ${ch === 1 ? "mono" : "RGB"}</span>` : "",
@@ -14837,8 +16845,20 @@ function dsRenderProcessPreview() {
 }
 
 function dsUpdateUI() {
+    // Quitar, añadir, reclasificar o filtrar lights invalida de inmediato el
+    // diagnóstico anterior. El preflight nuevo se ejecuta después del render,
+    // pero ninguna tarjeta conserva mensajes de la revisión precedente.
+    dsSchedulePreflight(false);
     const lights = dsActiveLights();
     const lightsRef = lights[0] || null;
+    if (dsCometEnabled() && dsCometDetection?.observations?.length) {
+        const current = [...lights.map(frame => frame.path)].sort();
+        const detected = [...dsCometDetection.observations.map(observation => observation.framePath)].sort();
+        if (current.length !== detected.length || current.some((path, index) => path !== detected[index])) {
+            dsCometDetection = null;
+        }
+    }
+    dsRenderCometDetection();
 
     for (const s of DS_SECTIONS) {
         const badge = document.getElementById(`ds-${s.kind}-count`);
@@ -14888,12 +16908,26 @@ function dsUpdateUI() {
     if (chips) {
         chips.innerHTML = "";
         const kws = dsKeywords();
-        const groups = kws
-            .map(k => ({ k, n: dsFiles.lights.filter(f => f.name.toLowerCase().includes(k)).length }))
-            .filter(g => g.n > 0);
-        if (groups.length === 0) {
+        const counts = new Map();
+        dsFiles.lights.filter(file => file.ok).forEach(file => {
+            dsFileGroups(file).forEach(group => counts.set(group, (counts.get(group) || 0) + 1));
+        });
+        const groups = [...counts.entries()]
+            .map(([k, n]) => ({ k, n }))
+            .sort((left, right) => left.k.localeCompare(right.k));
+        if (kws.length === 0) {
             chips.style.display = "none";
             dsSelectedGroup = null;
+        } else if (groups.length === 0) {
+            chips.style.display = "flex";
+            dsSelectedGroup = null;
+            const noMatch = document.createElement("span");
+            noMatch.className = "ds-keyword-no-match";
+            noMatch.textContent = tr(
+                "deepsky.keywords_no_match",
+                "La regla no coincide con ningún light. Busca en nombre, ruta, fecha, filtro o cámara.",
+            );
+            chips.appendChild(noMatch);
         } else {
             chips.style.display = "flex";
             const mk = (label, value, count) => {
@@ -14924,7 +16958,6 @@ function dsUpdateUI() {
         run.disabled = lights.length < 1 || (dsPreparedPlan && !dsPreparedPlan.valid);
         run.style.opacity = run.disabled ? "0.5" : "1";
     }
-    dsSchedulePreflight();
     dsSyncWizard();
 }
 
@@ -14940,7 +16973,7 @@ async function dsPick(kind) {
         const probes = await invoke("deepsky_probe", { paths });
         dsFiles[kind] = probes;
         const bad = probes.filter(p => !p.ok).length;
-        if (bad > 0) log("WARN", `${kind}: ${bad} archivo(s) ilegibles (marcados ⚠︎).`);
+        if (bad > 0) log("WARN", `${kind}: ${bad} archivo(s) ilegibles; revisa los estados marcados.`);
         dsUpdateUI();
     } catch (e) {
         console.error("deepsky pick:", e);
@@ -14951,14 +16984,24 @@ async function dsPick(kind) {
 // Carpeta recursiva → TODOS los frames bajo ella se asignan a `kind`.
 async function dsPickFolder(kind) {
     try {
-        const dir = await openDialog({ directory: true, multiple: false, title: `Carpeta de ${kind.toUpperCase()}` });
+        const storageKey = `zas_ds_last_${kind}_dir`;
+        const dir = await dsChooseDirectory({
+            purpose: "source",
+            defaultPath: localStorage.getItem(storageKey)
+                || localStorage.getItem("zas_ds_last_source_dir")
+                || null,
+            recursive: true,
+            title: `Carpeta de ${kind.toUpperCase()}`,
+        });
         if (!dir) return;
+        localStorage.setItem(storageKey, dir);
+        localStorage.setItem("zas_ds_last_source_dir", dir);
         const cl = await invoke("deepsky_scan_classify", { root: dir });
         const classifiedDarkFlats = cl.darkFlats || cl.dark_flats || [];
         const all = [...cl.lights, ...cl.darks, ...cl.flats, ...classifiedDarkFlats, ...cl.bias];
         if (all.length === 0) { log("WARN", "No se encontraron imágenes en la carpeta."); return; }
         // También acumula: cargar una segunda carpeta de darks se suma a la
-        // primera en vez de sustituirla (✕ del grupo sigue vaciándolo).
+        // primera en vez de sustituirla (Quitar en el grupo sigue vaciándolo).
         const added = dsMergeScannedFiles({ [kind]: all });
         log("INFO", `${kind}: +${added.total} archivo(s) de la carpeta (recursivo)${added.duplicates ? `, ${added.duplicates} ya estaban` : ""} · total ${dsFiles[kind].length}.`);
         dsUpdateUI();
@@ -14969,33 +17012,813 @@ async function dsPickFolder(kind) {
 // VENTANA DE PROGRESO CIELO PROFUNDO (estilo WBPP: fases + tiempos)
 // ============================================================
 let dsStacking = false;
+// Cubre la fase de inspección/preflight previa a dsProgressStart, donde
+// dsStacking todavía es false y un doble clic lanzaba dos apilados.
+let dsRunLaunchPending = false;
 let dsProgTimer = null;
 let dsProgStart = 0;
 let dsSessionProgressTotal = 1;
 let dsSessionProgressIndex = 1;
+let dsProductProgressTotal = 1;
+let dsProductProgressIndex = 1;
+let dsProgressActiveProduct = null;
 const DS_PHASES = [
-    { id: "calib", label: "Lectura, masters, calibración y estrellas", rx: /read|calibr|master|detect/i },
-    { id: "register", label: "Registro PSF + RANSAC", rx: /registr/i },
-    { id: "normalize", label: "Normalización robusta", rx: /normaliz/i },
-    { id: "integrate", label: "Integración · pasada base", rx: /integrate_pass_1|integrate_fallback|integrate_method_fallback|pasada 1/i },
-    { id: "reject", label: "Rechazo de píxeles", rx: /sigma_clip|tiled|reject|rechazo|pasada 2|por-píxel|franja/i },
-    { id: "drizzle", label: "Drizzle y cobertura", rx: /drizzle|cobertura/i, when: () => parseFloat(document.getElementById("sel-ds-drizzle")?.value || "1") > 1 },
-    { id: "bg", label: "Derivado opcional ABE + SCNR (SCI intacto)", rx: /abe|gradiente|scnr|neutraliz/i, when: () => !!document.getElementById("chk-ds-gradient")?.checked },
-    { id: "publish", label: "Vista previa y publicación del máster", rx: /preview|vista|public|complete|estir|stf/i }
+    {
+        id: "calib",
+        label: "Calibración",
+        detail: "Bias, darks, flats y dark-flats",
+        rx: /read|lectura|calibr|master|detect/i,
+    },
+    {
+        id: "register",
+        label: "Registro PSF",
+        detail: "Estrellas, RANSAC y transformaciones",
+        rx: /registr|ransac|psf|star match/i,
+    },
+    {
+        id: "normalize",
+        label: "Normalización",
+        detail: "Fondo, ganancia y pesos",
+        rx: /normaliz|local normalization|abe|scnr|neutraliz/i,
+    },
+    {
+        id: "integrate",
+        label: "Integración",
+        detail: "Productos científicos independientes",
+        rx: /integrat|nebula|fusion|struct|eidr|classic|pasada 1/i,
+    },
+    {
+        id: "reject",
+        label: "Rechazo y cobertura",
+        detail: "Píxeles, drizzle y mapas de soporte",
+        rx: /sigma_clip|tiled|reject|rechazo|pasada 2|por-píxel|franja|drizzle|cobertura/i,
+    },
+    {
+        id: "publish",
+        label: "Publicación",
+        detail: "Vista, receta y productos preservados",
+        rx: /preview|vista|public|complete|complet|estir|stf|recipe|receta|export/i,
+    },
 ];
 let dsPhaseTimes = {};
 let dsVisiblePhases = DS_PHASES;
+let dsProgressActivePhase = -1;
+let dsProgressResult = null;
+let dsProgressReferenceToken = 0;
+let dsProgressRunToken = 0;
+let dsProgressViewToken = 0;
+let dsProgressDiagnosticLines = [];
+let dsProgressProductState = new Map();
+let dsProgressViewport = { zoom: 1, x: 0, y: 0 };
+let dsProgressViewportPointer = null;
+
+const DS_PROGRESS_PRODUCTS = {
+    classic: {
+        label: "Classic",
+        icon: "icon-galaxy",
+        detail: "SCI · cobertura · rechazo",
+        rx: /classic|kappa|winsor|drizzle/i,
+    },
+    nebula_fusion_sci: {
+        label: "NebulaFusion SCI",
+        icon: "icon-sparkles",
+        detail: "SCI · VAR · NEFF · DQ",
+        rx: /nebula|fusion|\bnf\b/i,
+    },
+    struct: {
+        label: "STRUCT",
+        icon: "icon-mosaic",
+        detail: "STRUCT · máscara · SCI dependiente",
+        rx: /\bstruct\b/i,
+    },
+    eidr: {
+        label: "EIDR",
+        icon: "icon-compare",
+        detail: "SCI reconstruido · recuperabilidad",
+        rx: /\beidr\b|recoverab/i,
+    },
+};
 
 function dsFmtClock(ms) {
     const s = Math.floor(ms / 1000);
     return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 }
 
-function dsProgressStart() {
+function dsQaFixturePreviewUrl() {
+    return new URL(
+        "/benchmarks/design-references/deepsky-progress-visual-fixture.png",
+        window.location.href,
+    ).href;
+}
+
+function dsProgressSelectedProducts() {
+    const selected = [...document.querySelectorAll("#ds-product-grid [data-ds-product]:checked")]
+        .map(input => String(input.dataset.dsProduct || ""))
+        .filter(product => DS_PROGRESS_PRODUCTS[product]);
+    return selected.length ? selected : ["classic"];
+}
+
+function dsProgressPrimaryProduct() {
+    return String(document.getElementById("sel-ds-primary-product")?.value || "classic");
+}
+
+function dsProgressProductLabel(product) {
+    const definition = DS_PROGRESS_PRODUCTS[product] || { label: product, detail: "" };
+    if (product !== "classic") return definition.label;
+    const drizzle = Number(document.getElementById("sel-ds-drizzle")?.value || 1);
+    return drizzle > 1 ? `${definition.label} · Drizzle ×${drizzle}` : definition.label;
+}
+
+function dsProgressProductId(rawProduct) {
+    const value = String(rawProduct || "").trim().toLowerCase();
+    if (!value) return null;
+    if (value.includes("classic")) return "classic";
+    if (value.includes("struct")) return "struct";
+    if (value.includes("eidr")) return "eidr";
+    if (value.includes("nebula") || value.includes("fusion") || value === "nf") {
+        return "nebula_fusion_sci";
+    }
+    return DS_PROGRESS_PRODUCTS[value] ? value : null;
+}
+
+function dsProgressProductMarker(step) {
+    const text = String(step || "");
+    const direct = text.match(/\bProducto\s+(\d+)\/(\d+)\s*[·:]\s*([^\s·]+)/i);
+    if (direct) {
+        return {
+            index: Number(direct[1]),
+            total: Number(direct[2]),
+            product: dsProgressProductId(direct[3]),
+        };
+    }
+    const session = text.match(/\brama\s+(\d+)\/(\d+)\s*\(([^)]+)\)/i);
+    if (session) {
+        return {
+            index: Number(session[1]),
+            total: Number(session[2]),
+            product: dsProgressProductId(session[3]),
+        };
+    }
+    return null;
+}
+
+function dsProgressResumeNote(step) {
+    const text = String(step || "");
+    const resumed = /checkpoint\s+(?:completo\s+y\s+)?compatible|restaurad[oa]\s+desde|compatible\s+checkpoint|restored\s+from/i.test(text);
+    return resumed
+        ? tr("deepsky.prog_product_resumed_cache", "Reanudado desde caché compatible")
+        : "";
+}
+
+function dsProgressActivateProduct(marker) {
+    if (!marker) return;
+    const previous = dsProgressActiveProduct;
+    dsProductProgressIndex = Math.max(1, Number(marker.index) || 1);
+    dsProductProgressTotal = Math.max(dsProductProgressIndex, Number(marker.total) || 1);
+    dsProgressActiveProduct = marker.product;
+    if (previous && previous !== marker.product) {
+        const previousState = dsProgressProductState.get(previous);
+        if (previousState?.state === "active") {
+            dsProgressProductState.set(previous, {
+                state: "done",
+                pct: 100,
+                note: previousState.resumed
+                    ? tr("deepsky.prog_product_resumed_cache", "Reanudado desde caché compatible")
+                    : tr("deepsky.prog_product_cached", "Salida preservada; memoria liberada"),
+                resumed: Boolean(previousState.resumed),
+            });
+        }
+    }
+    if (marker.product) {
+        const current = dsProgressProductState.get(marker.product) || {};
+        dsProgressProductState.set(marker.product, {
+            state: "active",
+            pct: current.state === "done" ? 0 : Math.max(0, Number(current.pct) || 0),
+            note: `Rama ${dsProductProgressIndex}/${dsProductProgressTotal} · preparando`,
+            resumed: Boolean(current.resumed),
+        });
+    }
+    dsProgressRenderProducts();
+}
+
+function dsProgressEffectivePercent(localPct, sessionMarker = null, productMarker = null) {
+    const pct = Math.min(100, Math.max(0, Number(localPct) || 0));
+    const branchKnown = !!dsProgressActiveProduct;
+    const branchFraction = branchKnown
+        ? ((dsProductProgressIndex - 1) + (productMarker ? 0 : pct / 100))
+            / Math.max(1, dsProductProgressTotal)
+        : (sessionMarker ? 0 : pct / 100);
+    if (dsSessionProgressTotal > 1) {
+        return 100 * ((dsSessionProgressIndex - 1) + branchFraction)
+            / dsSessionProgressTotal;
+    }
+    return 100 * branchFraction;
+}
+
+function dsProgressAppendDiagnostic(message) {
+    const normalized = String(message || "").trim();
+    if (!normalized || dsProgressDiagnosticLines.at(-1) === normalized) return;
+    dsProgressDiagnosticLines.push(normalized);
+    if (dsProgressDiagnosticLines.length > 10) dsProgressDiagnosticLines.shift();
+    const body = document.getElementById("ds-prog-diagnostic-body");
+    if (body) body.textContent = dsProgressDiagnosticLines.join("\n");
+}
+
+function dsProgressRenderProducts() {
+    const host = document.getElementById("ds-prog-products");
+    if (!host) return;
+    const selected = dsProgressSelectedProducts();
+    const primary = dsProgressPrimaryProduct();
+    const drizzle = Number(document.getElementById("sel-ds-drizzle")?.value || 1);
+    host.innerHTML = selected.map(product => {
+        const definition = DS_PROGRESS_PRODUCTS[product];
+        const state = dsProgressProductState.get(product) || { state: "queued", pct: 0, note: "En cola" };
+        const detail = product === "classic" && drizzle > 1
+            ? `${definition.detail} · salida ×${drizzle}`
+            : definition.detail;
+        return `<article class="ds-progress-product" data-product="${escapeHtml(product)}" data-state="${escapeHtml(state.state)}">
+            <div class="ds-progress-product-head">
+                <svg class="zas-icon" aria-hidden="true"><use href="#${definition.icon}"></use></svg>
+                <strong>${escapeHtml(dsProgressProductLabel(product))}</strong>
+                ${primary === product ? `<em>${tr("deepsky.primary_short", "principal")}</em>` : ""}
+            </div>
+            <span>${escapeHtml(detail)}</span>
+            <div class="ds-progress-product-track" aria-hidden="true"><i style="width:${Math.max(0, Math.min(100, state.pct))}%"></i></div>
+            <small>${escapeHtml(state.note)}</small>
+        </article>`;
+    }).join("");
+    const count = document.getElementById("ds-prog-product-count");
+    if (count) count.textContent = `${selected.length} ${selected.length === 1 ? "producto" : "productos"}`;
+}
+
+function dsProgressProductFromStep(step) {
+    const text = String(step || "");
+    return dsProgressSelectedProducts().find(product => DS_PROGRESS_PRODUCTS[product].rx.test(text))
+        || dsProgressActiveProduct
+        || null;
+}
+
+function dsProgressUpdateProducts(step, pct, complete = false) {
+    const selected = dsProgressSelectedProducts();
+    if (complete) {
+        selected.forEach(product => {
+            const current = dsProgressProductState.get(product) || {};
+            dsProgressProductState.set(product, {
+                state: "done",
+                pct: 100,
+                note: current.resumed
+                    ? tr("deepsky.prog_product_resumed_cache", "Reanudado desde caché compatible")
+                    : tr("deepsky.prog_product_ready", "Salida publicada y preservada"),
+                resumed: Boolean(current.resumed),
+            });
+        });
+        dsProgressRenderProducts();
+        return;
+    }
+    const activeProduct = dsProgressProductFromStep(step);
+    if (!activeProduct) return;
+    for (const product of selected) {
+        const current = dsProgressProductState.get(product) || { state: "queued", pct: 0, note: "En cola" };
+        if (product === activeProduct) {
+            const resumeNote = dsProgressResumeNote(step);
+            dsProgressProductState.set(product, {
+                state: "active",
+                pct: Math.max(current.pct || 0, Math.min(96, Math.max(8, Number(pct) || 0))),
+                note: resumeNote || String(step || tr("deepsky.prog_integrating", "Integrando…")),
+                resumed: Boolean(current.resumed || resumeNote),
+            });
+        } else if (current.state === "active") {
+            dsProgressProductState.set(product, {
+                state: "done",
+                pct: 100,
+                note: current.resumed
+                    ? tr("deepsky.prog_product_resumed_cache", "Reanudado desde caché compatible")
+                    : tr("deepsky.prog_product_cached", "Salida preservada; memoria liberada"),
+                resumed: Boolean(current.resumed),
+            });
+        }
+    }
+    dsProgressRenderProducts();
+}
+
+function dsProgressApplyPublishedProducts(result) {
+    const published = Array.isArray(result?.products) ? result.products : [];
+    for (const product of published) {
+        const id = dsProgressProductId(product.product || product.id);
+        if (!id) continue;
+        const current = dsProgressProductState.get(id) || {};
+        const resumed = Boolean(product.resumedFromCheckpoint || current.resumed);
+        const status = ["warning", "fallback"].includes(String(product.status))
+            ? String(product.status)
+            : "done";
+        let note = resumed
+            ? tr("deepsky.prog_product_resumed_cache", "Reanudado desde caché compatible")
+            : tr("deepsky.prog_product_ready", "Salida publicada y preservada");
+        if (status === "fallback") {
+            note = product.fallbackReason
+                || tr("deepsky.prog_product_fallback", "No superó su validación; se preservó la salida segura indicada");
+        } else if (status === "warning" || Number(product.noCoveragePixels || 0) > 0) {
+            const holes = Number(product.noCoveragePixels || 0).toLocaleString();
+            note = `${holes} píxeles sin cobertura · revisa DQ/cobertura`;
+        }
+        dsProgressProductState.set(id, {
+            state: status,
+            pct: 100,
+            note,
+            resumed,
+        });
+    }
+    dsProgressRenderProducts();
+}
+
+function dsProgressViewportMetrics(compare = document.getElementById("ds-prog-compare-stage")) {
+    const rect = compare?.getBoundingClientRect?.();
+    return {
+        width: Math.max(0, Number(rect?.width || 0) * 0.5),
+        height: Math.max(0, Number(rect?.height || 0)),
+    };
+}
+
+function dsProgressViewportFocus(compare, clientX, clientY) {
+    const rect = compare?.getBoundingClientRect?.();
+    if (!rect) return { x: 0, y: 0 };
+    const paneWidth = Math.max(1, rect.width * 0.5);
+    const paneLeft = clientX < rect.left + paneWidth
+        ? rect.left
+        : rect.left + paneWidth;
+    return {
+        x: clientX - paneLeft - (paneWidth * 0.5),
+        y: clientY - rect.top - (rect.height * 0.5),
+    };
+}
+
+function dsProgressApplyViewport({ announce = false } = {}) {
+    const compare = document.getElementById("ds-prog-compare-stage");
+    if (!compare) return;
+    dsProgressViewport = normalizeDeepSkyProgressViewport(
+        dsProgressViewport,
+        dsProgressViewportMetrics(compare),
+    );
+    compare.style.setProperty("--ds-progress-zoom", String(dsProgressViewport.zoom));
+    compare.style.setProperty("--ds-progress-pan-x", `${dsProgressViewport.x.toFixed(2)}px`);
+    compare.style.setProperty("--ds-progress-pan-y", `${dsProgressViewport.y.toFixed(2)}px`);
+    compare.dataset.zoomed = dsProgressViewport.zoom > 1.001 ? "true" : "false";
+    const reset = document.getElementById("ds-prog-view-reset");
+    if (reset) {
+        reset.disabled = compare.dataset.beforeReady !== "true" && compare.dataset.afterReady !== "true";
+    }
+    if (announce) {
+        const status = document.getElementById("ds-prog-viewport-status");
+        if (status) {
+            const centered = Math.abs(dsProgressViewport.x) < 0.5 && Math.abs(dsProgressViewport.y) < 0.5;
+            const zoom = Math.round(dsProgressViewport.zoom * 100);
+            status.textContent = centered
+                ? trFormat("deepsky.prog_compare_status_centered", { zoom }, `Zoom ${zoom} por ciento, encuadre centrado.`)
+                : trFormat("deepsky.prog_compare_status_panned", { zoom }, `Zoom ${zoom} por ciento, encuadre sincronizado desplazado.`);
+        }
+    }
+}
+
+function dsProgressResetViewport({ announce = false } = {}) {
+    dsProgressViewport = { zoom: 1, x: 0, y: 0 };
+    dsProgressViewportPointer = null;
+    const compare = document.getElementById("ds-prog-compare-stage");
+    if (compare) delete compare.dataset.panning;
+    dsProgressApplyViewport({ announce });
+}
+
+function dsProgressZoomViewport(factor, focus = { x: 0, y: 0 }, announce = false) {
+    const compare = document.getElementById("ds-prog-compare-stage");
+    if (!compare) return;
+    dsProgressViewport = zoomDeepSkyProgressViewport(
+        dsProgressViewport,
+        factor,
+        focus,
+        dsProgressViewportMetrics(compare),
+    );
+    dsProgressApplyViewport({ announce });
+}
+
+function dsProgressPanViewport(deltaX, deltaY, announce = false) {
+    const compare = document.getElementById("ds-prog-compare-stage");
+    if (!compare) return;
+    dsProgressViewport = panDeepSkyProgressViewport(
+        dsProgressViewport,
+        { x: deltaX, y: deltaY },
+        dsProgressViewportMetrics(compare),
+    );
+    dsProgressApplyViewport({ announce });
+}
+
+function dsProgressBindViewport() {
+    const compare = document.getElementById("ds-prog-compare-stage");
+    if (!compare || compare.dataset.viewportBound === "true") return;
+    compare.dataset.viewportBound = "true";
+    const hasImage = () => compare.dataset.beforeReady === "true"
+        || compare.dataset.afterReady === "true";
+    const isControl = target => !!target?.closest?.("button, input, select, a, summary, .ds-progress-overlay-switcher");
+
+    compare.addEventListener("wheel", event => {
+        if (!hasImage() || isControl(event.target)) return;
+        event.preventDefault();
+        compare.focus({ preventScroll: true });
+        const focus = dsProgressViewportFocus(compare, event.clientX, event.clientY);
+        dsProgressZoomViewport(Math.exp(-event.deltaY * 0.0015), focus, false);
+    }, { passive: false });
+
+    compare.addEventListener("pointerdown", event => {
+        if (!hasImage() || event.button !== 0 || isControl(event.target)) return;
+        event.preventDefault();
+        compare.focus({ preventScroll: true });
+        dsProgressViewportPointer = {
+            id: event.pointerId,
+            x: event.clientX,
+            y: event.clientY,
+        };
+        compare.dataset.panning = "true";
+        compare.setPointerCapture?.(event.pointerId);
+    });
+    compare.addEventListener("pointermove", event => {
+        if (!dsProgressViewportPointer || dsProgressViewportPointer.id !== event.pointerId) return;
+        const deltaX = event.clientX - dsProgressViewportPointer.x;
+        const deltaY = event.clientY - dsProgressViewportPointer.y;
+        dsProgressViewportPointer.x = event.clientX;
+        dsProgressViewportPointer.y = event.clientY;
+        dsProgressPanViewport(deltaX, deltaY, false);
+    });
+    const endPointer = event => {
+        if (!dsProgressViewportPointer || dsProgressViewportPointer.id !== event.pointerId) return;
+        try { compare.releasePointerCapture?.(event.pointerId); } catch { /* captura ya liberada */ }
+        dsProgressViewportPointer = null;
+        delete compare.dataset.panning;
+        dsProgressApplyViewport({ announce: true });
+    };
+    compare.addEventListener("pointerup", endPointer);
+    compare.addEventListener("pointercancel", endPointer);
+    compare.addEventListener("dblclick", event => {
+        if (!hasImage() || isControl(event.target)) return;
+        event.preventDefault();
+        dsProgressResetViewport({ announce: true });
+    });
+    compare.addEventListener("dragstart", event => event.preventDefault());
+    compare.addEventListener("keydown", event => {
+        if (!hasImage() || event.altKey || event.metaKey || event.ctrlKey) return;
+        const key = event.key;
+        if (["+", "=", "Add", "PageUp"].includes(key)) {
+            event.preventDefault();
+            dsProgressZoomViewport(1.25, { x: 0, y: 0 }, true);
+        } else if (["-", "Subtract", "PageDown"].includes(key)) {
+            event.preventDefault();
+            dsProgressZoomViewport(0.8, { x: 0, y: 0 }, true);
+        } else if (["0", "Home"].includes(key)) {
+            event.preventDefault();
+            dsProgressResetViewport({ announce: true });
+        } else if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(key)) {
+            event.preventDefault();
+            const step = event.shiftKey ? 64 : 24;
+            dsProgressPanViewport(
+                key === "ArrowLeft" ? -step : key === "ArrowRight" ? step : 0,
+                key === "ArrowUp" ? -step : key === "ArrowDown" ? step : 0,
+                true,
+            );
+        }
+    });
+    document.getElementById("ds-prog-view-reset")?.addEventListener("click", () => {
+        dsProgressResetViewport({ announce: true });
+        compare.focus({ preventScroll: true });
+    });
+
+    if (typeof ResizeObserver === "function") {
+        const observer = new ResizeObserver(() => dsProgressApplyViewport());
+        observer.observe(compare);
+    }
+}
+
+async function dsProgressSetImage(element, source, isCurrent = () => true) {
+    if (!element || !source) return false;
+    try {
+        const displaySource = toDisplaySrc(source);
+        await new Promise((resolve, reject) => {
+            const probe = new Image();
+            probe.decoding = "async";
+            probe.onload = resolve;
+            probe.onerror = reject;
+            probe.src = displaySource;
+        });
+        // La carga ocurre fuera del elemento visible. Sólo la solicitud más
+        // reciente puede hacer el commit síncrono; una respuesta lenta de SCI
+        // ya no pisa Cobertura/Rechazo ni una ejecución nueva.
+        if (!isCurrent() || !element.isConnected) return false;
+        element.onload = null;
+        element.onerror = null;
+        element.src = displaySource;
+        element.classList.add("loaded");
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function dsProgressComparisonGeometry(result) {
+    if (result?.comparison?.referencePath) return result.comparison;
+    const primary = (result?.products || []).find(product => product.primary)
+        || (result?.products || [])[0];
+    if (primary?.comparison?.referencePath) return primary.comparison;
+    const groups = result?.groups || result?.groupResults || [];
+    for (let index = groups.length - 1; index >= 0; index -= 1) {
+        const groupPrimary = (groups[index]?.products || []).find(product => product.primary)
+            || (groups[index]?.products || [])[0];
+        if (groupPrimary?.comparison?.referencePath) return groupPrimary.comparison;
+    }
+    return null;
+}
+
+async function dsProgressCropReferencePreview(source, geometry) {
+    const image = new Image();
+    image.decoding = "async";
+    await new Promise((resolve, reject) => {
+        image.onload = resolve;
+        image.onerror = () => reject(new Error("reference-preview-load"));
+        image.src = source;
+    });
+    const crop = mapDeepSkyComparisonCrop(geometry, {
+        width: image.naturalWidth,
+        height: image.naturalHeight,
+    });
+    if (!crop) throw new Error("reference-comparison-geometry");
+    const canvas = document.createElement("canvas");
+    canvas.width = crop.width;
+    canvas.height = crop.height;
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!context) throw new Error("reference-preview-canvas");
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
+    context.drawImage(
+        image,
+        crop.sx,
+        crop.sy,
+        crop.sw,
+        crop.sh,
+        0,
+        0,
+        crop.width,
+        crop.height,
+    );
+    return canvas.toDataURL("image/png");
+}
+
+async function dsProgressAlignReferenceToMaster(result) {
+    const geometry = dsProgressComparisonGeometry(result);
+    if (!geometry) return false;
+    // Invalida cualquier preview crudo todavía en vuelo: al publicarse el
+    // máster sólo puede quedar visible la referencia recortada al mismo lienzo.
+    const token = ++dsProgressReferenceToken;
+    try {
+        const preview = await invoke("deepsky_frame_preview", {
+            path: geometry.referencePath,
+        });
+        if (token !== dsProgressReferenceToken) return false;
+        const alignedPreview = await dsProgressCropReferencePreview(preview, geometry);
+        if (token !== dsProgressReferenceToken) return false;
+        const image = document.getElementById("ds-prog-before-img");
+        const compare = document.getElementById("ds-prog-compare-stage");
+        if (!image || !compare || !await dsProgressSetImage(
+            image,
+            alignedPreview,
+            () => token === dsProgressReferenceToken,
+        )) return false;
+        if (token !== dsProgressReferenceToken) return false;
+        image.alt = tr(
+            "deepsky.prog_reference_registered_alt",
+            "Light de referencia ajustado a la geometría del máster",
+        );
+        compare.dataset.beforeReady = "true";
+        compare.dataset.compareReady = compare.dataset.afterReady === "true" ? "true" : "false";
+        const label = document.getElementById("ds-prog-before-label");
+        if (label) label.textContent = tr(
+            "deepsky.prog_reference_registered_label",
+            "ANTES · referencia en el mismo encuadre",
+        );
+        dsProgressApplyViewport();
+        return true;
+    } catch (error) {
+        dsProgressAppendDiagnostic(`${tr(
+            "deepsky.prog_reference_alignment_unavailable",
+            "No se pudo ajustar la referencia al recorte del máster",
+        )}: ${error}`);
+        return false;
+    }
+}
+
+async function dsProgressLoadReference(path, directPreview = "") {
+    const token = ++dsProgressReferenceToken;
+    const compare = document.getElementById("ds-prog-compare-stage");
+    const image = document.getElementById("ds-prog-before-img");
+    if (!compare || !image) return;
+    try {
+        const preview = directPreview || (path ? await invoke("deepsky_frame_preview", { path }) : "");
+        if (token !== dsProgressReferenceToken || !preview) return;
+        const shown = await dsProgressSetImage(
+            image,
+            preview,
+            () => token === dsProgressReferenceToken,
+        );
+        if (!shown || token !== dsProgressReferenceToken) return;
+        image.alt = tr("deepsky.prog_reference_alt", "Light de referencia estirado sólo para la vista");
+        const waitingReference = document.getElementById("ds-prog-waiting-reference");
+        if (waitingReference) {
+            waitingReference.src = preview;
+            waitingReference.alt = "";
+        }
+        compare.dataset.beforeReady = "true";
+        if (compare.dataset.afterReady === "true") {
+            compare.dataset.compareReady = "true";
+        }
+        dsProgressApplyViewport();
+        const title = document.getElementById("ds-prog-visual-title");
+        const note = document.getElementById("ds-prog-visual-note");
+        if (title) title.textContent = tr("deepsky.prog_wait_master", "Referencia lista");
+        if (note) note.textContent = tr("deepsky.prog_wait_master_note", "La mitad derecha mostrará únicamente una salida publicada por el motor.");
+    } catch (error) {
+        dsProgressAppendDiagnostic(`${tr("deepsky.prog_reference_unavailable", "Referencia visual no disponible")}: ${error}`);
+    }
+}
+
+async function dsProgressSetPublishedView(source, label, tokens = {}) {
+    const runToken = tokens.runToken ?? dsProgressRunToken;
+    const viewToken = tokens.viewToken ?? dsProgressViewToken;
+    const isCurrent = () => runToken === dsProgressRunToken
+        && viewToken === dsProgressViewToken;
+    const compare = document.getElementById("ds-prog-compare-stage");
+    const image = document.getElementById("ds-prog-after-img");
+    if (!compare || !image || !source) return false;
+    const shown = await dsProgressSetImage(image, source, isCurrent);
+    if (!shown || !isCurrent()) return false;
+    image.alt = label;
+    compare.dataset.afterReady = "true";
+    compare.dataset.compareReady = compare.dataset.beforeReady === "true" ? "true" : "false";
+    dsProgressApplyViewport();
+    const afterLabel = document.getElementById("ds-prog-after-label");
+    if (afterLabel) afterLabel.textContent = label;
+    return true;
+}
+
+async function dsProgressBalancedMasterPreview() {
+    try {
+        return await invoke("deepsky_restretch", {
+            mode: "unlinked",
+            strength: dsStretchStrength,
+        });
+    } catch {
+        return dsProgressResult?.previewPath || "";
+    }
+}
+
+async function dsProgressShowPublishedView(kind) {
+    if (!dsProgressResult) return;
+    const runToken = dsProgressRunToken;
+    const viewToken = ++dsProgressViewToken;
+    const isCurrent = () => runToken === dsProgressRunToken
+        && viewToken === dsProgressViewToken;
+    const buttons = [...document.querySelectorAll("#ds-progress [data-ds-prog-view]")];
+    const requested = kind || "master";
+    try {
+        let source;
+        let label;
+        if (requested === "master") {
+            source = await dsProgressBalancedMasterPreview();
+            label = tr(
+                "deepsky.prog_master_balanced_label",
+                "ACTUAL · máster balanceado para comparar",
+            );
+        } else {
+            source = document.body.dataset.dsProgressFixture === "1"
+                ? dsQaFixturePreviewUrl()
+                : await invoke("deepsky_result_view", { kind: requested });
+            label = requested === "coverage"
+                ? tr("deepsky.prog_coverage_label", "ACTUAL · mapa de cobertura")
+                : tr("deepsky.prog_rejection_label", "ACTUAL · rechazo alto");
+        }
+        if (!isCurrent()) return;
+        if (!await dsProgressSetPublishedView(source, label, { runToken, viewToken })) {
+            if (!isCurrent()) return;
+            throw new Error("preview");
+        }
+        if (!isCurrent()) return;
+        buttons.forEach(button => button.setAttribute(
+            "aria-pressed",
+            String(button.dataset.dsProgView === requested),
+        ));
+    } catch (error) {
+        if (!isCurrent()) return;
+        const warning = document.getElementById("ds-prog-warning");
+        if (warning) {
+            warning.hidden = false;
+            warning.textContent = tr(
+                "deepsky.prog_view_failed",
+                "Esa vista científica no está disponible para el producto activo. SCI permanece seleccionado.",
+            );
+        }
+        buttons.forEach(button => button.setAttribute(
+            "aria-pressed",
+            String(button.dataset.dsProgView === "master"),
+        ));
+        const fallback = await dsProgressBalancedMasterPreview();
+        if (!isCurrent()) return;
+        await dsProgressSetPublishedView(
+            fallback,
+            tr(
+                "deepsky.prog_master_balanced_label",
+                "ACTUAL · máster balanceado para comparar",
+            ),
+            { runToken, viewToken },
+        );
+        if (!isCurrent()) return;
+        dsProgressAppendDiagnostic(`Vista ${requested}: ${error}`);
+    }
+}
+
+function dsProgressRenderResources(telemetry = null) {
+    const host = document.getElementById("ds-prog-resources");
+    if (!host) return;
+    const finite = value => value !== null
+        && value !== undefined
+        && value !== ""
+        && Number.isFinite(Number(value));
+    const memory = value => finite(value) && Number(value) > 0 ? `${Math.round(Number(value))} MB` : "—";
+    const eta = telemetry && finite(telemetry.eta_seconds) && Number(telemetry.eta_seconds) > 0
+        ? dsFmtClock(Number(telemetry.eta_seconds) * 1000)
+        : telemetry && dsStacking
+            ? tr("deepsky.prog_eta_calculating", "Calculando…")
+            : "—";
+    const io = telemetry && (finite(telemetry.io_read_mb) || finite(telemetry.io_write_mb))
+        ? `${Number(telemetry.io_read_mb || 0).toFixed(0)} / ${Number(telemetry.io_write_mb || 0).toFixed(0)} MB`
+        : "—";
+    const cacheTotal = Number(telemetry?.cache_hits || 0) + Number(telemetry?.cache_misses || 0);
+    const cache = cacheTotal > 0 ? `${telemetry.cache_hits || 0} / ${cacheTotal}` : "—";
+    const throughput = telemetry && finite(telemetry.throughput)
+        ? `${Number(telemetry.throughput).toFixed(1)} elem/s`
+        : "—";
+    const observedCompute = deepSkyTelemetryComputeStatus(telemetry || {});
+    const cpuUse = observedCompute.cpuPercent === null
+        ? "CPU —"
+        : `CPU ${observedCompute.cpuPercent.toFixed(0)}%`;
+    const accelerator = observedCompute.gpuActive
+        ? tr("deepsky.compute_gpu_active", "GPU activa")
+        : tr("deepsky.compute_gpu_inactive", "GPU no activa");
+    const computeNote = observedCompute.gpuActive
+        ? [
+            observedCompute.backend,
+            observedCompute.vramMb ? `VRAM ${observedCompute.vramMb} MB` : "",
+        ].filter(Boolean).join(" · ")
+        : observedCompute.reason === "cpu_stage"
+            ? tr("deepsky.compute_cpu_stage", "Etapa científica CPU")
+            : observedCompute.reason;
+    const resources = [
+        ["ETA", eta, telemetry?.phase || "Esperando muestras"],
+        ["Motor", telemetry?.engine || "—", throughput],
+        [tr("deepsky.compute_resource", "CPU · acelerador"), `${cpuUse} · ${accelerator}`, computeNote || tr("deepsky.compute_observed", "uso observado")],
+        ["RAM", memory(telemetry?.ram_mb), "proceso actual"],
+        ["VRAM", memory(telemetry?.vram_mb), "estimación efectiva"],
+        ["I/O · caché", io, `aciertos ${cache}`],
+    ];
+    host.innerHTML = resources.map(([label, value, note]) => `
+        <div class="ds-progress-resource"><span>${escapeHtml(label)}</span>
+            <b title="${escapeHtml(String(value))}">${escapeHtml(String(value))}</b>
+            <small title="${escapeHtml(String(note))}">${escapeHtml(String(note))}</small></div>`).join("");
+}
+
+function dsProgressRenderEditorSteps() {
+    const host = document.getElementById("ds-prog-editor-steps");
+    if (!host) return;
+    host.innerHTML = DS_POSTSTACK_STEPS.map(step => `
+        <button type="button" data-ds-progress-editor-step="${step.id}"
+            title="${escapeHtml(dsPoststackStepLabel(step))}">
+            <b>${step.id}</b><span>${escapeHtml(dsPoststackStepLabel(step))}</span>
+        </button>`).join("");
+}
+
+function dsProgressStart(context = {}) {
+    const runToken = ++dsProgressRunToken;
+    dsProgressViewToken += 1;
     dsStacking = true;
+    document.body.classList.add("ds-progress-active");
+    dsResultViewToken += 1;
+    dsResultProducts = new Map();
+    dsActiveProductId = null;
     dsProgStart = Date.now();
+    dsProgressResult = null;
+    dsProgressDiagnosticLines = [];
+    dsProgressActivePhase = -1;
+    dsProductProgressTotal = 1;
+    dsProductProgressIndex = 1;
+    dsProgressActiveProduct = null;
     dsPhaseTimes = {};
-    dsVisiblePhases = DS_PHASES.filter(phase => !phase.when || phase.when());
+    dsVisiblePhases = DS_PHASES;
+    dsProgressProductState = new Map(dsProgressSelectedProducts().map(product => [
+        product,
+        { state: "queued", pct: 0, note: tr("deepsky.prog_queued", "En cola") },
+    ]));
     const steps = document.getElementById("ds-prog-steps");
     if (steps) {
         steps.innerHTML = "";
@@ -15003,34 +17826,124 @@ function dsProgressStart() {
             const row = document.createElement("div");
             row.id = `ds-ph-${ph.id}`;
             row.className = "ds-ph-row";
-            row.innerHTML = `<span class="ds-ph-mark" style="width:16px; text-align:center;">○</span><span class="ds-ph-label" style="flex:1;">${ph.label}</span><span class="ds-ph-time" style="font-family:'Courier New',monospace; font-size:0.66rem; color:#475569;"></span>`;
+            row.innerHTML = `<span class="ds-ph-mark"><svg class="zas-icon" aria-hidden="true"><use href="#icon-hourglass"></use></svg></span>
+                <span class="ds-ph-copy"><span class="ds-ph-label">${escapeHtml(ph.label)}</span>
+                    <span class="ds-ph-detail">${escapeHtml(ph.detail)}</span></span>
+                <span class="ds-ph-time"></span>`;
             steps.appendChild(row);
         });
     }
+    const stageCount = document.getElementById("ds-prog-stage-count");
+    if (stageCount) stageCount.textContent = `0 / ${dsVisiblePhases.length}`;
     const bar = document.getElementById("ds-prog-bar"); if (bar) { bar.style.width = "0%"; bar.setAttribute("aria-valuenow", "0"); }
     const pct = document.getElementById("ds-prog-pct"); if (pct) pct.textContent = "0%";
-    const cur = document.getElementById("ds-prog-current"); if (cur) cur.textContent = "";
-    // Chips de recursos visibles desde el arranque (con marcadores): la
-    // telemetría real los reemplaza en cuanto llega el primer evento.
-    const resources = document.getElementById("ds-prog-resources");
-    if (resources) {
-        resources.style.display = "grid";
-        resources.innerHTML = ["Motor", "Velocidad", "CPU", "RAM", "VRAM", "Caché"]
-            .map(label => `<span>${label} <b style="color:#64748b;">—</b></span>`)
-            .join("");
+    const cur = document.getElementById("ds-prog-current");
+    if (cur) cur.textContent = tr("deepsky.prog_preparing", "Preparando la receta validada…");
+    const compareSection = document.querySelector("#ds-progress .ds-progress-visual");
+    if (compareSection) compareSection.setAttribute(
+        "aria-label",
+        tr("deepsky.prog_compare_section_aria", "Comparación visual del apilado"),
+    );
+    const compare = document.getElementById("ds-prog-compare-stage");
+    if (compare) {
+        compare.setAttribute("aria-label", tr(
+            "deepsky.prog_compare_sync_aria",
+            "Comparación sincronizada entre el light de referencia y el máster actual",
+        ));
+        compare.querySelector(".ds-progress-pane-before")?.setAttribute(
+            "aria-label",
+            tr("deepsky.prog_compare_reference_pane_aria", "Light de referencia"),
+        );
+        compare.querySelector(".ds-progress-pane-after")?.setAttribute(
+            "aria-label",
+            tr("deepsky.prog_compare_master_pane_aria", "Máster actual"),
+        );
+        delete compare.dataset.beforeReady;
+        delete compare.dataset.afterReady;
+        delete compare.dataset.compareReady;
+        delete compare.dataset.panning;
     }
-    const warning = document.getElementById("ds-prog-warning"); if (warning) { warning.style.display = "none"; warning.textContent = ""; }
+    dsProgressResetViewport({ announce: true });
+    const compareReset = document.getElementById("ds-prog-view-reset");
+    if (compareReset) {
+        compareReset.setAttribute("aria-label", tr("deepsky.prog_compare_reset", "Restablecer zoom y encuadre compartidos"));
+        compareReset.title = tr("deepsky.prog_compare_reset_title", "Doble clic o pulsa aquí para restablecer el encuadre");
+    }
+    const compareHelp = document.getElementById("ds-prog-viewport-help");
+    if (compareHelp) compareHelp.textContent = tr(
+        "deepsky.prog_compare_help",
+        "Rueda para acercar. Arrastra para mover ambas imágenes al mismo tiempo. Doble clic para restablecer. Usa más, menos, flechas o Inicio con el teclado.",
+    );
+    for (const id of ["ds-prog-before-img", "ds-prog-after-img", "ds-prog-waiting-reference"]) {
+        const image = document.getElementById(id);
+        if (image) {
+            image.removeAttribute("src");
+            image.alt = "";
+            image.style.removeProperty("filter");
+        }
+    }
+    const beforeLabel = document.getElementById("ds-prog-before-label");
+    const afterLabel = document.getElementById("ds-prog-after-label");
+    if (beforeLabel) beforeLabel.textContent = tr("deepsky.prog_before_label", "ANTES · light de referencia");
+    if (afterLabel) afterLabel.textContent = tr("deepsky.prog_waiting_label", "ACTUAL · esperando máster");
+    document.querySelectorAll("#ds-progress [data-ds-prog-view]").forEach(button => {
+        button.disabled = true;
+        button.setAttribute("aria-pressed", String(button.dataset.dsProgView === "master"));
+    });
+    const handoff = document.getElementById("ds-prog-editor-handoff");
+    if (handoff) handoff.hidden = true;
+    const viewResult = document.getElementById("ds-prog-view-result");
+    const editResult = document.getElementById("ds-prog-edit-result");
+    if (viewResult) viewResult.hidden = true;
+    if (editResult) editResult.hidden = true;
+    const cancel = document.getElementById("ds-prog-cancel");
+    if (cancel) { cancel.hidden = false; cancel.disabled = false; }
+    const warning = document.getElementById("ds-prog-warning");
+    if (warning) { warning.hidden = true; warning.textContent = ""; }
+    const diagnosticSummary = document.getElementById("ds-prog-diagnostic-summary");
+    if (diagnosticSummary) diagnosticSummary.textContent = tr("deepsky.prog_no_warnings", "Sin advertencias");
+    dsProgressAppendDiagnostic(
+        `${tr("deepsky.prog_recipe_validated", "Receta validada")} · ${dsProgressSelectedProducts().map(dsProgressProductLabel).join(" · ")}`,
+    );
+    dsProgressRenderProducts();
+    dsProgressRenderResources();
+    dsProgressRenderEditorSteps();
     const ov = document.getElementById("ds-progress");
     if (ov) {
+        ov.dataset.state = "running";
         ov.style.display = "flex";
+        ov.setAttribute("aria-hidden", "false");
+        const shell = ov.querySelector(".ds-progress-shell");
+        if (shell) shell.scrollTop = 0;
+        dsSetBackgroundInert(true, ov);
         requestAnimationFrame(() => document.getElementById("ds-prog-cancel")?.focus());
     }
+    const statePill = document.querySelector("#ds-prog-state-pill b");
+    if (statePill) statePill.textContent = tr("deepsky.prog_live", "En proceso");
+    const kicker = document.getElementById("ds-progress-kicker");
+    if (kicker) kicker.textContent = tr("deepsky.prog_kicker", "Motor científico · máster lineal protegido");
+    const title = document.getElementById("ds-progress-title");
+    if (title) title.textContent = tr("deepsky.prog_title", "Apilado de Cielo Profundo");
+    const visualTitle = document.getElementById("ds-prog-visual-title");
+    const visualNote = document.getElementById("ds-prog-visual-note");
+    if (visualTitle) visualTitle.textContent = tr("deepsky.prog_visual_preparing", "Preparando la referencia");
+    if (visualNote) visualNote.textContent = tr(
+        "deepsky.prog_visual_preparing_note",
+        "El máster aparecerá al publicar la primera salida real.",
+    );
     clearInterval(dsProgTimer);
     dsProgTimer = setInterval(() => {
         const el = document.getElementById("ds-prog-elapsed");
-        if (el) el.textContent = dsFmtClock(Date.now() - dsProgStart);
+        if (el) {
+            const elapsed = Date.now() - dsProgStart;
+            el.textContent = dsFmtClock(elapsed);
+            el.setAttribute("datetime", `PT${Math.floor(elapsed / 1000)}S`);
+        }
     }, 1000);
     dsAttachSkyParallax();
+    const firstLight = context.lights?.[0]?.path || "";
+    void dsProgressLoadReference(firstLight, context.referencePreview || "");
+    return runToken;
 }
 
 // Parallax de puntero sobre el cielo del progreso: cada capa se desplaza a
@@ -15041,7 +17954,7 @@ function dsAttachSkyParallax() {
     if (!sky || sky.dataset.parallax) return;
     sky.dataset.parallax = "1";
     if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
-    const box = sky.closest(".donation-modal-box") || sky;
+    const box = sky.closest(".ds-progress-shell") || sky;
     const layers = () => ({
         neb: sky.querySelector(".ds-sky-neb-wrap"),
         s1: sky.querySelector(".ds-sky-stars.s1"),
@@ -15072,22 +17985,25 @@ function dsProgressUpdate(step, pct) {
         dsSessionProgressTotal = Math.max(1, Number(sessionMarker[2]));
         if (nextIndex !== dsSessionProgressIndex) {
             dsSessionProgressIndex = nextIndex;
+            dsProductProgressTotal = 1;
+            dsProductProgressIndex = 1;
+            dsProgressActiveProduct = null;
             dsPhaseTimes = {};
+            dsProgressActivePhase = -1;
             dsVisiblePhases.forEach(phase => {
                 const row = document.getElementById(`ds-ph-${phase.id}`);
                 if (!row) return;
-                const mark = row.querySelector(".ds-ph-mark");
+                const icon = row.querySelector(".ds-ph-mark use");
                 const time = row.querySelector(".ds-ph-time");
-                if (mark) { mark.textContent = "○"; mark.style.color = ""; }
+                if (icon) icon.setAttribute("href", "#icon-hourglass");
                 if (time) time.textContent = "";
-                row.style.color = "#94a3b8";
-                row.style.background = "transparent";
+                row.classList.remove("active", "done");
             });
         }
     }
-    const effectivePct = dsSessionProgressTotal > 1 && !sessionMarker
-        ? ((dsSessionProgressIndex - 1) * 100 + pct) / dsSessionProgressTotal
-        : pct;
+    const productMarker = dsProgressProductMarker(step);
+    if (productMarker) dsProgressActivateProduct(productMarker);
+    const effectivePct = dsProgressEffectivePercent(pct, sessionMarker, productMarker);
     const effectiveStep = dsSessionProgressTotal > 1 && !sessionMarker
         ? `Grupo ${dsSessionProgressIndex}/${dsSessionProgressTotal} · ${step}`
         : step;
@@ -15100,44 +18016,192 @@ function dsProgressUpdate(step, pct) {
     const pe = document.getElementById("ds-prog-pct"); if (pe) pe.textContent = `${Math.round(effectivePct)}%`;
     const cur = document.getElementById("ds-prog-current"); if (cur) cur.textContent = effectiveStep || "";
 
-    dsProgressPhaseUpdate(step, !sessionMarker && pct >= 99.5);
+    if (!sessionMarker && !productMarker) dsProgressPhaseUpdate(step, false);
+    dsProgressUpdateProducts(step, pct, false);
+    if (effectiveStep) dsProgressAppendDiagnostic(effectiveStep);
 }
 
 function dsProgressPhaseUpdate(step, complete = false) {
     let active = dsVisiblePhases.findIndex(ph => ph.rx.test(step || ""));
     if (complete) active = dsVisiblePhases.length;
     if (active < 0) return;
+    const selectedProductCount = dsProgressSelectedProducts().length;
+    const finalProductKnown = dsProgressActiveProduct
+        && dsProductProgressIndex >= dsProductProgressTotal;
+    if (!complete && selectedProductCount > 1 && !finalProductKnown) {
+        const integrationIndex = dsVisiblePhases.findIndex(phase => phase.id === "integrate");
+        if (integrationIndex >= 0) active = Math.min(active, integrationIndex);
+    }
+    dsProgressActivePhase = complete
+        ? dsVisiblePhases.length
+        : Math.max(dsProgressActivePhase, active);
+    active = dsProgressActivePhase;
     dsVisiblePhases.forEach((ph, i) => {
         const row = document.getElementById(`ds-ph-${ph.id}`);
         if (!row) return;
-        const mark = row.querySelector(".ds-ph-mark");
+        const icon = row.querySelector(".ds-ph-mark use");
         const time = row.querySelector(".ds-ph-time");
         if (i < active) {
             if (!dsPhaseTimes[ph.id]) dsPhaseTimes[ph.id] = Date.now();
-            mark.textContent = "✓";
+            if (icon) icon.setAttribute("href", "#icon-check");
             row.classList.add("done");
             row.classList.remove("active");
-            row.style.background = "transparent";
             if (time && dsPhaseTimes[ph.id + "_start"]) time.textContent = dsFmtClock(dsPhaseTimes[ph.id] - dsPhaseTimes[ph.id + "_start"]);
         } else if (i === active) {
             if (!dsPhaseTimes[ph.id + "_start"]) dsPhaseTimes[ph.id + "_start"] = Date.now();
-            mark.textContent = "▸";
+            if (icon) icon.setAttribute("href", "#icon-galaxy");
             row.classList.add("active");
             row.classList.remove("done");
         } else {
+            if (icon) icon.setAttribute("href", "#icon-hourglass");
             row.classList.remove("active", "done");
         }
     });
+    const stageCount = document.getElementById("ds-prog-stage-count");
+    if (stageCount) stageCount.textContent = `${Math.min(active, dsVisiblePhases.length)} / ${dsVisiblePhases.length}`;
+}
+
+async function dsProgressComplete(result, runToken = dsProgressRunToken) {
+    if (runToken !== dsProgressRunToken) return;
+    const viewToken = ++dsProgressViewToken;
+    dsStacking = false;
+    clearInterval(dsProgTimer);
+    dsProgressResult = result || null;
+    const ov = document.getElementById("ds-progress");
+    if (!ov) return;
+    ov.dataset.state = "complete";
+    ov.style.display = "flex";
+    ov.setAttribute("aria-hidden", "false");
+    dsSetBackgroundInert(true, ov);
+    const bar = document.getElementById("ds-prog-bar");
+    if (bar) { bar.style.width = "100%"; bar.setAttribute("aria-valuenow", "100"); }
+    const pct = document.getElementById("ds-prog-pct");
+    if (pct) pct.textContent = "100%";
+    const cur = document.getElementById("ds-prog-current");
+    if (cur) cur.textContent = tr(
+        "deepsky.prog_complete_body",
+        "Máster lineal publicado. El procesamiento creará sólo revisiones derivadas.",
+    );
+    const statePill = document.querySelector("#ds-prog-state-pill b");
+    if (statePill) statePill.textContent = tr("deepsky.prog_ready", "Resultado listo");
+    const kicker = document.getElementById("ds-progress-kicker");
+    if (kicker) kicker.textContent = tr("deepsky.prog_ready_kicker", "Integración terminada · fuente científica protegida");
+    const title = document.getElementById("ds-progress-title");
+    if (title) title.textContent = tr("deepsky.prog_ready_title", "Tu máster de cielo profundo está listo");
+    dsProgressPhaseUpdate("complete", true);
+    dsProgressUpdateProducts("complete", 100, true);
+    dsProgressApplyPublishedProducts(result);
+    await dsProgressAlignReferenceToMaster(result);
+    if (runToken !== dsProgressRunToken || viewToken !== dsProgressViewToken) return;
+    if (result?.previewPath) {
+        const source = await dsProgressBalancedMasterPreview();
+        if (runToken !== dsProgressRunToken || viewToken !== dsProgressViewToken) return;
+        await dsProgressSetPublishedView(
+            source,
+            tr(
+                "deepsky.prog_master_balanced_label",
+                "ACTUAL · máster balanceado para comparar",
+            ),
+            { runToken, viewToken },
+        );
+    }
+    if (runToken !== dsProgressRunToken || viewToken !== dsProgressViewToken) return;
+    document.querySelectorAll("#ds-progress [data-ds-prog-view]").forEach(button => {
+        button.disabled = !result?.previewPath;
+    });
+    const handoff = document.getElementById("ds-prog-editor-handoff");
+    if (handoff) handoff.hidden = false;
+    const cancel = document.getElementById("ds-prog-cancel");
+    const viewResult = document.getElementById("ds-prog-view-result");
+    const editResult = document.getElementById("ds-prog-edit-result");
+    if (cancel) cancel.hidden = true;
+    if (viewResult) viewResult.hidden = false;
+    if (editResult) editResult.hidden = false;
+    const diagnosticSummary = document.getElementById("ds-prog-diagnostic-summary");
+    if (diagnosticSummary) diagnosticSummary.textContent = tr("deepsky.prog_recipe_saved", "Receta y productos listos");
+    dsProgressAppendDiagnostic(
+        `${tr("deepsky.prog_finished", "Integración finalizada")} · ${Number(result?.framesUsed || 0)} lights · ${Number(result?.elapsedSeconds || 0).toFixed(1)} s`,
+    );
+    const shell = ov.querySelector(".ds-progress-shell");
+    if (shell) shell.scrollTop = 0;
+    requestAnimationFrame(() => editResult?.focus({ preventScroll: true }));
 }
 
 function dsProgressStop() {
     dsStacking = false;
+    dsProgressRunToken += 1;
+    dsProgressViewToken += 1;
+    document.body.classList.remove("ds-progress-active");
     clearInterval(dsProgTimer);
-    const ov = document.getElementById("ds-progress"); if (ov) ov.style.display = "none";
+    dsProgressReferenceToken += 1;
+    const ov = document.getElementById("ds-progress");
+    if (ov) {
+        ov.style.display = "none";
+        ov.setAttribute("aria-hidden", "true");
+    }
+    dsSetBackgroundInert(false);
+}
+
+async function dsProgressOpenEditor(step = 1) {
+    const overlay = document.getElementById("ds-progress");
+    const buttons = [...(overlay?.querySelectorAll("[data-ds-progress-editor-step], #ds-prog-edit-result") || [])];
+    const status = document.getElementById("ds-prog-current");
+    const previousStatus = status?.textContent || "";
+    let opened = false;
+    buttons.forEach(button => {
+        button.disabled = true;
+        button.setAttribute("aria-busy", "true");
+    });
+    if (status) status.textContent = tr("deepsky.editor_opening", "Abriendo Cielo Profundo Studio…");
+    try {
+        if (document.body.dataset.dsProgressFixture === "1") {
+            opened = !!dsOpenPoststackFixture(step);
+        } else {
+            dsPoststackStep = Math.min(DS_POSTSTACK_STEPS.length, Math.max(1, Number(step) || 1));
+            opened = await dsPoststackOpen();
+        }
+        // La pantalla de finalización sólo desaparece cuando Studio confirmó
+        // que abrió. Si el backend rechaza la sesión, el usuario conserva una
+        // salida visible y puede reintentar sin quedar en un hueco negro.
+        if (opened) dsProgressStop();
+    } finally {
+        if (!opened && status?.isConnected) status.textContent = previousStatus;
+        buttons.forEach(button => {
+            if (!button.isConnected) return;
+            button.disabled = false;
+            button.removeAttribute("aria-busy");
+        });
+    }
 }
 
 // Flujo de resultado DEDICADO de cielo profundo: solo la imagen final, sin la
 // vista fuente ni los paneles de post-procesado planetario (wavelets/deconv).
+function dsBindResultHeaderControls() {
+    const toolbar = document.getElementById("ds-result-toolbar");
+    if (!toolbar || toolbar.dataset.bound === "true") return;
+    toolbar.dataset.bound = "true";
+    document.getElementById("ds-result-master")?.addEventListener("click", async () => {
+        dsShowStretchBar();
+        await dsShowResultView("master");
+    });
+    document.getElementById("ds-result-editor")?.addEventListener("click", async () => {
+        dsShowStretchBar();
+        await dsPoststackOpen();
+    });
+}
+
+function dsSetResultStatus(message, tone = "ready") {
+    const status = document.getElementById("ds-result-status");
+    if (!status) return;
+    status.textContent = String(message || "");
+    status.dataset.tone = tone;
+    status.style.color = tone === "fallback"
+        ? "#fdba74"
+        : tone === "warning"
+            ? "#fde68a"
+            : "#86efac";
+}
+
 function dsEnterResultMode() {
     const vs = document.getElementById("view-source");
     const vr = document.getElementById("view-result");
@@ -15147,6 +18211,16 @@ function dsEnterResultMode() {
     // Ocultar el post-procesado planetario — cielo profundo tiene su barra STF.
     if (ui.panelWavelets) ui.panelWavelets.style.display = "none";
     if (ui.panelTools) ui.panelTools.style.display = "none";
+    const history = document.querySelector(".result-history-toolbar");
+    if (history) history.hidden = true;
+    const toolbar = document.getElementById("ds-result-toolbar");
+    if (toolbar) toolbar.hidden = false;
+    const title = document.querySelector(".result-view-title");
+    if (title) title.textContent = tr("deepsky.result_title", "Resultado de cielo profundo");
+    dsBindResultHeaderControls();
+    dsSetResultStatus(
+        tr("deepsky.result_protected", "Máster lineal protegido · las ediciones son revisiones"),
+    );
     document.body.dataset.dsResult = "1";
 }
 
@@ -15158,6 +18232,13 @@ function dsExitResultMode() {
     if (vs) vs.style.display = "";
     if (vr) vr.style.borderLeft = "";
     dsHideStretchBar();
+    dsDismissPoststackWorkspace();
+    const history = document.querySelector(".result-history-toolbar");
+    if (history) history.hidden = false;
+    const toolbar = document.getElementById("ds-result-toolbar");
+    if (toolbar) toolbar.hidden = true;
+    const title = document.querySelector(".result-view-title");
+    if (title) title.textContent = tr("viewer.processed_result", "Resultado Procesado");
     delete document.body.dataset.dsResult;
 }
 
@@ -15189,10 +18270,4736 @@ function dsTrapDialogFocus(event, dialog) {
 }
 
 // ---- Barra de estirado final (SIRIL-style screen transfer function) ----
-let dsStretchMode = "linked";
+// Balanceado es la vista inicial de inspección: iguala los fondos por canal y
+// evita que un máster OSC/dual-band lineal aparezca verde mientras se recorta.
+// Es únicamente STF de pantalla; nunca altera el máster float32.
+let dsStretchMode = "unlinked";
 let dsStretchStrength = 0.5;
 let dsResultView = "master";
 let dsResultBasePath = null; // primer light del apilado → carpeta de exportación
+let dsPoststackState = null;
+let dsPoststackStep = 1;
+let dsGradientExclusions = [];
+let dsGradientSamples = [];
+let dsGradientLastResult = null;
+let dsGradientSamplesVisible = false;
+let dsGradientSampleCursor = { column: 16, row: 16 };
+let dsPoststackShowingSource = false;
+let dsPoststackSourcePreview = "";
+let dsPoststackCurrentPreview = "";
+let dsPoststackDisplayPreview = "";
+let dsPoststackDisplaySourcePreview = "";
+let dsPoststackDisplayRefreshing = false;
+let dsPoststackDisplayRequestSerial = 0;
+let dsPoststackPreviewMode = "current";
+let dsPoststackFixtureOperations = [];
+let dsPoststackFixtureCursor = 0;
+let dsResultViewToken = 0;
+let dsResultProducts = new Map();
+let dsActiveProductId = null;
+let dsCropRect = { x: 0.025, y: 0.025, width: 0.95, height: 0.95 };
+let dsCropViewBase = { x: 0, y: 0, width: 1, height: 1 };
+let dsCropDrag = null;
+let dsAstrometryUi = { busy: false, error: "", online: false };
+let dsPoststackAnalysis = null;
+let dsPoststackPsfAnalysis = null;
+let dsPoststackSourceDescriptor = null;
+let dsLastSessionResult = null;
+let dsStudioPaletteGallery = null;
+let dsStudioPaletteRequestSerial = 0;
+let dsStudioAppliedPalette = null;
+let dsStudioPaletteAutoLoading = false;
+let dsStudioPaletteError = "";
+let dsStudioLayerTarget = "combined";
+let dsStudioLayerPreviews = new Map();
+let dsStudioCurveEditor = null;
+let dsStudioCurveChannel = "master";
+let dsStudioAnnotation = {
+    busy: false,
+    style: "zenithAtlas",
+    allowOnline: false,
+    showGrid: true,
+    includeCatalog: true,
+    maxObjects: 120,
+    result: null,
+    error: "",
+};
+let dsStudioExperience = localStorage.getItem("zas_ds_studio_experience") === "expert"
+    ? "expert"
+    : "essential";
+// Studio es un espacio de trabajo único. Las variantes acoplada/flotante
+// dejaban el lienzo en un estado persistente difícil de recuperar y no aportan
+// una operación científica distinta.
+let dsStudioLayout = "studio";
+try {
+    localStorage.removeItem("zas_ds_studio_layout");
+    localStorage.removeItem("zas_ds_editor_position");
+} catch { /* migración no crítica */ }
+let dsPoststackSettings = {
+    gradientMode: "auto",
+    gradientDegree: 2,
+    gradientSampleRadius: 0.025,
+    gradientAllowUnstable: false,
+    gradientSensitivity: 55,
+    gradientChromatic: true,
+    gradientProtect: true,
+    stretchPreset: "autoNatural",
+    stretchValue: null,
+    stretchSymmetry: null,
+    stretchLocal: null,
+    stretchLinked: true,
+    denoiseStrength: 42,
+    denoiseDetail: 70,
+    denoiseChroma: 38,
+    detailAmount: 28,
+    detailRadius: 1,
+    detailStars: 82,
+    finishSaturation: 12,
+    finishContrast: 8,
+    finishHighlights: 84,
+    curves: {
+        master: [[0, 0], [1, 1]],
+        luminance: [[0, 0], [1, 1]],
+        red: [[0, 0], [1, 1]],
+        green: [[0, 0], [1, 1]],
+        blue: [[0, 0], [1, 1]],
+        saturation: [[0, 0], [1, 1]],
+    },
+    curvesHueShift: 0,
+    curvesSaturationScale: 100,
+    curvesLightness: 0,
+    curvesSelective: [
+        { name: "red", center: 0, width: 45, hueShift: 0, saturation: 0, lightness: 0 },
+        { name: "orange", center: 30, width: 42, hueShift: 0, saturation: 0, lightness: 0 },
+        { name: "yellow", center: 60, width: 42, hueShift: 0, saturation: 0, lightness: 0 },
+        { name: "green", center: 120, width: 58, hueShift: 0, saturation: 0, lightness: 0 },
+        { name: "cyan", center: 180, width: 52, hueShift: 0, saturation: 0, lightness: 0 },
+        { name: "blue", center: 235, width: 54, hueShift: 0, saturation: 0, lightness: 0 },
+        { name: "violet", center: 275, width: 45, hueShift: 0, saturation: 0, lightness: 0 },
+        { name: "magenta", center: 320, width: 48, hueShift: 0, saturation: 0, lightness: 0 },
+    ],
+    dualBandProfile: localStorage.getItem("zas_ds_instrument_profile") || "metadata",
+    dualBandPalette: "hooNatural",
+    dualBandOiii: 65,
+    dualBandCrosstalk: 0,
+    deconvPreset: "balanced",
+    deconvIterations: 8,
+    deconvRegularization: 8,
+    deconvDeringing: 72,
+    deconvManualFwhmX: 2.8,
+    deconvManualFwhmY: 2.8,
+    deconvManualConfirmed: false,
+    starSensitivity: 58,
+    starScale: 100,
+    starHaloProtection: 78,
+    starFaintProtection: 62,
+    starReduction: 18,
+    starSaturation: 0,
+    starHaloSuppression: 25,
+    layerObjectWeight: 100,
+    layerStarWeight: 100,
+    layerResidualWeight: 100,
+};
+let dsPccUiEligibility = {
+    eligible: false,
+    reason: tr("deepsky.pcc_gate_pending", "La elegibilidad se determina al apilar o combinar un máster lineal."),
+};
+let dsHooUiEligibility = {
+    eligible: false,
+    reason: tr("deepsky.hoo_gate_pending", "HOO se habilita sólo al confirmar un máster OSC Ha+OIII/dual-band."),
+};
+
+const DS_STUDIO_CURVE_CHANNELS = Object.freeze([
+    ["master", "K", "Curva maestra"],
+    ["luminance", "L", "Luminancia"],
+    ["red", "R", "Rojo"],
+    ["green", "G", "Verde"],
+    ["blue", "B", "Azul"],
+    ["saturation", "S", "Saturación"],
+]);
+
+const DS_STUDIO_SELECTIVE_COLORS = Object.freeze([
+    ["red", "Rojos"],
+    ["orange", "Naranjas"],
+    ["yellow", "Amarillos"],
+    ["green", "Verdes"],
+    ["cyan", "Cianes"],
+    ["blue", "Azules"],
+    ["violet", "Violetas"],
+    ["magenta", "Magentas"],
+]);
+
+function dsStudioIsMono() {
+    const source = classifyDeepSkySource(dsPoststackEffectiveSourceDescriptor());
+    return source.kind === SOURCE_KINDS.MONO_BROADBAND
+        || source.kind === SOURCE_KINDS.MONO_NARROWBAND
+        || Number(dsPoststackState?.source?.channels || dsPoststackState?.channels || 0) === 1;
+}
+
+function dsStudioCurvePoints(channel = dsStudioCurveChannel) {
+    const stored = dsPoststackSettings.curves?.[channel];
+    return normalizeToneCurvePoints(stored || [[0, 0], [1, 1]]);
+}
+
+function dsStudioSetCurvePreset(preset) {
+    const points = ({
+        linear: [[0, 0], [1, 1]],
+        gentle: [[0, 0], [0.18, 0.13], [0.48, 0.53], [0.82, 0.9], [1, 1]],
+        nebula: [[0, 0], [0.12, 0.08], [0.38, 0.5], [0.72, 0.82], [1, 1]],
+        stars: [[0, 0], [0.22, 0.17], [0.55, 0.57], [0.86, 0.93], [1, 1]],
+        color: [[0, 0], [0.18, 0.12], [0.5, 0.57], [0.82, 0.9], [1, 1]],
+    })[preset] || [[0, 0], [1, 1]];
+    dsPoststackSettings.curves[dsStudioCurveChannel] = normalizeToneCurvePoints(points);
+}
+
+function dsStudioCurveRequest() {
+    return {
+        target: ["object", "stars"].includes(dsStudioLayerTarget)
+            ? dsStudioLayerTarget
+            : "combined",
+        master: dsStudioCurvePoints("master"),
+        luminance: dsStudioCurvePoints("luminance"),
+        red: dsStudioCurvePoints("red"),
+        green: dsStudioCurvePoints("green"),
+        blue: dsStudioCurvePoints("blue"),
+        saturation: dsStudioCurvePoints("saturation"),
+        hueShift: Number(dsPoststackSettings.curvesHueShift || 0),
+        saturationScale: Number(dsPoststackSettings.curvesSaturationScale || 100) / 100,
+        lightness: Number(dsPoststackSettings.curvesLightness || 0) / 100,
+        selective: dsStudioIsMono()
+            ? []
+            : dsPoststackSettings.curvesSelective.map(adjustment => ({
+                ...adjustment,
+                center: Number(adjustment.center),
+                width: Number(adjustment.width),
+                hueShift: Number(adjustment.hueShift),
+                saturation: Number(adjustment.saturation) / 100,
+                lightness: Number(adjustment.lightness) / 100,
+            })),
+    };
+}
+
+function dsSetPccUiEligibility(eligible, reason = "") {
+    dsPccUiEligibility = { eligible: !!eligible, reason: String(reason || "") };
+}
+
+function dsSetHooUiEligibility(eligible, reason = "") {
+    dsHooUiEligibility = { eligible: !!eligible, reason: String(reason || "") };
+}
+
+function dsPccEligibilityForStackRequest(request, multiband, lights) {
+    const requests = multiband
+        ? (request?.groups || []).map(group => group.request || {})
+        : [request || {}];
+    const captureModes = requests.map(item => String(item.captureMode || "auto").toLowerCase());
+    const filters = new Set([
+        ...(multiband ? (request?.groups || []).map(group => group.filterProfile) : []),
+        ...(lights || []).map(dsFilterOfFile),
+    ].filter(Boolean).map(filter => String(filter).toUpperCase()));
+    const narrowband = captureModes.some(mode => ["dualbandosc", "dual_band_osc", "mononarrowband", "mono_narrowband"].includes(mode))
+        || [...filters].some(filter => ["HA", "OIII", "SII", "HA_OIII", "SII_OIII"].includes(filter));
+    if (narrowband) {
+        return {
+            eligible: false,
+            reason: tr("deepsky.pcc_gate_narrowband", "PCC Gaia no es válido para narrowband/dual-band. Usa HOO/SHO o combinación de canales."),
+        };
+    }
+    const probes = (lights || []).filter(light => light?.ok !== false);
+    const mono = probes.length > 0 && probes.every(light => Number(light.ch || 1) === 1 && !light.bayer);
+    if (mono) {
+        return {
+            eligible: false,
+            reason: tr("deepsky.pcc_gate_mono", "El máster es monocromo. Combina primero LRGB/SHO/HOO según tus filtros."),
+        };
+    }
+    return {
+        eligible: true,
+        reason: tr("deepsky.pcc_gate_ready", "Disponible para este máster RGB de banda ancha; la receta permanece idempotente."),
+    };
+}
+
+function dsHooEligibilityForStackRequest(request, multiband, lights) {
+    const requests = multiband
+        ? (request?.groups || []).map(group => group.request || {})
+        : [request || {}];
+    const captureModes = requests.map(item => String(item.captureMode || "auto").toLowerCase());
+    const filters = new Set([
+        ...(multiband ? (request?.groups || []).map(group => group.filterProfile) : []),
+        ...(lights || []).map(dsFilterOfFile),
+    ].filter(Boolean).map(filter => String(filter).toUpperCase()));
+    if (filters.has("SII_OIII")) {
+        return {
+            eligible: false,
+            reason: tr("deepsky.hoo_gate_sii", "HOO no corresponde a SII+OIII. Usa una combinación SOO/SHO explícita."),
+        };
+    }
+    const probes = (lights || []).filter(light => light?.ok !== false);
+    const rgbCapable = probes.some(light => Number(light.ch || 1) >= 3 || !!light.bayer);
+    const dualBand = captureModes.some(mode => ["dualbandosc", "dual_band_osc"].includes(mode))
+        || filters.has("HA_OIII");
+    if (rgbCapable && dualBand) {
+        return {
+            eligible: true,
+            reason: tr("deepsky.hoo_gate_ready", "Disponible: OSC Ha+OIII confirmado; HOO crea sólo una vista derivada."),
+        };
+    }
+    return {
+        eligible: false,
+        reason: tr("deepsky.hoo_gate_unavailable", "HOO requiere un máster OSC Ha+OIII/dual-band confirmado."),
+    };
+}
+
+function dsStudioDescriptorFromStack(result, request, multiband, lights) {
+    if (multiband) {
+        const componentPaths = result?.componentPaths || {};
+        const groups = (result?.groups || []).map(group => ({
+            id: group.id,
+            filterProfile: group.filterProfile,
+            componentFilters: Object.keys(group.componentPaths || {}),
+            sourceReferences: Object.values(group.componentPaths || {}),
+        }));
+        return {
+            sourceType: "multi_filter_dual_band",
+            captureMode: "multi_filter_dual_band",
+            groups,
+            filters: groups.map(group => group.filterProfile),
+            components: Object.keys(componentPaths),
+            haPaths: componentPaths.HA || [],
+            oiiiPaths: componentPaths.OIII || [],
+            siiPaths: componentPaths.SII || [],
+            sourceReferences: Object.values(componentPaths).flat(),
+            oiiiReconciled: false,
+            instrumentProfile: {
+                id: dsPoststackSettings.dualBandProfile,
+                complete: false,
+            },
+            wcsValid: !!dsPoststackState?.astrometry,
+        };
+    }
+    const filters = [...new Set((lights || []).map(dsFilterOfFile).filter(Boolean))];
+    const channels = (lights || []).some(light => Number(light?.ch || 0) >= 3 || !!light?.bayer)
+        ? 3
+        : 1;
+    return {
+        sourceType: String(request?.captureMode || (channels >= 3 ? "broadband_rgb" : "mono")),
+        captureMode: request?.captureMode,
+        channels,
+        filters,
+        filterProfile: filters[0],
+        sourceReferences: [result?.masterFits || result?.previewPath || dsResultBasePath]
+            .filter(Boolean),
+        path: result?.masterFits || result?.previewPath || dsResultBasePath || undefined,
+        wcsValid: !!dsPoststackState?.astrometry,
+    };
+}
+
+function dsOpenPoststackFixture(step = 1, options = {}) {
+    document.body.dataset.dsPoststackFixture = "1";
+    const preview = dsQaFixturePreviewUrl();
+    dsPoststackFixtureOperations = (Array.isArray(options.operations) ? options.operations : [])
+        .map(operation => typeof operation === "string"
+            ? { kind: operation }
+            : { ...operation, kind: String(operation?.kind || "") })
+        .filter(operation => operation.kind);
+    if (
+        options.wcsVerified === true
+        && !dsPoststackFixtureOperations.some(operation => operation.kind === "astrometry")
+    ) {
+        dsPoststackFixtureOperations.push({
+            kind: "astrometry",
+            solution: dsPoststackFixtureAstrometry(),
+        });
+    }
+    dsPoststackFixtureCursor = Math.min(
+        dsPoststackFixtureOperations.length,
+        Math.max(0, Number(options.cursor ?? dsPoststackFixtureOperations.length) || 0),
+    );
+    const fixtureAstrometry = dsPoststackFixtureOperations
+        .slice(0, dsPoststackFixtureCursor)
+        .find(operation => operation.kind === "astrometry")?.solution || null;
+    dsPoststackState = {
+        width: 4144,
+        height: 2822,
+        cursor: dsPoststackFixtureCursor,
+        total: Math.max(dsPoststackFixtureOperations.length, Number(options.total || 0)),
+        canUndo: dsPoststackFixtureCursor > 0,
+        canRedo: dsPoststackFixtureCursor < dsPoststackFixtureOperations.length,
+        linear: options.linear !== false,
+        operations: dsPoststackFixtureOperations
+            .slice(0, dsPoststackFixtureCursor)
+            .map(operation => operation.kind),
+        crop: null,
+        astrometry: fixtureAstrometry,
+        astrometryStatus: fixtureAstrometry
+            ? {
+                state: "solved",
+                message: "WCS validado en el fixture de interacción.",
+                catalogKey: null,
+                localDirectory: null,
+            }
+            : {
+                state: "catalogRequired",
+                message: "No hay un mosaico Gaia local para este campo. El máster se conserva y puedes resolver en línea.",
+                catalogKey: "gaia_83.8200_-5.3910_2.841_16.0.json",
+                localDirectory: "/APILADOS/zenith_astrometry_index",
+            },
+        preview,
+    };
+    dsPoststackAnalysis = {
+        blackPoint: 312.4,
+        background: 428.7,
+        noiseSigma: 18.2,
+        whitePoint: 24870,
+        starFraction: 0.047,
+        suggestedStretch: { stretch: 7.4, symmetry: 0.11, localIntensity: 0.38 },
+    };
+    dsPoststackStep = Math.min(12, Math.max(1, Number(step) || 1));
+    dsGradientExclusions = [];
+    dsGradientSamples = [];
+    dsGradientLastResult = null;
+    dsStudioPaletteGallery = null;
+    dsStudioPaletteAutoLoading = false;
+    dsStudioPaletteError = "";
+    dsStudioAppliedPalette = null;
+    dsStudioAnnotation = {
+        busy: false,
+        style: "zenithAtlas",
+        allowOnline: false,
+        showGrid: true,
+        includeCatalog: true,
+        maxObjects: 120,
+        result: null,
+        error: "",
+    };
+    dsPoststackPsfAnalysis = null;
+    dsStudioLayerTarget = "combined";
+    dsStudioLayerPreviews = new Map();
+    dsPoststackShowingSource = false;
+    dsPoststackPreviewMode = "current";
+    dsPoststackSourcePreview = preview;
+    dsPoststackCurrentPreview = preview;
+    dsPoststackDisplayPreview = preview;
+    dsPoststackDisplaySourcePreview = preview;
+    const pccFixtureNarrowband = options.narrowband === true
+        || options.multiband === true
+        || options.mono === true;
+    dsPoststackSourceDescriptor = options.multiband
+        ? {
+            sourceType: "multi_filter_dual_band",
+            captureMode: "multi_filter_dual_band",
+            groups: [
+                { id: "ha-oiii", filterProfile: "HA_OIII", componentFilters: ["HA", "OIII"] },
+                { id: "sii-oiii", filterProfile: "SII_OIII", componentFilters: ["SII", "OIII"] },
+            ],
+            components: ["HA", "OIII", "SII"],
+            haPaths: ["/fixture/ha.fits"],
+            oiiiPaths: ["/fixture/o3-a.fits", "/fixture/o3-b.fits"],
+            siiPaths: ["/fixture/s2.fits"],
+            oiiiReconciled: !!options.oiiiReconciled,
+            instrumentProfile: { id: "fixture", complete: true },
+            wcsValid: false,
+        }
+        : options.mono
+            ? {
+                sourceType: "mono_broadband",
+                captureMode: "mono",
+                channels: 1,
+                components: ["L"],
+                filterProfile: "L",
+                wcsValid: false,
+            }
+        : pccFixtureNarrowband
+            ? {
+                sourceType: "osc_dual_band",
+                captureMode: "dualBandOsc",
+                channels: 3,
+                filterProfile: "HA_OIII",
+                components: ["HA", "OIII"],
+                wcsValid: false,
+            }
+            : {
+                sourceType: "broadband_rgb",
+                channels: 3,
+                components: ["R", "G", "B"],
+                wcsValid: false,
+            };
+    dsSetPccUiEligibility(
+        !pccFixtureNarrowband,
+        pccFixtureNarrowband
+            ? tr("deepsky.pcc_gate_narrowband", "PCC Gaia no es válido para narrowband/dual-band. Usa HOO/SHO o combinación de canales.")
+            : tr("deepsky.pcc_gate_ready", "Disponible para este máster RGB de banda ancha; la receta permanece idempotente."),
+    );
+    dsSetHooUiEligibility(
+        pccFixtureNarrowband,
+        pccFixtureNarrowband
+            ? tr("deepsky.hoo_gate_ready", "Disponible: OSC Ha+OIII confirmado; HOO crea sólo una vista derivada.")
+            : tr("deepsky.hoo_gate_unavailable", "HOO requiere un máster OSC Ha+OIII/dual-band confirmado."),
+    );
+    document.body.classList.add("ds-poststack-workspace");
+    const editor = dsPoststackRenderShell();
+    editor.hidden = false;
+    editor.dataset.qaFixture = "poststack-editor";
+    requestAnimationFrame(() => {
+        editor.querySelector(".ds-editor-panel")?.focus();
+        dsPoststackSyncInteractiveLayer();
+    });
+    return editor;
+}
+
+function dsIsPoststackFixture() {
+    return document.body.dataset.dsPoststackFixture === "1";
+}
+
+function dsPoststackFixtureRank(kind) {
+    const [base, target = "combined"] = String(kind || "").split(":");
+    return {
+        crop: 0,
+        gradient: 10,
+        astrometry: 20,
+        gaiaPcc: 30,
+        dualBandPalette: 35,
+        deconvolution: target === "combined" ? 40 : 60,
+        denoise: target === "combined" ? 45 : 62,
+        starSeparation: 55,
+        starAdjustment: 66,
+        recombine: 68,
+        stretch: target === "combined" ? 70 : 64,
+        curves: target === "combined" ? 75 : 64,
+        detail: target === "combined" ? 80 : 65,
+        finish: target === "combined" ? 100 : 67,
+    }[base] ?? 999;
+}
+
+function dsPoststackFixtureState() {
+    const active = dsPoststackFixtureOperations.slice(0, dsPoststackFixtureCursor);
+    const crop = active.find(operation => operation.kind === "crop")?.crop || null;
+    const astrometry = active.find(operation => operation.kind === "astrometry")?.solution || null;
+    const nonlinear = active.some(operation =>
+        ["stretch", "curves", "detail", "finish"].includes(operation.kind.split(":")[0]));
+    const separated = active.some(operation => operation.kind === "starSeparation");
+    const objectNonlinear = active.some(operation =>
+        ["stretch:object", "curves:object", "finish:object"].includes(operation.kind));
+    const starsNonlinear = active.some(operation =>
+        ["stretch:stars", "curves:stars", "finish:stars"].includes(operation.kind));
+    const recombineEligible = objectNonlinear === starsNonlinear;
+    const objectModified = active.some(operation =>
+        operation.kind.endsWith(":object") || operation.req?.target === "object");
+    const starsModified = active.some(operation =>
+        operation.kind.endsWith(":stars") || operation.req?.target === "stars"
+        || operation.kind === "starAdjustment");
+    return {
+        width: crop?.width || 4144,
+        height: crop?.height || 2822,
+        cursor: dsPoststackFixtureCursor,
+        total: dsPoststackFixtureOperations.length,
+        canUndo: dsPoststackFixtureCursor > 0,
+        canRedo: dsPoststackFixtureCursor < dsPoststackFixtureOperations.length,
+        linear: !nonlinear,
+        operations: active.map(operation => operation.kind),
+        crop,
+        astrometry,
+        astrometryStatus: astrometry
+            ? {
+                state: "solved",
+                message: "WCS validado en el fixture de interacción.",
+                catalogKey: null,
+                localDirectory: null,
+            }
+            : {
+                state: "catalogRequired",
+                message: "No hay un mosaico Gaia local para este campo. El máster se conserva y puedes resolver en línea.",
+                catalogKey: "gaia_83.8200_-5.3910_2.841_16.0.json",
+                localDirectory: "/APILADOS/zenith_astrometry_index",
+            },
+        layers: separated ? {
+            available: true,
+            engine: "nativePsfMultiscale",
+            objectModified,
+            starsModified,
+            recombined: recombineEligible
+                && active.some(operation => operation.kind === "recombine"),
+            exactRestore: !objectModified && !starsModified,
+            domain: nonlinear ? "presentation" : "linear",
+            objectDomain: objectNonlinear ? "presentation" : "linear",
+            starsDomain: starsNonlinear ? "presentation" : "linear",
+            recombineEligible,
+            recombineBlockReason: recombineEligible
+                ? null
+                : "Objeto y Estrellas están en dominios distintos. Completa o deshaz el estirado/acabado pendiente.",
+            reconstructionError: 0,
+            starFraction: 0.071,
+            psf: {
+                fwhmX: 2.84,
+                fwhmY: 2.62,
+                beta: 2.7,
+                starsUsed: 96,
+                confidence: 0.91,
+                measured: true,
+            },
+        } : null,
+        preview: dsQaFixturePreviewUrl(),
+    };
+}
+
+function dsPoststackFixtureCommit(kind, payload = {}) {
+    let operations = dsPoststackFixtureOperations.slice(0, dsPoststackFixtureCursor);
+    if (kind === "recombine") {
+        const current = dsPoststackFixtureState();
+        if (current.layers?.recombineEligible === false) {
+            throw new Error(current.layers.recombineBlockReason);
+        }
+    }
+    if (kind === "crop") {
+        operations = operations.filter(operation => {
+            const [base, target = "combined"] = operation.kind.split(":");
+            if (["gradient", "astrometry", "gaiaPcc", "deconvolution"].includes(base)) {
+                return false;
+            }
+            return [
+                "dualBandPalette",
+                "denoise",
+                "starSeparation",
+                "starAdjustment",
+                "recombine",
+                "stretch",
+                "curves",
+                "detail",
+                "finish",
+            ].includes(base);
+        });
+    }
+    const target = String(payload?.req?.target || "combined");
+    const slotKind = ["deconvolution", "denoise", "stretch", "curves", "detail", "finish"].includes(kind)
+        && target !== "combined"
+        ? `${kind}:${target}`
+        : kind;
+    const next = { kind: slotKind, ...payload };
+    const existing = operations.findIndex(operation => operation.kind === slotKind);
+    if (existing >= 0) operations[existing] = next;
+    else operations.push(next);
+    operations.sort((left, right) =>
+        dsPoststackFixtureRank(left.kind) - dsPoststackFixtureRank(right.kind));
+    dsPoststackFixtureOperations = operations;
+    dsPoststackFixtureCursor = operations.length;
+    dsPoststackState = dsPoststackFixtureState();
+    return dsPoststackState;
+}
+
+function dsPoststackFixtureCrop(req = {}) {
+    const sourceWidth = 4144;
+    const sourceHeight = 2822;
+    const x = Math.max(0, Math.min(sourceWidth - 1, Math.round(Number(req.x || 0) * sourceWidth)));
+    const y = Math.max(0, Math.min(sourceHeight - 1, Math.round(Number(req.y || 0) * sourceHeight)));
+    const width = Math.max(1, Math.min(sourceWidth - x, Math.round(Number(req.width || 1) * sourceWidth)));
+    const height = Math.max(1, Math.min(sourceHeight - y, Math.round(Number(req.height || 1) * sourceHeight)));
+    return { x, y, width, height, sourceWidth, sourceHeight };
+}
+
+function dsPoststackFixtureAstrometry() {
+    return {
+        ctype: "RA---TAN/DEC--TAN",
+        crval1: 83.82000,
+        crval2: -5.39100,
+        crpix1: 2072.5,
+        crpix2: 1411.5,
+        cd11: -0.0007891,
+        cd12: 0.000012,
+        cd21: 0.000012,
+        cd22: 0.0007891,
+        scaleArcsecPx: 2.841,
+        inliers: 186,
+        rmsPx: 0.42,
+        handedness: "negative",
+        source: "Fixture QA · índice local",
+        cached: true,
+    };
+}
+
+const DS_POSTSTACK_STEPS = [
+    { id: 1, planId: "crop", key: "crop", label: "Recortar", icon: "icon-scissors", phase: "PREPARAR" },
+    { id: 2, planId: "background_gradient", key: "background", label: "Fondo y gradiente", icon: "icon-eyedropper" },
+    { id: 3, planId: "astrometry", key: "astrometry", label: "Astrometría", icon: "icon-star" },
+    { id: 4, planId: "channels_color", key: "channels", label: "Canales y color", icon: "icon-palette" },
+    { id: 5, planId: "psf_deconvolution", key: "restore", label: "Restaurar PSF", icon: "icon-ruler", phase: "RESTAURAR" },
+    { id: 6, planId: "linear_denoise", key: "denoise", label: "Ruido lineal", icon: "icon-sparkles" },
+    { id: 7, planId: "star_layers", key: "layers", label: "Capas estelares", icon: "icon-galaxy", phase: "SEPARAR" },
+    { id: 8, planId: "stretch", key: "stretch", label: "Estirar", icon: "icon-chart", phase: "REVELAR" },
+    { id: 9, planId: "curves_color", key: "curves", label: "Curvas y color", icon: "icon-curves" },
+    { id: 10, planId: "detail", key: "detail", label: "Realzar detalle", icon: "icon-magic" },
+    { id: 11, planId: "finish", key: "finish", label: "Acabado", icon: "icon-trophy" },
+    { id: 12, planId: "export", key: "export", label: "Anotar y exportar", icon: "icon-download", phase: "ENTREGAR" },
+];
+
+function dsPoststackPlanStep(stepNumber, plan = dsPoststackStudioPlan()) {
+    const visible = DS_POSTSTACK_STEPS.find(step => step.id === Number(stepNumber));
+    return visible ? plan.steps.find(step => step.id === visible.planId) : null;
+}
+
+function dsPoststackStepLabel(step) {
+    return tr(`deepsky.editor_step_${step.id}`, step.label);
+}
+
+function dsPoststackStepDone(step) {
+    const operations = dsPoststackState?.operations || [];
+    if (step === 1) return operations.includes("crop");
+    if (step === 2) return operations.includes("gradient");
+    if (step === 3) return operations.includes("astrometry");
+    if (step === 4) return operations.includes("gaiaPcc")
+        || operations.includes("dualBandPalette")
+        || !!dsStudioAppliedPalette;
+    if (step === 5) return operations.some(operation => operation.startsWith("deconvolution"));
+    if (step === 6) return operations.some(operation => operation.startsWith("denoise"));
+    if (step === 7) return operations.includes("starSeparation");
+    if (step === 8) return operations.some(operation => operation.startsWith("stretch"));
+    if (step === 9) return operations.some(operation => operation.startsWith("curves"));
+    if (step === 10) return operations.some(operation => operation.startsWith("detail"));
+    if (step === 11) return operations.some(operation => operation.startsWith("finish"));
+    if (step === 12) return !!dsStudioAnnotation.result;
+    return false;
+}
+
+function dsPoststackTargetHasStretch(target = "combined") {
+    const operations = dsPoststackState?.operations || [];
+    if (target === "object" || target === "stars") {
+        return operations.includes(`stretch:${target}`);
+    }
+    if (operations.includes("stretch")) return true;
+    const layers = dsPoststackState?.layers;
+    return !!layers?.recombined
+        && layers.objectDomain === "presentation"
+        && layers.starsDomain === "presentation";
+}
+
+function dsPoststackRevisionSummary() {
+    const cursor = dsPoststackState?.cursor || 0;
+    const total = dsPoststackState?.total || 0;
+    const mode = dsPoststackState?.linear === false
+        ? tr("deepsky.editor_mode_processed", "derivada procesada")
+        : tr("deepsky.editor_mode_linear", "lineal");
+    return trFormat(
+        "deepsky.editor_revision",
+        { current: cursor, total, mode },
+        `Revisión ${cursor} de ${total} · ${mode} · original protegido`,
+    );
+}
+
+function dsEnableFloatingDrag(element, handle, storageKey) {
+    if (!element || !handle || element.dataset.dragReady === "true") return;
+    element.dataset.dragReady = "true";
+    try {
+        const saved = JSON.parse(localStorage.getItem(storageKey) || "null");
+        if (saved && Number.isFinite(saved.left) && Number.isFinite(saved.top)) {
+            element.style.left = `${Math.max(6, saved.left)}px`;
+            element.style.top = `${Math.max(6, saved.top)}px`;
+            element.style.right = "auto";
+            element.style.bottom = "auto";
+            element.style.transform = "none";
+        }
+    } catch { /* posición corrupta: usa el anclaje por defecto */ }
+    handle.addEventListener("pointerdown", event => {
+        if (event.button !== 0 || event.target.closest("button, input, select, a")) return;
+        const rect = element.getBoundingClientRect();
+        const start = { x: event.clientX, y: event.clientY, left: rect.left, top: rect.top };
+        handle.setPointerCapture(event.pointerId);
+        element.dataset.dragging = "true";
+        const move = moveEvent => {
+            const maxLeft = Math.max(6, window.innerWidth - element.offsetWidth - 6);
+            const maxTop = Math.max(6, window.innerHeight - Math.min(element.offsetHeight, window.innerHeight - 12) - 6);
+            const left = Math.min(maxLeft, Math.max(6, start.left + moveEvent.clientX - start.x));
+            const top = Math.min(maxTop, Math.max(6, start.top + moveEvent.clientY - start.y));
+            element.style.left = `${left}px`;
+            element.style.top = `${top}px`;
+            element.style.right = "auto";
+            element.style.bottom = "auto";
+            element.style.transform = "none";
+        };
+        const end = () => {
+            handle.removeEventListener("pointermove", move);
+            handle.removeEventListener("pointerup", end);
+            handle.removeEventListener("pointercancel", end);
+            delete element.dataset.dragging;
+            const finalRect = element.getBoundingClientRect();
+            try {
+                localStorage.setItem(storageKey, JSON.stringify({ left: finalRect.left, top: finalRect.top }));
+            } catch { /* preferencia no crítica */ }
+        };
+        handle.addEventListener("pointermove", move);
+        handle.addEventListener("pointerup", end);
+        handle.addEventListener("pointercancel", end);
+        event.preventDefault();
+    });
+}
+
+function dsResetFloatingPosition(element, storageKey) {
+    try { localStorage.removeItem(storageKey); } catch { /* preferencia no crítica */ }
+    if (!element) return;
+    element.style.removeProperty("left");
+    element.style.removeProperty("top");
+    element.style.removeProperty("right");
+    element.style.removeProperty("bottom");
+    element.style.removeProperty("transform");
+}
+
+function dsPoststackSetCompareSplit(value) {
+    const compare = document.querySelector("#ds-poststack-editor .ds-editor-compare");
+    if (!compare) return;
+    const split = Math.min(92, Math.max(8, Number(value) || 50));
+    compare.style.setProperty("--ds-editor-split", `${split}%`);
+}
+
+function dsPoststackCurrentPreviewLabel() {
+    const viewLabels = {
+        source: tr("deepsky.editor_compare_original", "ORIGINAL · lineal"),
+        dq: "ACTUAL · DQ",
+        coverage: "ACTUAL · cobertura",
+        rejection_high: "ACTUAL · rechazo",
+        variance: "ACTUAL · varianza",
+        neff: "ACTUAL · NEFF",
+        recoverability: "ACTUAL · recuperabilidad",
+        "layer-combined": "CAPAS · combinado",
+        "layer-object": "CAPAS · objeto sin estrellas",
+        "layer-stars": "CAPAS · estrellas",
+        "layer-mask": "CAPAS · máscara estelar",
+        "layer-residual": "CAPAS · residual",
+        "palette-preview": "VISTA PREVIA · paleta sin aplicar",
+        annotations: "PUBLICACIÓN · mapa anotado",
+        "milkyway-composite": "VÍA LÁCTEA · compuesto editable",
+        "milkyway-sky": "VÍA LÁCTEA · cielo lineal",
+        "milkyway-ground": "VÍA LÁCTEA · suelo lineal",
+        "milkyway-mask": "VÍA LÁCTEA · máscara cielo/suelo",
+        "milkyway-skyVariance": "VÍA LÁCTEA · varianza del cielo",
+        "milkyway-groundVariance": "VÍA LÁCTEA · varianza del suelo",
+        "milkyway-skyCoverage": "VÍA LÁCTEA · cobertura del cielo",
+        "milkyway-groundCoverage": "VÍA LÁCTEA · cobertura del suelo",
+        "milkyway-skyRejection": "VÍA LÁCTEA · rechazo del cielo",
+        "milkyway-groundRejection": "VÍA LÁCTEA · rechazo del suelo",
+    };
+    if (viewLabels[dsPoststackPreviewMode]) return viewLabels[dsPoststackPreviewMode];
+    if (dsPoststackPreviewMode === "gradient-model") {
+        return tr("deepsky.editor_compare_gradient_model", "ACTUAL · modelo de gradiente");
+    }
+    if (dsPoststackPreviewMode === "gradient-residual") {
+        return tr("deepsky.editor_compare_gradient_residual", "ACTUAL · residual de gradiente");
+    }
+    if (
+        dsPoststackPreviewMode === "current"
+        && dsPoststackDisplayPreview
+        && dsPoststackDisplaySourcePreview === dsPoststackState?.preview
+    ) {
+        const mode = dsStretchMode === "unlinked"
+            ? tr("deepsky.stf_balanced", "Balanceado")
+            : dsStretchMode === "linear"
+                ? tr("deepsky.stf_linear", "Lineal")
+                : tr("deepsky.stf_linked", "Vinculado");
+        return `ACTUAL · STF ${mode}`;
+    }
+    return dsPoststackState?.linear === false
+        ? tr("deepsky.editor_compare_processed", "ACTUAL · procesada")
+        : tr("deepsky.editor_compare_linear", "ACTUAL · lineal");
+}
+
+function dsIsMilkyWayWorkflow() {
+    return dsPoststackSourceDescriptor?.workflow === "milky_way"
+        || dsPoststackSourceDescriptor?.captureMode === "milky_way";
+}
+
+async function dsPoststackShowMilkyWayLayer(kind) {
+    const path = dsPoststackSourceDescriptor?.milkyWayLayers?.[kind];
+    if (!path) return;
+    try {
+        const preview = /^(?:data:|blob:|https?:|\/)/i.test(String(path)) && !/\.(?:fits?|fts)$/i.test(String(path))
+            ? String(path)
+            : await invoke("deepsky_frame_preview", { path: String(path), maxSize: 2200 });
+        await dsPoststackShowPreview(`milkyway-${kind}`, preview);
+    } catch (error) {
+        showCustomAlert(
+            tr("deepsky.view_unavailable", "Vista no disponible"),
+            normalizeBackendText(String(error)),
+        );
+    }
+}
+
+function dsPoststackEffectiveSourceDescriptor() {
+    if (dsPoststackSourceDescriptor && typeof dsPoststackSourceDescriptor === "object") {
+        return dsPoststackSourceDescriptor;
+    }
+    if (dsHooUiEligibility.eligible) {
+        return {
+            sourceType: "osc_dual_band",
+            captureMode: "dualBandOsc",
+            channels: 3,
+            filterProfile: "HA_OIII",
+            components: ["HA", "OIII"],
+            path: dsResultBasePath || undefined,
+            wcsValid: !!dsPoststackState?.astrometry,
+        };
+    }
+    if (dsPccUiEligibility.eligible) {
+        return {
+            sourceType: "broadband_rgb",
+            channels: 3,
+            components: ["R", "G", "B"],
+            path: dsResultBasePath || undefined,
+            wcsValid: !!dsPoststackState?.astrometry,
+        };
+    }
+    return {
+        sourceType: Number(dsPoststackState?.channels || 0) === 1 ? "mono" : "unknown",
+        channels: Number(dsPoststackState?.channels || 0) || undefined,
+        path: dsResultBasePath || undefined,
+        wcsValid: !!dsPoststackState?.astrometry,
+    };
+}
+
+function dsMergePoststackSourceDescriptor(current, update) {
+    if (!update || typeof update !== "object") return current || null;
+    if (!current || typeof current !== "object") return { ...update };
+    return {
+        ...update,
+        ...current,
+        path: current.path || update.path,
+        fileName: current.fileName || update.fileName,
+        channels: current.channels || update.channels,
+        filterProfile: current.filterProfile || update.filterProfile,
+        componentFilters: current.componentFilters?.length
+            ? [...current.componentFilters]
+            : [...(update.componentFilters || [])],
+        hasVariance: update.hasVariance ?? current.hasVariance,
+        hasDq: update.hasDq ?? current.hasDq,
+        routingReason: current.routingReason || update.routingReason,
+    };
+}
+
+function dsPoststackStudioPlan() {
+    const operations = dsPoststackState?.operations || [];
+    const descriptor = {
+        ...dsPoststackEffectiveSourceDescriptor(),
+        wcsValid: !!dsPoststackState?.astrometry,
+        backgroundCorrected: operations.includes("gradient"),
+    };
+    const plan = planDeepSkyStudio(descriptor, {
+        psfDeconvolution: { enabled: operations.some(operation => operation.startsWith("deconvolution")) },
+        linearDenoise: { enabled: operations.some(operation => operation.startsWith("denoise")) },
+        starLayers: { enabled: operations.includes("starSeparation") },
+        stretch: { enabled: operations.some(operation => operation.startsWith("stretch")) },
+        curvesColor: { enabled: operations.some(operation => operation.startsWith("curves")) },
+        channelsColor: {
+            enabled: operations.includes("gaiaPcc")
+                || operations.includes("dualBandPalette")
+                || !!dsStudioAppliedPalette,
+            mode: dsPccUiEligibility.eligible ? "pcc" : "palette",
+        },
+    });
+    return applyMilkyWayEditorSafetyPlan(plan, descriptor);
+}
+
+function dsStudioRecipeRequest() {
+    const operations = dsPoststackState?.operations || [];
+    const settings = {
+        crop: {
+            enabled: operations.includes("crop"),
+            ...dsPoststackCropPayload(false),
+        },
+        backgroundGradient: {
+            enabled: operations.includes("gradient"),
+            mode: dsPoststackSettings.gradientMode,
+            degree: Number(dsPoststackSettings.gradientDegree),
+            samples: dsGradientSamples.map(sample => ({ ...sample })),
+            exclusionRects: dsGradientExclusions.map(rect => ({ ...rect })),
+        },
+        astrometry: {
+            enabled: operations.includes("astrometry"),
+        },
+        channelsColor: {
+            enabled: operations.includes("gaiaPcc")
+                || operations.includes("dualBandPalette")
+                || !!dsStudioAppliedPalette,
+            mode: operations.includes("gaiaPcc") ? "pcc" : "palette",
+            palette: dsStudioAppliedPalette?.paletteId
+                || dsPoststackSettings.dualBandPalette,
+        },
+        linearDenoise: {
+            enabled: operations.some(operation => operation.startsWith("denoise")),
+            strength: Number(dsPoststackSettings.denoiseStrength) / 100,
+        },
+        psfDeconvolution: {
+            enabled: operations.some(operation => operation.startsWith("deconvolution")),
+            iterations: Number(dsPoststackSettings.deconvIterations),
+            regularization: Number(dsPoststackSettings.deconvRegularization) / 100,
+            manualPsfConfirmed: !!dsPoststackSettings.deconvManualConfirmed,
+            manualFwhmX: Number(dsPoststackSettings.deconvManualFwhmX),
+            manualFwhmY: Number(dsPoststackSettings.deconvManualFwhmY),
+        },
+        starLayers: {
+            enabled: operations.includes("starSeparation"),
+            engine: "nativePsfMultiscale",
+            sensitivity: Number(dsPoststackSettings.starSensitivity) / 100,
+        },
+        stretch: {
+            enabled: operations.some(operation => operation.startsWith("stretch")),
+            preset: dsPoststackSettings.stretchPreset,
+        },
+        curvesColor: {
+            enabled: operations.some(operation => operation.startsWith("curves")),
+            ...dsStudioCurveRequest(),
+        },
+        detail: {
+            enabled: operations.some(operation => operation.startsWith("detail")),
+            amount: Number(dsPoststackSettings.detailAmount) / 100,
+        },
+        finish: {
+            enabled: operations.some(operation => operation.startsWith("finish")),
+            saturation: Number(dsPoststackSettings.finishSaturation) / 100,
+        },
+        export: { enabled: true },
+    };
+    const descriptor = dsPoststackEffectiveSourceDescriptor();
+    const request = buildDeepSkyStudioRequest({
+        source: descriptor,
+        settings,
+        presentationMode: dsStudioExperience,
+    });
+    return preserveMilkyWayRecipeIdentity(request, descriptor);
+}
+
+function dsStudioSourceLabel(source = dsPoststackStudioPlan().source) {
+    return ({
+        [SOURCE_KINDS.BROADBAND_RGB]: "RGB de banda ancha",
+        [SOURCE_KINDS.MONO_BROADBAND]: "Mono / LRGB",
+        [SOURCE_KINDS.MONO_NARROWBAND]: "Mono de banda estrecha",
+        [SOURCE_KINDS.OSC_DUAL_BAND]: "OSC dual-band",
+        [SOURCE_KINDS.MULTI_FILTER_DUAL_BAND]: "Ha+OIII · SII+OIII",
+        [SOURCE_KINDS.ALREADY_COMBINED]: "Combinación existente",
+        [SOURCE_KINDS.UNKNOWN]: "Fuente por identificar",
+    })[source.kind] || "Fuente de cielo profundo";
+}
+
+function dsStudioStepStatus(step) {
+    if (step?.blocked) return tr("deepsky.editor_step_blocked", "Requiere atención");
+    if (step?.required) return tr("deepsky.editor_step_required", "Necesario");
+    if (step?.recommended) return tr("deepsky.editor_recommended", "Recomendado");
+    if (step?.applies === false) return tr("deepsky.editor_not_applicable", "No aplica");
+    return tr("deepsky.editor_optional", "Opcional");
+}
+
+function dsStudioProductOptions() {
+    const products = [...dsResultProducts.values()];
+    if (!products.length) {
+        return `<option value="">${tr("deepsky.editor_active_master", "Máster activo")}</option>`;
+    }
+    return products.map(product => {
+        const id = String(product.id);
+        return `<option value="${escapeHtml(id)}" ${id === String(dsActiveProductId || "") ? "selected" : ""}>${escapeHtml(dsProductDisplayLabel(product))}</option>`;
+    }).join("");
+}
+
+function dsPoststackInteractiveImage() {
+    const editorImage = document.querySelector(
+        "#ds-poststack-editor:not([hidden]) .ds-editor-compare > [data-editor-compare-current]",
+    );
+    if (editorImage?.getBoundingClientRect && editorImage.offsetParent !== null) return editorImage;
+    return ui.imgResult;
+}
+
+function dsImageVisibleContentRect(image) {
+    const rect = image?.getBoundingClientRect?.();
+    if (!rect) return null;
+    const naturalWidth = Number(image.naturalWidth || 0);
+    const naturalHeight = Number(image.naturalHeight || 0);
+    if (!naturalWidth || !naturalHeight || !rect.width || !rect.height) return rect;
+    const style = getComputedStyle(image);
+    if (style.objectFit !== "contain") return rect;
+    const scale = Math.min(rect.width / naturalWidth, rect.height / naturalHeight);
+    const width = naturalWidth * scale;
+    const height = naturalHeight * scale;
+    return {
+        left: rect.left + (rect.width - width) / 2,
+        top: rect.top + (rect.height - height) / 2,
+        right: rect.left + (rect.width + width) / 2,
+        bottom: rect.top + (rect.height + height) / 2,
+        width,
+        height,
+    };
+}
+
+async function dsStudioShowScientificView(kind) {
+    const requested = String(kind || "current");
+    if (requested === "current") {
+        const refreshed = await dsPoststackRefreshDisplayPreview({ render: true });
+        if (!refreshed) {
+            const preview = dsPoststackDisplayPreview
+                || dsPoststackState?.preview
+                || dsPoststackCurrentPreview;
+            if (preview) await dsPoststackShowPreview("current", preview);
+        }
+        return;
+    }
+    if (requested === "source") {
+        const preview = await dsPoststackLoadSourcePreview();
+        if (preview) await dsPoststackShowPreview("source", preview);
+        return;
+    }
+    if (requested === "gradient-model") {
+        if (dsGradientLastResult?.modelPreview) {
+            await dsPoststackShowPreview(requested, dsGradientLastResult.modelPreview);
+        }
+        return;
+    }
+    if (requested === "gradient-residual") {
+        if (dsGradientLastResult?.residualPreview) {
+            await dsPoststackShowPreview(requested, dsGradientLastResult.residualPreview);
+        }
+        return;
+    }
+    try {
+        const preview = dsIsPoststackFixture()
+            ? dsQaFixturePreviewUrl()
+            : await invoke("deepsky_result_view", { kind: requested });
+        await dsPoststackShowPreview(requested, preview);
+    } catch (error) {
+        showCustomAlert(
+            tr("deepsky.view_unavailable", "Vista no disponible"),
+            `${requested}: ${normalizeBackendText(String(error))}`,
+        );
+    }
+}
+
+async function dsPoststackApplyRecommended(button) {
+    const plan = dsPoststackStudioPlan();
+    const current = plan.steps[dsPoststackStep - 1];
+    if (current?.blocked) {
+        if (dsPoststackStep === 4) {
+            if (dsStudioNeedsChannelMasters(plan.source)) {
+                dsOpenDeepSkyChannelCombiner();
+            } else {
+                await dsStudioLoadPaletteGallery(button);
+            }
+        }
+        return;
+    }
+    if (!current?.applies) {
+        const next = plan.steps.find(step =>
+            step.order > dsPoststackStep && step.applies && (step.recommended || step.required));
+        if (next) {
+            dsPoststackStep = next.order;
+            dsPoststackRenderShell();
+            dsPoststackSyncInteractiveLayer();
+        }
+        return;
+    }
+    if (dsIsMilkyWayWorkflow() && !milkyWayEditorShouldAutoApplyStep(current)) {
+        const next = plan.steps.find(step =>
+            step.order > dsPoststackStep && milkyWayEditorShouldAutoApplyStep(step));
+        if (next) {
+            dsPoststackStep = next.order;
+            dsPoststackRenderShell();
+            dsPoststackSyncInteractiveLayer();
+        }
+        return;
+    }
+    if (dsPoststackStep === 1) {
+        if (current.recommended) await dsPoststackApplyCrop(button);
+        else {
+            dsPoststackStep = 2;
+            dsPoststackRenderShell();
+            dsPoststackSyncInteractiveLayer();
+        }
+    } else if (dsPoststackStep === 2) {
+        await dsPoststackApplyGradient(button);
+    } else if (dsPoststackStep === 3) {
+        await dsPoststackSolveAstrometry(button, { allowOnline: false });
+    } else if (dsPoststackStep === 4) {
+        if (plan.source.kind === SOURCE_KINDS.BROADBAND_RGB && dsPoststackState?.astrometry) {
+            await dsPoststackRunPcc(button);
+        } else if ([
+            SOURCE_KINDS.MONO_NARROWBAND,
+            SOURCE_KINDS.OSC_DUAL_BAND,
+            SOURCE_KINDS.MULTI_FILTER_DUAL_BAND,
+        ].includes(plan.source.kind)) {
+            if (!dsStudioPaletteGallery) await dsStudioLoadPaletteGallery(button);
+            else await dsStudioApplyPalette(button);
+        }
+    } else if (dsPoststackStep === 5) {
+        await dsPoststackApplyDeconvolution(button);
+    } else if (dsPoststackStep === 6) {
+        await dsPoststackApplyDenoise(button);
+    } else if (dsPoststackStep === 7) {
+        await dsPoststackSeparateStars(button);
+    } else if (dsPoststackStep === 8) {
+        await dsPoststackApplyStretch(button);
+    } else if (dsPoststackStep === 9) {
+        await dsPoststackApplyDetail(button);
+    } else if (dsPoststackStep === 10) {
+        await dsPoststackApplyFinish(button);
+    } else if (dsPoststackStep === 11) {
+        button?.closest("#ds-poststack-editor")
+            ?.querySelector('[data-editor-action="export"]')
+            ?.click();
+    } else if (dsPoststackStep === 12) {
+        button?.closest("#ds-poststack-editor")
+            ?.querySelector('[data-editor-action="export"]')
+            ?.click();
+    }
+}
+
+async function dsPoststackShowPreview(mode, preview) {
+    if (mode === "current" && dsPoststackState?.preview === preview) {
+        const refreshed = await dsPoststackRefreshDisplayPreview({ render: true });
+        if (refreshed) return;
+    }
+    if (!preview) return;
+    const token = ++dsResultViewToken;
+    dsPoststackPreviewMode = mode;
+    dsPoststackCurrentPreview = preview;
+    if (ui.imgResult) await dsSetResultImage(preview, token, false);
+    if (token !== dsResultViewToken) return;
+    dsPoststackRenderShell();
+    dsPoststackSyncInteractiveLayer();
+}
+
+function dsPoststackInvalidateDisplayPreview() {
+    dsPoststackDisplayPreview = "";
+    dsPoststackDisplaySourcePreview = "";
+    dsPoststackDisplayRequestSerial += 1;
+    dsPoststackDisplayRefreshing = false;
+}
+
+async function dsPoststackBuildDisplayPreview() {
+    if (dsIsPoststackFixture()) return dsQaFixturePreviewUrl();
+    try {
+        return await invoke("deepsky_restretch", {
+            mode: dsStretchMode,
+            strength: dsStretchStrength,
+        });
+    } catch (error) {
+        log("WARN", `STF de Studio: ${normalizeBackendText(String(error))}`);
+        return dsPoststackState?.preview || dsPoststackCurrentPreview || "";
+    }
+}
+
+async function dsPoststackRefreshDisplayPreview({ fitView = false, render = true } = {}) {
+    if (!dsPoststackState?.preview || dsPoststackPreviewMode !== "current") return false;
+    const sourcePreview = dsPoststackState.preview;
+    const requestSerial = ++dsPoststackDisplayRequestSerial;
+    dsPoststackDisplayRefreshing = true;
+    try {
+        const preview = await dsPoststackBuildDisplayPreview();
+        if (
+            requestSerial !== dsPoststackDisplayRequestSerial
+            || dsPoststackState?.preview !== sourcePreview
+            || dsPoststackPreviewMode !== "current"
+            || !preview
+        ) return false;
+        dsPoststackDisplayPreview = preview;
+        dsPoststackDisplaySourcePreview = sourcePreview;
+        dsPoststackCurrentPreview = preview;
+        const token = ++dsResultViewToken;
+        if (ui.imgResult) await dsSetResultImage(preview, token, fitView);
+        if (token !== dsResultViewToken) return false;
+        if (render) {
+            dsPoststackRenderShell();
+            dsPoststackSyncInteractiveLayer();
+        }
+        return true;
+    } finally {
+        if (requestSerial === dsPoststackDisplayRequestSerial) {
+            dsPoststackDisplayRefreshing = false;
+        }
+    }
+}
+
+function dsPoststackScheduleDisplayRefresh() {
+    if (
+        dsPoststackDisplayRefreshing
+        || dsPoststackPreviewMode !== "current"
+        || !dsPoststackState?.preview
+        || (
+            dsPoststackDisplayPreview
+            && dsPoststackDisplaySourcePreview === dsPoststackState.preview
+        )
+    ) return;
+    queueMicrotask(() => {
+        if (!dsPoststackDisplayRefreshing) void dsPoststackRefreshDisplayPreview();
+    });
+}
+
+async function dsPoststackLoadSourcePreview(force = false) {
+    if (document.body.dataset.dsPoststackFixture === "1") {
+        dsPoststackSourcePreview ||= dsQaFixturePreviewUrl();
+        return dsPoststackSourcePreview;
+    }
+    if (dsPoststackSourcePreview && !force) return dsPoststackSourcePreview;
+    try {
+        dsPoststackSourcePreview = await invoke("deepsky_poststack_source_preview");
+    } catch (error) {
+        log("WARN", `Comparador original: ${error}`);
+    }
+    return dsPoststackSourcePreview;
+}
+
+async function dsPoststackHydrateComparator(forceSource = false) {
+    const editor = document.getElementById("ds-poststack-editor");
+    const compare = editor?.querySelector(".ds-editor-compare");
+    if (!compare) return;
+    const sourceImage = compare.querySelector("[data-editor-compare-source]");
+    const currentImage = compare.querySelector("[data-editor-compare-current]");
+    const sourcePreview = await dsPoststackLoadSourcePreview(forceSource);
+    const currentPreview = dsPoststackDisplayPreview
+        || dsPoststackCurrentPreview
+        || dsPoststackState?.preview
+        || (document.body.dataset.dsPoststackFixture === "1"
+            ? dsQaFixturePreviewUrl()
+            : "");
+    if (sourceImage && sourcePreview) {
+        const shown = await dsProgressSetImage(sourceImage, sourcePreview);
+        if (shown && compare.isConnected) {
+            sourceImage.alt = tr("deepsky.editor_compare_source_alt", "Máster lineal original protegido");
+            compare.dataset.sourceReady = "true";
+        }
+    }
+    if (currentImage && currentPreview) {
+        const shown = await dsProgressSetImage(currentImage, currentPreview);
+        if (shown && compare.isConnected) {
+            currentImage.alt = tr("deepsky.editor_compare_current_alt", "Revisión procesada actual");
+            compare.dataset.currentReady = "true";
+        }
+    }
+}
+
+function dsPoststackRenderShell() {
+    if (dsPoststackPreviewMode === "current" && dsPoststackState?.preview) {
+        const displayMatchesState = dsPoststackDisplayPreview
+            && dsPoststackDisplaySourcePreview === dsPoststackState.preview;
+        dsPoststackCurrentPreview = displayMatchesState
+            ? dsPoststackDisplayPreview
+            : dsPoststackState.preview;
+        if (!displayMatchesState) dsPoststackScheduleDisplayRefresh();
+    }
+    let editor = document.getElementById("ds-poststack-editor");
+    if (!editor) {
+        editor = document.createElement("section");
+        editor.id = "ds-poststack-editor";
+        editor.hidden = true;
+        editor.setAttribute("role", "region");
+        editor.setAttribute("aria-label", tr("deepsky.editor_title", "Edición rápida de cielo profundo"));
+        document.body.appendChild(editor);
+        editor.addEventListener("click", async (event) => {
+            const curveChannelButton = event.target.closest("[data-curve-channel]");
+            if (curveChannelButton) {
+                dsStudioCurveChannel = String(curveChannelButton.dataset.curveChannel || "master");
+                dsPoststackRenderShell();
+                return;
+            }
+            const curvePresetButton = event.target.closest("[data-curve-preset]");
+            if (curvePresetButton) {
+                dsStudioSetCurvePreset(String(curvePresetButton.dataset.curvePreset || "linear"));
+                dsPoststackRenderShell();
+                return;
+            }
+            const displayModeButton = event.target.closest("[data-editor-display-mode]");
+            if (displayModeButton) {
+                dsStretchMode = String(displayModeButton.dataset.editorDisplayMode || "unlinked");
+                dsPoststackPreviewMode = "current";
+                await dsPoststackRefreshDisplayPreview({ render: true });
+                return;
+            }
+            const annotationStyleButton = event.target.closest("[data-annotation-style]");
+            if (annotationStyleButton) {
+                dsStudioAnnotation.style = String(annotationStyleButton.dataset.annotationStyle || "zenithAtlas");
+                dsStudioAnnotation.result = null;
+                dsStudioAnnotation.error = "";
+                dsPoststackRenderShell();
+                return;
+            }
+            const paletteButton = event.target.closest("[data-editor-palette]");
+            if (paletteButton) {
+                const paletteId = String(paletteButton.dataset.editorPalette || "");
+                const candidate = dsStudioPaletteGallery?.candidates?.find(item => item.id === paletteId);
+                if (paletteId && candidate?.eligible !== false) {
+                    dsPoststackSettings.dualBandPalette = paletteId;
+                    if (candidate?.preview) {
+                        await dsPoststackShowPreview("palette-preview", candidate.preview);
+                    } else {
+                        dsPoststackRenderShell();
+                    }
+                }
+                return;
+            }
+            const stepButton = event.target.closest("[data-editor-step]");
+            if (stepButton) {
+                if (stepButton.dataset.editorReturnLayers === "true") {
+                    dsStudioLayerTarget = "combined";
+                }
+                dsPoststackStep = Number(stepButton.dataset.editorStep);
+                if (dsPoststackStep === 1) {
+                    dsStudioLayerTarget = "combined";
+                    dsPoststackPreviewMode = "current";
+                }
+                const rendered = dsPoststackRenderShell();
+                rendered.querySelector(`[data-editor-step="${dsPoststackStep}"]`)?.focus();
+                dsPoststackSyncInteractiveLayer();
+                return;
+            }
+            const action = event.target.closest("[data-editor-action]")?.dataset.editorAction;
+            if (!action) return;
+            if (action === "close") dsPoststackClose();
+            if (action === "choose-master") await dsChooseStandaloneMaster();
+            if (action === "experience-essential" || action === "experience-expert") {
+                dsStudioExperience = action.endsWith("expert") ? "expert" : "essential";
+                try { localStorage.setItem("zas_ds_studio_experience", dsStudioExperience); } catch { /* preferencia no crítica */ }
+                dsPoststackRenderShell();
+                dsPoststackSyncInteractiveLayer();
+            }
+            if (action === "undo") await dsPoststackMove("deepsky_poststack_undo");
+            if (action === "redo") await dsPoststackMove("deepsky_poststack_redo");
+            if (action === "reset") await dsPoststackMove("deepsky_poststack_reset");
+            if (action === "quick-auto") {
+                await dsPoststackApplyRecommended(event.target.closest("button"));
+            }
+            if (action?.startsWith("studio-view-")) {
+                await dsStudioShowScientificView(action.slice("studio-view-".length));
+            }
+            if (action?.startsWith("milkyway-view-")) {
+                await dsPoststackShowMilkyWayLayer(action.slice("milkyway-view-".length));
+            }
+            if (action === "crop-reset") {
+                await dsPoststackApplyCrop(event.target.closest("button"), { full: true });
+            }
+            if (action === "crop") await dsPoststackApplyCrop(event.target.closest("button"));
+            if (action === "add-mask") dsBeginGradientMask();
+            if (action === "gradient-samples") {
+                dsGradientSamplesVisible = !dsGradientSamplesVisible;
+                dsPoststackRenderShell();
+                dsPoststackSyncInteractiveLayer();
+            }
+            if (action === "gradient-generate-samples") {
+                dsGradientSamples = dsGenerateGradientSamples();
+                dsGradientSamplesVisible = true;
+                dsPoststackSettings.gradientMode = "samples";
+                dsPoststackRenderShell();
+                dsPoststackSyncInteractiveLayer();
+            }
+            if (action === "clear-masks") {
+                dsGradientExclusions = [];
+                dsPoststackRenderShell();
+                dsPoststackSyncInteractiveLayer();
+            }
+            if (action === "gradient") await dsPoststackApplyGradient(event.target.closest("button"));
+            if (action === "gradient-current" && dsPoststackState?.preview) {
+                await dsPoststackShowPreview("current", dsPoststackState.preview);
+            }
+            if (action === "gradient-model" && dsGradientLastResult?.modelPreview) {
+                await dsPoststackShowPreview("gradient-model", dsGradientLastResult.modelPreview);
+            }
+            if (action === "gradient-residual" && dsGradientLastResult?.residualPreview) {
+                await dsPoststackShowPreview("gradient-residual", dsGradientLastResult.residualPreview);
+            }
+            if (action === "astrometry") await dsPoststackSolveAstrometry(event.target.closest("button"), { allowOnline: false });
+            if (action === "astrometry-online") await dsPoststackSolveAstrometry(event.target.closest("button"), { allowOnline: true, preferExisting: false });
+            if (action === "astrometry-seed") await dsPoststackSolveAstrometry(event.target.closest("button"), { allowOnline: false, requestSeed: true, preferExisting: false });
+            if (action === "annotation-open") {
+                dsPoststackStep = 12;
+                dsPoststackRenderShell();
+            }
+            if (action === "pcc") await dsPoststackRunPcc(event.target.closest("button"));
+            if (action === "dualband") await dsPoststackApplyDualBand(event.target.closest("button"));
+            if (action === "palette-gallery") await dsStudioLoadPaletteGallery(event.target.closest("button"));
+            if (action === "palette-apply") await dsStudioApplyPalette(event.target.closest("button"));
+            if (action === "palette-restore-source") await dsStudioRestorePaletteSource(event.target.closest("button"));
+            if (action === "deconvolution") await dsPoststackApplyDeconvolution(event.target.closest("button"));
+            if (action === "separate-stars") await dsPoststackSeparateStars(event.target.closest("button"));
+            if (action === "adjust-stars") await dsPoststackAdjustStars(event.target.closest("button"));
+            if (action === "recombine-layers") await dsPoststackRecombine(event.target.closest("button"));
+            if (action?.startsWith("layer-view-")) {
+                await dsPoststackShowLayer(action.slice("layer-view-".length));
+            }
+            if (action?.startsWith("layer-edit-")) {
+                const parts = action.split("-");
+                const target = parts[2];
+                const tool = parts[3];
+                dsStudioLayerTarget = target === "starless" ? "object" : target;
+                dsPoststackStep = ({
+                    restore: 5,
+                    denoise: 6,
+                    stretch: 8,
+                    curves: 9,
+                    detail: 10,
+                    finish: 11,
+                })[tool] || 7;
+                dsPoststackRenderShell();
+                dsPoststackSyncInteractiveLayer();
+            }
+            if (action === "layer-return") {
+                dsStudioLayerTarget = "combined";
+                dsPoststackStep = 7;
+                dsPoststackRenderShell();
+                dsPoststackSyncInteractiveLayer();
+            }
+            if (action === "split") {
+                dsOpenDeepSkyChannelCombiner();
+            }
+            if (action === "stretch") await dsPoststackApplyStretch(event.target.closest("button"));
+            if (action === "curves-reset") {
+                for (const [channel] of DS_STUDIO_CURVE_CHANNELS) {
+                    dsPoststackSettings.curves[channel] = [[0, 0], [1, 1]];
+                }
+                dsPoststackSettings.curvesHueShift = 0;
+                dsPoststackSettings.curvesSaturationScale = 100;
+                dsPoststackSettings.curvesLightness = 0;
+                dsPoststackSettings.curvesSelective = dsPoststackSettings.curvesSelective.map(item => ({
+                    ...item,
+                    hueShift: 0,
+                    saturation: 0,
+                    lightness: 0,
+                }));
+                dsPoststackRenderShell();
+            }
+            if (action === "postprocess-curves") await dsPoststackApplyCurves(event.target.closest("button"));
+            if (action === "postprocess-noise") await dsPoststackApplyDenoise(event.target.closest("button"));
+            if (action === "postprocess-detail") await dsPoststackApplyDetail(event.target.closest("button"));
+            if (action === "postprocess-finish") await dsPoststackApplyFinish(event.target.closest("button"));
+            if (action === "annotation-preview") await dsStudioGenerateAnnotations(event.target.closest("button"));
+            if (action === "annotation-online") {
+                dsStudioAnnotation.allowOnline = true;
+                await dsStudioGenerateAnnotations(event.target.closest("button"));
+            }
+            if (action === "annotation-export-overlay") {
+                await dsStudioExportAnnotations(false, event.target.closest("button"));
+            }
+            if (action === "annotation-export-composite") {
+                await dsStudioExportAnnotations(true, event.target.closest("button"));
+            }
+            if (action === "annotation-clear") {
+                dsStudioAnnotation.result = null;
+                dsStudioAnnotation.error = "";
+                if (dsPoststackState?.preview) await dsPoststackShowPreview("current", dsPoststackState.preview);
+                dsPoststackRenderShell();
+            }
+            if (action === "export") {
+                if (dsIsPoststackFixture()) {
+                    showCustomAlert(
+                        tr("deepsky.export", "Exportar"),
+                        "Fixture interactivo: el selector de salidas requiere un máster publicado por el motor nativo.",
+                    );
+                } else {
+                    dsPoststackClose();
+                    document.getElementById("ds-export-main")?.click();
+                }
+            }
+        });
+        editor.addEventListener("input", event => {
+            if (event.target?.id === "ds-editor-stf-strength") {
+                dsStretchStrength = Math.min(1, Math.max(0, Number(event.target.value) || 0));
+                const output = editor.querySelector("[data-editor-display-output]");
+                if (output) output.textContent = `${Math.round(dsStretchStrength * 100)}%`;
+                return;
+            }
+            if (event.target?.id === "ds-editor-compare-slider") {
+                dsPoststackSetCompareSplit(event.target.value);
+                return;
+            }
+            if (event.target?.id === "ds-studio-product") {
+                const productId = String(event.target.value || "");
+                if (productId) void dsShowResultView(`product-id:${productId}`).then(async () => {
+                    try {
+                        dsPoststackState = await invoke("deepsky_poststack_state");
+                        dsPoststackCurrentPreview = dsPoststackState?.preview || dsPoststackCurrentPreview;
+                    } catch { /* mantiene la vista del producto */ }
+                    dsPoststackRenderShell();
+                    dsPoststackSyncInteractiveLayer();
+                });
+                return;
+            }
+            const selectiveIndex = event.target?.dataset?.curveSelectiveIndex;
+            const selectiveComponent = event.target?.dataset?.curveComponent;
+            if (selectiveIndex != null && selectiveComponent) {
+                const adjustment = dsPoststackSettings.curvesSelective[Number(selectiveIndex)];
+                if (!adjustment) return;
+                adjustment[selectiveComponent] = Number(event.target.value);
+                const article = event.target.closest(".ds-selective-color");
+                const output = article?.querySelector("output");
+                if (output && selectiveComponent === "saturation") {
+                    const value = Number(event.target.value);
+                    output.textContent = `${value > 0 ? "+" : ""}${Math.round(value)}%`;
+                }
+                return;
+            }
+            const annotationSetting = event.target?.dataset?.annotationSetting;
+            if (annotationSetting) {
+                dsStudioAnnotation[annotationSetting] = event.target.type === "checkbox"
+                    ? event.target.checked
+                    : Number(event.target.value);
+                dsStudioAnnotation.result = null;
+                dsStudioAnnotation.error = "";
+                const output = editor.querySelector(`[data-annotation-output="${annotationSetting}"]`);
+                if (output) output.textContent = String(Math.round(Number(dsStudioAnnotation[annotationSetting])));
+                return;
+            }
+            const key = event.target?.dataset?.editorSetting;
+            if (!key) return;
+            const value = event.target.type === "checkbox"
+                ? event.target.checked
+                : event.target.type === "range" || event.target.type === "number"
+                    ? Number(event.target.value)
+                    : event.target.value;
+            dsPoststackSettings[key] = value;
+            const output = editor.querySelector(`[data-editor-output="${key}"]`);
+            if (output) output.textContent = event.target.dataset.unit === "percent"
+                ? `${Math.round(Number(value))}%`
+                : String(value);
+            if (["dualBandProfile", "dualBandOiii", "dualBandCrosstalk"].includes(key)) {
+                dsStudioPaletteGallery = null;
+                dsStudioPaletteRequestSerial += 1;
+                const applyPalette = editor.querySelector('[data-editor-action="palette-apply"]');
+                if (applyPalette) applyPalette.disabled = true;
+                const paletteGallery = editor.querySelector(".ds-palette-gallery");
+                if (paletteGallery) {
+                    paletteGallery.dataset.stale = "true";
+                    paletteGallery.setAttribute("aria-label", tr(
+                        "deepsky.editor_palette_stale",
+                        "Vista previa obsoleta; recalcula la galería antes de aplicar.",
+                    ));
+                }
+            }
+            if (key === "dualBandProfile") {
+                try { localStorage.setItem("zas_ds_instrument_profile", String(value)); } catch { /* preferencia no crítica */ }
+                dsApplyInstrumentProfileDefaults(String(value));
+            }
+            if (key === "gradientMode" || key === "gradientSampleRadius") {
+                if (key === "gradientSampleRadius") {
+                    dsGradientSamples.forEach(sample => {
+                        sample.radius = Number(value);
+                    });
+                }
+                dsPoststackRenderShell();
+                dsPoststackSyncInteractiveLayer();
+            }
+        });
+        editor.addEventListener("change", event => {
+            if (event.target?.id === "ds-editor-stf-strength") {
+                dsPoststackPreviewMode = "current";
+                void dsPoststackRefreshDisplayPreview({ render: true });
+                return;
+            }
+            const key = event.target?.dataset?.editorSetting;
+            if (!["dualBandProfile", "dualBandOiii", "dualBandCrosstalk"].includes(key)) return;
+            dsPoststackRenderShell();
+            dsPoststackSyncInteractiveLayer();
+        });
+        editor.addEventListener("keydown", event => {
+            if (event.key === "Escape") {
+                if (dsPoststackState?.layers?.available && dsStudioLayerTarget !== "combined") {
+                    dsStudioLayerTarget = "combined";
+                    dsPoststackStep = 7;
+                    dsPoststackRenderShell();
+                    dsPoststackSyncInteractiveLayer();
+                } else {
+                    dsPoststackClose();
+                }
+                return;
+            }
+            const layerTab = event.target.closest?.(".ds-layer-tabs [role=tab]");
+            if (layerTab && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+                event.preventDefault();
+                const tabs = [...layerTab.closest(".ds-layer-tabs").querySelectorAll("[role=tab]")]
+                    .filter(tab => !tab.hidden && !tab.disabled);
+                const current = tabs.indexOf(layerTab);
+                const next = event.key === "Home"
+                    ? tabs[0]
+                    : event.key === "End"
+                        ? tabs.at(-1)
+                        : tabs[(current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length];
+                next?.focus();
+                next?.click();
+                return;
+            }
+            const curveTab = event.target.closest?.(".ds-curve-tabs [role=tab]");
+            if (curveTab && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+                event.preventDefault();
+                const tabs = [...curveTab.closest(".ds-curve-tabs").querySelectorAll("[role=tab]")]
+                    .filter(tab => !tab.hidden && !tab.disabled);
+                const current = tabs.indexOf(curveTab);
+                const next = event.key === "Home"
+                    ? tabs[0]
+                    : event.key === "End"
+                        ? tabs.at(-1)
+                        : tabs[(current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length];
+                next?.focus();
+                next?.click();
+                return;
+            }
+            const stepButton = event.target.closest?.("[data-editor-step]");
+            if (!stepButton || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+            event.preventDefault();
+            const current = Number(stepButton.dataset.editorStep);
+            if (event.key === "Home") dsPoststackStep = 1;
+            else if (event.key === "End") dsPoststackStep = DS_POSTSTACK_STEPS.length;
+            else dsPoststackStep = Math.min(
+                DS_POSTSTACK_STEPS.length,
+                Math.max(1, current + (event.key === "ArrowRight" ? 1 : -1)),
+            );
+            const rendered = dsPoststackRenderShell();
+            rendered.querySelector(`[data-editor-step="${dsPoststackStep}"]`)?.focus();
+        });
+    }
+    const operations = dsPoststackState?.operations || [];
+    const studioPlan = dsPoststackStudioPlan();
+    const studioRecipe = dsStudioRecipeRequest();
+    const sourceLabel = dsStudioSourceLabel(studioPlan.source);
+    const plannedSteps = new Map(studioPlan.steps.map(step => [step.id, step]));
+    const stepButtons = DS_POSTSTACK_STEPS.map(step => {
+        const done = dsPoststackStepDone(step.id);
+        const planned = plannedSteps.get(step.planId);
+        const label = dsPoststackStepLabel(step);
+        const accessibleLabel = done
+            ? `${label} · ${tr("deepsky.editor_step_done", "completado")}`
+            : `${label} · ${dsStudioStepStatus(planned)}`;
+        const icon = done ? "icon-check" : step.icon;
+        return `
+        <button type="button" class="ds-editor-step" data-editor-step="${step.id}"
+            ${step.phase ? `data-phase="${escapeHtml(step.phase)}"` : ""}
+            ${dsPoststackStep === step.id ? 'aria-current="step"' : ""} data-done="${done}"
+            data-applies="${planned?.applies !== false}" data-recommended="${!!planned?.recommended}"
+            aria-label="${escapeHtml(accessibleLabel)}">
+            <span class="ds-editor-n"><svg class="zas-icon" aria-hidden="true"><use href="#${icon}"></use></svg></span>
+            <span class="ds-step-copy"><b>${escapeHtml(label)}</b><small>${escapeHtml(
+                done ? tr("deepsky.editor_step_done", "Completado") : dsStudioStepStatus(planned),
+            )}</small></span>
+        </button>`;
+    }).join("");
+    const activePlanStep = dsPoststackPlanStep(dsPoststackStep, studioPlan);
+    const milkyWayOptionalStep = dsIsMilkyWayWorkflow()
+        && activePlanStep?.applies !== false
+        && !milkyWayEditorShouldAutoApplyStep(activePlanStep);
+    const quickLabel = dsPoststackStep === 4 && dsStudioNeedsChannelMasters(studioPlan.source)
+        ? tr("deepsky.editor_add_channel_masters", "Añadir másteres de canal")
+        : milkyWayOptionalStep
+            ? "Omitir y seguir"
+        : dsPoststackStep === 12
+            ? tr("deepsky.export", "Elegir salidas")
+        : activePlanStep?.applies === false
+            ? tr("deepsky.editor_next_recommended", "Ir al siguiente recomendado")
+            : tr("deepsky.editor_apply_recommended", "Aplicar recomendación");
+    const sourceComponents = studioPlan.source.components.length
+        ? ` · ${studioPlan.source.components.join(" / ")}`
+        : "";
+    const layerTabs = dsPoststackState?.layers?.available ? `
+        <div class="ds-layer-tabs" role="tablist" aria-label="${tr("deepsky.editor_layer_views", "Capas estelares")}">
+            ${[
+                ["combined", "icon-mosaic", tr("deepsky.editor_layer_combined", "Combinado")],
+                ["object", "icon-galaxy", tr("deepsky.editor_layer_object", "Objeto")],
+                ["stars", "icon-star", tr("deepsky.editor_layer_stars", "Estrellas")],
+            ].map(([target, icon, label]) => `<button type="button" role="tab"
+                data-editor-action="layer-view-${target}"
+                aria-selected="${dsStudioLayerTarget === target}"
+                tabindex="${dsStudioLayerTarget === target ? "0" : "-1"}">
+                <svg class="zas-icon" aria-hidden="true"><use href="#${icon}"></use></svg>${escapeHtml(label)}
+            </button>`).join("")}
+            <button type="button" class="ds-expert-only" role="tab"
+                data-editor-action="layer-view-mask"
+                aria-selected="${dsStudioLayerTarget === "mask"}"
+                tabindex="${dsStudioLayerTarget === "mask" ? "0" : "-1"}">${tr("deepsky.editor_layer_mask", "Máscara")}</button>
+        </div>` : "";
+    const milkyWayLayers = dsPoststackSourceDescriptor?.milkyWayLayers || {};
+    const milkyWayLayerTabs = dsIsMilkyWayWorkflow() ? `
+        <div class="ds-layer-tabs ds-milkyway-tabs" role="group" aria-label="${tr("milkyway.editor_source_group", "Productos fuente sincronizados de Vía Láctea")}">
+            <span class="ds-milkyway-tabs-label">Edición activa · Compuesto derivado; Cielo, Suelo y mapas · sólo lectura</span>
+            ${[
+                ["composite", "icon-mosaic", tr("milkyway.product_composite", "Compuesto")],
+                ["sky", "icon-galaxy", tr("milkyway.product_sky", "Cielo")],
+                ["ground", "icon-moon", tr("milkyway.product_ground", "Suelo")],
+                ["mask", "icon-ruler", tr("milkyway.product_mask", "Máscara")],
+            ].filter(([kind]) => !!milkyWayLayers[kind]).map(([kind, icon, label]) => `<button type="button"
+                data-editor-action="milkyway-view-${kind}"
+                title="${label} ${tr("milkyway.editor_source_view", "fuente · vista sin modificar")}"
+                aria-pressed="${dsPoststackPreviewMode === `milkyway-${kind}`}">
+                <svg class="zas-icon" aria-hidden="true"><use href="#${icon}"></use></svg>${label}
+            </button>`).join("")}
+            <span class="ds-milkyway-tabs-break" aria-hidden="true"></span>
+            ${[
+                ["skyVariance", tr("milkyway.product_sky_variance", "Varianza cielo")],
+                ["groundVariance", tr("milkyway.product_ground_variance", "Varianza suelo")],
+                ["skyCoverage", tr("milkyway.product_sky_coverage", "Cobertura cielo")],
+                ["groundCoverage", tr("milkyway.product_ground_coverage", "Cobertura suelo")],
+                ["skyRejection", tr("milkyway.product_sky_rejection", "Rechazo cielo")],
+                ["groundRejection", tr("milkyway.product_ground_rejection", "Rechazo suelo")],
+            ].filter(([kind]) => !!milkyWayLayers[kind]).map(([kind, label]) => `<button type="button" class="ds-milkyway-map-tab"
+                data-editor-action="milkyway-view-${kind}"
+                title="${label} ${tr("milkyway.editor_source_view", "fuente · vista sin modificar")}"
+                aria-pressed="${dsPoststackPreviewMode === `milkyway-${kind}`}">${label}</button>`).join("")}
+        </div>` : "";
+    const studioTitle = dsIsMilkyWayWorkflow()
+        ? tr("milkyway.studio_title", "Vía Láctea Studio")
+        : tr("deepsky.editor_studio_title", "Cielo Profundo Studio");
+    const studioIcon = dsIsMilkyWayWorkflow() ? "icon-mosaic" : "icon-galaxy";
+    editor.setAttribute("aria-label", studioTitle);
+    for (const property of ["left", "top", "right", "bottom", "transform", "width", "height"]) {
+        editor.style.removeProperty(property);
+    }
+    editor.dataset.editorLayout = dsStudioLayout;
+    editor.dataset.experience = dsStudioExperience;
+    editor.dataset.editorTarget = dsIsMilkyWayWorkflow() ? "composite" : "active-master";
+    editor.dataset.recipeOperations = String(studioRecipe.operations.length);
+    editor.innerHTML = `
+        <header class="ds-studio-head">
+            <div class="ds-studio-brand">
+                <span class="ds-studio-brand-mark"><svg class="zas-icon" aria-hidden="true"><use href="#${studioIcon}"></use></svg></span>
+                <span class="ds-studio-brand-copy">
+                    <small>${tr("deepsky.editor_scientific_workspace", "Máster protegido · revisiones derivadas")}</small>
+                    <strong>${studioTitle}</strong>
+                </span>
+            </div>
+            <span class="ds-studio-source-pill" title="${escapeHtml(sourceLabel + sourceComponents)}"><span>${escapeHtml(sourceLabel + sourceComponents)}</span></span>
+            <div class="ds-studio-mode" role="group" aria-label="${tr("deepsky.editor_experience", "Nivel de controles")}">
+                <button type="button" data-editor-action="experience-essential" aria-pressed="${dsStudioExperience === "essential"}">${tr("deepsky.essential", "Esencial")}</button>
+                <button type="button" data-editor-action="experience-expert" aria-pressed="${dsStudioExperience === "expert"}">${tr("deepsky.expert", "Experto")}</button>
+            </div>
+            <div class="ds-editor-history">
+                ${dsPoststackState?.layers?.available && (dsPoststackStep !== 7 || dsStudioLayerTarget !== "combined")
+                    ? `<button type="button" class="ds-studio-layer-home" data-editor-action="layer-return"
+                        data-editor-step="7" data-editor-return-layers="true"
+                        aria-label="${tr("deepsky.editor_back_layers", "Volver al laboratorio de capas")}"
+                        title="${tr("deepsky.editor_back_layers", "Volver al laboratorio de capas")}">
+                        <svg class="zas-icon" aria-hidden="true"><use href="#icon-mosaic"></use></svg></button>`
+                    : ""}
+                <button type="button" data-editor-action="choose-master"
+                    aria-label="${tr("deepsky.editor_choose_master", "Abrir otro máster")}" title="${tr("deepsky.editor_choose_master", "Abrir otro máster")}">
+                    <svg class="zas-icon" aria-hidden="true"><use href="#icon-folder"></use></svg></button>
+                <button type="button" data-editor-action="undo" ${dsPoststackState?.canUndo ? "" : "disabled"}
+                    aria-label="${tr("deepsky.editor_undo", "Deshacer")}" title="${tr("deepsky.editor_undo", "Deshacer")}"><svg class="zas-icon" aria-hidden="true"><use href="#icon-undo"></use></svg></button>
+                <button type="button" data-editor-action="redo" ${dsPoststackState?.canRedo ? "" : "disabled"}
+                    aria-label="${tr("deepsky.editor_redo", "Rehacer")}" title="${tr("deepsky.editor_redo", "Rehacer")}"><svg class="zas-icon" aria-hidden="true"><use href="#icon-redo"></use></svg></button>
+                <button type="button" data-editor-action="reset" aria-label="${tr("deepsky.editor_reset", "Restaurar el original")}" title="${tr("deepsky.editor_reset", "Restaurar el original")}">
+                    <svg class="zas-icon" aria-hidden="true"><use href="#icon-refresh"></use></svg></button>
+                <button type="button" data-editor-action="close" aria-label="${tr("deepsky.close", "Cerrar")}"><svg class="zas-icon" aria-hidden="true"><use href="#icon-cross"></use></svg></button>
+            </div>
+        </header>
+        <div class="ds-studio-body">
+            <aside class="ds-studio-controls">
+                <div class="ds-editor-panel" tabindex="-1">${dsPoststackPanelMarkup(dsPoststackStep, operations)}</div>
+            </aside>
+            <main class="ds-studio-canvas">
+                <div class="ds-studio-viewbar">
+                    <label><select id="ds-studio-product" aria-label="${tr("deepsky.editor_product", "Producto científico")}">${dsStudioProductOptions()}</select></label>
+                    <div class="ds-editor-stf" role="group" aria-label="${tr("deepsky.editor_stf_label", "Vista STF de pantalla")}">
+                        <span>${tr("deepsky.editor_stf_label", "Vista STF")}</span>
+                        <button type="button" data-editor-display-mode="linked" aria-pressed="${dsStretchMode === "linked"}">${tr("deepsky.stf_linked", "Vinculado")}</button>
+                        <button type="button" data-editor-display-mode="unlinked" aria-pressed="${dsStretchMode === "unlinked"}">${tr("deepsky.stf_balanced", "Balanceado")}</button>
+                        <button type="button" data-editor-display-mode="linear" aria-pressed="${dsStretchMode === "linear"}">${tr("deepsky.stf_linear", "Lineal")}</button>
+                        <label class="ds-editor-stf-strength">
+                            <span>${tr("deepsky.stf_intensity", "Intensidad")}</span>
+                            <input id="ds-editor-stf-strength" type="range" min="0" max="1" step="0.05" value="${dsStretchStrength}">
+                            <output data-editor-display-output>${Math.round(dsStretchStrength * 100)}%</output>
+                        </label>
+                        <small>${tr("deepsky.stf_note", "Solo la vista · los datos siguen lineales")}</small>
+                    </div>
+                    ${milkyWayLayerTabs}
+                    ${layerTabs}
+                    <button type="button" data-editor-action="studio-view-current" aria-pressed="${dsPoststackPreviewMode === "current"}">${tr("deepsky.editor_view_actual", "Actual")}</button>
+                    <button type="button" data-editor-action="studio-view-source" aria-pressed="${dsPoststackPreviewMode === "source"}">${tr("deepsky.editor_view_original", "Original")}</button>
+                    <button type="button" data-editor-action="studio-view-gradient-model" aria-pressed="${dsPoststackPreviewMode === "gradient-model"}"
+                        ${dsGradientLastResult?.modelPreview ? "" : "disabled"}>${tr("deepsky.editor_view_model", "Modelo")}</button>
+                    <button type="button" data-editor-action="studio-view-gradient-residual" aria-pressed="${dsPoststackPreviewMode === "gradient-residual"}"
+                        ${dsGradientLastResult?.residualPreview ? "" : "disabled"}>${tr("deepsky.editor_view_residual", "Residual")}</button>
+                    <button type="button" class="ds-expert-only" data-editor-action="studio-view-dq" aria-pressed="${dsPoststackPreviewMode === "dq"}">DQ</button>
+                    <button type="button" class="ds-expert-only" data-editor-action="studio-view-coverage" aria-pressed="${dsPoststackPreviewMode === "coverage"}">${tr("deepsky.coverage", "Cobertura")}</button>
+                    <button type="button" class="ds-expert-only" data-editor-action="studio-view-rejection_high" aria-pressed="${dsPoststackPreviewMode === "rejection_high"}">${tr("deepsky.rejection", "Rechazo")}</button>
+                </div>
+                <div class="ds-editor-compare" style="--ds-editor-split:50%;"
+                    aria-label="${tr("deepsky.editor_compare_aria", "Comparación entre el máster original y la revisión actual")}">
+                    <img data-editor-compare-current alt="">
+                    <div class="ds-editor-compare-before"><img data-editor-compare-source alt=""></div>
+                    <span class="ds-editor-compare-label source">${tr("deepsky.editor_compare_original", "ORIGINAL · lineal")}</span>
+                    <span class="ds-editor-compare-label current">${escapeHtml(dsPoststackCurrentPreviewLabel())}</span>
+                    <span class="ds-editor-compare-line" aria-hidden="true"></span>
+                    <span class="ds-editor-compare-empty">${tr("deepsky.editor_compare_loading", "Preparando comparación A/B…")}</span>
+                    <input id="ds-editor-compare-slider" type="range" min="8" max="92" value="50"
+                        aria-label="${tr("deepsky.editor_compare_slider", "Mover comparación original y revisión")}">
+                </div>
+                <div class="ds-studio-canvas-foot">
+                    <strong>${escapeHtml(dsPoststackRevisionSummary())}</strong>
+                    <span>${escapeHtml(activePlanStep?.reason || "")}</span>
+                    <span class="ds-studio-safe">${tr("deepsky.editor_master_immutable", "Máster original inmutable")}</span>
+                </div>
+            </main>
+            <nav class="ds-editor-steps" aria-label="${tr("deepsky.editor_steps_aria", "Pasos de edición")}">${stepButtons}</nav>
+        </div>
+        <footer class="ds-studio-bottom">
+            <details class="ds-studio-inspector">
+                <summary><svg class="zas-icon" aria-hidden="true"><use href="#icon-chart"></use></svg>${tr("deepsky.editor_inspector", "Inspector científico")}</summary>
+                <div class="ds-studio-inspector-grid">
+                    <span>${tr("deepsky.editor_source_type", "Fuente")}<b>${escapeHtml(sourceLabel)}</b></span>
+                    <span>${tr("deepsky.editor_dimensions", "Dimensiones")}<b>${Number(dsPoststackState?.width || 0)} × ${Number(dsPoststackState?.height || 0)}</b></span>
+                    <span>${tr("deepsky.editor_background", "Fondo")}<b>${dsPoststackAnalysis ? Number(dsPoststackAnalysis.background).toFixed(1) : "—"}</b></span>
+                    <span>${tr("deepsky.editor_noise", "Ruido σ")}<b>${dsPoststackAnalysis ? Number(dsPoststackAnalysis.noiseSigma).toFixed(2) : "—"}</b></span>
+                    <span>${tr("deepsky.editor_recipe", "Receta")}<b>${studioRecipe.operations.length} ${tr("deepsky.editor_operations", "operaciones")}</b></span>
+                </div>
+            </details>
+            <span class="ds-studio-bottom-copy">${escapeHtml(activePlanStep?.reason || dsPoststackRevisionSummary())}</span>
+            <button type="button" class="ds-studio-quick" data-editor-action="quick-auto">${escapeHtml(quickLabel)}</button>
+        </footer>`;
+    editor.querySelectorAll("[data-editor-return-layers]").forEach(button => {
+        button.addEventListener("click", event => {
+            event.preventDefault();
+            event.stopPropagation();
+            dsStudioLayerTarget = "combined";
+            dsPoststackStep = 7;
+            dsPoststackRenderShell();
+            dsPoststackSyncInteractiveLayer();
+        });
+    });
+    const activePanel = editor.querySelector(".ds-editor-panel");
+    if (activePanel) activePanel.scrollTop = 0;
+    dsStudioInitCurveEditor(editor);
+    void dsPoststackHydrateComparator();
+    if (
+        dsPoststackStep === 4
+        && !dsStudioPaletteGallery
+        && !dsStudioPaletteAutoLoading
+        && !dsStudioPaletteError
+        && !dsStudioNeedsChannelMasters()
+        && [
+            SOURCE_KINDS.MONO_NARROWBAND,
+            SOURCE_KINDS.OSC_DUAL_BAND,
+            SOURCE_KINDS.MULTI_FILTER_DUAL_BAND,
+        ].includes(classifyDeepSkySource(dsPoststackEffectiveSourceDescriptor()).kind)
+    ) {
+        queueMicrotask(() => {
+            if (editor.isConnected && dsPoststackStep === 4) void dsStudioLoadPaletteGallery(null);
+        });
+    }
+    return editor;
+}
+
+function dsStudioInitCurveEditor(editor) {
+    dsStudioCurveEditor?.destroy?.();
+    dsStudioCurveEditor = null;
+    if (dsPoststackStep !== 9) return;
+    const canvas = editor?.querySelector("#ds-studio-curve-editor");
+    if (!canvas) return;
+    dsStudioCurveEditor = new ToneCurveEditor(canvas, {
+        lineColor: ({
+            red: "#fb7185",
+            green: "#4ade80",
+            blue: "#60a5fa",
+            saturation: "#f0abfc",
+            luminance: "#f8fafc",
+        })[dsStudioCurveChannel] || "#a78bfa",
+        nodeColor: "#c4b5fd",
+        activeColor: "#ffffff",
+        onInput: points => {
+            dsPoststackSettings.curves[dsStudioCurveChannel] = normalizeToneCurvePoints(points);
+            const status = editor.querySelector("[data-curve-status]");
+            if (status) {
+                status.textContent = tr(
+                    "deepsky.editor_curves_pending",
+                    "Curva modificada · Aplicar crea una revisión reproducible.",
+                );
+                status.dataset.state = "warning";
+            }
+        },
+        onCommit: points => {
+            dsPoststackSettings.curves[dsStudioCurveChannel] = normalizeToneCurvePoints(points);
+        },
+    });
+    dsStudioCurveEditor.setPoints(dsStudioCurvePoints());
+}
+
+function dsMilkyWayStepSafetyMarkup(step) {
+    if (!dsIsMilkyWayWorkflow() || step === 1) return "";
+    const planned = dsPoststackPlanStep(step);
+    if (!planned) return "";
+    const maskSensitive = [2, 5, 6, 7].includes(step) && planned.horizonMaskAware !== true;
+    const title = maskSensitive
+        ? "Opcional · sin protección automática del horizonte"
+        : step === 3
+            ? "WCS del Compuesto"
+            : step === 12
+                ? "Linaje reproducible"
+                : "Destino · Compuesto derivado";
+    return `<div class="ds-editor-callout ds-milkyway-safety-note" data-state="${maskSensitive ? "warning" : "ok"}">
+        <b>${escapeHtml(title)}</b><span>${escapeHtml(planned.reason || "")}</span>
+    </div>`;
+}
+
+function dsPoststackPanelMarkup(step, operations) {
+    return `${dsMilkyWayStepSafetyMarkup(step)}${dsPoststackPanelBodyMarkup(step, operations)}`;
+}
+
+function dsPoststackPanelBodyMarkup(step, operations) {
+    if (step === 1) {
+        const milkyWay = dsIsMilkyWayWorkflow();
+        const milkyWayCropped = !!dsPoststackSourceDescriptor?.milkyWayCrop;
+        const milkyWayProductNames = [
+            ["sky", tr("milkyway.product_sky", "Cielo")],
+            ["ground", tr("milkyway.product_ground", "Suelo")],
+            ["composite", tr("milkyway.product_composite", "Compuesto")],
+            ["mask", tr("milkyway.product_mask", "Máscara")],
+            ["skyVariance", tr("milkyway.product_sky_variance", "Varianza cielo")],
+            ["groundVariance", tr("milkyway.product_ground_variance", "Varianza suelo")],
+            ["skyCoverage", tr("milkyway.product_sky_coverage", "Cobertura cielo")],
+            ["groundCoverage", tr("milkyway.product_ground_coverage", "Cobertura suelo")],
+            ["skyRejection", tr("milkyway.product_sky_rejection", "Rechazo cielo")],
+            ["groundRejection", tr("milkyway.product_ground_rejection", "Rechazo suelo")],
+        ].filter(([kind]) => !!dsPoststackSourceDescriptor?.milkyWayLayers?.[kind])
+            .map(([, label]) => label);
+        const sourceWidth = dsPoststackState?.crop?.sourceWidth || dsPoststackState?.width || 0;
+        const sourceHeight = dsPoststackState?.crop?.sourceHeight || dsPoststackState?.height || 0;
+        const cropPayload = dsPoststackCropPayload(false);
+        const cropWidth = Math.max(1, Math.round(sourceWidth * cropPayload.width));
+        const cropHeight = Math.max(1, Math.round(sourceHeight * cropPayload.height));
+        return `<div class="ds-editor-section-head">
+                <div><span class="ds-editor-kicker">${tr("deepsky.editor_optional", "Opcional")}</span>
+                <h3>${tr("deepsky.editor_crop_title", "Recorte científico en la imagen")}</h3></div>
+                <span class="ds-editor-result-chip" id="ds-crop-size">${cropWidth} × ${cropHeight} px</span>
+            </div>
+            <p>${milkyWay
+                ? `Arrastra un único marco sobre la imagen activa. Al aplicar, Zenith deriva con el mismo rectángulo: ${escapeHtml(milkyWayProductNames.join(", "))}.`
+                : tr("deepsky.editor_crop_body", "Arrastra el marco y sus ocho tiradores directamente sobre la imagen. La vista responde al instante; Aplicar recorta juntos SCI, VAR, NEFF, DQ, cobertura y mapas diagnósticos.")}</p>
+            <div class="ds-editor-callout"><b>${tr("deepsky.editor_crop_global", "Geometría global sincronizada")}</b><span>${milkyWay
+                ? tr("milkyway.editor_crop_safe_body", "Los seis productos se publican primero en staging y comparten un geometryId nuevo. Los FITS originales nunca se sobrescriben; si hay WCS válido, CRPIX se desplaza al nuevo origen.")
+                : tr("deepsky.editor_crop_safe_body", "El mismo rectángulo se aplica a SCI, mapas científicos, Objeto, Estrellas, máscara y residual. Zenith recrea las ramas seguras y vuelve a medir WCS, gradiente y PSF cuando dependen de la geometría; el máster fuente permanece intacto.")}</span></div>
+            <div class="ds-editor-actions ds-editor-apply-row">
+                <button type="button" data-editor-action="crop-reset">${milkyWay && milkyWayCropped
+                    ? tr("milkyway.editor_restore_original_geometry", "Volver a geometría original")
+                    : tr("deepsky.editor_crop_full", "Imagen completa")}</button>
+                <button type="button" class="ds-editor-primary" data-editor-action="crop">${operations.includes("crop") || milkyWayCropped
+                    ? tr("deepsky.editor_crop_update", "Actualizar recorte")
+                    : tr("deepsky.editor_crop_apply", "Aplicar recorte")}</button>
+            </div>`;
+    }
+    if (step === 2) {
+        const warning = dsGradientLastResult?.overfitWarning;
+        const activeSamples = dsGradientSamples.filter(sample =>
+            sample.enabled !== false && !dsGradientPointExcluded(sample)).length;
+        return `<div class="ds-editor-section-head"><div><span class="ds-editor-kicker">${dsIsMilkyWayWorkflow()
+                ? "Opcional · opera sobre el Compuesto"
+                : tr("deepsky.editor_recommended", "Recomendado antes del color")}</span>
+                <h3>${tr("deepsky.editor_gradient_title", "Fondo y gradiente")}</h3></div>
+                <span class="ds-editor-result-chip">${tr("deepsky.editor_gradient_robust", "Modelo robusto + residual verificable")}</span></div>
+            <p>${tr("deepsky.editor_gradient_body", "Una sola operación modela y sustrae el fondo no deseado. En Automático detecta cielo limpio; en Muestras puedes editar puntos reales. No se ejecuta una segunda extracción que reste dos veces la nebulosa.")}</p>
+            <div class="ds-preset-row" role="radiogroup" aria-label="${tr("deepsky.editor_gradient_mode", "Método de fondo")}">
+                <label><input type="radio" name="ds-gradient-mode" value="auto" data-editor-setting="gradientMode"
+                    ${dsPoststackSettings.gradientMode === "auto" ? "checked" : ""}><span>${tr("deepsky.auto", "Automático")}</span></label>
+                <label><input type="radio" name="ds-gradient-mode" value="samples" data-editor-setting="gradientMode"
+                    ${dsPoststackSettings.gradientMode === "samples" ? "checked" : ""}><span>${tr("deepsky.editor_point_samples", "Muestras por puntos")}</span></label>
+            </div>
+            <div class="ds-control-grid">
+                <label class="ds-control-wide">${tr("deepsky.editor_sensitivity", "Protección de señal tenue")}
+                    <span data-editor-output="gradientSensitivity">${Math.round(dsPoststackSettings.gradientSensitivity)}%</span>
+                    <input type="range" min="0" max="100" step="1" value="${dsPoststackSettings.gradientSensitivity}"
+                        data-editor-setting="gradientSensitivity" data-unit="percent"></label>
+                <label><input id="ds-editor-protect" type="checkbox" data-editor-setting="gradientProtect"
+                    ${dsPoststackSettings.gradientProtect ? "checked" : ""}> ${tr("deepsky.editor_protect", "Detectar objetos extensos")}</label>
+                <label class="ds-expert-only"><input id="ds-editor-chromatic" type="checkbox" data-editor-setting="gradientChromatic"
+                    ${dsPoststackSettings.gradientChromatic ? "checked" : ""}> ${tr("deepsky.editor_chromatic", "Modelar cada canal")}</label>
+                <label class="ds-expert-only">${tr("deepsky.editor_gradient_degree", "Orden del modelo")}
+                    <select data-editor-setting="gradientDegree">
+                        ${[1, 2, 3, 4].map(value => `<option value="${value}" ${Number(dsPoststackSettings.gradientDegree) === value ? "selected" : ""}>${value}</option>`).join("")}
+                    </select>
+                </label>
+                <label class="ds-expert-only">${tr("deepsky.editor_sample_radius", "Radio de muestra")}
+                    <select data-editor-setting="gradientSampleRadius">
+                        ${[[0.012, "Fino"], [0.025, "Medio"], [0.04, "Amplio"]].map(([value, label]) =>
+                            `<option value="${value}" ${Math.abs(Number(dsPoststackSettings.gradientSampleRadius) - value) < 0.001 ? "selected" : ""}>${label}</option>`).join("")}
+                    </select>
+                </label>
+                <label class="ds-expert-only"><input type="checkbox" data-editor-setting="gradientAllowUnstable"
+                    ${dsPoststackSettings.gradientAllowUnstable ? "checked" : ""}> ${tr("deepsky.editor_allow_unstable_gradient", "Permitir modelo inestable (queda registrado)")}</label>
+            </div>
+            <div class="ds-editor-actions">
+                <button type="button" data-editor-action="gradient-generate-samples">${dsGradientSamples.length
+                    ? tr("deepsky.editor_regenerate_samples", "Regenerar puntos seguros")
+                    : tr("deepsky.editor_generate_samples", "Generar puntos seguros")}</button>
+                <button type="button" data-editor-action="gradient-samples" aria-pressed="${dsGradientSamplesVisible}">${dsGradientSamplesVisible
+                    ? tr("deepsky.editor_hide_samples", "Ocultar muestras")
+                    : tr("deepsky.editor_edit_samples", "Editar puntos en la imagen")}</button>
+                <button type="button" data-editor-action="add-mask">${tr("deepsky.editor_add_mask", "Proteger una zona")}</button>
+                <button type="button" data-editor-action="clear-masks" ${dsGradientExclusions.length ? "" : "disabled"}>${trFormat("deepsky.editor_clear_masks", { count: dsGradientExclusions.length }, `Limpiar máscaras (${dsGradientExclusions.length})`)}</button>
+            </div>
+            ${dsGradientLastResult ? `<div class="ds-editor-view-switcher" role="group" aria-label="${tr("deepsky.editor_gradient_views", "Vistas de corrección de gradiente")}">
+                <button type="button" data-editor-action="gradient-current" aria-pressed="${dsPoststackPreviewMode === "current"}">${tr("deepsky.editor_view_correction", "Ver corrección")}</button>
+                <button type="button" data-editor-action="gradient-model" aria-pressed="${dsPoststackPreviewMode === "gradient-model"}">${tr("deepsky.editor_view_model", "Ver modelo")}</button>
+                <button type="button" data-editor-action="gradient-residual" aria-pressed="${dsPoststackPreviewMode === "gradient-residual"}">${tr("deepsky.editor_view_residual", "Ver residual")}</button>
+            </div>` : ""}
+            <div class="ds-editor-status" data-state="${warning ? "warning" : "ok"}">${warning
+                ? escapeHtml(warning)
+                : dsGradientLastResult
+                    ? `${tr("deepsky.editor_gradient_stable", "Modelo estable")} · ${escapeHtml(dsGradientLastResult.mode || dsPoststackSettings.gradientMode)} · ${Number(dsGradientLastResult.sampleCount || activeSamples)} puntos · discrepancia A/B ${Number(dsGradientLastResult.splitHalfRatio).toFixed(2)}σ · ${Number(dsGradientLastResult.protectedPercent).toFixed(1)}% ${tr("deepsky.editor_protected", "protegido")}`
+                    : dsPoststackSettings.gradientMode === "samples"
+                        ? `${activeSamples} ${tr("deepsky.editor_active_samples", "puntos activos")}. ${tr("deepsky.editor_samples_tip", "Haz clic para añadir o desactivar puntos contaminados; las zonas protegidas nunca se muestrean.")}`
+                        : tr("deepsky.editor_gradient_ready", "Automático analiza el fondo, rechaza estrellas y señal extensa y bloquea un modelo inestable. Modelo y residual siempre quedan disponibles para comprobarlo.")}</div>
+            <div class="ds-editor-actions ds-editor-apply-row">
+                <button type="button" class="ds-editor-primary" data-editor-action="gradient"
+                    ${dsPoststackSettings.gradientMode === "samples" && activeSamples < 6 ? "disabled" : ""}>${tr("deepsky.editor_apply_gradient", "Calcular y crear revisión")}</button>
+            </div>`;
+    }
+    if (step === 3) {
+        const solution = dsPoststackState?.astrometry;
+        const status = dsPoststackState?.astrometryStatus || {};
+        const milkyWay = dsIsMilkyWayWorkflow();
+        const milkyWayGeometryId = dsPoststackSourceDescriptor?.milkyWayGeometryId || "milky-way-source-geometry";
+        const statusMessage = dsAstrometryUi.error || status.message || tr("deepsky.editor_astrometry_pending", "El apilado no encontró todavía una solución WCS validada.");
+        const needsCatalog = ["catalogRequired", "networkError"].includes(status.state) || /ASTROMETRY_(CATALOG|NETWORK)/.test(dsAstrometryUi.error);
+        return `<div class="ds-editor-section-head"><div><span class="ds-editor-kicker">${solution
+                ? tr("deepsky.editor_wcs_ready", "WCS validado")
+                : tr("deepsky.editor_wcs_pending", "Falta confirmar")}</span>
+                <h3>${tr("deepsky.editor_astrometry_title", "Astrometría e inserción WCS")}</h3></div>
+                <span class="ds-editor-result-chip" data-state="${solution ? "ok" : "warning"}">${solution
+                    ? `${solution.inliers} estrellas · ${Number(solution.rmsPx).toFixed(2)} px`
+                    : tr("deepsky.editor_no_wcs", "Sin WCS")}</span></div>
+            <p>${milkyWay
+                ? `Zenith resuelve con las estrellas visibles del cielo en el Compuesto y vincula el WCS a su geometryId (${escapeHtml(milkyWayGeometryId)}). Puedes usar el índice local, indicar el apuntado o autorizar Gaia en línea. No modifica píxeles ni las raíces.`
+                : tr("deepsky.editor_astrometry_body", "El apilado ya intenta validar o resolver con el índice local. Aquí puedes volver a insertar un WCS validado, proporcionar el apuntado o autorizar explícitamente Gaia en línea. No modifica píxeles.")}</p>
+            <div class="ds-editor-actions">
+                <button type="button" class="${solution ? "" : "ds-editor-primary"}" data-editor-action="astrometry">${solution
+                    ? tr("deepsky.editor_astrometry_embed", "Insertar WCS de nuevo")
+                    : tr("deepsky.editor_astrometry_local", "Resolver con índice local")}</button>
+                <button type="button" data-editor-action="astrometry-seed">${tr("deepsky.editor_astrometry_seed", "Indicar RA, Dec y escala")}</button>
+                ${needsCatalog ? `<button type="button" class="ds-editor-primary" data-editor-action="astrometry-online">${tr("deepsky.editor_astrometry_online", "Consultar Gaia en línea")}</button>` : ""}
+                ${solution ? `<button type="button" data-editor-action="annotation-open">${tr("deepsky.editor_annotation_open", "Crear mapa anotado")}</button>` : ""}
+            </div>
+            <div class="ds-editor-status" data-state="${solution ? "ok" : "warning"}">${solution
+                ? `${Number(solution.crval1).toFixed(5)}°, ${Number(solution.crval2).toFixed(5)}° · ${Number(solution.scaleArcsecPx).toFixed(3)}″/px · ${escapeHtml(solution.source)} · ${milkyWay ? `vinculado a ${escapeHtml(milkyWayGeometryId)}` : "se escribirá en FITS"}`
+                : escapeHtml(statusMessage)}</div>
+            ${status.catalogKey ? `<div class="ds-editor-technical"><b>${tr("deepsky.editor_catalog_needed", "Mosaico local requerido")}</b><code>${escapeHtml(status.catalogKey)}</code><span>${escapeHtml(status.localDirectory || "")}</span></div>` : ""}`;
+    }
+    if (step === 4) {
+        const descriptor = dsPoststackEffectiveSourceDescriptor();
+        const route = dsPoststackStudioPlan();
+        const source = route.source;
+        const hasWcs = !!dsPoststackState?.astrometry;
+        const paletteRoute = [
+            SOURCE_KINDS.MONO_NARROWBAND,
+            SOURCE_KINDS.OSC_DUAL_BAND,
+            SOURCE_KINDS.MULTI_FILTER_DUAL_BAND,
+        ].includes(source.kind);
+        if (paletteRoute) {
+            const gallery = dsStudioPaletteGallery;
+            const needsChannelMasters = dsStudioNeedsChannelMasters(source);
+            const cards = needsChannelMasters ? "" : (gallery?.candidates || []).map(candidate => `
+                <button type="button" class="ds-palette-card" data-editor-palette="${escapeHtml(candidate.id)}"
+                    aria-pressed="${dsPoststackSettings.dualBandPalette === candidate.id}"
+                    ${candidate.eligible ? "" : "disabled"} title="${escapeHtml(candidate.reason || "")}">
+                    ${candidate.preview
+                        ? `<img src="${escapeHtml(toDisplaySrc(candidate.preview))}" alt="${escapeHtml(candidate.label)}">`
+                        : `<span class="ds-palette-placeholder"><svg class="zas-icon" aria-hidden="true"><use href="#icon-palette"></use></svg></span>`}
+                    <span><b>${escapeHtml(candidate.label)}</b>
+                        <small>${escapeHtml(candidate.intent || candidate.scientificClass || candidate.reason || "")}</small>
+                        ${Number.isFinite(Number(candidate.score))
+                            ? `<em>${Math.round(Number(candidate.score))}/100 · ${candidate.id === gallery?.recommendedPaletteId
+                                ? tr("deepsky.editor_palette_recommended", "punto de partida recomendado")
+                                : tr("deepsky.editor_palette_comparable", "previsualización comparable")}</em>`
+                            : ""}
+                    </span>
+                </button>`).join("");
+            const duplicatedOiii = source.kind === SOURCE_KINDS.MULTI_FILTER_DUAL_BAND;
+            const routeTitle = duplicatedOiii
+                ? tr("deepsky.editor_multifilter_title", "Sesión Ha+OIII · SII+OIII")
+                : source.kind === SOURCE_KINDS.OSC_DUAL_BAND
+                    ? tr("deepsky.editor_dualband_title", "OSC dual-band Ha + OIII")
+                    : tr("deepsky.editor_narrowband_title", "Canales mono de banda estrecha");
+            return `<div class="ds-editor-section-head"><div><span class="ds-editor-kicker">${tr("deepsky.editor_route_detected", "Ruta detectada automáticamente")}</span>
+                    <h3>${escapeHtml(routeTitle)}</h3></div>
+                    <span class="ds-editor-result-chip">${tr("deepsky.editor_palette_gallery", "Galería de paletas")}</span></div>
+                <p>${duplicatedOiii
+                    ? tr("deepsky.editor_multifilter_body", "Zenith registra Ha, SII y las dos señales OIII, reconcilia su escala, ruido, PSF y cobertura y combina OIII de forma robusta antes de crear paletas comparables.")
+                    : needsChannelMasters
+                        ? tr("deepsky.editor_mono_channels_body", "Este máster mono contiene un solo canal medido. Añade los demás másteres Ha/OIII/SII o L/R/G/B; Zenith no separará líneas espectrales que no estén presentes ni inventará color.")
+                    : tr("deepsky.editor_dualband_body", "Zenith separa o reúne los canales disponibles y genera previews con el mismo STF. Elegir una tarjeta sólo cambia la vista; Aplicar crea una revisión lineal derivada.")}</p>
+                <div class="ds-route-card"><b>${escapeHtml(dsStudioSourceLabel(source))}</b>
+                    <span>${duplicatedOiii
+                        ? gallery?.oiiiReconciliation
+                            ? tr("deepsky.editor_oiii_reconciled", "OIII duplicado reconciliado y validado; ambas noches/filtros contribuyen según ruido y solapamiento.")
+                            : tr("deepsky.editor_oiii_pending", "Antes de mostrar paletas, se validarán y reconciliarán las dos señales OIII. No se escogerá una silenciosamente.")
+                        : needsChannelMasters
+                            ? tr("deepsky.editor_missing_independent_channels", "Sólo hay un máster mono activo. Las etiquetas de filtro describen su señal, pero no crean planos Ha/OIII/SII independientes.")
+                        : tr("deepsky.editor_palette_not_pcc", "PCC de banda ancha no corresponde a esta señal. Las paletas son interpretativas y conservan los canales lineales.")}</span>
+                </div>
+                <div class="ds-control-grid">
+                    <label class="ds-expert-only">${tr("deepsky.editor_instrument_profile", "Cámara / filtro")}
+                        <select data-editor-setting="dualBandProfile">
+                            <option value="metadata" ${dsPoststackSettings.dualBandProfile === "metadata" ? "selected" : ""}>${tr("deepsky.editor_profile_metadata", "Auto desde metadatos")}</option>
+                            <option value="sv220" ${dsPoststackSettings.dualBandProfile === "sv220" ? "selected" : ""}>SVBONY SV220</option>
+                            <option value="lextreme" ${dsPoststackSettings.dualBandProfile === "lextreme" ? "selected" : ""}>Optolong L-eXtreme</option>
+                            <option value="lultimate" ${dsPoststackSettings.dualBandProfile === "lultimate" ? "selected" : ""}>Optolong L-Ultimate</option>
+                            <option value="custom" ${dsPoststackSettings.dualBandProfile === "custom" ? "selected" : ""}>${tr("deepsky.editor_profile_custom", "Perfil personalizado")}</option>
+                        </select></label>
+                    <label class="ds-control-wide ds-expert-only">OIII desde verde <span data-editor-output="dualBandOiii">${Math.round(dsPoststackSettings.dualBandOiii)}%</span>
+                        <input type="range" min="0" max="100" value="${dsPoststackSettings.dualBandOiii}" data-editor-setting="dualBandOiii" data-unit="percent"></label>
+                    <label class="ds-control-wide ds-expert-only">${tr("deepsky.editor_crosstalk", "Supresión de contaminación Ha→OIII")} <span data-editor-output="dualBandCrosstalk">${Math.round(dsPoststackSettings.dualBandCrosstalk)}%</span>
+                        <input type="range" min="0" max="45" value="${dsPoststackSettings.dualBandCrosstalk}" data-editor-setting="dualBandCrosstalk" data-unit="percent"></label>
+                </div>
+                ${dsStudioPaletteAutoLoading ? `<div class="ds-palette-loading" role="status">
+                    <span class="ds-editor-spinner" aria-hidden="true"></span>
+                    <span><b>${tr("deepsky.editor_palette_analyzing", "Analizando señal y generando paletas…")}</b>
+                    ${tr("deepsky.editor_palette_analyzing_body", "Todas usarán el mismo STF, geometría y másteres lineales para que la comparación sea honesta.")}</span>
+                </div>` : ""}
+                ${dsStudioPaletteError ? `<div class="ds-editor-status" data-state="warning">${escapeHtml(dsStudioPaletteError)}</div>` : ""}
+                ${cards ? `<div class="ds-palette-gallery" aria-label="${tr("deepsky.editor_palette_auto_gallery", "Paletas generadas automáticamente")}">${cards}</div>` : ""}
+                ${gallery?.limitations?.length ? `<div class="ds-editor-status">${escapeHtml(gallery.limitations.join(" · "))}</div>` : ""}
+                <div class="ds-editor-actions ds-editor-apply-row">
+                    ${needsChannelMasters
+                        ? `<button type="button" class="ds-editor-primary" data-editor-action="split">${tr("deepsky.editor_add_channel_masters", "Añadir másteres de canal")}</button>`
+                        : `<button type="button" data-editor-action="palette-gallery">${gallery
+                            ? tr("deepsky.editor_refresh_gallery", "Recalcular galería")
+                            : tr("deepsky.editor_create_gallery", "Generar paletas ahora")}</button>
+                        <button type="button" class="ds-editor-primary" data-editor-action="palette-apply"
+                            ${gallery?.candidates?.some(candidate =>
+                                candidate.id === dsPoststackSettings.dualBandPalette && candidate.eligible) ? "" : "disabled"}>${operations.includes("dualBandPalette")
+                                ? tr("deepsky.editor_recalculate_palette", "Actualizar revisión")
+                                : tr("deepsky.editor_apply_palette", "Aplicar paleta seleccionada")}</button>`}
+                    ${dsStudioAppliedPalette
+                        ? `<button type="button" data-editor-action="palette-restore-source">${tr("deepsky.editor_restore_source_product", "Volver al producto fuente")}</button>`
+                        : ""}
+                    ${needsChannelMasters ? "" : `<button type="button" class="ds-expert-only" data-editor-action="split">${tr("deepsky.split", "Exportar canales")}</button>`}
+                </div>`;
+        }
+        const pccEligible = source.kind === SOURCE_KINDS.BROADBAND_RGB;
+        const monoRoute = source.kind === SOURCE_KINDS.MONO_BROADBAND;
+        return `<div class="ds-editor-section-head"><div><span class="ds-editor-kicker">${pccEligible
+                ? tr("deepsky.editor_broadband_route", "Ruta RGB de banda ancha")
+                : tr("deepsky.editor_channel_route", "Ruta mono / canales")}</span>
+                <h3>${tr("deepsky.editor_color_title", "Color y combinación de canales")}</h3></div>
+                <span class="ds-editor-result-chip" data-state="${pccEligible ? "ok" : "warning"}">${pccEligible ? "PCC Gaia" : monoRoute ? "LRGB" : tr("deepsky.editor_not_applicable", "No aplica")}</span></div>
+            <p>${pccEligible
+                ? tr("deepsky.editor_color_broadband_body", "PCC Gaia usa estrellas y el WCS para equilibrar RGB de banda ancha. Es idempotente y conserva el original.")
+                : monoRoute
+                    ? tr("deepsky.editor_color_mono_body", "Un máster mono aislado no contiene los otros canales. Añade L/R/G/B o canales narrowband; Zenith no inventará color.")
+                    : tr("deepsky.editor_color_skip_body", "Esta fuente ya está combinada o no puede clasificarse con seguridad. Puedes omitir este paso y conservar la rama lineal.")}</p>
+            <div class="ds-editor-actions">
+                <label class="${pccEligible ? "" : "ds-expert-only"}">${tr("deepsky.spcc_reference", "Referencia blanca")}
+                    <select id="ds-editor-pcc-reference">
+                        <option value="averageSpiral" ${localStorage.getItem("zas_spcc_reference") !== "g2v" ? "selected" : ""}>${tr("deepsky.spcc_ref_asg", "Galaxia espiral promedio")}</option>
+                        <option value="g2v" ${localStorage.getItem("zas_spcc_reference") === "g2v" ? "selected" : ""}>G2V</option>
+                    </select>
+                </label>
+                <button type="button" class="ds-editor-primary" data-editor-action="pcc"
+                    ${pccEligible && hasWcs ? "" : "disabled"} aria-describedby="ds-editor-pcc-gate">${operations.includes("gaiaPcc")
+                    ? tr("deepsky.editor_pcc_again", "Recalcular PCC Gaia")
+                    : tr("deepsky.editor_pcc_run", "Aplicar PCC Gaia")}</button>
+                <button type="button" data-editor-action="split">${monoRoute
+                    ? tr("deepsky.editor_add_channels", "Añadir canales")
+                    : tr("deepsky.split", "Separar canales")}</button>
+            </div>
+            <div id="ds-editor-pcc-gate" class="ds-editor-status" data-state="${pccEligible && hasWcs ? "ok" : "warning"}">${escapeHtml(!hasWcs && pccEligible
+                ? tr("deepsky.editor_pcc_needs_wcs", "Primero completa Astrometría: PCC necesita saber qué estrellas está midiendo.")
+                : pccEligible
+                    ? tr("deepsky.pcc_gate_ready", "Disponible para este máster RGB de banda ancha; la receta permanece idempotente.")
+                    : route.steps[3]?.reason || "")}</div>
+            <details class="ds-editor-spcc-gate"><summary>${tr("deepsky.editor_spcc_question", "¿Por qué no se llama SPCC?")}</summary>${tr("deepsky.editor_spcc_gate", "SPCC real requiere Gaia DR3 XP y curvas QE/filtro/óptica/atmósfera. Sin ese perfil, Zenith ofrece PCC y nunca usa una etiqueta engañosa.")}</details>`;
+    }
+    if (step === 5) {
+        const psf = dsPoststackPsfAnalysis?.psf || dsPoststackState?.layers?.psf;
+        const target = dsStudioLayerTarget === "mask" ? "combined" : dsStudioLayerTarget;
+        const targetLabel = ({
+            combined: tr("deepsky.editor_layer_combined", "imagen combinada"),
+            object: tr("deepsky.editor_layer_object", "Objeto"),
+            stars: tr("deepsky.editor_layer_stars", "Estrellas"),
+        })[target] || "imagen combinada";
+        const operationKey = target === "combined" ? "deconvolution" : `deconvolution:${target}`;
+        const measured = !!psf?.measured;
+        const effectiveFwhm = measured
+            ? 0.5 * (Number(psf.fwhmX) + Number(psf.fwhmY))
+            : null;
+        return `<div class="ds-editor-section-head"><div>
+                <span class="ds-editor-kicker">${tr("deepsky.editor_linear_restore", "Restauración lineal float32")}</span>
+                <h3>${tr("deepsky.editor_deconv_title", "Deconvolución guiada por PSF")}</h3></div>
+                <span class="ds-editor-result-chip" data-state="${measured ? "ok" : "warning"}">${measured
+                    ? `FWHM global ${effectiveFwhm.toFixed(2)} px`
+                    : tr("deepsky.editor_psf_pending", "PSF por medir")}</span></div>
+            <p>${tr("deepsky.editor_deconv_body", "Mide estrellas válidas y recupera detalle mediante Richardson–Lucy regularizada con PSF global circularizada, conservación de flujo, pedestal reversible y freno de halos. No usa el motor planetario ni recorta a 16-bit.")}</p>
+            ${target !== "combined" ? `<button type="button" class="ds-layer-return" data-editor-action="layer-return" data-editor-step="7" data-editor-return-layers="true"><svg class="zas-icon" aria-hidden="true"><use href="#icon-undo"></use></svg>${tr("deepsky.editor_back_layers", "Volver al laboratorio de capas")}</button>
+                <div class="ds-editor-callout"><b>${tr("deepsky.editor_active_branch", "Rama activa")}: ${escapeHtml(targetLabel)}</b><span>${tr("deepsky.editor_branch_only_body", "La operación crea una revisión sólo en esta rama; la otra queda intacta.")}</span></div>` : ""}
+            <div class="ds-preset-row" role="radiogroup" aria-label="${tr("deepsky.editor_restore_presets", "Fuerza de restauración")}">
+                ${[["soft", tr("deepsky.editor_restore_soft", "Suave")], ["balanced", tr("deepsky.editor_restore_balanced", "Equilibrada")], ["detail", tr("deepsky.editor_restore_detail", "Detalle")]]
+                    .map(([value, label]) => `<label><input type="radio" name="ds-deconv-preset" value="${value}"
+                        data-editor-setting="deconvPreset" ${dsPoststackSettings.deconvPreset === value ? "checked" : ""}><span>${label}</span></label>`).join("")}
+            </div>
+            <div class="ds-control-grid ds-expert-only">
+                <label class="ds-control-wide">${tr("deepsky.editor_deconv_iterations", "Iteraciones")} <span data-editor-output="deconvIterations">${dsPoststackSettings.deconvIterations}</span>
+                    <input type="range" min="3" max="24" value="${dsPoststackSettings.deconvIterations}" data-editor-setting="deconvIterations"></label>
+                <label class="ds-control-wide">${tr("deepsky.editor_regularization", "Regularización")} <span data-editor-output="deconvRegularization">${dsPoststackSettings.deconvRegularization}%</span>
+                    <input type="range" min="0" max="30" value="${dsPoststackSettings.deconvRegularization}" data-editor-setting="deconvRegularization" data-unit="percent"></label>
+                <label class="ds-control-wide">${tr("deepsky.editor_deringing", "Protección de halos")} <span data-editor-output="deconvDeringing">${dsPoststackSettings.deconvDeringing}%</span>
+                    <input type="range" min="0" max="100" value="${dsPoststackSettings.deconvDeringing}" data-editor-setting="deconvDeringing" data-unit="percent"></label>
+                ${measured ? "" : `<fieldset class="ds-control-wide ds-manual-psf">
+                    <legend>${tr("deepsky.editor_manual_psf", "PSF manual confirmada")}</legend>
+                    <label>FWHM X (px)<input type="number" min="0.6" max="15" step="0.1" value="${Number(dsPoststackSettings.deconvManualFwhmX).toFixed(1)}" data-editor-setting="deconvManualFwhmX"></label>
+                    <label>FWHM Y (px)<input type="number" min="0.6" max="15" step="0.1" value="${Number(dsPoststackSettings.deconvManualFwhmY).toFixed(1)}" data-editor-setting="deconvManualFwhmY"></label>
+                    <label class="ds-control-wide"><input type="checkbox" data-editor-setting="deconvManualConfirmed" ${dsPoststackSettings.deconvManualConfirmed ? "checked" : ""}>
+                        ${tr("deepsky.editor_manual_psf_confirm", "Confirmo que estas anchuras proceden de una medición estelar; se registrarán como valor manual, no como PSF automática.")}</label>
+                </fieldset>`}
+            </div>
+            <div class="ds-editor-status" data-state="${measured ? "ok" : "warning"}" aria-live="polite">${measured
+                ? `${Number(psf.starsUsed || 0)} ${tr("deepsky.editor_valid_stars", "estrellas válidas")} · elipse medida ${Number(psf.fwhmX).toFixed(2)}×${Number(psf.fwhmY).toFixed(2)} px · ${tr("deepsky.editor_psf_confidence", "confianza")} ${(Number(psf.confidence || 0) * 100).toFixed(0)}% · ${tr("deepsky.editor_psf_global_model", "restauración conservadora con FWHM circularizada")}`
+                : tr("deepsky.editor_psf_measure_note", "Al aplicar, Zenith medirá la PSF sobre la última revisión lineal. Si la confianza no es suficiente, no modificará los píxeles.")}</div>
+            <div class="ds-editor-actions ds-editor-apply-row"><button type="button" class="ds-editor-primary" data-editor-action="deconvolution">${operations.includes(operationKey)
+                ? tr("deepsky.editor_update_restore", "Actualizar restauración")
+                : tr("deepsky.editor_apply_restore", "Crear revisión restaurada")}</button></div>`;
+    }
+    if (step === 8) {
+        const branchTarget = ["object", "stars"].includes(dsStudioLayerTarget)
+            ? dsStudioLayerTarget
+            : "combined";
+        const operationKey = branchTarget === "combined" ? "stretch" : `stretch:${branchTarget}`;
+        const suggested = dsPoststackAnalysis?.suggestedStretch || {};
+        const stretchValue = dsPoststackSettings.stretchValue ?? Number(suggested.stretch || 6);
+        const symmetry = dsPoststackSettings.stretchSymmetry ?? Math.round(Number(suggested.symmetry || 0.12) * 100);
+        const local = dsPoststackSettings.stretchLocal ?? Math.round(Number(suggested.localIntensity || 0.35) * 100);
+        return `<div class="ds-editor-section-head"><div><span class="ds-editor-kicker">${tr("deepsky.editor_optional", "Opcional")}</span>
+                <h3>${tr("deepsky.editor_stretch_title", "Estirado hiperbólico adaptativo")}</h3></div>
+                <span class="ds-editor-result-chip">${tr("deepsky.editor_ghs", "GHS · reversible")}</span></div>
+            <p>${branchTarget === "combined"
+                ? tr("deepsky.editor_stretch_body", "Cada preset se calcula desde el fondo, ruido, rango y fracción estelar de este máster. Aplicar crea una revisión no lineal; el FITS fuente sigue intacto y puedes deshacerla.")
+                : tr("deepsky.editor_branch_stretch_body", "El preset se vuelve a adaptar a esta rama, no al combinado. La otra capa conserva exactamente su revisión hasta que decidas procesarla y recombinar.")}</p>
+            ${branchTarget !== "combined" ? `<button type="button" class="ds-layer-return" data-editor-action="layer-return" data-editor-step="7" data-editor-return-layers="true"><svg class="zas-icon" aria-hidden="true"><use href="#icon-undo"></use></svg>${tr("deepsky.editor_back_layers", "Volver al laboratorio de capas")}</button>
+                <div class="ds-editor-callout"><b>${tr("deepsky.editor_active_branch", "Rama activa")}: ${branchTarget === "object" ? tr("deepsky.editor_layer_object", "Objeto") : tr("deepsky.editor_layer_stars", "Estrellas")}</b><span>${tr("deepsky.editor_branch_only_body", "La operación crea una revisión sólo en esta rama; la otra queda intacta.")}</span></div>` : ""}
+            <div class="ds-preset-row">
+                ${[
+                    ["autoNatural", "Auto natural"],
+                    ["faintNebula", "Nebulosa tenue"],
+                    ["galaxy", "Galaxia"],
+                    ["starField", "Campo estelar"],
+                    ["narrowband", "Banda estrecha"],
+                ].map(([value, label]) => `<label><input type="radio" name="ds-stretch-preset" value="${value}"
+                    data-editor-setting="stretchPreset" ${dsPoststackSettings.stretchPreset === value ? "checked" : ""}><span>${label}</span></label>`).join("")}
+            </div>
+            <div class="ds-control-grid">
+                <label class="ds-control-wide">${tr("deepsky.editor_ghs_strength", "Factor hiperbólico")} <span data-editor-output="stretchValue">${Number(stretchValue).toFixed(1)}</span>
+                    <input type="range" min="0.5" max="32" step="0.1" value="${stretchValue}" data-editor-setting="stretchValue"></label>
+                <label class="ds-control-wide">${tr("deepsky.editor_ghs_symmetry", "Punto de simetría")} <span data-editor-output="stretchSymmetry">${Math.round(symmetry)}%</span>
+                    <input type="range" min="1" max="70" value="${symmetry}" data-editor-setting="stretchSymmetry" data-unit="percent"></label>
+                <label class="ds-control-wide">${tr("deepsky.editor_ghs_local", "Intensidad local")} <span data-editor-output="stretchLocal">${Math.round(local)}%</span>
+                    <input type="range" min="0" max="100" value="${local}" data-editor-setting="stretchLocal" data-unit="percent"></label>
+                <label><input type="checkbox" data-editor-setting="stretchLinked" ${dsPoststackSettings.stretchLinked ? "checked" : ""}> ${tr("deepsky.editor_linked_rgb", "Canales RGB ligados")}</label>
+            </div>
+            <div class="ds-editor-actions ds-editor-apply-row"><button type="button" class="ds-editor-primary" data-editor-action="stretch">${operations.includes(operationKey)
+                ? tr("deepsky.editor_update_stretch", "Actualizar estirado")
+                : tr("deepsky.editor_apply_stretch", "Aplicar estirado")}</button></div>
+            <div class="ds-editor-status">${dsPoststackAnalysis
+                ? `${tr("deepsky.editor_analysis", "Análisis")}: fondo ${Number(dsPoststackAnalysis.background).toFixed(1)} · ruido σ ${Number(dsPoststackAnalysis.noiseSigma).toFixed(2)} · estrellas ${(Number(dsPoststackAnalysis.starFraction) * 100).toFixed(1)}%`
+                : tr("deepsky.editor_analysis_pending", "Analizando el máster para adaptar los presets…")}</div>`;
+    }
+    if (step === 6) {
+        const branchTarget = ["object", "stars"].includes(dsStudioLayerTarget)
+            ? dsStudioLayerTarget
+            : "combined";
+        const operationKey = branchTarget === "combined" ? "denoise" : `denoise:${branchTarget}`;
+        return `<div class="ds-editor-section-head"><div><span class="ds-editor-kicker">${tr("deepsky.editor_float32_tool", "Herramienta float32 de cielo profundo")}</span>
+                <h3>${tr("deepsky.editor_noise_title", "Reducir ruido preservando señal")}</h3></div><span class="ds-editor-result-chip">${tr("deepsky.editor_edge_aware", "Guiado por bordes")}</span></div>
+            <p>${tr("deepsky.editor_noise_body", "Filtra el ruido lineal con una vecindad robusta y limita la mezcla donde hay estructura. No abre el módulo planetario ni convierte a 16-bit.")}</p>
+            ${branchTarget !== "combined" ? `<button type="button" class="ds-layer-return" data-editor-action="layer-return" data-editor-step="7" data-editor-return-layers="true"><svg class="zas-icon" aria-hidden="true"><use href="#icon-undo"></use></svg>${tr("deepsky.editor_back_layers", "Volver al laboratorio de capas")}</button>
+                <div class="ds-editor-callout"><b>${tr("deepsky.editor_active_branch", "Rama activa")}: ${branchTarget === "object" ? tr("deepsky.editor_layer_object", "Objeto") : tr("deepsky.editor_layer_stars", "Estrellas")}</b><span>${tr("deepsky.editor_branch_only_body", "La operación crea una revisión sólo en esta rama; la otra queda intacta.")}</span></div>` : ""}
+            <div class="ds-control-grid">
+                <label class="ds-control-wide">${tr("deepsky.editor_noise_strength", "Reducción")} <span data-editor-output="denoiseStrength">${dsPoststackSettings.denoiseStrength}%</span>
+                    <input type="range" min="0" max="100" value="${dsPoststackSettings.denoiseStrength}" data-editor-setting="denoiseStrength" data-unit="percent"></label>
+                <label class="ds-control-wide">${tr("deepsky.editor_detail_protect", "Protección de estructura")} <span data-editor-output="denoiseDetail">${dsPoststackSettings.denoiseDetail}%</span>
+                    <input type="range" min="0" max="100" value="${dsPoststackSettings.denoiseDetail}" data-editor-setting="denoiseDetail" data-unit="percent"></label>
+                <label class="ds-control-wide">${tr("deepsky.editor_chroma_denoise", "Reducción cromática")} <span data-editor-output="denoiseChroma">${dsPoststackSettings.denoiseChroma}%</span>
+                    <input type="range" min="0" max="100" value="${dsPoststackSettings.denoiseChroma}" data-editor-setting="denoiseChroma" data-unit="percent"></label>
+            </div>
+            <div class="ds-editor-actions ds-editor-apply-row"><button type="button" class="ds-editor-primary" data-editor-action="postprocess-noise">${operations.includes(operationKey) ? tr("deepsky.editor_update_denoise", "Actualizar reducción") : tr("deepsky.editor_apply_denoise", "Aplicar reducción")}</button></div>`;
+    }
+    if (step === 7) {
+        const layers = dsPoststackState?.layers;
+        if (!layers?.available) {
+            return `<div class="ds-editor-section-head"><div>
+                    <span class="ds-editor-kicker">${tr("deepsky.editor_native_layers", "Motor nativo local")}</span>
+                    <h3>${tr("deepsky.editor_layers_title", "Separar Objeto y Estrellas")}</h3></div>
+                    <span class="ds-editor-result-chip">${tr("deepsky.editor_additive_close", "Cierre aditivo")}</span></div>
+                <p>${tr("deepsky.editor_layers_body", "Analiza la PSF y la estructura multiescala para crear Objeto, Estrellas, máscara y residual. El combinado permanece intacto hasta que decidas recombinar; el máster original nunca cambia.")}</p>
+                <div class="ds-layer-principle">
+                    <svg class="zas-icon" aria-hidden="true"><use href="#icon-galaxy"></use></svg>
+                    <div><b>${tr("deepsky.editor_not_magic_claim", "Separación verificable, no una promesa de perfección")}</b>
+                    <span>${tr("deepsky.editor_layers_truth", "La máscara permite auditar qué se clasificó como estrella. El residual verifica el cierre numérico y debe permanecer prácticamente en cero.")}</span></div>
+                </div>
+                <div class="ds-control-grid ds-expert-only">
+                    <label class="ds-control-wide">${tr("deepsky.editor_star_sensitivity", "Estrellas tenues")} <span data-editor-output="starSensitivity">${dsPoststackSettings.starSensitivity}%</span>
+                        <input type="range" min="20" max="95" value="${dsPoststackSettings.starSensitivity}" data-editor-setting="starSensitivity" data-unit="percent"></label>
+                    <label class="ds-control-wide">${tr("deepsky.editor_star_scale", "Escala PSF")} <span data-editor-output="starScale">${dsPoststackSettings.starScale}%</span>
+                        <input type="range" min="65" max="180" value="${dsPoststackSettings.starScale}" data-editor-setting="starScale" data-unit="percent"></label>
+                    <label class="ds-control-wide">${tr("deepsky.editor_halo_protection", "Protección de halos")} <span data-editor-output="starHaloProtection">${dsPoststackSettings.starHaloProtection}%</span>
+                        <input type="range" min="0" max="100" value="${dsPoststackSettings.starHaloProtection}" data-editor-setting="starHaloProtection" data-unit="percent"></label>
+                    <label class="ds-control-wide">${tr("deepsky.editor_faint_protection", "Protección de nebulosidad tenue")} <span data-editor-output="starFaintProtection">${dsPoststackSettings.starFaintProtection}%</span>
+                        <input type="range" min="0" max="100" value="${dsPoststackSettings.starFaintProtection}" data-editor-setting="starFaintProtection" data-unit="percent"></label>
+                </div>
+                <div class="ds-editor-actions ds-editor-apply-row"><button type="button" class="ds-editor-primary" data-editor-action="separate-stars">${tr("deepsky.editor_create_layers", "Crear capas estelares")}</button></div>`;
+        }
+        const target = dsStudioLayerTarget === "mask" ? "mask" : dsStudioLayerTarget;
+        const layerPsfReliable = !!layers.psf?.measured
+            && Number(layers.psf?.starsUsed || 0) >= 6
+            && Number(layers.psf?.confidence || 0) >= 0.18;
+        const combinedStatus = !layers.recombined
+            ? tr("deepsky.editor_combined_safe", "Original preservado · recombinación pendiente")
+            : layers.exactRestore
+                ? tr("deepsky.editor_exact_restore", "Coincide exactamente con la entrada")
+                : tr("deepsky.editor_combined_updated", "Recombinación derivada actualizada");
+        const cards = [
+            ["combined", "icon-mosaic", tr("deepsky.editor_layer_combined", "Combinado"), combinedStatus],
+            ["object", "icon-galaxy", tr("deepsky.editor_layer_object", "Objeto"), layers.objectModified
+                ? `${tr("deepsky.editor_branch_modified", "Rama editada")} · ${layers.objectDomain === "presentation"
+                    ? tr("deepsky.editor_domain_processed", "procesada")
+                    : tr("deepsky.editor_domain_linear", "lineal")}`
+                : tr("deepsky.editor_branch_ready", "Lista para editar")],
+            ["stars", "icon-star", tr("deepsky.editor_layer_stars", "Estrellas"), layers.starsModified
+                ? `${tr("deepsky.editor_branch_modified", "Rama editada")} · ${layers.starsDomain === "presentation"
+                    ? tr("deepsky.editor_domain_processed", "procesada")
+                    : tr("deepsky.editor_domain_linear", "lineal")}`
+                : tr("deepsky.editor_branch_ready", "Lista para editar")],
+        ].map(([id, icon, label, status]) => `<button type="button" class="ds-layer-card"
+            data-editor-action="layer-view-${id}" aria-pressed="${target === id}">
+            <svg class="zas-icon" aria-hidden="true"><use href="#${icon}"></use></svg>
+            <span><b>${escapeHtml(label)}</b><small>${escapeHtml(status)}</small></span>
+        </button>`).join("");
+        let tools = "";
+        if (target === "object") {
+            tools = `<div class="ds-layer-toolbox"><h4>${tr("deepsky.editor_edit_object", "Editar Objeto")}</h4>
+                <p>${tr("deepsky.editor_edit_object_body", "Trabaja nebulosa, galaxia y fondo sin tocar las estrellas. Puedes volver a cualquier herramienta.")}</p>
+                <div class="ds-editor-actions">
+                    <button type="button" data-editor-action="layer-edit-object-restore">${tr("deepsky.editor_deconv_short", "Deconvolución")}</button>
+                    <button type="button" data-editor-action="layer-edit-object-denoise">${tr("deepsky.editor_denoise_short", "Reducir ruido")}</button>
+                    <button type="button" data-editor-action="layer-edit-object-stretch">${tr("deepsky.editor_stretch_short", "Estirar")}</button>
+                    <button type="button" data-editor-action="layer-edit-object-curves">${tr("deepsky.editor_curves_short", "Curvas y color")}</button>
+                    <button type="button" data-editor-action="layer-edit-object-detail">${tr("deepsky.editor_detail_short", "Realzar detalle")}</button>
+                    <button type="button" data-editor-action="layer-edit-object-finish">${tr("deepsky.editor_finish_short", "Acabado")}</button>
+                </div></div>`;
+        } else if (target === "stars") {
+            tools = `<div class="ds-layer-toolbox"><h4>${tr("deepsky.editor_edit_stars", "Editar Estrellas")}</h4>
+                <p>${tr("deepsky.editor_edit_stars_body", "Reduce tamaño y halos o ajusta su color sin alterar el objeto.")}</p>
+                <div class="ds-control-grid">
+                    <label class="ds-control-wide">${tr("deepsky.editor_star_reduction", "Reducción")} <span data-editor-output="starReduction">${dsPoststackSettings.starReduction}%</span>
+                        <input type="range" min="0" max="70" value="${dsPoststackSettings.starReduction}" data-editor-setting="starReduction" data-unit="percent"></label>
+                    <label class="ds-control-wide">${tr("deepsky.editor_star_saturation", "Color estelar")} <span data-editor-output="starSaturation">${dsPoststackSettings.starSaturation}%</span>
+                        <input type="range" min="-100" max="120" value="${dsPoststackSettings.starSaturation}" data-editor-setting="starSaturation" data-unit="percent"></label>
+                    <label class="ds-control-wide">${tr("deepsky.editor_halo_suppression", "Suavizar halos")} <span data-editor-output="starHaloSuppression">${dsPoststackSettings.starHaloSuppression}%</span>
+                        <input type="range" min="0" max="100" value="${dsPoststackSettings.starHaloSuppression}" data-editor-setting="starHaloSuppression" data-unit="percent"></label>
+                </div>
+                <div class="ds-editor-actions"><button type="button" class="ds-editor-primary" data-editor-action="adjust-stars">${tr("deepsky.editor_apply_stars", "Actualizar Estrellas")}</button>
+                    <button type="button" data-editor-action="layer-edit-stars-restore">${tr("deepsky.editor_deconv_short", "Deconvolución")}</button>
+                    <button type="button" data-editor-action="layer-edit-stars-denoise">${tr("deepsky.editor_denoise_short", "Reducir ruido")}</button>
+                    <button type="button" data-editor-action="layer-edit-stars-stretch">${tr("deepsky.editor_stretch_short", "Estirar")}</button>
+                    <button type="button" data-editor-action="layer-edit-stars-curves">${tr("deepsky.editor_curves_short", "Curvas y color")}</button>
+                    <button type="button" data-editor-action="layer-edit-stars-detail">${tr("deepsky.editor_detail_short", "Realzar detalle")}</button>
+                    <button type="button" data-editor-action="layer-edit-stars-finish">${tr("deepsky.editor_finish_short", "Acabado")}</button></div></div>`;
+        } else if (target === "mask") {
+            tools = `<div class="ds-layer-toolbox"><h4>${tr("deepsky.editor_layer_mask", "Máscara y residual")}</h4>
+                <p>${tr("deepsky.editor_layer_diagnostics_body", "La máscara blanca muestra qué alimenta Estrellas y permite encontrar halos, estrellas omitidas o nebulosidad confundida. El residual sólo comprueba el cierre aditivo y debe verse casi negro.")}</p>
+                <button type="button" data-editor-action="layer-view-residual">${tr("deepsky.editor_view_residual", "Ver residual")}</button></div>`;
+        } else {
+            tools = `<div class="ds-layer-toolbox"><h4>${tr("deepsky.editor_recombine_title", "Recombinar cuando tú decidas")}</h4>
+                <p>${tr("deepsky.editor_recombine_body", "Objeto + Estrellas + residual comparten geometría. Ajusta la presencia estelar o vuelve a cualquiera de las ramas sin perder su historial.")}</p>
+                ${layers.recombineEligible === false ? `<div class="ds-editor-status" data-state="warning">${escapeHtml(layers.recombineBlockReason || tr("deepsky.editor_recombine_domain_block", "Objeto y Estrellas deben estar en el mismo dominio antes de recombinar."))}</div>` : ""}
+                <div class="ds-control-grid">
+                    <label class="ds-control-wide">${tr("deepsky.editor_object_weight", "Objeto")} <span data-editor-output="layerObjectWeight">${dsPoststackSettings.layerObjectWeight}%</span>
+                        <input type="range" min="0" max="160" value="${dsPoststackSettings.layerObjectWeight}" data-editor-setting="layerObjectWeight" data-unit="percent"></label>
+                    <label class="ds-control-wide">${tr("deepsky.editor_star_weight", "Estrellas")} <span data-editor-output="layerStarWeight">${dsPoststackSettings.layerStarWeight}%</span>
+                        <input type="range" min="0" max="160" value="${dsPoststackSettings.layerStarWeight}" data-editor-setting="layerStarWeight" data-unit="percent"></label>
+                    <label class="ds-control-wide ds-expert-only">${tr("deepsky.editor_residual_weight", "Residual firmado")} <span data-editor-output="layerResidualWeight">${dsPoststackSettings.layerResidualWeight}%</span>
+                        <input type="range" min="0" max="160" value="${dsPoststackSettings.layerResidualWeight}" data-editor-setting="layerResidualWeight" data-unit="percent"></label>
+                </div>
+                <div class="ds-editor-actions"><button type="button" class="ds-editor-primary" data-editor-action="recombine-layers" ${layers.recombineEligible === false ? "disabled" : ""}>${layers.recombined
+                    ? tr("deepsky.editor_update_combined", "Actualizar combinado")
+                    : tr("deepsky.editor_create_combined", "Crear combinado")}</button></div></div>`;
+        }
+        return `<div class="ds-editor-section-head"><div><span class="ds-editor-kicker">${tr("deepsky.editor_layer_lab", "Laboratorio reversible")}</span>
+                <h3>${tr("deepsky.editor_layers_title", "Objeto · Estrellas · Combinado")}</h3></div>
+                <span class="ds-editor-result-chip" data-state="${layerPsfReliable ? "ok" : "warning"}">${(Number(layers.starFraction || 0) * 100).toFixed(1)}% ${tr("deepsky.editor_stellar_signal", "señal estelar")}</span></div>
+            <div class="ds-layer-grid">${cards}</div>
+            <div class="ds-editor-status" data-state="${layers.reconstructionError <= 1e-5 ? "ok" : "warning"}" aria-live="polite">${tr("deepsky.editor_reconstruction_error", "Error de reconstrucción")} ${Number(layers.reconstructionError || 0).toExponential(2)} · ${escapeHtml(layers.engine || "nativePsfMultiscale")}</div>
+            ${layerPsfReliable ? "" : `<div class="ds-editor-status" data-state="warning">${tr("deepsky.editor_layers_low_psf", "La PSF no alcanzó confianza automática. Revisa máscara y residual antes de recombinar; el combinado original permanece intacto.")}</div>`}
+            <details class="ds-layer-refine ds-expert-only">
+                <summary>${tr("deepsky.editor_refine_layers", "Refinar separación")}</summary>
+                <p>${tr("deepsky.editor_refine_layers_body", "Ajusta la clasificación después de revisar máscara y residual. Se vuelven a crear las capas desde la revisión lineal que alimentó el separador y las recetas de rama se reproducen de forma transaccional.")}</p>
+                <div class="ds-control-grid">
+                    <label class="ds-control-wide">${tr("deepsky.editor_star_sensitivity", "Estrellas tenues")} <span data-editor-output="starSensitivity">${dsPoststackSettings.starSensitivity}%</span>
+                        <input type="range" min="20" max="95" value="${dsPoststackSettings.starSensitivity}" data-editor-setting="starSensitivity" data-unit="percent"></label>
+                    <label class="ds-control-wide">${tr("deepsky.editor_star_scale", "Escala PSF")} <span data-editor-output="starScale">${dsPoststackSettings.starScale}%</span>
+                        <input type="range" min="65" max="180" value="${dsPoststackSettings.starScale}" data-editor-setting="starScale" data-unit="percent"></label>
+                    <label class="ds-control-wide">${tr("deepsky.editor_halo_protection", "Protección de halos")} <span data-editor-output="starHaloProtection">${dsPoststackSettings.starHaloProtection}%</span>
+                        <input type="range" min="0" max="100" value="${dsPoststackSettings.starHaloProtection}" data-editor-setting="starHaloProtection" data-unit="percent"></label>
+                    <label class="ds-control-wide">${tr("deepsky.editor_faint_protection", "Protección de nebulosidad tenue")} <span data-editor-output="starFaintProtection">${dsPoststackSettings.starFaintProtection}%</span>
+                        <input type="range" min="0" max="100" value="${dsPoststackSettings.starFaintProtection}" data-editor-setting="starFaintProtection" data-unit="percent"></label>
+                </div>
+                <div class="ds-editor-actions"><button type="button" data-editor-action="separate-stars">${tr("deepsky.editor_recalculate_layers", "Recalcular capas")}</button></div>
+            </details>
+            ${tools}`;
+    }
+    if (step === 9) {
+        const mono = dsStudioIsMono();
+        if (mono && !["master", "luminance"].includes(dsStudioCurveChannel)) {
+            dsStudioCurveChannel = "master";
+        }
+        const branchTarget = ["object", "stars"].includes(dsStudioLayerTarget)
+            ? dsStudioLayerTarget
+            : "combined";
+        const stretched = dsPoststackTargetHasStretch(branchTarget);
+        const operationKey = branchTarget === "combined" ? "curves" : `curves:${branchTarget}`;
+        const channelTabs = DS_STUDIO_CURVE_CHANNELS
+            .filter(([id]) => !mono || ["master", "luminance"].includes(id))
+            .map(([id, short, label]) => `<button type="button" role="tab" data-curve-channel="${id}"
+                aria-selected="${dsStudioCurveChannel === id}" tabindex="${dsStudioCurveChannel === id ? "0" : "-1"}"
+                title="${escapeHtml(label)}">
+                <b>${short}</b><span>${escapeHtml(label)}</span></button>`).join("");
+        const selective = mono ? "" : dsPoststackSettings.curvesSelective.map((adjustment, index) => {
+            const label = DS_STUDIO_SELECTIVE_COLORS.find(([id]) => id === adjustment.name)?.[1]
+                || adjustment.name;
+            return `<article class="ds-selective-color" data-color="${escapeHtml(adjustment.name)}">
+                <header><span class="ds-selective-swatch" aria-hidden="true"></span><b>${escapeHtml(label)}</b>
+                    <output>${Number(adjustment.saturation) > 0 ? "+" : ""}${Math.round(Number(adjustment.saturation))}%</output></header>
+                <label>${tr("deepsky.editor_selective_saturation", "Saturación")}
+                    <input type="range" min="-100" max="150" value="${Number(adjustment.saturation)}"
+                        data-curve-selective-index="${index}" data-curve-component="saturation"></label>
+                <div class="ds-expert-only ds-selective-expert">
+                    <label>${tr("deepsky.editor_hue", "Tono")}
+                        <input type="range" min="-30" max="30" value="${Number(adjustment.hueShift)}"
+                            data-curve-selective-index="${index}" data-curve-component="hueShift"></label>
+                    <label>${tr("deepsky.editor_lightness", "Luminosidad")}
+                        <input type="range" min="-60" max="60" value="${Math.round(Number(adjustment.lightness))}"
+                            data-curve-selective-index="${index}" data-curve-component="lightness"></label>
+                </div>
+            </article>`;
+        }).join("");
+        return `<div class="ds-editor-section-head"><div>
+                <span class="ds-editor-kicker">${tr("deepsky.editor_presentation_float32", "Revisión de presentación float32")}</span>
+                <h3>${tr("deepsky.editor_curves_title", "Curvas y color selectivo")}</h3></div>
+                <span class="ds-editor-result-chip" data-state="${mono ? "warning" : "ok"}">${mono
+                    ? tr("deepsky.editor_mono_kl", "Mono · K/L")
+                    : tr("deepsky.editor_rgb_hsl", "K/L/R/G/B/S · HSL")}</span></div>
+            <p>${mono
+                ? tr("deepsky.editor_curves_mono_body", "En mono se habilitan únicamente la curva maestra y la luminancia. Zenith no inventa RGB, tono ni saturación.")
+                : tr("deepsky.editor_curves_body", "Ajusta la curva maestra, luminancia y canales por separado. El saturador selectivo trabaja por tono y protege la luminancia; todas las operaciones se reproducen desde el máster inmutable.")}</p>
+            ${branchTarget !== "combined" ? `<button type="button" class="ds-layer-return" data-editor-action="layer-return" data-editor-step="7" data-editor-return-layers="true"><svg class="zas-icon" aria-hidden="true"><use href="#icon-undo"></use></svg>${tr("deepsky.editor_back_layers", "Volver al laboratorio de capas")}</button>
+                <div class="ds-editor-callout"><b>${tr("deepsky.editor_active_branch", "Rama activa")}: ${branchTarget === "object" ? tr("deepsky.editor_layer_object", "Objeto") : tr("deepsky.editor_layer_stars", "Estrellas")}</b><span>${tr("deepsky.editor_branch_only_body", "La operación crea una revisión sólo en esta rama; la otra queda intacta.")}</span></div>` : ""}
+            <div class="ds-curve-tabs" role="tablist" aria-label="${tr("deepsky.editor_curve_channels", "Canales de curva")}">${channelTabs}</div>
+            <section class="ds-curve-workbench">
+                <canvas id="ds-studio-curve-editor" width="540" height="260"
+                    aria-label="${tr("deepsky.editor_curve_canvas", "Editor de curva; clic para añadir un punto, arrastra para ajustar y clic secundario para borrar")}"></canvas>
+                <div class="ds-curve-presets" role="group" aria-label="${tr("deepsky.editor_curve_presets", "Presets de curva")}">
+                    ${[
+                        ["linear", "Lineal"],
+                        ["gentle", "Contraste suave"],
+                        ["nebula", "Nebulosa tenue"],
+                        ["stars", "Color estelar"],
+                        ["color", "Cromática"],
+                    ].map(([id, label]) => `<button type="button" data-curve-preset="${id}">${label}</button>`).join("")}
+                </div>
+            </section>
+            ${mono ? "" : `<details class="ds-hsl-global" open>
+                <summary>${tr("deepsky.editor_hsl_global", "HSL global")}</summary>
+                <div class="ds-control-grid">
+                    <label class="ds-control-wide">${tr("deepsky.editor_hue", "Tono")} <span data-editor-output="curvesHueShift">${Number(dsPoststackSettings.curvesHueShift) > 0 ? "+" : ""}${Math.round(Number(dsPoststackSettings.curvesHueShift))}°</span>
+                        <input type="range" min="-30" max="30" value="${Number(dsPoststackSettings.curvesHueShift)}" data-editor-setting="curvesHueShift"></label>
+                    <label class="ds-control-wide">${tr("deepsky.editor_saturation", "Saturación")} <span data-editor-output="curvesSaturationScale">${Math.round(Number(dsPoststackSettings.curvesSaturationScale))}%</span>
+                        <input type="range" min="0" max="250" value="${Number(dsPoststackSettings.curvesSaturationScale)}" data-editor-setting="curvesSaturationScale" data-unit="percent"></label>
+                    <label class="ds-control-wide">${tr("deepsky.editor_lightness", "Luminosidad")} <span data-editor-output="curvesLightness">${Number(dsPoststackSettings.curvesLightness) > 0 ? "+" : ""}${Math.round(Number(dsPoststackSettings.curvesLightness))}%</span>
+                        <input type="range" min="-60" max="60" value="${Number(dsPoststackSettings.curvesLightness)}" data-editor-setting="curvesLightness" data-unit="percent"></label>
+                </div>
+            </details>
+            <details class="ds-selective-module" ${dsStudioExperience === "expert" ? "open" : ""}>
+                <summary>${tr("deepsky.editor_selective_color", "Saturación independiente por color")}</summary>
+                <div class="ds-selective-grid">${selective}</div>
+            </details>`}
+            ${stretched ? "" : `<div class="ds-editor-status" data-state="warning">${tr("deepsky.editor_curves_need_stretch", "Curvas y HSL pertenecen a la salida de presentación. Completa Estirar o trabaja sobre una rama ya estirada.")}</div>`}
+            <div class="ds-editor-status" data-curve-status data-state="${operations.includes(operationKey) ? "ok" : "idle"}">${operations.includes(operationKey)
+                ? tr("deepsky.editor_curves_applied", "Curvas aplicadas como revisión reproducible.")
+                : tr("deepsky.editor_curves_ready", "La curva identidad no cambia ningún píxel. Ajusta sólo lo necesario.")}</div>
+            <div class="ds-editor-actions ds-editor-apply-row">
+                <button type="button" data-editor-action="curves-reset">${tr("deepsky.editor_curves_reset", "Restablecer curvas")}</button>
+                <button type="button" class="ds-editor-primary" data-editor-action="postprocess-curves" ${stretched ? "" : "disabled"}>${operations.includes(operationKey)
+                    ? tr("deepsky.editor_update_curves", "Actualizar curvas y color")
+                    : tr("deepsky.editor_apply_curves", "Aplicar curvas y color")}</button>
+            </div>`;
+    }
+    if (step === 10) {
+        const branchSelected = ["object", "stars"].includes(dsStudioLayerTarget);
+        const branchTarget = branchSelected
+            ? dsStudioLayerTarget
+            : "combined";
+        const eligible = branchSelected || dsPoststackTargetHasStretch("combined");
+        const operationKey = branchTarget === "combined" ? "detail" : `detail:${branchTarget}`;
+        return `<div class="ds-editor-section-head"><div><span class="ds-editor-kicker">${tr("deepsky.editor_float32_tool", "Herramienta float32 de cielo profundo")}</span>
+                <h3>${tr("deepsky.editor_detail_title", "Realzar detalle sin inflar estrellas")}</h3></div><span class="ds-editor-result-chip">${tr("deepsky.editor_star_guard", "Protección estelar")}</span></div>
+            <p>${branchSelected
+                ? tr("deepsky.editor_branch_detail_body", "Realce multiescala sobre esta rama antes de recombinar. Conserva su escala de transferencia, limita el ruido y no modifica la otra capa.")
+                : tr("deepsky.editor_detail_body", "Realce multiescala limitado por el piso de ruido y la luminancia estelar. La fuerza cae automáticamente en núcleos brillantes.")}</p>
+            ${branchTarget !== "combined" ? `<button type="button" class="ds-layer-return" data-editor-action="layer-return" data-editor-step="7" data-editor-return-layers="true"><svg class="zas-icon" aria-hidden="true"><use href="#icon-undo"></use></svg>${tr("deepsky.editor_back_layers", "Volver al laboratorio de capas")}</button>
+                <div class="ds-editor-callout"><b>${tr("deepsky.editor_active_branch", "Rama activa")}: ${branchTarget === "object" ? tr("deepsky.editor_layer_object", "Objeto") : tr("deepsky.editor_layer_stars", "Estrellas")}</b><span>${tr("deepsky.editor_branch_only_body", "La operación crea una revisión sólo en esta rama; la otra queda intacta.")}</span></div>` : ""}
+            <div class="ds-control-grid">
+                <label class="ds-control-wide">${tr("deepsky.editor_detail_amount", "Cantidad")} <span data-editor-output="detailAmount">${dsPoststackSettings.detailAmount}%</span>
+                    <input type="range" min="0" max="120" value="${dsPoststackSettings.detailAmount}" data-editor-setting="detailAmount" data-unit="percent"></label>
+                <label>${tr("deepsky.editor_detail_scale", "Escala")}
+                    <select data-editor-setting="detailRadius"><option value="1" ${Number(dsPoststackSettings.detailRadius) === 1 ? "selected" : ""}>Fina</option>
+                    <option value="2" ${Number(dsPoststackSettings.detailRadius) === 2 ? "selected" : ""}>Media</option>
+                    <option value="3" ${Number(dsPoststackSettings.detailRadius) === 3 ? "selected" : ""}>Amplia</option></select></label>
+                <label class="ds-control-wide">${tr("deepsky.editor_star_protection", "Protección de estrellas")} <span data-editor-output="detailStars">${dsPoststackSettings.detailStars}%</span>
+                    <input type="range" min="0" max="100" value="${dsPoststackSettings.detailStars}" data-editor-setting="detailStars" data-unit="percent"></label>
+            </div>
+            ${eligible ? "" : `<div class="ds-editor-status" data-state="warning">${tr("deepsky.editor_detail_needs_stretch", "En Combinado, este realce pertenece a la salida procesada. Completa Estirar o trabaja antes sobre Objeto/Estrellas.")}</div>`}
+            <div class="ds-editor-actions ds-editor-apply-row"><button type="button" class="ds-editor-primary" data-editor-action="postprocess-detail" ${eligible ? "" : "disabled"}>${operations.includes(operationKey) ? tr("deepsky.editor_update_detail", "Actualizar detalle") : tr("deepsky.editor_apply_detail", "Aplicar detalle")}</button></div>`;
+    }
+    if (step === 11) {
+        const branchTarget = ["object", "stars"].includes(dsStudioLayerTarget)
+            ? dsStudioLayerTarget
+            : "combined";
+        const stretched = dsPoststackTargetHasStretch(branchTarget);
+        const operationKey = branchTarget === "combined" ? "finish" : `finish:${branchTarget}`;
+        return `<div class="ds-editor-section-head"><div><span class="ds-editor-kicker">${tr("deepsky.editor_float32_tool", "Herramienta float32 de cielo profundo")}</span>
+                <h3>${tr("deepsky.editor_finish_title", "Acabado protegido")}</h3></div><span class="ds-editor-result-chip">${tr("deepsky.editor_highlight_guard", "Control de altas luces")}</span></div>
+            <p>${branchTarget === "combined"
+                ? tr("deepsky.editor_finish_body", "Ajusta saturación y contraste sobre la revisión actual reduciendo automáticamente el efecto en estrellas y núcleos brillantes.")
+                : tr("deepsky.editor_branch_finish_body", "El acabado afecta únicamente esta rama procesada. Puedes volver a Objeto o Estrellas, igualar sus dominios y crear el combinado cuando estés conforme.")}</p>
+            ${branchTarget !== "combined" ? `<button type="button" class="ds-layer-return" data-editor-action="layer-return" data-editor-step="7" data-editor-return-layers="true"><svg class="zas-icon" aria-hidden="true"><use href="#icon-undo"></use></svg>${tr("deepsky.editor_back_layers", "Volver al laboratorio de capas")}</button>
+                <div class="ds-editor-callout"><b>${tr("deepsky.editor_active_branch", "Rama activa")}: ${branchTarget === "object" ? tr("deepsky.editor_layer_object", "Objeto") : tr("deepsky.editor_layer_stars", "Estrellas")}</b><span>${tr("deepsky.editor_branch_only_body", "La operación crea una revisión sólo en esta rama; la otra queda intacta.")}</span></div>` : ""}
+            <div class="ds-control-grid">
+                <label class="ds-control-wide">${tr("deepsky.editor_saturation", "Saturación")} <span data-editor-output="finishSaturation">${dsPoststackSettings.finishSaturation > 0 ? "+" : ""}${dsPoststackSettings.finishSaturation}%</span>
+                    <input type="range" min="-100" max="150" value="${dsPoststackSettings.finishSaturation}" data-editor-setting="finishSaturation" data-unit="percent"></label>
+                <label class="ds-control-wide">${tr("deepsky.editor_contrast", "Contraste")} <span data-editor-output="finishContrast">${dsPoststackSettings.finishContrast > 0 ? "+" : ""}${dsPoststackSettings.finishContrast}%</span>
+                    <input type="range" min="-50" max="80" value="${dsPoststackSettings.finishContrast}" data-editor-setting="finishContrast" data-unit="percent"></label>
+                <label class="ds-control-wide">${tr("deepsky.editor_highlight_protection", "Protección de altas luces")} <span data-editor-output="finishHighlights">${dsPoststackSettings.finishHighlights}%</span>
+                    <input type="range" min="0" max="100" value="${dsPoststackSettings.finishHighlights}" data-editor-setting="finishHighlights" data-unit="percent"></label>
+            </div>
+            ${stretched ? "" : `<div class="ds-editor-status" data-state="warning">${tr("deepsky.editor_finish_needs_stretch", "El acabado es opcional y sólo se habilita después del estirado. La salida lineal sigue disponible.")}</div>`}
+            <div class="ds-editor-actions ds-editor-apply-row"><button type="button" class="ds-editor-primary" data-editor-action="postprocess-finish" ${stretched ? "" : "disabled"}>${operations.includes(operationKey) ? tr("deepsky.editor_update_finish", "Actualizar acabado") : tr("deepsky.editor_apply_finish", "Aplicar acabado")}</button></div>`;
+    }
+    const solution = dsPoststackState?.astrometry;
+    const annotation = dsStudioAnnotation.result;
+    const diagnostics = annotation?.diagnostics;
+    const styles = [
+        ["zenithAtlas", "Atlas Zenith", "Cuadrícula ecuatorial, objetos principales y límites limpios.", "icon-mosaic"],
+        ["zenithSurvey", "Survey", "Catálogo más denso, círculos discretos y lectura técnica.", "icon-search"],
+        ["zenithFocus", "Focus", "Sólo protagonistas, jerarquía grande y guías mínimas.", "icon-star"],
+        ["zenithMinimal", "Minimal", "Etiquetas esenciales sin cuadrícula para publicación.", "icon-sparkles"],
+    ];
+    return `<div class="ds-editor-section-head"><div><span class="ds-editor-kicker">${tr("deepsky.editor_last_step", "Publicación reproducible")}</span>
+            <h3>${tr("deepsky.editor_annotation_title", "Mapa anotado y exportación")}</h3></div>
+            <span class="ds-editor-result-chip" data-state="${solution ? "ok" : "warning"}">${solution ? "WCS" : tr("deepsky.editor_no_wcs", "Sin WCS")}</span></div>
+        <p>${tr("deepsky.editor_annotation_body", "Zenith proyecta el catálogo sobre el WCS del máster y crea una capa transparente independiente. Las anotaciones no alteran los píxeles científicos y pueden exportarse solas o compuestas sobre la revisión visible.")}</p>
+        <div class="ds-annotation-style-grid" role="radiogroup" aria-label="${tr("deepsky.editor_annotation_styles", "Estilo de anotaciones")}">
+            ${styles.map(([id, label, body, icon]) => `<button type="button" data-annotation-style="${id}"
+                aria-pressed="${dsStudioAnnotation.style === id}">
+                <svg class="zas-icon" aria-hidden="true"><use href="#${icon}"></use></svg>
+                <span><b>${label}</b><small>${body}</small></span>
+            </button>`).join("")}
+        </div>
+        <div class="ds-control-grid">
+            <label><input type="checkbox" data-annotation-setting="showGrid" ${dsStudioAnnotation.showGrid ? "checked" : ""}>
+                ${tr("deepsky.editor_annotation_grid", "Cuadrícula RA/Dec")}</label>
+            <label><input type="checkbox" data-annotation-setting="includeCatalog" ${dsStudioAnnotation.includeCatalog ? "checked" : ""}>
+                ${tr("deepsky.editor_annotation_catalog", "Objetos de catálogo")}</label>
+            <label class="ds-control-wide">${tr("deepsky.editor_annotation_density", "Máximo de objetos")}
+                <span data-annotation-output="maxObjects">${Math.round(Number(dsStudioAnnotation.maxObjects))}</span>
+                <input type="range" min="12" max="240" step="4" value="${Number(dsStudioAnnotation.maxObjects)}"
+                    data-annotation-setting="maxObjects"></label>
+        </div>
+        ${solution ? `<div class="ds-editor-status" data-state="ok">${tr("deepsky.editor_annotation_wcs_ready", "Geometría lista")}: ${Number(solution.inliers || 0)} ${tr("deepsky.editor_valid_stars", "estrellas válidas")} · RMS ${Number(solution.rmsPx || 0).toFixed(2)} px · ${escapeHtml(solution.source || diagnostics?.wcsSource || "WCS")}</div>`
+            : `<div class="ds-editor-status" data-state="warning">${tr("deepsky.editor_annotation_needs_wcs", "Las anotaciones requieren un WCS validado. Vuelve a Astrometría; la falta de red no modifica ni bloquea el máster.")}</div>`}
+        ${dsStudioAnnotation.error ? `<div class="ds-editor-status" data-state="warning">${escapeHtml(dsStudioAnnotation.error)}</div>` : ""}
+        ${annotation ? `<div class="ds-annotation-summary">
+            <span><b>${Number(diagnostics?.labelsDrawn || annotation.objects?.filter(item => item.labelVisible).length || 0)}</b>${tr("deepsky.editor_annotation_labels", "etiquetas")}</span>
+            <span><b>${Number(diagnostics?.projectedRows || annotation.objects?.length || 0)}</b>${tr("deepsky.editor_annotation_projected", "objetos proyectados")}</span>
+            <span><b>${diagnostics?.cacheHit ? tr("deepsky.editor_cache_hit", "Reutilizada") : diagnostics?.onlineAttempted ? tr("deepsky.editor_web_catalog", "Web + caché") : tr("deepsky.editor_local_catalog", "Local")}</b>${tr("deepsky.editor_annotation_catalog_source", "fuente de catálogo")}</span>
+        </div>` : ""}
+        <div class="ds-editor-actions ds-editor-apply-row">
+            ${solution
+                ? `<button type="button" class="ds-editor-primary" data-editor-action="annotation-preview">${annotation
+                    ? tr("deepsky.editor_annotation_refresh", "Actualizar mapa")
+                    : tr("deepsky.editor_annotation_generate", "Generar mapa anotado")}</button>`
+                : `<button type="button" class="ds-editor-primary" data-editor-step="3">${tr("deepsky.editor_back_astrometry", "Resolver astrometría")}</button>`}
+            ${solution ? `<button type="button" class="ds-expert-only" data-editor-action="annotation-online">${tr("deepsky.editor_annotation_online", "Actualizar catálogo web")}</button>` : ""}
+            ${annotation ? `<button type="button" data-editor-action="annotation-clear">${tr("deepsky.editor_annotation_clear", "Ocultar anotaciones")}</button>` : ""}
+        </div>
+        ${annotation ? `<div class="ds-editor-actions">
+            <button type="button" data-editor-action="annotation-export-overlay">${tr("deepsky.editor_annotation_export_overlay", "Exportar capa PNG")}</button>
+            <button type="button" data-editor-action="annotation-export-composite">${tr("deepsky.editor_annotation_export_composite", "Exportar imagen anotada")}</button>
+        </div>` : ""}
+        <div class="ds-editor-callout"><b>${tr("deepsky.editor_source_preserved", "El original sigue disponible")}</b><span>${tr("deepsky.editor_source_preserved_body", "Deshacer, Reset y A/B se reconstruyen desde el máster fuente inmutable. La capa anotada es sólo un producto de publicación.")}</span></div>
+        <div class="ds-editor-actions"><button type="button" class="ds-editor-primary" data-editor-action="export">${tr("deepsky.export", "Elegir todas las salidas")}</button></div>`;
+}
+
+function dsApplyInstrumentProfileDefaults(profile) {
+    const defaults = {
+        metadata: { oiii: 65, crosstalk: 0 },
+        sv220: { oiii: 61, crosstalk: 6 },
+        lextreme: { oiii: 67, crosstalk: 7 },
+        lultimate: { oiii: 63, crosstalk: 5 },
+    }[profile];
+    if (!defaults) return;
+    dsPoststackSettings.dualBandOiii = defaults.oiii;
+    dsPoststackSettings.dualBandCrosstalk = defaults.crosstalk;
+}
+
+function dsPoststackCropBaseFromState() {
+    const crop = dsPoststackState?.crop;
+    if (!crop?.sourceWidth || !crop?.sourceHeight) return { x: 0, y: 0, width: 1, height: 1 };
+    return {
+        x: crop.x / crop.sourceWidth,
+        y: crop.y / crop.sourceHeight,
+        width: crop.width / crop.sourceWidth,
+        height: crop.height / crop.sourceHeight,
+    };
+}
+
+function dsPoststackCropPayload(full = false) {
+    if (full) return { x: 0, y: 0, width: 1, height: 1 };
+    return {
+        x: dsCropViewBase.x + dsCropRect.x * dsCropViewBase.width,
+        y: dsCropViewBase.y + dsCropRect.y * dsCropViewBase.height,
+        width: dsCropRect.width * dsCropViewBase.width,
+        height: dsCropRect.height * dsCropViewBase.height,
+    };
+}
+
+function dsUpdateCropOverlay() {
+    const layer = document.getElementById("ds-crop-layer");
+    const box = layer?.querySelector(".ds-crop-box");
+    const interactiveImage = dsPoststackInteractiveImage();
+    if (!layer || !box || !interactiveImage) return;
+    const imageRect = dsImageVisibleContentRect(interactiveImage);
+    if (imageRect.width < 20 || imageRect.height < 20) return;
+    Object.assign(layer.style, {
+        left: `${imageRect.left}px`,
+        top: `${imageRect.top}px`,
+        width: `${imageRect.width}px`,
+        height: `${imageRect.height}px`,
+    });
+    Object.assign(box.style, {
+        left: `${dsCropRect.x * 100}%`,
+        top: `${dsCropRect.y * 100}%`,
+        width: `${dsCropRect.width * 100}%`,
+        height: `${dsCropRect.height * 100}%`,
+    });
+    const payload = dsPoststackCropPayload(false);
+    const sourceWidth = dsPoststackState?.crop?.sourceWidth || dsPoststackState?.width || 0;
+    const sourceHeight = dsPoststackState?.crop?.sourceHeight || dsPoststackState?.height || 0;
+    const width = Math.max(1, Math.round(sourceWidth * payload.width));
+    const height = Math.max(1, Math.round(sourceHeight * payload.height));
+    const label = box.querySelector(".ds-crop-live-size");
+    if (label) label.textContent = `${width} × ${height} px`;
+    const panelLabel = document.getElementById("ds-crop-size");
+    if (panelLabel) panelLabel.textContent = `${width} × ${height} px`;
+}
+
+function dsShowCropOverlay() {
+    if (!dsPoststackInteractiveImage()?.getBoundingClientRect) return;
+    let layer = document.getElementById("ds-crop-layer");
+    if (!layer) {
+        layer = document.createElement("div");
+        layer.id = "ds-crop-layer";
+        layer.innerHTML = `<div class="ds-crop-toolbar" role="toolbar" aria-label="${tr("deepsky.editor_crop_toolbar", "Acciones del recorte activo")}">
+                <span><svg class="zas-icon" aria-hidden="true"><use href="#icon-scissors"></use></svg>${tr("deepsky.editor_crop_active", "Recorte activo")}</span>
+                <button type="button" data-crop-action="full">${tr("deepsky.editor_crop_full", "Imagen completa")}</button>
+                <button type="button" class="ds-crop-apply" data-crop-action="apply">${tr("deepsky.editor_crop_apply", "Aplicar recorte")}</button>
+            </div>
+            <div class="ds-crop-box" role="group" tabindex="0" aria-label="${tr("deepsky.editor_crop_overlay", "Área de recorte editable. Flechas mueven; Shift y flechas hacen pasos amplios.")}">
+            <span class="ds-crop-live-size" aria-live="polite"></span>
+            ${["nw", "n", "ne", "e", "se", "s", "sw", "w"].map(direction =>
+                `<button type="button" class="ds-crop-handle ${direction}" data-crop-direction="${direction}"
+                    aria-label="${tr("deepsky.editor_resize_crop", "Redimensionar recorte")} ${direction}"></button>`).join("")}
+        </div>`;
+        document.body.appendChild(layer);
+        const box = layer.querySelector(".ds-crop-box");
+        const toolbar = layer.querySelector(".ds-crop-toolbar");
+        toolbar.addEventListener("pointerdown", event => event.stopPropagation());
+        toolbar.addEventListener("click", async event => {
+            const button = event.target.closest("[data-crop-action]");
+            if (!button) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (button.dataset.cropAction === "full") {
+                await dsPoststackApplyCrop(button, { full: true });
+            } else {
+                await dsPoststackApplyCrop(button);
+            }
+        });
+        box.addEventListener("pointerdown", event => {
+            const handle = event.target.closest("[data-crop-direction]");
+            const direction = handle?.dataset.cropDirection || "move";
+            const start = { x: event.clientX, y: event.clientY, rect: { ...dsCropRect }, direction };
+            dsCropDrag = start;
+            box.setPointerCapture(event.pointerId);
+            const move = moveEvent => {
+                if (!dsCropDrag) return;
+                const bounds = layer.getBoundingClientRect();
+                const dx = (moveEvent.clientX - start.x) / bounds.width;
+                const dy = (moveEvent.clientY - start.y) / bounds.height;
+                const minSize = 0.035;
+                let { x, y, width, height } = start.rect;
+                if (direction === "move") {
+                    x = Math.min(1 - width, Math.max(0, x + dx));
+                    y = Math.min(1 - height, Math.max(0, y + dy));
+                } else {
+                    if (direction.includes("w")) {
+                        const right = x + width;
+                        x = Math.min(right - minSize, Math.max(0, x + dx));
+                        width = right - x;
+                    }
+                    if (direction.includes("e")) width = Math.min(1 - x, Math.max(minSize, width + dx));
+                    if (direction.includes("n")) {
+                        const bottom = y + height;
+                        y = Math.min(bottom - minSize, Math.max(0, y + dy));
+                        height = bottom - y;
+                    }
+                    if (direction.includes("s")) height = Math.min(1 - y, Math.max(minSize, height + dy));
+                }
+                dsCropRect = { x, y, width, height };
+                dsUpdateCropOverlay();
+            };
+            const end = () => {
+                dsCropDrag = null;
+                box.removeEventListener("pointermove", move);
+                box.removeEventListener("pointerup", end);
+                box.removeEventListener("pointercancel", end);
+            };
+            box.addEventListener("pointermove", move);
+            box.addEventListener("pointerup", end);
+            box.addEventListener("pointercancel", end);
+            event.preventDefault();
+        });
+        box.addEventListener("keydown", event => {
+            if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+            const handle = event.target.closest("[data-crop-direction]");
+            const direction = handle?.dataset.cropDirection || "move";
+            const step = event.shiftKey ? 0.02 : 0.004;
+            const minSize = 0.035;
+            let { x, y, width, height } = dsCropRect;
+            const dx = event.key === "ArrowLeft" ? -step : event.key === "ArrowRight" ? step : 0;
+            const dy = event.key === "ArrowUp" ? -step : event.key === "ArrowDown" ? step : 0;
+            if (direction === "move") {
+                x = Math.min(1 - width, Math.max(0, x + dx));
+                y = Math.min(1 - height, Math.max(0, y + dy));
+            } else {
+                if (direction.includes("w") && dx !== 0) {
+                    const right = x + width;
+                    x = Math.min(right - minSize, Math.max(0, x + dx));
+                    width = right - x;
+                }
+                if (direction.includes("e") && dx !== 0) {
+                    width = Math.min(1 - x, Math.max(minSize, width + dx));
+                }
+                if (direction.includes("n") && dy !== 0) {
+                    const bottom = y + height;
+                    y = Math.min(bottom - minSize, Math.max(0, y + dy));
+                    height = bottom - y;
+                }
+                if (direction.includes("s") && dy !== 0) {
+                    height = Math.min(1 - y, Math.max(minSize, height + dy));
+                }
+            }
+            dsCropRect = { x, y, width, height };
+            dsUpdateCropOverlay();
+            event.preventDefault();
+        });
+    }
+    dsUpdateCropOverlay();
+}
+
+function dsGradientPointExcluded(point) {
+    return dsGradientExclusions.some(mask =>
+        point.x >= mask.x
+        && point.x <= mask.x + mask.width
+        && point.y >= mask.y
+        && point.y <= mask.y + mask.height);
+}
+
+function dsGenerateGradientSamples(columns = 14, rows = 10) {
+    const samples = [];
+    const radius = Math.max(0.004, Math.min(0.08, Number(dsPoststackSettings.gradientSampleRadius) || 0.025));
+    for (let row = 0; row < rows; row += 1) {
+        for (let column = 0; column < columns; column += 1) {
+            const point = {
+                id: `sample-${row}-${column}`,
+                x: (column + 0.75) / (columns + 0.5),
+                y: (row + 0.75) / (rows + 0.5),
+                radius,
+                enabled: true,
+                weight: 1,
+            };
+            point.enabled = !dsGradientPointExcluded(point);
+            samples.push(point);
+        }
+    }
+    dsGradientSampleCursor = { index: 0, column: 0, row: 0 };
+    return samples;
+}
+
+function dsRenderGradientExclusions() {
+    document.getElementById("ds-gradient-exclusions-layer")?.remove();
+    if (dsPoststackStep !== 2 || (!dsGradientExclusions.length && !dsGradientSamplesVisible)) return;
+    const interactiveImage = dsPoststackInteractiveImage();
+    if (!interactiveImage) return;
+    const rect = dsImageVisibleContentRect(interactiveImage);
+    if (rect.width < 20 || rect.height < 20) return;
+    const layer = document.createElement("div");
+    layer.id = "ds-gradient-exclusions-layer";
+    Object.assign(layer.style, {
+        left: `${rect.left}px`,
+        top: `${rect.top}px`,
+        width: `${rect.width}px`,
+        height: `${rect.height}px`,
+    });
+    layer.innerHTML = dsGradientExclusions.map(mask => `<span class="ds-gradient-mask"
+        style="left:${mask.x * 100}%;top:${mask.y * 100}%;width:${mask.width * 100}%;height:${mask.height * 100}%"></span>`).join("");
+    if (dsGradientSamplesVisible) {
+        const canvas = document.createElement("canvas");
+        canvas.className = "ds-gradient-samples";
+        canvas.tabIndex = 0;
+        canvas.setAttribute("role", "application");
+        canvas.setAttribute("aria-label", tr("deepsky.editor_samples_aria", "Muestras de fondo. Haz clic para añadir una muestra o activar y desactivar la más cercana. Usa flechas y Espacio con el teclado."));
+        layer.appendChild(canvas);
+        const toggleSample = index => {
+            const sample = dsGradientSamples[index];
+            if (!sample) return;
+            sample.enabled = sample.enabled === false;
+            dsGradientSampleCursor = { index, column: index, row: 0 };
+            dsDrawGradientSamples(canvas);
+        };
+        canvas.addEventListener("pointerdown", event => {
+            const bounds = canvas.getBoundingClientRect();
+            const x = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width));
+            const y = Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height));
+            let nearest = -1;
+            let nearestDistance = Number.POSITIVE_INFINITY;
+            dsGradientSamples.forEach((sample, index) => {
+                const distance = Math.hypot(sample.x - x, sample.y - y);
+                if (distance < nearestDistance) {
+                    nearest = index;
+                    nearestDistance = distance;
+                }
+            });
+            if (nearest >= 0 && nearestDistance <= 0.035) {
+                toggleSample(nearest);
+            } else {
+                const sample = {
+                    id: `sample-user-${Date.now()}`,
+                    x,
+                    y,
+                    radius: Number(dsPoststackSettings.gradientSampleRadius) || 0.025,
+                    enabled: !dsGradientPointExcluded({ x, y }),
+                    weight: 1,
+                };
+                dsGradientSamples.push(sample);
+                dsGradientSampleCursor = { index: dsGradientSamples.length - 1, column: 0, row: 0 };
+                dsDrawGradientSamples(canvas);
+            }
+            event.preventDefault();
+        });
+        canvas.addEventListener("keydown", event => {
+            if (!dsGradientSamples.length) return;
+            let index = Math.max(0, Math.min(
+                dsGradientSamples.length - 1,
+                Number(dsGradientSampleCursor.index) || 0,
+            ));
+            if (event.key === "ArrowLeft" || event.key === "ArrowUp") index = Math.max(0, index - 1);
+            else if (event.key === "ArrowRight" || event.key === "ArrowDown") index = Math.min(dsGradientSamples.length - 1, index + 1);
+            else if (event.key === " " || event.key === "Enter") {
+                toggleSample(index);
+                event.preventDefault();
+                return;
+            } else {
+                return;
+            }
+            dsGradientSampleCursor = { index, column: index, row: 0 };
+            dsDrawGradientSamples(canvas);
+            event.preventDefault();
+        });
+    }
+    document.body.appendChild(layer);
+    dsDrawGradientSamples(layer.querySelector(".ds-gradient-samples"));
+}
+
+function dsDrawGradientSamples(canvas) {
+    if (!canvas) return;
+    const bounds = canvas.getBoundingClientRect();
+    if (bounds.width < 20 || bounds.height < 20) return;
+    const ratio = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.max(1, Math.round(bounds.width * ratio));
+    canvas.height = Math.max(1, Math.round(bounds.height * ratio));
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.scale(ratio, ratio);
+    context.clearRect(0, 0, bounds.width, bounds.height);
+    dsGradientSamples.forEach((sample, index) => {
+        const x = sample.x * bounds.width;
+        const y = sample.y * bounds.height;
+        const excluded = dsGradientPointExcluded(sample);
+        const enabled = sample.enabled !== false && !excluded;
+        context.beginPath();
+        context.arc(x, y, Math.max(2.4, sample.radius * Math.min(bounds.width, bounds.height)), 0, Math.PI * 2);
+        context.fillStyle = enabled ? "rgba(103,232,249,.24)" : "rgba(251,191,36,.22)";
+        context.fill();
+        context.strokeStyle = enabled ? "rgba(103,232,249,.94)" : "rgba(251,191,36,.94)";
+        context.lineWidth = Number(dsGradientSampleCursor.index) === index ? 2 : 1;
+        context.stroke();
+    });
+    const selected = dsGradientSamples[Number(dsGradientSampleCursor.index) || 0];
+    if (selected) {
+        context.beginPath();
+        context.arc(selected.x * bounds.width, selected.y * bounds.height, 7, 0, Math.PI * 2);
+        context.strokeStyle = "#f8fafc";
+        context.lineWidth = 1.5;
+        context.stroke();
+    }
+}
+
+function dsUpdateGradientLayerPosition() {
+    const layer = document.getElementById("ds-gradient-exclusions-layer");
+    const interactiveImage = dsPoststackInteractiveImage();
+    if (!layer || !interactiveImage) return;
+    const rect = dsImageVisibleContentRect(interactiveImage);
+    Object.assign(layer.style, {
+        left: `${rect.left}px`,
+        top: `${rect.top}px`,
+        width: `${rect.width}px`,
+        height: `${rect.height}px`,
+    });
+    dsDrawGradientSamples(layer.querySelector(".ds-gradient-samples"));
+}
+
+function dsPoststackSyncInteractiveLayer() {
+    document.getElementById("ds-crop-layer")?.remove();
+    document.getElementById("ds-gradient-exclusions-layer")?.remove();
+    if (dsPoststackStep === 1) dsShowCropOverlay();
+    if (dsPoststackStep === 2) dsRenderGradientExclusions();
+}
+
+async function dsPoststackApplyCommand(command, req, button, busyLabel) {
+    const token = ++dsResultViewToken;
+    const previous = button?.textContent;
+    if (button) {
+        button.disabled = true;
+        button.textContent = busyLabel;
+    }
+    try {
+        if (dsIsMilkyWayWorkflow()
+            && dsPoststackPreviewMode.startsWith("milkyway-")
+            && command !== "deepsky_poststack_apply_crop"
+            && dsPoststackState?.preview) {
+            dsPoststackPreviewMode = "current";
+            dsPoststackCurrentPreview = dsPoststackState.preview;
+            await dsSetResultImage(dsPoststackState.preview, token, false);
+            if (token !== dsResultViewToken) return null;
+        }
+        const fixtureKinds = {
+            deepsky_poststack_apply_crop: "crop",
+            deepsky_poststack_apply_dualband: "dualBandPalette",
+            deepsky_poststack_apply_deconvolution: "deconvolution",
+            deepsky_poststack_separate_stars: "starSeparation",
+            deepsky_poststack_adjust_stars: "starAdjustment",
+            deepsky_poststack_recombine: "recombine",
+            deepsky_poststack_apply_stretch: "stretch",
+            deepsky_poststack_apply_curves: "curves",
+            deepsky_poststack_apply_denoise: "denoise",
+            deepsky_poststack_apply_detail: "detail",
+            deepsky_poststack_apply_finish: "finish",
+        };
+        const fixtureKind = fixtureKinds[command];
+        const fixturePayload = fixtureKind === "crop"
+            ? { crop: dsPoststackFixtureCrop(req) }
+            : { req: { ...req } };
+        const state = dsIsPoststackFixture() && fixtureKind
+            ? dsPoststackFixtureCommit(fixtureKind, fixturePayload)
+            : await invoke(command, { req });
+        if (token !== dsResultViewToken) return null;
+        dsPoststackState = state;
+        dsPoststackInvalidateDisplayPreview();
+        if ([
+            "deepsky_poststack_apply_crop",
+            "deepsky_poststack_apply_gradient",
+            "deepsky_poststack_apply_dualband",
+        ].includes(command)) {
+            dsPoststackPsfAnalysis = null;
+        }
+        if (command !== "deepsky_poststack_layer_preview") {
+            dsStudioLayerPreviews = new Map();
+        }
+        if (!state?.layers?.available) dsStudioLayerTarget = "combined";
+        if (state?.source) {
+            dsPoststackSourceDescriptor = dsMergePoststackSourceDescriptor(
+                dsPoststackSourceDescriptor,
+                state.source,
+            );
+        }
+        const explicitTarget = ["object", "stars"].includes(String(req?.target || ""))
+            ? String(req.target)
+            : command === "deepsky_poststack_adjust_stars"
+                ? "stars"
+                : null;
+        dsPoststackPreviewMode = explicitTarget ? `layer-${explicitTarget}` : "current";
+        dsPoststackCurrentPreview = state.preview || dsPoststackCurrentPreview;
+        if (command.includes("crop")) await dsPoststackLoadSourcePreview(true);
+        if (token !== dsResultViewToken) return null;
+        dsPoststackShowingSource = false;
+        if (explicitTarget && state?.layers?.available) {
+            const layerResult = dsIsPoststackFixture()
+                ? {
+                    target: explicitTarget,
+                    preview: dsQaFixturePreviewUrl(),
+                    maskPreview: dsQaFixturePreviewUrl(),
+                    reconstructionError: 0,
+                    starFraction: 0.071,
+                }
+                : await invoke("deepsky_poststack_layer_preview", { target: explicitTarget });
+            if (token !== dsResultViewToken) return null;
+            dsStudioLayerTarget = explicitTarget;
+            dsStudioLayerPreviews.set(explicitTarget, layerResult);
+            dsPoststackCurrentPreview = layerResult.preview || dsPoststackCurrentPreview;
+            if (layerResult.preview) await dsSetResultImage(layerResult.preview, token, false);
+        } else if (state.preview) {
+            await dsSetResultImage(state.preview, token, command.includes("crop"));
+        }
+        dsUpdateHistogram();
+        if (!dsIsPoststackFixture()) {
+            try {
+                dsPoststackAnalysis = await invoke("deepsky_poststack_analyze");
+            } catch { /* análisis adaptativo no bloquea la operación principal */ }
+        }
+        dsPoststackRenderShell();
+        dsPoststackSyncInteractiveLayer();
+        return state;
+    } catch (error) {
+        showCustomAlert(tr("general.error", "Error"), String(error));
+        return null;
+    } finally {
+        if (button && button.isConnected) {
+            button.disabled = false;
+            button.textContent = previous;
+        }
+    }
+}
+
+async function dsActivateMilkyWayGeometry(descriptor, primaryPath) {
+    const loaded = await invoke("deepsky_poststack_load_master", {
+        req: { path: primaryPath },
+    });
+    dsPoststackState = loaded?.state;
+    dsPoststackSourceDescriptor = {
+        ...(loaded?.source || loaded?.state?.source || {}),
+        ...descriptor,
+        path: primaryPath,
+    };
+    dsResultBasePath = primaryPath;
+    dsPoststackSourcePreview = "";
+    dsPoststackCurrentPreview = loaded?.state?.preview || "";
+    dsPoststackPreviewMode = "current";
+    dsGradientExclusions = [];
+    dsGradientSamples = [];
+    dsGradientLastResult = null;
+    dsStudioPaletteGallery = null;
+    dsStudioAppliedPalette = null;
+    dsStudioAnnotation.result = null;
+    dsStudioAnnotation.error = "";
+    dsPoststackPsfAnalysis = null;
+    dsStudioLayerTarget = "combined";
+    dsStudioLayerPreviews = new Map();
+    if (dsPoststackCurrentPreview) {
+        const token = ++dsResultViewToken;
+        await dsSetResultImage(dsPoststackCurrentPreview, token, true);
+    }
+    try {
+        dsPoststackAnalysis = await invoke("deepsky_poststack_analyze");
+    } catch {
+        dsPoststackAnalysis = null;
+    }
+}
+
+async function dsRestoreMilkyWayRootGeometry(button) {
+    const root = dsPoststackSourceDescriptor?.milkyWayRoot;
+    const rootLayers = root?.layers || {};
+    const primaryPath = rootLayers.composite || rootLayers.sky;
+    if (!primaryPath) return false;
+    const previous = button?.textContent;
+    if (button) {
+        button.disabled = true;
+        button.textContent = tr("milkyway.editor_restoring_geometry", "Restaurando geometría…");
+    }
+    try {
+        await dsActivateMilkyWayGeometry({
+            ...dsPoststackSourceDescriptor,
+            path: primaryPath,
+            sourceReferences: Object.values(rootLayers),
+            milkyWayLayers: { ...rootLayers },
+            milkyWayRoot: root,
+            milkyWayGeometryId: root.geometryId,
+            milkyWayWcsGeometryId: root.wcsValid ? root.geometryId : null,
+            milkyWayCrop: null,
+            recipePath: root.recipePath,
+            wcsValid: !!root.wcsValid,
+        }, primaryPath);
+        dsCropViewBase = { x: 0, y: 0, width: 1, height: 1 };
+        dsCropRect = { x: 0.025, y: 0.025, width: 0.95, height: 0.95 };
+        dsPoststackRenderShell();
+        dsPoststackSyncInteractiveLayer();
+        return true;
+    } catch (error) {
+        showCustomAlert(tr("general.error", "Error"), normalizeBackendText(String(error)));
+        return false;
+    } finally {
+        if (button?.isConnected) {
+            button.disabled = false;
+            button.textContent = previous;
+        }
+    }
+}
+
+async function dsPoststackApplyMilkyWayCrop(button, options = {}) {
+    if (dsIsPoststackFixture()) return null;
+    if (options.full) {
+        if (dsPoststackSourceDescriptor?.milkyWayCrop) {
+            await dsRestoreMilkyWayRootGeometry(button);
+        } else {
+            dsCropViewBase = { x: 0, y: 0, width: 1, height: 1 };
+            dsCropRect = { x: 0, y: 0, width: 1, height: 1 };
+            dsPoststackRenderShell();
+            dsPoststackSyncInteractiveLayer();
+        }
+        return dsPoststackState;
+    }
+    const activeOperations = (dsPoststackState?.operations || []).filter(operation => operation !== "crop");
+    if (activeOperations.length) {
+        const proceed = await showCustomChoice(
+            tr("general.warning", "Aviso"),
+            tr(
+                "milkyway.editor_crop_resets_edits",
+                "El recorte sincronizado crea una nueva geometría lineal para Cielo, Suelo, Compuesto y mapas. Las revisiones de edición actuales no se copiarán; los originales y su receta permanecen intactos. ¿Continuar?",
+            ),
+        );
+        if (!proceed) return null;
+    }
+    const sourceWidth = Number(dsPoststackState?.width || 0);
+    const sourceHeight = Number(dsPoststackState?.height || 0);
+    let request;
+    try {
+        request = buildMilkyWayAtomicCropRequest(
+            dsPoststackSourceDescriptor?.milkyWayLayers,
+            dsPoststackCropPayload(false),
+            sourceWidth,
+            sourceHeight,
+        );
+    } catch (error) {
+        showCustomAlert(tr("general.error", "Error"), normalizeBackendText(String(error)));
+        return null;
+    }
+    const previous = button?.textContent;
+    if (button) {
+        button.disabled = true;
+        const productCount = Object.keys(dsPoststackSourceDescriptor?.milkyWayLayers || {}).length;
+        button.textContent = tr(
+            "milkyway.editor_cropping_layers",
+            `Recortando ${productCount} producto${productCount === 1 ? "" : "s"}…`,
+        );
+    }
+    try {
+        const cropped = await invoke("crop_milky_way_products", { request });
+        const descriptor = describeMilkyWayGeometryRevision(dsPoststackSourceDescriptor, cropped);
+        const primaryPath = milkyWayPrimaryPath(cropped);
+        if (!primaryPath) throw new Error("El recorte no publicó Cielo ni Compuesto");
+        await dsActivateMilkyWayGeometry(descriptor, primaryPath);
+        dsLastSessionResult = {
+            ...(dsLastSessionResult || {}),
+            milkyWayCrop: cropped,
+        };
+        dsCropViewBase = { x: 0, y: 0, width: 1, height: 1 };
+        dsCropRect = { x: 0, y: 0, width: 1, height: 1 };
+        dsPoststackRenderShell();
+        dsPoststackSyncInteractiveLayer();
+        return dsPoststackState;
+    } catch (error) {
+        showCustomAlert(tr("general.error", "Error"), normalizeBackendText(String(error)));
+        return null;
+    } finally {
+        if (button?.isConnected) {
+            button.disabled = false;
+            button.textContent = previous;
+        }
+    }
+}
+
+async function dsPoststackApplyCrop(button, options = {}) {
+    if (dsIsMilkyWayWorkflow() && !dsIsPoststackFixture()) {
+        return dsPoststackApplyMilkyWayCrop(button, options);
+    }
+    const state = await dsPoststackApplyCommand(
+        "deepsky_poststack_apply_crop",
+        dsPoststackCropPayload(!!options.full),
+        button,
+        tr("deepsky.editor_cropping", "Recortando todos los productos…"),
+    );
+    if (!state) return;
+    dsCropViewBase = dsPoststackCropBaseFromState();
+    dsCropRect = { x: 0, y: 0, width: 1, height: 1 };
+    dsPoststackRenderShell();
+    dsPoststackSyncInteractiveLayer();
+}
+
+async function dsPoststackApplyDualBand(button) {
+    await dsPoststackApplyCommand("deepsky_poststack_apply_dualband", {
+        palette: String(dsPoststackSettings.dualBandPalette),
+        profile: String(dsPoststackSettings.dualBandProfile),
+        oiiiGreenWeight: Number(dsPoststackSettings.dualBandOiii) / 100,
+        crosstalkSuppression: Number(dsPoststackSettings.dualBandCrosstalk) / 100,
+        neutralize: true,
+    }, button, tr("deepsky.editor_mapping_channels", "Separando Ha y OIII…"));
+}
+
+function dsStudioPaletteRequest(paletteId = null) {
+    const descriptor = dsPoststackEffectiveSourceDescriptor();
+    return {
+        ...(paletteId ? { paletteId } : {}),
+        haPaths: Array.isArray(descriptor.haPaths) ? descriptor.haPaths : [],
+        oiiiPaths: Array.isArray(descriptor.oiiiPaths) ? descriptor.oiiiPaths : [],
+        siiPaths: Array.isArray(descriptor.siiPaths) ? descriptor.siiPaths : [],
+        instrumentProfile: dsPoststackSettings.dualBandProfile || undefined,
+        paletteIds: [
+            "hooNatural",
+            "hooTeal",
+            "hooSoft",
+            "hooGold",
+            "sho",
+            "shoBalanced",
+            "hso",
+            "soo",
+        ],
+        register: true,
+        oiiiGreenWeight: Number(dsPoststackSettings.dualBandOiii) / 100,
+        crosstalkSuppression: Number(dsPoststackSettings.dualBandCrosstalk) / 100,
+        previewMaxEdge: 1120,
+    };
+}
+
+function dsStudioNeedsChannelMasters(source = classifyDeepSkySource(
+    dsPoststackEffectiveSourceDescriptor(),
+)) {
+    if (source.kind !== SOURCE_KINDS.MONO_NARROWBAND) return false;
+    const sources = source.independentComponentSources || {};
+    // HOO o SOO son las combinaciones mínimas con dos señales distintas.
+    // Una cabecera “Ha+OIII” sobre un solo archivo mono nunca cuenta dos veces.
+    const hasDistinctPair = [["HA", "OIII"], ["SII", "OIII"]].some(
+        ([left, right]) => (sources[left] || []).some(leftSource =>
+            (sources[right] || []).some(rightSource => rightSource !== leftSource)),
+    );
+    return !hasDistinctPair;
+}
+
+function dsOpenDeepSkyChannelCombiner() {
+    if (dsIsPoststackFixture()) {
+        showCustomAlert(
+            tr("deepsky.editor_add_channel_masters", "Añadir másteres de canal"),
+            tr(
+                "deepsky.editor_add_channel_masters_fixture",
+                "Fixture interactivo: aquí se abre el combinador LRGB/HOO/SHO. En la aplicación nativa podrás elegir másteres mono lineales sin modificar sus archivos fuente.",
+            ),
+        );
+        return;
+    }
+    const button = document.getElementById("btn-deepsky-combine-open");
+    if (button) {
+        dsPoststackClose();
+        button.click();
+        return;
+    }
+    showCustomAlert(
+        tr("deepsky.editor_add_channel_masters", "Añadir másteres de canal"),
+        tr(
+            "deepsky.editor_channel_combiner_unavailable",
+            "Publica primero el máster mono o vuelve a la vista de resultado para abrir el combinador LRGB/HOO/SHO.",
+        ),
+    );
+}
+
+async function dsStudioLoadPaletteGallery(button) {
+    if (dsStudioPaletteAutoLoading) return;
+    dsStudioPaletteAutoLoading = true;
+    dsStudioPaletteError = "";
+    const serial = ++dsStudioPaletteRequestSerial;
+    const previous = button?.textContent;
+    if (!button) dsPoststackRenderShell();
+    if (button) {
+        button.disabled = true;
+        button.textContent = tr("deepsky.editor_preparing_gallery", "Preparando galería…");
+    }
+    try {
+        const descriptor = dsPoststackEffectiveSourceDescriptor();
+        const source = classifyDeepSkySource(descriptor);
+        const request = dsStudioPaletteRequest();
+        if (
+            source.kind === SOURCE_KINDS.MULTI_FILTER_DUAL_BAND
+            && request.haPaths.length === 0
+            && request.oiiiPaths.length === 0
+            && request.siiPaths.length === 0
+        ) {
+            throw new Error(tr(
+                "deepsky.editor_missing_component_masters",
+                "La sesión fue identificada como multibanda, pero no publicó los másteres Ha/OIII/SII necesarios. Reintegra conservando componentes científicos.",
+            ));
+        }
+        let gallery;
+        if (dsIsPoststackFixture()) {
+            const preview = dsQaFixturePreviewUrl();
+            const ids = source.kind === SOURCE_KINDS.OSC_DUAL_BAND
+                ? ["hooNatural", "hooTeal", "hooSoft", "hooGold"]
+                : ["hooNatural", "hooTeal", "hooSoft", "hooGold", "sho", "shoBalanced", "hso", "soo"];
+            gallery = {
+                route: source.kind,
+                mastersImmutable: true,
+                recommendedPaletteId: ids.includes("sho") ? "sho" : "hooNatural",
+                oiiiReconciliation: source.kind === SOURCE_KINDS.MULTI_FILTER_DUAL_BAND
+                    ? { method: "fixture QA · normalización robusta", inputCount: 2 }
+                    : null,
+                candidates: ids.map((id, index) => ({
+                    id,
+                    label: ({
+                        hooNatural: "HOO natural",
+                        hooTeal: "HOO cyan",
+                        hooSoft: "HOO suave",
+                        hooGold: "HOO dorada",
+                        sho: "SHO · Hubble",
+                        shoBalanced: "SHO equilibrada",
+                        hso: "HSO",
+                        soo: "SOO",
+                    })[id],
+                    eligible: true,
+                    reason: "Fixture visual: la elegibilidad científica se valida en el motor nativo.",
+                    preview,
+                    scientificClass: index < 2 ? "dual-band interpretativa" : "narrowband interpretativa",
+                    intent: ({
+                        hooNatural: "Transición natural Ha/OIII",
+                        hooTeal: "Máxima separación cálido/frío",
+                        hooSoft: "Transiciones suaves y estrellas contenidas",
+                        hooGold: "Volumen Ha con contrapunto OIII",
+                        sho: "Asignación SHO clásica",
+                        shoBalanced: "SHO con transición SII/Ha continua",
+                        hso: "Ha conservado en rojo",
+                        soo: "Bicolor SII/OIII",
+                    })[id],
+                    score: Math.max(68, 94 - index * 3),
+                    scoreReasons: ["Fixture visual comparable", "Mismo STF y geometría"],
+                })),
+                limitations: ["Fixture visual: no acredita separación espectral ni registro real."],
+            };
+        } else {
+            gallery = source.kind === SOURCE_KINDS.OSC_DUAL_BAND
+                && request.haPaths.length === 0
+                && request.oiiiPaths.length === 0
+                ? await invoke("deepsky_studio_active_dualband_gallery", {
+                    request: {
+                        paletteIds: request.paletteIds,
+                        oiiiGreenWeight: request.oiiiGreenWeight,
+                        crosstalkSuppression: request.crosstalkSuppression,
+                        previewMaxEdge: request.previewMaxEdge,
+                    },
+                })
+                : await invoke("deepsky_studio_palette_gallery", { request });
+        }
+        if (serial !== dsStudioPaletteRequestSerial) return;
+        dsStudioPaletteGallery = gallery;
+        const recommended = gallery?.recommendedPaletteId;
+        if (recommended && gallery?.candidates?.some(candidate =>
+            candidate.id === recommended && candidate.eligible)) {
+            dsPoststackSettings.dualBandPalette = recommended;
+        }
+        if (
+            Number(gallery?.oiiiReconciliation?.inputCount || 0) > 1
+            && dsPoststackSourceDescriptor
+        ) {
+            dsPoststackSourceDescriptor = {
+                ...dsPoststackSourceDescriptor,
+                oiiiReconciled: true,
+                channelReconciliation: {
+                    ...(dsPoststackSourceDescriptor.channelReconciliation || {}),
+                    oiii: {
+                        status: "validated",
+                        ...gallery.oiiiReconciliation,
+                    },
+                },
+            };
+        }
+        dsStudioPaletteAutoLoading = false;
+        dsPoststackRenderShell();
+        const selected = gallery?.candidates?.find(candidate =>
+            candidate.id === dsPoststackSettings.dualBandPalette);
+        if (selected?.preview) await dsPoststackShowPreview("palette-preview", selected.preview);
+    } catch (error) {
+        dsStudioPaletteError = normalizeBackendText(String(error));
+        dsStudioPaletteAutoLoading = false;
+        if (button) showCustomAlert(tr("general.error", "Error"), dsStudioPaletteError);
+        dsPoststackRenderShell();
+        dsPoststackSyncInteractiveLayer();
+    } finally {
+        dsStudioPaletteAutoLoading = false;
+        if (button?.isConnected) {
+            button.disabled = false;
+            button.textContent = previous;
+        }
+    }
+}
+
+async function dsStudioApplyPalette(button) {
+    const paletteId = String(dsPoststackSettings.dualBandPalette || "");
+    const candidate = dsStudioPaletteGallery?.candidates?.find(item => item.id === paletteId);
+    if (!paletteId || !candidate || candidate.eligible === false) return;
+    const sourceKindBeforeApply = classifyDeepSkySource(
+        dsPoststackEffectiveSourceDescriptor(),
+    ).kind;
+    const previousActiveProduct = dsResultProducts.get(String(dsActiveProductId || ""));
+    const previousActiveLabel = previousActiveProduct
+        ? previousActiveProduct.sourceLabel
+            || dsProductDisplayBaseLabel(previousActiveProduct)
+        : dsStudioSourceLabel({ kind: sourceKindBeforeApply });
+    const previous = button?.textContent;
+    if (button) {
+        button.disabled = true;
+        button.textContent = tr("deepsky.editor_applying_palette", "Creando revisión…");
+    }
+    try {
+        // Every palette must be derived from the same immutable component source.
+        // Otherwise choosing a second card would remap the already remapped RGB
+        // result and the gallery would no longer be comparable.
+        if (dsStudioAppliedPalette) {
+            const preservedId = dsStudioAppliedPalette?.preservedProductId;
+            if (preservedId && !dsIsPoststackFixture()) {
+                await invoke("deepsky_select_product", { productId: String(preservedId) });
+                dsActiveProductId = String(preservedId);
+                dsPoststackState = await invoke("deepsky_poststack_state");
+            } else if (dsIsPoststackFixture()) {
+                dsPoststackState = dsPoststackFixtureState();
+            }
+        }
+        const result = dsIsPoststackFixture()
+            ? {
+                state: dsPoststackFixtureCommit("dualBandPalette", { req: { paletteId } }),
+                preview: candidate?.preview || dsQaFixturePreviewUrl(),
+                descriptor: {
+                    paletteId,
+                    inputFilesImmutable: true,
+                    quantitativeLineFlux: false,
+                },
+            }
+            : await invoke("deepsky_studio_apply_palette", {
+                request: dsStudioPaletteRequest(paletteId),
+            });
+        dsPoststackState = result.state;
+        dsStudioAppliedPalette = result.descriptor || { paletteId };
+        if (result.descriptor?.productId) {
+            const productId = String(result.descriptor.productId);
+            dsResultProducts.set(productId, {
+                id: productId,
+                product: "studio_palette",
+                previewPath: result.preview,
+                effectiveMethod: result.descriptor.paletteId,
+                paletteId: result.descriptor.paletteId,
+                route: result.descriptor.route,
+                sourceKind: sourceKindBeforeApply,
+                scientificClass: result.descriptor.scientificClass,
+                quantitativeLineFlux: result.descriptor.quantitativeLineFlux,
+                inputFilesImmutable: result.descriptor.inputFilesImmutable,
+                limitations: result.descriptor.limitations || [],
+                width: result.state?.width,
+                height: result.state?.height,
+                primary: false,
+                status: "ready",
+            });
+            if (result.descriptor?.preservedProductId) {
+                const preservedId = String(result.descriptor.preservedProductId);
+                if (!dsResultProducts.has(preservedId)) {
+                    dsResultProducts.set(preservedId, {
+                        id: preservedId,
+                        product: "preserved_source",
+                        sourceKind: sourceKindBeforeApply,
+                        sourceLabel: previousActiveLabel,
+                        previewPath: dsPoststackSourcePreview,
+                        effectiveMethod: "lossless_preserved_source",
+                        primary: false,
+                        status: "ready",
+                    });
+                }
+            }
+            dsSetPrimaryProduct(productId);
+            dsActiveProductId = productId;
+            dsSyncResultProductOptions();
+            const resultView = document.getElementById("ds-result-view");
+            if (resultView) resultView.value = `product-id:${productId}`;
+        }
+        dsPoststackCurrentPreview = result.preview || result.state?.preview || dsPoststackCurrentPreview;
+        dsPoststackPreviewMode = "current";
+        if (result.preview) {
+            const token = ++dsResultViewToken;
+            await dsSetResultImage(result.preview, token, true);
+        }
+        if (!dsIsPoststackFixture()) {
+            try {
+                dsPoststackAnalysis = await invoke("deepsky_poststack_analyze");
+            } catch { /* la revisión sigue siendo válida sin el resumen */ }
+        }
+        dsPoststackRenderShell();
+        dsPoststackSyncInteractiveLayer();
+    } catch (error) {
+        showCustomAlert(tr("general.error", "Error"), normalizeBackendText(String(error)));
+    } finally {
+        if (button?.isConnected) {
+            button.disabled = false;
+            button.textContent = previous;
+        }
+    }
+}
+
+async function dsStudioRestorePaletteSource(button) {
+    if (!dsStudioAppliedPalette) return;
+    const preservedId = dsStudioAppliedPalette?.preservedProductId;
+    if (!preservedId && !dsIsPoststackFixture()) return;
+    const previous = button?.textContent;
+    if (button) {
+        button.disabled = true;
+        button.textContent = tr("deepsky.editor_restoring_source", "Volviendo a la fuente…");
+    }
+    try {
+        if (dsIsPoststackFixture()) {
+            dsPoststackState = dsPoststackFixtureState();
+            dsPoststackCurrentPreview = dsPoststackSourcePreview || dsQaFixturePreviewUrl();
+        } else {
+            await invoke("deepsky_select_product", { productId: String(preservedId) });
+            dsActiveProductId = String(preservedId);
+            dsSetPrimaryProduct(preservedId);
+            dsSyncResultProductOptions();
+            const resultView = document.getElementById("ds-result-view");
+            if (resultView) resultView.value = `product-id:${preservedId}`;
+            dsPoststackState = await invoke("deepsky_poststack_state");
+            dsPoststackCurrentPreview = dsPoststackState?.preview || "";
+            dsPoststackSourcePreview = await invoke("deepsky_poststack_source_preview");
+            if (dsPoststackCurrentPreview) {
+                const token = ++dsResultViewToken;
+                await dsSetResultImage(dsPoststackCurrentPreview, token, true);
+            }
+            try {
+                dsPoststackAnalysis = await invoke("deepsky_poststack_analyze");
+            } catch { /* no bloquea volver al producto fuente */ }
+        }
+        dsStudioAppliedPalette = null;
+        dsPoststackPreviewMode = "current";
+        dsPoststackRenderShell();
+        dsPoststackSyncInteractiveLayer();
+    } catch (error) {
+        showCustomAlert(tr("general.error", "Error"), normalizeBackendText(String(error)));
+    } finally {
+        if (button?.isConnected) {
+            button.disabled = false;
+            button.textContent = previous;
+        }
+    }
+}
+
+async function dsPoststackApplyStretch(button) {
+    const target = ["object", "stars"].includes(dsStudioLayerTarget)
+        ? dsStudioLayerTarget
+        : "combined";
+    const explicitStretch = dsPoststackSettings.stretchValue == null
+        ? (target === "combined"
+            ? Number(dsPoststackAnalysis?.suggestedStretch?.stretch ?? 6)
+            : null)
+        : Number(dsPoststackSettings.stretchValue);
+    const explicitSymmetry = dsPoststackSettings.stretchSymmetry == null
+        ? (target === "combined" ? 0.12 : null)
+        : Number(dsPoststackSettings.stretchSymmetry) / 100;
+    const explicitLocal = dsPoststackSettings.stretchLocal == null
+        ? (target === "combined" ? 0.35 : null)
+        : Number(dsPoststackSettings.stretchLocal) / 100;
+    await dsPoststackApplyCommand("deepsky_poststack_apply_stretch", {
+        target,
+        preset: String(dsPoststackSettings.stretchPreset),
+        stretch: explicitStretch,
+        symmetry: explicitSymmetry,
+        localIntensity: explicitLocal,
+        linked: !!dsPoststackSettings.stretchLinked,
+    }, button, tr("deepsky.editor_stretching", "Aplicando GHS…"));
+}
+
+async function dsPoststackApplyCurves(button) {
+    await dsPoststackApplyCommand(
+        "deepsky_poststack_apply_curves",
+        dsStudioCurveRequest(),
+        button,
+        tr("deepsky.editor_applying_curves", "Aplicando curvas float32…"),
+    );
+}
+
+async function dsPoststackApplyDenoise(button) {
+    const target = ["object", "stars"].includes(dsStudioLayerTarget)
+        ? dsStudioLayerTarget
+        : "combined";
+    await dsPoststackApplyCommand("deepsky_poststack_apply_denoise", {
+        target,
+        strength: Number(dsPoststackSettings.denoiseStrength) / 100,
+        detailProtection: Number(dsPoststackSettings.denoiseDetail) / 100,
+        chromaStrength: Number(dsPoststackSettings.denoiseChroma) / 100,
+    }, button, tr("deepsky.editor_denoising", "Reduciendo ruido float32…"));
+}
+
+async function dsPoststackApplyDetail(button) {
+    const target = ["object", "stars"].includes(dsStudioLayerTarget)
+        ? dsStudioLayerTarget
+        : "combined";
+    await dsPoststackApplyCommand("deepsky_poststack_apply_detail", {
+        target,
+        amount: Number(dsPoststackSettings.detailAmount) / 100,
+        radius: Number(dsPoststackSettings.detailRadius),
+        starProtection: Number(dsPoststackSettings.detailStars) / 100,
+    }, button, tr("deepsky.editor_detailing", "Realzando detalle…"));
+}
+
+async function dsPoststackApplyFinish(button) {
+    const target = ["object", "stars"].includes(dsStudioLayerTarget)
+        ? dsStudioLayerTarget
+        : "combined";
+    await dsPoststackApplyCommand("deepsky_poststack_apply_finish", {
+        target,
+        saturation: Number(dsPoststackSettings.finishSaturation) / 100,
+        contrast: Number(dsPoststackSettings.finishContrast) / 100,
+        highlightProtection: Number(dsPoststackSettings.finishHighlights) / 100,
+    }, button, tr("deepsky.editor_finishing", "Aplicando acabado…"));
+}
+
+async function dsPoststackApplyDeconvolution(button) {
+    const preset = String(dsPoststackSettings.deconvPreset || "balanced");
+    const presetDefaults = {
+        soft: { iterations: 5, regularization: 0.12, deringing: 0.82 },
+        balanced: { iterations: 8, regularization: 0.08, deringing: 0.72 },
+        detail: { iterations: 14, regularization: 0.055, deringing: 0.62 },
+    }[preset] || {};
+    const target = ["object", "stars"].includes(dsStudioLayerTarget)
+        ? dsStudioLayerTarget
+        : "combined";
+    if (!dsPoststackPsfAnalysis && dsPoststackState?.layers?.psf) {
+        const psf = dsPoststackState.layers.psf;
+        const eligible = !!psf.measured
+            && Number(psf.starsUsed || 0) >= 6
+            && Number(psf.confidence || 0) >= 0.18;
+        dsPoststackPsfAnalysis = {
+            psf,
+            eligible,
+            reason: eligible
+                ? tr("deepsky.editor_psf_from_separation", "Se reutiliza la PSF medida al crear las capas; no se estima sobre una rama ya editada.")
+                : tr("deepsky.editor_psf_low_confidence", "La PSF guardada con las capas no tiene confianza suficiente para restauración automática."),
+        };
+    }
+    if (!dsPoststackPsfAnalysis) {
+        try {
+            dsPoststackPsfAnalysis = dsIsPoststackFixture()
+                ? {
+                    eligible: true,
+                    reason: "Fixture QA · PSF medida",
+                    psf: {
+                        fwhmX: 2.84,
+                        fwhmY: 2.62,
+                        theta: 0.03,
+                        beta: 2.7,
+                        starsUsed: 96,
+                        confidence: 0.91,
+                        measured: true,
+                    },
+                }
+                : await invoke("deepsky_poststack_analyze_psf");
+        } catch (error) {
+            showCustomAlert(
+                tr("deepsky.editor_psf_unavailable", "PSF no disponible"),
+                normalizeBackendText(String(error)),
+            );
+            return;
+        }
+    }
+    if (!dsPoststackPsfAnalysis?.eligible && dsStudioExperience !== "expert") {
+        showCustomAlert(
+            tr("deepsky.editor_restore_not_applied", "Restauración no aplicada"),
+            dsPoststackPsfAnalysis?.reason
+                || tr("deepsky.editor_psf_low_confidence", "No hay suficientes estrellas válidas para una restauración automática segura."),
+        );
+        return;
+    }
+    const manualConfirmed = !dsPoststackPsfAnalysis?.eligible
+        && dsStudioExperience === "expert"
+        && !!dsPoststackSettings.deconvManualConfirmed;
+    if (!dsPoststackPsfAnalysis?.eligible && !manualConfirmed) {
+        showCustomAlert(
+            tr("deepsky.editor_manual_psf_required", "Confirma la PSF manual"),
+            tr("deepsky.editor_manual_psf_required_body", "Introduce FWHM X/Y medidas sobre estrellas y activa la confirmación. Zenith no fingirá que una PSF estimada con baja confianza fue medida automáticamente."),
+        );
+        return;
+    }
+    const psf = manualConfirmed
+        ? {
+            ...(dsPoststackPsfAnalysis?.psf || {}),
+            fwhmX: Number(dsPoststackSettings.deconvManualFwhmX),
+            fwhmY: Number(dsPoststackSettings.deconvManualFwhmY),
+            starsUsed: 0,
+            confidence: 0,
+            measured: false,
+        }
+        : dsPoststackPsfAnalysis?.psf || dsPoststackState?.layers?.psf || null;
+    await dsPoststackApplyCommand("deepsky_poststack_apply_deconvolution", {
+        target,
+        psf,
+        manualConfirmed,
+        iterations: dsStudioExperience === "expert"
+            ? Number(dsPoststackSettings.deconvIterations)
+            : presetDefaults.iterations,
+        regularization: dsStudioExperience === "expert"
+            ? Number(dsPoststackSettings.deconvRegularization) / 100
+            : presetDefaults.regularization,
+        deringing: dsStudioExperience === "expert"
+            ? Number(dsPoststackSettings.deconvDeringing) / 100
+            : presetDefaults.deringing,
+        fluxConservation: true,
+    }, button, tr("deepsky.editor_restoring", "Midiendo PSF y restaurando…"));
+}
+
+async function dsPoststackSeparateStars(button) {
+    const state = await dsPoststackApplyCommand("deepsky_poststack_separate_stars", {
+        engine: "nativePsfMultiscale",
+        sensitivity: Number(dsPoststackSettings.starSensitivity) / 100,
+        scale: Number(dsPoststackSettings.starScale) / 100,
+        haloProtection: Number(dsPoststackSettings.starHaloProtection) / 100,
+        faintStarProtection: Number(dsPoststackSettings.starFaintProtection) / 100,
+        preserveResidual: true,
+    }, button, tr("deepsky.editor_separating_stars", "Analizando PSF y creando capas…"));
+    if (!state) return;
+    dsStudioLayerTarget = "combined";
+    dsStudioLayerPreviews = new Map();
+    await dsPoststackShowLayer("combined");
+}
+
+async function dsPoststackAdjustStars(button) {
+    const state = await dsPoststackApplyCommand("deepsky_poststack_adjust_stars", {
+        reduction: Number(dsPoststackSettings.starReduction) / 100,
+        saturation: Number(dsPoststackSettings.starSaturation) / 100,
+        haloSuppression: Number(dsPoststackSettings.starHaloSuppression) / 100,
+    }, button, tr("deepsky.editor_adjusting_stars", "Actualizando sólo Estrellas…"));
+    if (state) {
+        dsStudioLayerPreviews.delete("stars");
+        dsStudioLayerPreviews.delete("combined");
+        await dsPoststackShowLayer("stars");
+    }
+}
+
+async function dsPoststackRecombine(button) {
+    const state = await dsPoststackApplyCommand("deepsky_poststack_recombine", {
+        objectWeight: Number(dsPoststackSettings.layerObjectWeight) / 100,
+        starWeight: Number(dsPoststackSettings.layerStarWeight) / 100,
+        residualWeight: Number(dsPoststackSettings.layerResidualWeight) / 100,
+    }, button, tr("deepsky.editor_recombining", "Reconciliando capas…"));
+    if (state) {
+        dsStudioLayerPreviews.delete("combined");
+        await dsPoststackShowLayer("combined");
+    }
+}
+
+async function dsPoststackShowLayer(target) {
+    const normalized = target === "starless" ? "object" : String(target || "combined");
+    if (!dsPoststackState?.layers?.available) return;
+    try {
+        let result = dsStudioLayerPreviews.get(normalized);
+        if (!result) {
+            result = dsIsPoststackFixture()
+                ? {
+                    target: normalized,
+                    preview: dsQaFixturePreviewUrl(),
+                    maskPreview: dsQaFixturePreviewUrl(),
+                    reconstructionError: 0,
+                    starFraction: 0.071,
+                }
+                : await invoke("deepsky_poststack_layer_preview", { target: normalized });
+            dsStudioLayerPreviews.set(normalized, result);
+        }
+        // Residual comparte el panel diagnóstico con la máscara. Conservamos
+        // la vista residual, pero no dejamos el roving-tab sin selección.
+        dsStudioLayerTarget = normalized === "residual" ? "mask" : normalized;
+        const preview = normalized === "mask" && result.maskPreview
+            ? result.maskPreview
+            : result.preview;
+        await dsPoststackShowPreview(`layer-${normalized}`, preview);
+    } catch (error) {
+        showCustomAlert(
+            tr("deepsky.view_unavailable", "Vista no disponible"),
+            normalizeBackendText(String(error)),
+        );
+    }
+}
+
+async function dsChooseStandaloneMaster() {
+    const path = await openDialog({
+        multiple: false,
+        directory: false,
+        title: tr("deepsky.editor_choose_master", "Abrir máster lineal de cielo profundo"),
+        filters: [{
+            name: tr("deepsky.editor_linear_master", "Máster lineal FITS/TIFF"),
+            extensions: ["fits", "fit", "fts", "tif", "tiff"],
+        }],
+    });
+    if (!path) return false;
+    if (dsPoststackState && !dsIsPoststackFixture()) {
+        const confirmed = await showCustomChoice(
+            tr("general.warning", "Aviso"),
+            tr(
+                "deepsky.editor_confirm_replace_session",
+                "Abrir otro máster reemplazará la sesión y sus productos navegables en memoria. Los FITS/TIFF existentes no se borrarán ni se modificarán. ¿Continuar?",
+            ),
+        );
+        if (!confirmed) return false;
+    }
+    if (/\.tiff?$/i.test(String(path))) {
+        const confirmed = await showCustomChoice(
+            tr("general.warning", "Aviso"),
+            tr(
+                "deepsky.editor_confirm_linear_tiff",
+                "Confirma que este TIFF conserva datos lineales de 16/32 bits y procede de un máster científico. Zenith detectará señales conocidas de estirado, pero un TIFF sin metadatos no permite demostrar matemáticamente su linealidad.",
+            ),
+        );
+        if (!confirmed) return false;
+    }
+    try {
+        const loaded = await invoke("deepsky_poststack_load_master", {
+            req: { path: String(path) },
+        });
+        dsPoststackState = loaded?.state;
+        dsPoststackSourceDescriptor = loaded?.source || loaded?.state?.source || {
+            path: String(path),
+            sourceReferences: [String(path)],
+        };
+        dsResultBasePath = String(path);
+        dsLastSessionResult = null;
+        dsResultProducts = new Map();
+        dsActiveProductId = null;
+        dsPoststackSourcePreview = "";
+        dsPoststackCurrentPreview = loaded?.state?.preview || "";
+        dsPoststackPreviewMode = "current";
+        dsPoststackStep = 1;
+        dsGradientExclusions = [];
+        dsGradientSamples = [];
+        dsGradientLastResult = null;
+        dsStudioPaletteGallery = null;
+        dsStudioAppliedPalette = null;
+        dsPoststackPsfAnalysis = null;
+        dsStudioLayerTarget = "combined";
+        dsStudioLayerPreviews = new Map();
+        delete document.body.dataset.dsPoststackFixture;
+        dsEnterResultMode();
+        if (dsPoststackCurrentPreview) {
+            const token = ++dsResultViewToken;
+            await dsSetResultImage(dsPoststackCurrentPreview, token, true);
+        }
+        await dsPoststackOpen();
+        return true;
+    } catch (error) {
+        showCustomAlert(
+            tr("general.error", "Error"),
+            normalizeBackendText(String(error)),
+        );
+        return false;
+    }
+}
+
+function dsMilkyWayResultPath(result, key) {
+    return resolveMilkyWayResultPath(result, key);
+}
+
+async function dsOpenMilkyWayResultInEditor(result) {
+    const fixturePreview = "/benchmarks/design-references/milky-way-nightscape-fixture.png";
+    if (result?.fixture) {
+        dsOpenPoststackFixture(1);
+        dsPoststackSourceDescriptor = {
+            ...dsPoststackSourceDescriptor,
+            workflow: "milky_way",
+            sourceType: "broadband_rgb",
+            captureMode: "milky_way",
+            channels: 3,
+            components: ["R", "G", "B"],
+            wcsValid: false,
+            milkyWayGeometryId: "milky-way-fixture-geometry",
+            milkyWayWcsGeometryId: null,
+            recipePath: "fixture://milky-way/recipe.json",
+            milkyWayLayers: {
+                sky: fixturePreview,
+                ground: fixturePreview,
+                composite: fixturePreview,
+                mask: fixturePreview,
+                skyVariance: fixturePreview,
+                groundVariance: fixturePreview,
+                skyCoverage: fixturePreview,
+                groundCoverage: fixturePreview,
+                skyRejection: fixturePreview,
+                groundRejection: fixturePreview,
+            },
+        };
+        dsPoststackSourcePreview = fixturePreview;
+        dsPoststackCurrentPreview = fixturePreview;
+        dsPoststackRenderShell();
+        await dsPoststackHydrateComparator(true);
+        return true;
+    }
+    const primaryPath = milkyWayPrimaryPath(result);
+    if (!primaryPath) {
+        await showCustomAlert(
+            tr("general.error", "Error"),
+            tr("milkyway.editor_missing_primary", "El motor no publicó ni Compuesto ni Cielo. Los demás mapas se conservaron, pero no existe una imagen científica que Studio pueda abrir."),
+        );
+        return false;
+    }
+    try {
+        const loaded = await invoke("deepsky_poststack_load_master", {
+            req: { path: primaryPath },
+        });
+        const layers = milkyWayLayerPaths(result);
+        const loadedChannels = Number(loaded?.state?.channels || 3);
+        const milkyWaySourceType = loadedChannels === 1 ? "mono" : "broadband_rgb";
+        const milkyWayComponents = loadedChannels === 1 ? ["L"] : ["R", "G", "B"];
+        dsPoststackState = loaded?.state;
+        dsPoststackSourceDescriptor = {
+            ...(loaded?.source || loaded?.state?.source || {}),
+            workflow: "milky_way",
+            sourceType: milkyWaySourceType,
+            captureMode: "milky_way",
+            channels: loadedChannels,
+            components: milkyWayComponents,
+            path: primaryPath,
+            sourceReferences: Object.values(layers),
+            milkyWayLayers: layers,
+            milkyWayRoot: {
+                layers: { ...layers },
+                geometryId: result?.geometryId || result?.geometry_id || "milky-way-source-geometry",
+                wcsValid: result?.wcsPreserved ?? result?.wcs_preserved ?? !!loaded?.state?.astrometry,
+                recipePath: dsMilkyWayResultPath(result, "recipe") || undefined,
+            },
+            milkyWayGeometryId: result?.geometryId || result?.geometry_id || "milky-way-source-geometry",
+            milkyWayWcsGeometryId: (result?.wcsPreserved ?? result?.wcs_preserved ?? !!loaded?.state?.astrometry)
+                ? (result?.geometryId || result?.geometry_id || "milky-way-source-geometry")
+                : null,
+            recipePath: dsMilkyWayResultPath(result, "recipe") || undefined,
+            wcsValid: result?.wcsPreserved ?? result?.wcs_preserved ?? !!loaded?.state?.astrometry,
+        };
+        dsResultBasePath = primaryPath;
+        dsLastSessionResult = { milkyWay: result };
+        dsResultProducts = new Map();
+        dsActiveProductId = null;
+        dsPoststackSourcePreview = "";
+        dsPoststackCurrentPreview = loaded?.state?.preview || "";
+        dsPoststackPreviewMode = "current";
+        dsPoststackStep = 1;
+        dsGradientExclusions = [];
+        dsGradientSamples = [];
+        dsGradientLastResult = null;
+        dsStudioPaletteGallery = null;
+        dsStudioAppliedPalette = null;
+        dsPoststackPsfAnalysis = null;
+        dsStudioLayerTarget = "combined";
+        dsStudioLayerPreviews = new Map();
+        delete document.body.dataset.dsPoststackFixture;
+        dsEnterResultMode();
+        if (dsPoststackCurrentPreview) {
+            const token = ++dsResultViewToken;
+            await dsSetResultImage(dsPoststackCurrentPreview, token, true);
+        }
+        return await dsPoststackOpen();
+    } catch (error) {
+        await showCustomAlert(
+            tr("general.error", "Error"),
+            normalizeBackendText(String(error)),
+        );
+        return false;
+    }
+}
+
+function dsClearPoststackFrontendSession() {
+    dsPoststackState = null;
+    dsPoststackAnalysis = null;
+    dsPoststackSourceDescriptor = null;
+    dsPoststackSourcePreview = "";
+    dsPoststackCurrentPreview = "";
+    dsPoststackInvalidateDisplayPreview();
+    dsPoststackPreviewMode = "current";
+    dsGradientExclusions = [];
+    dsGradientSamples = [];
+    dsGradientLastResult = null;
+    dsStudioPaletteGallery = null;
+    dsStudioAppliedPalette = null;
+    dsPoststackPsfAnalysis = null;
+    dsStudioLayerTarget = "combined";
+    dsStudioLayerPreviews = new Map();
+    dsResultProducts = new Map();
+    dsActiveProductId = null;
+    dsLastSessionResult = null;
+}
+
+async function dsOpenDeepSkyEditorEntry() {
+    if (document.body.dataset.dsPoststackFixture === "1") {
+        dsOpenPoststackFixture(dsPoststackStep || 1);
+        return;
+    }
+    if (dsPoststackState) {
+        const opened = await dsPoststackOpen();
+        if (opened) return;
+        if (dsPoststackState) return;
+    }
+    await dsChooseStandaloneMaster();
+}
+
+async function dsPoststackOpen() {
+    dsPoststackSourcePreview = "";
+    dsPoststackPreviewMode = "current";
+    dsPoststackInvalidateDisplayPreview();
+    const [stateResult, analysisResult, sourceResult] = await Promise.allSettled([
+        invoke("deepsky_poststack_state"),
+        invoke("deepsky_poststack_analyze"),
+        document.body.dataset.dsPoststackFixture === "1"
+            ? Promise.resolve(dsQaFixturePreviewUrl())
+            : invoke("deepsky_poststack_source_preview"),
+    ]);
+    if (stateResult.status === "fulfilled") {
+        dsPoststackState = stateResult.value;
+        if (stateResult.value?.source) {
+            dsPoststackSourceDescriptor = dsMergePoststackSourceDescriptor(
+                dsPoststackSourceDescriptor,
+                stateResult.value.source,
+            );
+        }
+        dsPoststackCurrentPreview = stateResult.value?.preview || dsPoststackCurrentPreview;
+        dsCropViewBase = dsPoststackCropBaseFromState();
+        dsCropRect = { x: 0, y: 0, width: 1, height: 1 };
+    } else {
+        const reason = normalizeBackendText(String(stateResult.reason || ""));
+        log("WARN", `Editor de cielo profundo: ${reason}`);
+        if (document.body.dataset.dsPoststackFixture !== "1") {
+            if (/no hay (?:un )?(?:máster|master|resultado)|sin (?:máster|master|resultado) activo/i.test(reason)) {
+                dsClearPoststackFrontendSession();
+                dsDismissPoststackWorkspace();
+            } else {
+                showCustomAlert(
+                    tr("deepsky.editor_title", "Editor de Cielo Profundo"),
+                    tr(
+                        "deepsky.editor_state_unavailable",
+                        "No se pudo validar la sesión activa. El máster no se modificó; reintenta antes de abrir otro archivo.",
+                    ) + `\n\n${reason}`,
+                );
+            }
+            return false;
+        }
+    }
+    if (analysisResult.status === "fulfilled") dsPoststackAnalysis = analysisResult.value;
+    if (sourceResult.status === "fulfilled") dsPoststackSourcePreview = sourceResult.value;
+    await dsPoststackRefreshDisplayPreview({ fitView: true, render: false });
+    document.body.classList.add("ds-poststack-workspace");
+    document.getElementById("zenith-guide-panel")?.setAttribute("aria-hidden", "true");
+    const editor = dsPoststackRenderShell();
+    editor.hidden = false;
+    dsPoststackSyncInteractiveLayer();
+    editor.querySelector(".ds-editor-panel")?.focus();
+    return true;
+}
+
+function dsDismissPoststackWorkspace() {
+    const editor = document.getElementById("ds-poststack-editor");
+    if (editor) editor.hidden = true;
+    document.body.classList.remove("ds-poststack-workspace");
+    document.getElementById("zenith-guide-panel")?.setAttribute("aria-hidden", "false");
+    document.getElementById("ds-gradient-mask-layer")?.remove();
+    document.getElementById("ds-gradient-exclusions-layer")?.remove();
+    document.getElementById("ds-crop-layer")?.remove();
+}
+
+function dsPoststackClose() {
+    dsDismissPoststackWorkspace();
+    if (document.body.dataset.dsResult === "1") {
+        dsShowStretchBar();
+        void dsShowResultView("master");
+        document.getElementById("ds-result-master")?.focus({ preventScroll: true });
+    }
+}
+
+async function dsPoststackMove(command) {
+    const token = ++dsResultViewToken;
+    try {
+        let state;
+        if (dsIsPoststackFixture()) {
+            if (command === "deepsky_poststack_undo") {
+                dsPoststackFixtureCursor = Math.max(0, dsPoststackFixtureCursor - 1);
+            } else if (command === "deepsky_poststack_redo") {
+                dsPoststackFixtureCursor = Math.min(
+                    dsPoststackFixtureOperations.length,
+                    dsPoststackFixtureCursor + 1,
+                );
+            } else if (command === "deepsky_poststack_reset") {
+                dsPoststackFixtureCursor = 0;
+            }
+            state = dsPoststackFixtureState();
+        } else {
+            state = await invoke(command);
+        }
+        if (token !== dsResultViewToken) return;
+        dsPoststackState = state;
+        dsPoststackInvalidateDisplayPreview();
+        dsStudioLayerPreviews = new Map();
+        if (!state?.layers?.available) dsStudioLayerTarget = "combined";
+        dsPoststackPreviewMode = "current";
+        dsPoststackCurrentPreview = state.preview || dsPoststackCurrentPreview;
+        await dsPoststackLoadSourcePreview(true);
+        if (token !== dsResultViewToken) return;
+        dsPoststackShowingSource = false;
+        if (state.preview) await dsSetResultImage(state.preview, token, false);
+        dsCropViewBase = dsPoststackCropBaseFromState();
+        dsCropRect = { x: 0, y: 0, width: 1, height: 1 };
+        dsUpdateHistogram();
+        dsPoststackRenderShell();
+        dsPoststackSyncInteractiveLayer();
+    } catch (error) {
+        showCustomAlert(tr("general.error", "Error"), String(error));
+    }
+}
+
+async function dsPoststackToggleSource() {
+    const token = ++dsResultViewToken;
+    try {
+        dsPoststackShowingSource = !dsPoststackShowingSource;
+        const preview = dsIsPoststackFixture()
+            ? (dsPoststackShowingSource
+                ? dsQaFixturePreviewUrl()
+                : dsPoststackFixtureState().preview)
+            : dsPoststackShowingSource
+                ? await invoke("deepsky_poststack_source_preview")
+                : (await invoke("deepsky_poststack_state")).preview;
+        if (token !== dsResultViewToken) return;
+        if (preview) await dsSetResultImage(preview, token, false);
+        dsPoststackRenderShell();
+        dsPoststackSyncInteractiveLayer();
+    } catch (error) {
+        dsPoststackShowingSource = false;
+        showCustomAlert(tr("general.error", "Error"), String(error));
+    }
+}
+
+function dsBeginGradientMask() {
+    const interactiveImage = dsPoststackInteractiveImage();
+    if (!interactiveImage?.naturalWidth) return;
+    document.getElementById("ds-gradient-mask-layer")?.remove();
+    const imageRect = dsImageVisibleContentRect(interactiveImage);
+    const visible = {
+        left: Math.max(0, imageRect.left),
+        top: Math.max(0, imageRect.top),
+        right: Math.min(window.innerWidth, imageRect.right),
+        bottom: Math.min(window.innerHeight, imageRect.bottom),
+    };
+    if (visible.right - visible.left < 40 || visible.bottom - visible.top < 40) return;
+    const layer = document.createElement("div");
+    layer.id = "ds-gradient-mask-layer";
+    layer.style.left = `${visible.left}px`;
+    layer.style.top = `${visible.top}px`;
+    layer.style.width = `${visible.right - visible.left}px`;
+    layer.style.height = `${visible.bottom - visible.top}px`;
+    layer.setAttribute("aria-label", tr("deepsky.editor_mask_drag", "Arrastra sobre nebulosa o galaxia para protegerla"));
+    document.body.appendChild(layer);
+    let start = null;
+    let selection = null;
+    layer.addEventListener("pointerdown", event => {
+        start = { x: event.clientX, y: event.clientY };
+        selection = document.createElement("div");
+        selection.className = "ds-gradient-selection";
+        layer.appendChild(selection);
+        layer.setPointerCapture(event.pointerId);
+    });
+    layer.addEventListener("pointermove", event => {
+        if (!start || !selection) return;
+        const x0 = Math.min(start.x, event.clientX) - visible.left;
+        const y0 = Math.min(start.y, event.clientY) - visible.top;
+        const x1 = Math.max(start.x, event.clientX) - visible.left;
+        const y1 = Math.max(start.y, event.clientY) - visible.top;
+        Object.assign(selection.style, { left: `${x0}px`, top: `${y0}px`, width: `${x1 - x0}px`, height: `${y1 - y0}px` });
+    });
+    layer.addEventListener("pointerup", event => {
+        if (!start) return layer.remove();
+        const x0 = Math.max(visible.left, Math.min(start.x, event.clientX));
+        const y0 = Math.max(visible.top, Math.min(start.y, event.clientY));
+        const x1 = Math.min(visible.right, Math.max(start.x, event.clientX));
+        const y1 = Math.min(visible.bottom, Math.max(start.y, event.clientY));
+        const width = visible.right - visible.left;
+        const height = visible.bottom - visible.top;
+        if (x1 - x0 >= 8 && y1 - y0 >= 8) {
+            dsGradientExclusions.push({
+                x: (x0 - imageRect.left) / imageRect.width,
+                y: (y0 - imageRect.top) / imageRect.height,
+                width: (x1 - x0) / imageRect.width,
+                height: (y1 - y0) / imageRect.height,
+            });
+        }
+        layer.remove();
+        dsPoststackRenderShell();
+        dsPoststackSyncInteractiveLayer();
+    });
+}
+
+async function dsPoststackApplyGradient(button) {
+    const editor = document.getElementById("ds-poststack-editor");
+    const previous = button?.textContent;
+    if (button) { button.disabled = true; button.textContent = tr("deepsky.editor_calculating", "Calculando…"); }
+    try {
+        const req = {
+            mode: String(dsPoststackSettings.gradientMode || "auto"),
+            protectExtendedObjects: !!dsPoststackSettings.gradientProtect,
+            chromatic: !!dsPoststackSettings.gradientChromatic,
+            sensitivity: Number(dsPoststackSettings.gradientSensitivity) / 100,
+            degree: Math.max(1, Math.min(4, Number(dsPoststackSettings.gradientDegree) || 2)),
+            samples: dsPoststackSettings.gradientMode === "samples"
+                ? dsGradientSamples.map(sample => ({
+                    x: Number(sample.x),
+                    y: Number(sample.y),
+                    radius: Number(sample.radius || dsPoststackSettings.gradientSampleRadius || 0.025),
+                    enabled: sample.enabled !== false && !dsGradientPointExcluded(sample),
+                    weight: Number(sample.weight || 1),
+                }))
+                : [],
+            allowUnstable: !!dsPoststackSettings.gradientAllowUnstable,
+            exclusionRects: dsGradientExclusions,
+        };
+        const result = dsIsPoststackFixture()
+            ? {
+                state: dsPoststackFixtureCommit("gradient", { req }),
+                modelPreview: dsQaFixturePreviewUrl(),
+                residualPreview: dsQaFixturePreviewUrl(),
+                overfitWarning: null,
+                splitHalfRatio: 0.44,
+                protectedPercent: 18.7,
+            }
+            : await invoke("deepsky_poststack_apply_gradient", { req });
+        dsGradientLastResult = result;
+        dsPoststackState = result.state;
+        dsPoststackInvalidateDisplayPreview();
+        dsPoststackPreviewMode = "current";
+        dsPoststackCurrentPreview = result.state.preview || dsPoststackCurrentPreview;
+        const interactiveImage = dsPoststackInteractiveImage();
+        if (interactiveImage && result.residualPreview) {
+            await setImageAndWait(interactiveImage, result.residualPreview, false);
+        }
+        dsUpdateHistogram();
+    } catch (error) {
+        showCustomAlert(tr("general.error", "Error"), String(error));
+    } finally {
+        if (button) { button.disabled = false; button.textContent = previous; }
+        dsPoststackRenderShell();
+        dsPoststackSyncInteractiveLayer();
+    }
+}
+
+function dsPoststackWorkDir() {
+    if (!dsResultBasePath) return undefined;
+    const value = String(dsResultBasePath).replace(/[\\/]+$/, "");
+    const leaf = value.split(/[\\/]/).at(-1) || "";
+    const scientificFile = /\.(?:fit|fits|fts|tif|tiff|xisf|png|jpe?g)$/i.test(leaf);
+    return scientificFile ? value.replace(/[\\/][^\\/]+$/, "") : value;
+}
+
+function dsStudioAnnotationBackendStyle(style = dsStudioAnnotation.style) {
+    return ({
+        zenithAtlas: "atlas",
+        zenithSurvey: "survey",
+        zenithFocus: "focus",
+        zenithMinimal: "minimal",
+    })[style] || "atlas";
+}
+
+function dsStudioAnnotationRequest({ allowOnline = dsStudioAnnotation.allowOnline } = {}) {
+    return {
+        style: dsStudioAnnotationBackendStyle(),
+        allowOnline: !!allowOnline,
+        includeCatalog: dsStudioAnnotation.includeCatalog !== false,
+        includeGrid: dsStudioAnnotation.showGrid !== false,
+        workDir: dsPoststackWorkDir(),
+        maxRows: 240,
+        maxPreviewEdge: 1600,
+        maxLabels: Math.max(12, Math.min(240, Math.round(Number(dsStudioAnnotation.maxObjects) || 120))),
+        refreshCache: !!allowOnline,
+    };
+}
+
+async function dsStudioFixtureAnnotation(request) {
+    const source = dsQaFixturePreviewUrl();
+    const image = new Image();
+    image.decoding = "async";
+    image.src = source;
+    await new Promise((resolve, reject) => {
+        image.onload = resolve;
+        image.onerror = () => reject(new Error("No se pudo cargar la imagen de QA para anotar."));
+    });
+    const factor = Math.min(1, 1400 / Math.max(image.naturalWidth, image.naturalHeight));
+    const width = Math.max(1, Math.round(image.naturalWidth * factor));
+    const height = Math.max(1, Math.round(image.naturalHeight * factor));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    context.drawImage(image, 0, 0, width, height);
+    const style = String(request.style || "atlas");
+    const colors = style === "survey"
+        ? { grid: "rgba(34,211,238,.42)", major: "#fb7185", minor: "#22d3ee", text: "#ecfeff" }
+        : style === "focus"
+            ? { grid: "rgba(196,181,253,.20)", major: "#f0abfc", minor: "#c4b5fd", text: "#faf5ff" }
+            : style === "minimal"
+                ? { grid: "rgba(255,255,255,0)", major: "#f8fafc", minor: "#d8b4fe", text: "#f8fafc" }
+                : { grid: "rgba(148,163,184,.38)", major: "#fda4af", minor: "#67e8f9", text: "#f8fafc" };
+    context.lineWidth = Math.max(1, width / 1200);
+    if (request.includeGrid && style !== "minimal") {
+        context.strokeStyle = colors.grid;
+        context.fillStyle = "rgba(226,232,240,.72)";
+        context.font = `${Math.max(11, width / 88)}px ui-monospace, monospace`;
+        for (let column = 1; column < 6; column += 1) {
+            const x = (column / 6) * width;
+            context.beginPath();
+            context.moveTo(x, 0);
+            context.lineTo(x, height);
+            context.stroke();
+            context.fillText(`${5 + column}h`, x + 5, height - 10);
+        }
+        for (let row = 1; row < 5; row += 1) {
+            const y = (row / 5) * height;
+            context.beginPath();
+            context.moveTo(0, y);
+            context.lineTo(width, y);
+            context.stroke();
+            context.fillText(`${-8 + row}°`, 7, y - 6);
+        }
+    }
+    const allObjects = [
+        { mainId: "NGC 6357", label: "NGC 6357 · War and Peace", x: .67, y: .58, radius: .105, type: "HII" },
+        { mainId: "NGC 6334", label: "NGC 6334 · Cat's Paw", x: .31, y: .38, radius: .075, type: "HII" },
+        { mainId: "Pismis 24", label: "Pismis 24", x: .64, y: .47, radius: .025, type: "Cl*" },
+        { mainId: "G353.2+0.9", label: "G353.2+0.9", x: .78, y: .72, radius: .02, type: "ISM" },
+        { mainId: "ESO 392-4", label: "ESO 392-4", x: .18, y: .68, radius: .018, type: "G" },
+    ];
+    const visible = style === "minimal"
+        ? allObjects.slice(0, 2)
+        : style === "focus"
+            ? allObjects.slice(0, 3)
+            : allObjects;
+    context.font = `700 ${Math.max(12, width / 74)}px Inter, system-ui, sans-serif`;
+    context.textBaseline = "middle";
+    const objects = visible.map((object, index) => {
+        const x = object.x * width;
+        const y = object.y * height;
+        const radius = object.radius * Math.min(width, height);
+        const color = index < 2 ? colors.major : colors.minor;
+        context.strokeStyle = color;
+        context.lineWidth = index < 2 ? 2 : 1.25;
+        context.beginPath();
+        context.arc(x, y, radius, 0, Math.PI * 2);
+        context.stroke();
+        const labelX = Math.min(width - 190, x + radius + 9);
+        const labelY = Math.max(18, y - radius * .35);
+        const metrics = context.measureText(object.label);
+        context.fillStyle = "rgba(2,6,23,.78)";
+        context.fillRect(labelX - 5, labelY - 11, metrics.width + 10, 22);
+        context.fillStyle = index < 2 ? color : colors.text;
+        context.fillText(object.label, labelX, labelY);
+        return {
+            mainId: object.mainId,
+            label: object.label,
+            raDeg: 262.6 + index * .08,
+            decDeg: -34.0 + index * .11,
+            objectType: object.type,
+            objectClass: index < 2 ? "nebula" : "catalog",
+            majorAxisArcmin: radius / width * 120,
+            minorAxisArcmin: radius / width * 100,
+            x,
+            y,
+            radiusPx: radius,
+            labelVisible: true,
+        };
+    });
+    return {
+        resultId: `fixture-annotation-${style}`,
+        sourceWidth: image.naturalWidth,
+        sourceHeight: image.naturalHeight,
+        previewWidth: width,
+        previewHeight: height,
+        style,
+        styleId: dsStudioAnnotation.style,
+        compositedPreview: canvas.toDataURL("image/png"),
+        transparentOverlay: canvas.toDataURL("image/png"),
+        objects,
+        primitives: [],
+        diagnostics: {
+            schemaVersion: 1,
+            resultId: `fixture-annotation-${style}`,
+            resultGeneration: 1,
+            wcsSource: "Fixture QA · índice local",
+            wcsRmsPx: 0.42,
+            styleId: dsStudioAnnotation.style,
+            catalogSource: "Fixture visual",
+            cachePath: "",
+            cacheHit: true,
+            onlineAttempted: false,
+            queryFingerprint: "fixture",
+            responseRows: objects.length,
+            usefulRows: objects.length,
+            projectedRows: objects.length,
+            labelsDrawn: objects.length,
+            labelsDecluttered: 0,
+            elapsedMs: 12,
+            warnings: ["Fixture visual: no acredita proyección de catálogo real."],
+            attribution: "Zenith Astro Stacker · fixture QA",
+        },
+    };
+}
+
+function dsStudioAnnotationError(error) {
+    if (error && typeof error === "object" && error.message) return String(error.message);
+    const raw = String(error || "");
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+        try {
+            const parsed = JSON.parse(raw.slice(start, end + 1));
+            if (parsed?.message) {
+                return [parsed.message, parsed.suggestedAction].filter(Boolean).join(" ");
+            }
+        } catch { /* conserva el mensaje del runtime */ }
+    }
+    return normalizeBackendText(raw);
+}
+
+async function dsStudioGenerateAnnotations(button) {
+    if (dsStudioAnnotation.busy) return;
+    if (!dsPoststackState?.astrometry) {
+        dsPoststackStep = 3;
+        dsPoststackRenderShell();
+        return;
+    }
+    if (dsIsMilkyWayWorkflow()) {
+        const geometryId = dsPoststackSourceDescriptor?.milkyWayGeometryId
+            || "milky-way-source-geometry";
+        if (dsPoststackSourceDescriptor?.milkyWayWcsGeometryId !== geometryId) {
+            dsAstrometryUi = {
+                busy: false,
+                online: false,
+                error: `El WCS no corresponde a la geometría compuesta ${geometryId}. Resuelve Astrometría antes de anotar.`,
+            };
+            dsPoststackStep = 3;
+            dsPoststackRenderShell();
+            return;
+        }
+    }
+    const previous = button?.textContent;
+    dsStudioAnnotation.busy = true;
+    dsStudioAnnotation.error = "";
+    if (button) {
+        button.disabled = true;
+        button.textContent = tr("deepsky.editor_annotation_generating", "Proyectando catálogo…");
+    }
+    try {
+        const request = dsStudioAnnotationRequest();
+        const result = dsIsPoststackFixture()
+            ? await dsStudioFixtureAnnotation(request)
+            : await invoke("deepsky_annotations_preview", { request });
+        const identifiedResult = attachMilkyWayOutputIdentity(
+            result,
+            dsPoststackSourceDescriptor || {},
+        );
+        dsStudioAnnotation.result = identifiedResult;
+        dsStudioAnnotation.allowOnline = false;
+        dsPoststackPreviewMode = "annotations";
+        dsPoststackCurrentPreview = identifiedResult.compositedPreview || dsPoststackCurrentPreview;
+        if (identifiedResult.compositedPreview) {
+            const token = ++dsResultViewToken;
+            await dsSetResultImage(identifiedResult.compositedPreview, token, false);
+        }
+    } catch (error) {
+        dsStudioAnnotation.error = dsStudioAnnotationError(error);
+    } finally {
+        dsStudioAnnotation.busy = false;
+        dsPoststackRenderShell();
+        dsPoststackSyncInteractiveLayer();
+        if (button?.isConnected) {
+            button.disabled = false;
+            button.textContent = previous;
+        }
+    }
+}
+
+async function dsStudioExportAnnotations(composited, button) {
+    const annotation = dsStudioAnnotation.result;
+    if (!annotation) return;
+    if (dsIsPoststackFixture()) {
+        showCustomAlert(
+            tr("deepsky.export", "Exportar"),
+            tr("deepsky.editor_annotation_fixture_export", "Fixture interactivo: la aplicación nativa permite guardar la capa PNG transparente o la imagen anotada compuesta."),
+        );
+        return;
+    }
+    const workDir = dsPoststackWorkDir() || "";
+    const separator = workDir.includes("\\") ? "\\" : "/";
+    const suffix = composited ? "imagen-anotada" : "capa-anotaciones";
+    const path = await saveDialog({
+        title: composited
+            ? tr("deepsky.editor_annotation_export_composite", "Exportar imagen anotada")
+            : tr("deepsky.editor_annotation_export_overlay", "Exportar capa PNG"),
+        defaultPath: `${workDir}${workDir ? separator : ""}zenith-${suffix}.png`,
+        filters: [{ name: "PNG", extensions: ["png"] }],
+    });
+    if (!path) return;
+    const previous = button?.textContent;
+    if (button) {
+        button.disabled = true;
+        button.textContent = tr("deepsky.exporting", "Exportando…");
+    }
+    try {
+        await invoke("deepsky_annotations_export", {
+            request: {
+                annotation,
+                path: String(path),
+                composited: !!composited,
+            },
+        });
+    } catch (error) {
+        showCustomAlert(tr("general.error", "Error"), dsStudioAnnotationError(error));
+    } finally {
+        if (button?.isConnected) {
+            button.disabled = false;
+            button.textContent = previous;
+        }
+    }
+}
+
+function dsAstrometryFriendlyError(error) {
+    const raw = String(error || "");
+    const parts = raw.split("|");
+    if (parts[0] === "ASTROMETRY_CATALOG_REQUIRED") {
+        return tr("deepsky.editor_astrometry_catalog_missing", "No hay un mosaico Gaia local para este campo. Puedes autorizar Gaia en línea o instalar el archivo indicado abajo.");
+    }
+    if (parts[0] === "ASTROMETRY_NETWORK") {
+        return `${parts.slice(3).join("|") || tr("deepsky.editor_astrometry_timeout", "Gaia no respondió a tiempo")}. ${tr("deepsky.editor_astrometry_retry", "El máster no cambió; reintenta o usa el mosaico local.")}`;
+    }
+    if (/RA\/Dec|RA, Dec|escala|apuntado/i.test(raw)) {
+        return tr("deepsky.editor_astrometry_needs_seed", "Faltan RA, Dec o escala en las cabeceras. Indícalas para localizar el campo.");
+    }
+    return raw;
+}
+
+async function dsPoststackSolveAstrometry(button, options = {}) {
+    const previous = button?.textContent;
+    if (button) { button.disabled = true; button.textContent = tr("deepsky.editor_solving", "Resolviendo…"); }
+    const run = params => dsIsPoststackFixture()
+        ? Promise.resolve(dsPoststackFixtureAstrometry())
+        : invoke("solve_deepsky_astrometry", {
+            req: {
+                ...params,
+                workDir: dsPoststackWorkDir(),
+                allowOnline: !!options.allowOnline,
+                preferExisting: options.preferExisting !== false,
+            },
+        });
+    try {
+        let solution;
+        if (options.requestSeed) {
+            const seed = await dsPromptSpccSeed();
+            if (!seed) return;
+            solution = await run({ ra: seed.ra, dec: seed.dec, scaleArcsecPx: seed.scale });
+        } else {
+            try {
+                solution = await run({});
+            } catch (error) {
+                if (!/RA\/Dec|RA, Dec|escala|apuntado/i.test(String(error))) throw error;
+                const seed = await dsPromptSpccSeed();
+                if (!seed) return;
+                solution = await run({ ra: seed.ra, dec: seed.dec, scaleArcsecPx: seed.scale });
+            }
+        }
+        dsPoststackState = dsIsPoststackFixture()
+            ? dsPoststackFixtureCommit("astrometry", { solution })
+            : await invoke("deepsky_poststack_state");
+        if (dsIsMilkyWayWorkflow()) {
+            const geometryId = dsPoststackSourceDescriptor?.milkyWayGeometryId
+                || "milky-way-source-geometry";
+            dsPoststackSourceDescriptor = {
+                ...dsPoststackSourceDescriptor,
+                wcsValid: true,
+                milkyWayWcsGeometryId: geometryId,
+            };
+        }
+        dsPoststackPreviewMode = "current";
+        dsAstrometryUi = { busy: false, error: "", online: !!options.allowOnline };
+        log("SUCCESS", `Astrometría: ${solution.inliers} inliers · RMS ${Number(solution.rmsPx).toFixed(2)} px`);
+    } catch (error) {
+        try { dsPoststackState = await invoke("deepsky_poststack_state"); } catch { /* conserva el último estado */ }
+        dsAstrometryUi = { busy: false, error: dsAstrometryFriendlyError(error), online: !!options.allowOnline };
+        log("WARN", `Astrometría pendiente: ${dsAstrometryUi.error}`);
+    } finally {
+        if (button) { button.disabled = false; button.textContent = previous; }
+        dsPoststackRenderShell();
+        dsPoststackSyncInteractiveLayer();
+    }
+}
+
+async function dsPoststackRunPcc(button) {
+    const source = classifyDeepSkySource(dsPoststackEffectiveSourceDescriptor());
+    if (source.kind !== SOURCE_KINDS.BROADBAND_RGB) {
+        showCustomAlert(
+            tr("deepsky.pcc", "PCC Gaia"),
+            tr("deepsky.pcc_gate_narrowband", "PCC Gaia se ofrece sólo para un máster RGB de banda ancha identificado."),
+        );
+        return;
+    }
+    const editor = document.getElementById("ds-poststack-editor");
+    const reference = editor?.querySelector("#ds-editor-pcc-reference")?.value || "averageSpiral";
+    localStorage.setItem("zas_spcc_reference", reference);
+    const previous = button?.textContent;
+    if (button) { button.disabled = true; button.textContent = tr("deepsky.pcc_running", "Calibrando…"); }
+    const run = params => {
+        if (dsIsPoststackFixture()) {
+            const postStack = dsPoststackFixtureCommit("gaiaPcc", {
+                req: { ...params, whiteReference: reference },
+            });
+            return Promise.resolve({
+                postStack,
+                preview: postStack.preview,
+                matched: 164,
+                gainR: 1.034,
+                gainG: 1.000,
+                gainB: 0.972,
+                note: "Fixture interactivo: valida estados y controles, no una calibración fotométrica.",
+            });
+        }
+        return invoke("pcc_gaia_calibrate", {
+            req: {
+                ...params,
+                whiteReference: reference,
+                workDir: dsPoststackWorkDir(),
+                allowOnline: true,
+                preferExisting: true,
+            },
+        });
+    };
+    try {
+        let result;
+        try {
+            result = await run({});
+        } catch (error) {
+            if (!/RA\/Dec|escala|índices locales/i.test(String(error))) throw error;
+            const seed = await dsPromptSpccSeed();
+            if (!seed) return;
+            result = await run({ ra: seed.ra, dec: seed.dec, scaleArcsecPx: seed.scale });
+        }
+        dsPoststackState = result.postStack;
+        dsPoststackPreviewMode = "current";
+        dsPoststackCurrentPreview = result.postStack?.preview || dsPoststackCurrentPreview;
+        if (ui.imgResult && result.preview) await setImageAndWait(ui.imgResult, result.preview, false);
+        dsUpdateHistogram();
+        const report = trFormat(
+            "deepsky.pcc_report",
+            { matched: result.matched, gr: result.gainR.toFixed(3), gg: result.gainG.toFixed(3), gb: result.gainB.toFixed(3) },
+            `PCC Gaia: ${result.matched} estrellas · R/G/B ${result.gainR.toFixed(3)}/${result.gainG.toFixed(3)}/${result.gainB.toFixed(3)}`,
+        );
+        log("SUCCESS", report);
+        showCustomAlert(tr("deepsky.pcc", "PCC Gaia"), `${report}\n\n${result.note || ""}`);
+    } catch (error) {
+        showCustomAlert(tr("general.error", "Error"), String(error));
+    } finally {
+        if (button) { button.disabled = false; button.textContent = previous; }
+        dsPoststackRenderShell();
+    }
+}
 
 // Exporta el resultado de cielo profundo (estirado 16-bit/PNG y/o lineal 16-bit).
 // NO usa showProcessing (eso saldría del modo resultado); estado ocupado inline.
@@ -15239,15 +23046,227 @@ async function dsExportResult(opts, triggerBtn) {
     }
 }
 
-async function dsApplyStretch() {
+async function dsSetResultImage(source, token = dsResultViewToken, fitView = false) {
+    if (!source || !ui.imgResult) return false;
+    const displaySource = toDisplaySrc(source);
     try {
-        const b64 = await invoke("deepsky_restretch", { mode: dsStretchMode, strength: dsStretchStrength });
-        if (ui.imgResult) await setImageAndWait(ui.imgResult, b64, false);
+        await new Promise((resolve, reject) => {
+            const probe = new Image();
+            probe.onload = resolve;
+            probe.onerror = reject;
+            probe.src = displaySource;
+        });
+        if (token !== dsResultViewToken || !ui.imgResult) return false;
+        const image = ui.imgResult;
+        image.classList.remove("loaded");
+        image.onload = null;
+        image.onerror = null;
+        image.src = displaySource;
+        if (typeof image.decode === "function") {
+            try { await image.decode(); } catch { /* el preload ya validó la imagen */ }
+        }
+        if (token !== dsResultViewToken || !image.naturalWidth || !image.naturalHeight) return false;
+        prepareZoomSurfaceForImage(image);
+        if (fitView) {
+            fitToScreen(image);
+        } else {
+            updateTransform();
+            requestAnimationFrame(() => ensureImageVisibleInViewport(image));
+        }
+        image.classList.add("loaded");
+        return true;
+    } catch (error) {
+        if (token === dsResultViewToken) {
+            console.error("No se pudo cargar la vista de cielo profundo", error);
+        }
+        return false;
+    }
+}
+
+function dsSetPrimaryProduct(productId) {
+    const primaryId = productId == null ? null : String(productId);
+    dsResultProducts = new Map([...dsResultProducts.entries()].map(([id, product]) => [
+        String(id),
+        {
+            ...product,
+            primary: primaryId !== null && String(id) === primaryId,
+        },
+    ]));
+}
+
+function dsProductKind(product) {
+    const declared = String(product?.product || "").toLowerCase();
+    const value = `${declared} ${String(product?.id || "").toLowerCase()}`;
+    if (declared === "comet" || value.includes("comet:layer")) return "comet";
+    if (declared === "combined" || value.includes("comet:combined")) return "combined";
+    if (declared === "studio_palette" || value.includes("studio-palette")) {
+        return "studio_palette";
+    }
+    if (declared === "preserved_source" || value.includes("studio-source:")) {
+        return "preserved_source";
+    }
+    if (value.includes("nebula")) return "nebula_fusion_sci";
+    if (value.includes("struct")) return "struct";
+    if (value.includes("eidr")) return "eidr";
+    return "classic";
+}
+
+function dsProductDisplayBaseLabel(product) {
+    const kind = dsProductKind(product);
+    const status = String(product?.status || "ready");
+    const dimensions = product?.width && product?.height
+        ? ` · ${Number(product.width).toLocaleString()}×${Number(product.height).toLocaleString()}`
+        : "";
+    let label;
+    if (kind === "studio_palette") {
+        const paletteId = String(product?.paletteId || product?.effectiveMethod || "");
+        const paletteLabel = ({
+            hooNatural: "HOO natural",
+            hooTeal: "HOO teal",
+            sho: "SHO · Hubble",
+            hso: "HSO",
+            soo: "SOO",
+        })[paletteId] || paletteId || tr("deepsky.editor_palette_derived", "derivada");
+        label = `${tr("deepsky.editor_palette_product", "Paleta Studio")} · ${paletteLabel}`;
+    } else if (kind === "preserved_source") {
+        label = `${tr("deepsky.editor_preserved_source", "Fuente preservada")} · ${
+            product?.sourceLabel || tr("deepsky.editor_linear_master_short", "máster lineal")
+        }`;
+    } else if (kind === "comet") {
+        label = tr("deepsky.comet_layer", "Cometa");
+    } else if (kind === "combined") {
+        label = tr("deepsky.comet_combined_layer", "Estrellas + cometa");
+    } else if (kind === "nebula_fusion_sci") {
+        label = "NebulaFusion SCI";
+    } else if (kind === "struct") {
+        label = status === "fallback"
+            ? "STRUCT no generado · SCI de dependencia"
+            : "STRUCT · mapa estructural";
+    } else if (kind === "eidr") {
+        label = status === "fallback" || String(product?.effectiveMethod || "") !== "eidr"
+            ? "EIDR no validado · Classic conservado"
+            : "EIDR · reconstrucción validada";
+    } else {
+        const drizzle = Number(product?.effectiveDrizzle || 1);
+        const scale = Number.isInteger(drizzle) ? String(drizzle) : drizzle.toFixed(1);
+        label = drizzle > 1.01 ? `Classic · Drizzle ×${scale}` : "Classic";
+    }
+    const holes = Number(product?.noCoveragePixels || 0);
+    const warning = holes > 0
+        ? ` · ${trFormat("deepsky.product_holes", { count: holes.toLocaleString() }, `${holes.toLocaleString()} huecos`)}`
+        : "";
+    return `${label}${dimensions}${warning}`;
+}
+
+function dsProductDisplayLabel(product) {
+    const primary = product?.primary
+        ? `${tr("deepsky.primary_short", "Principal")} · `
+        : "";
+    return `${primary}${dsProductDisplayBaseLabel(product)}`;
+}
+
+function dsProductDisclosure(product) {
+    if (!product) {
+        return {
+            tone: "ready",
+            text: tr("deepsky.result_protected", "Máster lineal protegido · las ediciones son revisiones"),
+        };
+    }
+    const fallback = String(product.fallbackReason || "").trim();
+    if (fallback) return { tone: "fallback", text: fallback };
+    const holes = Number(product.noCoveragePixels || 0);
+    if (holes > 0) {
+        return {
+            tone: "warning",
+            text: `${holes.toLocaleString()} píxeles sin cobertura; el FITS conserva NaN + DQ y la vista los repara sólo para inspección.`,
+        };
+    }
+    const dimensions = product.width && product.height
+        ? `${Number(product.width).toLocaleString()}×${Number(product.height).toLocaleString()} · `
+        : "";
+    const descriptions = {
+        classic: "integración robusta convencional; Drizzle sólo cambia su propia rama.",
+        nebula_fusion_sci: "coadd lineal con VAR, NEFF, DQ y cobertura para auditar incertidumbre.",
+        struct: "mapa de evidencia estructural derivado de NebulaFusion; no sustituye al SCI.",
+        eidr: "reconstrucción forward-model publicada únicamente si supera su validación holdout.",
+        studio_palette: "combinación lineal interpretativa derivada; conserva el producto fuente y no declara flujo espectral cuantitativo.",
+        preserved_source: "copia lossless del producto activo anterior; permanece seleccionable sin recalcular ni modificar el máster fuente.",
+        comet: "capa cometaria lineal separada; la incertidumbre compartida con la rama estelar queda declarada como no cuantificada.",
+        combined: "composición lineal de estrellas y cometa; conserva ambas capas independientes para edición y exportación.",
+    };
+    return {
+        tone: product.scientificEligible === false ? "warning" : "ready",
+        text: `${dimensions}${descriptions[dsProductKind(product)]}`,
+    };
+}
+
+function dsSyncResultProductOptions() {
+    const view = document.getElementById("ds-result-view");
+    if (!view) return;
+    view.querySelectorAll("[data-products]").forEach(element => element.remove());
+    const integrationProducts = [...dsResultProducts.values()].filter(product => {
+        const kind = dsProductKind(product);
+        return kind !== "comet" && kind !== "combined";
+    });
+    if (!integrationProducts.length) return;
+    const group = document.createElement("optgroup");
+    group.label = tr("deepsky.product_views", "Productos de integración");
+    group.dataset.products = "1";
+    for (const product of integrationProducts) {
+        const option = document.createElement("option");
+        option.value = `product-id:${product.id}`;
+        option.dataset.previewPath = product.previewPath || "";
+        option.dataset.productKind = product.product || "";
+        option.dataset.productKindNormalized = dsProductKind(product);
+        option.dataset.productStatus = product.status || "ready";
+        option.textContent = dsProductDisplayLabel(product);
+        option.title = dsProductDisclosure(product).text;
+        group.appendChild(option);
+    }
+    view.appendChild(group);
+}
+
+function dsUpdateProductDisclosure(product) {
+    const disclosure = dsProductDisclosure(product);
+    const note = document.getElementById("ds-result-product-note");
+    if (note) {
+        note.textContent = disclosure.text;
+        note.title = disclosure.text;
+        note.dataset.tone = disclosure.tone;
+        note.style.color = disclosure.tone === "fallback"
+            ? "#fdba74"
+            : disclosure.tone === "warning"
+                ? "#fde68a"
+                : "#94a3b8";
+    }
+    dsSetResultStatus(disclosure.text, disclosure.tone);
+}
+
+async function dsApplyStretch(token = ++dsResultViewToken, fitView = false) {
+    try {
+        const b64 = await invoke("deepsky_restretch", {
+            mode: dsStretchMode,
+            strength: dsStretchStrength,
+        });
+        if (token !== dsResultViewToken) return false;
+        const shown = await dsSetResultImage(b64, token, fitView);
+        if (!shown || token !== dsResultViewToken) return false;
+        if (document.body.classList.contains("ds-poststack-workspace") && dsPoststackState?.preview) {
+            dsPoststackDisplayPreview = b64;
+            dsPoststackDisplaySourcePreview = dsPoststackState.preview;
+            dsPoststackCurrentPreview = b64;
+            dsPoststackPreviewMode = "current";
+        }
         dsUpdateHistogram();
-    } catch (e) { log("ERROR", `Re-estirado: ${e}`); }
+        return true;
+    } catch (e) {
+        if (token === dsResultViewToken) log("ERROR", `Re-estirado: ${e}`);
+        return false;
+    }
 }
 
 async function dsShowResultView(kind) {
+    const token = ++dsResultViewToken;
     dsResultView = kind;
     const selector = document.getElementById("ds-result-view");
     if (selector) selector.value = kind;
@@ -15255,17 +23274,64 @@ async function dsShowResultView(kind) {
     if (kind === "master") {
         if (hist) hist.style.display = "block";
         dsPositionHistogram();
-        await dsApplyStretch();
+        dsUpdateProductDisclosure(dsResultProducts.get(dsActiveProductId));
+        await dsApplyStretch(token, false);
         return;
     }
     if (hist) hist.style.display = "none";
     // Vistas de sesión multibanda: preview PNG de un grupo (ya renderizado en
     // disco) o componente FITS float32 estirado bajo demanda por el backend.
-    if (kind.startsWith("session:")) {
-        const path = kind.slice("session:".length);
-        if (ui.imgResult) {
-            const shown = await setImageAndWait(ui.imgResult, path, false);
-            if (!shown) log("ERROR", "No se pudo cargar la vista de esa integración.");
+    if (kind.startsWith("product-id:")) {
+        const productId = kind.slice("product-id:".length);
+        try {
+            await invoke("deepsky_select_product", { productId });
+            if (token !== dsResultViewToken) return;
+            // “Activo” es sólo el producto que se inspecciona/edita. No
+            // reescribe el rol “Principal” elegido por la receta; Aplicar una
+            // paleta o Volver a la fuente sí cambian ese rol explícitamente.
+            dsActiveProductId = productId;
+            dsPoststackSourcePreview = "";
+            dsPoststackCurrentPreview = "";
+            const state = await invoke("deepsky_poststack_state");
+            if (token !== dsResultViewToken) return;
+            dsPoststackState = state;
+            if (state?.source) {
+                dsPoststackSourceDescriptor = dsMergePoststackSourceDescriptor(
+                    dsPoststackSourceDescriptor,
+                    state.source,
+                );
+            }
+            dsPoststackCurrentPreview = state?.preview || "";
+            const selectedProduct = dsResultProducts.get(productId);
+            const selectedProductKind = dsProductKind(selectedProduct);
+            dsUpdateProductDisclosure(selectedProduct);
+            if (selectedProductKind === "struct" && selectedProduct?.status !== "fallback") {
+                if (hist) hist.style.display = "none";
+                const image = await invoke("deepsky_result_view", { kind: "struct" });
+                if (token !== dsResultViewToken) return;
+                await dsSetResultImage(image, token, true);
+                log("INFO", `${tr("deepsky.active_product", "Producto activo")}: ${productId} · STRUCT`);
+                return;
+            }
+            if (hist) hist.style.display = "block";
+            await dsApplyStretch(token, true);
+            log("INFO", `${tr("deepsky.active_product", "Producto activo")}: ${productId}`);
+        } catch (error) {
+            if (token !== dsResultViewToken) return;
+            log("ERROR", `${tr("deepsky.active_product", "Producto activo")}: ${error}`);
+            if (selector) selector.value = "master";
+            dsResultView = "master";
+            if (hist) hist.style.display = "block";
+            await dsApplyStretch(token, true);
+        }
+        return;
+    }
+    if (kind.startsWith("session:") || kind.startsWith("product:")) {
+        const prefix = kind.startsWith("product:") ? "product:" : "session:";
+        const path = kind.slice(prefix.length);
+        const shown = await dsSetResultImage(path, token, true);
+        if (!shown && token === dsResultViewToken) {
+            log("ERROR", "No se pudo cargar la vista de esa integración.");
         }
         return;
     }
@@ -15273,18 +23339,19 @@ async function dsShowResultView(kind) {
         const path = kind.slice("component:".length);
         try {
             const image = await invoke("deepsky_frame_preview", { path });
-            if (ui.imgResult) await setImageAndWait(ui.imgResult, image, false);
+            if (token !== dsResultViewToken) return;
+            await dsSetResultImage(image, token, true);
         } catch (e) {
-            log("ERROR", `Componente: ${e}`);
+            if (token === dsResultViewToken) log("ERROR", `Componente: ${e}`);
         }
         return;
     }
     try {
         const image = await invoke("deepsky_result_view", { kind });
-        if (ui.imgResult) await setImageAndWait(ui.imgResult, image, false);
+        if (token !== dsResultViewToken) return;
+        await dsSetResultImage(image, token, true);
     } catch (e) {
-        // Explicar QUÉ produce cada vista en vez de fallar en silencio: los
-        // mapas científicos dependen del motor con el que se integró.
+        if (token !== dsResultViewToken) return;
         const requirement = {
             variance: "NebulaFusion (Lite o Full)",
             neff: "NebulaFusion (Lite o Full)",
@@ -15305,8 +23372,71 @@ async function dsShowResultView(kind) {
         dsResultView = "master";
         if (selector) selector.value = "master";
         if (hist) hist.style.display = "block";
-        await dsApplyStretch();
+        await dsApplyStretch(token, true);
     }
+}
+
+function dsPopulateProductViews(result) {
+    const view = document.getElementById("ds-result-view");
+    if (!view || !result) return;
+    const products = (result.products || []).filter(product => product.previewPath);
+    dsResultProducts = new Map(products.map(product => [String(product.id), product]));
+    if (!products.length) {
+        dsSyncResultProductOptions();
+        dsActiveProductId = null;
+        dsUpdateProductDisclosure(null);
+        return;
+    }
+    const primary = products.find(product => product.primary) || products[0];
+    dsSetPrimaryProduct(primary.id);
+    dsActiveProductId = String(primary.id);
+    dsSyncResultProductOptions();
+    dsUpdateProductDisclosure(primary);
+}
+
+function dsPopulateCometViews(result) {
+    const view = document.getElementById("ds-result-view");
+    if (!view) return;
+    view.querySelectorAll("[data-comet-layers]").forEach(element => element.remove());
+    for (const [id, product] of dsResultProducts.entries()) {
+        const kind = dsProductKind(product);
+        if (kind === "comet" || kind === "combined") dsResultProducts.delete(id);
+    }
+    const layers = result?.comet?.layers || [];
+    const nonStarLayers = layers.filter(layer => layer.kind !== "stars");
+    nonStarLayers.forEach(layer => {
+        dsResultProducts.set(String(layer.id), {
+            id: String(layer.id),
+            product: String(layer.kind),
+            previewPath: layer.previewPath || "",
+            recipePath: layer.recipePath || null,
+            outputDir: layer.outputDir || null,
+            resultId: layer.resultId || null,
+            effectiveMethod: layer.kind === "comet"
+                ? "comet-cross-trajectory-residual"
+                : "linear-stars-plus-signed-comet-residual",
+            primary: false,
+            scientificEligible: false,
+            status: "warning",
+        });
+    });
+    dsSyncResultProductOptions();
+    if (!nonStarLayers.length) return;
+    const labels = {
+        comet: tr("deepsky.comet_layer", "Cometa"),
+        combined: tr("deepsky.comet_combined_layer", "Estrellas + cometa"),
+    };
+    const group = document.createElement("optgroup");
+    group.label = tr("deepsky.comet_layers", "Capas de cometa");
+    group.dataset.cometLayers = "1";
+    nonStarLayers.forEach(layer => {
+        const option = document.createElement("option");
+        option.value = `product-id:${layer.id}`;
+        option.textContent = labels[layer.kind] || layer.id;
+        option.title = dsProductDisclosure(dsResultProducts.get(String(layer.id))).text;
+        group.appendChild(option);
+    });
+    view.appendChild(group);
 }
 
 // Rellena el selector de vistas con las integraciones y componentes de la
@@ -15330,12 +23460,24 @@ function dsPopulateSessionViews(result) {
     };
     addGroup(
         tr("deepsky.session_views", "Integraciones de la sesión"),
-        (result.groups || [])
-            .filter(group => group.previewPath)
-            .map(group => ({
-                text: `${dsFilterLabel(group.filterProfile)} · ${group.framesUsed} lights`,
-                value: `session:${group.previewPath}`,
-            }))
+        (result.groups || []).flatMap(group => {
+            const products = (group.products || []).filter(product => product.previewPath);
+            if (!products.length) {
+                return group.previewPath ? [{
+                    text: `${dsFilterLabel(group.filterProfile)} · ${group.framesUsed} lights`,
+                    value: `session:${group.previewPath}`,
+                }] : [];
+            }
+            return products.map(product => {
+                const sampling = product.product === "classic"
+                    ? `Drizzle ${Number(product.effectiveDrizzle || 1).toFixed(0)}×`
+                    : `${tr("deepsky.output_scale", "salida")} ${Number(product.outputScale || 1).toFixed(Number(product.outputScale || 1) % 1 ? 2 : 0)}×`;
+                return {
+                    text: `${dsFilterLabel(group.filterProfile)} · ${product.id} · ${sampling}${product.primary ? ` · ${tr("deepsky.primary_short", "Principal")}` : ""}`,
+                    value: `product:${product.previewPath}`,
+                };
+            });
+        })
     );
     const components = [];
     for (const [name, paths] of Object.entries(result.componentPaths || {})) {
@@ -15421,6 +23563,11 @@ function dsBuildHistogramPanel() {
     // Anclado al COSTADO derecho: centrado se encimaba con los botones de la
     // barra STF cuando la tarjeta crece (calidad + patrón de detector).
     panel.style.cssText = "position:fixed; bottom:132px; right:18px; z-index:501; width:280px; padding:8px 10px 6px; background:rgba(15,23,42,0.94); border:1px solid rgba(124,58,237,0.35); border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(6px);";
+    const drag = document.createElement("div");
+    drag.className = "ds-histogram-drag";
+    drag.style.cssText = "display:flex;align-items:center;gap:7px;margin:-2px 0 6px;padding:3px 2px;color:#94a3b8;font-size:.68rem;cursor:grab;touch-action:none;";
+    drag.innerHTML = `<svg class="zas-icon" aria-hidden="true" style="width:14px;height:14px;color:#818cf8;"><use href="#icon-grip"></use></svg>
+        <span>${tr("deepsky.hist_title", "Histograma del máster")}</span>`;
     const cv = document.createElement("canvas");
     cv.width = 240; cv.height = 66;
     cv.style.cssText = "width:100%; height:66px; display:block; background:rgba(2,6,23,0.6); border-radius:6px;";
@@ -15428,8 +23575,9 @@ function dsBuildHistogramPanel() {
     info.className = "ds-hist-info";
     info.style.cssText = "font-size:0.6rem; color:#94a3b8; margin-top:4px; text-align:center;";
     info.textContent = tr("deepsky.hist_title", "Histograma");
-    panel.append(cv, info);
+    panel.append(drag, cv, info);
     document.body.appendChild(panel);
+    dsEnableFloatingDrag(panel, drag, "zas_ds_histogram_position");
 }
 
 // Coloca el histograma JUSTO encima de la barra STF, midiendo su altura real
@@ -15437,6 +23585,7 @@ function dsBuildHistogramPanel() {
 function dsPositionHistogram() {
     const hist = document.getElementById("ds-histogram");
     if (!hist || hist.style.display === "none") return;
+    if (hist.style.top && hist.style.left) return;
     requestAnimationFrame(() => {
         const bar = document.getElementById("ds-stretch-bar");
         const barBottom = 12; // debe coincidir con el bottom de la barra STF
@@ -15445,7 +23594,10 @@ function dsPositionHistogram() {
     });
 }
 if (typeof window !== "undefined") {
-    window.addEventListener("resize", () => dsPositionHistogram());
+    window.addEventListener("resize", () => {
+        dsPositionHistogram();
+        if (document.body.classList.contains("ds-poststack-workspace")) dsPoststackSyncInteractiveLayer();
+    });
 }
 
 // Tabla de calidad por-toma (WBPP-style): FWHM, excentricidad, ruido, peso.
@@ -15472,7 +23624,7 @@ function dsShowReportPanel() {
         <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
             <span style="font-size:1rem; font-weight:700; color:#e2e8f0;">${tr("deepsky.report_title", "Calidad de tomas")}</span>
             <span style="font-size:0.72rem; color:#94a3b8;">${used}/${rows.length} ${tr("deepsky.report_used", "usadas")}</span>
-            <button id="ds-report-x" type="button" style="margin-left:auto; width:auto; padding:5px 10px; border-radius:8px; border:none; background:rgba(51,65,85,0.6); color:#cbd5e1; cursor:pointer;">✕</button>
+            <button id="ds-report-x" type="button" aria-label="${tr("deepsky.close", "Cerrar")}" style="margin-left:auto; width:auto; padding:5px 10px; border-radius:8px; border:none; background:rgba(51,65,85,0.6); color:#cbd5e1; cursor:pointer;"><svg class="zas-icon" aria-hidden="true" style="width:14px;height:14px;"><use href="#icon-cross"></use></svg></button>
         </div>
         <table style="width:100%; border-collapse:collapse;">
             <thead><tr>
@@ -15509,7 +23661,12 @@ function dsShowStretchBar() {
     if (!bar) {
         bar = document.createElement("div");
         bar.id = "ds-stretch-bar";
-        bar.style.cssText = "position:fixed; bottom:12px; left:50%; transform:translateX(-50%); z-index:500; display:flex; align-items:center; justify-content:center; flex-wrap:wrap; max-width:calc(100vw - 20px); gap:8px; padding:8px 12px; background:rgba(15,23,42,0.94); border:1px solid rgba(124,58,237,0.35); border-radius:14px; box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(6px);";
+        bar.style.cssText = "position:fixed; bottom:12px; left:50%; transform:translateX(-50%); z-index:500; display:flex; align-items:center; justify-content:center; flex-wrap:wrap; width:max-content; box-sizing:border-box; max-width:calc(100vw - 20px); gap:8px; padding:8px 12px; background:rgba(15,23,42,0.94); border:1px solid rgba(124,58,237,0.35); border-radius:14px; box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(6px);";
+        const dragHandle = document.createElement("div");
+        dragHandle.className = "ds-stretch-drag";
+        dragHandle.setAttribute("aria-label", tr("deepsky.stretch_drag", "Mover barra de resultado"));
+        dragHandle.style.cssText = "display:grid;place-items:center;flex:0 0 24px;width:24px;height:30px;color:#818cf8;cursor:grab;touch-action:none;";
+        dragHandle.innerHTML = `<svg class="zas-icon" aria-hidden="true" style="width:16px;height:16px;"><use href="#icon-grip"></use></svg>`;
         const view = document.createElement("select");
         view.id = "ds-result-view";
         view.title = tr("deepsky.result_view_hint", "Alternar máster y mapas científicos");
@@ -15528,6 +23685,14 @@ function dsShowStretchBar() {
             <option value="recoverability">${tr("deepsky.view_recoverability", "Recuperabilidad (EIDR)")}</option>
             <option value="struct_residual">${tr("deepsky.view_struct_residual", "Residual de STRUCT")}</option>`;
         view.addEventListener("change", () => dsShowResultView(view.value));
+        const productNote = document.createElement("span");
+        productNote.id = "ds-result-product-note";
+        productNote.setAttribute("role", "status");
+        productNote.style.cssText = "min-width:180px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.61rem;color:#94a3b8;";
+        productNote.textContent = tr(
+            "deepsky.result_protected",
+            "Máster lineal protegido · las ediciones son revisiones",
+        );
         const modes = [
             { m: "linked", label: tr("deepsky.stf_auto", "Auto (color)") },
             { m: "unlinked", label: tr("deepsky.stf_balanced", "Balanceado") },
@@ -15563,6 +23728,7 @@ function dsShowStretchBar() {
         const exportWrap = document.createElement("div");
         exportWrap.style.cssText = "position:relative;";
         const btnExport = document.createElement("button");
+        btnExport.id = "ds-export-main";
         btnExport.type = "button";
         btnExport.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;vertical-align:-2px;margin-right:5px;"><use href="#icon-download"></use></svg>${tr("deepsky.export", "Exportar")}`;
         btnExport.style.cssText = "width:auto; padding:6px 13px; border-radius:9px; font-size:0.74rem; font-weight:600; cursor:pointer; border:1px solid #7c3aed; background:linear-gradient(135deg,#7c3aed,#db2777); color:#fff;";
@@ -15611,7 +23777,13 @@ function dsShowStretchBar() {
         exportWrap.append(btnExport, pop);
 
         const close = document.createElement("button");
-        close.type = "button"; close.textContent = "✕";
+        close.type = "button";
+        close.innerHTML = `<svg class="zas-icon" aria-hidden="true" style="width:14px;height:14px;"><use href="#icon-cross"></use></svg>`;
+        close.setAttribute("aria-label", tr("deepsky.close_result_bar", "Minimizar controles del resultado"));
+        close.title = tr(
+            "deepsky.close_result_bar_hint",
+            "Minimiza esta barra; puedes recuperarla con «Ver máster» en la cabecera.",
+        );
         close.style.cssText = "width:auto; padding:4px 8px; border-radius:8px; border:none; background:none; color:#64748b; cursor:pointer;";
         close.addEventListener("click", dsHideStretchBar);
         const btnReport = document.createElement("button");
@@ -15621,6 +23793,7 @@ function dsShowStretchBar() {
         btnReport.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; align-items:center; display:" + (dsFrameReport && dsFrameReport.length ? "inline-flex" : "none") + ";";
         btnReport.addEventListener("click", (ev) => { ev.stopPropagation(); dsShowReportPanel(); });
         const btnRepeat = document.createElement("button");
+        btnRepeat.id = "ds-repeat-integration";
         btnRepeat.type = "button";
         btnRepeat.textContent = tr("deepsky.repeat_integration", "Reintegrar");
         btnRepeat.title = tr("deepsky.repeat_integration_hint", "Conservar tomas y registro; revisar sólo la receta de integración");
@@ -15629,7 +23802,8 @@ function dsShowStretchBar() {
             const modal = document.getElementById("deepsky-modal");
             if (modal) {
                 modal.style.display = "flex";
-                dsSetWizardStep(2, true);
+                dsSetBackgroundInert(true);
+                dsSetWizardStep(3, true);
                 dsPreparePlan();
             }
         });
@@ -15640,6 +23814,7 @@ function dsShowStretchBar() {
         btnSplit.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-palette"></use></svg>${tr("deepsky.split", "Separar canales")}`;
         btnSplit.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; align-items:center; display:inline-flex;";
         btnSplit.title = tr("deepsky.split_hint", "Guarda R, G, B y una L sintética como TIFF mono 16-bit para retocar por canal y recombinar (LRGB/SHO).");
+        btnSplit.hidden = true;
         btnSplit.addEventListener("click", async (ev) => {
             ev.stopPropagation();
             if (!dsResultBasePath) { log("WARN", tr("deepsky.no_base", "No hay carpeta de destino para exportar.")); return; }
@@ -15664,8 +23839,13 @@ function dsShowStretchBar() {
         btnHoo.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-palette"></use></svg>${tr("deepsky.hoo", "HOO dual-band")}`;
         btnHoo.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; align-items:center; display:inline-flex;";
         btnHoo.title = tr("deepsky.hoo_hint", "Vista HOO derivada del máster dual-band: Ha→R, OIII→G y B (fondo neutralizado). Solo cambia la VISTA — el máster lineal float32 (SCI/VAR/NEFF/DQ) queda intacto; Reintegrar o cambiar de vista vuelve al RGB original.");
+        btnHoo.hidden = true;
         btnHoo.addEventListener("click", async (ev) => {
             ev.stopPropagation();
+            if (!dsHooUiEligibility.eligible) {
+                showCustomAlert("HOO", dsHooUiEligibility.reason);
+                return;
+            }
             const prev = btnHoo.innerHTML;
             btnHoo.disabled = true; btnHoo.style.opacity = "0.6";
             btnHoo.innerHTML = `<svg class="zas-icon icon-spin" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-settings"></use></svg>${tr("deepsky.hoo_running", "Combinando HOO…")}`;
@@ -15682,23 +23862,28 @@ function dsShowStretchBar() {
                 btnHoo.disabled = false; btnHoo.style.opacity = "1"; btnHoo.innerHTML = prev;
             }
         });
-        // SPCC: calibración de color fotométrica contra Gaia DR3 (banda ancha).
+        // Compatibilidad visual anterior: la operación real es PCC Gaia.
         const btnSpcc = document.createElement("button");
         btnSpcc.id = "ds-spcc-btn";
         btnSpcc.type = "button";
-        btnSpcc.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-palette"></use></svg>${tr("deepsky.spcc", "SPCC color")}`;
+        btnSpcc.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-palette"></use></svg>${tr("deepsky.pcc", "PCC Gaia")}`;
         btnSpcc.style.cssText = "width:auto; padding:6px 11px; border-radius:9px; font-size:0.72rem; cursor:pointer; border:1px solid #334155; background:rgba(30,41,59,0.7); color:#cbd5e1; align-items:center; display:inline-flex;";
-        btnSpcc.title = tr("deepsky.spcc_hint", "Calibración de color fotométrica contra Gaia DR3 (banda ancha OSC/RGB, requiere internet). Para banda estrecha/dual-band usa HOO/SHO.");
+        btnSpcc.title = tr("deepsky.pcc_hint", "PCC Gaia para banda ancha OSC/RGB. Usa índices/caché local antes del fallback en línea; no es SPCC espectrofotométrica.");
+        btnSpcc.hidden = true;
         btnSpcc.addEventListener("click", async (ev) => {
             ev.stopPropagation();
             const prev = btnSpcc.innerHTML;
-            const run = async (params) => await invoke("spcc_calibrate", { req: params });
+            const run = async (params) => await invoke("pcc_gaia_calibrate", { req: params });
             btnSpcc.disabled = true; btnSpcc.style.opacity = "0.6";
-            btnSpcc.innerHTML = `<svg class="zas-icon icon-spin" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-settings"></use></svg>${tr("deepsky.spcc_running", "Calibrando color…")}`;
+            btnSpcc.innerHTML = `<svg class="zas-icon icon-spin" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-settings"></use></svg>${tr("deepsky.pcc_running", "Calibrando color…")}`;
             try {
                 let res;
                 try {
-                    res = await run({ whiteReference: localStorage.getItem("zas_spcc_reference") || "averageSpiral" });
+                    res = await run({
+                        whiteReference: localStorage.getItem("zas_spcc_reference") || "averageSpiral",
+                        allowOnline: true,
+                        preferExisting: true,
+                    });
                 } catch (e) {
                     const msg = String(e);
                     if (/RA\/Dec|apuntado|escala|RA, Dec/i.test(msg)) {
@@ -15707,19 +23892,26 @@ function dsShowStretchBar() {
                         // propio con los tres campos.
                         const seed = await dsPromptSpccSeed();
                         if (!seed) throw new Error(tr("general.cancelled", "Cancelado"));
-                        res = await run({ ra: seed.ra, dec: seed.dec, scaleArcsecPx: seed.scale, whiteReference: seed.reference });
+                        res = await run({
+                            ra: seed.ra,
+                            dec: seed.dec,
+                            scaleArcsecPx: seed.scale,
+                            whiteReference: seed.reference,
+                            allowOnline: true,
+                            preferExisting: true,
+                        });
                     } else { throw e; }
                 }
                 if (ui.imgResult && res && res.preview) await setImageAndWait(ui.imgResult, res.preview, false);
                 dsResultView = "master";
                 dsUpdateHistogram();
-                const rep = tr("deepsky.spcc_report", "SPCC: {matched} estrellas Gaia · ganancias R/G/B {gr}/{gg}/{gb}")
+                const rep = tr("deepsky.pcc_report", "PCC Gaia: {matched} estrellas · ganancias R/G/B {gr}/{gg}/{gb}")
                     .replace("{matched}", res.matched)
                     .replace("{gr}", res.gainR.toFixed(3))
                     .replace("{gg}", res.gainG.toFixed(3))
                     .replace("{gb}", res.gainB.toFixed(3));
                 log("SUCCESS", rep);
-                showCustomAlert(tr("deepsky.spcc", "SPCC color"), `${rep}\n\n${res.note || ""}`);
+                showCustomAlert(tr("deepsky.pcc", "PCC Gaia"), `${rep}\n\n${res.note || ""}`);
             } catch (e) {
                 log("ERROR", `${e}`);
                 showCustomAlert(tr("general.error", "Error"), String(e));
@@ -15727,13 +23919,26 @@ function dsShowStretchBar() {
                 btnSpcc.disabled = false; btnSpcc.style.opacity = "1"; btnSpcc.innerHTML = prev;
             }
         });
-        bar.append(view, seg, sldWrap, note, divider, btnSplit, btnHoo, btnSpcc, btnReport, btnRepeat, exportWrap, close);
+        const btnEditor = document.createElement("button");
+        btnEditor.id = "ds-editor-open";
+        btnEditor.type = "button";
+        btnEditor.innerHTML = `<svg class="zas-icon" style="width:13px;height:13px;margin-right:5px;"><use href="#icon-magic"></use></svg>${tr("deepsky.editor_open", "Edición guiada")}`;
+        btnEditor.style.cssText = "width:auto; padding:6px 13px; border-radius:9px; font-size:0.74rem; font-weight:650; cursor:pointer; border:1px solid rgba(167,139,250,.6); background:rgba(91,33,182,.22); color:#ede9fe; display:inline-flex; align-items:center;";
+        btnEditor.addEventListener("click", dsPoststackOpen);
+        bar.append(dragHandle, view, productNote, seg, sldWrap, note, divider, btnEditor, btnReport, btnRepeat, exportWrap, close, btnSplit, btnHoo, btnSpcc);
         document.body.appendChild(bar);
+        dsEnableFloatingDrag(bar, dragHandle, "zas_ds_stretch_position");
     }
     bar.style.display = "flex";
+    const hooButton = document.getElementById("ds-hoo-btn");
+    if (hooButton) {
+        hooButton.disabled = !dsHooUiEligibility.eligible;
+        hooButton.title = dsHooUiEligibility.reason || hooButton.title;
+    }
     dsResultView = "master";
     const view = document.getElementById("ds-result-view");
     if (view) view.value = "master";
+    dsUpdateProductDisclosure(dsResultProducts.get(dsActiveProductId));
     dsBuildHistogramPanel();
     const hist = document.getElementById("ds-histogram");
     if (hist) hist.style.display = "block";
@@ -15756,12 +23961,14 @@ function dsSyncStretchBar() {
 // Carpeta raíz → auto-clasificación WBPP (por subcarpetas/nombres).
 async function dsScanFolder() {
     try {
-        const dir = await openDialog({
-            directory: true,
-            multiple: false,
+        const dir = await dsChooseDirectory({
+            purpose: "source",
+            defaultPath: localStorage.getItem("zas_ds_last_source_dir") || null,
+            recursive: true,
             title: tr("deepsky.scan_folder_pick", "Carpeta raíz de la sesión (auto-clasificar)"),
         });
         if (!dir) return;
+        localStorage.setItem("zas_ds_last_source_dir", dir);
         showProcessing(tr("deepsky.scanning", "ESCANEANDO Y CLASIFICANDO..."));
         const cl = await invoke("deepsky_scan_classify", { root: dir });
         hideProcessing();
@@ -15819,7 +24026,7 @@ async function dsScanFolder() {
                 ${headerDetectedDarkFlats
                     ? trFormat("deepsky.dark_flats_header_detected", { count: headerDetectedDarkFlats }, `${headerDetectedDarkFlats} identificados por IMAGETYP + contexto FlatWizard.`)
                     : ""}
-                ${tr("deepsky.scan_accumulates", "Puedes escanear más carpetas: se suman a las anteriores. Usa ✕ en cada grupo para vaciarlo.")}
+                ${tr("deepsky.scan_accumulates", "Puedes escanear más carpetas: se suman a las anteriores. Usa Quitar en cada grupo para vaciarlo.")}
                 ${tr("deepsky.scan_signature_note", "Zenith validará después cada firma antes de usarla.")}</span>`;
         }
         dsUpdateUI();
@@ -15839,16 +24046,180 @@ if (import.meta.env.DEV || DS_UX_FIXTURE_BUILD) {
 }
 
 function dsLoadUxFixtureIfRequested(modal) {
+    const requestedFixture = new URLSearchParams(window.location.search).get("ux-fixture");
     const requestedInDev = import.meta.env.DEV
-        && new URLSearchParams(window.location.search).get("ux-fixture") === "multiband";
+        && ["multiband", "poststack-editor", "progress", "folder-picker", "error-modal"].includes(requestedFixture);
     if (!DS_UX_FIXTURE_BUILD && !requestedInDev) return;
+    if (requestedFixture === "progress") {
+        // Demostración visual explícita: valida el layout y las interacciones
+        // sin afirmar que Vite haya leído o integrado FITS. En producción el
+        // mismo visor recibe el light y el preview publicados por Tauri.
+        document.body.dataset.dsProgressFixture = "1";
+        modal.style.display = "none";
+        dsSetBackgroundInert(false);
+        for (const [id, checked] of [
+            ["chk-ds-product-classic", true],
+            ["chk-ds-product-nf", true],
+            ["chk-ds-product-struct", true],
+            ["chk-ds-product-eidr", true],
+        ]) {
+            const input = document.getElementById(id);
+            if (input) input.checked = checked;
+        }
+        const primary = document.getElementById("sel-ds-primary-product");
+        if (primary) primary.value = "nebula_fusion_sci";
+        const drizzle = document.getElementById("sel-ds-drizzle");
+        if (drizzle) drizzle.value = "2";
+        const fixturePreview = dsQaFixturePreviewUrl();
+        dsProgressStart({ referencePreview: fixturePreview });
+        const beforeImage = document.getElementById("ds-prog-before-img");
+        if (beforeImage) beforeImage.style.filter = "brightness(.72) saturate(.78)";
+        const fixtureState = new URLSearchParams(window.location.search).get("state");
+        if (fixtureState === "eidr") {
+            for (const product of ["classic", "nebula_fusion_sci", "struct"]) {
+                dsProgressProductState.set(product, {
+                    state: "done",
+                    pct: 100,
+                    note: "Salida demo preservada",
+                });
+            }
+            dsProgressUpdate("Producto 4/4 · eidr", 75);
+            dsProgressUpdate("EIDR: canal 1/3 — sistema normal...", 45);
+            dsProgressRenderResources({
+                phase: "EIDR · canal 1/3",
+                engine: "EIDR CPU forward-model + PCG",
+                eta_seconds: null,
+                throughput: null,
+                cpu_percent: 72,
+                gpu_percent: null,
+                ram_mb: 8950,
+                vram_mb: null,
+                io_read_mb: 41762,
+                io_write_mb: 37109,
+                cache_hits: 50,
+                cache_misses: 0,
+            });
+            const diagnosticSummary = document.getElementById("ds-prog-diagnostic-summary");
+            if (diagnosticSummary) diagnosticSummary.textContent = "Fixture EIDR · sin integración FITS";
+            dsProgressAppendDiagnostic("DEMO VISUAL EIDR: valida progreso, iconos y espera; no acredita el motor.");
+            return;
+        }
+        dsProgressProductState.set("classic", {
+            state: "done",
+            pct: 100,
+            note: "Salida demo preservada",
+        });
+        dsProgressProductState.set("nebula_fusion_sci", {
+            state: "active",
+            pct: 62,
+            note: "Publicando VAR / NEFF / DQ",
+        });
+        dsProgressRenderProducts();
+        dsProgressUpdate("NebulaFusion SCI · publicando VAR / NEFF / DQ", 62);
+        dsProgressRenderResources({
+            phase: "NebulaFusion SCI",
+            engine: "NebulaFusion SCI · CPU scientific model",
+            eta_seconds: 1080,
+            throughput: 2.8,
+            cpu_percent: 64,
+            gpu_percent: null,
+            ram_mb: 22400,
+            vram_mb: 6100,
+            io_read_mb: 318,
+            io_write_mb: 94,
+            cache_hits: 28,
+            cache_misses: 4,
+        });
+        dsProgressResult = { previewPath: fixturePreview, framesUsed: 72, elapsedSeconds: 24 };
+        void dsProgressSetPublishedView(fixturePreview, "ACTUAL · demo visual del máster");
+        document.querySelectorAll("#ds-progress [data-ds-prog-view]").forEach(button => {
+            button.disabled = button.dataset.dsProgView !== "master";
+        });
+        const diagnosticSummary = document.getElementById("ds-prog-diagnostic-summary");
+        if (diagnosticSummary) diagnosticSummary.textContent = "Fixture visual · sin integración FITS";
+        dsProgressAppendDiagnostic("DEMO VISUAL: esta ruta no acredita calibración, integración ni telemetría física.");
+        if (fixtureState === "complete") {
+            void dsProgressComplete(dsProgressResult);
+        }
+        return;
+    }
+    if (requestedFixture === "folder-picker") {
+        const purpose = new URLSearchParams(window.location.search).get("purpose") === "destination"
+            ? "destination"
+            : "source";
+        document.body.dataset.dsFolderPickerFixture = "1";
+        dsRenderSections();
+        modal.style.display = "flex";
+        dsSetBackgroundInert(true);
+        dsWizardStep = 0;
+        dsSyncWizard();
+        void dsChooseDirectory({
+            purpose,
+            recursive: true,
+            defaultPath: "/Volumes/GM7Predator/APILADOS/M42",
+            title: purpose === "destination"
+                ? tr("deepsky.work_dir_pick", "Carpeta de trabajo y salida (cachés, masters y exportaciones)")
+                : tr("deepsky.scan_folder_pick", "Carpeta raíz de la sesión (auto-clasificar)"),
+        });
+        return;
+    }
+    if (requestedFixture === "poststack-editor") {
+        // Fixture exclusivamente visual: monta el editor real con un estado
+        // reproducible, sin fingir que hubo lectura, calibración o apilado FITS.
+        // Los botones que necesitan Tauri siguen usando sus comandos normales y
+        // por tanto no fabrican resultados científicos dentro del navegador.
+        modal.style.display = "none";
+        dsSetBackgroundInert(false);
+        const fixtureParams = new URLSearchParams(window.location.search);
+        dsOpenPoststackFixture(
+            Number(fixtureParams.get("step") || 1),
+            {
+                narrowband: fixtureParams.get("pcc") === "narrowband",
+                multiband: fixtureParams.get("source") === "multiband",
+                mono: fixtureParams.get("source") === "mono",
+                wcsVerified: fixtureParams.get("state") === "verified",
+                oiiiReconciled: fixtureParams.get("oiii") === "reconciled",
+            },
+        );
+        return;
+    }
+    document.body.dataset.dsUxFixture = "multiband";
     const probe = (name, filter, exptime, temp = -8, session = null) => ({
         path: `/ux-fixture/${name}.fits`, name: `${name}.fits`, ok: true,
         w: 4144, h: 2822, ch: 1, bayer: "GRBG", filter, exptime,
         gain: 160, binning: 1, temp, error: null,
         date_obs: session ? `${session}T22:00:00Z` : null,
-        signature: { session },
+        signature: {
+            camera: "ZWO ASI2600MC Pro",
+            sensor: "Sony IMX571",
+            readMode: "High gain",
+            gain: 160,
+            offset: 30,
+            temperatureC: temp,
+            exposureSeconds: exptime,
+            binningX: 1,
+            binningY: 1,
+            roi: [0, 0, 4144, 2822],
+            cfaPattern: "GRBG",
+            cfaPhase: [0, 0],
+            filter: dsFilterToken(filter),
+            session,
+            opticalTrain: "SV220 · train A",
+            adcBits: 16,
+            whiteLevelAdu: 65535,
+        },
+        storeLayout: { layout: "cfa", pattern: "GRBG", phaseX: 0, phaseY: 0 },
     });
+    // Caso realista para QA: flats de la noche siguiente con todos los campos
+    // físicos medibles presentes, pero sin identidad extendida que algunos
+    // programas de captura no escriben. Es el único caso certificable.
+    const fixtureFlatProbe = (name, filter, exptime, temp, session) => {
+        const frame = probe(name, filter, exptime, temp, session);
+        for (const field of ["sensor", "readMode", "roi", "opticalTrain", "adcBits", "whiteLevelAdu"]) {
+            frame.signature[field] = null;
+        }
+        return frame;
+    };
     dsFiles.lights = [
         ...Array.from({ length: 53 }, (_, index) => probe(
             `M42_SV220_Ha_OIII_${String(index + 1).padStart(3, "0")}`,
@@ -15867,13 +24238,46 @@ function dsLoadUxFixtureIfRequested(modal) {
     ];
     dsFiles.darks = Array.from({ length: 20 }, (_, index) => probe(`Dark_600s_${index + 1}`, null, 600));
     dsFiles.flats = [
-        ...Array.from({ length: 180 }, (_, index) => probe(`Flat_SV220_Ha_OIII_${index + 1}`, "SV220 Ha OIII", .5)),
-        ...Array.from({ length: 300 }, (_, index) => probe(`Flat_SV220_SII_OIII_${index + 1}`, "SV220 SII OIII", .5)),
+        ...Array.from({ length: 180 }, (_, index) => fixtureFlatProbe(
+            `Flat_SV220_Ha_OIII_${index + 1}`,
+            "SV220 Ha OIII",
+            .5,
+            -8,
+            "2026-03-01",
+        )),
+        ...Array.from({ length: 300 }, (_, index) => fixtureFlatProbe(
+            `Flat_SV220_SII_OIII_${index + 1}`,
+            "SV220 SII OIII",
+            .5,
+            -8,
+            "2026-03-02",
+        )),
     ];
     dsFiles.darkFlats = Array.from({ length: 30 }, (_, index) => probe(`DarkFlat_0.5s_${index + 1}`, null, .5));
-    dsFiles.bias = [];
+    dsFiles.bias = Array.from({ length: 50 }, (_, index) => probe(`Bias_${index + 1}`, null, .001));
+    const fixtureVerified = new URLSearchParams(window.location.search).get("state") === "verified";
+    if (fixtureVerified) {
+        for (const row of dsCalibrationRows(dsFiles.lights).filter(item => item.night.startsWith("2026-05"))) {
+            const flatBlock = dsCalibrationBlocks("flats")
+                .find(block => dsBlockFitsRow("flats", block, row)
+                    && !block.files.some(file => dsSessionIdentity(file) === row.night));
+            const darkFlatBlock = dsCalibrationBlocks("darkFlats")
+                .find(block => dsBlockFitsRow("darkFlats", block, row));
+            const biasBlock = dsCalibrationBlocks("bias")[0];
+            dsCalibAssignments.set(row.key, {
+                ...(flatBlock ? { flats: flatBlock.id } : {}),
+                ...(darkFlatBlock ? { darkFlats: darkFlatBlock.id } : {}),
+                ...(biasBlock ? { bias: biasBlock.id } : {}),
+            });
+            dsScientificAttestations.set(row.key, {
+                confirmed: true,
+                reason: "fixture QA: mismo equipo, flat capturado la noche siguiente",
+            });
+        }
+    }
     dsRenderSections();
     modal.style.display = "flex";
+    dsSetBackgroundInert(true);
     dsWizardStep = 1;
     dsUpdateUI();
     clearTimeout(dsPreflightTimer);
@@ -15881,12 +24285,16 @@ function dsLoadUxFixtureIfRequested(modal) {
     dsInspectionSerial += 1;
     dsSyncWizard();
     const groupPlan = (frames, seconds, tag) => ({
-        valid: true, groups: [{ frameCount: frames }], recommendedProfile: "maximum_quality",
-        effectiveEngine: "Hybrid CPU+GPU · Apple M5 (Metal)", effectiveRejection: "winsorized",
-        estimatedSeconds: seconds, warnings: [], errors: [],
+        valid: fixtureVerified, groups: [{ frameCount: frames }], recommendedProfile: "maximum_quality",
+        effectiveEngine: "CPU tiled scientific · GPU cosmetic/star map", effectiveRejection: "winsorized",
+        estimatedSeconds: seconds,
+        warnings: fixtureVerified ? [] : ["El flat de la noche siguiente coincide físicamente, pero requiere confirmar la identidad extendida ausente."],
+        errors: fixtureVerified ? [] : ["Sesión pendiente: elige el flat marcado «Puede comprobarse» y confirma que el equipo no cambió."],
+        scientificEligible: fixtureVerified,
+        scientificEligibilityReasons: fixtureVerified ? [] : ["Flats de otra noche pendientes de confirmación del usuario"],
         sessionMap: [
-            { night: `2026-03-0${tag}`, lights: Math.ceil(frames / 2), exposureSeconds: 21000, flatNight: null, flatCount: 0, flatDistanceDays: 0, darks: "darks: 600s", filter: "HA_OIII", lightPaths: Array.from({ length: Math.ceil(frames / 2) }, (_, i) => `/ux-fixture/L${tag}a_${i}.fits`) },
-            { night: `2026-05-1${tag}`, lights: Math.floor(frames / 2), exposureSeconds: 19000, flatNight: null, flatCount: 0, flatDistanceDays: 0, darks: "darks: 600s", filter: "HA_OIII", lightPaths: Array.from({ length: Math.floor(frames / 2) }, (_, i) => `/ux-fixture/L${tag}b_${i}.fits`) },
+            { night: `2026-03-0${tag}`, lights: Math.ceil(frames / 2), exposureSeconds: 21000, flatNight: `2026-03-0${tag}`, flatCount: tag === 1 ? 180 : 300, flatDistanceDays: 0, darks: "darks: 600 s · 20 tomas", darkFlats: "dark-flats: 0.5 s · 30 tomas", bias: "bias: 50 tomas", calibrationState: "exact", filter: tag === 1 ? "HA_OIII" : "SII_OIII", lightPaths: Array.from({ length: Math.ceil(frames / 2) }, (_, i) => `/ux-fixture/L${tag}a_${i}.fits`) },
+            { night: `2026-05-1${tag}`, lights: Math.floor(frames / 2), exposureSeconds: 19000, flatNight: fixtureVerified ? `2026-03-0${tag}` : null, flatCount: fixtureVerified ? (tag === 1 ? 180 : 300) : 0, flatDistanceDays: fixtureVerified ? 71 : 0, darks: "darks: 600 s · 20 tomas", darkFlats: fixtureVerified ? "30 toma(s) manuales verificadas" : "dark-flats: pendiente", bias: fixtureVerified ? "50 toma(s) manuales verificadas" : "bias: pendiente", calibrationState: fixtureVerified ? "userVerified" : "blocked", filter: tag === 1 ? "HA_OIII" : "SII_OIII", lightPaths: Array.from({ length: Math.floor(frames / 2) }, (_, i) => `/ux-fixture/L${tag}b_${i}.fits`) },
         ],
         calibrationBatches: {
             flats: [
@@ -15894,20 +24302,22 @@ function dsLoadUxFixtureIfRequested(modal) {
                 { id: `flats:2026-05-1${tag} · HA_OIII`, label: `2026-05-1${tag} · HA_OIII · 90 flats`, count: 90, paths: Array.from({ length: 3 }, (_, i) => `/ux-fixture/F${tag}b_${i}.fits`) },
             ],
             darks: [{ id: "darks:600 s", label: "600 s · 20 darks", count: 20, paths: Array.from({ length: 3 }, (_, i) => `/ux-fixture/D_${i}.fits`) }],
+            darkFlats: [{ id: "darkFlats:0.5 s", label: "0.5 s · 30 dark-flats", count: 30, paths: Array.from({ length: 3 }, (_, i) => `/ux-fixture/DF_${i}.fits`) }],
+            bias: [{ id: "bias:Todos", label: "Todos · 50 bias", count: 50, paths: Array.from({ length: 3 }, (_, i) => `/ux-fixture/B_${i}.fits`) }],
         },
     });
     dsApplyPreparedPlan({
-        sessionId: "ux-session", valid: true, totalFrames: 125,
+        sessionId: "ux-session", valid: fixtureVerified, totalFrames: 125,
         estimatedRamMb: 620, estimatedVramMb: 410, estimatedDiskMb: 11800, estimatedSeconds: 86,
         componentFilters: ["HA", "OIII", "SII"],
         warnings: [tr("deepsky.multiband_fixture_warning", "Multiband session: 2 coordinated integrations")],
-        errors: [],
+        errors: fixtureVerified ? [] : ["Flats de otra noche pendientes: abre el desplegable Flats de cada noche de mayo y confirma el equipo."],
         groups: [
             { id: "ha_oiii", label: "Ha + OIII · 53 lights", filterProfile: "HA_OIII", componentFilters: ["HA", "OIII"], plan: groupPlan(53, 38, 1) },
             { id: "sii_oiii", label: "SII + OIII · 72 lights", filterProfile: "SII_OIII", componentFilters: ["SII", "OIII"], plan: groupPlan(72, 48, 2) },
         ],
     });
-    dsRenderFrameInspection([
+    dsFrameInspection = [
         { path: "/ux-fixture/M42_001.fits", name: "M42_SV220_Ha_OIII_001.fits", stars: 386, fwhm: 2.31, noise: 84, eccentricity: .41, score: .94, rejectable: false, recommendedReference: true },
         { path: "/ux-fixture/M42_002.fits", name: "M42_SV220_SII_OIII_002.fits", stars: 352, fwhm: 2.57, noise: 91, eccentricity: .45, score: .89, rejectable: false, recommendedReference: false },
         {
@@ -15925,25 +24335,229 @@ function dsLoadUxFixtureIfRequested(modal) {
                 "FWHM and eccentricity are outside the robust range",
             ),
         },
-    ]);
+    ];
+    dsInspectionFingerprint = dsActiveLights().map(light => light.path).sort().join("\n");
+    dsRenderFrameInspection(dsFrameInspection);
+    dsSyncWizard();
+    if (requestedFixture === "error-modal") {
+        requestAnimationFrame(() => {
+            const presentation = dsPresentRunError(
+                modal,
+                "flat manual 1: calibración previa falló para /ux-fixture/Flats/2025-05-05_SV405CC_SV220.fits: faltan whiteLevelAdu y adcBits para validar saturación del flat",
+            );
+            // Reproduce la secuencia que originó el bug: un llamador antiguo
+            // intentaba devolver la propiedad modal al asistente justo después
+            // de abrir la alerta. El diálogo global debe conservar clic/foco.
+            dsSetBackgroundInert(true, modal);
+            void presentation;
+        });
+    }
+}
+
+const dsBackgroundAccessibilityState = new Map();
+
+function dsRestoreBackgroundAccessibility(element, previous) {
+    element.inert = previous.inert;
+    if (previous.ariaHidden === null) element.removeAttribute("aria-hidden");
+    else element.setAttribute("aria-hidden", previous.ariaHidden);
+}
+
+function dsSetBackgroundInert(
+    active,
+    activeDialog = document.getElementById("deepsky-modal"),
+) {
+    const customOverlay = document.getElementById("custom-modal-overlay");
+    if (
+        active
+        && customModalActive
+        && customOverlay
+        && getComputedStyle(customOverlay).display !== "none"
+    ) {
+        // Un error global visible siempre es el propietario modal. Esto evita
+        // que cualquier flujo antiguo vuelva a dejar «Entendido» visible pero
+        // inerte al intentar reactivar su panel de fondo.
+        activeDialog = customOverlay;
+    }
+    document.body.classList.toggle("ds-modal-active", Boolean(active));
+    if (!active) {
+        for (const [element, previous] of [...dsBackgroundAccessibilityState.entries()]) {
+            dsRestoreBackgroundAccessibility(element, previous);
+            dsBackgroundAccessibilityState.delete(element);
+        }
+        return;
+    }
+    if (!activeDialog) return;
+    for (const child of [...document.body.children]) {
+        if (!(child instanceof HTMLElement)) continue;
+        if (child === activeDialog) {
+            const previous = dsBackgroundAccessibilityState.get(child);
+            if (previous) {
+                dsRestoreBackgroundAccessibility(child, previous);
+                dsBackgroundAccessibilityState.delete(child);
+            }
+            // El diálogo que toma el relevo debe quedar operativo aunque su
+            // estado original fuese `display:none` + aria-hidden (como el
+            // combinador LRGB/SHO). La visibilidad la controla el llamador.
+            child.inert = false;
+            child.removeAttribute("aria-hidden");
+            continue;
+        }
+        if (!dsBackgroundAccessibilityState.has(child)) {
+            dsBackgroundAccessibilityState.set(child, {
+                inert: child.inert,
+                ariaHidden: child.getAttribute("aria-hidden"),
+            });
+        }
+        child.inert = true;
+        child.setAttribute("aria-hidden", "true");
+    }
+}
+
+function dsRunErrorPresentation(error) {
+    const message = normalizeBackendText(String(error || tr("general.error", "Error")));
+    const invalidScientificSort =
+        /comparison function does not correctly implement a total order|comparador.+orden total/i.test(message);
+    const calibrationError = /\b(?:flat|dark-flat|bias|dark|calibraci[oó]n)\b/i.test(message);
+    const missingWhiteLevel = /whiteLevelAdu/i.test(message) && /adcBits/i.test(message);
+    const failedPath = message.match(/calibraci[oó]n previa fall[oó] para (.+):\s*([^:]+)$/i)?.[1] || "";
+    const failedName = failedPath
+        ? failedPath.split(/[\\/]/).filter(Boolean).at(-1)
+        : "";
+    if (invalidScientificSort) {
+        return {
+            step: 4,
+            focusId: "btn-deepsky-run",
+            title: tr("deepsky.numeric_guard_title", "La integración se detuvo de forma segura"),
+            message: `
+                <div class="ds-run-error">
+                    <strong>${escapeHtml(tr(
+                        "deepsky.numeric_guard_summary",
+                        "Una muestra no finita llegó a una operación estadística que exige un orden numérico completo.",
+                    ))}</strong>
+                    <p>${escapeHtml(tr(
+                        "deepsky.numeric_guard_body",
+                        "No fue falta de RAM. Zenith canceló la rama afectada para no publicar un máster ambiguo ni cerrar la aplicación.",
+                    ))}</p>
+                    <p class="ds-run-error-action">${escapeHtml(tr(
+                        "deepsky.numeric_guard_action",
+                        "Volverás a Apilar. Los controles quedan disponibles y el registro técnico conserva el punto exacto del fallo.",
+                    ))}</p>
+                    <details>
+                        <summary>${escapeHtml(tr("deepsky.technical_detail", "Ver detalle técnico"))}</summary>
+                        <code>${escapeHtml(message)}</code>
+                    </details>
+                </div>`,
+        };
+    }
+    if (missingWhiteLevel) {
+        return {
+            step: 1,
+            focusId: "sel-ds-calibration-policy",
+            title: tr("deepsky.flat_validation_title", "No se pudo validar un flat"),
+            message: `
+                <div class="ds-run-error">
+                    <strong>${escapeHtml(failedName || tr("deepsky.flat_frame", "Flat seleccionado"))}</strong>
+                    <p>${escapeHtml(tr(
+                        "deepsky.flat_validation_missing_white",
+                        "La cabecera no declara el nivel blanco ni la profundidad ADC, y los píxeles no aportaron evidencia suficiente para inferirlos con seguridad. Zenith no usó esta toma ni publicó un máster parcial.",
+                    ))}</p>
+                    <p class="ds-run-error-action">${escapeHtml(tr(
+                        "deepsky.flat_validation_action",
+                        "Volverás a Calibraciones. Revisa ese lote o elige Permitir degradación de forma explícita.",
+                    ))}</p>
+                    <details>
+                        <summary>${escapeHtml(tr("deepsky.technical_detail", "Ver detalle técnico"))}</summary>
+                        <code>${escapeHtml(message)}</code>
+                    </details>
+                </div>`,
+        };
+    }
+    if (calibrationError) {
+        return {
+            step: 1,
+            focusId: "sel-ds-calibration-policy",
+            title: tr("deepsky.calibration_error_title", "Revisa las calibraciones"),
+            message: `
+                <div class="ds-run-error">
+                    <strong>${escapeHtml(tr(
+                        "deepsky.calibration_not_applied",
+                        "La calibración se detuvo antes de integrar los lights.",
+                    ))}</strong>
+                    <p>${escapeHtml(tr(
+                        "deepsky.calibration_error_action",
+                        "Volverás al tablero de Calibraciones para corregir el lote señalado. No se publicó ningún máster parcial.",
+                    ))}</p>
+                    <details>
+                        <summary>${escapeHtml(tr("deepsky.technical_detail", "Ver detalle técnico"))}</summary>
+                        <code>${escapeHtml(message)}</code>
+                    </details>
+                </div>`,
+        };
+    }
+    return {
+        step: 4,
+        focusId: "btn-deepsky-run",
+        title: tr("general.error", "Error"),
+        message,
+    };
+}
+
+async function dsPresentRunError(modal, error) {
+    const presentation = dsRunErrorPresentation(error);
+    modal.style.display = "flex";
+    dsSetBackgroundInert(true, modal);
+    dsSetWizardStep(presentation.step, true);
+    await showCustomAlert(presentation.title, presentation.message);
+    requestAnimationFrame(() => {
+        document.getElementById(presentation.focusId)?.focus({ preventScroll: true });
+    });
 }
 
 (function initDeepSky() {
     const modal = document.getElementById("deepsky-modal");
     const btnOpen = document.getElementById("btn-deepsky-mode");
     if (!modal || !btnOpen) return;
+    document.getElementById("btn-deepsky-editor")?.addEventListener("click", () => {
+        void dsOpenDeepSkyEditorEntry();
+    });
+    dsMountCalibrationControls();
+    dsMountProductControls();
     dsEnsureCaptureModeOptions();
+    dsSetExperienceMode(dsExperienceMode, false);
+    dsSyncComputePolicyUi();
+    void i18nReady.then(() => dsSyncComputePolicyUi());
+    const targetMode = document.getElementById("sel-ds-target-mode");
+    targetMode?.addEventListener("change", () => {
+        if (!dsCometEnabled()) dsCometDetection = null;
+        dsRenderCometDetection();
+        dsSchedulePreflight(true);
+    });
+    document.getElementById("btn-ds-detect-comet")?.addEventListener("click", dsDetectComet);
+    for (const id of ["chk-ds-comet-layers", "num-ds-comet-radius"]) {
+        document.getElementById(id)?.addEventListener("change", () => dsSchedulePreflight(true));
+    }
+    dsRenderCometDetection();
+    modal.querySelectorAll("[data-ds-experience]").forEach(button => {
+        button.addEventListener("click", () => dsSetExperienceMode(button.dataset.dsExperience));
+    });
+    document.getElementById("btn-ds-open-expert-controls")?.addEventListener("click", () => {
+        dsSetExperienceMode("expert");
+        requestAnimationFrame(() => dsSpotlight(document.querySelector("#deepsky-modal .ds-advanced")));
+    });
 
     btnOpen.addEventListener("click", () => {
         dsRenderSections();
         if (typeof applyTranslations === "function") { try { applyTranslations(); } catch (_) { } }
+        dsSyncComputePolicyUi();
         modal.style.display = "flex";
+        dsSetBackgroundInert(true);
         dsSetWizardStep(0, true);
         dsUpdateUI();
         setTimeout(() => modal.querySelector('.ds-wizard-step[data-step="0"]')?.focus(), 0);
     });
     const closeWizard = () => {
         modal.style.display = "none";
+        dsSetBackgroundInert(false);
         btnOpen.focus();
         setAssistantJourney({
             flow: "individual",
@@ -15953,7 +24567,8 @@ function dsLoadUxFixtureIfRequested(modal) {
         });
     };
     document.getElementById("btn-deepsky-close")?.addEventListener("click", closeWizard);
-    modal.addEventListener("click", (e) => { if (e.target === modal) closeWizard(); });
+    // El asistente conserva deliberadamente el trabajo ante clics accidentales
+    // en el fondo. Sólo el botón Cerrar o Escape descartan la vista modal.
     document.getElementById("btn-deepsky-prev")?.addEventListener("click", () => dsSetWizardStep(dsWizardStep - 1));
     document.getElementById("btn-deepsky-next")?.addEventListener("click", () => dsSetWizardStep(dsWizardStep + 1));
     modal.querySelectorAll(".ds-wizard-step").forEach(btn => {
@@ -15966,8 +24581,35 @@ function dsLoadUxFixtureIfRequested(modal) {
         dsTrapDialogFocus(e, modal);
     });
     const progressDialog = document.getElementById("ds-progress");
-    progressDialog?.addEventListener("keydown", (e) => dsTrapDialogFocus(e, progressDialog));
+    progressDialog?.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && progressDialog.dataset.state === "complete") {
+            e.preventDefault();
+            dsProgressStop();
+            document.getElementById("ds-editor-open")?.focus();
+            return;
+        }
+        dsTrapDialogFocus(e, progressDialog);
+    });
+    dsProgressBindViewport();
+    progressDialog?.querySelectorAll("[data-ds-prog-view]").forEach(button => {
+        button.addEventListener("click", () => {
+            if (!button.disabled) void dsProgressShowPublishedView(button.dataset.dsProgView);
+        });
+    });
+    document.getElementById("ds-prog-view-result")?.addEventListener("click", () => {
+        dsProgressStop();
+        document.getElementById("ds-editor-open")?.focus();
+    });
+    document.getElementById("ds-prog-edit-result")?.addEventListener("click", () => {
+        void dsProgressOpenEditor(1);
+    });
+    document.getElementById("ds-prog-editor-steps")?.addEventListener("click", event => {
+        const button = event.target.closest("[data-ds-progress-editor-step]");
+        if (button) void dsProgressOpenEditor(Number(button.dataset.dsProgressEditorStep));
+    });
     document.getElementById("ds-prog-cancel")?.addEventListener("click", async () => {
+        const button = document.getElementById("ds-prog-cancel");
+        if (button) button.disabled = true;
         try { await invoke("cancel_processing"); } catch (_) { }
         const c = document.getElementById("ds-prog-current"); if (c) c.textContent = tr("general.cancelling", "Cancelando...");
     });
@@ -15976,8 +24618,23 @@ function dsLoadUxFixtureIfRequested(modal) {
     ["sel-ds-oiii-mix", "sel-ds-crosstalk", "sel-ds-session-palette"].forEach(id => {
         document.getElementById(id)?.addEventListener("change", () => dsSchedulePreflight(true));
     });
-    ["sel-ds-capture-mode", "sel-ds-calibration-policy", "sel-ds-manual-darks", "sel-ds-manual-flats"].forEach(id => {
+    ["sel-ds-capture-mode", "sel-ds-calibration-policy"].forEach(id => {
         document.getElementById(id)?.addEventListener("change", () => dsSchedulePreflight(true));
+    });
+    ["sel-ds-manual-darks", "sel-ds-manual-flats"].forEach(id => {
+        document.getElementById(id)?.addEventListener("change", async event => {
+            if (event.target.value === "all") {
+                const accepted = await showCustomChoice(
+                    tr("general.warning", "Aviso"),
+                    tr(
+                        "deepsky.force_global_confirm",
+                        "El forzado global se volverá a validar por light. Las firmas incompatibles no se aplicarán y harán caer NF/EIDR a Classic. ¿Mantener esta selección?",
+                    ),
+                );
+                if (!accepted) event.target.value = "auto";
+            }
+            dsSchedulePreflight(true);
+        });
     });
     document.getElementById("chk-ds-cosmetic")?.addEventListener("change", (e) => { e.target.dataset.touched = "1"; });
     // El control de gota (pixfrac) solo aplica con drizzle activo.
@@ -15988,20 +24645,126 @@ function dsLoadUxFixtureIfRequested(modal) {
     };
     dsDrizzleSel?.addEventListener("change", dsSyncPixfrac);
     dsSyncPixfrac();
-    // Los controles F4 de NebulaFusion (CFA directo y escala de salida) solo
-    // aplican con ese método: con "classic" se deshabilitan y atenúan (y
-    // dsBuildStackRequest tampoco los envía).
-    const dsMethodSel = document.getElementById("sel-ds-method");
-    const dsSyncNebulaFusionControls = () => {
-        const nfActive =
-            dsMethodSel?.value === "nebula_fusion" ||
-            dsMethodSel?.value === "nebula_fusion_full" ||
-            dsMethodSel?.value === "nebula_fusion_struct";
-        const eidrActive = dsMethodSel?.value === "eidr";
-        // CFA directo aplica a NF y a EIDR; super-binning solo a NF; la
-        // escala solo a EIDR.
+    // Productos v5: cualquier subconjunto puede convivir. Los controles
+    // específicos se activan cuando al menos uno de sus consumidores está
+    // seleccionado; el selector v4 oculto refleja sólo el primario.
+    const dsPrimaryProduct = document.getElementById("sel-ds-primary-product");
+    const dsSyncIntegrationProductControls = () => {
+        let selected = new Set(
+            [...document.querySelectorAll("#ds-product-grid [data-ds-product]:checked")]
+                .map(input => input.dataset.dsProduct),
+        );
+        const drizzle = Number(document.getElementById("sel-ds-drizzle")?.value || 1);
+        const hasIndependentScientificProduct = [...selected]
+            .some(product => product !== "classic");
+        let classicAddedForDrizzle = false;
+        // Drizzle es una salida Classic, no un parámetro global de NF/EIDR.
+        // Si el usuario pide ambas cosas, conservamos explícitamente las dos
+        // ramas en vez de crear un request imposible o devolverlo a otro paso.
+        if (drizzle > 1 && hasIndependentScientificProduct && !selected.has("classic")) {
+            const classic = document.getElementById("chk-ds-product-classic");
+            if (classic) {
+                classic.checked = true;
+                selected.add("classic");
+                classicAddedForDrizzle = true;
+            }
+        }
+        if (!selected.size) {
+            const classic = document.getElementById("chk-ds-product-classic");
+            if (classic) classic.checked = true;
+            selected = new Set(["classic"]);
+        }
+        const nfSelected = selected.has("nebula_fusion_sci");
+        const structSelected = selected.has("struct");
+        const nfActive = nfSelected || structSelected;
+        const eidrActive = selected.has("eidr");
+        if (dsPrimaryProduct) {
+            for (const option of dsPrimaryProduct.options) {
+                option.disabled = !selected.has(option.value);
+            }
+            if (!selected.has(dsPrimaryProduct.value)) {
+                dsPrimaryProduct.value = selected.values().next().value || "";
+            }
+        }
+        const combinationSummary = document.getElementById("ds-product-combination-summary");
+        if (combinationSummary) {
+            const primaryLabel = dsPrimaryProduct?.selectedOptions?.[0]?.textContent?.trim()
+                || tr("deepsky.product_classic", "Classic");
+            const outputWord = selected.size === 1
+                ? tr("deepsky.product_output_singular", "salida elegida")
+                : tr("deepsky.product_output_plural", "salidas elegidas");
+            const dependency = structSelected
+                ? (nfSelected
+                    ? tr(
+                        "deepsky.product_struct_with_nf",
+                        "STRUCT usa una pasada NebulaFusion Full propia; la salida NebulaFusion seleccionada también se conserva.",
+                    )
+                    : tr(
+                        "deepsky.product_struct_hidden_dependency",
+                        "STRUCT calculará NebulaFusion Full internamente, pero sólo expondrá STRUCT como salida elegida.",
+                    ))
+                : "";
+            const parallelFlow = drizzle > 1
+                && selected.has("classic")
+                && (nfActive || eidrActive);
+            const branchLabels = [];
+            if (parallelFlow) {
+                branchLabels.push(trFormat(
+                    "deepsky.product_branch_classic",
+                    { drizzle: drizzle.toFixed(0) },
+                    `Classic · Drizzle ${drizzle.toFixed(0)}× · máster independiente`,
+                ));
+                if (nfSelected) {
+                    const nfMode = document.getElementById("sel-ds-nfmode")
+                        ?.selectedOptions?.[0]?.textContent?.trim() || "NebulaFusion";
+                    branchLabels.push(trFormat(
+                        "deepsky.product_branch_nf",
+                        { mode: nfMode },
+                        `NebulaFusion SCI · ${nfMode} · drizzle interno 1×`,
+                    ));
+                }
+                if (structSelected) {
+                    branchLabels.push(tr(
+                        "deepsky.product_branch_struct",
+                        "STRUCT · NebulaFusion Full interno · drizzle interno 1×",
+                    ));
+                }
+                if (eidrActive) {
+                    const eidrScale = document.getElementById("sel-ds-eidrscale")
+                        ?.selectedOptions?.[0]?.textContent?.trim() || "Auto";
+                    branchLabels.push(trFormat(
+                        "deepsky.product_branch_eidr",
+                        { scale: eidrScale },
+                        `EIDR · reconstrucción ${eidrScale} · drizzle interno 1×`,
+                    ));
+                }
+            }
+            const parallelSummary = parallelFlow
+                ? `<div class="ds-product-parallel-flow">
+                    <b>${escapeHtml(trFormat(
+                        "deepsky.product_parallel_title",
+                        { count: branchLabels.length },
+                        `${branchLabels.length} flujos paralelos · másters separados`,
+                    ))}</b>
+                    ${branchLabels.map(label => `<span>${escapeHtml(label)}</span>`).join("")}
+                    <small>${escapeHtml(tr(
+                        "deepsky.product_parallel_shared",
+                        "Parten de las mismas tomas y decisiones de calibración; cada rama ejecuta su propia rejilla, integración y exportación.",
+                    ))}</small>
+                    ${classicAddedForDrizzle ? `<small>${escapeHtml(tr(
+                        "deepsky.product_parallel_auto_classic",
+                        "Classic se añadió automáticamente porque Drizzle sólo se aplica a esa salida.",
+                    ))}</small>` : ""}
+                </div>`
+                : "";
+            combinationSummary.innerHTML = `<strong>${selected.size} ${escapeHtml(outputWord)}</strong> · ${escapeHtml(tr(
+                "deepsky.product_shared_run",
+                "mismas tomas y decisiones de calibración; integración separada; no se mezclan",
+            ))} · ${escapeHtml(tr("deepsky.product_opens", "se abrirá e intentará resolver WCS"))}: ${escapeHtml(primaryLabel)}${dependency ? `<br>${escapeHtml(dependency)}` : ""}${parallelSummary}`;
+        }
         [["chk-ds-cfadirect", "lbl-ds-cfadirect", nfActive || eidrActive],
          ["sel-ds-outputbin", "lbl-ds-outputbin", nfActive],
+         ["sel-ds-nfmode", "lbl-ds-nfmode", !!document.getElementById("chk-ds-product-nf")?.checked],
          ["sel-ds-eidrscale", "lbl-ds-eidrscale", eidrActive],
          ["sel-ds-eidrmode", "lbl-ds-eidrmode", eidrActive],
          ["chk-ds-eidrrefine", "lbl-ds-eidrrefine", eidrActive]].forEach(([inputId, labelId, active]) => {
@@ -16010,9 +24773,15 @@ function dsLoadUxFixtureIfRequested(modal) {
             const label = document.getElementById(labelId);
             if (label) label.style.opacity = active ? "1" : "0.5";
         });
+        dsBuildIntegrationProducts();
     };
-    dsMethodSel?.addEventListener("change", dsSyncNebulaFusionControls);
-    dsSyncNebulaFusionControls();
+    document.querySelectorAll("#ds-product-grid [data-ds-product]").forEach(input => {
+        input.addEventListener("change", dsSyncIntegrationProductControls);
+    });
+    dsPrimaryProduct?.addEventListener("change", dsSyncIntegrationProductControls);
+    document.getElementById("sel-ds-nfmode")?.addEventListener("change", dsSyncIntegrationProductControls);
+    dsDrizzleSel?.addEventListener("change", dsSyncIntegrationProductControls);
+    dsSyncIntegrationProductControls();
 
     // Presets: cada botón fija todos los controles; "Personalizado" no toca nada.
     document.querySelectorAll("#deepsky-modal .ds-preset").forEach(btn => {
@@ -16020,28 +24789,50 @@ function dsLoadUxFixtureIfRequested(modal) {
     });
     // Cambiar cualquier control manualmente pasa el preset a "Personalizado" y
     // refresca el diagrama/tiempo estimado.
-    // sel-ds-method (NebulaFusion) también refresca el plan: el preflight es quien
-    // avisa de incompatibilidades (drizzle, GPU only, metadata). Los presets no lo tocan.
-    ["sel-ds-interp", "sel-ds-drizzle", "sel-ds-pixfrac", "sel-ds-rejection", "sel-ds-method", "chk-ds-cfadirect",
+    // Los productos también refrescan el plan: el preflight publica
+    // elegibilidad/coste por salida. Los presets no cambian esta selección.
+    ["sel-ds-interp", "sel-ds-drizzle", "sel-ds-pixfrac", "sel-ds-rejection",
+        "chk-ds-product-classic", "chk-ds-product-nf", "chk-ds-product-struct",
+        "chk-ds-product-eidr", "sel-ds-primary-product", "sel-ds-nfmode", "chk-ds-cfadirect",
         "sel-ds-outputbin", "num-ds-kappa-low",
         "num-ds-kappa-high", "sel-ds-clipiters", "sel-ds-normalization", "sel-ds-pedestal",
         "sel-ds-compute", "chk-ds-autocrop", "chk-ds-cosmetic", "chk-ds-darkopt", "chk-ds-gradient",
         "sel-ds-eidrscale", "sel-ds-eidrmode", "chk-ds-eidrrefine", "chk-ds-localw"].forEach(id => {
             const el = document.getElementById(id);
-            if (el) el.addEventListener("change", dsMarkCustomPreset);
-        });
+        if (el) el.addEventListener("change", dsMarkCustomPreset);
+    });
+    document.getElementById("sel-ds-compute")?.addEventListener("change", () => {
+        dsSyncComputePolicyUi();
+    });
 
     document.getElementById("btn-deepsky-run")?.addEventListener("click", async () => {
-        const lights = dsActiveLights();
-        if (lights.length < 1) {
-            log("WARN", tr("deepsky.need_lights", "Selecciona al menos 1 light."));
+        // Doble clic: la inspección/preflight tarda segundos y el botón seguía
+        // vivo, lanzando dos apilados concurrentes sobre el mismo outputDir.
+        if (dsStacking || dsRunLaunchPending) {
+            log("WARN", tr("deepsky.stack_already_running", "Ya hay un apilado en curso; espera a que termine o cancélalo."));
             return;
         }
-        await dsInspectFrames();
-        const plan = await dsPreparePlan();
+        dsRunLaunchPending = true;
+        let lights;
+        let plan;
+        try {
+            lights = dsActiveLights();
+            if (lights.length < 1) {
+                log("WARN", tr("deepsky.need_lights", "Selecciona al menos 1 light."));
+                return;
+            }
+            await dsInspectFrames();
+            plan = await dsPreparePlan();
+        } finally {
+            // Desde aquí hasta dsProgressStart no hay awaits: dsStacking toma
+            // el relevo sin ventana de carrera.
+            dsRunLaunchPending = false;
+        }
         if (!plan?.valid) {
-            dsSetWizardStep(1, true);
-            showCustomAlert(tr("general.error", "Error"), (plan?.errors || ["El plan contiene incompatibilidades."]).join("\n"));
+            await dsPresentRunError(
+                modal,
+                (plan?.errors || ["El plan contiene incompatibilidades."]).join("\n"),
+            );
             return;
         }
         // El request se construye DESPUÉS de validar: el plan mostrado y lo
@@ -16049,19 +24840,40 @@ function dsLoadUxFixtureIfRequested(modal) {
         const multiband = dsIsMultibandSession();
         const request = multiband ? dsBuildSessionRequest() : dsBuildStackRequest();
         modal.style.display = "none";
+        dsSetBackgroundInert(false);
         dsResultBasePath = localStorage.getItem("zas_ds_workdir") || lights[0]?.path || null; // carpeta destino de exportación
         dsSessionProgressTotal = multiband ? Math.max(1, request.groups.length) : 1;
         dsSessionProgressIndex = 1;
-        dsProgressStart(); // ventana WBPP dedicada (no la pantalla genérica)
+        const progressRunToken = dsProgressStart({ lights, request }); // centro visual dedicado; usa el light real como referencia
         try {
             const result = await invoke(multiband ? "run_deepsky_session" : "run_deepsky_stack", { request });
-            dsProgressStop();
+            dsLastSessionResult = result;
+            dsPoststackSourceDescriptor = dsStudioDescriptorFromStack(
+                result,
+                request,
+                multiband,
+                lights,
+            );
+            dsStudioPaletteGallery = null;
+            dsStudioAppliedPalette = null;
+            const pccEligibility = dsPccEligibilityForStackRequest(request, multiband, lights);
+            dsSetPccUiEligibility(pccEligibility.eligible, pccEligibility.reason);
+            const hooEligibility = dsHooEligibilityForStackRequest(request, multiband, lights);
+            dsSetHooUiEligibility(hooEligibility.eligible, hooEligibility.reason);
             // FLUJO DEDICADO DE CIELO PROFUNDO: solo la imagen final (sin vista
             // fuente ni el post-procesado planetario de wavelets).
+            dsStretchMode = "unlinked";
             dsEnterResultMode();
             if (ui.imgResult) {
-                await setImageAndWait(ui.imgResult, result.previewPath, false);
-                fitToScreen();
+                const token = ++dsResultViewToken;
+                let initialPreview = result.previewPath;
+                try {
+                    initialPreview = await invoke("deepsky_restretch", {
+                        mode: dsStretchMode,
+                        strength: dsStretchStrength,
+                    });
+                } catch { /* conserva la vista publicada si el STF no está disponible */ }
+                await dsSetResultImage(initialPreview, token, true);
             }
             dsShowStretchBar();
             if (multiband) {
@@ -16069,23 +24881,49 @@ function dsLoadUxFixtureIfRequested(modal) {
                 // Vistas conmutables de la sesión: cada integración (Ha+OIII /
                 // SII+OIII) y cada componente extraído quedan en el selector.
                 dsPopulateSessionViews(result);
-                log("SUCCESS", `Sesión multibanda terminada: ${result.groups.length} masters · ${result.framesUsed} lights usadas · ${result.elapsedSeconds.toFixed(1)} s\nResultados: ${result.outputDir}`);
+                const masterCount = (result.groups || []).reduce(
+                    (total, group) => total + Math.max(1, (group.products || []).length),
+                    0,
+                );
+                log("SUCCESS", `Sesión multibanda terminada: ${masterCount} masters separados en ${result.groups.length} grupo(s) · ${result.framesUsed} lights usadas · ${result.elapsedSeconds.toFixed(1)} s\nResultados: ${result.outputDir}`);
             } else {
+                dsPopulateProductViews(result);
+                dsPopulateCometViews(result);
+                const primaryProduct = (result.products || []).find(product => product.primary);
+                if (primaryProduct?.product === "struct") {
+                    // The backend result stores NebulaFusion SCI plus the
+                    // separate STRUCT plane. Honour the user's primary choice
+                    // by displaying STRUCT, without relabelling SCI as STRUCT.
+                    await dsShowResultView(`product-id:${primaryProduct.id}`);
+                }
+                const productSummary = (result.products || [])
+                    .map(product => {
+                        const status = product.status === "fallback"
+                            ? `fallback → ${product.effectiveMethod}`
+                            : product.status === "warning"
+                                ? `${product.effectiveMethod} · advertencia`
+                                : product.effectiveMethod;
+                        return `${dsProductDisplayLabel(product)}: ${status}`;
+                    })
+                    .join(" · ");
+                const cometSummary = result.comet
+                    ? `\n${tr("deepsky.comet_layers", "Capas de cometa")}: ${(result.comet.layers || []).map(layer => layer.kind).join(" · ")} · ${Math.round(Number(result.comet.confidence || 0) * 100)}%`
+                    : "";
                 log("SUCCESS", `${tr("deepsky.done", "Cielo Profundo apilado. Usa la barra inferior para ajustar el estirado (los datos quedan lineales).")}
-Motor: ${result.engine} · ${result.framesUsed} usadas · ${result.framesRejected} rechazadas · ${result.elapsedSeconds.toFixed(1)} s${result.recipePath ? `\nReceta: ${result.recipePath}` : ""}`);
+Motor: ${result.engine} · ${result.framesUsed} usadas · ${result.framesRejected} rechazadas · ${result.elapsedSeconds.toFixed(1)} s${productSummary ? `\nProductos: ${productSummary}` : ""}${cometSummary}${result.recipePath ? `\nReceta: ${result.recipePath}` : ""}`);
             }
+            await dsProgressComplete(result, progressRunToken);
         } catch (e) {
             dsProgressStop();
             if (isCancellationError(e)) {
                 log("WARN", tr("general.cancelled", "Operación cancelada."));
                 modal.style.display = "flex";
-                dsSetWizardStep(3, true);
+                dsSetBackgroundInert(true);
+                dsSetWizardStep(4, true);
                 requestAnimationFrame(() => document.getElementById("btn-deepsky-run")?.focus());
             } else {
                 log("ERROR", `Cielo Profundo: ${e}`);
-                showCustomAlert(tr("general.error", "Error"), String(e));
-                modal.style.display = "flex";
-                dsSetWizardStep(3, true);
+                await dsPresentRunError(modal, e);
             }
         }
     });
@@ -16098,7 +24936,7 @@ Motor: ${result.engine} · ${result.framesUsed} usadas · ${result.framesRejecte
 // ============ COMBINAR CANALES (LRGB / SHO / HOO) ============
 const dsCombineFiles = { r: null, g: null, b: null, l: null };
 const DS_COMBINE_PRESETS = {
-    rgb: { neutralize: true, scnr: true, slots: [
+    rgb: { neutralize: false, scnr: false, slots: [
         { key: "r", label: () => tr("deepsky.slot_r", "R — rojo") },
         { key: "g", label: () => tr("deepsky.slot_g", "G — verde") },
         { key: "b", label: () => tr("deepsky.slot_b", "B — azul") },
@@ -16140,13 +24978,18 @@ function dsRenderCombineSlots() {
         pick.setAttribute("aria-label", `${pick.textContent}: ${slot.label()}`);
         pick.style.cssText = "flex:0 0 auto; width:auto; padding:6px 12px; border-radius:8px; font-size:0.7rem; cursor:pointer; border:1px solid #7c3aed; background:rgba(124,58,237,0.2); color:#ddd6fe;";
         pick.addEventListener("click", async () => {
-            const f = await openDialog({ multiple: false, title: slot.label(), filters: [{ name: "Imagen", extensions: ["fit", "fits", "tif", "tiff", "png", "jpg", "jpeg"] }] });
+            const f = await openDialog({
+                multiple: false,
+                title: slot.label(),
+                filters: [{ name: "Máster lineal FITS/TIFF", extensions: ["fits", "fit", "fts", "tif", "tiff"] }],
+            });
             if (f) { dsCombineFiles[slot.key] = f; dsRenderCombineSlots(); }
         });
         row.appendChild(pick);
         if (path) {
             const clr = document.createElement("button");
-            clr.type = "button"; clr.textContent = "✕";
+            clr.type = "button";
+            clr.innerHTML = '<svg class="zas-icon" aria-hidden="true" style="width:14px;height:14px;"><use href="#icon-cross"></use></svg>';
             clr.setAttribute("aria-label", `${tr("deepsky.clear", "Limpiar")}: ${slot.label()}`);
             clr.style.cssText = "flex:0 0 auto; width:auto; padding:6px 8px; border-radius:8px; border:none; background:none; color:#64748b; cursor:pointer;";
             clr.addEventListener("click", () => { dsCombineFiles[slot.key] = null; dsRenderCombineSlots(); });
@@ -16163,15 +25006,27 @@ function dsRenderCombineSlots() {
     const wizard = document.getElementById("deepsky-modal");
     const closeCombine = () => {
         modal.style.display = "none";
-        if (wizard) wizard.style.display = "flex";
+        modal.setAttribute("aria-hidden", "true");
+        if (wizard) {
+            wizard.style.display = "flex";
+            wizard.removeAttribute("aria-hidden");
+            dsSetBackgroundInert(true, wizard);
+        } else {
+            dsSetBackgroundInert(false);
+        }
         dsSyncWizard();
         requestAnimationFrame(() => btnOpen.focus());
     };
     btnOpen.addEventListener("click", () => {
-        if (wizard) wizard.style.display = "none";
+        if (wizard) {
+            wizard.style.display = "none";
+            wizard.setAttribute("aria-hidden", "true");
+        }
         dsRenderCombineSlots();
         if (typeof applyTranslations === "function") { try { applyTranslations(); } catch (_) { } }
         modal.style.display = "flex";
+        modal.removeAttribute("aria-hidden");
+        dsSetBackgroundInert(true, modal);
         requestAnimationFrame(() => document.getElementById("ds-combine-close")?.focus());
     });
     document.getElementById("ds-combine-close")?.addEventListener("click", closeCombine);
@@ -16192,8 +25047,12 @@ function dsRenderCombineSlots() {
             return;
         }
         modal.style.display = "none";
+        modal.setAttribute("aria-hidden", "true");
         dsResultBasePath = r;
         showProcessing(tr("deepsky.combining", "COMBINANDO CANALES..."));
+        const processingOverlay = document.getElementById("processing-overlay");
+        if (processingOverlay) dsSetBackgroundInert(true, processingOverlay);
+        else dsSetBackgroundInert(false);
         try {
             const b64 = await invoke("deepsky_combine_channels", {
                 rPath: r, gPath: g, bPath: b,
@@ -16201,17 +25060,34 @@ function dsRenderCombineSlots() {
                 register: document.getElementById("ds-combine-register")?.checked ?? true,
                 neutralize: preset.neutralize,
                 scnr: preset.scnr,
-                gradient: true
+                gradient: false,
+                combinationMode: presetKey
             });
             hideProcessing();
+            dsSetBackgroundInert(false);
+            dsSetPccUiEligibility(
+                presetKey === "rgb",
+                presetKey === "rgb"
+                    ? tr("deepsky.pcc_gate_ready", "Disponible para este máster RGB de banda ancha; la receta permanece idempotente.")
+                    : tr("deepsky.pcc_gate_narrowband", "PCC Gaia no es válido para narrowband/dual-band. Usa HOO/SHO o combinación de canales."),
+            );
+            dsSetHooUiEligibility(
+                false,
+                tr("deepsky.hoo_gate_combined", "HOO no se reaplica: el máster ya es una combinación de canales terminada."),
+            );
             dsEnterResultMode();
             if (ui.imgResult) { await setImageAndWait(ui.imgResult, b64, false); fitToScreen(); }
             dsShowStretchBar();
             log("SUCCESS", tr("deepsky.combine_done", "Canales combinados. Ajusta el estirado en la barra inferior."));
         } catch (e) {
             hideProcessing();
+            dsSetBackgroundInert(false);
             log("ERROR", `Combinar canales: ${e}`);
-            showCustomAlert(tr("general.error", "Error"), String(e));
+            await showCustomAlert(tr("general.error", "Error"), String(e));
+            modal.style.display = "flex";
+            modal.removeAttribute("aria-hidden");
+            dsSetBackgroundInert(true, modal);
+            requestAnimationFrame(() => document.getElementById("ds-combine-run")?.focus());
         }
     });
 })();
@@ -16439,6 +25315,122 @@ is commented out in index.html and this handler remains commented for reference.
 
 })();
 */
+
+// =========================================================================
+// DIRECT IMPORT STACKED IMAGE FOR POST-PROCESSING LOGIC
+// =========================================================================
+(function () {
+    const btnImportStacked = document.getElementById("btn-import-stacked");
+
+    if (btnImportStacked) {
+        btnImportStacked.addEventListener("click", async () => {
+            try {
+                const selected = await openDialog({
+                    multiple: false,
+                    directory: false,
+                    title: tr("general.import_stacked", "Importar Imagen Apilada"),
+                    filters: [{
+                        name: "Stacked Image",
+                        extensions: ["fits", "fit", "fts", "tif", "tiff", "png", "jpg", "jpeg"]
+                    }]
+                });
+
+                if (!selected) return;
+                const path = (typeof selected === "object" && selected !== null && selected.path) ? selected.path : selected;
+                if (!path || typeof path !== "string") return;
+
+                showProcessing(tr("general.loading_stacked_image", "CARGANDO IMAGEN APILADA..."));
+
+                setTimeout(async () => {
+                    try {
+                        // 1. Clear previous app memory/session state
+                        await invoke("clear_app_memory");
+
+                        // 2. Load stacked image into Rust AppState
+                        const res = await invoke("load_stacked_image", { path: String(path) });
+
+                        // 3. Exit DeepSky result view if currently active
+                        if (typeof dsExitResultMode === "function") {
+                            dsExitResultMode();
+                        }
+
+                        // 4. Set current file path and metadata for UI tracking
+                        currentFilePath = path;
+                        currentFileMetadata = {
+                            width: res.width,
+                            height: res.height,
+                            is_mono: res.is_mono,
+                            is_surface: false
+                        };
+
+                        // 5. Begin new post-processing session result
+                        await beginNewPostprocessResult(null, "imported");
+
+                        // 6. Reveal Post-Processing UI panels & view-result
+                        const vs = document.getElementById("view-source");
+                        const vr = document.getElementById("view-result");
+                        if (vs) vs.style.display = "none";
+                        if (vr) {
+                            vr.style.display = "flex";
+                            vr.style.borderLeft = "none";
+                        }
+
+                        if (ui.panelWavelets) ui.panelWavelets.style.display = "block";
+                        if (ui.panelTools) ui.panelTools.style.display = "block";
+
+                        // Hide mosaic buttons in stacking flow
+                        const btnGen = document.getElementById("btn-gen-mosaic");
+                        const btnArr = document.getElementById("btn-arrange-mosaic");
+                        const chkGuideWrap = document.getElementById("chk-mosaic-guided-wrapper");
+                        if (btnGen) btnGen.style.display = "none";
+                        if (btnArr) btnArr.style.display = "none";
+                        if (chkGuideWrap) chkGuideWrap.style.display = "none";
+
+                        if (ui.selDrMode && ui.selDrMode.parentElement) {
+                            ui.selDrMode.parentElement.style.display = "block";
+                        }
+
+                        // 7. Refresh Post Histogram & execute pipeline render
+                        await refreshPostHistogram(false);
+                        lastProcessedParams = "";
+                        pipelineRequestId++;
+                        showLocalProcessing(tr("general.processing", "Procesando..."));
+                        showImgLoader();
+                        await processPipeline(pipelineRequestId, JSON.stringify(getPipelineParams()));
+
+                        // 8. Fit RESULT image to screen after render
+                        if (ui.imgResult) {
+                            requestAnimationFrame(() => {
+                                fitToScreen(ui.imgResult);
+                            });
+                        }
+
+                        // 9. Set assistant journey
+                        setAssistantJourney({
+                            flow: "individual",
+                            stage: "postprocess",
+                            workflowStep: 2,
+                            workflowTotal: 3,
+                        }, {
+                            open: true,
+                            announceKey: `${currentPostprocessResultId}:individual:postprocess`,
+                        });
+
+                        log("INFO", `Imagen apilada importada con éxito: ${path}`);
+                    } catch (err) {
+                        console.error("Error al cargar imagen apilada:", err);
+                        showCustomAlert(tr("general.error", "Error"), normalizeBackendText(err));
+                    } finally {
+                        hideProcessing();
+                    }
+                }, 80);
+            } catch (e) {
+                console.error("Error abriendo diálogo de imagen apilada:", e);
+                showCustomAlert(tr("general.error", "Error"), String(e));
+            }
+        });
+    }
+})();
 
 // =========================================================================
 // DIRECT ANIMATION LOAD LOGIC (NEW)
@@ -17590,4 +26582,41 @@ window._clearStackingRoi = function () {
 // dejaba la bandera en true, la red daba el arranque por bueno y destapaba una
 // interfaz completa donde ningun boton respondia. Aqui, si el modulo muere a
 // medias, la bandera se queda en false y sale el panel de fallo con la pila.
+let milkyWayFlow = null;
+// Guarda la PROMESA en vuelo, no solo el resultado: dos clics antes de que el
+// chunk resuelva ejecutaban initMilkyWayFlow dos veces (dos modales con el
+// mismo id, dos listeners de progreso y un snapshot de `inert` cruzado que
+// dejaba toda la app inerte al cerrar el segundo flujo).
+let milkyWayFlowPromise = null;
+async function ensureMilkyWayFlow(openNow = false) {
+    if (!milkyWayFlow) {
+        milkyWayFlowPromise ??= import("./milky_way_ui.js").then(({ initMilkyWayFlow }) => {
+            milkyWayFlow = initMilkyWayFlow({
+                invoke,
+                listenEvent: listen,
+                openDialog,
+                openEditor: dsOpenMilkyWayResultInEditor,
+                translate: (key, fallback) => tr(key, fallback),
+                translateProgress: translateBackendProgressText,
+                bindLauncher: false,
+            });
+            window.__milkyWayFlow = milkyWayFlow;
+            return milkyWayFlow;
+        }).catch(error => {
+            // Si el módulo muere a medias, permite reintentar el arranque y
+            // conserva el contrato original: la bandera queda en null.
+            milkyWayFlowPromise = null;
+            throw error;
+        });
+        await milkyWayFlowPromise;
+    }
+    if (openNow) milkyWayFlow.open();
+    return milkyWayFlow;
+}
+document.getElementById("btn-milkyway-mode")?.addEventListener("click", () => {
+    void ensureMilkyWayFlow(true);
+});
+if (import.meta.env.DEV && new URLSearchParams(window.location.search).get("ux-fixture") === "milky-way") {
+    void ensureMilkyWayFlow(false);
+}
 window.__zasBootOk = true;
